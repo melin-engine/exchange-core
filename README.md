@@ -10,17 +10,18 @@ A sub-millisecond, production-grade trading engine targeting **10M orders/sec**,
 
 ## Status
 
-Early development. Core types are implemented:
+Early development. Core matching engine is functional:
 
 - [x] Fixed-point price and quantity types (`NonZeroU64`-backed, niche-optimized)
-- [x] Order model (Market, Limit)
-- [x] Time-in-force (GTC, IOC, FOK)
-- [x] Execution reports (Fill, Placed, Cancelled, Rejected)
+- [x] Order types: Market, Limit, Stop, Stop-Limit
+- [x] Time-in-force: GTC, IOC, FOK
+- [x] Execution reports (Fill, Placed, Triggered, Cancelled, Rejected)
 - [x] Order book (price-time priority, BTreeMap + VecDeque)
-- [x] Matching engine (limit/market, GTC/IOC/FOK, cancel)
-- [ ] Fuzz & property-based testing (`cargo-fuzz`, `proptest`)
+- [x] Matching engine with stop trigger logic
+- [x] Multi-instrument exchange dispatcher
 - [ ] Event journal / recovery
-- [ ] Risk checks
+- [ ] Risk checks (self-trade prevention, position limits)
+- [ ] Fuzz & property-based testing (`cargo-fuzz`, `proptest`)
 - [ ] Gateway / network layer
 
 ## Build
