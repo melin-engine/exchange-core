@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
-# Pre-commit hook: ensure all Rust code is formatted.
+# Pre-commit hook: enforce formatting, lint, and test checks.
+
+set -e
 
 if ! cargo fmt --check 2>/dev/null; then
     echo "error: code is not formatted. Run 'cargo fmt' and try again."
+    exit 1
+fi
+
+if ! cargo clippy -- -D warnings 2>/dev/null; then
+    echo "error: clippy reported warnings. Fix them and try again."
+    exit 1
+fi
+
+if ! cargo test 2>/dev/null; then
+    echo "error: tests failed. Fix them and try again."
     exit 1
 fi
