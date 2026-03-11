@@ -132,16 +132,23 @@ mod tests {
         let mut reports = Vec::new();
 
         // Place a sell on BTC.
-        exchange.execute(btc, limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC), &mut reports);
+        exchange.execute(
+            btc,
+            limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
         assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
         reports.clear();
 
         // Market buy on ETH should find no liquidity — books are isolated.
         exchange.execute(eth, market_order(2, Side::Buy, 10), &mut reports);
-        assert_eq!(reports[0], ExecutionReport::Rejected {
-            order_id: OrderId(2),
-            reason: RejectReason::NoLiquidity,
-        });
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(2),
+                reason: RejectReason::NoLiquidity,
+            }
+        );
         reports.clear();
 
         // Market buy on BTC should match.
@@ -168,7 +175,11 @@ mod tests {
 
         let mut reports = Vec::new();
 
-        exchange.execute(btc, limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC), &mut reports);
+        exchange.execute(
+            btc,
+            limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
         reports.clear();
 
         exchange.cancel(btc, OrderId(1), &mut reports);
