@@ -19,8 +19,9 @@ Early development. Core matching engine is functional:
 - [x] Order book (price-time priority, BTreeMap + VecDeque)
 - [x] Matching engine with stop trigger logic
 - [x] Multi-instrument exchange dispatcher
+- [x] Account balance management (per-account, per-currency reserves)
 - [ ] Event journal / recovery
-- [ ] Risk checks (self-trade prevention, position limits)
+- [ ] Risk checks (self-trade prevention, order throttling, position limits)
 - [ ] Fuzz & property-based testing (`cargo-fuzz`, `proptest`)
 - [ ] Gateway / network layer
 
