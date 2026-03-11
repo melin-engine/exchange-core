@@ -5,6 +5,14 @@
 
 use std::num::NonZeroU64;
 
+/// Instrument/pair identifier.
+///
+/// Uses a `u32` rather than a string to avoid heap allocation and enable
+/// fast hashing/comparison on the hot path. The mapping from human-readable
+/// symbol names to numeric IDs is managed outside the matching engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Symbol(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
 
