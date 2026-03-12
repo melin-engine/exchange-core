@@ -627,18 +627,20 @@ pub fn build_pipeline(
     writer: JournalWriter,
     group_commit_delay: Duration,
 ) -> (
-    ring::Producer<InputSlot>,
+    ring::MultiProducer<InputSlot>,
     JournalStage,
     MatchingStage,
     spsc::Consumer<OutputSlot>,
     Arc<Sequence>,
 ) {
-    // Input disruptor: 1 producer, 2 parallel consumers.
+    // Input disruptor: N producers (reader threads), 2 parallel consumers.
+    // MultiProducer allows lock-free concurrent publishing from all reader
+    // threads, eliminating the Mutex that previously serialized access.
     let (input_producer, mut consumers) =
         ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
             .add_consumer() // consumer 0: journal, gated on producer
             .add_consumer() // consumer 1: matching, gated on producer (parallel)
-            .build();
+            .build_multi_producer();
 
     let matching_consumer = consumers.pop().expect("matching consumer");
     let journal_consumer = consumers.pop().expect("journal consumer");
@@ -819,13 +821,8 @@ mod tests {
 
         let writer = JournalWriter::create(&path).unwrap();
 
-        let (
-            mut input_producer,
-            journal_stage,
-            matching_stage,
-            mut output_consumer,
-            journal_cursor,
-        ) = build_pipeline(exchange, writer, Duration::ZERO);
+        let (input_producer, journal_stage, matching_stage, mut output_consumer, journal_cursor) =
+            build_pipeline(exchange, writer, Duration::ZERO);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);

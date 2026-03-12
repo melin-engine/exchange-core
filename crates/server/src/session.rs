@@ -2,13 +2,12 @@
 //!
 //! Each connection gets a dedicated OS thread that performs blocking reads
 //! from the socket. Decoded requests are published directly to the input
-//! disruptor (via `Arc<Mutex<Producer>>`), bypassing tokio entirely.
+//! disruptor via a lock-free `MultiProducer` — no mutex, no tokio.
 //!
 //! Writing happens in the response thread, which holds all connection
 //! writers and writes directly after matching + journal gating.
 
 use std::io::Read;
-use std::sync::{Arc, Mutex};
 
 use tracing::debug;
 
@@ -32,7 +31,7 @@ use crate::response::ControlEvent;
 pub fn spawn_reader_thread<R: Read + Send + 'static>(
     connection_id: ConnectionId,
     reader: R,
-    producer: Arc<Mutex<ring::Producer<InputSlot>>>,
+    producer: ring::MultiProducer<InputSlot>,
     control_tx: std::sync::mpsc::Sender<ControlEvent>,
     addr: std::net::SocketAddr,
 ) {
@@ -53,7 +52,7 @@ pub fn spawn_reader_thread<R: Read + Send + 'static>(
 fn reader_loop<R: Read>(
     connection_id: ConnectionId,
     reader: R,
-    producer: Arc<Mutex<ring::Producer<InputSlot>>>,
+    producer: ring::MultiProducer<InputSlot>,
     _control_tx: &std::sync::mpsc::Sender<ControlEvent>,
     addr: std::net::SocketAddr,
 ) {
@@ -93,19 +92,14 @@ fn reader_loop<R: Read>(
         #[cfg(feature = "latency-trace")]
         let pre_publish = trace_ts();
 
-        // Lock the producer, publish to the disruptor, release.
-        // The mutex protects the single-writer invariant when multiple
-        // reader threads are active. Contention is proportional to
-        // connection count — acceptable for low-medium client counts.
-        {
-            let mut prod = producer.lock().expect("producer lock poisoned");
-            prod.publish(InputSlot {
-                connection_id: connection_id.0,
-                event,
-                publish_ts: trace_ts(),
-                recv_ts,
-            });
-        }
+        // Lock-free publish to the disruptor. MultiProducer uses CAS-based
+        // slot claiming — no mutex, scales to any connection count.
+        producer.publish(InputSlot {
+            connection_id: connection_id.0,
+            event,
+            publish_ts: trace_ts(),
+            recv_ts,
+        });
 
         #[cfg(feature = "latency-trace")]
         publish_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(

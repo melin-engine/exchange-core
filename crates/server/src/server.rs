@@ -15,7 +15,6 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{debug, error, info};
@@ -102,11 +101,10 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
         build_pipeline(exchange, writer, config.group_commit_delay);
 
-    // Shared producer for reader threads. Each reader locks to publish.
-    // Mutex contention scales with connection count — acceptable for
-    // low-medium client counts (Option 1). Thread-per-core or fan-in
-    // channels are alternatives for high connection counts.
-    let shared_producer = Arc::new(Mutex::new(input_producer));
+    // Multi-producer: each reader thread gets a clone. Lock-free CAS-based
+    // slot claiming eliminates mutex contention entirely. Scales to any
+    // connection count without serialization overhead.
+    let shared_producer = input_producer;
 
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -182,7 +180,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         session::spawn_reader_thread(
             connection_id,
             std_read,
-            Arc::clone(&shared_producer),
+            shared_producer.clone(),
             control_tx.clone(),
             addr,
         );
