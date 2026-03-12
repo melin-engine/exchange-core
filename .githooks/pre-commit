@@ -3,17 +3,17 @@
 
 set -e
 
-if ! cargo fmt --check 2>/dev/null; then
-    echo "error: code is not formatted. Run 'cargo fmt' and try again."
+if ! cargo fmt --all --check 2>/dev/null; then
+    echo "error: code is not formatted. Run 'cargo fmt --all' and try again."
     exit 1
 fi
 
-if ! cargo clippy -- -D warnings 2>/dev/null; then
+if ! cargo clippy --workspace -- -D warnings 2>/dev/null; then
     echo "error: clippy reported warnings. Fix them and try again."
     exit 1
 fi
 
-if ! cargo test 2>/dev/null; then
+if ! cargo test --workspace 2>/dev/null; then
     echo "error: tests failed. Fix them and try again."
     exit 1
 fi
