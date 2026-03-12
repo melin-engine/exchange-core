@@ -1,17 +1,18 @@
 //! End-to-end pipelined benchmark for the trading engine.
 //!
-//! Boots the server in-process, connects via TCP, and blasts order pairs
-//! (buy then sell at the same price from the same account — self-trade,
-//! net zero balance change, unlimited cycles).
+//! Boots the server in-process, connects via TCP (default) or Unix domain
+//! socket (`--uds`), and blasts order pairs (buy then sell at the same
+//! price from the same account — self-trade, net zero balance change,
+//! unlimited cycles).
 //!
 //! Uses closed-loop windowed pipelining: maintains a fixed number of
 //! in-flight orders to keep the pipeline saturated without unbounded
 //! queue buildup. Measures per-order round-trip latency under load.
 //!
 //! Usage:
-//!     cargo run --release -p trading-bench [-- <order_pairs>]
+//!     cargo run --release -p trading-bench [-- [--uds] <order_pairs>]
 //!
-//! Default: 1,000,000 order pairs (2,000,000 total orders).
+//! Default: TCP transport, 1,000,000 order pairs (2,000,000 total orders).
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -21,13 +22,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use trading_engine::types::*;
 use trading_protocol::codec;
 use trading_protocol::message::{Request, ResponseKind};
-use trading_protocol::tcp::{TcpTransportListener, TcpTransportStream};
 use trading_protocol::transport::{TransportRead, TransportStream, TransportWrite};
 use trading_server::server::ServerConfig;
 
@@ -44,9 +43,12 @@ const WARMUP_ORDERS: usize = 1_000;
 const WINDOW: usize = 64;
 
 fn main() {
-    let pairs: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let use_uds = args.iter().any(|a| a == "--uds");
+    let pairs: usize = args
+        .iter()
+        .filter(|a| *a != "--uds")
+        .find_map(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PAIRS);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -54,22 +56,14 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
-    rt.block_on(run_benchmark(pairs));
+    rt.block_on(run_benchmark(pairs, use_uds));
 }
 
-async fn run_benchmark(pairs: usize) {
+async fn run_benchmark(pairs: usize, use_uds: bool) {
     let tmp_dir = tempdir();
     let journal_path = tmp_dir.join("bench.journal");
 
-    // Bind to an OS-assigned port to avoid conflicts.
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-    let listener = TcpTransportListener::bind(bind_addr)
-        .await
-        .expect("failed to bind");
-    let actual_addr = listener.local_addr().expect("listener has local addr");
-
     let config = ServerConfig {
-        bind_addr: actual_addr,
         journal_path,
         snapshot_path: None,
         ..ServerConfig::default()
@@ -80,21 +74,107 @@ async fn run_benchmark(pairs: usize) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_server = Arc::clone(&shutdown);
 
-    // Spawn server on a background task.
+    // Set up transport and run the benchmark. Each branch calls
+    // run_bench_loop with its concrete transport types (monomorphized).
+    if use_uds {
+        let (reader, writer, name) = setup_uds(&tmp_dir, config, shutdown_for_server).await;
+        run_bench_loop(reader, writer, name, pairs, shutdown).await;
+    } else {
+        let (reader, writer, name) = setup_tcp(config, shutdown_for_server).await;
+        run_bench_loop(reader, writer, name, pairs, shutdown).await;
+    };
+
+    // Cleanup temp directory.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Set up TCP transport: bind listener, spawn server, connect client.
+async fn setup_tcp(
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+) -> (impl TransportRead, impl TransportWrite, &'static str) {
+    use trading_protocol::tcp::{TcpTransportListener, TcpTransportStream};
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+    let listener = TcpTransportListener::bind(bind_addr)
+        .await
+        .expect("failed to bind TCP");
+    let actual_addr = listener.local_addr().expect("listener has local addr");
+
     let _server_handle = tokio::spawn(async move {
-        if let Err(e) =
-            trading_server::server::run_with_shutdown(listener, config, shutdown_for_server).await
+        if let Err(e) = trading_server::server::run_with_shutdown(listener, config, shutdown).await
         {
             eprintln!("server error: {e}");
         }
     });
 
-    // Connect with retry instead of a fixed sleep.
-    let stream = connect_with_retry(actual_addr, 50).await;
+    // Connect with retry.
+    let stream = {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match tokio::net::TcpStream::connect(actual_addr).await {
+                Ok(s) => break s,
+                Err(_) if attempts < 50 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("failed to connect after 50 attempts: {e}"),
+            }
+        }
+    };
     stream.set_nodelay(true).expect("set TCP_NODELAY");
     let transport = TcpTransportStream::new(stream);
-    let (mut reader, mut writer) = transport.into_split();
+    let (reader, writer) = transport.into_split();
 
+    (reader, writer, "TCP loopback")
+}
+
+/// Set up UDS transport: bind listener, spawn server, connect client.
+async fn setup_uds(
+    tmp_dir: &std::path::Path,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+) -> (impl TransportRead, impl TransportWrite, &'static str) {
+    use trading_protocol::uds::{UdsTransportListener, UdsTransportStream};
+
+    let sock_path = tmp_dir.join("bench.sock");
+    let listener = UdsTransportListener::bind(&sock_path).expect("failed to bind UDS");
+
+    let _server_handle = tokio::spawn(async move {
+        if let Err(e) = trading_server::server::run_with_shutdown(listener, config, shutdown).await
+        {
+            eprintln!("server error: {e}");
+        }
+    });
+
+    // Connect with retry.
+    let stream = {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match tokio::net::UnixStream::connect(&sock_path).await {
+                Ok(s) => break s,
+                Err(_) if attempts < 50 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("failed to connect after 50 attempts: {e}"),
+            }
+        }
+    };
+    let transport = UdsTransportStream::new(stream);
+    let (reader, writer) = transport.into_split();
+
+    (reader, writer, "Unix domain socket")
+}
+
+/// Run the core benchmark loop: encode, send, receive, report.
+async fn run_bench_loop(
+    mut reader: impl TransportRead,
+    mut writer: impl TransportWrite,
+    transport_name: &str,
+    pairs: usize,
+    shutdown: Arc<AtomicBool>,
+) {
     let total_orders = WARMUP_ORDERS + (pairs * 2);
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -207,6 +287,8 @@ async fn run_benchmark(pairs: usize) {
         "=== Pipelined Benchmark ({measured_orders} orders, {WARMUP_ORDERS} warmup, window={WINDOW}) ==="
     );
     println!();
+    println!("  Transport: {transport_name}");
+    println!();
     println!("  Throughput");
     println!("    wall time:  {wall_ms:.2} ms");
     println!(
@@ -242,24 +324,6 @@ async fn run_benchmark(pairs: usize) {
     shutdown.store(true, Ordering::Relaxed);
     // Give pipeline threads time to drain and print reports.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // Cleanup temp directory.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-}
-
-/// Connect to the server with retries. The server is spawned on a background
-/// task and may not be accepting yet when we first try to connect.
-async fn connect_with_retry(addr: SocketAddr, max_attempts: usize) -> TcpStream {
-    for attempt in 1..=max_attempts {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return stream,
-            Err(_) if attempt < max_attempts => {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(e) => panic!("failed to connect after {max_attempts} attempts: {e}"),
-        }
-    }
-    unreachable!()
 }
 
 /// Create a temporary directory that persists for the process lifetime.

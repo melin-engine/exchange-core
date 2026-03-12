@@ -8,6 +8,7 @@ pub mod error;
 pub mod message;
 pub mod tcp;
 pub mod transport;
+pub mod uds;
 
 /// Re-export engine types that clients need to construct requests and
 /// interpret responses, so they don't need a direct dependency on the

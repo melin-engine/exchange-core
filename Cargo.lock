@@ -943,6 +943,7 @@ dependencies = [
 name = "trading-protocol"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "tokio",
  "trading-engine",
 ]
