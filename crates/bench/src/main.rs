@@ -9,25 +9,30 @@
 //! in-flight orders to keep the pipeline saturated without unbounded
 //! queue buildup. Measures per-order round-trip latency under load.
 //!
+//! The client uses blocking I/O (no tokio) to eliminate async scheduling
+//! noise from latency measurements. Only the server accept loop runs
+//! on a minimal tokio runtime in a background thread.
+//!
 //! Usage:
 //!     cargo run --release -p trading-bench [-- [--uds] <order_pairs>]
 //!
 //! Default: TCP transport, 1,000,000 order pairs (2,000,000 total orders).
 
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use tokio::sync::mpsc as tokio_mpsc;
 
 use trading_engine::types::*;
+use trading_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use trading_protocol::codec;
 use trading_protocol::message::{Request, ResponseKind};
-use trading_protocol::transport::{TransportRead, TransportStream, TransportWrite};
 use trading_server::server::ServerConfig;
 
 /// Number of order pairs (buy + sell) per benchmark run.
@@ -51,15 +56,6 @@ fn main() {
         .find_map(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PAIRS);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
-
-    rt.block_on(run_benchmark(pairs, use_uds));
-}
-
-async fn run_benchmark(pairs: usize, use_uds: bool) {
     let tmp_dir = tempdir();
     let journal_path = tmp_dir.join("bench.journal");
 
@@ -69,108 +65,123 @@ async fn run_benchmark(pairs: usize, use_uds: bool) {
         ..ServerConfig::default()
     };
 
-    // Shared shutdown flag — set after benchmark completes so pipeline
-    // threads can clean up and print latency-trace reports.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_for_server = Arc::clone(&shutdown);
 
-    // Set up transport and run the benchmark. Each branch calls
-    // run_bench_loop with its concrete transport types (monomorphized).
     if use_uds {
-        let (reader, writer, name) = setup_uds(&tmp_dir, config, shutdown_for_server).await;
-        run_bench_loop(reader, writer, name, pairs, shutdown).await;
+        let sock_path = tmp_dir.join("bench.sock");
+        start_uds_server(sock_path.clone(), config, Arc::clone(&shutdown));
+        let stream = connect_uds(&sock_path);
+        let reader = BlockingFrameReader::new(stream.try_clone().expect("clone UDS stream"));
+        let writer = BlockingFrameWriter::new(stream);
+        run_bench_loop(reader, writer, "Unix domain socket", pairs, shutdown);
     } else {
-        let (reader, writer, name) = setup_tcp(config, shutdown_for_server).await;
-        run_bench_loop(reader, writer, name, pairs, shutdown).await;
-    };
+        let addr = start_tcp_server(config, Arc::clone(&shutdown));
+        let stream = connect_tcp(addr);
+        stream.set_nodelay(true).expect("set TCP_NODELAY");
+        let reader = BlockingFrameReader::new(stream.try_clone().expect("clone TCP stream"));
+        let writer = BlockingFrameWriter::new(stream);
+        run_bench_loop(reader, writer, "TCP loopback", pairs, shutdown);
+    }
 
-    // Cleanup temp directory.
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Set up TCP transport: bind listener, spawn server, connect client.
-async fn setup_tcp(
-    config: ServerConfig,
-    shutdown: Arc<AtomicBool>,
-) -> (impl TransportRead, impl TransportWrite, &'static str) {
-    use trading_protocol::tcp::{TcpTransportListener, TcpTransportStream};
+/// Start TCP server in a background thread with its own tokio runtime.
+/// Returns the bound address once the listener is ready.
+fn start_tcp_server(config: ServerConfig, shutdown: Arc<AtomicBool>) -> SocketAddr {
+    use trading_protocol::tcp::TcpTransportListener;
 
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-    let listener = TcpTransportListener::bind(bind_addr)
-        .await
-        .expect("failed to bind TCP");
-    let actual_addr = listener.local_addr().expect("listener has local addr");
+    let (addr_tx, addr_rx) = std_mpsc::channel();
 
-    let _server_handle = tokio::spawn(async move {
-        if let Err(e) = trading_server::server::run_with_shutdown(listener, config, shutdown).await
-        {
-            eprintln!("server error: {e}");
-        }
-    });
+    std::thread::Builder::new()
+        .name("server-runtime".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server tokio runtime");
 
-    // Connect with retry.
-    let stream = {
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match tokio::net::TcpStream::connect(actual_addr).await {
-                Ok(s) => break s,
-                Err(_) if attempts < 50 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            rt.block_on(async move {
+                let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+                let listener = TcpTransportListener::bind(bind_addr)
+                    .await
+                    .expect("bind TCP");
+                let actual_addr = listener.local_addr().expect("local addr");
+                addr_tx.send(actual_addr).expect("send addr");
+
+                if let Err(e) =
+                    trading_server::server::run_with_shutdown(listener, config, shutdown).await
+                {
+                    eprintln!("server error: {e}");
                 }
-                Err(e) => panic!("failed to connect after 50 attempts: {e}"),
-            }
-        }
-    };
-    stream.set_nodelay(true).expect("set TCP_NODELAY");
-    let transport = TcpTransportStream::new(stream);
-    let (reader, writer) = transport.into_split();
+            });
+        })
+        .expect("spawn server thread");
 
-    (reader, writer, "TCP loopback")
+    addr_rx.recv().expect("receive server addr")
 }
 
-/// Set up UDS transport: bind listener, spawn server, connect client.
-async fn setup_uds(
-    tmp_dir: &std::path::Path,
-    config: ServerConfig,
-    shutdown: Arc<AtomicBool>,
-) -> (impl TransportRead, impl TransportWrite, &'static str) {
-    use trading_protocol::uds::{UdsTransportListener, UdsTransportStream};
+/// Start UDS server in a background thread with its own tokio runtime.
+/// Blocks until the listener is bound and ready for connections.
+fn start_uds_server(sock_path: PathBuf, config: ServerConfig, shutdown: Arc<AtomicBool>) {
+    use trading_protocol::uds::UdsTransportListener;
 
-    let sock_path = tmp_dir.join("bench.sock");
-    let listener = UdsTransportListener::bind(&sock_path).expect("failed to bind UDS");
+    let (ready_tx, ready_rx) = std_mpsc::channel();
 
-    let _server_handle = tokio::spawn(async move {
-        if let Err(e) = trading_server::server::run_with_shutdown(listener, config, shutdown).await
-        {
-            eprintln!("server error: {e}");
-        }
-    });
+    std::thread::Builder::new()
+        .name("server-runtime".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server tokio runtime");
 
-    // Connect with retry.
-    let stream = {
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match tokio::net::UnixStream::connect(&sock_path).await {
-                Ok(s) => break s,
-                Err(_) if attempts < 50 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            rt.block_on(async move {
+                let listener = UdsTransportListener::bind(&sock_path).expect("bind UDS");
+                ready_tx.send(()).expect("send ready");
+
+                if let Err(e) =
+                    trading_server::server::run_with_shutdown(listener, config, shutdown).await
+                {
+                    eprintln!("server error: {e}");
                 }
-                Err(e) => panic!("failed to connect after 50 attempts: {e}"),
-            }
-        }
-    };
-    let transport = UdsTransportStream::new(stream);
-    let (reader, writer) = transport.into_split();
+            });
+        })
+        .expect("spawn server thread");
 
-    (reader, writer, "Unix domain socket")
+    ready_rx.recv().expect("wait for server ready");
+}
+
+/// Connect to TCP server with retry.
+fn connect_tcp(addr: SocketAddr) -> std::net::TcpStream {
+    for attempt in 1..=50 {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => return s,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("failed to connect after 50 attempts: {e}"),
+        }
+    }
+    unreachable!()
+}
+
+/// Connect to UDS server with retry.
+fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
+    for attempt in 1..=50 {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(s) => return s,
+            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("failed to connect after 50 attempts: {e}"),
+        }
+    }
+    unreachable!()
 }
 
 /// Run the core benchmark loop: encode, send, receive, report.
-async fn run_bench_loop(
-    mut reader: impl TransportRead,
-    mut writer: impl TransportWrite,
+///
+/// Pure blocking I/O — no async runtime on the client side.
+fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
+    reader: BlockingFrameReader<R>,
+    mut writer: BlockingFrameWriter<W>,
     transport_name: &str,
     pairs: usize,
     shutdown: Arc<AtomicBool>,
@@ -208,71 +219,89 @@ async fn run_bench_loop(
 
     // --- Closed-loop windowed pipelining ---
     //
-    // Bounded timestamp channel acts as flow control: the sender blocks
-    // when WINDOW orders are in-flight. The receiver pops a timestamp on
-    // each BatchEnd, unblocking the sender to send the next order.
-    // This keeps the pipeline saturated without unbounded queue buildup.
-    let (ts_tx, mut ts_rx) = tokio_mpsc::channel::<Instant>(WINDOW);
+    // Bounded sync channel acts as flow control: the sender blocks when
+    // WINDOW timestamps are queued (WINDOW orders in-flight). The receiver
+    // pops a timestamp on each BatchEnd, unblocking the sender.
+    let (ts_tx, ts_rx) = std_mpsc::sync_channel::<Instant>(WINDOW);
 
-    // Spawn receiver: reads responses, records per-order latency on each BatchEnd.
-    let recv_handle = tokio::spawn(async move {
-        // Histogram range: 1 ns to 10 s, 3 significant digits.
-        let mut histogram =
-            Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-        let mut batch_count: usize = 0;
+    // Spawn receiver thread: reads responses, records per-order latency on each BatchEnd.
+    let recv_handle = std::thread::Builder::new()
+        .name("bench-reader".into())
+        .spawn(move || {
+            let mut reader = reader;
+            // Histogram range: 1 ns to 10 s, 3 significant digits.
+            let mut histogram =
+                Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+            let mut batch_count: usize = 0;
 
-        loop {
-            let frame = reader
-                .read_frame()
-                .await
-                .expect("read_frame")
-                .expect("server disconnected unexpectedly");
+            loop {
+                let frame = reader
+                    .read_frame()
+                    .expect("read_frame")
+                    .expect("server disconnected unexpectedly");
 
-            let response = codec::decode_response(&frame).expect("decode response");
-            if matches!(response, ResponseKind::BatchEnd) {
-                let sent_at = ts_rx.recv().await.expect("timestamp channel closed");
-                let latency_ns = sent_at.elapsed().as_nanos() as u64;
+                let response = codec::decode_response(&frame).expect("decode response");
+                if matches!(response, ResponseKind::BatchEnd) {
+                    let sent_at = ts_rx.recv().expect("timestamp channel closed");
+                    let latency_ns = sent_at.elapsed().as_nanos() as u64;
 
-                // Skip warmup orders.
-                if batch_count >= WARMUP_ORDERS {
-                    histogram.record(latency_ns).expect("record");
-                }
+                    // Skip warmup orders.
+                    if batch_count >= WARMUP_ORDERS {
+                        histogram.record(latency_ns).expect("record");
+                    }
 
-                batch_count += 1;
-                if batch_count >= total_orders {
-                    break;
+                    batch_count += 1;
+                    if batch_count >= total_orders {
+                        break;
+                    }
                 }
             }
-        }
 
-        histogram
-    });
+            histogram
+        })
+        .expect("spawn reader thread");
 
     // Sender: pushes timestamp then frame. Blocks when WINDOW orders are
-    // in-flight (bounded channel backpressure). Flushes periodically and
-    // always before the channel might block (when approaching window capacity).
+    // in-flight (bounded sync channel). Flushes periodically and always
+    // before the channel would block (to prevent deadlock — the receiver
+    // needs to see frames on the socket to drain the window).
     let blast_start = Instant::now();
     let mut unflushed: usize = 0;
 
     for frame in &encoded_frames {
-        ts_tx.send(Instant::now()).await.expect("timestamp send");
-        writer.write_frame(frame).await.expect("write_frame");
+        let ts = Instant::now();
+
+        // Try non-blocking send. If the window is full, flush buffered
+        // writes first (so the receiver can process responses and drain
+        // the window), then do a blocking send.
+        match ts_tx.try_send(ts) {
+            Ok(()) => {}
+            Err(std_mpsc::TrySendError::Full(ts)) => {
+                if unflushed > 0 {
+                    writer.flush().expect("flush");
+                    unflushed = 0;
+                }
+                ts_tx.send(ts).expect("timestamp send");
+            }
+            Err(std_mpsc::TrySendError::Disconnected(_)) => panic!("receiver disconnected"),
+        }
+
+        writer.write_frame(frame).expect("write_frame");
         unflushed += 1;
 
-        // Flush when we've accumulated a batch or when the window is
-        // nearly full (to avoid deadlock — the receiver needs to see
-        // frames to drain the window and unblock the sender).
-        if unflushed >= 16 || ts_tx.capacity() == 0 {
-            writer.flush().await.expect("flush");
+        // Flush periodically to amortize syscall overhead while keeping
+        // the pipeline fed.
+        if unflushed >= 16 {
+            writer.flush().expect("flush");
             unflushed = 0;
         }
     }
     if unflushed > 0 {
-        writer.flush().await.expect("flush");
+        writer.flush().expect("flush");
     }
 
     // Wait for all responses and get the histogram back.
-    let histogram = recv_handle.await.expect("receiver task panicked");
+    let histogram = recv_handle.join().expect("receiver thread panicked");
     let blast_duration = blast_start.elapsed();
 
     // --- Report ---
@@ -323,7 +352,7 @@ async fn run_bench_loop(
     println!();
     shutdown.store(true, Ordering::Relaxed);
     // Give pipeline threads time to drain and print reports.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::thread::sleep(Duration::from_millis(200));
 }
 
 /// Create a temporary directory that persists for the process lifetime.
