@@ -179,6 +179,14 @@ impl JournalWriter {
         &self.path
     }
 
+    /// Raw file descriptor for the journal file.
+    ///
+    /// Used by the io_uring journal stage to construct `IORING_OP_FSYNC`
+    /// opcodes without owning the file.
+    pub fn fd(&self) -> std::os::unix::io::RawFd {
+        self.file.as_raw_fd()
+    }
+
     /// Ensure enough pre-allocated space exists for the next write.
     /// If the write would exceed the current allocation, extends by
     /// another chunk. This is rare — once per ~800K entries.

@@ -40,18 +40,33 @@ const DEFAULT_PAIRS: usize = 1_000_000;
 /// Warmup orders (not measured) to prime the pipeline and caches.
 const WARMUP_ORDERS: usize = 1_000;
 
-/// Number of orders in flight simultaneously. Controls the level of
-/// pipelining — enough to keep the server pipeline saturated (journal +
+/// Default number of orders in flight simultaneously. Controls the level
+/// of pipelining — enough to keep the server pipeline saturated (journal +
 /// matching stages overlap), small enough that per-order latency reflects
 /// actual processing time rather than unbounded queueing.
-const WINDOW: usize = 64;
+const DEFAULT_WINDOW: usize = 64;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let use_uds = args.iter().any(|a| a == "--uds");
+
+    // Parse --window=N
+    let window: usize = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--window="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WINDOW);
+
+    // Parse --group-commit-us=N (group commit delay in microseconds)
+    let group_commit_us: u64 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--group-commit-us="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
     let pairs: usize = args
         .iter()
-        .filter(|a| *a != "--uds")
+        .filter(|a| !a.starts_with("--"))
         .find_map(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PAIRS);
 
@@ -61,6 +76,7 @@ fn main() {
     let config = ServerConfig {
         journal_path,
         snapshot_path: None,
+        group_commit_delay: Duration::from_micros(group_commit_us),
         ..ServerConfig::default()
     };
 
@@ -76,7 +92,15 @@ fn main() {
         let stream = connect_uds(&sock_path);
         let reader = BlockingFrameReader::new(stream.try_clone().expect("clone UDS stream"));
         let writer = BlockingFrameWriter::new(stream);
-        run_bench_loop(reader, writer, "Unix domain socket", pairs, shutdown);
+        run_bench_loop(
+            reader,
+            writer,
+            "Unix domain socket",
+            pairs,
+            window,
+            group_commit_us,
+            shutdown,
+        );
     } else {
         use trading_protocol::tcp::BlockingTcpListener;
 
@@ -89,7 +113,15 @@ fn main() {
         stream.set_nodelay(true).expect("set TCP_NODELAY");
         let reader = BlockingFrameReader::new(stream.try_clone().expect("clone TCP stream"));
         let writer = BlockingFrameWriter::new(stream);
-        run_bench_loop(reader, writer, "TCP loopback", pairs, shutdown);
+        run_bench_loop(
+            reader,
+            writer,
+            "TCP loopback",
+            pairs,
+            window,
+            group_commit_us,
+            shutdown,
+        );
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -145,6 +177,8 @@ fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
     mut writer: BlockingFrameWriter<W>,
     transport_name: &str,
     pairs: usize,
+    window: usize,
+    group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
 ) {
     let total_orders = WARMUP_ORDERS + (pairs * 2);
@@ -183,7 +217,7 @@ fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
     // Bounded sync channel acts as flow control: the sender blocks when
     // WINDOW timestamps are queued (WINDOW orders in-flight). The receiver
     // pops a timestamp on each BatchEnd, unblocking the sender.
-    let (ts_tx, ts_rx) = std_mpsc::sync_channel::<Instant>(WINDOW);
+    let (ts_tx, ts_rx) = std_mpsc::sync_channel::<Instant>(window);
 
     // Spawn receiver thread: reads responses, records per-order latency on each BatchEnd.
     let recv_handle = std::thread::Builder::new()
@@ -274,8 +308,11 @@ fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
     let wall_ms = blast_duration.as_micros() as f64 / 1000.0;
 
     println!(
-        "=== Pipelined Benchmark ({measured_orders} orders, {WARMUP_ORDERS} warmup, window={WINDOW}) ==="
+        "=== Pipelined Benchmark ({measured_orders} orders, {WARMUP_ORDERS} warmup, window={window}) ==="
     );
+    if group_commit_us > 0 {
+        println!("  Group commit delay: {group_commit_us} µs");
+    }
     println!();
     println!("  Transport: {transport_name}");
     println!();

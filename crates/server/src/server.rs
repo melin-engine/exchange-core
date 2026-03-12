@@ -46,6 +46,12 @@ pub struct ServerConfig {
     /// keep all cores on the same NUMA node, avoid hyperthreading
     /// siblings for latency-sensitive threads.
     pub core_affinity: [usize; 3],
+    /// Group commit coalescing window for the journal stage. The journal
+    /// waits up to this duration after the first unsynced write before
+    /// issuing fsync, allowing more events to accumulate in the batch.
+    /// Under high load the batch fills naturally and the delay rarely
+    /// fires. Zero means sync immediately after each batch read.
+    pub group_commit_delay: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -55,6 +61,7 @@ impl Default for ServerConfig {
             journal_path: PathBuf::from("trading.journal"),
             snapshot_path: None,
             core_affinity: [1, 2, 3],
+            group_commit_delay: std::time::Duration::ZERO,
         }
     }
 }
@@ -93,7 +100,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 
     // Build the disruptor pipeline.
     let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
-        build_pipeline(exchange, writer);
+        build_pipeline(exchange, writer, config.group_commit_delay);
 
     // Shared producer for reader threads. Each reader locks to publish.
     // Mutex contention scales with connection count — acceptable for

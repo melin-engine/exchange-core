@@ -246,6 +246,16 @@ impl<T: Copy + Default> Consumer<T> {
             .store(self.next_read, Ordering::Release);
     }
 
+    /// Set the progress counter to an explicit sequence number.
+    ///
+    /// Unlike [`commit`] which publishes `next_read`, this publishes an
+    /// arbitrary sequence. Used by the io_uring journal stage to commit
+    /// only the events covered by a completed fsync, while `next_read`
+    /// may have advanced further during the async fsync wait.
+    pub fn set_progress(&self, seq: u64) {
+        self.processed.get().store(seq, Ordering::Release);
+    }
+
     /// Returns a shared reference to this consumer's progress counter.
     ///
     /// External code (e.g., the response stage) can read this to determine
@@ -253,6 +263,15 @@ impl<T: Copy + Default> Consumer<T> {
     /// without a direct disruptor dependency.
     pub fn progress_counter(&self) -> Arc<Sequence> {
         Arc::clone(&self.processed)
+    }
+
+    /// Current read position (next sequence to be read).
+    ///
+    /// Used by the io_uring journal stage to snapshot the sequence after
+    /// encoding a batch, so it knows which position the in-flight fsync
+    /// covers.
+    pub fn next_read(&self) -> u64 {
+        self.next_read
     }
 
     /// Number of entries available to read.
