@@ -4,33 +4,80 @@ A sub-millisecond, production-grade trading engine targeting **10M orders/sec**,
 
 ## Architecture
 
-- **Single-threaded matching engine** — no locks on the hot path; I/O and journaling on separate threads via ring buffers
-- **Event sourcing** — deterministic replay for crash recovery and audit
-- **Mechanical sympathy** — cache-friendly data structures, zero allocations on the hot path, fixed-point pricing (no floats)
+```
+Clients ──TCP──> Accept Loop ──tokio mpsc──> Publisher Thread ──┐
+                                                                │
+                                                     Input Disruptor (ring buffer)
+                                                                │
+                                             ┌──────────────────┼──────────────────┐
+                                             │                                     │
+                                        Journal Thread                    Matching Thread
+                                        batch write + fsync               execute on Exchange
+                                        (pre-allocated storage)           publish to output SPSC
+                                             │                                     │
+                                        advances cursor ──────────┐                │
+                                                                  ▼                │
+                                                          Response Thread  ◄───────┘
+                                                          gates on journal cursor
+                                                          routes to per-connection channels
+                                                                  │
+                                                           ──TCP──> Clients
+```
 
-## Status
+- **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
+- **LMAX disruptor pipeline** — 4 OS threads (publisher, journal, matching, response) on lock-free ring buffers; journal and matching run in parallel on the same events
+- **Persist-before-ack** — responses are held until the journal confirms fsync, but matching proceeds in parallel with I/O
+- **Batch fsync amortization** — under load, one `sync_data()` covers many events; `posix_fallocate` pre-allocates 64 MiB chunks so fsync only flushes data pages, not extent metadata
+- **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart
+- **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), zero allocations on the hot path
 
-Early development. Core matching engine is functional:
+## Features
 
-- [x] Fixed-point price and quantity types (`NonZeroU64`-backed, niche-optimized)
-- [x] Order types: Market, Limit, Stop, Stop-Limit
-- [x] Time-in-force: GTC, IOC, FOK
-- [x] Execution reports (Fill, Placed, Triggered, Cancelled, Rejected)
-- [x] Order book (price-time priority, BTreeMap + VecDeque)
-- [x] Matching engine with stop trigger logic
-- [x] Multi-instrument exchange dispatcher
-- [x] Account balance management (per-account, per-currency reserves)
-- [ ] Event journal / recovery
-- [ ] Risk checks (self-trade prevention, order throttling, position limits)
-- [ ] Fuzz & property-based testing (`cargo-fuzz`, `proptest`)
-- [ ] Gateway / network layer
+### Matching Engine
+- Order types: Market, Limit, Stop, Stop-Limit
+- Time-in-force: GTC, IOC, FOK
+- Strict price-time priority (BTreeMap + VecDeque order book)
+- Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
+- Multi-instrument exchange with shared account balances
+
+### Event Sourcing
+- Write-ahead journal with CRC32C checksums
+- Batch journal I/O via disruptor ring buffer pipeline
+- Pre-allocated storage (`posix_fallocate`) for reduced fsync latency
+- Snapshot save/load for fast recovery
+- Deterministic replay from journal
+
+### Networking
+- Custom binary wire protocol (length-prefixed framing)
+- TCP transport with `TCP_NODELAY`
+- Transport abstraction (TCP now, QUIC/kernel bypass later)
+- Typed client library
+- Terminal UI for interactive testing
+
+### Risk & Accounting
+- Per-account, per-currency balance management
+- Reserve on order, update on fill, release on cancel
 
 ## Build
 
 ```sh
-cargo build
-cargo test
-cargo clippy
+cargo build          # compile
+cargo run            # run server
+cargo test           # run tests (115 tests across workspace)
+cargo clippy         # lint
+cargo fmt            # format
+```
+
+## Project Structure
+
+```
+crates/
+├── disruptor/     Lock-free ring buffers (generic, no trading-domain knowledge)
+├── engine/        Matching engine, order books, event sourcing, journal pipeline
+├── protocol/      Binary wire protocol and transport abstractions
+├── server/        TCP server, pipeline orchestration, session management
+├── client/        Typed client library
+└── tui/           Terminal UI for interactive testing
 ```
 
 ## License
