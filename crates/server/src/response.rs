@@ -57,7 +57,11 @@ pub fn run(
     let mut batch = [OutputSlot::default(); MAX_BATCH];
 
     // Cached journal cursor value to avoid atomic reads on every slot.
+    #[cfg(not(feature = "no-fsync"))]
     let mut cached_journal_pos: u64 = 0;
+    // Suppress unused warnings when journal gating is disabled.
+    #[cfg(feature = "no-fsync")]
+    let _ = &journal_cursor;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -90,18 +94,24 @@ pub fn run(
             // Wait for the journal to confirm this event is durable.
             // The journal cursor represents total entries processed
             // (fsync'd). We need cursor > input_seq.
-            let needed = slot.input_seq + 1;
-            if cached_journal_pos < needed {
-                // Spin until journal catches up. In the common case this
-                // is a single atomic read (journal is ahead or just finished).
-                // Under load, the journal batches many events per fsync,
-                // so the cursor jumps in chunks.
-                loop {
-                    cached_journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                    if cached_journal_pos >= needed {
-                        break;
+            //
+            // Skipped under `no-fsync` — there's nothing to wait for
+            // when the journal doesn't actually flush to disk.
+            #[cfg(not(feature = "no-fsync"))]
+            {
+                let needed = slot.input_seq + 1;
+                if cached_journal_pos < needed {
+                    // Spin until journal catches up. In the common case this
+                    // is a single atomic read (journal is ahead or just finished).
+                    // Under load, the journal batches many events per fsync,
+                    // so the cursor jumps in chunks.
+                    loop {
+                        cached_journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                        if cached_journal_pos >= needed {
+                            break;
+                        }
+                        std::hint::spin_loop();
                     }
-                    std::hint::spin_loop();
                 }
             }
 

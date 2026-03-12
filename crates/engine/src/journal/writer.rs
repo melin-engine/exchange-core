@@ -132,6 +132,7 @@ impl JournalWriter {
         self.file
             .write_all_at(&self.buffer[..written], self.write_pos)?;
         self.write_pos += written as u64;
+        #[cfg(not(feature = "no-fsync"))]
         self.file.sync_data()?;
 
         self.next_sequence += 1;
@@ -163,6 +164,7 @@ impl JournalWriter {
     /// durable in a single I/O operation. Because storage is pre-allocated,
     /// this only flushes data pages — no extent metadata updates needed.
     pub fn sync(&mut self) -> Result<(), JournalError> {
+        #[cfg(not(feature = "no-fsync"))]
         self.file.sync_data()?;
         Ok(())
     }
@@ -187,6 +189,7 @@ impl JournalWriter {
         self.allocated_end = preallocate(&self.file, self.write_pos)?;
         // sync_all to persist the new extent metadata. This is a rare
         // cost — amortized over ~800K entries per chunk.
+        #[cfg(not(feature = "no-fsync"))]
         self.file.sync_all()?;
         Ok(())
     }

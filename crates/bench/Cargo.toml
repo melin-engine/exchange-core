@@ -3,6 +3,9 @@ name = "trading-bench"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+no-fsync = ["trading-engine/no-fsync"]
+
 [[bin]]
 name = "trading-bench"
 path = "src/main.rs"
