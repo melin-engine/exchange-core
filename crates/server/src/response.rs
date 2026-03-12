@@ -8,7 +8,7 @@
 //! Runs on a dedicated OS thread. No tokio involvement — eliminates
 //! async scheduling jitter from the response path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,6 +122,12 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
 
+        // Track connections that received writes during this batch so we
+        // can flush them once at the end, instead of per-BatchEnd event.
+        // With N clients interleaved, this reduces flush syscalls from
+        // ~N/batch to exactly N/batch (one per dirty connection).
+        let mut dirty_connections: HashSet<u64> = HashSet::new();
+
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
@@ -146,8 +152,6 @@ pub fn run(
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,
             };
-
-            let is_batch_end = matches!(kind, ResponseKind::BatchEnd);
 
             if let Some(writer) = connections.get_mut(&slot.connection_id) {
                 // Encode the response directly to wire format.
@@ -175,24 +179,30 @@ pub fn run(
                     continue;
                 }
 
-                // Flush after each batch to minimize latency — the client
-                // is waiting for all reports before proceeding.
-                if is_batch_end && let Err(e) = writer.flush() {
-                    tracing::debug!(
-                        connection_id = slot.connection_id,
-                        error = %e,
-                        "flush error, dropping connection"
-                    );
-                    connections.remove(&slot.connection_id);
-                    continue;
-                }
+                dirty_connections.insert(slot.connection_id);
 
                 // Record server-side end-to-end: reader recv → response flush.
                 #[cfg(feature = "latency-trace")]
-                if is_batch_end {
+                if matches!(kind, ResponseKind::BatchEnd) {
                     server_e2e_hist
                         .record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
                 }
+            }
+        }
+
+        // Flush all connections that received writes during this batch.
+        // Deferred flushing amortizes syscall overhead: one flush per
+        // dirty connection per batch instead of one per BatchEnd event.
+        for conn_id in &dirty_connections {
+            if let Some(writer) = connections.get_mut(conn_id)
+                && let Err(e) = writer.flush()
+            {
+                tracing::debug!(
+                    connection_id = conn_id,
+                    error = %e,
+                    "flush error, dropping connection"
+                );
+                connections.remove(conn_id);
             }
         }
 
