@@ -801,11 +801,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trading-disruptor"
+version = "0.1.0"
+
+[[package]]
 name = "trading-engine"
 version = "0.1.0"
 dependencies = [
  "crc32c",
  "tempfile",
+ "trading-disruptor",
 ]
 
 [[package]]
@@ -824,6 +829,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trading-disruptor",
  "trading-engine",
  "trading-protocol",
 ]
