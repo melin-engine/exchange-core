@@ -73,11 +73,21 @@ impl UdsTransportStream {
     pub fn new(stream: UnixStream) -> Self {
         Self { stream }
     }
+
+    /// Consume the transport and return the inner tokio `UnixStream`.
+    ///
+    /// Used by the server to convert to a blocking `std::os::unix::net::UnixStream`
+    /// via `into_std()` for dedicated I/O threads.
+    pub fn into_inner(self) -> UnixStream {
+        self.stream
+    }
 }
 
 impl TransportStream for UdsTransportStream {
     type Read = UdsTransportRead;
     type Write = UdsTransportWrite;
+    type BlockingRead = std::os::unix::net::UnixStream;
+    type BlockingWrite = std::os::unix::net::UnixStream;
 
     fn into_split(self) -> (UdsTransportRead, UdsTransportWrite) {
         let (read, write) = self.stream.into_split();
@@ -87,6 +97,20 @@ impl TransportStream for UdsTransportStream {
                 writer: BufWriter::new(write),
             },
         )
+    }
+
+    fn into_blocking_split(
+        self,
+    ) -> std::io::Result<(
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    )> {
+        let std_stream = self.stream.into_std()?;
+        // tokio leaves the socket in non-blocking mode after into_std().
+        // Switch to blocking mode for dedicated I/O threads.
+        std_stream.set_nonblocking(false)?;
+        let read_half = std_stream.try_clone()?;
+        Ok((read_half, std_stream))
     }
 }
 

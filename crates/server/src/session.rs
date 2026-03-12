@@ -1,57 +1,73 @@
-//! Per-connection session management.
+//! Per-connection reader thread.
 //!
-//! Each TCP connection spawns two tokio tasks:
-//! - **Reader**: decodes requests from the wire and forwards them to the engine.
-//! - **Writer**: encodes responses from the engine and sends them to the client.
+//! Each connection gets a dedicated OS thread that performs blocking reads
+//! from the socket. Decoded requests are published directly to the input
+//! disruptor (via `Arc<Mutex<Producer>>`), bypassing tokio entirely.
 //!
-//! This split allows reading and writing to proceed concurrently without
-//! blocking each other.
+//! Writing happens in the response thread, which holds all connection
+//! writers and writes directly after matching + journal gating.
 
-use std::net::SocketAddr;
+use std::io::Read;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tracing::debug;
 
-use tracing::{debug, error};
+use trading_engine::journal::event::JournalEvent;
+use trading_engine::journal::pipeline::InputSlot;
+use trading_engine::journal::trace::trace_ts;
 
+use trading_disruptor::ring;
+
+use trading_protocol::blocking::BlockingFrameReader;
 use trading_protocol::codec;
-use trading_protocol::message::{ConnectionId, EngineCommand, Response, ResponseKind};
-use trading_protocol::transport::{TransportRead, TransportWrite};
+use trading_protocol::message::{ConnectionId, Request};
 
-/// Maximum encoded response size. Responses are small (execution reports),
-/// so 128 bytes is generous.
-const MAX_RESPONSE_BUF: usize = 128;
+use crate::response::ControlEvent;
 
-/// Spawn reader and writer tasks for a new connection.
+/// Spawn a reader thread for a new connection.
 ///
-/// The reader task decodes requests and sends `EngineCommand::Request`
-/// messages to the engine. On disconnect, it sends `EngineCommand::Disconnected`.
-///
-/// The writer task receives `Response` messages from the engine and encodes
-/// them to the wire. It flushes after each `BatchEnd`.
-pub fn spawn_session<R: TransportRead, W: TransportWrite>(
+/// The reader performs blocking I/O on its own OS thread — no tokio
+/// scheduling jitter. On disconnect, sends `ControlEvent::Disconnected`
+/// to the response thread.
+pub fn spawn_reader_thread<R: Read + Send + 'static>(
     connection_id: ConnectionId,
     reader: R,
-    writer: W,
-    engine_tx: mpsc::Sender<EngineCommand>,
-    response_rx: mpsc::Receiver<Response>,
-    addr: SocketAddr,
+    producer: Arc<Mutex<ring::Producer<InputSlot>>>,
+    control_tx: std::sync::mpsc::Sender<ControlEvent>,
+    addr: std::net::SocketAddr,
 ) {
-    tokio::spawn(reader_task(connection_id, reader, engine_tx, addr));
-    tokio::spawn(writer_task(connection_id, writer, response_rx, addr));
+    std::thread::Builder::new()
+        .name(format!("reader-{}", connection_id.0))
+        .spawn(move || {
+            reader_loop(connection_id, reader, producer, &control_tx, addr);
+
+            // Notify response thread to remove this connection's writer.
+            let _ = control_tx.send(ControlEvent::Disconnected {
+                connection_id: connection_id.0,
+            });
+        })
+        .expect("failed to spawn reader thread");
 }
 
-/// Read frames from the transport, decode requests, and forward to the engine.
-async fn reader_task<R: TransportRead>(
+/// Blocking reader loop. Reads frames, decodes, publishes to the disruptor.
+fn reader_loop<R: Read>(
     connection_id: ConnectionId,
-    mut reader: R,
-    engine_tx: mpsc::Sender<EngineCommand>,
-    addr: SocketAddr,
+    reader: R,
+    producer: Arc<Mutex<ring::Producer<InputSlot>>>,
+    _control_tx: &std::sync::mpsc::Sender<ControlEvent>,
+    addr: std::net::SocketAddr,
 ) {
+    let mut frame_reader = BlockingFrameReader::new(reader);
+
+    #[cfg(feature = "latency-trace")]
+    let mut publish_hist = trading_engine::journal::trace::StageHistogram::new(
+        "reader: publish (decode → disruptor publish)",
+    );
+
     loop {
-        let frame = match reader.read_frame().await {
+        let frame = match frame_reader.read_frame() {
             Ok(Some(frame)) => frame,
             Ok(None) => {
-                // Clean disconnect.
                 debug!(addr = %addr, "client disconnected");
                 break;
             }
@@ -65,88 +81,47 @@ async fn reader_task<R: TransportRead>(
             Ok(req) => req,
             Err(e) => {
                 debug!(addr = %addr, error = %e, "decode error");
-                // Skip malformed messages rather than disconnecting — the
-                // client may have a codec bug but other messages may be valid.
                 continue;
             }
         };
 
-        let cmd = EngineCommand::Request {
-            connection_id,
-            request,
-            sent_ts: trading_engine::journal::trace::trace_ts(),
-        };
-        if engine_tx.send(cmd).await.is_err() {
-            // Engine shut down.
-            debug!(addr = %addr, "engine channel closed, dropping connection");
-            break;
+        #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
+        let recv_ts = trace_ts();
+
+        let event = request_to_event(&request);
+
+        #[cfg(feature = "latency-trace")]
+        let pre_publish = trace_ts();
+
+        // Lock the producer, publish to the disruptor, release.
+        // The mutex protects the single-writer invariant when multiple
+        // reader threads are active. Contention is proportional to
+        // connection count — acceptable for low-medium client counts.
+        {
+            let mut prod = producer.lock().expect("producer lock poisoned");
+            prod.publish(InputSlot {
+                connection_id: connection_id.0,
+                event,
+                publish_ts: trace_ts(),
+                recv_ts,
+            });
         }
+
+        #[cfg(feature = "latency-trace")]
+        publish_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(
+            pre_publish,
+            trace_ts(),
+        ));
     }
 
-    // Notify the engine that this connection is gone so it can clean up
-    // the response sender from its connection table.
-    let _ = engine_tx
-        .send(EngineCommand::Disconnected { connection_id })
-        .await;
+    #[cfg(feature = "latency-trace")]
+    publish_hist.print_report();
 }
 
-/// Receive responses from the engine and encode them to the transport.
-async fn writer_task<W: TransportWrite>(
-    connection_id: ConnectionId,
-    mut writer: W,
-    mut response_rx: mpsc::Receiver<Response>,
-    addr: SocketAddr,
-) {
-    let mut buf = [0u8; MAX_RESPONSE_BUF];
-
-    #[cfg(feature = "latency-trace")]
-    let mut mpsc_hist = trading_engine::journal::trace::StageHistogram::new(
-        "writer: tokio mpsc (response try_send → writer recv)",
-    );
-    #[cfg(feature = "latency-trace")]
-    let mut server_e2e_hist = trading_engine::journal::trace::StageHistogram::new(
-        "server e2e (reader recv → writer flush)",
-    );
-
-    while let Some(response) = response_rx.recv().await {
-        #[cfg(feature = "latency-trace")]
-        mpsc_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(
-            response.sent_ts,
-            trading_engine::journal::trace::trace_ts(),
-        ));
-
-        let is_batch_end = matches!(response.kind, ResponseKind::BatchEnd);
-
-        let written = match codec::encode_response(&response.kind, &mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                error!(connection_id = connection_id.0, error = %e, "encode error");
-                continue;
-            }
-        };
-
-        // write_frame expects the payload (tag + fields), not the length prefix.
-        // Our encode_response writes [length(4) | tag+payload], so skip the prefix.
-        if let Err(e) = writer.write_frame(&buf[4..written]).await {
-            debug!(addr = %addr, error = %e, "write error");
-            break;
-        }
-
-        // Flush after each batch to minimize latency — the client is waiting
-        // for all reports from its request before proceeding.
-        if is_batch_end && let Err(e) = writer.flush().await {
-            debug!(addr = %addr, error = %e, "flush error");
-            break;
-        }
-
-        // Record server-side end-to-end: reader recv → writer flush complete.
-        // Only on BatchEnd since that's when the client sees the response.
-        #[cfg(feature = "latency-trace")]
-        if is_batch_end {
-            server_e2e_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(
-                response.recv_ts,
-                trading_engine::journal::trace::trace_ts(),
-            ));
-        }
+/// Convert a wire `Request` to a `JournalEvent` for the pipeline.
+fn request_to_event(request: &Request) -> JournalEvent {
+    match *request {
+        Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
+        Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
     }
 }

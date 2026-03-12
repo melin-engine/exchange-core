@@ -4,61 +4,56 @@
 //! 1. Recovers or creates the `JournaledExchange`.
 //! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
 //! 3. Builds the disruptor pipeline (input ring buffer + output SPSC).
-//! 4. Spawns 4 OS threads: publisher, journal, matching, response.
-//! 5. Runs the accept loop, spawning sessions for each connection.
+//! 4. Spawns 3 OS threads: journal, matching, response.
+//! 5. Runs the accept loop, spawning a reader OS thread per connection.
+//!
+//! No tokio on the hot path — reader threads do blocking I/O and publish
+//! directly to the disruptor. The response thread writes directly to sockets.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use trading_engine::journal::JournaledExchange;
 use trading_engine::journal::pipeline::build_pipeline;
 
-use trading_protocol::message::{ConnectionId, EngineCommand, Response};
+use trading_protocol::blocking::BlockingFrameWriter;
+use trading_protocol::message::ConnectionId;
 use trading_protocol::transport::{TransportListener, TransportStream};
 
+use crate::response::ControlEvent;
 use crate::session;
 
 /// Server configuration.
 pub struct ServerConfig {
     /// Address to bind the TCP listener.
     pub bind_addr: SocketAddr,
-    /// Capacity of the engine command channel (inbound from all clients).
-    /// 256K commands — at 10M orders/sec with 100 clients, gives ~2.5 ms
-    /// of burst buffering per client before backpressure.
-    pub command_channel_capacity: usize,
-    /// Capacity of per-connection response channels.
-    /// 64K slots × ~40 bytes = ~2.5 MiB per connection. Must be large
-    /// enough that the TCP writer task can keep up under sustained load
-    /// without dropping responses via try_send.
-    pub response_channel_capacity: usize,
     /// Path to the journal file for durable event sourcing.
     pub journal_path: PathBuf,
     /// Optional path to a snapshot file for faster recovery.
     pub snapshot_path: Option<PathBuf>,
-    /// CPU core IDs for pinning the 4 pipeline threads.
-    /// Order: [journal, matching, response, publisher].
-    /// Default: cores 1–4 (skips core 0 which handles kernel interrupts).
+    /// CPU core IDs for pinning the 3 pipeline threads.
+    /// Order: [journal, matching, response].
+    /// Default: cores 1–3 (skips core 0 which handles kernel interrupts).
     ///
     /// Production recommendation: use `isolcpus` to reserve cores,
     /// keep all cores on the same NUMA node, avoid hyperthreading
     /// siblings for latency-sensitive threads.
-    pub core_affinity: [usize; 4],
+    pub core_affinity: [usize; 3],
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:9876".parse().expect("valid default addr"),
-            command_channel_capacity: 262_144,
-            response_channel_capacity: 65_536,
             journal_path: PathBuf::from("trading.journal"),
             snapshot_path: None,
-            core_affinity: [1, 2, 3, 4],
+            core_affinity: [1, 2, 3],
         }
     }
 }
@@ -68,8 +63,8 @@ impl Default for ServerConfig {
 /// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes
 ///    it into `Exchange` and `JournalWriter` for the pipeline.
 /// 2. Builds the disruptor pipeline (input ring + output SPSC + stages).
-/// 3. Spawns 4 OS threads: publisher, journal, matching, response.
-/// 4. Runs the accept loop, spawning sessions for each connection.
+/// 3. Spawns 3 OS threads: journal, matching, response.
+/// 4. Runs the accept loop, spawning a reader OS thread per connection.
 ///
 /// Returns when the listener encounters a fatal error.
 pub async fn run<L: TransportListener>(
@@ -99,11 +94,16 @@ pub async fn run_with_shutdown<L: TransportListener>(
     let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
         build_pipeline(exchange, writer);
 
+    // Shared producer for reader threads. Each reader locks to publish.
+    // Mutex contention scales with connection count — acceptable for
+    // low-medium client counts (Option 1). Thread-per-core or fan-in
+    // channels are alternatives for high connection counts.
+    let shared_producer = Arc::new(Mutex::new(input_producer));
+
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
     // Spawn pipeline OS threads.
-    // Copy core_affinity once — [usize; 4] is Copy, moved into each closure.
     let cores = config.core_affinity;
 
     let s1 = Arc::clone(&shutdown);
@@ -133,18 +133,6 @@ pub async fn run_with_shutdown<L: TransportListener>(
         })
         .expect("failed to spawn response thread");
 
-    // Command channel: all client reader tasks → publisher thread.
-    let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>(config.command_channel_capacity);
-
-    // Spawn the publisher on a dedicated OS thread.
-    let publisher_handle = std::thread::Builder::new()
-        .name("publisher".into())
-        .spawn(move || {
-            apply_affinity("publisher", cores[3]);
-            crate::engine::run(engine_rx, input_producer, control_tx);
-        })
-        .expect("failed to spawn publisher thread");
-
     info!(addr = %config.bind_addr, "listening");
 
     // Monotonically increasing connection ID counter. AtomicU64 because
@@ -166,32 +154,36 @@ pub async fn run_with_shutdown<L: TransportListener>(
 
         debug!(connection_id = connection_id.0, addr = %addr, "new connection");
 
-        // Per-connection response channel.
-        let (response_tx, response_rx) =
-            mpsc::channel::<Response>(config.response_channel_capacity);
+        // Convert the async stream to blocking read/write halves.
+        let (std_read, std_write) = match stream.into_blocking_split() {
+            Ok(parts) => parts,
+            Err(e) => {
+                error!(connection_id = connection_id.0, error = %e, "failed to convert to blocking");
+                continue;
+            }
+        };
 
-        // Register the connection with the engine before spawning tasks.
-        // This ensures the response stage has the sender before any
-        // requests arrive.
-        if engine_tx
-            .send(EngineCommand::Connected {
-                connection_id,
-                sender: response_tx,
+        // Register the writer with the response thread before spawning
+        // the reader. This ensures the response stage has the writer
+        // before any requests arrive.
+        let boxed_writer: Box<dyn Write + Send> = Box::new(std_write);
+        if control_tx
+            .send(ControlEvent::Connected {
+                connection_id: connection_id.0,
+                writer: BlockingFrameWriter::new(boxed_writer),
             })
-            .await
             .is_err()
         {
-            info!("engine channel closed, shutting down");
+            info!("response thread gone, shutting down");
             break;
         }
 
-        let (reader, writer) = stream.into_split();
-        session::spawn_session(
+        // Spawn a dedicated reader thread for this connection.
+        session::spawn_reader_thread(
             connection_id,
-            reader,
-            writer,
-            engine_tx.clone(),
-            response_rx,
+            std_read,
+            Arc::clone(&shared_producer),
+            control_tx.clone(),
             addr,
         );
     }
@@ -199,9 +191,6 @@ pub async fn run_with_shutdown<L: TransportListener>(
     // Signal pipeline threads to shut down.
     shutdown.store(true, Ordering::Relaxed);
 
-    // Drop the sender to close the publisher thread's channel.
-    drop(engine_tx);
-    let _ = publisher_handle.join();
     let _ = journal_handle.join();
     let _ = matching_handle.join();
     let _ = response_handle.join();

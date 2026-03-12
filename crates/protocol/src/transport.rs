@@ -20,7 +20,21 @@ pub trait TransportListener: Send + 'static {
 pub trait TransportStream: Send + 'static {
     type Read: TransportRead;
     type Write: TransportWrite;
+
+    /// Blocking (std) read half for dedicated I/O threads.
+    type BlockingRead: std::io::Read + Send + 'static;
+    /// Blocking (std) write half for dedicated I/O threads.
+    type BlockingWrite: std::io::Write + Send + 'static;
+
+    /// Split into async read/write halves (for client use with tokio).
     fn into_split(self) -> (Self::Read, Self::Write);
+
+    /// Convert to blocking (std) read/write halves for dedicated I/O threads.
+    ///
+    /// Deregisters from the tokio reactor and returns cloned std streams.
+    /// Used by the server to run reader threads and response thread with
+    /// blocking I/O, eliminating tokio scheduling jitter from the hot path.
+    fn into_blocking_split(self) -> io::Result<(Self::BlockingRead, Self::BlockingWrite)>;
 }
 
 /// Read half of a transport stream. Delivers complete frames (length-delimited).

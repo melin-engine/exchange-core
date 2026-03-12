@@ -54,11 +54,21 @@ impl TcpTransportStream {
     pub fn new(stream: TcpStream) -> Self {
         Self { stream }
     }
+
+    /// Consume the transport and return the inner tokio `TcpStream`.
+    ///
+    /// Used by the server to convert to a blocking `std::net::TcpStream`
+    /// via `into_std()` for dedicated I/O threads.
+    pub fn into_inner(self) -> TcpStream {
+        self.stream
+    }
 }
 
 impl TransportStream for TcpTransportStream {
     type Read = TcpTransportRead;
     type Write = TcpTransportWrite;
+    type BlockingRead = std::net::TcpStream;
+    type BlockingWrite = std::net::TcpStream;
 
     fn into_split(self) -> (TcpTransportRead, TcpTransportWrite) {
         let (read, write) = self.stream.into_split();
@@ -68,6 +78,16 @@ impl TransportStream for TcpTransportStream {
                 writer: BufWriter::new(write),
             },
         )
+    }
+
+    fn into_blocking_split(self) -> std::io::Result<(std::net::TcpStream, std::net::TcpStream)> {
+        let std_stream = self.stream.into_std()?;
+        // tokio leaves the socket in non-blocking mode after into_std().
+        // Switch to blocking mode for dedicated I/O threads.
+        std_stream.set_nonblocking(false)?;
+        let read_half = std_stream.try_clone()?;
+        // std_stream is the write half, read_half is a dup'd fd for reading.
+        Ok((read_half, std_stream))
     }
 }
 
