@@ -143,7 +143,41 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
         Ok(engine)
     } else {
         info!("creating new journal");
-        let engine = JournaledExchange::create(&config.journal_path)?;
+        let mut engine = JournaledExchange::create(&config.journal_path)?;
+        seed_test_data(&mut engine)?;
         Ok(engine)
     }
+}
+
+/// Seed the exchange with test instruments and accounts so the TUI can
+/// be used immediately. This runs only on first startup (fresh journal).
+fn seed_test_data(engine: &mut JournaledExchange) -> Result<(), Box<dyn std::error::Error>> {
+    use trading_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+
+    // Currencies: 0 = USD, 1 = BTC, 2 = ETH
+    let usd = CurrencyId(0);
+    let btc = CurrencyId(1);
+    let eth = CurrencyId(2);
+
+    // Instruments: symbol 1 = BTC/USD, symbol 2 = ETH/USD
+    engine.add_instrument(InstrumentSpec {
+        symbol: Symbol(1),
+        base: btc,
+        quote: usd,
+    })?;
+    engine.add_instrument(InstrumentSpec {
+        symbol: Symbol(2),
+        base: eth,
+        quote: usd,
+    })?;
+
+    // Two test accounts with generous balances in all currencies.
+    for &account in &[AccountId(1), AccountId(2)] {
+        engine.deposit(account, usd, 1_000_000)?;
+        engine.deposit(account, btc, 1_000)?;
+        engine.deposit(account, eth, 10_000)?;
+    }
+
+    info!("seeded test data: 2 instruments, 2 accounts");
+    Ok(())
 }
