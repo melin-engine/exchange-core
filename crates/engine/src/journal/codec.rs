@@ -34,7 +34,7 @@ use crate::types::{
 
 use super::error::JournalError;
 use super::event::JournalEvent;
-use super::le;
+use crate::le;
 
 /// File magic bytes: "JOUR" in ASCII (little-endian u32).
 pub const FILE_MAGIC: u32 = 0x4A4F_5552;

@@ -31,7 +31,7 @@ use crate::orderbook::OrderBook;
 use crate::types::{AccountId, CurrencyId, InstrumentSpec, OrderId, Price, Quantity, Side, Symbol};
 
 use super::error::JournalError;
-use super::le;
+use crate::le;
 
 /// Decoded book-side levels: Vec of (price, orders-at-that-level).
 type RestingLevels = Vec<(Price, Vec<RestingOrderSnapshot>)>;

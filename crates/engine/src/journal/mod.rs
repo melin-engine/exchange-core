@@ -9,7 +9,6 @@ pub mod codec;
 pub mod engine;
 pub mod error;
 pub mod event;
-pub(crate) mod le;
 pub mod reader;
 pub mod snapshot;
 pub mod writer;
