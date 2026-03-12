@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 
 use trading_protocol::codec;
 use trading_protocol::error::ProtocolError;
-use trading_protocol::message::{Request, Response};
+use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::tcp::{TcpTransportRead, TcpTransportStream, TcpTransportWrite};
 use trading_protocol::transport::{TransportRead, TransportStream, TransportWrite};
 
@@ -79,7 +79,10 @@ impl Client {
     /// Send a request and collect all responses until BatchEnd.
     ///
     /// Returns the list of responses (excluding the BatchEnd marker itself).
-    pub async fn send_request(&mut self, request: &Request) -> Result<Vec<Response>, ClientError> {
+    pub async fn send_request(
+        &mut self,
+        request: &Request,
+    ) -> Result<Vec<ResponseKind>, ClientError> {
         // Encode and send.
         let written = codec::encode_request(request, &mut self.encode_buf)?;
         // write_frame expects payload without length prefix; encode_request
@@ -100,7 +103,7 @@ impl Client {
 
             let response = codec::decode_response(&frame)?;
             match response {
-                Response::BatchEnd => break,
+                ResponseKind::BatchEnd => break,
                 other => responses.push(other),
             }
         }
@@ -126,7 +129,7 @@ mod tests {
 
         // Respond with BatchEnd.
         let mut buf = [0u8; 128];
-        let written = codec::encode_response(&Response::BatchEnd, &mut buf).unwrap();
+        let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).await.unwrap();
         writer.flush().await.unwrap();
     }

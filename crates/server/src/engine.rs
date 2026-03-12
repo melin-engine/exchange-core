@@ -13,6 +13,8 @@ use tracing::info;
 
 use trading_engine::journal::event::JournalEvent;
 use trading_engine::journal::pipeline::InputSlot;
+#[cfg(feature = "latency-trace")]
+use trading_engine::journal::trace;
 use trading_engine::journal::trace::trace_ts;
 
 use trading_disruptor::ring;
@@ -31,6 +33,10 @@ pub fn run(
     mut input_producer: ring::Producer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
 ) {
+    #[cfg(feature = "latency-trace")]
+    let mut mpsc_hist =
+        trace::StageHistogram::new("publisher: tokio mpsc (reader send → publisher recv)");
+
     loop {
         let cmd = match rx.blocking_recv() {
             Some(cmd) => cmd,
@@ -60,16 +66,24 @@ pub fn run(
             EngineCommand::Request {
                 connection_id,
                 request,
+                sent_ts,
             } => {
+                #[cfg(feature = "latency-trace")]
+                mpsc_hist.record_ns(trace::trace_elapsed_ns(sent_ts, trace_ts()));
+
                 let event = request_to_event(&request);
                 input_producer.publish(InputSlot {
                     connection_id: connection_id.0,
                     event,
                     publish_ts: trace_ts(),
+                    recv_ts: sent_ts,
                 });
             }
         }
     }
+
+    #[cfg(feature = "latency-trace")]
+    mpsc_hist.print_report();
 }
 
 /// Convert a wire `Request` to a `JournalEvent` for the pipeline.

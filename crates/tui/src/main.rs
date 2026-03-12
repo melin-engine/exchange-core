@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use tokio::sync::mpsc;
 
 use trading_client::Client;
-use trading_protocol::message::{Request, Response};
+use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::types::{
     AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side,
     Symbol, TimeInForce,
@@ -468,9 +468,9 @@ async fn client_task(
                 let latency = start.elapsed();
                 for resp in &responses {
                     let msg = match resp {
-                        Response::Report(report) => format_report(report),
-                        Response::EngineError => "ENGINE ERROR".into(),
-                        Response::BatchEnd => continue,
+                        ResponseKind::Report(report) => format_report(report),
+                        ResponseKind::EngineError => "ENGINE ERROR".into(),
+                        ResponseKind::BatchEnd => continue,
                     };
                     let _ = response_tx.send(msg).await;
                 }

@@ -3,6 +3,9 @@ name = "trading-protocol"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+latency-trace = ["trading-engine/latency-trace"]
+
 [dependencies]
 trading-engine = { path = "../engine" }
 tokio = { version = "1", features = ["net", "io-util", "sync"] }

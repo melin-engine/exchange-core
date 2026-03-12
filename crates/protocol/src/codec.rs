@@ -25,7 +25,7 @@ use trading_engine::types::{
 };
 
 use crate::error::ProtocolError;
-use crate::message::{Request, Response};
+use crate::message::{Request, ResponseKind};
 
 // --- Request tags ---
 const TAG_SUBMIT_ORDER: u8 = 1;
@@ -121,18 +121,18 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
 /// Encode a response into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
 /// The caller must ensure `buf` is large enough (128 bytes is always sufficient).
-pub fn encode_response(response: &Response, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize, ProtocolError> {
     let mut pos = 4; // reserve for length prefix
 
     match response {
-        Response::Report(report) => {
+        ResponseKind::Report(report) => {
             pos += encode_execution_report(report, &mut buf[pos..]);
         }
-        Response::EngineError => {
+        ResponseKind::EngineError => {
             buf[pos] = TAG_ENGINE_ERROR;
             pos += 1;
         }
-        Response::BatchEnd => {
+        ResponseKind::BatchEnd => {
             buf[pos] = TAG_BATCH_END;
             pos += 1;
         }
@@ -145,7 +145,7 @@ pub fn encode_response(response: &Response, buf: &mut [u8]) -> Result<usize, Pro
 }
 
 /// Decode a response from `buf` (after the length prefix has been stripped).
-pub fn decode_response(buf: &[u8]) -> Result<Response, ProtocolError> {
+pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
     if buf.is_empty() {
         return Err(ProtocolError::Truncated);
     }
@@ -154,11 +154,11 @@ pub fn decode_response(buf: &[u8]) -> Result<Response, ProtocolError> {
     let payload = &buf[1..];
 
     match tag {
-        TAG_ENGINE_ERROR => Ok(Response::EngineError),
-        TAG_BATCH_END => Ok(Response::BatchEnd),
+        TAG_ENGINE_ERROR => Ok(ResponseKind::EngineError),
+        TAG_BATCH_END => Ok(ResponseKind::BatchEnd),
         TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED => {
             let report = decode_execution_report(tag, payload)?;
-            Ok(Response::Report(report))
+            Ok(ResponseKind::Report(report))
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
@@ -552,15 +552,15 @@ mod tests {
         ]
     }
 
-    fn make_responses() -> Vec<Response> {
+    fn make_responses() -> Vec<ResponseKind> {
         vec![
-            Response::Report(ExecutionReport::Placed {
+            ResponseKind::Report(ExecutionReport::Placed {
                 order_id: OrderId(1),
                 side: Side::Buy,
                 price: Price(nz(100)),
                 quantity: Quantity(nz(50)),
             }),
-            Response::Report(ExecutionReport::Fill {
+            ResponseKind::Report(ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
                 maker_account: AccountId(10),
@@ -568,36 +568,36 @@ mod tests {
                 price: Price(nz(100)),
                 quantity: Quantity(nz(10)),
             }),
-            Response::Report(ExecutionReport::Cancelled {
+            ResponseKind::Report(ExecutionReport::Cancelled {
                 order_id: OrderId(3),
                 remaining_quantity: Quantity(nz(5)),
             }),
-            Response::Report(ExecutionReport::Triggered {
+            ResponseKind::Report(ExecutionReport::Triggered {
                 order_id: OrderId(4),
                 trigger_price: Price(nz(200)),
             }),
-            Response::Report(ExecutionReport::Rejected {
+            ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(5),
                 reason: RejectReason::NoLiquidity,
             }),
-            Response::Report(ExecutionReport::Rejected {
+            ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(6),
                 reason: RejectReason::FOKCannotFill,
             }),
-            Response::Report(ExecutionReport::Rejected {
+            ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(7),
                 reason: RejectReason::InsufficientBalance,
             }),
-            Response::Report(ExecutionReport::Rejected {
+            ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(8),
                 reason: RejectReason::UnknownAccount,
             }),
-            Response::Report(ExecutionReport::Rejected {
+            ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(9),
                 reason: RejectReason::UnknownSymbol,
             }),
-            Response::EngineError,
-            Response::BatchEnd,
+            ResponseKind::EngineError,
+            ResponseKind::BatchEnd,
         ]
     }
 

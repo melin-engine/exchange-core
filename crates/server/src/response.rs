@@ -21,7 +21,7 @@ use trading_engine::journal::pipeline::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
 use trading_engine::journal::trace;
 
-use trading_protocol::message::Response;
+use trading_protocol::message::{Response, ResponseKind};
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
@@ -135,15 +135,16 @@ pub fn run(
             }
 
             if let Some(tx) = connections.get(&slot.connection_id) {
-                let response = match slot.payload {
-                    OutputPayload::Report(report) => Response::Report(report),
-                    OutputPayload::BatchEnd => Response::BatchEnd,
-                    OutputPayload::EngineError => Response::EngineError,
+                let kind = match slot.payload {
+                    OutputPayload::Report(report) => ResponseKind::Report(report),
+                    OutputPayload::BatchEnd => ResponseKind::BatchEnd,
+                    OutputPayload::EngineError => ResponseKind::EngineError,
                 };
                 // try_send to avoid blocking — if the channel is full,
                 // the response is dropped (backpressure). Client sees gap,
                 // can reconnect.
-                let _ = tx.try_send(response);
+                #[allow(clippy::unit_arg)] // recv_ts is () (ZST) when latency-trace is disabled
+                let _ = tx.try_send(Response::new(kind, slot.recv_ts));
             }
             // Connection not found → response silently dropped.
             // Happens if client disconnected between submit and response.

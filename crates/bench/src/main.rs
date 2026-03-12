@@ -26,7 +26,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use trading_engine::types::*;
 use trading_protocol::codec;
-use trading_protocol::message::{Request, Response};
+use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::tcp::{TcpTransportListener, TcpTransportStream};
 use trading_protocol::transport::{TransportRead, TransportStream, TransportWrite};
 use trading_server::server::ServerConfig;
@@ -149,7 +149,7 @@ async fn run_benchmark(pairs: usize) {
                 .expect("server disconnected unexpectedly");
 
             let response = codec::decode_response(&frame).expect("decode response");
-            if matches!(response, Response::BatchEnd) {
+            if matches!(response, ResponseKind::BatchEnd) {
                 let sent_at = ts_rx.recv().await.expect("timestamp channel closed");
                 let latency_ns = sent_at.elapsed().as_nanos() as u64;
 

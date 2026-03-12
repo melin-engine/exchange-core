@@ -54,6 +54,10 @@ pub struct InputSlot {
     /// Timestamp when the publisher wrote this slot to the disruptor.
     /// `()` (zero-sized) when `latency-trace` is disabled.
     pub publish_ts: TraceTimestamp,
+    /// Timestamp when the reader task received this request from the wire.
+    /// Flows through the entire pipeline to measure server-side end-to-end latency.
+    /// `()` (zero-sized) when `latency-trace` is disabled.
+    pub recv_ts: TraceTimestamp,
 }
 
 impl Default for InputSlot {
@@ -69,6 +73,7 @@ impl Default for InputSlot {
                 amount: 0,
             },
             publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
         }
     }
 }
@@ -91,6 +96,10 @@ pub struct OutputSlot {
     /// Timestamp when the matching stage finished processing this event.
     /// `()` (zero-sized) when `latency-trace` is disabled.
     pub match_complete_ts: TraceTimestamp,
+    /// Timestamp when the reader task received this request from the wire.
+    /// Carried through the pipeline to measure server-side end-to-end latency.
+    /// `()` (zero-sized) when `latency-trace` is disabled.
+    pub recv_ts: TraceTimestamp,
 }
 
 /// Payload within an output slot.
@@ -111,6 +120,7 @@ impl Default for OutputSlot {
             input_seq: 0,
             payload: OutputPayload::BatchEnd,
             match_complete_ts: trace_ts(),
+            recv_ts: trace_ts(),
         }
     }
 }
@@ -313,6 +323,7 @@ impl MatchingStage {
                     input_seq,
                     payload: OutputPayload::Report(*report),
                     match_complete_ts,
+                    recv_ts: slot.recv_ts,
                 });
             }
 
@@ -322,6 +333,7 @@ impl MatchingStage {
                 input_seq,
                 payload: OutputPayload::BatchEnd,
                 match_complete_ts,
+                recv_ts: slot.recv_ts,
             });
         }
     }
@@ -444,6 +456,7 @@ mod tests {
                 },
             },
             publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
         });
         producer.publish(InputSlot {
             connection_id: 1,
@@ -453,6 +466,7 @@ mod tests {
                 amount: 100_000,
             },
             publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -499,6 +513,7 @@ mod tests {
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             },
             publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -573,6 +588,7 @@ mod tests {
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             },
             publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
         });
 
         // Wait for the Placed report in the output SPSC.

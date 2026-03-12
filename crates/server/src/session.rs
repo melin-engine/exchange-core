@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use trading_protocol::codec;
-use trading_protocol::message::{ConnectionId, EngineCommand, Response};
+use trading_protocol::message::{ConnectionId, EngineCommand, Response, ResponseKind};
 use trading_protocol::transport::{TransportRead, TransportWrite};
 
 /// Maximum encoded response size. Responses are small (execution reports),
@@ -74,6 +74,7 @@ async fn reader_task<R: TransportRead>(
         let cmd = EngineCommand::Request {
             connection_id,
             request,
+            sent_ts: trading_engine::journal::trace::trace_ts(),
         };
         if engine_tx.send(cmd).await.is_err() {
             // Engine shut down.
@@ -98,10 +99,25 @@ async fn writer_task<W: TransportWrite>(
 ) {
     let mut buf = [0u8; MAX_RESPONSE_BUF];
 
-    while let Some(response) = response_rx.recv().await {
-        let is_batch_end = matches!(response, Response::BatchEnd);
+    #[cfg(feature = "latency-trace")]
+    let mut mpsc_hist = trading_engine::journal::trace::StageHistogram::new(
+        "writer: tokio mpsc (response try_send → writer recv)",
+    );
+    #[cfg(feature = "latency-trace")]
+    let mut server_e2e_hist = trading_engine::journal::trace::StageHistogram::new(
+        "server e2e (reader recv → writer flush)",
+    );
 
-        let written = match codec::encode_response(&response, &mut buf) {
+    while let Some(response) = response_rx.recv().await {
+        #[cfg(feature = "latency-trace")]
+        mpsc_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(
+            response.sent_ts,
+            trading_engine::journal::trace::trace_ts(),
+        ));
+
+        let is_batch_end = matches!(response.kind, ResponseKind::BatchEnd);
+
+        let written = match codec::encode_response(&response.kind, &mut buf) {
             Ok(n) => n,
             Err(e) => {
                 error!(connection_id = connection_id.0, error = %e, "encode error");
@@ -121,6 +137,16 @@ async fn writer_task<W: TransportWrite>(
         if is_batch_end && let Err(e) = writer.flush().await {
             debug!(addr = %addr, error = %e, "flush error");
             break;
+        }
+
+        // Record server-side end-to-end: reader recv → writer flush complete.
+        // Only on BatchEnd since that's when the client sees the response.
+        #[cfg(feature = "latency-trace")]
+        if is_batch_end {
+            server_e2e_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(
+                response.recv_ts,
+                trading_engine::journal::trace::trace_ts(),
+            ));
         }
     }
 }
