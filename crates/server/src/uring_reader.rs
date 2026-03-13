@@ -1,10 +1,10 @@
-//! io_uring-based multiplexed reader.
+//! io_uring-based multiplexed reader with multishot RECV.
 //!
-//! Replaces the epoll reader pool with io_uring RECV operations. Instead of
-//! `epoll_wait` + non-blocking `read(2)` syscalls per connection, we submit
-//! `IORING_OP_RECV` SQEs and get completions in batches via a single
-//! `io_uring_enter` syscall. This eliminates the epoll→read double-syscall
-//! overhead and lets the kernel batch completions.
+//! Uses `IORING_OP_RECV` with `IORING_RECV_MULTISHOT` — a single SQE per
+//! connection produces multiple CQEs as data arrives, eliminating the
+//! resubmission overhead of standard RECV. Combined with provided buffer
+//! groups (`IOSQE_BUFFER_SELECT`), the kernel selects a buffer from a
+//! shared pool for each recv, replacing per-connection buffer allocations.
 //!
 //! Uses a single reader thread — io_uring is efficient enough for hundreds
 //! of connections. New connections are registered via eventfd wakeup, same
@@ -31,20 +31,41 @@ use trading_protocol::message::{ConnectionId, Request};
 
 use crate::uring_response::ControlEvent;
 
-/// Size of the per-connection recv buffer. 4 KiB accommodates multiple
-/// frames per recv (frames are typically <100 bytes), reducing the
-/// number of RECV resubmissions.
-const RECV_BUF_SIZE: usize = 4096;
+/// Size of each provided buffer. 4 KiB accommodates multiple frames per
+/// recv (frames are typically <100 bytes).
+const BUF_SIZE: usize = 4096;
+
+/// Number of provided buffers in the shared pool. Must be large enough
+/// to handle concurrent in-flight recvs across all connections. When the
+/// pool is exhausted, multishot terminates and is resubmitted after buffers
+/// are re-provided.
+const NUM_BUFFERS: u16 = 512;
+
+/// Buffer group ID for the provided recv buffer pool.
+const BUF_GROUP_ID: u16 = 0;
 
 /// Maximum frame payload size (matches `BlockingFrameReader`).
 const MAX_FRAME_SIZE: usize = 1024;
 
 /// io_uring submission queue depth. Power of 2, sized for hundreds of
-/// connections (one RECV per connection + eventfd read).
-const RING_SIZE: u32 = 512;
+/// connections (multishot RECVs + eventfd read + buffer re-provisions).
+const RING_SIZE: u32 = 1024;
 
 /// User data sentinel for the eventfd read SQE.
 const EVENTFD_TOKEN: u64 = u64::MAX;
+
+/// User data sentinel for ProvideBuffers CQEs. These are best-effort
+/// re-provisions — we log errors but don't act on success.
+const PROVIDE_BUFS_TOKEN: u64 = u64::MAX - 1;
+
+/// CQE flag: buffer ID is valid in upper 16 bits of flags.
+const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+
+/// CQE flag: more completions coming from this multishot operation.
+const IORING_CQE_F_MORE: u32 = 1 << 1;
+
+/// Bit shift to extract buffer ID from CQE flags.
+const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 /// Command sent from the accept loop to the reader thread.
 pub struct ReaderRegistration<R> {
@@ -105,22 +126,20 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
 // Slab-based connection storage
 // ---------------------------------------------------------------------------
 
-/// Per-connection state for io_uring recv + incremental frame parsing.
+/// Per-connection state for multishot io_uring recv + incremental frame parsing.
 struct ConnectionEntry<R> {
     connection_id: u64,
     addr: SocketAddr,
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
     fd: RawFd,
-    /// Buffer for io_uring RECV. Kernel writes received bytes here.
-    /// Boxed for pointer stability — the slab Vec may relocate entries,
-    /// but the Box heap allocation stays fixed while a RECV SQE is in-flight.
-    recv_buf: Box<[u8; RECV_BUF_SIZE]>,
     /// Accumulated bytes not yet parsed into complete frames.
     /// Grows when partial frames arrive, shrinks when frames are consumed.
     parse_buf: Vec<u8>,
-    /// True if a RECV SQE is currently in-flight for this connection.
-    recv_pending: bool,
+    /// True if a multishot RecvMulti is currently active for this connection.
+    /// Multishot stays active until the kernel clears IORING_CQE_F_MORE
+    /// (e.g., buffer pool exhaustion, socket error, or EOF).
+    multishot_active: bool,
 }
 
 /// Index-stable allocator for connection state. Slab indices are used as
@@ -189,10 +208,19 @@ fn uring_reader_loop<R: AsRawFd>(
     // Eventfd read buffer — boxed for pointer stability across SQE lifetimes.
     let mut eventfd_buf: Box<[u8; 8]> = Box::new([0u8; 8]);
 
+    // Shared buffer pool for provided buffers. Contiguous allocation of
+    // NUM_BUFFERS × BUF_SIZE bytes. The kernel selects a buffer from this
+    // pool for each recv completion, identified by buffer ID in the CQE.
+    let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
+
     // Pre-allocated CQE collection buffer. We must collect CQEs before
     // processing because the CQ borrow must end before pushing new SQEs.
-    // Pre-sized to RING_SIZE to avoid per-iteration heap allocation.
-    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(RING_SIZE as usize);
+    // Stores (user_data, result, flags) — flags needed for buffer ID and
+    // multishot continuation.
+    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize);
+
+    // Register the provided buffer pool with io_uring.
+    register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr());
 
     // Submit the initial eventfd read so we wake on first connection.
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
@@ -217,9 +245,21 @@ fn uring_reader_loop<R: AsRawFd>(
         // Must collect before processing because the CQ borrow must end
         // before we can push new SQEs to the SQ.
         cqes.clear();
-        cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+        cqes.extend(
+            ring.completion()
+                .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
+        );
 
-        for &(token, result) in &cqes {
+        for &(token, result, flags) in &cqes {
+            // ── ProvideBuffers completion ──
+            if token == PROVIDE_BUFS_TOKEN {
+                if result < 0 {
+                    debug!(error = result, "ProvideBuffers failed");
+                }
+                continue;
+            }
+
+            // ── Eventfd wakeup ──
             if token == EVENTFD_TOKEN {
                 if result >= 0 {
                     // Process all pending registrations.
@@ -230,15 +270,14 @@ fn uring_reader_loop<R: AsRawFd>(
                             addr: reg.addr,
                             fd,
                             _reader: reg.reader,
-                            recv_buf: Box::new([0u8; RECV_BUF_SIZE]),
                             parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
-                            recv_pending: false,
+                            multishot_active: false,
                         };
                         let idx = slab.insert(entry);
                         fd_to_slab.insert(fd, idx);
 
-                        // Submit initial RECV for this connection.
-                        push_recv(&mut ring, &mut slab, idx);
+                        // Submit multishot RECV for this connection.
+                        push_recv_multi(&mut ring, &mut slab, idx);
                     }
                 } else {
                     debug!(error = result, "eventfd read error");
@@ -249,9 +288,10 @@ fn uring_reader_loop<R: AsRawFd>(
                 continue;
             }
 
-            // ── Connection RECV completion ──
+            // ── Connection multishot RECV completion ──
 
             let slab_idx = token as usize;
+            let has_more = (flags & IORING_CQE_F_MORE) != 0;
 
             if result <= 0 {
                 // Disconnect (0) or error (negative errno).
@@ -280,14 +320,28 @@ fn uring_reader_loop<R: AsRawFd>(
 
             let n = result as usize;
 
-            // Feed received bytes into the frame parser. We extract the
-            // decision (remove or resubmit) and then act on it after
-            // releasing the mutable slab borrow.
-            let action = if let Some(entry) = slab.get_mut(slab_idx) {
-                entry.recv_pending = false;
+            // Extract the buffer ID from the CQE flags. The kernel sets
+            // IORING_CQE_F_BUFFER and encodes the buffer ID in bits 16-31.
+            let buf_id = if (flags & IORING_CQE_F_BUFFER) != 0 {
+                (flags >> IORING_CQE_BUFFER_SHIFT) as usize
+            } else {
+                // Should not happen with provided buffers — defensive skip.
+                debug!(slab_idx, "recv CQE without buffer flag");
+                continue;
+            };
 
-                // Append received bytes to the parse buffer.
-                entry.parse_buf.extend_from_slice(&entry.recv_buf[..n]);
+            // Feed received bytes into the frame parser from the shared pool.
+            let action = if let Some(entry) = slab.get_mut(slab_idx) {
+                if !has_more {
+                    entry.multishot_active = false;
+                }
+
+                // Copy received data from the shared buffer pool into the
+                // connection's parse buffer.
+                let buf_start = buf_id * BUF_SIZE;
+                entry
+                    .parse_buf
+                    .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
 
                 // Extract and publish complete frames.
                 let drop_conn = process_frames(
@@ -301,13 +355,22 @@ fn uring_reader_loop<R: AsRawFd>(
                         connection_id: entry.connection_id,
                         fd: entry.fd,
                     }
-                } else {
+                } else if !has_more {
+                    // Multishot terminated (buffer pool exhaustion or kernel
+                    // decision) but connection is healthy — resubmit.
                     Action::Resubmit
+                } else {
+                    Action::None
                 }
             } else {
                 // Stale CQE for a removed connection — ignore.
                 Action::None
             };
+
+            // Re-provide the consumed buffer back to the pool. Must happen
+            // after we've copied the data out. Pushed to SQ and submitted
+            // on the next submit_and_wait.
+            re_provide_buffer(&mut ring, buffer_pool.as_mut_ptr(), buf_id);
 
             match action {
                 Action::Remove { connection_id, fd } => {
@@ -316,7 +379,7 @@ fn uring_reader_loop<R: AsRawFd>(
                     let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
                 }
                 Action::Resubmit => {
-                    push_recv(&mut ring, &mut slab, slab_idx);
+                    push_recv_multi(&mut ring, &mut slab, slab_idx);
                 }
                 Action::None => {}
             }
@@ -333,11 +396,11 @@ fn uring_reader_loop<R: AsRawFd>(
 
 /// What to do after processing a RECV CQE.
 enum Action {
-    /// Connection is healthy — resubmit RECV.
+    /// Multishot terminated but connection healthy — resubmit RecvMulti.
     Resubmit,
     /// Connection should be removed (malformed frame).
     Remove { connection_id: u64, fd: RawFd },
-    /// Stale CQE — do nothing.
+    /// Multishot still active — nothing to do.
     None,
 }
 
@@ -345,32 +408,68 @@ enum Action {
 // SQE helpers
 // ---------------------------------------------------------------------------
 
-/// Push a RECV SQE for a connection. Does not submit — the caller batches
-/// submissions via `submit_and_wait` at the top of the loop.
-fn push_recv<R>(ring: &mut IoUring, slab: &mut ConnectionSlab<R>, idx: usize) {
-    let entry = match slab.get_mut(idx) {
-        Some(e) => e,
-        None => return,
-    };
+/// Register the provided buffer pool with io_uring via ProvideBuffers.
+/// Submits synchronously and panics on failure — called once at startup.
+fn register_buffer_pool(ring: &mut IoUring, pool_ptr: *mut u8) {
+    let sqe = opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, NUM_BUFFERS, BUF_GROUP_ID, 0)
+        .build()
+        .user_data(PROVIDE_BUFS_TOKEN);
 
-    if entry.recv_pending {
-        return;
+    unsafe {
+        ring.submission()
+            .push(&sqe)
+            .expect("io_uring SQ full during buffer pool registration");
     }
 
-    let sqe = opcode::Recv::new(
-        types::Fd(entry.fd),
-        entry.recv_buf.as_mut_ptr(),
-        RECV_BUF_SIZE as u32,
-    )
-    .build()
-    .user_data(idx as u64);
+    ring.submit_and_wait(1)
+        .expect("io_uring submit failed during buffer pool registration");
+
+    // Check the completion result.
+    let cqe = ring
+        .completion()
+        .next()
+        .expect("no CQE after ProvideBuffers");
+    assert!(cqe.result() >= 0, "ProvideBuffers failed: {}", cqe.result());
+}
+
+/// Re-provide a single consumed buffer back to the pool. Pushed to SQ
+/// without immediate submission — batched with the next submit_and_wait.
+fn re_provide_buffer(ring: &mut IoUring, pool_ptr: *mut u8, buf_id: usize) {
+    let buf_ptr = unsafe { pool_ptr.add(buf_id * BUF_SIZE) };
+    let sqe = opcode::ProvideBuffers::new(buf_ptr, BUF_SIZE as i32, 1, BUF_GROUP_ID, buf_id as u16)
+        .build()
+        .user_data(PROVIDE_BUFS_TOKEN);
 
     unsafe {
         ring.submission()
             .push(&sqe)
             .expect("io_uring SQ full — increase RING_SIZE");
     }
-    entry.recv_pending = true;
+}
+
+/// Push a multishot RECV SQE for a connection. The kernel will produce
+/// CQEs continuously until EOF, error, or buffer pool exhaustion —
+/// no resubmission needed unless multishot terminates.
+fn push_recv_multi<R>(ring: &mut IoUring, slab: &mut ConnectionSlab<R>, idx: usize) {
+    let entry = match slab.get_mut(idx) {
+        Some(e) => e,
+        None => return,
+    };
+
+    if entry.multishot_active {
+        return;
+    }
+
+    let sqe = opcode::RecvMulti::new(types::Fd(entry.fd), BUF_GROUP_ID)
+        .build()
+        .user_data(idx as u64);
+
+    unsafe {
+        ring.submission()
+            .push(&sqe)
+            .expect("io_uring SQ full — increase RING_SIZE");
+    }
+    entry.multishot_active = true;
 }
 
 /// Push a READ SQE for the eventfd (wakeup notification).
