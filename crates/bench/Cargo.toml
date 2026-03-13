@@ -19,3 +19,4 @@ trading-protocol = { path = "../protocol" }
 trading-server = { path = "../server" }
 hdrhistogram = "7"
 libc = { workspace = true }
+tikv-jemallocator = { workspace = true }

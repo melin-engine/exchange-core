@@ -1,3 +1,8 @@
+/// jemalloc: thread-local caches eliminate allocator lock contention,
+/// giving more predictable latency than glibc malloc under high throughput.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::mpsc;
