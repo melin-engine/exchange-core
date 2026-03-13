@@ -1,6 +1,6 @@
 # Trading Engine
 
-A sub-millisecond, production-grade trading engine targeting **10M orders/sec**, built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html) in Rust.
+A sub-millisecond, trading engine targeting **10M orders/sec**, built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html) in Rust.
 
 ## Architecture
 
@@ -26,10 +26,9 @@ Clients ──TCP/UDS──> Accept Loop
                                                       ──TCP/UDS──> Clients
 ```
 
-- **Zero tokio** — dedicated OS threads with blocking I/O; no async runtime anywhere in the codebase
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
 - **LMAX disruptor pipeline** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
-- **Persist-before-ack** — responses are held until the journal confirms fsync, but matching proceeds in parallel with I/O
+- **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
 - **Batch fsync amortization** — under load, one fsync covers many events; optional io_uring async fsync overlaps I/O wait with encoding; `posix_fallocate` pre-allocates 64 MiB chunks so fsync only flushes data pages, not extent metadata
 - **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), zero allocations on the hot path
