@@ -590,7 +590,10 @@ impl MatchingStage {
     /// Returns the `Exchange` on shutdown for potential snapshot saving.
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> Exchange {
         // Pre-allocated report buffer, reused across commands.
-        let mut reports: Vec<ExecutionReport> = Vec::with_capacity(64);
+        // Pre-allocate with generous capacity. A market order sweeping many
+        // price levels can produce one Fill per level + Placed/Cancelled. 256
+        // avoids mid-hot-path reallocation for all but extreme scenarios.
+        let mut reports: Vec<ExecutionReport> = Vec::with_capacity(256);
         // Spin count for adaptive wait: spin first (fast wakeup), then yield
         // to the OS scheduler (prevents the kernel from aggressively preempting
         // this thread during busy periods). 1000 spins ≈ 1µs at ~1ns/spin,

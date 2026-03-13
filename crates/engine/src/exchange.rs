@@ -31,6 +31,9 @@ pub struct Exchange {
     /// Tracks order side by ID so fills can determine buyer/seller.
     /// Populated on order submission, cleaned up on full fill or cancel.
     order_sides: HashMap<OrderId, Side>,
+    /// Reusable buffer for consumed order IDs from `process_reports()`.
+    /// Avoids per-order Vec allocation on the hot path.
+    consumed_buf: Vec<OrderId>,
 }
 
 impl Exchange {
@@ -40,6 +43,7 @@ impl Exchange {
             instruments: HashMap::new(),
             accounts: AccountManager::new(),
             order_sides: HashMap::new(),
+            consumed_buf: Vec::new(),
         }
     }
 
@@ -55,6 +59,7 @@ impl Exchange {
             instruments,
             accounts,
             order_sides,
+            consumed_buf: Vec::new(),
         }
     }
 
@@ -139,14 +144,18 @@ impl Exchange {
 
         // Process reports to update balances.
         let new_reports = &reports[report_start..];
-        let consumed = self
-            .accounts
-            .process_reports(new_reports, &self.order_sides, &spec);
+        self.consumed_buf.clear();
+        self.accounts.process_reports(
+            new_reports,
+            &self.order_sides,
+            &spec,
+            &mut self.consumed_buf,
+        );
 
         // Clean up order_sides for fully consumed orders (filled, cancelled,
         // or rejected). Without this, order_sides leaks entries and triggers
         // increasingly expensive HashMap resizes on the hot path.
-        for order_id in consumed {
+        for &order_id in &self.consumed_buf {
             self.order_sides.remove(&order_id);
         }
     }
@@ -171,12 +180,16 @@ impl Exchange {
 
         // Release reserved funds if cancellation succeeded.
         let new_reports = &reports[report_start..];
-        let consumed = self
-            .accounts
-            .process_reports(new_reports, &self.order_sides, &spec);
+        self.consumed_buf.clear();
+        self.accounts.process_reports(
+            new_reports,
+            &self.order_sides,
+            &spec,
+            &mut self.consumed_buf,
+        );
 
         // Clean up order_sides for cancelled orders.
-        for order_id in consumed {
+        for &order_id in &self.consumed_buf {
             self.order_sides.remove(&order_id);
         }
     }

@@ -283,8 +283,8 @@ impl AccountManager {
         reports: &[ExecutionReport],
         maker_sides: &HashMap<OrderId, Side>,
         spec: &InstrumentSpec,
-    ) -> Vec<OrderId> {
-        let mut consumed = Vec::new();
+        consumed: &mut Vec<OrderId>,
+    ) {
         for report in reports {
             match *report {
                 ExecutionReport::Fill {
@@ -334,7 +334,6 @@ impl AccountManager {
                 ExecutionReport::Placed { .. } | ExecutionReport::Triggered { .. } => {}
             }
         }
-        consumed
     }
 
     /// Compute the required reserve currency and amount for an order.

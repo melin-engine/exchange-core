@@ -211,6 +211,10 @@ pub struct OrderBook {
     stop_index: HashMap<OrderId, (Side, Price)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
+    /// Reusable buffers for `check_triggers()` to avoid per-order allocations.
+    /// Cleared and reused each call. Capacity grows to high-water mark and stays.
+    trigger_price_buf: Vec<Price>,
+    triggered_buf: Vec<PendingStop>,
 }
 
 impl Default for OrderBook {
@@ -229,6 +233,8 @@ impl OrderBook {
             stop_sells: BTreeMap::new(),
             stop_index: HashMap::new(),
             last_trade_price: None,
+            trigger_price_buf: Vec::new(),
+            triggered_buf: Vec::new(),
         }
     }
 
@@ -250,6 +256,8 @@ impl OrderBook {
             stop_sells,
             stop_index,
             last_trade_price,
+            trigger_price_buf: Vec::new(),
+            triggered_buf: Vec::new(),
         }
     }
 
@@ -598,6 +606,10 @@ impl OrderBook {
 
     /// Check if the last trade price triggers any pending stop orders.
     /// Triggered stops are converted to market/limit orders and executed.
+    ///
+    /// Uses pre-allocated buffers (`trigger_price_buf`, `triggered_buf`) to
+    /// avoid per-order heap allocations on the hot path. Buffers grow to
+    /// high-water mark and stay — no per-call allocation after warmup.
     fn check_triggers(&mut self, reports: &mut Vec<ExecutionReport>) {
         let Some(trade_price) = self.last_trade_price else {
             return;
@@ -605,44 +617,50 @@ impl OrderBook {
 
         // Stop buys: trigger when trade price >= trigger price.
         // Collect all triggers at or below the trade price (ascending order).
-        let triggered_buy_prices: Vec<Price> = self
-            .stop_buys
-            .keys()
-            .take_while(|&&p| p <= trade_price)
-            .copied()
-            .collect();
+        self.trigger_price_buf.clear();
+        self.trigger_price_buf.extend(
+            self.stop_buys
+                .keys()
+                .take_while(|&&p| p <= trade_price)
+                .copied(),
+        );
 
-        let mut triggered: Vec<PendingStop> = Vec::new();
-        for price in triggered_buy_prices {
+        self.triggered_buf.clear();
+        for &price in &self.trigger_price_buf {
             if let Some(stops) = self.stop_buys.remove(&price) {
                 for stop in &stops {
                     self.stop_index.remove(&stop.id);
                 }
-                triggered.extend(stops);
+                self.triggered_buf.extend(stops);
             }
         }
 
         // Stop sells: trigger when trade price <= trigger price.
         // Collect all triggers at or above the trade price (descending order).
-        let triggered_sell_prices: Vec<Price> = self
-            .stop_sells
-            .keys()
-            .rev()
-            .take_while(|&&p| p >= trade_price)
-            .copied()
-            .collect();
+        self.trigger_price_buf.clear();
+        self.trigger_price_buf.extend(
+            self.stop_sells
+                .keys()
+                .rev()
+                .take_while(|&&p| p >= trade_price)
+                .copied(),
+        );
 
-        for price in triggered_sell_prices {
+        for &price in &self.trigger_price_buf {
             if let Some(stops) = self.stop_sells.remove(&price) {
                 for stop in &stops {
                     self.stop_index.remove(&stop.id);
                 }
-                triggered.extend(stops);
+                self.triggered_buf.extend(stops);
             }
         }
 
         // Execute triggered stops as market/limit orders.
-        for stop in triggered {
+        // Take the buffer to avoid borrowing `self` while calling `execute_*`.
+        // `std::mem::take` swaps in an empty Vec (no allocation) and returns
+        // the populated one. After the loop, swap it back to retain capacity.
+        let mut triggered = std::mem::take(&mut self.triggered_buf);
+        for stop in triggered.drain(..) {
             reports.push(ExecutionReport::Triggered {
                 order_id: stop.id,
                 trigger_price: stop.trigger_price,
@@ -674,6 +692,7 @@ impl OrderBook {
                 }
             }
         }
+        self.triggered_buf = triggered;
     }
 
     fn place_on_book(
