@@ -76,12 +76,6 @@ fn main() {
     let mode: String = parse_flag(&args, "--mode=").unwrap_or_else(|| "roundtrip".into());
     let use_uds = args.iter().any(|a| a == "--uds");
 
-    let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
-    let group_commit_us: u64 = parse_flag(&args, "--group-commit-us=").unwrap_or(0);
-    let num_clients: usize = parse_flag(&args, "--clients=").unwrap_or(DEFAULT_CLIENTS);
-    let bench_threads: usize =
-        parse_flag(&args, "--bench-threads=").unwrap_or(DEFAULT_BENCH_THREADS);
-
     let pairs: usize = args
         .iter()
         .filter(|a| !a.starts_with("--"))
@@ -89,16 +83,40 @@ fn main() {
         .unwrap_or(DEFAULT_PAIRS);
 
     match mode.as_str() {
-        "engine" => run_engine_bench(pairs),
-        "pipeline" => run_pipeline_bench(pairs, window, group_commit_us),
-        "roundtrip" => run_roundtrip_bench(
-            use_uds,
-            pairs,
-            window,
-            num_clients,
-            bench_threads,
-            group_commit_us,
-        ),
+        "engine" => {
+            warn_ignored_flags(
+                &args,
+                &[
+                    "--clients=",
+                    "--bench-threads=",
+                    "--window=",
+                    "--group-commit-us=",
+                    "--uds",
+                ],
+            );
+            run_engine_bench(pairs);
+        }
+        "pipeline" => {
+            warn_ignored_flags(&args, &["--clients=", "--bench-threads=", "--uds"]);
+            let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
+            let group_commit_us: u64 = parse_flag(&args, "--group-commit-us=").unwrap_or(0);
+            run_pipeline_bench(pairs, window, group_commit_us);
+        }
+        "roundtrip" => {
+            let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
+            let group_commit_us: u64 = parse_flag(&args, "--group-commit-us=").unwrap_or(0);
+            let num_clients: usize = parse_flag(&args, "--clients=").unwrap_or(DEFAULT_CLIENTS);
+            let bench_threads: usize =
+                parse_flag(&args, "--bench-threads=").unwrap_or(DEFAULT_BENCH_THREADS);
+            run_roundtrip_bench(
+                use_uds,
+                pairs,
+                window,
+                num_clients,
+                bench_threads,
+                group_commit_us,
+            );
+        }
         other => {
             eprintln!("unknown mode: {other} (expected: engine, pipeline, roundtrip)");
             std::process::exit(1);
@@ -443,6 +461,16 @@ fn parse_flag<T: std::str::FromStr>(args: &[String], prefix: &str) -> Option<T> 
     args.iter()
         .find_map(|a| a.strip_prefix(prefix))
         .and_then(|s| s.parse().ok())
+}
+
+/// Warn if the user passed flags that are ignored in the current mode.
+fn warn_ignored_flags(args: &[String], ignored: &[&str]) {
+    for &prefix in ignored {
+        if args.iter().any(|a| a.starts_with(prefix) || a == prefix) {
+            let name = prefix.trim_end_matches('=');
+            eprintln!("warning: {name} is ignored in this mode");
+        }
+    }
 }
 
 /// Start the server on a background thread. The listener is already bound,
