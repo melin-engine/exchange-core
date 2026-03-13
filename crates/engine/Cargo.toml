@@ -13,6 +13,9 @@ latency-trace = ["dep:hdrhistogram"]
 ## Use io_uring for async fsync in the journal stage. Linux-only.
 ## Overlaps fsync I/O wait with encoding the next batch for higher throughput.
 io-uring = ["dep:io-uring"]
+## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
+## bottleneck: the stage closest to 100% busy is the constraint.
+pipeline-stats = []
 
 [dependencies]
 crc32c = "0.6"

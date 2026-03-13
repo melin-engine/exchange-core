@@ -96,6 +96,11 @@ pub fn run(
     // to avoid aggressive OS preemption of this pipeline thread.
     let mut idle_spins: u32 = 0;
 
+    #[cfg(feature = "pipeline-stats")]
+    let mut busy_count: u64 = 0;
+    #[cfg(feature = "pipeline-stats")]
+    let mut idle_count: u64 = 0;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             // Flush any remaining buffered writes before shutdown.
@@ -110,6 +115,8 @@ pub fn run(
                 dispatch_hist.print_report();
                 server_e2e_hist.print_report();
             }
+            #[cfg(feature = "pipeline-stats")]
+            print_utilization("response", busy_count, idle_count);
             return;
         }
 
@@ -150,6 +157,10 @@ pub fn run(
                     }
                 }
             }
+            #[cfg(feature = "pipeline-stats")]
+            {
+                idle_count += 1;
+            }
             if idle_spins < 1000 {
                 idle_spins += 1;
                 std::hint::spin_loop();
@@ -159,6 +170,10 @@ pub fn run(
             continue;
         }
         idle_spins = 0;
+        #[cfg(feature = "pipeline-stats")]
+        {
+            busy_count += 1;
+        }
 
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
@@ -236,4 +251,18 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
     }
+}
+
+/// Print busy/idle utilization for a pipeline stage on shutdown.
+#[cfg(feature = "pipeline-stats")]
+fn print_utilization(stage: &str, busy: u64, idle: u64) {
+    let total = busy + idle;
+    if total == 0 {
+        eprintln!("[pipeline-stats] {stage}: no iterations recorded");
+        return;
+    }
+    let pct = (busy as f64 / total as f64) * 100.0;
+    eprintln!(
+        "[pipeline-stats] {stage}: {pct:.2}% busy ({busy} busy / {idle} idle / {total} total)",
+    );
 }

@@ -190,6 +190,11 @@ impl JournalStage {
         // Timestamp of first unsynced write (for group commit delay).
         let mut first_write_ts: Option<Instant> = None;
 
+        #[cfg(feature = "pipeline-stats")]
+        let mut busy_count: u64 = 0;
+        #[cfg(feature = "pipeline-stats")]
+        let mut idle_count: u64 = 0;
+
         #[cfg(feature = "latency-trace")]
         let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
             "journal: disruptor wakeup (publish → journal consume)",
@@ -211,6 +216,8 @@ impl JournalStage {
                     wakeup_hist.print_report();
                     batch_hist.print_report();
                 }
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("journal", busy_count, idle_count);
                 return self.writer;
             }
 
@@ -224,6 +231,10 @@ impl JournalStage {
 
             if count > 0 {
                 idle_spins = 0;
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    busy_count += 1;
+                }
 
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
@@ -267,11 +278,17 @@ impl JournalStage {
                     pending = 0;
                     first_write_ts = None;
                 }
-            } else if idle_spins < 1000 {
-                idle_spins += 1;
-                std::hint::spin_loop();
             } else {
-                std::thread::yield_now();
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    idle_count += 1;
+                }
+                if idle_spins < 1000 {
+                    idle_spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
             }
         }
     }
@@ -303,6 +320,11 @@ impl JournalStage {
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let mut idle_spins: u32 = 0;
+
+        #[cfg(feature = "pipeline-stats")]
+        let mut busy_count: u64 = 0;
+        #[cfg(feature = "pipeline-stats")]
+        let mut idle_count: u64 = 0;
 
         // Sequence tracking for the overlapped state machine.
         // `synced_seq`: last position committed (durable on disk).
@@ -386,6 +408,8 @@ impl JournalStage {
                     wakeup_hist.print_report();
                     batch_hist.print_report();
                 }
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("journal", busy_count, idle_count);
                 return self.writer;
             }
 
@@ -393,6 +417,10 @@ impl JournalStage {
             let count = self.consumer.read_batch(&mut batch, MAX_JOURNAL_BATCH);
             if count > 0 {
                 idle_spins = 0;
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    busy_count += 1;
+                }
 
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
@@ -492,6 +520,10 @@ impl JournalStage {
             let idle = count == 0;
 
             if idle {
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    idle_count += 1;
+                }
                 if idle_spins < 1000 {
                     idle_spins += 1;
                     std::hint::spin_loop();
@@ -556,6 +588,11 @@ impl MatchingStage {
         // which is well under the inter-event arrival time at peak throughput.
         let mut idle_spins: u32 = 0;
 
+        #[cfg(feature = "pipeline-stats")]
+        let mut busy_count: u64 = 0;
+        #[cfg(feature = "pipeline-stats")]
+        let mut idle_count: u64 = 0;
+
         #[cfg(feature = "latency-trace")]
         let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
             "matching: disruptor wakeup (publish → matching consume)",
@@ -571,11 +608,17 @@ impl MatchingStage {
                     wakeup_hist.print_report();
                     execute_hist.print_report();
                 }
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("matching", busy_count, idle_count);
                 return self.exchange;
             }
 
             let entry = self.consumer.try_consume();
             let Some((input_seq, slot)) = entry else {
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    idle_count += 1;
+                }
                 if idle_spins < 1000 {
                     idle_spins += 1;
                     std::hint::spin_loop();
@@ -585,6 +628,10 @@ impl MatchingStage {
                 continue;
             };
             idle_spins = 0;
+            #[cfg(feature = "pipeline-stats")]
+            {
+                busy_count += 1;
+            }
 
             #[cfg(feature = "latency-trace")]
             {
@@ -658,6 +705,20 @@ impl MatchingStage {
             }
         }
     }
+}
+
+/// Print busy/idle utilization for a pipeline stage on shutdown.
+#[cfg(feature = "pipeline-stats")]
+fn print_utilization(stage: &str, busy: u64, idle: u64) {
+    let total = busy + idle;
+    if total == 0 {
+        eprintln!("[pipeline-stats] {stage}: no iterations recorded");
+        return;
+    }
+    let pct = (busy as f64 / total as f64) * 100.0;
+    eprintln!(
+        "[pipeline-stats] {stage}: {pct:.2}% busy ({busy} busy / {idle} idle / {total} total)",
+    );
 }
 
 /// Build the input disruptor and output SPSC, returning the stages and

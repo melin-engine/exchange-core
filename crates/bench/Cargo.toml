@@ -7,6 +7,7 @@ edition = "2024"
 no-fsync = ["trading-engine/no-fsync"]
 latency-trace = ["trading-server/latency-trace"]
 io-uring = ["trading-server/io-uring"]
+pipeline-stats = ["trading-server/pipeline-stats"]
 
 [[bin]]
 name = "trading-bench"
