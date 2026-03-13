@@ -1046,6 +1046,7 @@ dependencies = [
  "hdrhistogram",
  "libc",
  "tikv-jemallocator",
+ "tracing-subscriber",
  "trading-disruptor",
  "trading-engine",
  "trading-protocol",

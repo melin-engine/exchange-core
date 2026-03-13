@@ -72,6 +72,12 @@ const MAX_FRAME_SIZE: usize = 1024;
 const MAX_EPOLL_EVENTS: usize = 64;
 
 fn main() {
+    // Initialize tracing so pipeline-stats and latency-trace output is visible.
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_thread_names(true)
+        .init();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode: String = parse_flag(&args, "--mode=").unwrap_or_else(|| "roundtrip".into());
     let use_uds = args.iter().any(|a| a == "--uds");
