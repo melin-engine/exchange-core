@@ -6,3 +6,6 @@ pub mod journal;
 pub mod le;
 pub mod orderbook;
 pub mod types;
+
+#[cfg(test)]
+mod proptests;

@@ -3,6 +3,12 @@
 
 set -e
 
+# Check that Cargo.lock is staged when it has unstaged changes.
+if ! git diff --quiet -- Cargo.lock 2>/dev/null; then
+    echo "error: Cargo.lock has unstaged changes. Stage it with 'git add Cargo.lock' and try again."
+    exit 1
+fi
+
 if ! cargo fmt --all --check 2>/dev/null; then
     echo "error: code is not formatted. Run 'cargo fmt --all' and try again."
     exit 1
