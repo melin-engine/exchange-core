@@ -189,6 +189,11 @@ fn uring_reader_loop<R: AsRawFd>(
     // Eventfd read buffer — boxed for pointer stability across SQE lifetimes.
     let mut eventfd_buf: Box<[u8; 8]> = Box::new([0u8; 8]);
 
+    // Pre-allocated CQE collection buffer. We must collect CQEs before
+    // processing because the CQ borrow must end before pushing new SQEs.
+    // Pre-sized to RING_SIZE to avoid per-iteration heap allocation.
+    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(RING_SIZE as usize);
+
     // Submit the initial eventfd read so we wake on first connection.
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
 
@@ -208,14 +213,13 @@ fn uring_reader_loop<R: AsRawFd>(
             }
         }
 
-        // Drain all available CQEs. Must collect into a Vec because the CQ
-        // borrow must end before we can push new SQEs to the SQ.
-        let cqes: Vec<(u64, i32)> = ring
-            .completion()
-            .map(|cqe| (cqe.user_data(), cqe.result()))
-            .collect();
+        // Drain all available CQEs into the pre-allocated buffer.
+        // Must collect before processing because the CQ borrow must end
+        // before we can push new SQEs to the SQ.
+        cqes.clear();
+        cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
 
-        for (token, result) in cqes {
+        for &(token, result) in &cqes {
             if token == EVENTFD_TOKEN {
                 if result >= 0 {
                     // Process all pending registrations.
@@ -457,9 +461,13 @@ fn process_frames<R>(
         ));
     }
 
-    // Compact: remove consumed bytes from parse buffer.
+    // Compact: shift remaining bytes to the front of the parse buffer.
+    // Uses copy_within + truncate instead of drain() to avoid the
+    // Drain iterator overhead.
     if cursor > 0 {
-        conn.parse_buf.drain(..cursor);
+        let remaining = conn.parse_buf.len() - cursor;
+        conn.parse_buf.copy_within(cursor.., 0);
+        conn.parse_buf.truncate(remaining);
     }
 
     false

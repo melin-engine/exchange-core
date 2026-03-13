@@ -118,6 +118,11 @@ pub fn run(
     // Connections to remove after flush (send errors).
     let mut to_remove: Vec<u64> = Vec::new();
 
+    // Pre-allocated CQE collection buffer. Must collect CQEs before
+    // processing because the CQ borrow must end before mutating connections.
+    // Pre-sized to RING_SIZE to avoid per-iteration heap allocation.
+    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(RING_SIZE as usize);
+
     // Adaptive spin: spin first (fast wakeup), yield after threshold.
     let mut idle_spins: u32 = 0;
 
@@ -135,6 +140,7 @@ pub fn run(
                     &mut connections,
                     &dirty_connections,
                     &mut to_remove,
+                    &mut cqes,
                 );
                 dirty_connections.clear();
             }
@@ -183,6 +189,7 @@ pub fn run(
                     &mut connections,
                     &dirty_connections,
                     &mut to_remove,
+                    &mut cqes,
                 );
                 for conn_id in to_remove.drain(..) {
                     connections.remove(&conn_id);
@@ -303,6 +310,7 @@ fn flush_sends(
     connections: &mut HashMap<u64, ConnectionEntry>,
     dirty: &HashSet<u64>,
     to_remove: &mut Vec<u64>,
+    cqes: &mut Vec<(u64, i32)>,
 ) {
     // Submit SEND SQEs for all dirty connections.
     let mut pending: usize = 0;
@@ -338,14 +346,12 @@ fn flush_sends(
         return;
     }
 
-    // Process completions. Must collect to release CQ borrow before
-    // mutating connections.
-    let cqes: Vec<(u64, i32)> = ring
-        .completion()
-        .map(|cqe| (cqe.user_data(), cqe.result()))
-        .collect();
+    // Drain completions into pre-allocated buffer. Must collect to
+    // release CQ borrow before mutating connections.
+    cqes.clear();
+    cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
 
-    for (conn_id, result) in cqes {
+    for &(conn_id, result) in cqes.iter() {
         if result < 0 {
             debug!(
                 connection_id = conn_id,
