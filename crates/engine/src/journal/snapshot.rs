@@ -189,6 +189,8 @@ pub(crate) struct PendingStopSnapshot {
     pub(crate) quantity: Quantity,
     pub(crate) time_in_force: crate::types::TimeInForce,
     pub(crate) limit_price: Option<Price>,
+    /// Quote budget for buy-side market/stop-market orders.
+    pub(crate) quote_budget: Option<u64>,
 }
 
 // --- Encoding helpers ---
@@ -301,6 +303,13 @@ fn encode_stop_side(levels: &[(Price, Vec<PendingStopSnapshot>)], buf: &mut Vec<
                 Some(p) => {
                     buf.push(1);
                     le::push_u64(buf, p.get());
+                }
+                None => buf.push(0),
+            }
+            match stop.quote_budget {
+                Some(budget) => {
+                    buf.push(1);
+                    le::push_u64(buf, budget);
                 }
                 None => buf.push(0),
             }
@@ -648,6 +657,27 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 _ => return Err(corrupt("invalid limit_price tag in stop")),
             };
 
+            // Decode quote_budget (Option<u64>).
+            if pos >= buf.len() {
+                return Err(JournalError::TruncatedEntry);
+            }
+            let quote_budget = match buf[pos] {
+                1 => {
+                    pos += 1;
+                    if pos + 8 > buf.len() {
+                        return Err(JournalError::TruncatedEntry);
+                    }
+                    let budget = le::get_u64(&buf[pos..]);
+                    pos += 8;
+                    Some(budget)
+                }
+                0 => {
+                    pos += 1;
+                    None
+                }
+                _ => return Err(corrupt("invalid quote_budget tag in stop")),
+            };
+
             stops.push(PendingStopSnapshot {
                 id,
                 account,
@@ -656,6 +686,7 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 quantity: Quantity(qty),
                 time_in_force: tif,
                 limit_price,
+                quote_budget,
             });
         }
         levels.push((Price(trigger_val), stops));
@@ -777,6 +808,7 @@ impl OrderBook {
                             quantity: s.quantity(),
                             time_in_force: s.time_in_force(),
                             limit_price: s.limit_price(),
+                            quote_budget: s.quote_budget(),
                         })
                         .collect();
                     (trigger_price, snaps)
@@ -823,6 +855,7 @@ impl OrderBook {
                             s.quantity,
                             s.time_in_force,
                             s.limit_price,
+                            s.quote_budget,
                         )
                     })
                     .collect();

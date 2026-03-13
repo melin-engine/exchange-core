@@ -4,6 +4,7 @@
 //! Within a price level, orders are matched FIFO.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroU64;
 
 use crate::types::{
     AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side,
@@ -30,6 +31,10 @@ pub(crate) struct PendingStop {
     /// If `Some`, becomes a limit order at this price when triggered.
     /// If `None`, becomes a market order.
     limit_price: Option<Price>,
+    /// Maximum quote currency cost for buy-side market/stop-market orders.
+    /// Prevents fills from exceeding the reserved amount. `None` for sell-side
+    /// orders and limit/stop-limit buys (where cost is bounded by price × qty).
+    quote_budget: Option<u64>,
 }
 
 /// One side of the order book (either all bids or all asks).
@@ -77,6 +82,7 @@ impl PendingStop {
         quantity: Quantity,
         time_in_force: TimeInForce,
         limit_price: Option<Price>,
+        quote_budget: Option<u64>,
     ) -> Self {
         Self {
             id,
@@ -86,6 +92,7 @@ impl PendingStop {
             quantity,
             time_in_force,
             limit_price,
+            quote_budget,
         }
     }
 
@@ -115,6 +122,10 @@ impl PendingStop {
 
     pub(crate) fn limit_price(&self) -> Option<Price> {
         self.limit_price
+    }
+
+    pub(crate) fn quote_budget(&self) -> Option<u64> {
+        self.quote_budget
     }
 }
 
@@ -281,18 +292,28 @@ impl OrderBook {
     }
 
     /// Process an incoming order, appending execution reports to `reports`.
-    pub fn execute(&mut self, order: Order, reports: &mut Vec<ExecutionReport>) {
+    ///
+    /// `quote_budget` limits the total quote currency cost for buy-side market
+    /// orders (where the fill price is unknown at reservation time). Pass the
+    /// reserved amount so the matching engine stops before exceeding it.
+    /// `None` for sells and limit buys (cost bounded by price × quantity).
+    pub fn execute(
+        &mut self,
+        order: Order,
+        quote_budget: Option<u64>,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
         match order.order_type {
             OrderType::Limit { price } => self.execute_limit(order, price, reports),
-            OrderType::Market => self.execute_market(order, reports),
+            OrderType::Market => self.execute_market(order, quote_budget, reports),
             OrderType::Stop { trigger_price } => {
-                self.add_stop(order, trigger_price, None);
+                self.add_stop(order, trigger_price, None, quote_budget);
             }
             OrderType::StopLimit {
                 trigger_price,
                 limit_price,
             } => {
-                self.add_stop(order, trigger_price, Some(limit_price));
+                self.add_stop(order, trigger_price, Some(limit_price), None);
             }
         }
         self.check_triggers(reports);
@@ -357,6 +378,7 @@ impl OrderBook {
             order.side,
             order.quantity,
             Some(price),
+            None,
             reports,
         );
 
@@ -378,7 +400,12 @@ impl OrderBook {
         }
     }
 
-    fn execute_market(&mut self, order: Order, reports: &mut Vec<ExecutionReport>) {
+    fn execute_market(
+        &mut self,
+        order: Order,
+        quote_budget: Option<u64>,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely.
@@ -408,6 +435,7 @@ impl OrderBook {
             order.side,
             order.quantity,
             None,
+            quote_budget,
             reports,
         );
 
@@ -422,6 +450,10 @@ impl OrderBook {
 
     /// Match an incoming order against the opposite side of the book.
     ///
+    /// `quote_budget` caps the total quote cost for buy-side market orders,
+    /// preventing fills from exceeding the reserved amount. Ignored for sells
+    /// and limit buys.
+    ///
     /// Returns the remaining quantity if not fully filled, or `None` if fully filled.
     fn match_against(
         &mut self,
@@ -430,6 +462,7 @@ impl OrderBook {
         taker_side: Side,
         mut quantity: Quantity,
         price_limit: Option<Price>,
+        mut quote_budget: Option<u64>,
         reports: &mut Vec<ExecutionReport>,
     ) -> Option<Quantity> {
         let opposite = match taker_side {
@@ -461,13 +494,29 @@ impl OrderBook {
             }
         };
 
-        for price in prices {
+        'outer: for price in prices {
             let Some(level) = opposite.levels.get_mut(&price) else {
                 continue;
             };
 
             while let Some(maker) = level.front_mut() {
-                let fill_qty = quantity.min(maker.remaining);
+                let mut fill_qty = quantity.min(maker.remaining);
+
+                // Enforce quote budget: limit fill to what the taker can afford.
+                if let Some(budget) = quote_budget {
+                    let cost = (price.get() as u128) * (fill_qty.get() as u128);
+                    if cost > budget as u128 {
+                        // Can only afford a partial fill at this price.
+                        let affordable = budget / price.get();
+                        if affordable == 0 {
+                            // Can't afford even 1 lot — stop matching.
+                            break 'outer;
+                        }
+                        // Safety: affordable > 0 checked above.
+                        fill_qty = Quantity(NonZeroU64::new(affordable).expect("affordable > 0"))
+                            .min(fill_qty);
+                    }
+                }
 
                 reports.push(ExecutionReport::Fill {
                     maker_order_id: maker.id,
@@ -478,6 +527,12 @@ impl OrderBook {
                     quantity: fill_qty,
                 });
                 self.last_trade_price = Some(price);
+
+                // Deduct cost from budget after the fill.
+                if let Some(budget) = &mut quote_budget {
+                    let cost = price.get().saturating_mul(fill_qty.get());
+                    *budget = budget.saturating_sub(cost);
+                }
 
                 match maker.remaining.checked_sub(fill_qty) {
                     Some(new_remaining) => {
@@ -493,6 +548,10 @@ impl OrderBook {
                 match quantity.checked_sub(fill_qty) {
                     Some(new_qty) => {
                         quantity = new_qty;
+                        // If budget is exhausted, stop matching.
+                        if quote_budget == Some(0) {
+                            break 'outer;
+                        }
                     }
                     None => {
                         // Taker fully filled.
@@ -511,7 +570,13 @@ impl OrderBook {
         Some(quantity)
     }
 
-    fn add_stop(&mut self, order: Order, trigger_price: Price, limit_price: Option<Price>) {
+    fn add_stop(
+        &mut self,
+        order: Order,
+        trigger_price: Price,
+        limit_price: Option<Price>,
+        quote_budget: Option<u64>,
+    ) {
         let stop = PendingStop {
             id: order.id,
             account: order.account,
@@ -520,6 +585,7 @@ impl OrderBook {
             quantity: order.quantity,
             time_in_force: order.time_in_force,
             limit_price,
+            quote_budget,
         };
         let stops = match order.side {
             Side::Buy => &mut self.stop_buys,
@@ -600,7 +666,9 @@ impl OrderBook {
             // triggered orders are market/limit, so they won't re-add stops.
             match order.order_type {
                 OrderType::Limit { price } => self.execute_limit(order, price, reports),
-                OrderType::Market => self.execute_market(order, reports),
+                OrderType::Market => {
+                    self.execute_market(order, stop.quote_budget, reports);
+                }
                 OrderType::Stop { .. } | OrderType::StopLimit { .. } => {
                     unreachable!("triggered stops become market or limit orders")
                 }
@@ -708,6 +776,7 @@ mod tests {
         let mut reports = Vec::new();
         book.execute(
             limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -724,6 +793,7 @@ mod tests {
         reports.clear();
         book.execute(
             limit_order(2, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
@@ -738,10 +808,12 @@ mod tests {
         // Bid at 100, ask at 200 — no cross.
         book.execute(
             limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             limit_order(2, Side::Sell, 200, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -753,12 +825,14 @@ mod tests {
         reports.clear();
         book.execute(
             market_order(3, Side::Sell, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
         reports.clear();
         book.execute(
             market_order(4, Side::Buy, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
@@ -774,6 +848,7 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -781,6 +856,7 @@ mod tests {
         // Buy at 100 should match the resting sell.
         book.execute(
             limit_order(2, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -808,6 +884,7 @@ mod tests {
         // Resting ask at 90.
         book.execute(
             limit_order(1, Side::Sell, 90, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -815,6 +892,7 @@ mod tests {
         // Buy limit at 100 should match at the maker's price (90).
         book.execute(
             limit_order(2, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -841,6 +919,7 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -848,6 +927,7 @@ mod tests {
         // Buy 10, only 5 available — partial fill, rest goes on book.
         book.execute(
             limit_order(2, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -877,6 +957,7 @@ mod tests {
         reports.clear();
         book.execute(
             limit_order(3, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         assert_eq!(reports.len(), 1);
@@ -892,10 +973,12 @@ mod tests {
         // Two asks at price 100, first one should fill first.
         book.execute(
             limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             limit_order(2, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -903,6 +986,7 @@ mod tests {
         // Buy 7: should fill 5 from order 1 (first in queue), then 2 from order 2.
         book.execute(
             limit_order(3, Side::Buy, 100, 7, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -934,6 +1018,7 @@ mod tests {
         reports.clear();
         book.execute(
             market_order(4, Side::Buy, 3, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(3)));
@@ -948,16 +1033,19 @@ mod tests {
         // Asks at 110, then 100. Buy should hit 100 first.
         book.execute(
             limit_order(1, Side::Sell, 110, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             limit_order(2, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             limit_order(3, Side::Buy, 110, 3, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -978,6 +1066,7 @@ mod tests {
         reports.clear();
         book.execute(
             market_order(4, Side::Buy, 7, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(2)));
@@ -994,12 +1083,14 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             market_order(2, Side::Buy, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
 
@@ -1015,6 +1106,7 @@ mod tests {
 
         book.execute(
             market_order(1, Side::Buy, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
 
@@ -1035,6 +1127,7 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1042,6 +1135,7 @@ mod tests {
         // Market buy for 10, only 5 available.
         book.execute(
             market_order(2, Side::Buy, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
 
@@ -1066,12 +1160,14 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             limit_order(2, Side::Buy, 100, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
 
@@ -1096,6 +1192,7 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1103,6 +1200,7 @@ mod tests {
         // FOK buy for 10, only 5 available — should reject without any fills.
         book.execute(
             limit_order(2, Side::Buy, 100, 10, TimeInForce::FOK),
+            None,
             &mut reports,
         );
 
@@ -1119,6 +1217,7 @@ mod tests {
         reports.clear();
         book.execute(
             market_order(3, Side::Buy, 5, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(5)));
@@ -1132,12 +1231,14 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             limit_order(2, Side::Buy, 100, 10, TimeInForce::FOK),
+            None,
             &mut reports,
         );
 
@@ -1155,6 +1256,7 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1189,6 +1291,7 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.cancel(OrderId(1), &mut reports);
@@ -1197,6 +1300,7 @@ mod tests {
         // Market buy should find no liquidity.
         book.execute(
             market_order(2, Side::Buy, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
 
@@ -1219,20 +1323,24 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             limit_order(2, Side::Sell, 101, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             limit_order(3, Side::Sell, 102, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             market_order(4, Side::Buy, 12, TimeInForce::IOC),
+            None,
             &mut reports,
         );
 
@@ -1276,6 +1384,7 @@ mod tests {
         reports.clear();
         book.execute(
             market_order(5, Side::Buy, 3, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(3)));
@@ -1291,12 +1400,14 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             limit_order(2, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -1323,16 +1434,19 @@ mod tests {
         // Bids at 90 and 100. Sell should hit 100 first.
         book.execute(
             limit_order(1, Side::Buy, 90, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             limit_order(2, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             limit_order(3, Side::Sell, 90, 3, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -1353,6 +1467,7 @@ mod tests {
         reports.clear();
         book.execute(
             market_order(4, Side::Sell, 7, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(2)));
@@ -1404,10 +1519,12 @@ mod tests {
         // Place a resting ask at 100 and a stop buy that triggers at 100.
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             stop_order(2, Side::Buy, 100, 5, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1415,6 +1532,7 @@ mod tests {
         // A trade at 100 should trigger the stop buy.
         book.execute(
             limit_order(3, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -1451,10 +1569,12 @@ mod tests {
         // Place a resting bid at 100 and a stop sell that triggers at 100.
         book.execute(
             limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             stop_order(2, Side::Sell, 100, 5, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1462,6 +1582,7 @@ mod tests {
         // A trade at 100 should trigger the stop sell.
         book.execute(
             limit_order(3, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -1497,16 +1618,19 @@ mod tests {
         // Stop buy at 110, but trade happens at 100.
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             stop_order(2, Side::Buy, 110, 5, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         reports.clear();
 
         book.execute(
             limit_order(3, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -1531,10 +1655,12 @@ mod tests {
         // Resting ask at 100, stop-limit buy: trigger at 100, limit at 95.
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             stop_limit_order(2, Side::Buy, 100, 95, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1542,6 +1668,7 @@ mod tests {
         // Trade at 100 triggers the stop, but limit price 95 < ask 100, so it rests.
         book.execute(
             limit_order(3, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 
@@ -1577,6 +1704,7 @@ mod tests {
 
         book.execute(
             stop_order(1, Side::Buy, 100, 10, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         reports.clear();
@@ -1601,10 +1729,12 @@ mod tests {
 
         book.execute(
             limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
         book.execute(
             stop_order(2, Side::Buy, 100, 5, TimeInForce::IOC),
+            None,
             &mut reports,
         );
         book.cancel(OrderId(2), &mut reports);
@@ -1613,6 +1743,7 @@ mod tests {
         // Trade at 100 — cancelled stop should not trigger.
         book.execute(
             limit_order(3, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
             &mut reports,
         );
 

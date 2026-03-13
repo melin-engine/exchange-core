@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, RejectReason, Side,
-    Symbol,
+    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, OrderType,
+    RejectReason, Side, Symbol,
 };
 
 /// Top-level exchange managing multiple instruments.
@@ -106,13 +106,25 @@ impl Exchange {
         };
 
         // Reserve funds before submitting to the matching engine.
-        if let Err(reason) = self.accounts.try_reserve(&order, &spec) {
-            reports.push(ExecutionReport::Rejected {
-                order_id: order.id,
-                reason,
-            });
-            return;
-        }
+        let reserved = match self.accounts.try_reserve(&order, &spec) {
+            Ok(amount) => amount,
+            Err(reason) => {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: order.id,
+                    reason,
+                });
+                return;
+            }
+        };
+
+        // For buy-side market/stop-market orders, pass the reserved amount as
+        // a cost budget so the matching engine stops before exceeding it.
+        // Limit and stop-limit buys don't need this — their cost is bounded
+        // by price × quantity which matches the reservation exactly.
+        let quote_budget = match (order.side, order.order_type) {
+            (Side::Buy, OrderType::Market) | (Side::Buy, OrderType::Stop { .. }) => Some(reserved),
+            _ => None,
+        };
 
         // Track the order's side for fill processing.
         self.order_sides.insert(order.id, order.side);
@@ -123,7 +135,7 @@ impl Exchange {
             .books
             .get_mut(&symbol)
             .expect("book exists because instrument was added");
-        book.execute(order, reports);
+        book.execute(order, quote_budget, reports);
 
         // Process reports to update balances.
         let new_reports = &reports[report_start..];

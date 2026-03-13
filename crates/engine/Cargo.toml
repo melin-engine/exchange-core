@@ -25,4 +25,5 @@ libc = { workspace = true }
 trading-disruptor = { path = "../disruptor" }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
