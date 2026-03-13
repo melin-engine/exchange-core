@@ -7,30 +7,30 @@ A sub-millisecond, production-grade trading engine targeting **10M orders/sec**,
 ```
 Clients ──TCP/UDS──> Accept Loop
                          │
-                    per-connection Reader Thread (blocking I/O)
+                    Epoll Reader Pool (edge-triggered, non-blocking I/O)
                          │
-                    Arc<Mutex<Producer>> ──> Input Disruptor (ring buffer)
-                                                     │
-                                      ┌──────────────┼──────────────────┐
-                                      │                                 │
-                                 Journal Thread                Matching Thread
-                                 batch write + fsync           execute on Exchange
-                                 (pre-allocated storage)       publish to output SPSC
-                                      │                                 │
-                                 advances cursor ────────┐              │
-                                                         ▼              │
-                                                  Response Thread  ◄───┘
-                                                  gates on journal cursor
-                                                  writes directly to sockets
+                    lock-free MultiProducer ──> Input Disruptor (ring buffer)
                                                          │
-                                                  ──TCP/UDS──> Clients
+                                          ┌──────────────┼──────────────────┐
+                                          │                                 │
+                                     Journal Thread                Matching Thread
+                                     batch write + fsync           execute on Exchange
+                                     (io_uring async fsync)        publish to output SPSC
+                                          │                                 │
+                                     advances cursor ────────┐              │
+                                                             ▼              │
+                                                      Response Thread  ◄───┘
+                                                      gates on journal cursor
+                                                      writes directly to sockets
+                                                             │
+                                                      ──TCP/UDS──> Clients
 ```
 
-- **No tokio on the hot path** — dedicated OS threads with blocking I/O for both reading and writing; tokio is only used for the accept loop
+- **Zero tokio** — dedicated OS threads with blocking I/O; no async runtime anywhere in the codebase
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
-- **LMAX disruptor pipeline** — 3 OS threads (journal, matching, response) on lock-free ring buffers; journal and matching run in parallel on the same events
+- **LMAX disruptor pipeline** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Persist-before-ack** — responses are held until the journal confirms fsync, but matching proceeds in parallel with I/O
-- **Batch fsync amortization** — under load, one `sync_data()` covers many events; `posix_fallocate` pre-allocates 64 MiB chunks so fsync only flushes data pages, not extent metadata
+- **Batch fsync amortization** — under load, one fsync covers many events; optional io_uring async fsync overlaps I/O wait with encoding; `posix_fallocate` pre-allocates 64 MiB chunks so fsync only flushes data pages, not extent metadata
 - **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), zero allocations on the hot path
 
@@ -53,8 +53,8 @@ Clients ──TCP/UDS──> Accept Loop
 ### Networking
 - Custom binary wire protocol (length-prefixed framing)
 - TCP transport with `TCP_NODELAY` and Unix domain socket transport
-- Dedicated I/O threads with blocking reads/writes (no tokio on hot path)
-- Transport abstraction with async and blocking split (TCP/UDS now, io_uring/kernel bypass later)
+- Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
+- Transport abstraction (TCP/UDS now, io_uring/kernel bypass later)
 - Typed client library
 - Terminal UI for interactive testing
 
@@ -67,7 +67,7 @@ Clients ──TCP/UDS──> Accept Loop
 ```sh
 cargo build          # compile
 cargo run            # run server
-cargo test           # run tests (124 tests across workspace)
+cargo test           # run tests (126 tests across workspace)
 cargo clippy         # lint
 cargo fmt            # format
 ```
