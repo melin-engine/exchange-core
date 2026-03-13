@@ -28,7 +28,7 @@ impl JournaledExchange {
     pub fn create(journal_path: &Path) -> Result<Self, JournalError> {
         let writer = JournalWriter::create(journal_path)?;
         Ok(Self {
-            exchange: Exchange::new(),
+            exchange: Exchange::with_capacity(),
             writer,
         })
     }
@@ -88,7 +88,7 @@ impl JournaledExchange {
     /// then reopens the writer for appending new events.
     pub fn recover(journal_path: &Path) -> Result<Self, JournalError> {
         let mut reader = JournalReader::open(journal_path)?;
-        let mut exchange = Exchange::new();
+        let mut exchange = Exchange::with_capacity();
         let mut reports = Vec::new();
 
         while let Some(entry) = reader.next_entry()? {
