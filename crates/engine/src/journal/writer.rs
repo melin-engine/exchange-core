@@ -345,3 +345,350 @@ pub fn wall_clock_nanos() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::*;
+    use crate::journal::reader::JournalReader;
+    use crate::types::*;
+
+    fn nz(v: u64) -> NonZeroU64 {
+        NonZeroU64::new(v).unwrap()
+    }
+
+    fn sample_event() -> JournalEvent {
+        JournalEvent::SubmitOrder {
+            symbol: Symbol(1),
+            order: Order {
+                id: OrderId(1),
+                account: AccountId(1),
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(nz(100)),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(nz(10)),
+            },
+        }
+    }
+
+    /// Helper: write events, drop writer, read back all entries.
+    fn read_all(path: &Path) -> Vec<crate::journal::reader::JournalEntry> {
+        let mut reader = JournalReader::open(path).unwrap();
+        let mut entries = Vec::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            entries.push(entry);
+        }
+        entries
+    }
+
+    #[test]
+    fn create_initializes_header_and_preallocates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let writer = JournalWriter::create(&path).unwrap();
+        assert_eq!(writer.next_sequence(), 1);
+        assert_eq!(writer.path(), path);
+
+        // File should be pre-allocated (64 MiB chunk).
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            file_len >= PREALLOC_CHUNK,
+            "expected pre-allocated file, got {file_len} bytes"
+        );
+    }
+
+    #[test]
+    fn create_fails_if_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let _writer = JournalWriter::create(&path).unwrap();
+        drop(_writer);
+
+        // Second create on same path should fail (create_new).
+        let result = JournalWriter::create(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn append_assigns_sequential_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = JournalWriter::create(&path).unwrap();
+        let event = sample_event();
+
+        let seq1 = writer.append(&event).unwrap();
+        let seq2 = writer.append(&event).unwrap();
+        let seq3 = writer.append(&event).unwrap();
+
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_eq!(seq3, 3);
+        assert_eq!(writer.next_sequence(), 4);
+    }
+
+    #[test]
+    fn append_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let event = sample_event();
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            writer.append(&event).unwrap();
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].event, event);
+        assert!(entries[0].timestamp_ns > 0);
+    }
+
+    #[test]
+    fn append_no_sync_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let event = sample_event();
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            let seq = writer.append_no_sync(&event).unwrap();
+            assert_eq!(seq, 1);
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, event);
+    }
+
+    #[test]
+    fn batch_append_then_flush_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let events = vec![
+            JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(0),
+                amount: 100,
+            },
+            JournalEvent::Deposit {
+                account: AccountId(2),
+                currency: CurrencyId(0),
+                amount: 200,
+            },
+            sample_event(),
+        ];
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for event in &events {
+                writer.batch_append(event).unwrap();
+            }
+            // Nothing written to disk yet — flush the batch.
+            writer.flush_batch().unwrap();
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), events.len());
+        for (i, (entry, expected)) in entries.iter().zip(events.iter()).enumerate() {
+            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(&entry.event, expected);
+        }
+    }
+
+    #[test]
+    fn batch_append_with_ts_uses_provided_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let event = sample_event();
+        let fixed_ts: u64 = 1_700_000_000_000_000_000; // a specific nanos value
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            let seq = writer.batch_append_with_ts(&event, fixed_ts).unwrap();
+            assert_eq!(seq, 1);
+            writer.flush_batch().unwrap();
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].timestamp_ns, fixed_ts);
+        assert_eq!(entries[0].event, event);
+    }
+
+    #[test]
+    fn flush_batch_sync_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let event = sample_event();
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            writer.batch_append(&event).unwrap();
+            writer.batch_append(&event).unwrap();
+            writer.flush_batch_sync().unwrap();
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+    }
+
+    #[test]
+    fn flush_batch_on_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = JournalWriter::create(&path).unwrap();
+        // Flushing empty batch should succeed without error.
+        writer.flush_batch().unwrap();
+        writer.flush_batch_sync().unwrap();
+
+        // File should still be readable with zero entries.
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn multiple_batch_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+
+            // First batch.
+            writer.batch_append(&sample_event()).unwrap();
+            writer.batch_append(&sample_event()).unwrap();
+            writer.flush_batch().unwrap();
+
+            // Second batch.
+            writer.batch_append(&sample_event()).unwrap();
+            writer.flush_batch_sync().unwrap();
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 3);
+    }
+
+    #[test]
+    fn open_append_continues_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        // Write 3 events, close.
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..3 {
+                writer.append(&sample_event()).unwrap();
+            }
+        }
+
+        // Recovery: read to find valid_end and last_seq.
+        let (last_seq, valid_end) = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            (reader.last_sequence().unwrap(), reader.valid_file_end())
+        };
+
+        // Reopen and append more.
+        let extra = JournalEvent::CancelOrder {
+            symbol: Symbol(1),
+            order_id: OrderId(42),
+        };
+        {
+            let mut writer = JournalWriter::open_append(&path, last_seq, valid_end).unwrap();
+            assert_eq!(writer.next_sequence(), 4);
+            let seq = writer.append(&extra).unwrap();
+            assert_eq!(seq, 4);
+        }
+
+        // Read back all 4 entries.
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[3].sequence, 4);
+        assert_eq!(entries[3].event, extra);
+    }
+
+    #[test]
+    fn open_append_truncates_preallocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            writer.append(&sample_event()).unwrap();
+        }
+
+        let (last_seq, valid_end) = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            (reader.last_sequence().unwrap(), reader.valid_file_end())
+        };
+
+        // open_append truncates to valid_end then re-preallocates.
+        let _writer = JournalWriter::open_append(&path, last_seq, valid_end).unwrap();
+
+        // File should be re-preallocated from valid_end.
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(file_len, valid_end + PREALLOC_CHUNK);
+    }
+
+    #[test]
+    fn batch_append_does_not_write_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = JournalWriter::create(&path).unwrap();
+        writer.batch_append(&sample_event()).unwrap();
+        writer.batch_append(&sample_event()).unwrap();
+        // Data is buffered but not flushed — reader should see zero entries.
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 0);
+
+        // Now flush — entries appear.
+        writer.flush_batch().unwrap();
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn append_flushes_previously_buffered_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let cancel = JournalEvent::CancelOrder {
+            symbol: Symbol(1),
+            order_id: OrderId(99),
+        };
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            // Buffer two events without flushing.
+            writer.batch_append(&sample_event()).unwrap();
+            writer.batch_append(&sample_event()).unwrap();
+            // append() calls batch_append + flush_batch_sync, so all three
+            // events should be flushed together.
+            writer.append(&cancel).unwrap();
+        }
+
+        let entries = read_all(&path);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 3);
+        assert_eq!(entries[2].event, cancel);
+    }
+}
