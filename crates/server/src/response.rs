@@ -104,9 +104,12 @@ pub fn run(
     loop {
         if shutdown.load(Ordering::Relaxed) {
             // Flush any remaining buffered writes before shutdown.
+            // Best-effort: clients may have disconnected already.
             for conn_id in &dirty_connections {
-                if let Some(writer) = connections.get_mut(conn_id) {
-                    let _ = writer.flush();
+                if let Some(writer) = connections.get_mut(conn_id)
+                    && let Err(e) = writer.flush()
+                {
+                    tracing::debug!(conn = conn_id, "flush on shutdown: {e}");
                 }
             }
             #[cfg(feature = "latency-trace")]
@@ -258,11 +261,16 @@ pub fn run(
 fn print_utilization(stage: &str, busy: u64, idle: u64) {
     let total = busy + idle;
     if total == 0 {
-        eprintln!("[pipeline-stats] {stage}: no iterations recorded");
+        tracing::info!(stage, "no iterations recorded");
         return;
     }
     let pct = (busy as f64 / total as f64) * 100.0;
-    eprintln!(
-        "[pipeline-stats] {stage}: {pct:.2}% busy ({busy} busy / {idle} idle / {total} total)",
+    tracing::info!(
+        stage,
+        pct_busy = format_args!("{pct:.2}%"),
+        busy,
+        idle,
+        total,
+        "pipeline utilization",
     );
 }

@@ -208,7 +208,7 @@ impl JournalStage {
                 // Flush any pending data before shutdown.
                 if pending > 0 {
                     if let Err(e) = self.writer.sync() {
-                        eprintln!("journal sync error on shutdown: {e}");
+                        tracing::error!(error = %e, "journal sync error on shutdown");
                     }
                     self.consumer.commit(pending);
                 }
@@ -251,7 +251,7 @@ impl JournalStage {
 
                 for slot in &batch[..count] {
                     if let Err(e) = self.writer.append_no_sync(&slot.event) {
-                        eprintln!("journal encode error: {e}");
+                        tracing::error!(error = %e, "journal encode error");
                     }
                 }
                 pending += count;
@@ -274,7 +274,7 @@ impl JournalStage {
 
                 if should_sync {
                     if let Err(e) = self.writer.sync() {
-                        eprintln!("journal sync error: {e}");
+                        tracing::error!(error = %e, "journal sync error");
                     }
                     self.consumer.commit(pending);
                     pending = 0;
@@ -391,7 +391,10 @@ impl JournalStage {
                         .expect("io_uring wait failed on shutdown");
                     let cqe = ring.completion().next().expect("missing CQE on shutdown");
                     if cqe.result() < 0 {
-                        eprintln!("journal io_uring fsync error on shutdown: {}", cqe.result());
+                        tracing::error!(
+                            result = cqe.result(),
+                            "journal io_uring fsync error on shutdown"
+                        );
                     }
                     self.consumer.set_progress(fsync_covers_seq);
                     synced_seq = fsync_covers_seq;
@@ -400,7 +403,7 @@ impl JournalStage {
                 #[cfg(not(feature = "no-fsync"))]
                 if written_seq > synced_seq {
                     if let Err(e) = self.writer.sync() {
-                        eprintln!("journal sync error on shutdown: {e}");
+                        tracing::error!(error = %e, "journal sync error on shutdown");
                     }
                     self.consumer.set_progress(written_seq);
                 }
@@ -437,7 +440,7 @@ impl JournalStage {
 
                 for slot in &batch[..count] {
                     if let Err(e) = self.writer.append_no_sync(&slot.event) {
-                        eprintln!("journal encode error: {e}");
+                        tracing::error!(error = %e, "journal encode error");
                     }
                 }
                 // `next_read` has advanced by `count` — snapshot as written_seq.
@@ -493,7 +496,7 @@ impl JournalStage {
 
                 if let Some(result) = cqe_result {
                     if result < 0 {
-                        eprintln!("journal io_uring fsync error: {result}");
+                        tracing::error!(result, "journal io_uring fsync error");
                     }
                     // These events are now durable — publish the progress.
                     self.consumer.set_progress(fsync_covers_seq);
@@ -545,11 +548,11 @@ impl JournalStage {
             }
             for slot in &batch[..count] {
                 if let Err(e) = self.writer.append_no_sync(&slot.event) {
-                    eprintln!("journal encode error on drain: {e}");
+                    tracing::error!(error = %e, "journal encode error on drain");
                 }
             }
             if let Err(e) = self.writer.sync() {
-                eprintln!("journal sync error on drain: {e}");
+                tracing::error!(error = %e, "journal sync error on drain");
             }
             self.consumer.commit(count);
         }
@@ -718,12 +721,17 @@ impl MatchingStage {
 fn print_utilization(stage: &str, busy: u64, idle: u64) {
     let total = busy + idle;
     if total == 0 {
-        eprintln!("[pipeline-stats] {stage}: no iterations recorded");
+        tracing::info!(stage, "no iterations recorded");
         return;
     }
     let pct = (busy as f64 / total as f64) * 100.0;
-    eprintln!(
-        "[pipeline-stats] {stage}: {pct:.2}% busy ({busy} busy / {idle} idle / {total} total)",
+    tracing::info!(
+        stage,
+        pct_busy = format_args!("{pct:.2}%"),
+        busy,
+        idle,
+        total,
+        "pipeline utilization",
     );
 }
 

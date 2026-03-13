@@ -22,6 +22,7 @@ crc32c = "0.6"
 hdrhistogram = { version = "7", optional = true }
 io-uring = { version = "0.7", optional = true }
 libc = { workspace = true }
+tracing = { workspace = true }
 trading-disruptor = { path = "../disruptor" }
 
 [dev-dependencies]
