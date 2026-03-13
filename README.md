@@ -14,8 +14,8 @@ Clients ──TCP/UDS──> Accept Loop
                                           ┌──────────────┼──────────────────┐
                                           │                                 │
                                      Journal Thread                Matching Thread
-                                     batch write + fsync           execute on Exchange
-                                     (io_uring async fsync)        publish to output SPSC
+                                     batch write + sync            execute on Exchange
+                                     (pwritev2 + RWF_DSYNC/FUA)   publish to output SPSC
                                           │                                 │
                                      advances cursor ────────┐              │
                                                              ▼              │
@@ -29,7 +29,7 @@ Clients ──TCP/UDS──> Accept Loop
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
 - **LMAX disruptor pipeline** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
-- **Batch fsync amortization** — under load, one fsync covers many events; optional io_uring async fsync overlaps I/O wait with encoding; `posix_fallocate` pre-allocates 64 MiB chunks so fsync only flushes data pages, not extent metadata
+- **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 64 MiB chunks so sync only flushes data pages, not extent metadata
 - **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), zero allocations on the hot path
 
@@ -66,7 +66,7 @@ Clients ──TCP/UDS──> Accept Loop
 ```sh
 cargo build          # compile
 cargo run            # run server
-cargo test           # run tests (134 tests across workspace)
+cargo test           # run tests (148 tests across workspace)
 cargo clippy         # lint
 cargo fmt            # format
 ```
@@ -86,35 +86,26 @@ crates/
 
 ## Performance
 
-The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP/UDS round-trip. Results below are from the round-trip mode measuring full TCP loopback latency. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8.
+The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP/UDS round-trip. Results below are from the round-trip mode measuring full TCP loopback latency. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8. All threads pinned to dedicated cores, IRQs pinned to core 0, CPU governor locked to performance.
 
-All benchmarks: 16 clients, 64 pipelined orders per client.
+All benchmarks: 10M order pairs, 16 clients, 64 pipelined orders per client.
 
-**Without persistence** (10M pairs, pipeline + network ceiling):
-
-```
-cargo run --release -p trading-bench --features io-uring,no-persist -- 10000000 --clients=16 --window=64
-
-Throughput:  2.57M orders/sec (0.39 µs/order)
-Latency:     p99 = 520 µs, p99.9 = 593 µs, max = 780 µs
-```
-
-**Without fsync** (1M pairs, isolates pipeline latency from disk I/O):
+**Without persistence** (pipeline + network ceiling):
 
 ```
-cargo run --release -p trading-bench --features io-uring,no-fsync -- 1000000 --clients=16 --window=64
+sudo ./scripts/bench-isolate.sh --features io-uring,no-persist -- 10000000 --clients=16 --window=64
 
-Throughput:  1.62M orders/sec (0.62 µs/order)
-Latency:     p99 = 378 µs, p99.9 = 506 µs, max = 1.07 ms
+Throughput:  3.69M orders/sec (0.27 µs/order)
+Latency:     p99 = 348 µs, p99.9 = 497 µs, max = 2.26 ms
 ```
 
-**With fsync** (1M pairs, full durability, io_uring async fdatasync):
+**With fsync/FUA** (full durability, pwritev2 + RWF_DSYNC):
 
 ```
-cargo run --release -p trading-bench --features io-uring -- 1000000 --clients=16 --window=64
+sudo ./scripts/bench-isolate.sh --features io-uring -- 10000000 --clients=16 --window=64
 
-Throughput:  605K orders/sec (1.65 µs/order)
-Latency:     p99 = 1.80 ms, p99.9 = 6.75 ms, max = 7.08 ms
+Throughput:  779K orders/sec (1.28 µs/order)
+Latency:     p99 = 1.95 ms, p99.9 = 4.91 ms, max = 10.7 ms
 ```
 
 ## License
