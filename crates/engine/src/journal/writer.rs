@@ -24,6 +24,10 @@ use super::event::JournalEvent;
 /// Fixed-size array avoids per-write heap allocation on the hot path.
 const MAX_ENTRY_SIZE: usize = 128;
 
+/// Batch buffer capacity. Sized for MAX_JOURNAL_BATCH (1024) entries at
+/// ~80 bytes each = ~80 KiB. Pre-allocated once, reused across batches.
+const BATCH_BUF_CAPACITY: usize = 128 * 1024;
+
 /// Pre-allocation chunk size (64 MiB). Large enough to amortize the cost of
 /// extent metadata updates across many entries. At ~80 bytes per entry,
 /// one chunk covers ~800K entries before the next allocation is needed.
@@ -37,9 +41,13 @@ const PREALLOC_CHUNK: u64 = 64 * 1024 * 1024;
 /// before reopening.
 pub struct JournalWriter {
     file: File,
-    /// Pre-allocated fixed-size buffer to avoid per-write heap allocation.
+    /// Pre-allocated fixed-size buffer for single-entry encoding.
     /// A fixed array (not Vec) because entries have a known bounded size.
     buffer: [u8; MAX_ENTRY_SIZE],
+    /// Batch write buffer. Events are encoded here via `batch_append()`,
+    /// then flushed in a single `pwrite` via `flush_batch()`. This reduces
+    /// syscalls from N (one pwrite per event) to 1 per batch.
+    batch_buf: Vec<u8>,
     /// Next sequence number to assign (monotonically increasing, starts at 1).
     next_sequence: u64,
     /// Path to the journal file (kept for error messages / reopening).
@@ -82,6 +90,7 @@ impl JournalWriter {
         Ok(Self {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
+            batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
             next_sequence: 1,
             path: path.to_path_buf(),
             write_pos,
@@ -112,6 +121,7 @@ impl JournalWriter {
         Ok(Self {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
+            batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
             next_sequence: last_seq + 1,
             path: path.to_path_buf(),
             write_pos: valid_end,
@@ -156,6 +166,56 @@ impl JournalWriter {
 
         self.next_sequence += 1;
         Ok(seq)
+    }
+
+    /// Encode an event into the batch buffer without writing to disk.
+    ///
+    /// Much faster than `append_no_sync` — no syscall per event, just
+    /// memory copies into the pre-allocated batch buffer. Call `flush_batch`
+    /// after encoding the entire batch to issue a single `pwrite`.
+    ///
+    /// Uses one `wall_clock_nanos()` call per event for the journal timestamp.
+    /// For batches sharing a timestamp, use `batch_append_with_ts`.
+    pub fn batch_append(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
+        let seq = self.next_sequence;
+        let timestamp_ns = wall_clock_nanos();
+        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
+        self.batch_buf.extend_from_slice(&self.buffer[..written]);
+        self.next_sequence += 1;
+        Ok(seq)
+    }
+
+    /// Encode an event into the batch buffer with a caller-provided timestamp.
+    ///
+    /// Avoids the `clock_gettime` syscall per event when the caller can batch
+    /// a single timestamp for the entire batch. Same semantics as `batch_append`
+    /// but uses the provided timestamp instead of calling `wall_clock_nanos()`.
+    pub fn batch_append_with_ts(
+        &mut self,
+        event: &JournalEvent,
+        timestamp_ns: u64,
+    ) -> Result<u64, JournalError> {
+        let seq = self.next_sequence;
+        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
+        self.batch_buf.extend_from_slice(&self.buffer[..written]);
+        self.next_sequence += 1;
+        Ok(seq)
+    }
+
+    /// Write the accumulated batch buffer to disk in a single `pwrite` syscall.
+    ///
+    /// Reduces syscalls from N (one per event) to 1 per batch. Must be called
+    /// after one or more `batch_append` / `batch_append_with_ts` calls and
+    /// before `sync()`.
+    pub fn flush_batch(&mut self) -> Result<(), JournalError> {
+        if self.batch_buf.is_empty() {
+            return Ok(());
+        }
+        self.ensure_allocated(self.batch_buf.len() as u64)?;
+        self.file.write_all_at(&self.batch_buf, self.write_pos)?;
+        self.write_pos += self.batch_buf.len() as u64;
+        self.batch_buf.clear();
+        Ok(())
     }
 
     /// Flush the journal to disk (fsync).
@@ -231,7 +291,9 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
 ///
 /// The `u128 as u64` truncation is safe: u64 nanos covers ~584 years from
 /// epoch (until 2554). Falls back to 0 if system clock is before epoch.
-fn wall_clock_nanos() -> u64 {
+///
+/// Public so the pipeline stage can call once per batch instead of per event.
+pub fn wall_clock_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

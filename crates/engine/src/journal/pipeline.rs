@@ -250,10 +250,18 @@ impl JournalStage {
                     ));
                 }
 
+                // Batch-encode all events into the writer's internal buffer.
+                // One timestamp per batch avoids per-event clock_gettime syscalls.
+                // flush_batch issues a single pwrite for the entire batch.
                 #[cfg(not(feature = "no-persist"))]
-                for slot in &batch[..count] {
-                    if let Err(e) = self.writer.append_no_sync(&slot.event) {
-                        tracing::error!(error = %e, "journal encode error");
+                {
+                    for slot in &batch[..count] {
+                        if let Err(e) = self.writer.batch_append(&slot.event) {
+                            tracing::error!(error = %e, "journal encode error");
+                        }
+                    }
+                    if let Err(e) = self.writer.flush_batch() {
+                        tracing::error!(error = %e, "journal flush_batch error");
                     }
                 }
                 pending += count;
@@ -441,10 +449,18 @@ impl JournalStage {
                     ));
                 }
 
+                // Batch-encode all events into the writer's internal buffer.
+                // One timestamp per batch avoids per-event clock_gettime syscalls.
+                // flush_batch issues a single pwrite for the entire batch.
                 #[cfg(not(feature = "no-persist"))]
-                for slot in &batch[..count] {
-                    if let Err(e) = self.writer.append_no_sync(&slot.event) {
-                        tracing::error!(error = %e, "journal encode error");
+                {
+                    for slot in &batch[..count] {
+                        if let Err(e) = self.writer.batch_append(&slot.event) {
+                            tracing::error!(error = %e, "journal encode error");
+                        }
+                    }
+                    if let Err(e) = self.writer.flush_batch() {
+                        tracing::error!(error = %e, "journal flush_batch error");
                     }
                 }
                 // `next_read` has advanced by `count` — snapshot as written_seq.
@@ -553,9 +569,12 @@ impl JournalStage {
             #[cfg(not(feature = "no-persist"))]
             {
                 for slot in &batch[..count] {
-                    if let Err(e) = self.writer.append_no_sync(&slot.event) {
+                    if let Err(e) = self.writer.batch_append(&slot.event) {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
+                }
+                if let Err(e) = self.writer.flush_batch() {
+                    tracing::error!(error = %e, "journal flush_batch error on drain");
                 }
                 if let Err(e) = self.writer.sync() {
                     tracing::error!(error = %e, "journal sync error on drain");
