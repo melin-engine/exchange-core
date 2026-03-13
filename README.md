@@ -79,14 +79,14 @@ crates/
 ├── engine/        Matching engine, order books, event sourcing, journal pipeline
 ├── protocol/      Binary wire protocol, transport abstractions, blocking I/O
 ├── server/        Server, pipeline orchestration, dedicated I/O threads
-├── bench/         Pipelined end-to-end benchmark (TCP default, --uds flag)
+├── bench/         Benchmark suite (engine, pipeline, and full round-trip modes)
 ├── client/        Typed client library
 └── tui/           Terminal UI for interactive testing
 ```
 
 ## Performance
 
-End-to-end benchmark (`crates/bench/`) measures full TCP round-trip latency on loopback: client sends order, server processes through the entire pipeline (read → journal → match → response), client receives execution report. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8.
+The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP/UDS round-trip. Results below are from the round-trip mode measuring full TCP loopback latency. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8.
 
 **Without fsync** (isolates pipeline latency from disk I/O):
 

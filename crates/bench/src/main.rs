@@ -1,26 +1,26 @@
-//! End-to-end pipelined benchmark for the trading engine.
+//! Trading engine benchmark suite with three modes:
 //!
-//! Boots the server in-process, connects via TCP (default) or Unix domain
-//! socket (`--uds`), and blasts order pairs (buy then sell at the same
-//! price from the same account — self-trade, net zero balance change,
-//! unlimited cycles).
+//! **`--mode=roundtrip`** (default): Full end-to-end benchmark. Boots the server
+//! in-process, connects via TCP (default) or Unix domain socket (`--uds`), and
+//! blasts order pairs through the complete network round-trip path. Measures
+//! client-perceived latency including transport, queuing, journaling, and matching.
 //!
-//! Uses a **small pool of epoll client threads** (default 4), each
-//! multiplexing a subset of connections via epoll. This avoids the
-//! thread oversubscription of 1-thread-per-client-direction (128 threads
-//! for 64 clients) while maintaining I/O parallelism. Total threads:
-//! ~4 bench + 5 server = 9 on 16 cores — no oversubscription.
+//! **`--mode=pipeline`**: Server pipeline without network transport. Publishes
+//! events directly to the disruptor ring buffer and consumes responses from the
+//! output SPSC queue. Isolates journal + matching stage latency from TCP/UDS
+//! overhead.
 //!
-//! Closed-loop windowed pipelining: maintains a fixed number of in-flight
-//! orders per connection. Measures per-order round-trip latency under load.
+//! **`--mode=engine`**: Matching engine only. Calls `Exchange::execute()` directly
+//! in a tight loop — no disruptor, no journal, no I/O. Measures pure matching
+//! engine throughput and latency.
 //!
-//! Zero async — the server accept loop, pipeline threads, and this bench
-//! loop all use blocking or epoll-based I/O. No tokio dependency.
+//! All modes use self-trade pairs (buy then sell at the same price from the same
+//! account — net zero balance change, unlimited cycles).
 //!
 //! Usage:
-//!     cargo run --release -p trading-bench [-- [--uds] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
+//!     cargo run --release -p trading-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
 //!
-//! Default: TCP transport, 1 client, 1,000,000 order pairs (2,000,000 total orders).
+//! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
 /// jemalloc: thread-local caches eliminate allocator lock contention,
 /// giving more predictable latency than glibc malloc under high throughput.
@@ -73,6 +73,7 @@ const MAX_EPOLL_EVENTS: usize = 64;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode: String = parse_flag(&args, "--mode=").unwrap_or_else(|| "roundtrip".into());
     let use_uds = args.iter().any(|a| a == "--uds");
 
     let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
@@ -87,6 +88,288 @@ fn main() {
         .find_map(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PAIRS);
 
+    match mode.as_str() {
+        "engine" => run_engine_bench(pairs),
+        "pipeline" => run_pipeline_bench(pairs, window, group_commit_us),
+        "roundtrip" => run_roundtrip_bench(
+            use_uds,
+            pairs,
+            window,
+            num_clients,
+            bench_threads,
+            group_commit_us,
+        ),
+        other => {
+            eprintln!("unknown mode: {other} (expected: engine, pipeline, roundtrip)");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ===========================================================================
+// Engine-only benchmark
+// ===========================================================================
+
+/// Pure matching engine benchmark. Calls `Exchange::execute()` directly in a
+/// tight loop with no disruptor, journal, or I/O. Measures the raw cost of
+/// order matching and balance management.
+fn run_engine_bench(total_pairs: usize) {
+    let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
+
+    let mut exchange = trading_engine::exchange::Exchange::new();
+    exchange.add_instrument(InstrumentSpec {
+        symbol: Symbol(1),
+        base: CurrencyId(1),
+        quote: CurrencyId(2),
+    });
+    // Deposit enough for all orders. Each buy reserves price(100) * qty(1) = 100
+    // quote currency, each sell reserves 1 base currency. Self-trades release
+    // immediately, so a generous initial deposit avoids balance exhaustion.
+    exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
+    exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
+
+    let total_orders = WARMUP_ORDERS + total_pairs * 2;
+    let mut reports = Vec::with_capacity(256);
+    let mut histogram =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+
+    // Warmup: prime caches and allocator.
+    for i in 0..WARMUP_ORDERS {
+        let order_id = OrderId((i as u64) + 1);
+        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: order_id,
+                account: AccountId(1),
+                side,
+                order_type: OrderType::Limit {
+                    price: Price(nz(100)),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(nz(1)),
+            },
+            &mut reports,
+        );
+    }
+
+    // Measured run.
+    let start = Instant::now();
+    for i in WARMUP_ORDERS..total_orders {
+        let order_id = OrderId((i as u64) + 1);
+        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+        reports.clear();
+
+        let t0 = Instant::now();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: order_id,
+                account: AccountId(1),
+                side,
+                order_type: OrderType::Limit {
+                    price: Price(nz(100)),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(nz(1)),
+            },
+            &mut reports,
+        );
+        let elapsed_ns = t0.elapsed().as_nanos() as u64;
+        histogram.record(elapsed_ns).expect("record");
+    }
+    let wall = start.elapsed();
+
+    print_results(
+        "Engine-Only",
+        total_pairs * 2,
+        WARMUP_ORDERS,
+        &histogram,
+        wall,
+        &[],
+    );
+}
+
+// ===========================================================================
+// Pipeline benchmark (disruptor + journal + matching, no network)
+// ===========================================================================
+
+/// Pipeline benchmark. Builds the full disruptor pipeline (journal stage +
+/// matching stage) but bypasses TCP/UDS transport. The bench thread publishes
+/// InputSlots directly to the MultiProducer and drains OutputSlots from the
+/// SPSC consumer. Measures pipeline latency without network overhead.
+fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
+    use trading_engine::journal::JournalWriter;
+    use trading_engine::journal::event::JournalEvent;
+    use trading_engine::journal::pipeline::{InputSlot, build_pipeline};
+    use trading_engine::journal::trace::trace_ts;
+
+    let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
+
+    // Set up exchange with one instrument and funded account.
+    let mut exchange = trading_engine::exchange::Exchange::new();
+    exchange.add_instrument(InstrumentSpec {
+        symbol: Symbol(1),
+        base: CurrencyId(1),
+        quote: CurrencyId(2),
+    });
+    exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
+    exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
+
+    let tmp_dir = tempdir();
+    let journal_path = tmp_dir.join("pipeline-bench.journal");
+    let writer = JournalWriter::create(&journal_path).expect("create journal");
+
+    let group_commit_delay = Duration::from_micros(group_commit_us);
+    let (producer, journal_stage, matching_stage, mut output_consumer, _journal_cursor) =
+        build_pipeline(exchange, writer, group_commit_delay);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Spawn journal and matching stage threads.
+    let shutdown_j = Arc::clone(&shutdown);
+    let journal_handle = std::thread::Builder::new()
+        .name("journal".into())
+        .spawn(move || journal_stage.run(&shutdown_j))
+        .expect("spawn journal thread");
+
+    let shutdown_m = Arc::clone(&shutdown);
+    let matching_handle = std::thread::Builder::new()
+        .name("matching".into())
+        .spawn(move || matching_stage.run(&shutdown_m))
+        .expect("spawn matching thread");
+
+    let total_orders = WARMUP_ORDERS + total_pairs * 2;
+    let mut histogram =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+
+    // Track in-flight timestamps for windowed pipelining.
+    // VecDeque for FIFO: push_back on publish, pop_front on BatchEnd.
+    let mut inflight_ts: VecDeque<Instant> = VecDeque::with_capacity(window);
+    let mut completed = 0usize;
+
+    let start = Instant::now();
+
+    for i in 0..total_orders {
+        let order_id = OrderId((i as u64) + 1);
+        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+
+        // Wait for window capacity before publishing.
+        while inflight_ts.len() >= window {
+            drain_output(
+                &mut output_consumer,
+                &mut inflight_ts,
+                &mut histogram,
+                &mut completed,
+                WARMUP_ORDERS,
+            );
+        }
+
+        let ts = Instant::now();
+        producer.publish(InputSlot {
+            connection_id: 0,
+            event: JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: order_id,
+                    account: AccountId(1),
+                    side,
+                    order_type: OrderType::Limit {
+                        price: Price(nz(100)),
+                    },
+                    time_in_force: TimeInForce::GTC,
+                    quantity: Quantity(nz(1)),
+                },
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+        inflight_ts.push_back(ts);
+    }
+
+    // Drain remaining responses.
+    while completed < total_orders {
+        drain_output(
+            &mut output_consumer,
+            &mut inflight_ts,
+            &mut histogram,
+            &mut completed,
+            WARMUP_ORDERS,
+        );
+    }
+
+    let wall = start.elapsed();
+
+    // Shutdown pipeline threads.
+    shutdown.store(true, Ordering::Relaxed);
+
+    let mut extra_lines = Vec::new();
+    if group_commit_us > 0 {
+        extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
+    }
+    extra_lines.push(format!("  Window: {window}"));
+
+    print_results(
+        "Pipeline (no network)",
+        total_pairs * 2,
+        WARMUP_ORDERS,
+        &histogram,
+        wall,
+        &extra_lines,
+    );
+
+    println!();
+    println!("=== Pipeline Latency Trace ===");
+    println!();
+
+    // Wait for pipeline threads to finish and print trace reports.
+    let _ = journal_handle.join();
+    let _ = matching_handle.join();
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Drain available OutputSlots from the SPSC consumer, recording latency
+/// for each BatchEnd response.
+fn drain_output(
+    consumer: &mut trading_disruptor::spsc::Consumer<trading_engine::journal::pipeline::OutputSlot>,
+    inflight_ts: &mut VecDeque<Instant>,
+    histogram: &mut Histogram<u64>,
+    completed: &mut usize,
+    warmup: usize,
+) {
+    use trading_engine::journal::pipeline::OutputPayload;
+
+    loop {
+        let Some((_seq, slot)) = consumer.try_consume() else {
+            std::hint::spin_loop();
+            return;
+        };
+        if matches!(slot.payload, OutputPayload::BatchEnd) {
+            let sent_at = inflight_ts.pop_front().expect("inflight timestamp");
+            let latency_ns = sent_at.elapsed().as_nanos() as u64;
+            if *completed >= warmup {
+                histogram.record(latency_ns).expect("record");
+            }
+            *completed += 1;
+        }
+    }
+}
+
+// ===========================================================================
+// Roundtrip benchmark (full server with network transport)
+// ===========================================================================
+
+/// Full end-to-end roundtrip benchmark through the server with TCP or UDS.
+fn run_roundtrip_bench(
+    use_uds: bool,
+    pairs: usize,
+    window: usize,
+    num_clients: usize,
+    bench_threads: usize,
+    group_commit_us: u64,
+) {
     let tmp_dir = tempdir();
     let journal_path = tmp_dir.join("bench.journal");
 
@@ -114,7 +397,7 @@ fn main() {
             (read_stream, writer)
         };
 
-        run_bench(
+        run_roundtrip_inner(
             connect,
             "Unix domain socket",
             pairs,
@@ -140,7 +423,7 @@ fn main() {
             (read_stream, writer)
         };
 
-        run_bench(
+        run_roundtrip_inner(
             connect,
             "TCP loopback",
             pairs,
@@ -463,7 +746,7 @@ fn run_epoll_loop<W: Write>(
 // ---------------------------------------------------------------------------
 
 /// Create connections, distribute across bench threads, run, report results.
-fn run_bench<R, W, F>(
+fn run_roundtrip_inner<R, W, F>(
     connect: F,
     transport_name: &str,
     total_pairs: usize,
@@ -567,54 +850,21 @@ fn run_bench<R, W, F>(
 
     let blast_duration = blast_start.elapsed();
 
-    // --- Report ---
-    let total_measured = total_pairs * 2;
-    let total_orders = total_measured + (WARMUP_ORDERS * num_clients);
-    let throughput = (total_orders as f64) / blast_duration.as_secs_f64();
-    let wall_ms = blast_duration.as_micros() as f64 / 1000.0;
-
-    println!(
-        "=== Pipelined Benchmark ({total_measured} orders, {} warmup, window={window}, clients={num_clients}) ===",
-        WARMUP_ORDERS * num_clients
-    );
+    let mut extra_lines = Vec::new();
     if group_commit_us > 0 {
-        println!("  Group commit delay: {group_commit_us} µs");
+        extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
     }
-    println!();
-    println!("  Transport: {transport_name}");
-    println!("  Bench threads: {num_threads}");
-    println!();
-    println!("  Throughput");
-    println!("    wall time:  {wall_ms:.2} ms");
-    println!(
-        "    throughput: {throughput:.0} orders/sec ({:.2} µs/order)",
-        1_000_000.0 / throughput
-    );
-    println!();
-    println!("  Per-Order Round-Trip Latency (all clients merged)");
-    println!(
-        "    min:    {:>8.2} µs",
-        merged_histogram.min() as f64 / 1000.0
-    );
-    println!(
-        "    p50:    {:>8.2} µs",
-        merged_histogram.value_at_quantile(0.50) as f64 / 1000.0
-    );
-    println!(
-        "    p90:    {:>8.2} µs",
-        merged_histogram.value_at_quantile(0.90) as f64 / 1000.0
-    );
-    println!(
-        "    p99:    {:>8.2} µs",
-        merged_histogram.value_at_quantile(0.99) as f64 / 1000.0
-    );
-    println!(
-        "    p99.9:  {:>8.2} µs",
-        merged_histogram.value_at_quantile(0.999) as f64 / 1000.0
-    );
-    println!(
-        "    max:    {:>8.2} µs",
-        merged_histogram.max() as f64 / 1000.0
+    extra_lines.push(format!("  Transport: {transport_name}"));
+    extra_lines.push(format!("  Bench threads: {num_threads}"));
+    extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
+
+    print_results(
+        "Roundtrip",
+        total_pairs * 2,
+        WARMUP_ORDERS * num_clients,
+        &merged_histogram,
+        blast_duration,
+        &extra_lines,
     );
 
     // Signal server shutdown so pipeline threads can clean up and print
@@ -682,6 +932,56 @@ fn encode_frames(total_orders: usize, order_id_offset: u64) -> Vec<Vec<u8>> {
     }
 
     frames
+}
+
+// ===========================================================================
+// Shared reporting
+// ===========================================================================
+
+/// Print benchmark results: header, throughput, latency histogram.
+fn print_results(
+    label: &str,
+    measured_orders: usize,
+    warmup_orders: usize,
+    histogram: &Histogram<u64>,
+    wall: Duration,
+    extra_lines: &[String],
+) {
+    let total_orders = measured_orders + warmup_orders;
+    let throughput = (total_orders as f64) / wall.as_secs_f64();
+    let wall_ms = wall.as_micros() as f64 / 1000.0;
+
+    println!("=== {label} Benchmark ({measured_orders} measured, {warmup_orders} warmup) ===");
+    for line in extra_lines {
+        println!("{line}");
+    }
+    println!();
+    println!("  Throughput");
+    println!("    wall time:  {wall_ms:.2} ms");
+    println!(
+        "    throughput: {throughput:.0} orders/sec ({:.2} µs/order)",
+        1_000_000.0 / throughput
+    );
+    println!();
+    println!("  Per-Order Latency");
+    println!("    min:    {:>8.2} µs", histogram.min() as f64 / 1000.0);
+    println!(
+        "    p50:    {:>8.2} µs",
+        histogram.value_at_quantile(0.50) as f64 / 1000.0
+    );
+    println!(
+        "    p90:    {:>8.2} µs",
+        histogram.value_at_quantile(0.90) as f64 / 1000.0
+    );
+    println!(
+        "    p99:    {:>8.2} µs",
+        histogram.value_at_quantile(0.99) as f64 / 1000.0
+    );
+    println!(
+        "    p99.9:  {:>8.2} µs",
+        histogram.value_at_quantile(0.999) as f64 / 1000.0
+    );
+    println!("    max:    {:>8.2} µs", histogram.max() as f64 / 1000.0);
 }
 
 /// Create a temporary directory that persists for the process lifetime.
