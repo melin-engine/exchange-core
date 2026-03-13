@@ -89,7 +89,7 @@ impl Client {
         loop {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
-            let response = codec::decode_response(&frame)?;
+            let response = codec::decode_response(frame)?;
             match response {
                 ResponseKind::BatchEnd => break,
                 other => responses.push(other),

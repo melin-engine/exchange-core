@@ -395,7 +395,7 @@ fn run_client_loop<R: Read + Send + 'static, W: Write + Send>(
                     .expect("read_frame")
                     .expect("server disconnected unexpectedly");
 
-                let response = codec::decode_response(&frame).expect("decode response");
+                let response = codec::decode_response(frame).expect("decode response");
                 if matches!(response, ResponseKind::BatchEnd) {
                     let sent_at = ts_rx.recv().expect("timestamp channel closed");
                     let latency_ns = sent_at.elapsed().as_nanos() as u64;

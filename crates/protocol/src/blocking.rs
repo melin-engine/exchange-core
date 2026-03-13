@@ -21,17 +21,26 @@ const MAX_FRAME_SIZE: usize = 1024;
 /// and `std::os::unix::net::UnixStream`.
 pub struct BlockingFrameReader<R> {
     reader: BufReader<R>,
+    /// Reusable frame buffer — avoids a heap allocation per frame.
+    /// Fixed at MAX_FRAME_SIZE (1 KiB); the valid slice is `&buf[..len]`.
+    buf: [u8; MAX_FRAME_SIZE],
+    /// Length of the last successfully read frame (valid bytes in `buf`).
+    frame_len: usize,
 }
 
 impl<R: Read> BlockingFrameReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader: BufReader::new(reader),
+            buf: [0u8; MAX_FRAME_SIZE],
+            frame_len: 0,
         }
     }
 
-    /// Read the next complete frame. Returns `None` on clean disconnect.
-    pub fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+    /// Read the next complete frame into the internal buffer.
+    /// Returns a borrowed slice of the frame payload, or `None` on clean
+    /// disconnect. The slice is valid until the next `read_frame()` call.
+    pub fn read_frame(&mut self) -> io::Result<Option<&[u8]>> {
         // Read the 4-byte length prefix.
         let mut len_buf = [0u8; 4];
         match self.reader.read_exact(&mut len_buf) {
@@ -48,10 +57,10 @@ impl<R: Read> BlockingFrameReader<R> {
             ));
         }
 
-        let mut frame = vec![0u8; len];
-        self.reader.read_exact(&mut frame)?;
+        self.reader.read_exact(&mut self.buf[..len])?;
+        self.frame_len = len;
 
-        Ok(Some(frame))
+        Ok(Some(&self.buf[..len]))
     }
 }
 
