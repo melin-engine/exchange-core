@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
 use tracing::debug;
@@ -105,6 +106,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
     core_start: usize,
+    connection_timeout: Option<Duration>,
 ) -> UringReaderHandle<R> {
     let (tx, rx) = mpsc::channel();
 
@@ -120,7 +122,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
                 Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
                 Err(e) => tracing::warn!(thread = "uring-reader", core = core_start, error = %e, "failed to pin"),
             }
-            uring_reader_loop(rx, wakeup_fd, producer, &control_tx);
+            uring_reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout);
         })
         .expect("failed to spawn uring reader thread");
 
@@ -145,6 +147,9 @@ struct ConnectionEntry<R> {
     /// Multishot stays active until the kernel clears IORING_CQE_F_MORE
     /// (e.g., buffer pool exhaustion, socket error, or EOF).
     multishot_active: bool,
+    /// Last time any data was received on this connection. Used for
+    /// idle timeout detection.
+    last_activity: Instant,
 }
 
 /// Index-stable allocator for connection state. Slab indices are used as
@@ -203,6 +208,7 @@ fn uring_reader_loop<R: AsRawFd>(
     wakeup_fd: RawFd,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
+    connection_timeout: Option<Duration>,
 ) {
     let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
     let mut slab = ConnectionSlab::<R>::new();
@@ -234,6 +240,13 @@ fn uring_reader_loop<R: AsRawFd>(
     let mut publish_hist = trading_engine::journal::trace::StageHistogram::new(
         "reader: publish (decode → disruptor publish)",
     );
+
+    // Coarse gate for timeout scanning — avoids scanning on every
+    // submit_and_wait return during high throughput.
+    let mut last_timeout_scan = Instant::now();
+    // Pre-allocated buffer for stale connection indices to avoid
+    // heap allocation inside the hot loop.
+    let mut stale: Vec<(usize, u64, RawFd)> = Vec::new();
 
     loop {
         // Submit any pending SQEs and block until at least 1 CQE is ready.
@@ -277,6 +290,7 @@ fn uring_reader_loop<R: AsRawFd>(
                             _reader: reg.reader,
                             parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
                             multishot_active: false,
+                            last_activity: Instant::now(),
                         };
                         let idx = slab.insert(entry);
                         fd_to_slab.insert(fd, idx);
@@ -341,6 +355,9 @@ fn uring_reader_loop<R: AsRawFd>(
                     entry.multishot_active = false;
                 }
 
+                // Any successful recv resets the idle timeout.
+                entry.last_activity = Instant::now();
+
                 // Copy received data from the shared buffer pool into the
                 // connection's parse buffer.
                 let buf_start = buf_id * BUF_SIZE;
@@ -387,6 +404,35 @@ fn uring_reader_loop<R: AsRawFd>(
                     push_recv_multi(&mut ring, &mut slab, slab_idx);
                 }
                 Action::None => {}
+            }
+        }
+
+        // Scan for idle connections that have exceeded the timeout.
+        // Coarse gate: only scan once per second to avoid unnecessary
+        // iteration during high-throughput phases when submit_and_wait
+        // returns immediately with CQEs.
+        if let Some(timeout) = connection_timeout {
+            let now = Instant::now();
+            if now.duration_since(last_timeout_scan) >= Duration::from_secs(1) {
+                last_timeout_scan = now;
+                stale.clear();
+                for (idx, slot) in slab.entries.iter().enumerate() {
+                    if let Some(entry) = slot
+                        && now.duration_since(entry.last_activity) > timeout
+                    {
+                        debug!(
+                            connection_id = entry.connection_id,
+                            addr = %entry.addr,
+                            "connection timed out"
+                        );
+                        stale.push((idx, entry.connection_id, entry.fd));
+                    }
+                }
+                for &(idx, connection_id, fd) in &stale {
+                    slab.remove(idx);
+                    fd_to_slab.remove(&fd);
+                    let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
+                }
             }
         }
     }
@@ -543,6 +589,12 @@ fn process_frames<R>(
             }
         };
 
+        // Heartbeat requests are keepalives — they reset last_activity
+        // (caller updates it on recv) but must not enter the pipeline.
+        if matches!(request, Request::Heartbeat) {
+            continue;
+        }
+
         #[allow(clippy::let_unit_value)]
         let recv_ts = trace_ts();
 
@@ -578,9 +630,12 @@ fn process_frames<R>(
 }
 
 /// Convert a wire `Request` to a `JournalEvent` for the pipeline.
+///
+/// `Request::Heartbeat` is filtered out before reaching this function.
 fn request_to_event(request: &Request) -> JournalEvent {
     match *request {
         Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
         Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
+        Request::Heartbeat => unreachable!("heartbeats filtered before request_to_event"),
     }
 }

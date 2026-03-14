@@ -13,6 +13,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use trading_disruptor::padding::Sequence;
 use trading_disruptor::spsc;
@@ -50,6 +51,13 @@ pub enum ControlEvent {
     Disconnected { connection_id: u64 },
 }
 
+/// Per-connection state for the response stage.
+struct ConnectionState {
+    writer: BlockingFrameWriter<Box<dyn Write + Send>>,
+    /// Last time data was sent to this connection. Used for heartbeat scheduling.
+    last_send: Instant,
+}
+
 /// Run the response stage loop. Blocks the calling thread until shutdown.
 ///
 /// Consumes from the output SPSC and writes encoded responses directly
@@ -61,11 +69,11 @@ pub fn run(
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
     shutdown: &AtomicBool,
+    heartbeat_interval: Option<Duration>,
 ) {
-    // Connection table: maps connection IDs to their blocking writers.
+    // Connection table: maps connection IDs to their state (writer + last_send).
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
-    let mut connections: HashMap<u64, BlockingFrameWriter<Box<dyn Write + Send>>> =
-        HashMap::with_capacity(256);
+    let mut connections: HashMap<u64, ConnectionState> = HashMap::with_capacity(256);
 
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
@@ -93,6 +101,19 @@ pub fn run(
     // many batches instead of paying it every batch.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
 
+    // Pre-encode the heartbeat response frame once. Tag-only (1 byte payload).
+    let heartbeat_frame = {
+        let mut buf = [0u8; 8];
+        let written =
+            codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
+        // write_frame expects payload without length prefix.
+        let payload = buf[4..written].to_vec();
+        payload
+    };
+
+    // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
+    let mut last_heartbeat_scan = Instant::now();
+
     // Adaptive spin: spin first (fast wakeup), yield after threshold
     // to avoid aggressive OS preemption of this pipeline thread.
     let mut idle_spins: u32 = 0;
@@ -107,8 +128,8 @@ pub fn run(
             // Flush any remaining buffered writes before shutdown.
             // Best-effort: clients may have disconnected already.
             for conn_id in &dirty_connections {
-                if let Some(writer) = connections.get_mut(conn_id)
-                    && let Err(e) = writer.flush()
+                if let Some(state) = connections.get_mut(conn_id)
+                    && let Err(e) = state.writer.flush()
                 {
                     tracing::debug!(conn = conn_id, "flush on shutdown: {e}");
                 }
@@ -131,7 +152,13 @@ pub fn run(
                     connection_id,
                     writer,
                 } => {
-                    connections.insert(connection_id, writer);
+                    connections.insert(
+                        connection_id,
+                        ConnectionState {
+                            writer,
+                            last_send: Instant::now(),
+                        },
+                    );
                 }
                 ControlEvent::Disconnected { connection_id } => {
                     connections.remove(&connection_id);
@@ -149,14 +176,51 @@ pub fn run(
             // load, we reach this quickly and flush promptly.
             if !dirty_connections.is_empty() {
                 for conn_id in dirty_connections.drain() {
-                    if let Some(writer) = connections.get_mut(&conn_id)
-                        && let Err(e) = writer.flush()
+                    if let Some(state) = connections.get_mut(&conn_id)
+                        && let Err(e) = state.writer.flush()
                     {
                         tracing::debug!(
                             connection_id = conn_id,
                             error = %e,
                             "flush error, dropping connection"
                         );
+                        connections.remove(&conn_id);
+                    }
+                }
+            }
+
+            // Send heartbeats to idle connections. Only checked during
+            // idle periods (SPSC empty) to avoid overhead on the hot path.
+            if let Some(interval) = heartbeat_interval {
+                let now = Instant::now();
+                // Coarse gate: only scan at most once per second.
+                if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
+                    last_heartbeat_scan = now;
+                    let mut failed: Vec<u64> = Vec::new();
+                    for (&conn_id, state) in connections.iter_mut() {
+                        if now.duration_since(state.last_send) >= interval {
+                            if let Err(e) = state.writer.write_frame(&heartbeat_frame) {
+                                tracing::debug!(
+                                    connection_id = conn_id,
+                                    error = %e,
+                                    "heartbeat write error, dropping connection"
+                                );
+                                failed.push(conn_id);
+                                continue;
+                            }
+                            if let Err(e) = state.writer.flush() {
+                                tracing::debug!(
+                                    connection_id = conn_id,
+                                    error = %e,
+                                    "heartbeat flush error, dropping connection"
+                                );
+                                failed.push(conn_id);
+                                continue;
+                            }
+                            state.last_send = now;
+                        }
+                    }
+                    for conn_id in failed {
                         connections.remove(&conn_id);
                     }
                 }
@@ -215,7 +279,7 @@ pub fn run(
                 OutputPayload::EngineError => ResponseKind::EngineError,
             };
 
-            if let Some(writer) = connections.get_mut(&slot.connection_id) {
+            if let Some(state) = connections.get_mut(&slot.connection_id) {
                 // Encode the response directly to wire format.
                 let written = match codec::encode_response(&kind, &mut encode_buf) {
                     Ok(n) => n,
@@ -231,7 +295,7 @@ pub fn run(
 
                 // write_frame expects the payload (tag + fields), not the
                 // length prefix. encode_response writes [length(4) | tag+payload].
-                if let Err(e) = writer.write_frame(&encode_buf[4..written]) {
+                if let Err(e) = state.writer.write_frame(&encode_buf[4..written]) {
                     tracing::debug!(
                         connection_id = slot.connection_id,
                         error = %e,
@@ -241,6 +305,7 @@ pub fn run(
                     continue;
                 }
 
+                state.last_send = Instant::now();
                 dirty_connections.insert(slot.connection_id);
 
                 // Record server-side end-to-end: reader recv → response flush.

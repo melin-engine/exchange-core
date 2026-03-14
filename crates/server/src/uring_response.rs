@@ -13,6 +13,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
 use tracing::debug;
@@ -72,6 +73,8 @@ struct ConnectionEntry {
     /// referencing `as_ptr()` remain valid even if the HashMap relocates
     /// this struct — as long as we don't reallocate the Vec during in-flight sends.
     send_buf: Vec<u8>,
+    /// Last time data was sent to this connection. Used for heartbeat scheduling.
+    last_send: Instant,
 }
 
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
@@ -84,6 +87,7 @@ pub fn run(
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
     shutdown: &AtomicBool,
+    heartbeat_interval: Option<Duration>,
 ) {
     let mut ring =
         IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
@@ -122,6 +126,18 @@ pub fn run(
     // processing because the CQ borrow must end before mutating connections.
     // Pre-sized to RING_SIZE to avoid per-iteration heap allocation.
     let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(RING_SIZE as usize);
+
+    // Pre-encode the heartbeat response frame once. Full wire frame
+    // (length prefix + tag) for direct append to send_buf.
+    let heartbeat_wire_frame = {
+        let mut buf = [0u8; 8];
+        let written =
+            codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
+        buf[..written].to_vec()
+    };
+
+    // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
+    let mut last_heartbeat_scan = Instant::now();
 
     // Adaptive spin: spin first (fast wakeup), yield after threshold.
     let mut idle_spins: u32 = 0;
@@ -169,6 +185,7 @@ pub fn run(
                             fd,
                             _owner,
                             send_buf: Vec::with_capacity(4096),
+                            last_send: Instant::now(),
                         },
                     );
                 }
@@ -196,6 +213,38 @@ pub fn run(
                 }
                 dirty_connections.clear();
             }
+
+            // Send heartbeats to idle connections. Only checked during
+            // idle periods (SPSC empty) to avoid overhead on the hot path.
+            if let Some(interval) = heartbeat_interval {
+                let now = Instant::now();
+                // Coarse gate: only scan at most once per second.
+                if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
+                    last_heartbeat_scan = now;
+                    for (&conn_id, entry) in connections.iter_mut() {
+                        if now.duration_since(entry.last_send) >= interval {
+                            entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
+                            dirty_connections.insert(conn_id);
+                            entry.last_send = now;
+                        }
+                    }
+                    // Flush the heartbeat sends immediately.
+                    if !dirty_connections.is_empty() {
+                        flush_sends(
+                            &mut ring,
+                            &mut connections,
+                            &dirty_connections,
+                            &mut to_remove,
+                            &mut cqes,
+                        );
+                        for conn_id in to_remove.drain(..) {
+                            connections.remove(&conn_id);
+                        }
+                        dirty_connections.clear();
+                    }
+                }
+            }
+
             #[cfg(feature = "pipeline-stats")]
             {
                 idle_count += 1;
@@ -278,6 +327,7 @@ pub fn run(
                 // encode_response writes [length(4) | payload], which is the
                 // complete wire format — no extra framing needed.
                 entry.send_buf.extend_from_slice(&encode_buf[..written]);
+                entry.last_send = Instant::now();
                 dirty_connections.insert(slot.connection_id);
 
                 // Record server-side end-to-end: reader recv → response flush.

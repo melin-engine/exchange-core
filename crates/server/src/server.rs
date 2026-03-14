@@ -67,6 +67,14 @@ pub struct ServerConfig {
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
     #[arg(long, default_value_t = 0)]
     pub group_commit_us: u64,
+    /// Heartbeat interval in seconds. The server sends a heartbeat to idle
+    /// connections after this many seconds of silence. Set to 0 to disable.
+    #[arg(long, default_value_t = 10)]
+    pub heartbeat_interval_secs: u64,
+    /// Connection timeout in seconds. The server disconnects clients that
+    /// have not sent any data within this window. Set to 0 to disable.
+    #[arg(long, default_value_t = 30)]
+    pub connection_timeout_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +87,8 @@ impl Default for ServerConfig {
             readers: 2,
             reader_cores: 4,
             group_commit_us: 0,
+            heartbeat_interval_secs: 10,
+            connection_timeout_secs: 30,
         }
     }
 }
@@ -87,6 +97,24 @@ impl ServerConfig {
     /// Group commit delay as a Duration.
     pub fn group_commit_delay(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.group_commit_us)
+    }
+
+    /// Heartbeat interval as a Duration. Returns `None` if disabled (0).
+    pub fn heartbeat_interval(&self) -> Option<std::time::Duration> {
+        if self.heartbeat_interval_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(self.heartbeat_interval_secs))
+        }
+    }
+
+    /// Connection timeout as a Duration. Returns `None` if disabled (0).
+    pub fn connection_timeout(&self) -> Option<std::time::Duration> {
+        if self.connection_timeout_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(self.connection_timeout_secs))
+        }
     }
 }
 
@@ -153,11 +181,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // multiplex its connections and MultiProducer to publish to the
     // disruptor. With 2 readers (cores 4-5) + 3 pipeline (cores 1-3) =
     // 5 pinned OS threads, no oversubscription even with hundreds of connections.
+    let connection_timeout = config.connection_timeout();
+    let heartbeat_interval = config.heartbeat_interval();
+
     let mut reader_handle = reader::spawn_reader_pool(
         config.readers,
         input_producer,
         control_tx.clone(),
         config.reader_cores,
+        connection_timeout,
     );
 
     // Spawn pipeline OS threads.
@@ -187,9 +219,21 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         .spawn(move || {
             apply_affinity("response", cores[2]);
             #[cfg(not(feature = "io-uring"))]
-            crate::response::run(output_consumer, control_rx, journal_cursor, &s3);
+            crate::response::run(
+                output_consumer,
+                control_rx,
+                journal_cursor,
+                &s3,
+                heartbeat_interval,
+            );
             #[cfg(feature = "io-uring")]
-            crate::uring_response::run(output_consumer, control_rx, journal_cursor, &s3);
+            crate::uring_response::run(
+                output_consumer,
+                control_rx,
+                journal_cursor,
+                &s3,
+                heartbeat_interval,
+            );
         })
         .expect("failed to spawn response thread");
 

@@ -477,7 +477,9 @@ fn client_thread(
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
                         ResponseKind::EngineError => "ENGINE ERROR".into(),
-                        ResponseKind::BatchEnd | ResponseKind::ServerReady => continue,
+                        ResponseKind::BatchEnd
+                        | ResponseKind::ServerReady
+                        | ResponseKind::Heartbeat => continue,
                     };
                     let _ = response_tx.send(msg);
                 }

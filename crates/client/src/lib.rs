@@ -97,7 +97,8 @@ impl Client {
         self.writer.write_frame(&self.encode_buf[4..written])?;
         self.writer.flush()?;
 
-        // Collect responses until BatchEnd.
+        // Collect responses until BatchEnd. Heartbeats received during
+        // idle periods are silently consumed (not part of a request batch).
         let mut responses = Vec::new();
         loop {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
@@ -105,6 +106,7 @@ impl Client {
             let response = codec::decode_response(frame)?;
             match response {
                 ResponseKind::BatchEnd => break,
+                ResponseKind::Heartbeat | ResponseKind::ServerReady => continue,
                 other => responses.push(other),
             }
         }

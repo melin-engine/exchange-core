@@ -24,6 +24,9 @@ pub enum Request {
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
     CancelOrder { symbol: Symbol, order_id: OrderId },
+    /// Keepalive heartbeat. Resets the server's idle timeout for this
+    /// connection. Tag-only, no payload.
+    Heartbeat,
 }
 
 /// Server → client response payload.
@@ -43,4 +46,6 @@ pub enum ResponseKind {
     /// sending requests. Used for readiness synchronization in LAN
     /// benchmarks where the client can't observe server startup.
     ServerReady,
+    /// Keepalive heartbeat sent during idle periods. Tag-only, no payload.
+    Heartbeat,
 }

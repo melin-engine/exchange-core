@@ -19,6 +19,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 
@@ -93,6 +94,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
     core_start: usize,
+    connection_timeout: Option<Duration>,
 ) -> EpollReaderHandle<R> {
     assert!(num_threads > 0, "need at least 1 reader thread");
 
@@ -110,6 +112,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
         let wakeup_fd = event_fd;
         let core_id = core_start + i;
 
+        let timeout = connection_timeout;
         std::thread::Builder::new()
             .name(format!("reader-{i}"))
             .spawn(move || {
@@ -117,7 +120,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
                     Ok(c) => tracing::info!(thread = "reader-{i}", core = c, "pinned to core"),
                     Err(e) => tracing::warn!(thread = "reader-{i}", core = core_id, error = %e, "failed to pin"),
                 }
-                epoll_reader_loop(rx, wakeup_fd, producer_clone, &control_tx_clone);
+                epoll_reader_loop(rx, wakeup_fd, producer_clone, &control_tx_clone, timeout);
             })
             .expect("failed to spawn reader thread");
 
@@ -146,6 +149,9 @@ struct ConnectionState<R> {
     payload_filled: usize,
     /// True when we've parsed the length prefix and are reading payload.
     reading_payload: bool,
+    /// Last time any data was received on this connection. Used for
+    /// idle timeout detection.
+    last_activity: Instant,
 }
 
 /// Main epoll reader loop. Runs until the channel is disconnected.
@@ -154,6 +160,7 @@ fn epoll_reader_loop<R: AsRawFd>(
     wakeup_fd: RawFd,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
+    connection_timeout: Option<Duration>,
 ) {
     let epoll_fd = unsafe { libc::epoll_create1(0) };
     assert!(epoll_fd >= 0, "epoll_create1 failed");
@@ -175,9 +182,29 @@ fn epoll_reader_loop<R: AsRawFd>(
         "reader: publish (decode → disruptor publish)",
     );
 
+    // epoll_wait timeout: 1000ms when connection timeouts are enabled
+    // so we periodically scan for stale connections; -1 (block forever)
+    // when disabled.
+    let epoll_timeout_ms: i32 = if connection_timeout.is_some() {
+        1000
+    } else {
+        -1
+    };
+
+    // Coarse gate for timeout scanning — avoids scanning on every
+    // epoll_wait return during high throughput. Only scans when >=1 second
+    // has elapsed since the last scan.
+    let mut last_timeout_scan = Instant::now();
+
     loop {
-        let nfds =
-            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EPOLL_EVENTS as i32, -1) };
+        let nfds = unsafe {
+            libc::epoll_wait(
+                epoll_fd,
+                events.as_mut_ptr(),
+                MAX_EPOLL_EVENTS as i32,
+                epoll_timeout_ms,
+            )
+        };
 
         if nfds < 0 {
             let err = io::Error::last_os_error();
@@ -219,6 +246,32 @@ fn epoll_reader_loop<R: AsRawFd>(
 
             if disconnected {
                 remove_connection(epoll_fd, fd, &mut connections, control_tx);
+            }
+        }
+
+        // Scan for idle connections that have exceeded the timeout.
+        // Coarse gate: only scan once per second to avoid unnecessary
+        // iteration during high-throughput phases when epoll_wait returns
+        // immediately with events.
+        if let Some(timeout) = connection_timeout {
+            let now = Instant::now();
+            if now.duration_since(last_timeout_scan) >= Duration::from_secs(1) {
+                last_timeout_scan = now;
+                let stale_fds: Vec<RawFd> = connections
+                    .iter()
+                    .filter(|(_, conn)| now.duration_since(conn.last_activity) > timeout)
+                    .map(|(&fd, _)| fd)
+                    .collect();
+                for fd in stale_fds {
+                    if let Some(conn) = connections.get(&fd) {
+                        debug!(
+                            connection_id = conn.connection_id,
+                            addr = %conn.addr,
+                            "connection timed out"
+                        );
+                    }
+                    remove_connection(epoll_fd, fd, &mut connections, control_tx);
+                }
             }
         }
     }
@@ -274,6 +327,7 @@ fn register_connection<R: AsRawFd>(
             payload_len: 0,
             payload_filled: 0,
             reading_payload: false,
+            last_activity: Instant::now(),
         },
     );
 }
@@ -319,6 +373,8 @@ fn process_connection<R>(
                     if filled < 4 {
                         return false; // EAGAIN
                     }
+                    // Any successful read resets the idle timeout.
+                    conn.last_activity = Instant::now();
                     let len = u32::from_le_bytes(conn.len_buf) as usize;
                     if len > MAX_FRAME_SIZE {
                         debug!(
@@ -367,6 +423,12 @@ fn process_connection<R>(
                             continue;
                         }
                     };
+
+                    // Heartbeat requests are keepalives — they reset
+                    // last_activity (above) but must not enter the pipeline.
+                    if matches!(request, Request::Heartbeat) {
+                        continue;
+                    }
 
                     #[allow(clippy::let_unit_value)]
                     let recv_ts = trace_ts();
@@ -435,9 +497,12 @@ fn nonblocking_read(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 }
 
 /// Convert a wire `Request` to a `JournalEvent` for the pipeline.
+///
+/// `Request::Heartbeat` is filtered out before reaching this function.
 fn request_to_event(request: &Request) -> JournalEvent {
     match *request {
         Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
         Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
+        Request::Heartbeat => unreachable!("heartbeats filtered before request_to_event"),
     }
 }

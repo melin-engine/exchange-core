@@ -30,6 +30,7 @@ use crate::message::{Request, ResponseKind};
 // --- Request tags ---
 const TAG_SUBMIT_ORDER: u8 = 1;
 const TAG_CANCEL_ORDER: u8 = 2;
+const TAG_REQUEST_HEARTBEAT: u8 = 3;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -40,6 +41,7 @@ const TAG_REJECTED: u8 = 15;
 const TAG_ENGINE_ERROR: u8 = 16;
 const TAG_BATCH_END: u8 = 17;
 const TAG_SERVER_READY: u8 = 18;
+const TAG_RESPONSE_HEARTBEAT: u8 = 19;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -77,6 +79,10 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+        }
+        Request::Heartbeat => {
+            buf[pos] = TAG_REQUEST_HEARTBEAT;
+            pos += 1;
         }
     }
 
@@ -116,6 +122,7 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
                 order_id: OrderId(le::get_u64(&payload[4..])),
             })
         }
+        TAG_REQUEST_HEARTBEAT => Ok(Request::Heartbeat),
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -142,6 +149,10 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = TAG_SERVER_READY;
             pos += 1;
         }
+        ResponseKind::Heartbeat => {
+            buf[pos] = TAG_RESPONSE_HEARTBEAT;
+            pos += 1;
+        }
     }
 
     let payload_len = pos - 4;
@@ -163,6 +174,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
         TAG_ENGINE_ERROR => Ok(ResponseKind::EngineError),
         TAG_BATCH_END => Ok(ResponseKind::BatchEnd),
         TAG_SERVER_READY => Ok(ResponseKind::ServerReady),
+        TAG_RESPONSE_HEARTBEAT => Ok(ResponseKind::Heartbeat),
         TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
@@ -569,6 +581,7 @@ mod tests {
                 symbol: Symbol(1),
                 order_id: OrderId(100),
             },
+            Request::Heartbeat,
         ]
     }
 
@@ -623,6 +636,7 @@ mod tests {
             ResponseKind::EngineError,
             ResponseKind::BatchEnd,
             ResponseKind::ServerReady,
+            ResponseKind::Heartbeat,
         ]
     }
 
