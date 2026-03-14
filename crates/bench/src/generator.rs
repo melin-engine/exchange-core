@@ -55,6 +55,15 @@ pub struct GeneratorConfig {
     /// Aggressive buys are placed above mid, aggressive sells below mid,
     /// producing immediate fills. Default: 0.10 (10% of submits fill).
     pub aggression_ratio: f64,
+    /// Probability that a submit is a market order (no price, IOC-like).
+    /// Default: 0.05 (5% of submits).
+    pub market_order_ratio: f64,
+    /// Probability that a limit order uses IOC time-in-force instead of GTC.
+    /// Default: 0.05 (5% of limit submits).
+    pub ioc_ratio: f64,
+    /// Probability that a limit order uses FOK time-in-force instead of GTC.
+    /// Default: 0.02 (2% of limit submits).
+    pub fok_ratio: f64,
     /// Starting order ID. Used to partition ID ranges across multiple
     /// bench clients to avoid collisions.
     pub start_order_id: u64,
@@ -73,6 +82,9 @@ impl Default for GeneratorConfig {
             min_size: 1,
             max_size: 1000,
             aggression_ratio: 0.10,
+            market_order_ratio: 0.05,
+            ioc_ratio: 0.05,
+            fok_ratio: 0.02,
             start_order_id: 1,
         }
     }
@@ -180,26 +192,49 @@ impl OrderFlowGenerator {
         } else {
             Side::Sell
         };
-        let price = self.pick_price(side);
         let quantity = self.pick_size();
 
-        // Track for future cancellation. If the ring is full, the evicted
-        // order gets a pending cancel so it doesn't orphan in the book.
-        let cap = self.live_orders.len();
-        let write_idx = self.live_cursor % cap;
-        if self.live_count == cap {
-            let (evicted_id, evicted_sym) = self.live_orders[write_idx];
-            if evicted_id.0 != 0 {
-                self.pending_cancels.push(GeneratedEvent::Cancel {
-                    symbol: evicted_sym,
-                    order_id: evicted_id,
-                });
+        // Pick order type and time-in-force.
+        let roll: f64 = self.unit_dist.sample(&mut self.rng);
+        let (order_type, time_in_force) = if roll < self.config.market_order_ratio {
+            // Market order — no price, always IOC semantics.
+            (OrderType::Market, TimeInForce::IOC)
+        } else {
+            let price = self.pick_price(side);
+            let tif_roll: f64 = self.unit_dist.sample(&mut self.rng);
+            let tif = if tif_roll < self.config.fok_ratio {
+                TimeInForce::FOK
+            } else if tif_roll < self.config.fok_ratio + self.config.ioc_ratio {
+                TimeInForce::IOC
+            } else {
+                TimeInForce::GTC
+            };
+            (OrderType::Limit { price }, tif)
+        };
+
+        // Only track GTC limit orders for cancellation — market/IOC/FOK
+        // orders don't rest on the book.
+        let rests = matches!(
+            (&order_type, time_in_force),
+            (OrderType::Limit { .. }, TimeInForce::GTC)
+        );
+        if rests {
+            let cap = self.live_orders.len();
+            let write_idx = self.live_cursor % cap;
+            if self.live_count == cap {
+                let (evicted_id, evicted_sym) = self.live_orders[write_idx];
+                if evicted_id.0 != 0 {
+                    self.pending_cancels.push(GeneratedEvent::Cancel {
+                        symbol: evicted_sym,
+                        order_id: evicted_id,
+                    });
+                }
             }
-        }
-        self.live_orders[write_idx] = (order_id, symbol);
-        self.live_cursor += 1;
-        if self.live_count < cap {
-            self.live_count += 1;
+            self.live_orders[write_idx] = (order_id, symbol);
+            self.live_cursor += 1;
+            if self.live_count < cap {
+                self.live_count += 1;
+            }
         }
 
         GeneratedEvent::Submit {
@@ -208,8 +243,8 @@ impl OrderFlowGenerator {
                 id: order_id,
                 account,
                 side,
-                order_type: OrderType::Limit { price },
-                time_in_force: TimeInForce::GTC,
+                order_type,
+                time_in_force,
                 quantity,
                 stp: SelfTradeProtection::Allow,
             },
@@ -419,6 +454,37 @@ mod tests {
             }
         }
         panic!("no submit generated");
+    }
+
+    #[test]
+    fn order_type_diversity() {
+        let mut ofg = OrderFlowGenerator::new(GeneratorConfig::default());
+        let mut markets = 0u64;
+        let mut limit_gtc = 0u64;
+        let mut limit_ioc = 0u64;
+        let mut limit_fok = 0u64;
+
+        for _ in 0..100_000 {
+            if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
+                match (&order.order_type, order.time_in_force) {
+                    (OrderType::Market, _) => markets += 1,
+                    (OrderType::Limit { .. }, TimeInForce::GTC) => limit_gtc += 1,
+                    (OrderType::Limit { .. }, TimeInForce::IOC) => limit_ioc += 1,
+                    (OrderType::Limit { .. }, TimeInForce::FOK) => limit_fok += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(markets > 0, "should have market orders");
+        assert!(limit_gtc > 0, "should have limit GTC orders");
+        assert!(limit_ioc > 0, "should have limit IOC orders");
+        assert!(limit_fok > 0, "should have limit FOK orders");
+        // GTC should be the majority.
+        assert!(
+            limit_gtc > markets + limit_ioc + limit_fok,
+            "GTC should dominate"
+        );
     }
 
     #[test]
