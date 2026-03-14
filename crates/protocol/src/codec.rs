@@ -31,6 +31,7 @@ use crate::message::{Request, ResponseKind};
 const TAG_SUBMIT_ORDER: u8 = 1;
 const TAG_CANCEL_ORDER: u8 = 2;
 const TAG_REQUEST_HEARTBEAT: u8 = 3;
+const TAG_CANCEL_ALL: u8 = 4;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -83,6 +84,12 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
         }
+        Request::CancelAll { account } => {
+            buf[pos] = TAG_CANCEL_ALL;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+        }
         Request::Heartbeat => {
             buf[pos] = TAG_REQUEST_HEARTBEAT;
             pos += 1;
@@ -123,6 +130,14 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             Ok(Request::CancelOrder {
                 symbol: Symbol(le::get_u32(&payload[0..])),
                 order_id: OrderId(le::get_u64(&payload[4..])),
+            })
+        }
+        TAG_CANCEL_ALL => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(Request::CancelAll {
+                account: AccountId(le::get_u32(&payload[0..])),
             })
         }
         TAG_REQUEST_HEARTBEAT => Ok(Request::Heartbeat),
@@ -589,6 +604,9 @@ mod tests {
             Request::CancelOrder {
                 symbol: Symbol(1),
                 order_id: OrderId(100),
+            },
+            Request::CancelAll {
+                account: AccountId(42),
             },
             Request::Heartbeat,
         ]

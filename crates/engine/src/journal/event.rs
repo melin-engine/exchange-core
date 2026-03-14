@@ -26,4 +26,7 @@ pub enum JournalEvent {
     CancelOrder { symbol: Symbol, order_id: OrderId },
     /// Set fat finger risk limits for an instrument.
     SetRiskLimits { symbol: Symbol, limits: RiskLimits },
+    /// Cancel all resting orders and pending stops for an account
+    /// across all instruments (kill switch).
+    CancelAll { account: AccountId },
 }

@@ -296,6 +296,40 @@ impl Exchange {
         }
     }
 
+    /// Cancel all resting orders and pending stops for an account across
+    /// all instruments (kill switch). Releases all associated reservations.
+    pub fn cancel_all(&mut self, account: AccountId, reports: &mut Vec<ExecutionReport>) {
+        // Collect symbols first to avoid borrowing self.books while also
+        // needing self.accounts and self.order_sides.
+        let symbols: Vec<Symbol> = self.books.keys().copied().collect();
+
+        for symbol in symbols {
+            let Some(spec) = self.instruments.get(&symbol).copied() else {
+                continue;
+            };
+
+            let report_start = reports.len();
+
+            let Some(book) = self.books.get_mut(&symbol) else {
+                continue;
+            };
+            book.cancel_all_for_account(account, reports);
+
+            let new_reports = &reports[report_start..];
+            self.consumed_buf.clear();
+            self.accounts.process_reports(
+                new_reports,
+                &self.order_sides,
+                &spec,
+                &mut self.consumed_buf,
+            );
+
+            for &order_id in &self.consumed_buf {
+                self.order_sides.remove(&order_id);
+            }
+        }
+    }
+
     /// Cancel a resting order on the given instrument.
     pub fn cancel(
         &mut self,
@@ -2441,6 +2475,162 @@ mod tests {
             &mut reports,
         );
         assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    // --- Kill switch tests ---
+
+    #[test]
+    fn cancel_all_cancels_resting_orders() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 1000);
+
+        let mut reports = Vec::new();
+        // ACCT_A places two buy orders.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 99, 20, TimeInForce::GTC),
+            &mut reports,
+        );
+        // ACCT_B places a sell order (distinct OrderId to avoid global collision).
+        exchange.execute(
+            Symbol(1),
+            limit_order(100, ACCT_B, Side::Sell, 200, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Kill switch for ACCT_A.
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        // Should produce exactly 2 Cancelled reports (ACCT_A's orders).
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|r| matches!(r, ExecutionReport::Cancelled { .. }))
+        );
+
+        // ACCT_B's order should still be resting.
+        reports.clear();
+        exchange.cancel(Symbol(1), OrderId(100), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0], ExecutionReport::Cancelled { .. }));
+    }
+
+    #[test]
+    fn cancel_all_releases_reservations() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        // Place a buy order that reserves 100 * 50 = 5000.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 50, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 5_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 5_000);
+
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        // Reservation should be fully released.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 10_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn cancel_all_across_multiple_instruments() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.add_instrument(eth_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            Symbol(2),
+            limit_order(2, ACCT_A, Side::Buy, 50, 20, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        // Both orders cancelled.
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|r| matches!(r, ExecutionReport::Cancelled { .. }))
+        );
+    }
+
+    #[test]
+    fn cancel_all_cancels_pending_stops() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell so there's a trade to set last_trade_price,
+        // then a stop-buy for ACCT_A.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop {
+                    trigger_price: price(500),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+            },
+            &mut reports,
+        );
+        // Also a resting limit order.
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Sell, 1000, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        // Both the pending stop and the resting limit should be cancelled.
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|r| matches!(r, ExecutionReport::Cancelled { .. }))
+        );
+    }
+
+    #[test]
+    fn cancel_all_empty_is_noop() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(reports.is_empty());
     }
 
     // --- Client dedup tests (continued) ---

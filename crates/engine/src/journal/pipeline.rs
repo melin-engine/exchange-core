@@ -537,6 +537,9 @@ impl MatchingStage {
             JournalEvent::SetRiskLimits { symbol, limits } => {
                 self.exchange.set_risk_limits(symbol, limits);
             }
+            JournalEvent::CancelAll { account } => {
+                self.exchange.cancel_all(account, reports);
+            }
         }
     }
 }

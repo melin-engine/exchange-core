@@ -4,7 +4,7 @@
 //! Administrative operations (add instrument, deposit) are server-side
 //! only — they'll be configured at startup or via a separate admin API.
 
-use trading_engine::types::{ExecutionReport, Order, OrderId, Symbol};
+use trading_engine::types::{AccountId, ExecutionReport, Order, OrderId, Symbol};
 
 /// Connection identifier assigned by the server.
 ///
@@ -24,6 +24,9 @@ pub enum Request {
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
     CancelOrder { symbol: Symbol, order_id: OrderId },
+    /// Cancel all resting orders and pending stops for an account
+    /// across all instruments (kill switch).
+    CancelAll { account: AccountId },
     /// Keepalive heartbeat. Resets the server's idle timeout for this
     /// connection. Tag-only, no payload.
     Heartbeat,

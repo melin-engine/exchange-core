@@ -43,7 +43,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// Current format version. Bumped on any layout change.
 /// v1 → v2: added SelfTradeProtection byte to Order encoding.
 /// v2 → v3: added SetRiskLimits event for fat finger checks.
-pub const FORMAT_VERSION: u16 = 3;
+/// v3 → v4: added CancelAll event for kill switch.
+pub const FORMAT_VERSION: u16 = 4;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -63,6 +64,7 @@ const TAG_DEPOSIT: u8 = 2;
 const TAG_SUBMIT_ORDER: u8 = 3;
 const TAG_CANCEL_ORDER: u8 = 4;
 const TAG_SET_RISK_LIMITS: u8 = 5;
+const TAG_CANCEL_ALL: u8 = 6;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -174,6 +176,11 @@ pub fn encode(
                 }
             }
             TAG_SET_RISK_LIMITS
+        }
+        JournalEvent::CancelAll { account } => {
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+            TAG_CANCEL_ALL
         }
     };
 
@@ -378,6 +385,17 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                     max_order_qty,
                     max_order_notional,
                 },
+            }
+        }
+        TAG_CANCEL_ALL => {
+            if payload.len() < 4 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "CancelAll payload too short",
+                });
+            }
+            JournalEvent::CancelAll {
+                account: AccountId(le::get_u32(&payload[0..])),
             }
         }
         _ => {
@@ -628,6 +646,9 @@ mod tests {
                     max_order_qty: None,
                     max_order_notional: None,
                 },
+            },
+            JournalEvent::CancelAll {
+                account: AccountId(42),
             },
         ]
     }

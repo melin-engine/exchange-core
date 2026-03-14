@@ -433,6 +433,60 @@ impl OrderBook {
         }
     }
 
+    /// Cancel all resting orders and pending stops belonging to the given
+    /// account. Used by the kill switch. Produces one `Cancelled` report
+    /// per removed order.
+    ///
+    /// Scans the book linearly — O(total_orders) — which is acceptable
+    /// since kill switch is a rare emergency operation, not on the hot path.
+    pub fn cancel_all_for_account(
+        &mut self,
+        account: AccountId,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
+        // Collect matching order IDs by scanning the book sides directly.
+        // We scan the BTreeMap levels (not order_index) because RestingOrder
+        // carries the account field we need to filter on.
+        let mut to_cancel: Vec<OrderId> = Vec::new();
+
+        for queue in self.bids.levels.values() {
+            for order in queue {
+                if order.account == account {
+                    to_cancel.push(order.id);
+                }
+            }
+        }
+        for queue in self.asks.levels.values() {
+            for order in queue {
+                if order.account == account {
+                    to_cancel.push(order.id);
+                }
+            }
+        }
+
+        // Scan pending stops.
+        for stops in self.stop_buys.values() {
+            for stop in stops {
+                if stop.account == account {
+                    to_cancel.push(stop.id);
+                }
+            }
+        }
+        for stops in self.stop_sells.values() {
+            for stop in stops {
+                if stop.account == account {
+                    to_cancel.push(stop.id);
+                }
+            }
+        }
+
+        // Cancel each collected order. cancel() handles removal from
+        // order_index/stop_index, BookSide levels, and report generation.
+        for id in to_cancel {
+            self.cancel(id, reports);
+        }
+    }
+
     fn execute_limit(&mut self, order: Order, price: Price, reports: &mut Vec<ExecutionReport>) {
         let opposite = self.opposite_side(order.side);
 

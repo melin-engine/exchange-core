@@ -56,6 +56,17 @@ impl JournaledExchange {
         Ok(())
     }
 
+    /// Cancel all orders for an account (kill switch). Journals before executing.
+    pub fn cancel_all(
+        &mut self,
+        account: AccountId,
+        reports: &mut Vec<ExecutionReport>,
+    ) -> Result<(), JournalError> {
+        self.writer.append(&JournalEvent::CancelAll { account })?;
+        self.exchange.cancel_all(account, reports);
+        Ok(())
+    }
+
     /// Set risk limits for an instrument. Journals before executing.
     pub fn set_risk_limits(
         &mut self,
@@ -199,6 +210,9 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         }
         JournalEvent::SetRiskLimits { symbol, limits } => {
             exchange.set_risk_limits(symbol, limits);
+        }
+        JournalEvent::CancelAll { account } => {
+            exchange.cancel_all(account, reports);
         }
     }
 }

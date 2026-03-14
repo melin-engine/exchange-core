@@ -541,6 +541,7 @@ fn request_to_event(request: &Request) -> JournalEvent {
     match *request {
         Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
         Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
+        Request::CancelAll { account } => JournalEvent::CancelAll { account },
         Request::Heartbeat => unreachable!("heartbeats filtered before request_to_event"),
     }
 }
