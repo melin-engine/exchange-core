@@ -161,27 +161,54 @@ crates/
 
 ## Performance
 
-The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP/UDS round-trip. Results below are from the round-trip mode measuring full TCP loopback latency. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8. All threads pinned to dedicated cores, IRQs pinned to core 0, CPU governor locked to performance.
+The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP or UDS round-trip. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8. All threads pinned to dedicated cores, IRQs pinned to core 0, CPU governor locked to performance, kernel boot isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`).
 
-All benchmarks: 10M order pairs, 16 clients, 64 pipelined orders per client.
+All benchmarks: 10M order pairs (20M measured), 16 clients, 64 pipelined orders per client.
 
-**Without persistence** (pipeline + network ceiling):
-
-```
-sudo ./scripts/bench-isolate.sh --features io-uring,no-persist -- 10000000 --clients=16 --window=64
-
-Throughput:  3.61M orders/sec (0.28 µs/order)
-Latency:     p99 = 355 µs, p99.9 = 605 µs, max = 2.55 ms
-```
-
-**With fsync/FUA** (full durability, pwritev2 + RWF_DSYNC):
+**Engine-only** (matching engine, no pipeline/network):
 
 ```
-sudo ./scripts/bench-isolate.sh --features io-uring -- 10000000 --clients=16 --window=64
-
-Throughput:  830K orders/sec (1.20 µs/order)
-Latency:     p99 = 1.84 ms, p99.9 = 4.55 ms, max = 7.55 ms
+sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64 --mode engine
 ```
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 11.2M orders/sec (0.09 µs/order) |
+| **p90** | 0.05 µs |
+| **p99** | 0.05 µs |
+| **p99.9** | 0.09 µs |
+| **p99.99** | 0.12 µs |
+| **max** | 95.23 µs |
+
+**Full TCP round-trip without persistence**
+
+```
+sudo ./scripts/bench-isolate.sh --features no-persist -- 10000000 --clients=16 --window=64
+```
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 3.01M orders/sec (0.33 µs/order) |
+| **p90** | 350 µs |
+| **p99** | 495 µs |
+| **p99.9** | 546 µs |
+| **p99.99** | 588 µs |
+| **max** | 722 µs |
+
+**Full TCP round-trip with persistence (fsync/FUA included)**
+
+```
+sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64
+```
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 779K orders/sec (1.28 µs/order) |
+| **p90** | 1.53 ms |
+| **p99** | 1.85 ms |
+| **p99.9** | 4.50 ms |
+| **p99.99** | 7.32 ms |
+| **max** | 7.58 ms |
 
 ## License
 
