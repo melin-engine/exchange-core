@@ -211,6 +211,10 @@ struct BenchArgs {
     /// branch predictors, and allocator settle before measurement starts.
     #[arg(long, default_value_t = WARMUP_ORDERS)]
     warmup: usize,
+    /// Path for the journal file. Defaults to a temporary directory.
+    /// Use this to place the journal on a dedicated disk for benchmarking.
+    #[arg(long)]
+    journal: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -227,7 +231,13 @@ fn main() {
             run_engine_bench(args.pairs, args.warmup);
         }
         "pipeline" => {
-            run_pipeline_bench(args.pairs, args.window, args.group_commit_us, args.warmup);
+            run_pipeline_bench(
+                args.pairs,
+                args.window,
+                args.group_commit_us,
+                args.warmup,
+                args.journal,
+            );
         }
         "roundtrip" => {
             #[cfg(feature = "io-uring")]
@@ -245,6 +255,7 @@ fn main() {
                 args.group_commit_us,
                 args.addr,
                 args.warmup,
+                args.journal,
             );
         }
         other => {
@@ -402,7 +413,13 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
 /// matching stage) but bypasses TCP/UDS transport. The bench thread publishes
 /// InputSlots directly to the MultiProducer and drains OutputSlots from the
 /// SPSC consumer. Measures pipeline latency without network overhead.
-fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64, warmup: usize) {
+fn run_pipeline_bench(
+    total_pairs: usize,
+    window: usize,
+    group_commit_us: u64,
+    warmup: usize,
+    journal_path: Option<std::path::PathBuf>,
+) {
     use trading_engine::journal::JournalWriter;
     use trading_engine::journal::event::JournalEvent;
     use trading_engine::journal::pipeline::{InputSlot, build_pipeline};
@@ -422,8 +439,8 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64, w
     exchange.prefault();
 
     let tmp_dir = tempdir();
-    let journal_path = tmp_dir.join("pipeline-bench.journal");
-    let writer = JournalWriter::create(&journal_path).expect("create journal");
+    let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("pipeline-bench.journal"));
+    let writer = JournalWriter::create(&effective_journal).expect("create journal");
 
     let group_commit_delay = Duration::from_micros(group_commit_us);
     let (producer, journal_stage, matching_stage, mut output_consumer, _journal_cursor) =
@@ -581,6 +598,7 @@ fn run_roundtrip_bench(
     group_commit_us: u64,
     remote_addr: Option<std::net::SocketAddr>,
     warmup: usize,
+    journal_path: Option<std::path::PathBuf>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -614,10 +632,10 @@ fn run_roundtrip_bench(
 
     // Local mode: spawn an embedded server.
     let tmp_dir = tempdir();
-    let journal_path = tmp_dir.join("bench.journal");
+    let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("bench.journal"));
 
     let config = ServerConfig {
-        journal: journal_path,
+        journal: effective_journal,
         snapshot: None,
         group_commit_us,
         ..ServerConfig::default()
