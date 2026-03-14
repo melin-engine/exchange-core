@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["io-uring"]
 no-fsync = ["trading-engine/no-fsync"]
 no-persist = ["trading-server/no-persist"]
 latency-trace = ["trading-server/latency-trace"]
