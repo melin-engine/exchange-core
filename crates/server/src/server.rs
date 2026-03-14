@@ -91,6 +91,64 @@ impl Default for ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// Build a `ServerConfig` from CLI arguments, falling back to defaults.
+    ///
+    /// Supported flags:
+    /// - `--bind=<addr>` — listen address (default: 127.0.0.1:9876)
+    /// - `--journal=<path>` — journal file path (default: trading.journal)
+    /// - `--snapshot=<path>` — snapshot file path (default: none)
+    /// - `--cores=<j,m,r>` — pipeline core IDs (default: 1,2,3)
+    /// - `--readers=<n>` — reader thread count (default: 2)
+    /// - `--reader-cores=<start>` — first reader core ID (default: 4)
+    /// - `--group-commit-us=<n>` — group commit delay in microseconds (default: 0)
+    pub fn from_args(args: &[String]) -> Result<Self, String> {
+        let mut config = Self::default();
+
+        if let Some(v) = parse_flag::<SocketAddr>(args, "--bind=") {
+            config.bind_addr = v;
+        }
+        if let Some(v) = parse_flag::<String>(args, "--journal=") {
+            config.journal_path = PathBuf::from(v);
+        }
+        if let Some(v) = parse_flag::<String>(args, "--snapshot=") {
+            config.snapshot_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = parse_flag::<String>(args, "--cores=") {
+            let cores: Vec<&str> = v.split(',').collect();
+            if cores.len() != 3 {
+                return Err(format!(
+                    "--cores expects 3 comma-separated core IDs (got {})",
+                    cores.len()
+                ));
+            }
+            let mut affinity = [0usize; 3];
+            for (i, c) in cores.iter().enumerate() {
+                affinity[i] = c.parse().map_err(|_| format!("invalid core ID: {c}"))?;
+            }
+            config.core_affinity = affinity;
+        }
+        if let Some(v) = parse_flag::<usize>(args, "--readers=") {
+            config.reader_threads = v;
+        }
+        if let Some(v) = parse_flag::<usize>(args, "--reader-cores=") {
+            config.reader_core_start = v;
+        }
+        if let Some(v) = parse_flag::<u64>(args, "--group-commit-us=") {
+            config.group_commit_delay = std::time::Duration::from_micros(v);
+        }
+
+        Ok(config)
+    }
+}
+
+/// Parse a `--key=value` flag from an argument list.
+fn parse_flag<T: std::str::FromStr>(args: &[String], prefix: &str) -> Option<T> {
+    args.iter()
+        .find_map(|a| a.strip_prefix(prefix))
+        .and_then(|s| s.parse().ok())
+}
+
 /// Run the trading server.
 ///
 /// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes

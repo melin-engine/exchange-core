@@ -1,9 +1,10 @@
 //! Trading engine benchmark suite with three modes:
 //!
-//! **`--mode=roundtrip`** (default): Full end-to-end benchmark. Boots the server
-//! in-process, connects via TCP (default) or Unix domain socket (`--uds`), and
-//! blasts order pairs through the complete network round-trip path. Measures
-//! client-perceived latency including transport, queuing, journaling, and matching.
+//! **`--mode=roundtrip`** (default): Full end-to-end benchmark. By default, boots
+//! the server in-process and connects via TCP loopback. With `--addr=<ip:port>`,
+//! connects to a remote engine instead (LAN benchmark mode). With `--uds`,
+//! uses Unix domain sockets. Measures client-perceived latency including
+//! transport, queuing, journaling, and matching.
 //!
 //! **`--mode=pipeline`**: Server pipeline without network transport. Publishes
 //! events directly to the disruptor ring buffer and consumes responses from the
@@ -18,7 +19,7 @@
 //! account — net zero balance change, unlimited cycles).
 //!
 //! Usage:
-//!     cargo run --release -p trading-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
+//!     cargo run --release -p trading-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
@@ -180,6 +181,7 @@ fn main() {
                     "warning: --bench-threads is ignored with io-uring (single-threaded event loop)"
                 );
             }
+            let remote_addr: Option<std::net::SocketAddr> = parse_flag(&args, "--addr=");
             run_roundtrip_bench(
                 use_uds,
                 pairs,
@@ -187,6 +189,7 @@ fn main() {
                 num_clients,
                 bench_threads,
                 group_commit_us,
+                remote_addr,
             );
         }
         other => {
@@ -474,6 +477,10 @@ fn drain_output(
 // ===========================================================================
 
 /// Full end-to-end roundtrip benchmark through the server with TCP or UDS.
+///
+/// When `remote_addr` is `Some`, connects to a remote engine instead of
+/// spawning an embedded server. This is the mode used for LAN benchmarks
+/// where the engine runs on a separate machine.
 fn run_roundtrip_bench(
     use_uds: bool,
     pairs: usize,
@@ -481,7 +488,38 @@ fn run_roundtrip_bench(
     num_clients: usize,
     bench_threads: usize,
     group_commit_us: u64,
+    remote_addr: Option<std::net::SocketAddr>,
 ) {
+    // Remote mode: connect to an external engine, no embedded server.
+    if let Some(addr) = remote_addr {
+        if use_uds {
+            eprintln!("error: --addr and --uds are mutually exclusive");
+            std::process::exit(1);
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let connect = || {
+            let stream = connect_tcp(addr);
+            stream.set_nodelay(true).expect("set TCP_NODELAY");
+            let read_stream = stream.try_clone().expect("clone TCP stream");
+            (read_stream, stream)
+        };
+
+        run_roundtrip_inner(
+            connect,
+            &format!("TCP {addr}"),
+            pairs,
+            window,
+            num_clients,
+            bench_threads,
+            group_commit_us,
+            shutdown,
+        );
+        return;
+    }
+
+    // Local mode: spawn an embedded server.
     let tmp_dir = tempdir();
     let journal_path = tmp_dir.join("bench.journal");
 

@@ -123,7 +123,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 ### Operations & Reliability
 - [x] Structured logging (`tracing` crate)
 - [x] Per-stage pipeline latency tracing (`latency-trace` feature gate)
-- [ ] Configuration management (config file / CLI args — currently hardcoded)
+- [x] Configuration management (CLI args for bind address, journal path, core affinity, reader threads)
 - [ ] Graceful shutdown (drain in-flight orders, flush journal)
 - [ ] Health checks / readiness probes
 - [ ] Metrics (latency histograms, throughput counters, connection counts)

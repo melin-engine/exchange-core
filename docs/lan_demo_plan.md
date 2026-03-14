@@ -37,15 +37,9 @@ Both servers should be in the same Hetzner datacenter and ideally on the same ra
 
 Before running the demo, these features must be implemented:
 
-### 1. Configuration Management (hard blocker)
+### ~~1. Configuration Management~~ (done)
 
-The engine's bind address is hardcoded to `127.0.0.1:9876`. The bench client starts an embedded server on `127.0.0.1:0`. For the LAN demo, we need:
-
-**Engine server:** Accept `--bind=0.0.0.0:9876` (or a config file) so it listens on the network interface.
-
-**Bench client:** Accept `--addr=<engine-ip>:9876` to connect to a remote engine instead of spawning an embedded one. This means a new bench mode (or modifying `roundtrip`) that skips the embedded server and connects to an external address.
-
-Also needed: configurable core affinity (the core layout may differ between machines).
+Server CLI args: `--bind`, `--journal`, `--snapshot`, `--cores`, `--readers`, `--reader-cores`, `--group-commit-us`. Bench client: `--addr=<ip:port>` connects to a remote engine instead of spawning an embedded server.
 
 ### 2. Graceful Shutdown
 
