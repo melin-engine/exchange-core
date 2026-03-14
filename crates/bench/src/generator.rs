@@ -51,6 +51,10 @@ pub struct GeneratorConfig {
     pub min_size: u64,
     /// Maximum order size.
     pub max_size: u64,
+    /// Probability that a new order is aggressive (crosses the spread).
+    /// Aggressive buys are placed above mid, aggressive sells below mid,
+    /// producing immediate fills. Default: 0.10 (10% of submits fill).
+    pub aggression_ratio: f64,
     /// Starting order ID. Used to partition ID ranges across multiple
     /// bench clients to avoid collisions.
     pub start_order_id: u64,
@@ -68,6 +72,7 @@ impl Default for GeneratorConfig {
             size_alpha: 2.0,
             min_size: 1,
             max_size: 1000,
+            aggression_ratio: 0.10,
             start_order_id: 1,
         }
     }
@@ -92,6 +97,9 @@ pub struct OrderFlowGenerator {
     live_cursor: usize,
     /// Number of valid entries in live_orders (up to capacity).
     live_count: usize,
+    /// Cancels for orders evicted from the ring buffer when it wraps.
+    /// Drained before generating new events to prevent orphaned orders.
+    pending_cancels: Vec<GeneratedEvent>,
     /// Uniform distribution for [0, 1) sampling.
     unit_dist: Uniform<f64>,
     /// Uniform distribution for side selection.
@@ -110,6 +118,7 @@ impl OrderFlowGenerator {
             live_orders: vec![(OrderId(0), Symbol(0)); capacity],
             live_cursor: 0,
             live_count: 0,
+            pending_cancels: Vec::new(),
             unit_dist: Uniform::new(0.0, 1.0).expect("valid range"),
             side_dist: Uniform::new(0, 2).expect("valid range"),
         }
@@ -117,6 +126,10 @@ impl OrderFlowGenerator {
 
     /// Generate the next event.
     pub fn next_event(&mut self) -> GeneratedEvent {
+        // Drain pending cancels for orders evicted from the ring buffer.
+        if let Some(cancel) = self.pending_cancels.pop() {
+            return cancel;
+        }
         if self.live_count > 0 && self.unit_dist.sample(&mut self.rng) < self.config.cancel_ratio {
             self.generate_cancel()
         } else {
@@ -170,9 +183,20 @@ impl OrderFlowGenerator {
         let price = self.pick_price(side);
         let quantity = self.pick_size();
 
-        // Track for future cancellation.
+        // Track for future cancellation. If the ring is full, the evicted
+        // order gets a pending cancel so it doesn't orphan in the book.
         let cap = self.live_orders.len();
-        self.live_orders[self.live_cursor % cap] = (order_id, symbol);
+        let write_idx = self.live_cursor % cap;
+        if self.live_count == cap {
+            let (evicted_id, evicted_sym) = self.live_orders[write_idx];
+            if evicted_id.0 != 0 {
+                self.pending_cancels.push(GeneratedEvent::Cancel {
+                    symbol: evicted_sym,
+                    order_id: evicted_id,
+                });
+            }
+        }
+        self.live_orders[write_idx] = (order_id, symbol);
         self.live_cursor += 1;
         if self.live_count < cap {
             self.live_count += 1;
@@ -236,15 +260,24 @@ impl OrderFlowGenerator {
     ///
     /// Power-law with exponent alpha: P(x) ~ x^(-alpha).
     /// Inverse CDF: x = x_min * (1 - U)^(-1/(alpha-1)) for alpha > 1.
+    ///
+    /// With probability `aggression_ratio`, the order is aggressive: buys
+    /// are placed above mid (crossing into the ask side) and sells below
+    /// mid (crossing into the bid side), producing immediate fills.
     fn pick_price(&mut self, side: Side) -> Price {
         let u: f64 = self.unit_dist.sample(&mut self.rng);
         let alpha = self.config.price_alpha;
         let raw = (1.0 - u).powf(-1.0 / (alpha - 1.0));
         let offset = (raw as u64).clamp(1, self.config.max_price_offset);
 
-        let price_val = match side {
-            Side::Buy => self.config.mid_price.saturating_sub(offset),
-            Side::Sell => self.config.mid_price.saturating_add(offset),
+        // Aggressive orders cross the spread: buy above mid, sell below.
+        let aggressive = self.unit_dist.sample(&mut self.rng) < self.config.aggression_ratio;
+
+        let price_val = match (side, aggressive) {
+            (Side::Buy, false) => self.config.mid_price.saturating_sub(offset),
+            (Side::Buy, true) => self.config.mid_price.saturating_add(offset),
+            (Side::Sell, false) => self.config.mid_price.saturating_add(offset),
+            (Side::Sell, true) => self.config.mid_price.saturating_sub(offset),
         };
         let price_val = price_val.max(1);
         Price(NonZeroU64::new(price_val).expect("price > 0"))
@@ -386,6 +419,51 @@ mod tests {
             }
         }
         panic!("no submit generated");
+    }
+
+    #[test]
+    fn aggressive_orders_produce_fills() {
+        use trading_engine::exchange::Exchange;
+        use trading_engine::types::{CurrencyId, ExecutionReport, InstrumentSpec};
+
+        let config = GeneratorConfig {
+            num_accounts: 2,
+            aggression_ratio: 0.50, // 50% aggressive for faster convergence
+            ..Default::default()
+        };
+        let mut ofg = OrderFlowGenerator::new(config);
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(1),
+            base: CurrencyId(1),
+            quote: CurrencyId(2),
+        });
+        exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 4);
+        exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 4);
+        exchange.deposit(AccountId(2), CurrencyId(1), u64::MAX / 4);
+        exchange.deposit(AccountId(2), CurrencyId(2), u64::MAX / 4);
+
+        let mut reports = Vec::new();
+        let mut fills = 0u64;
+
+        for _ in 0..10_000 {
+            reports.clear();
+            match ofg.next_event() {
+                GeneratedEvent::Submit { symbol, order } => {
+                    exchange.execute(symbol, order, &mut reports);
+                }
+                GeneratedEvent::Cancel { symbol, order_id } => {
+                    exchange.cancel(symbol, order_id, &mut reports);
+                }
+            }
+            fills += reports
+                .iter()
+                .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+                .count() as u64;
+        }
+
+        assert!(fills > 0, "expected some fills with 50% aggression ratio");
     }
 
     #[test]
