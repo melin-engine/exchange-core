@@ -13,6 +13,17 @@ use std::num::NonZeroU64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Symbol(pub u32);
 
+/// Client-assigned order identifier.
+///
+/// Uses `u64` — fits in a register, supports 18.4 quintillion unique IDs.
+/// Assigned by the client, not the server. Must be **monotonically
+/// increasing per account** — the exchange tracks a per-account high-water
+/// mark and rejects any `OrderId <= max_seen` as a duplicate (see
+/// `Exchange::max_order_id`). This prevents double-execution on
+/// crash-recovery retry.
+///
+/// Used as a HashMap key throughout the engine (order_sides, order_index,
+/// reservations), so cheap hashing matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
 
