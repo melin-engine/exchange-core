@@ -71,7 +71,7 @@ const WARMUP_ORDERS: usize = 100_000;
 const DEFAULT_WINDOW: usize = 64;
 
 /// Default number of concurrent client connections.
-const DEFAULT_CLIENTS: usize = 1;
+const DEFAULT_CLIENTS: usize = 16;
 
 /// Default number of bench client threads. Each thread manages a subset of
 /// connections via epoll. Pinned to cores 6-9 (2 physical + 2 HT siblings
