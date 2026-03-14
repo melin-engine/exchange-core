@@ -184,12 +184,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let connection_timeout = config.connection_timeout();
     let heartbeat_interval = config.heartbeat_interval();
 
+    let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = reader::spawn_reader_pool(
         config.readers,
         input_producer,
         control_tx.clone(),
         config.reader_cores,
         connection_timeout,
+        Arc::clone(&reader_shutdown),
     );
 
     // Spawn pipeline OS threads.
@@ -237,6 +239,13 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         })
         .expect("failed to spawn response thread");
 
+    // Set the listener to non-blocking so accept() returns immediately
+    // with WouldBlock when no connection is pending. This lets the accept
+    // loop check the shutdown flag without blocking indefinitely.
+    // Rust's std TcpListener retries on EINTR, so signals alone can't
+    // interrupt a blocking accept().
+    listener.set_nonblocking(true);
+
     info!(addr = %config.bind, "listening");
 
     // Monotonically increasing connection ID counter. AtomicU64 because
@@ -244,12 +253,23 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // flexibility (e.g., multiple listeners).
     let next_connection_id = AtomicU64::new(1);
 
-    // Accept loop — blocking. Each accepted connection is registered with
-    // the epoll reader thread (no per-connection threads).
+    // Accept loop — non-blocking with 100ms sleep on WouldBlock. Each
+    // accepted connection is registered with the reader thread (no
+    // per-connection threads).
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutdown signal received");
+            break;
+        }
+
         let (std_read, mut std_write, addr) = match listener.accept() {
             Ok(conn) => conn,
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // No pending connection — sleep briefly then retry.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
                 error!(error = %e, "accept error");
                 continue;
             }
@@ -303,15 +323,22 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         });
     }
 
-    // Signal pipeline threads to shut down.
+    // --- Ordered shutdown sequence ---
+    // 1. Stop readers first so no new events enter the disruptor.
+    info!("shutdown: stopping reader threads");
+    reader_handle.shutdown();
+    reader_handle.join();
+
+    // 2. Now signal the pipeline. The journal and matching stages will
+    //    drain any remaining events before exiting.
+    info!("shutdown: draining pipeline");
     shutdown.store(true, Ordering::Relaxed);
 
-    // Thread join can only fail if the thread panicked; nothing useful to
-    // do except let the panic propagate on drop, which is the default.
     let _ = journal_handle.join();
     let _ = matching_handle.join();
     let _ = response_handle.join();
 
+    info!("shutdown complete");
     Ok(())
 }
 

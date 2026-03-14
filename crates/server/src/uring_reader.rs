@@ -17,7 +17,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
@@ -79,6 +82,8 @@ pub struct ReaderRegistration<R> {
 pub struct UringReaderHandle<R> {
     tx: mpsc::Sender<ReaderRegistration<R>>,
     event_fd: RawFd,
+    join_handle: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl<R> UringReaderHandle<R> {
@@ -90,6 +95,22 @@ impl<R> UringReaderHandle<R> {
             unsafe {
                 libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
             }
+        }
+    }
+
+    /// Signal the reader thread to shut down and wake it from io_uring_enter.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let val: u64 = 1;
+        unsafe {
+            libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
+        }
+    }
+
+    /// Join the reader thread. Call after `shutdown()`.
+    pub fn join(mut self) {
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -107,6 +128,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     control_tx: mpsc::Sender<ControlEvent>,
     core_start: usize,
     connection_timeout: Option<Duration>,
+    shutdown: Arc<AtomicBool>,
 ) -> UringReaderHandle<R> {
     let (tx, rx) = mpsc::channel();
 
@@ -114,19 +136,25 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     assert!(event_fd >= 0, "eventfd creation failed");
 
     let wakeup_fd = event_fd;
+    let shutdown_clone = Arc::clone(&shutdown);
 
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("uring-reader".into())
         .spawn(move || {
             match crate::affinity::pin_to_core(core_start) {
                 Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
                 Err(e) => tracing::warn!(thread = "uring-reader", core = core_start, error = %e, "failed to pin"),
             }
-            uring_reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout);
+            uring_reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout, &shutdown_clone);
         })
         .expect("failed to spawn uring reader thread");
 
-    UringReaderHandle { tx, event_fd }
+    UringReaderHandle {
+        tx,
+        event_fd,
+        join_handle: Some(handle),
+        shutdown,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +237,7 @@ fn uring_reader_loop<R: AsRawFd>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
+    shutdown: &AtomicBool,
 ) {
     let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
     let mut slab = ConnectionSlab::<R>::new();
@@ -249,6 +278,10 @@ fn uring_reader_loop<R: AsRawFd>(
     let mut stale: Vec<(usize, u64, RawFd)> = Vec::new();
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         // Submit any pending SQEs and block until at least 1 CQE is ready.
         match ring.submit_and_wait(1) {
             Ok(_) => {}

@@ -18,7 +18,10 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tracing::debug;
@@ -59,7 +62,9 @@ struct ReaderThread<R> {
 /// Distributes connections round-robin across reader threads.
 pub struct EpollReaderHandle<R> {
     threads: Vec<ReaderThread<R>>,
+    join_handles: Vec<JoinHandle<()>>,
     next: usize,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl<R> EpollReaderHandle<R> {
@@ -81,6 +86,29 @@ impl<R> EpollReaderHandle<R> {
             }
         }
     }
+
+    /// Signal all reader threads to shut down and wake them from epoll_wait.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Wake each reader thread so it sees the shutdown flag.
+        for thread in &self.threads {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(
+                    thread.event_fd,
+                    &val as *const u64 as *const libc::c_void,
+                    8,
+                );
+            }
+        }
+    }
+
+    /// Join all reader threads. Call after `shutdown()`.
+    pub fn join(self) {
+        for handle in self.join_handles {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Spawn a pool of epoll reader threads. Returns a handle for registering
@@ -95,10 +123,12 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     control_tx: mpsc::Sender<ControlEvent>,
     core_start: usize,
     connection_timeout: Option<Duration>,
+    shutdown: Arc<AtomicBool>,
 ) -> EpollReaderHandle<R> {
     assert!(num_threads > 0, "need at least 1 reader thread");
 
     let mut threads = Vec::with_capacity(num_threads);
+    let mut join_handles = Vec::with_capacity(num_threads);
 
     for i in 0..num_threads {
         let (tx, rx) = mpsc::channel();
@@ -113,21 +143,28 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
         let core_id = core_start + i;
 
         let timeout = connection_timeout;
-        std::thread::Builder::new()
+        let shutdown_clone = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
             .name(format!("reader-{i}"))
             .spawn(move || {
                 match crate::affinity::pin_to_core(core_id) {
                     Ok(c) => tracing::info!(thread = "reader-{i}", core = c, "pinned to core"),
                     Err(e) => tracing::warn!(thread = "reader-{i}", core = core_id, error = %e, "failed to pin"),
                 }
-                epoll_reader_loop(rx, wakeup_fd, producer_clone, &control_tx_clone, timeout);
+                epoll_reader_loop(rx, wakeup_fd, producer_clone, &control_tx_clone, timeout, &shutdown_clone);
             })
             .expect("failed to spawn reader thread");
 
         threads.push(ReaderThread { tx, event_fd });
+        join_handles.push(handle);
     }
 
-    EpollReaderHandle { threads, next: 0 }
+    EpollReaderHandle {
+        threads,
+        join_handles,
+        next: 0,
+        shutdown,
+    }
 }
 
 /// Per-connection state for incremental (non-blocking) frame parsing.
@@ -161,6 +198,7 @@ fn epoll_reader_loop<R: AsRawFd>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
+    shutdown: &AtomicBool,
 ) {
     let epoll_fd = unsafe { libc::epoll_create1(0) };
     assert!(epoll_fd >= 0, "epoll_create1 failed");
@@ -182,14 +220,10 @@ fn epoll_reader_loop<R: AsRawFd>(
         "reader: publish (decode → disruptor publish)",
     );
 
-    // epoll_wait timeout: 1000ms when connection timeouts are enabled
-    // so we periodically scan for stale connections; -1 (block forever)
-    // when disabled.
-    let epoll_timeout_ms: i32 = if connection_timeout.is_some() {
-        1000
-    } else {
-        -1
-    };
+    // epoll_wait timeout: 1000ms to periodically check the shutdown flag
+    // and scan for stale connections. The eventfd wakeup provides immediate
+    // responsiveness for new connections and shutdown signals.
+    let epoll_timeout_ms: i32 = 1000;
 
     // Coarse gate for timeout scanning — avoids scanning on every
     // epoll_wait return during high throughput. Only scans when >=1 second
@@ -197,6 +231,10 @@ fn epoll_reader_loop<R: AsRawFd>(
     let mut last_timeout_scan = Instant::now();
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         let nfds = unsafe {
             libc::epoll_wait(
                 epoll_fd,

@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use crate::transport::BlockingTransportListener;
@@ -46,6 +47,12 @@ impl BlockingUdsListener {
     /// Returns the filesystem path this listener is bound to.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl AsRawFd for BlockingUdsListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
     }
 }
 

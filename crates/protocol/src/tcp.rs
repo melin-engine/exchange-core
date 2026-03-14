@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::transport::BlockingTransportListener;
 
@@ -29,6 +30,12 @@ impl BlockingTcpListener {
     }
 }
 
+impl AsRawFd for BlockingTcpListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+
 impl BlockingTransportListener for BlockingTcpListener {
     type Read = std::net::TcpStream;
     type Write = std::net::TcpStream;
@@ -36,10 +43,15 @@ impl BlockingTransportListener for BlockingTcpListener {
     fn accept(&mut self) -> io::Result<(std::net::TcpStream, std::net::TcpStream, SocketAddr)> {
         let (stream, addr) = self.listener.accept()?;
         stream.set_nodelay(true)?;
-        // Clone the fd: read_half for the reader thread, stream for the
-        // response thread's writer.
+        // Ensure accepted connections are in blocking mode even if the
+        // listener is non-blocking (for shutdown support).
+        stream.set_nonblocking(false)?;
         let read_half = stream.try_clone()?;
         Ok((read_half, stream, addr))
+    }
+
+    fn set_nonblocking(&mut self, nonblocking: bool) {
+        let _ = self.listener.set_nonblocking(nonblocking);
     }
 }
 

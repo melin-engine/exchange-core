@@ -398,6 +398,8 @@ impl MatchingStage {
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                // Drain remaining entries so every journaled event gets a response.
+                self.drain_remaining(&mut reports);
                 #[cfg(feature = "latency-trace")]
                 {
                     wakeup_hist.print_report();
@@ -469,6 +471,40 @@ impl MatchingStage {
             }
 
             // Signal end of batch for this request.
+            self.output.publish(OutputSlot {
+                connection_id: slot.connection_id,
+                input_seq,
+                payload: OutputPayload::BatchEnd,
+                match_complete_ts,
+                recv_ts: slot.recv_ts,
+            });
+        }
+    }
+
+    /// Drain any remaining entries from the ring buffer on shutdown,
+    /// processing each and publishing responses. Ensures every journaled
+    /// event gets a matching response sent to the client.
+    fn drain_remaining(&mut self, reports: &mut Vec<ExecutionReport>) {
+        loop {
+            let entry = self.consumer.try_consume();
+            let Some((input_seq, slot)) = entry else {
+                break;
+            };
+            reports.clear();
+            self.process_event(&slot, reports);
+
+            #[allow(clippy::let_unit_value)]
+            let match_complete_ts = trace_ts();
+
+            for report in &*reports {
+                self.output.publish(OutputSlot {
+                    connection_id: slot.connection_id,
+                    input_seq,
+                    payload: OutputPayload::Report(*report),
+                    match_complete_ts,
+                    recv_ts: slot.recv_ts,
+                });
+            }
             self.output.publish(OutputSlot {
                 connection_id: slot.connection_id,
                 input_seq,

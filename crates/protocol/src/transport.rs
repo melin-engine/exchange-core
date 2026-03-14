@@ -27,4 +27,8 @@ pub trait BlockingTransportListener: Send + 'static {
     /// Accept a new connection, returning blocking read/write halves
     /// and the peer address.
     fn accept(&mut self) -> io::Result<(Self::Read, Self::Write, SocketAddr)>;
+
+    /// Set the listener to non-blocking mode for shutdown-aware accept loops.
+    /// Accepted connections are still set to blocking mode individually.
+    fn set_nonblocking(&mut self, _nonblocking: bool) {}
 }
