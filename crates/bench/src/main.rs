@@ -89,6 +89,50 @@ const MAX_FRAME_SIZE: usize = 1024;
 #[cfg(not(feature = "io-uring"))]
 const MAX_EPOLL_EVENTS: usize = 64;
 
+// ---------------------------------------------------------------------------
+// TSC (Time Stamp Counter) utilities for low-overhead per-order timing
+// ---------------------------------------------------------------------------
+
+/// Read the TSC with a serializing instruction (`rdtscp`). Returns raw tick
+/// count. ~4ns overhead vs ~15-25ns for `Instant::now()` via vDSO.
+/// `rdtscp` waits for all prior instructions to complete before reading,
+/// preventing the CPU from reordering the timestamp relative to the work
+/// being measured.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rdtscp() -> u64 {
+    unsafe {
+        let mut _aux: u32 = 0;
+        core::arch::x86_64::__rdtscp(&mut _aux)
+    }
+}
+
+/// Calibrate TSC ticks per nanosecond by measuring a short sleep against
+/// `Instant::now()`. Returns the conversion factor (ticks / ns).
+#[cfg(target_arch = "x86_64")]
+fn calibrate_tsc() -> f64 {
+    // Warm up the TSC path.
+    for _ in 0..100 {
+        let _ = rdtscp();
+    }
+
+    let duration = Duration::from_millis(10);
+    let t0_tsc = rdtscp();
+    let t0_wall = Instant::now();
+    std::thread::sleep(duration);
+    let t1_tsc = rdtscp();
+    let elapsed_ns = t0_wall.elapsed().as_nanos() as f64;
+    let elapsed_tsc = (t1_tsc - t0_tsc) as f64;
+    elapsed_tsc / elapsed_ns
+}
+
+/// Convert TSC tick delta to nanoseconds using a pre-calibrated factor.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
+    (ticks as f64 / ticks_per_ns) as u64
+}
+
 /// One latency time-series sample: interval percentiles at a point in time.
 /// Captured every `SAMPLE_INTERVAL` completed orders using an interval
 /// histogram (snapshot + reset), so each sample reflects recent behavior
@@ -217,6 +261,17 @@ fn main() {
 fn run_engine_bench(total_pairs: usize, warmup: usize) {
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
+    // Calibrate TSC for low-overhead per-order timing (~4ns vs ~20ns for
+    // Instant::now). The engine-only loop is tight enough that clock_gettime
+    // overhead is visible in the histogram.
+    #[cfg(target_arch = "x86_64")]
+    let ticks_per_ns = calibrate_tsc();
+    #[cfg(target_arch = "x86_64")]
+    eprintln!(
+        "TSC calibration: {:.3} GHz ({:.2} ticks/ns)",
+        ticks_per_ns, ticks_per_ns
+    );
+
     let mut exchange = trading_engine::exchange::Exchange::with_capacity();
     exchange.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
@@ -273,7 +328,13 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         reports.clear();
 
+        // Use rdtscp for per-order timing on x86_64 (~4ns overhead).
+        // Fall back to Instant::now() on other architectures.
+        #[cfg(target_arch = "x86_64")]
+        let t0 = rdtscp();
+        #[cfg(not(target_arch = "x86_64"))]
         let t0 = Instant::now();
+
         exchange.execute(
             Symbol(1),
             Order {
@@ -289,7 +350,12 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
             },
             &mut reports,
         );
+
+        #[cfg(target_arch = "x86_64")]
+        let elapsed_ns = tsc_to_ns(rdtscp() - t0, ticks_per_ns);
+        #[cfg(not(target_arch = "x86_64"))]
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
+
         histogram.record(elapsed_ns).expect("record");
         #[cfg(feature = "chart")]
         {
