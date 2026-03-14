@@ -38,4 +38,9 @@ pub enum ResponseKind {
     /// (fills, placements, triggers). BatchEnd tells the client that all
     /// reports for this request have been sent.
     BatchEnd,
+    /// Sent by the server immediately after accepting a connection.
+    /// Signals that the pipeline is ready and the client may begin
+    /// sending requests. Used for readiness synchronization in LAN
+    /// benchmarks where the client can't observe server startup.
+    ServerReady,
 }

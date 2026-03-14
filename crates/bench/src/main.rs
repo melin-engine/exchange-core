@@ -697,6 +697,23 @@ fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
+/// Read and verify a `ServerReady` frame from a blocking stream.
+/// Must be called before the stream is set to non-blocking mode.
+fn await_server_ready(stream: &mut impl std::io::Read) {
+    // Frame: 4-byte LE length prefix + payload.
+    let mut len_buf = [0u8; 4];
+    std::io::Read::read_exact(stream, &mut len_buf).expect("read ServerReady length");
+    let len = u32::from_le_bytes(len_buf) as usize;
+    assert!(len <= MAX_FRAME_SIZE, "ServerReady frame too large: {len}");
+    let mut payload = [0u8; 8];
+    std::io::Read::read_exact(stream, &mut payload[..len]).expect("read ServerReady payload");
+    let response = codec::decode_response(&payload[..len]).expect("decode ServerReady");
+    assert!(
+        matches!(response, ResponseKind::ServerReady),
+        "expected ServerReady, got {response:?}"
+    );
+}
+
 /// Connect to UDS server with retry (up to 50 attempts, 10ms apart).
 fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
     let mut last_err = None;
@@ -985,7 +1002,7 @@ fn run_roundtrip_inner<R, W, F>(
     shutdown: Arc<AtomicBool>,
     warmup: usize,
 ) where
-    R: AsRawFd + Send + 'static,
+    R: std::io::Read + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
     F: Fn() -> (R, W),
 {
@@ -1048,7 +1065,11 @@ fn run_epoll_roundtrip<R, W, F>(
         (0..num_threads).map(|_| Vec::new()).collect();
 
     for client_id in 0..num_clients {
-        let (read_stream, write_stream) = connect();
+        let (mut read_stream, write_stream) = connect();
+
+        // Wait for ServerReady handshake while the socket is still blocking.
+        await_server_ready(&mut read_stream);
+
         let fd = read_stream.as_raw_fd();
         let writer = BlockingFrameWriter::new(write_stream);
 
@@ -1179,7 +1200,7 @@ fn run_uring_roundtrip<R, W, F>(
     shutdown: Arc<AtomicBool>,
     warmup: usize,
 ) where
-    R: AsRawFd + Send + 'static,
+    R: std::io::Read + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
     F: Fn() -> (R, W),
 {
@@ -1189,7 +1210,11 @@ fn run_uring_roundtrip<R, W, F>(
     let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
 
     for client_id in 0..num_clients {
-        let (read_stream, write_stream) = connect();
+        let (mut read_stream, write_stream) = connect();
+
+        // Wait for ServerReady handshake while the socket is still blocking.
+        await_server_ready(&mut read_stream);
+
         let read_fd = read_stream.as_raw_fd();
         let write_fd = write_stream.as_raw_fd();
 

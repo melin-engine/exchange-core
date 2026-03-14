@@ -61,11 +61,24 @@ pub struct Client {
 
 impl Client {
     /// Connect to a trading server at the given address.
+    ///
+    /// Blocks until the server sends a `ServerReady` frame, confirming that
+    /// the pipeline is initialized and the connection is ready for trading.
     pub fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
         let stream = std::net::TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        let reader = BlockingFrameReader::new(stream.try_clone()?);
+        let mut reader = BlockingFrameReader::new(stream.try_clone()?);
         let writer = BlockingFrameWriter::new(stream);
+
+        // Wait for the ServerReady handshake before returning.
+        let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
+        let response = codec::decode_response(frame)?;
+        if !matches!(response, ResponseKind::ServerReady) {
+            return Err(ClientError::Protocol(
+                trading_protocol::error::ProtocolError::InvalidField("expected ServerReady"),
+            ));
+        }
+
         Ok(Self {
             reader,
             writer,
@@ -105,11 +118,22 @@ mod tests {
     use super::*;
     use trading_protocol::types::{OrderId, Symbol};
 
+    /// Send a ServerReady frame to the given writer.
+    fn send_ready(writer: &mut BlockingFrameWriter<std::net::TcpStream>) {
+        let mut buf = [0u8; 8];
+        let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
+    }
+
     /// Mock server that reads one request and responds with BatchEnd.
     fn mock_batch_end_server(listener: std::net::TcpListener) {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
         let mut writer = BlockingFrameWriter::new(stream);
+
+        // Send ServerReady handshake.
+        send_ready(&mut writer);
 
         // Read one request frame (discard it).
         let _frame = reader.read_frame().unwrap().unwrap();
@@ -145,9 +169,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Server accepts and immediately drops the connection.
+        // Server accepts, sends ServerReady, reads one request, then drops.
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            let mut writer = BlockingFrameWriter::new(stream.try_clone().unwrap());
+            send_ready(&mut writer);
             let mut reader = BlockingFrameReader::new(stream);
             let _frame = reader.read_frame().unwrap();
             // Drop without sending BatchEnd.

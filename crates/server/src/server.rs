@@ -11,6 +11,7 @@
 //! uses epoll to multiplex all connections, eliminating thread oversubscription.
 //! The response thread writes directly to sockets.
 
+use std::io::Write;
 use std::net::SocketAddr;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::AsRawFd;
@@ -202,7 +203,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Accept loop — blocking. Each accepted connection is registered with
     // the epoll reader thread (no per-connection threads).
     loop {
-        let (std_read, std_write, addr) = match listener.accept() {
+        let (std_read, mut std_write, addr) = match listener.accept() {
             Ok(conn) => conn,
             Err(e) => {
                 error!(error = %e, "accept error");
@@ -213,6 +214,16 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         let connection_id = ConnectionId(next_connection_id.fetch_add(1, Ordering::Relaxed));
 
         debug!(connection_id = connection_id.0, addr = %addr, "new connection");
+
+        // Send ServerReady to the client before handing the socket to the
+        // response stage. This signals that the pipeline is fully initialized
+        // and the client may begin sending requests. Written directly to the
+        // raw socket (not through the pipeline) since it's a one-time
+        // handshake on the control path, not the hot path.
+        if let Err(e) = send_server_ready(&mut std_write) {
+            debug!(connection_id = connection_id.0, error = %e, "failed to send ServerReady, dropping");
+            continue;
+        }
 
         // Register the writer with the response thread before the reader.
         // This ensures the response stage has the writer before any
@@ -322,4 +333,18 @@ fn seed_test_data(engine: &mut JournaledExchange) -> Result<(), Box<dyn std::err
 
     info!("seeded test data: 2 instruments, 2 accounts");
     Ok(())
+}
+
+/// Encode and write a `ServerReady` frame directly to a socket.
+///
+/// Wire format: 4-byte LE length prefix (value=1) + 1-byte tag.
+/// Total 5 bytes. Written with `write_all` for correctness (no short writes).
+fn send_server_ready(stream: &mut impl Write) -> std::io::Result<()> {
+    use trading_protocol::codec;
+    use trading_protocol::message::ResponseKind;
+
+    let mut buf = [0u8; 8];
+    let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
+        .map_err(|e| std::io::Error::other(format!("encode error: {e}")))?;
+    stream.write_all(&buf[..written])
 }
