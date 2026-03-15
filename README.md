@@ -76,14 +76,14 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Strict price-time priority (BTreeMap + VecDeque order book)
 - [x] Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
 - [x] Multi-instrument exchange with shared account balances
-- [ ] Cancel-replace / order amendment
+- [ ] Cancel-replace / order amendment (atomic modify without losing queue priority for unchanged price)
 - [ ] Circuit breakers (price bands, trading halts)
 - [ ] Auction mechanisms (opening/closing/volatility auctions)
 
 ### Fees
-- [ ] Maker/taker fee model
-- [ ] Fee deduction on fill
-- [ ] Fee schedules (volume-based tiers)
+- [ ] Maker/taker fee model (configurable per instrument or tier)
+- [ ] Fee deduction on fill (deduct from proceeds, include in ExecutionReport)
+- [ ] Fee schedules (volume-based tiers, account-level overrides)
 
 ### Risk & Accounting
 - [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
@@ -92,8 +92,8 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Kill switch (cancel all resting orders and pending stops for an account across all instruments)
 - [x] Client deduplication (per-account OrderId high-water mark — prevents double-execution on crash-recovery retry)
 - [ ] Price band checks (reject orders too far from reference price)
-- [ ] Order throttling (per-account rate limiting)
 - [ ] Position/exposure limits
+- [ ] Order throttling (per-account rate limiting)
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums
@@ -121,10 +121,12 @@ Checklist of features expected of a production trade execution engine. Items mar
 
 ### Gateway
 - [x] TCP proxy between clients and engine (binary protocol)
-- [ ] Scalable I/O model (epoll/io_uring multiplexing)
+- [ ] Scalable I/O model (epoll/io_uring multiplexing — current 2-threads-per-client caps at ~500 connections)
+- [ ] Output event channel from matching stage (broadcast — prerequisite for market data)
 - [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates)
 - [ ] Subscription management (subscribe/unsubscribe per instrument)
 - [ ] Reference data management (instrument lifecycle)
+- [ ] Rate limiting and connection management (per-client throttling)
 
 ### Authentication & Authorization
 - [ ] Client authentication
@@ -132,27 +134,42 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Admin API (instrument management, circuit breaker controls, kill switch)
 
 ### Operations & Reliability
-- [x] Structured logging (`tracing` crate)
+- [x] Structured logging (`tracing` crate, error-level for server malfunctions only)
 - [x] Per-stage pipeline latency tracing (`latency-trace` feature gate)
 - [x] Configuration management (CLI args for bind address, journal path, core affinity, reader threads)
 - [x] Graceful shutdown (SIGINT/SIGTERM handler, ordered drain: readers → journal → matching → response)
 - [x] Health checks / readiness probes (`ServerReady` wire handshake on connect)
 
 ### Metrics & Observability
+
+Most analytics can run on a **replica** replaying the journal, keeping the primary's hot path free of instrumentation jitter.
+
+#### Primary node (lightweight, operational health)
 - [x] Pipeline stage utilization (`pipeline-stats` feature gate — busy/idle ratio per stage)
-- [ ] Metrics transport (decide where/how to expose: stats file, output event channel, admin socket)
-- [ ] Connection counts, disruptor queue depth — *primary node only*
-- [ ] Order/fill/cancel throughput, latency histograms, volume analytics — *replica or offline (journal-derived, zero primary impact)*
+- [ ] Metrics transport (decide where/how to expose: stats file, output event channel, Prometheus endpoint, or admin socket — must not touch the hot path)
+- [ ] Connection counts (active clients, connects/disconnects per second)
+- [ ] Disruptor queue depth / backpressure monitoring (input ring fill level)
+- [ ] Health/liveness endpoint (beyond current `ServerReady` handshake)
+
+#### Replica or offline (journal-derived, zero primary impact)
+- [ ] Order/fill/cancel throughput counters (events per second by type)
+- [ ] Latency histograms (journal `timestamp_ns` → matching → response, per-event)
+- [ ] Volume analytics (traded volume per instrument, per account)
+- [ ] Book depth analytics (resting order counts, spread tracking)
+- [ ] Audit trail queries (full event history for regulatory compliance)
+- [ ] Fee/PnL accounting (when fees and position tracking exist)
+
+### Testing
+- [x] `proptest` invariant tests on order book (price-time priority, volume conservation, balance conservation, book index consistency, overflow safety)
+- [x] Verified `price × quantity` intermediate calculations don't overflow `u64` (use `u128` for computed values)
+- [ ] `cargo-fuzz` crash discovery (arbitrary order sequences, overflow/saturation edge cases)
 
 ### Redundancy & High Availability
-- [ ] Journal replication (WAL streaming to replica)
+- [ ] Journal replication (WAL streaming to replica; sync for zero data loss, async for lower latency)
 - [ ] State machine replication (deterministic replay on replica)
 - [ ] Failover detection and promotion (leader election, split-brain prevention)
 - [ ] Client failover (reconnect to new primary, resume with sequence numbers)
-
-### Horizontal Scaling
-- [ ] Instrument sharding (partition instruments across engine instances, each single-threaded)
-- [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol)
+- [ ] Network partition handling (fencing, quorum-based decisions)
 
 ### Benchmarking & Measurements
 - [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
@@ -160,12 +177,9 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] JSON output for machine-readable results (`--json`)
 - [x] TUI charts: tail latency stability and latency histogram (`--features chart`)
 - [x] Dynamic percentile depth based on sample size
-- [ ] Multi-threaded LAN benchmark — test scaling across bench threads on the Cherry servers
 - [ ] Saturation curve — sweep `--clients` and `--window`, plot latency vs throughput from JSON output
 - [ ] Multi-machine benchmark — run bench from multiple machines simultaneously (`--account-id`, `--order-id-offset`)
 - [ ] Real-world data replay (NASDAQ ITCH 5.0, Databento, Lobster — legal review needed)
-- [ ] Flame graph integration — automated `perf record` + folding for hot-path analysis
-- [ ] Benchmark reproducibility — seeded RNG option for deterministic order flow across runs
 
 ### Performance Tuning
 - [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
