@@ -35,7 +35,6 @@ cargo fmt            # format
 - **Conventional Commits** — all commit messages must follow the [Conventional Commits](https://www.conventionalcommits.org/) spec (e.g., `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`).
 - **Never commit without explicit request** — do NOT commit unless the user explicitly asks (e.g. "commit", "commit and push"). Completing a task does NOT imply permission to commit. Always wait for the user to request the commit.
 - **Never push without explicit confirmation** — always ask for review before pushing. Do not push unless the user confirms.
-- **Never commit CLAUDE.md** — this file is managed manually by the user. Do not `git add` or commit it, even if it has been modified.
 - **Commit intermediary steps** — for large multi-step tasks, commit each logical step separately rather than batching everything into one giant commit. This keeps history clean and bisectable. Always ask for review after each commit before moving to the next.
 - **Always check `Cargo.lock`** — when dependencies change, `Cargo.lock` must be staged and committed alongside `Cargo.toml` changes. The pre-commit hook enforces this.
 
@@ -87,7 +86,7 @@ cargo fmt            # format
 - [ ] Fee schedules (volume-based tiers, account-level overrides)
 
 ### Testing
-- [ ] `proptest` invariant tests on order book (fill quantities, book consistency, volume conservation)
+- [x] `proptest` invariant tests on order book (price-time priority, volume conservation, balance conservation, book index consistency, overflow safety)
 - [ ] `cargo-fuzz` crash discovery (arbitrary order sequences, overflow/saturation edge cases)
 - [x] Verify `price × quantity` intermediate calculations don't overflow `u64` (use `u128` for computed values)
 
@@ -358,7 +357,7 @@ Deferred:
 
 ### `crates/engine/` — matching engine and event sourcing
 - `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, etc.)
-- `src/account.rs` — account balance management (deposit, withdraw, reserve, fill, release)
+- `src/account.rs` — account balance management (flat `Vec<Balance>` indexed by `account_id * stride + currency_id` for O(1) lookups; deposit, withdraw, reserve, fill, release)
 - `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic
 - `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation
 - `src/journal/` — durable write-ahead log for event sourcing and crash recovery
