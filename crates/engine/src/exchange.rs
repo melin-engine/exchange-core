@@ -139,19 +139,24 @@ impl Exchange {
 
     /// Touch all pre-allocated HashMap pages so page faults happen at startup,
     /// not on the hot path. Call once after adding instruments, before accepting
-    /// orders.
+    /// orders. Skips maps that already contain data — their pages are already
+    /// faulted from the insertions that populated them.
     pub fn prefault(&mut self) {
-        let cap = self.order_sides.capacity();
-        for i in 0..cap {
-            self.order_sides.insert(OrderId(i as u64), Side::Buy);
+        if self.order_sides.is_empty() {
+            let cap = self.order_sides.capacity();
+            for i in 0..cap {
+                self.order_sides.insert(OrderId(i as u64), Side::Buy);
+            }
+            self.order_sides.clear();
         }
-        self.order_sides.clear();
 
-        let max_oid_cap = self.max_order_id.capacity();
-        for i in 0..max_oid_cap {
-            self.max_order_id.insert(AccountId(i as u32), 0);
+        if self.max_order_id.is_empty() {
+            let max_oid_cap = self.max_order_id.capacity();
+            for i in 0..max_oid_cap {
+                self.max_order_id.insert(AccountId(i as u32), 0);
+            }
+            self.max_order_id.clear();
         }
-        self.max_order_id.clear();
 
         self.accounts.prefault();
 
