@@ -61,9 +61,6 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Stop (stop-loss)
 - [x] Stop-Limit
 - [ ] Iceberg (hidden quantity)
-- [ ] Trailing Stop
-- [ ] OCO (One-Cancels-Other)
-- [ ] Bracket (entry + take-profit + stop-loss)
 
 ### Time-in-Force
 - [x] GTC (Good-Til-Cancelled)
@@ -74,7 +71,6 @@ Checklist of features expected of a production trade execution engine. Items mar
 
 ### Execution Qualifiers
 - [ ] Post-Only (maker-only, reject if would take)
-- [ ] Reduce-Only (only decrease position size)
 
 ### Matching Engine
 - [x] Strict price-time priority (BTreeMap + VecDeque order book)
@@ -122,9 +118,6 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Heartbeats and connection timeouts (bidirectional keepalive, configurable idle timeout detection)
 - [ ] Backpressure handling (defined policy when disruptor is full)
 - [ ] TLS (encrypted client connections)
-- [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap)
-- [ ] QUIC transport
-- [ ] Kernel bypass (DPDK/ef_vi)
 
 ### Gateway
 - [x] TCP proxy between clients and engine (binary protocol)
@@ -160,7 +153,6 @@ Checklist of features expected of a production trade execution engine. Items mar
 ### Horizontal Scaling
 - [ ] Instrument sharding (partition instruments across engine instances, each single-threaded)
 - [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol)
-- [ ] Cross-shard risk checks (portfolio-level margin requires message passing between shards)
 
 ### Benchmarking & Measurements
 - [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)

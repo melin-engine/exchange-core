@@ -72,13 +72,9 @@ cargo fmt            # format
 
 ### Conditional / Advanced Orders
 - [ ] Iceberg (hidden quantity)
-- [ ] Trailing Stop
-- [ ] OCO (One-Cancels-Other)
-- [ ] Bracket (entry + take-profit + stop-loss)
 
 ### Execution Qualifiers
 - [ ] Post-Only (maker-only)
-- [ ] Reduce-Only
 
 ### Fees
 - [ ] Maker/taker fee model (configurable per instrument or tier)
@@ -112,7 +108,7 @@ cargo fmt            # format
 
 ### Networking
 - [x] Binary wire protocol (custom codec, length-prefixed framing)
-- [x] Transport abstraction (TCP now, QUIC/kernel bypass later)
+- [x] Transport abstraction (TCP now, extensible for future transports)
 - [x] TCP transport with `TCP_NODELAY`
 - [x] Server (pipeline orchestration, accept loop)
 - [x] Client library
@@ -121,14 +117,10 @@ cargo fmt            # format
 - [x] Epoll reader pool (edge-triggered, non-blocking multiplexed reads)
 - [x] Lock-free CAS-based multi-producer disruptor (no mutex on input path)
 - [x] io_uring transport (separate read/write rings, replacing epoll + blocking writes) — `uring_reader.rs`, `uring_response.rs`, bench client
-- [ ] Investigate unified io_uring I/O thread (Option B: single ring for both recv+send per connection set — merges reader + response roles, saves one `io_uring_enter` per cycle but breaks pipeline stage separation)
 - [x] Multishot RECV (`RecvMulti` + provided buffer groups) — eliminates SQE resubmission; `uring_reader.rs`
 - [x] Heartbeats and connection timeouts (bidirectional keepalive, idle timeout detection, `--heartbeat-interval-secs`, `--connection-timeout-secs`)
 - [ ] Backpressure handling (defined policy when disruptor is full)
 - [ ] TLS (rustls or native-tls for encrypted client connections)
-- [ ] DDoS protection (connection rate limiting, per-IP limits, SYN cookies, max connections cap)
-- [ ] QUIC transport (investigate `quinn`)
-- [ ] Kernel bypass (DPDK/ef_vi) for single-digit µs latency — now the primary throughput bottleneck is TCP stack overhead (2x gap between no-persist and engine-only on LAN)
 
 ### Gateway
 - [x] Gateway crate — proxy between clients and engine (binary protocol, TCP)
@@ -151,7 +143,6 @@ cargo fmt            # format
 ### Horizontal Scaling
 - [ ] Instrument sharding (partition instruments across engine instances, each single-threaded — linear throughput scaling)
 - [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol)
-- [ ] Cross-shard risk checks (portfolio-level margin/exposure requires message passing between shards, adds latency and complexity)
 
 ### Redundancy & High Availability
 - [ ] Journal replication (stream WAL to replica; sync for zero data loss, async for lower latency)
@@ -299,7 +290,7 @@ LAN benchmark (two Cherry AMD Ryzen 9950X servers, dedicated NVMe journal disk):
 
 The 2x gap between fsync (5.2M) and no-persist (11.2M) shows that journal I/O is no longer the dominant bottleneck on PLP NVMe hardware. The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is now the primary throughput limiter. The engine itself runs at 17.3M/s — the pipeline and network consume the remaining headroom.
 
-**How to apply:** Further throughput gains require reducing TCP overhead: kernel bypass (DPDK/ef_vi), QUIC, or batched io_uring multishot send. Journal optimization is no longer the priority.
+**How to apply:** Further throughput gains require reducing TCP overhead (e.g., batched io_uring multishot send). Journal optimization is no longer the priority.
 
 Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+=bench.
 
