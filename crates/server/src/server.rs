@@ -75,6 +75,12 @@ pub struct ServerConfig {
     /// have not sent any data within this window. Set to 0 to disable.
     #[arg(long, default_value_t = 30)]
     pub connection_timeout_secs: u64,
+    /// Number of test accounts to seed on first startup.
+    #[arg(long, default_value_t = 2)]
+    pub accounts: u32,
+    /// Number of test instruments to seed on first startup.
+    #[arg(long, default_value_t = 2)]
+    pub instruments: u32,
 }
 
 impl Default for ServerConfig {
@@ -89,6 +95,8 @@ impl Default for ServerConfig {
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
             connection_timeout_secs: 30,
+            accounts: 2,
+            instruments: 2,
         }
     }
 }
@@ -360,7 +368,7 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
     } else {
         info!("creating new journal");
         let mut engine = JournaledExchange::create(&config.journal)?;
-        seed_test_data(&mut engine)?;
+        seed_test_data(&mut engine, config.accounts, config.instruments)?;
         Ok(engine)
     }
 }
@@ -375,34 +383,37 @@ fn apply_affinity(thread_name: &str, core_id: usize) {
 
 /// Seed the exchange with test instruments and accounts so the TUI can
 /// be used immediately. This runs only on first startup (fresh journal).
-fn seed_test_data(engine: &mut JournaledExchange) -> Result<(), Box<dyn std::error::Error>> {
+fn seed_test_data(
+    engine: &mut JournaledExchange,
+    num_accounts: u32,
+    num_instruments: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     use trading_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
-    // Currencies: 0 = USD, 1 = BTC, 2 = ETH
-    let usd = CurrencyId(0);
-    let btc = CurrencyId(1);
-    let eth = CurrencyId(2);
-
-    // Instruments: symbol 1 = BTC/USD, symbol 2 = ETH/USD
-    engine.add_instrument(InstrumentSpec {
-        symbol: Symbol(1),
-        base: btc,
-        quote: usd,
-    })?;
-    engine.add_instrument(InstrumentSpec {
-        symbol: Symbol(2),
-        base: eth,
-        quote: usd,
-    })?;
-
-    // Two test accounts with generous balances in all currencies.
-    for &account in &[AccountId(1), AccountId(2)] {
-        engine.deposit(account, usd, 1_000_000)?;
-        engine.deposit(account, btc, 1_000)?;
-        engine.deposit(account, eth, 10_000)?;
+    // Register instruments. Each instrument has a unique base/quote currency
+    // pair using the same convention as the bench generator:
+    // symbol i → base = CurrencyId(i*2 - 1), quote = CurrencyId(i*2).
+    for i in 1..=num_instruments {
+        engine.add_instrument(InstrumentSpec {
+            symbol: Symbol(i),
+            base: CurrencyId(i * 2 - 1),
+            quote: CurrencyId(i * 2),
+        })?;
     }
 
-    info!("seeded test data: 2 instruments, 2 accounts");
+    // Seed accounts with generous balances in all currencies.
+    for acct in 1..=num_accounts {
+        for i in 1..=num_instruments {
+            engine.deposit(AccountId(acct), CurrencyId(i * 2 - 1), u64::MAX / 4)?;
+            engine.deposit(AccountId(acct), CurrencyId(i * 2), u64::MAX / 4)?;
+        }
+    }
+
+    info!(
+        accounts = num_accounts,
+        instruments = num_instruments,
+        "seeded test data"
+    );
     Ok(())
 }
 

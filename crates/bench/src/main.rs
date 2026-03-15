@@ -218,6 +218,12 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
+    /// Number of trading accounts.
+    #[arg(long, default_value_t = 1000)]
+    accounts: u32,
+    /// Number of instruments.
+    #[arg(long, default_value_t = 100)]
+    instruments: u32,
     /// Write results to a JSON file. Useful for building saturation curves
     /// from multiple runs with different load levels.
     #[arg(long)]
@@ -236,7 +242,13 @@ fn main() {
 
     match args.mode.as_str() {
         "engine" => {
-            run_engine_bench(args.pairs, args.warmup, json_path);
+            run_engine_bench(
+                args.pairs,
+                args.warmup,
+                args.accounts,
+                args.instruments,
+                json_path,
+            );
         }
         "pipeline" => {
             run_pipeline_bench(
@@ -259,6 +271,8 @@ fn main() {
                 args.addr,
                 args.warmup,
                 args.journal,
+                args.accounts,
+                args.instruments,
                 json_path,
             );
         }
@@ -279,7 +293,13 @@ fn main() {
 /// power-law price/size distributions, multiple accounts, and resting book depth.
 /// All events are pre-generated before the measured run so RNG overhead doesn't
 /// pollute per-order timing.
-fn run_engine_bench(total_pairs: usize, warmup: usize, json_path: Option<&std::path::Path>) {
+fn run_engine_bench(
+    total_pairs: usize,
+    warmup: usize,
+    num_accounts: u32,
+    num_instruments: u32,
+    json_path: Option<&std::path::Path>,
+) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
     #[cfg(target_arch = "x86_64")]
@@ -290,9 +310,11 @@ fn run_engine_bench(total_pairs: usize, warmup: usize, json_path: Option<&std::p
         ticks_per_ns, ticks_per_ns
     );
 
-    let config = GeneratorConfig::default();
-    let num_accounts = config.num_accounts;
-    let num_instruments = config.num_instruments;
+    let config = GeneratorConfig {
+        num_accounts,
+        num_instruments,
+        ..Default::default()
+    };
 
     let mut exchange = trading_engine::exchange::Exchange::with_capacity();
 
@@ -606,6 +628,8 @@ fn run_roundtrip_bench(
     remote_addr: Option<std::net::SocketAddr>,
     warmup: usize,
     journal_path: Option<std::path::PathBuf>,
+    num_accounts: u32,
+    num_instruments: u32,
     json_path: Option<&std::path::Path>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
@@ -647,6 +671,11 @@ fn run_roundtrip_bench(
         journal: effective_journal,
         snapshot: None,
         group_commit_us,
+        accounts: num_accounts,
+        instruments: num_instruments,
+        // Disable connection timeout for benchmarks — pre-generation
+        // can take longer than the default 30s for large runs.
+        connection_timeout_secs: 0,
         ..ServerConfig::default()
     };
 
@@ -1152,8 +1181,8 @@ fn run_epoll_roundtrip<R, W, F>(
 
         let frames = {
             let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
-                // Use 2 accounts to match server seed data.
-                num_accounts: 2,
+                num_accounts,
+                num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
