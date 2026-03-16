@@ -71,6 +71,22 @@ pub struct RiskLimits {
     pub max_order_notional: Option<u64>,
 }
 
+/// Per-instrument circuit breaker configuration. Checked in
+/// `Exchange::execute()` after dedup and before fat finger checks.
+///
+/// Static price bands reject orders with a limit price outside
+/// `[lower, upper]`. The `halted` flag rejects all new orders.
+/// `Copy`-friendly for zero-cost hot-path access.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    /// Inclusive lower bound for limit order prices. `None` = no lower bound.
+    pub price_band_lower: Option<Price>,
+    /// Inclusive upper bound for limit order prices. `None` = no upper bound.
+    pub price_band_upper: Option<Price>,
+    /// When true, reject all new orders for this instrument.
+    pub halted: bool,
+}
+
 /// Price in ticks (fixed-point). A tick is the smallest price increment
 /// for a given instrument.
 ///
@@ -235,6 +251,10 @@ pub enum RejectReason {
     /// Order notional (price × quantity) exceeds the instrument's
     /// configured maximum.
     ExceedsMaxNotional,
+    /// Trading is halted for this instrument (circuit breaker).
+    TradingHalted,
+    /// Order price is outside the instrument's configured price bands.
+    OutsidePriceBand,
 }
 
 #[cfg(test)]

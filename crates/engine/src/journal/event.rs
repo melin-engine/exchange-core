@@ -4,7 +4,9 @@
 //! engine is deterministic, so replaying inputs reproduces outputs identically.
 //! This halves journal size and simplifies the format.
 
-use crate::types::{AccountId, CurrencyId, InstrumentSpec, Order, OrderId, RiskLimits, Symbol};
+use crate::types::{
+    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, Order, OrderId, RiskLimits, Symbol,
+};
 
 /// An input event to be journaled for replay and crash recovery.
 ///
@@ -29,4 +31,9 @@ pub enum JournalEvent {
     /// Cancel all resting orders and pending stops for an account
     /// across all instruments (kill switch).
     CancelAll { account: AccountId },
+    /// Set circuit breaker configuration for an instrument.
+    SetCircuitBreaker {
+        symbol: Symbol,
+        config: CircuitBreakerConfig,
+    },
 }

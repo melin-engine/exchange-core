@@ -447,6 +447,8 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::DuplicateOrderId => "duplicate order ID",
                 RejectReason::ExceedsMaxOrderQty => "exceeds max order size",
                 RejectReason::ExceedsMaxNotional => "exceeds max notional",
+                RejectReason::TradingHalted => "trading halted",
+                RejectReason::OutsidePriceBand => "outside price band",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

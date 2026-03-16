@@ -63,6 +63,8 @@ const REJECT_SELF_TRADE_PREVENTED: u8 = 5;
 const REJECT_DUPLICATE_ORDER_ID: u8 = 6;
 const REJECT_EXCEEDS_MAX_ORDER_QTY: u8 = 7;
 const REJECT_EXCEEDS_MAX_NOTIONAL: u8 = 8;
+const REJECT_TRADING_HALTED: u8 = 9;
+const REJECT_OUTSIDE_PRICE_BAND: u8 = 10;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -563,6 +565,8 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::DuplicateOrderId => REJECT_DUPLICATE_ORDER_ID,
         RejectReason::ExceedsMaxOrderQty => REJECT_EXCEEDS_MAX_ORDER_QTY,
         RejectReason::ExceedsMaxNotional => REJECT_EXCEEDS_MAX_NOTIONAL,
+        RejectReason::TradingHalted => REJECT_TRADING_HALTED,
+        RejectReason::OutsidePriceBand => REJECT_OUTSIDE_PRICE_BAND,
     }
 }
 
@@ -577,6 +581,8 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_DUPLICATE_ORDER_ID => Ok(RejectReason::DuplicateOrderId),
         REJECT_EXCEEDS_MAX_ORDER_QTY => Ok(RejectReason::ExceedsMaxOrderQty),
         REJECT_EXCEEDS_MAX_NOTIONAL => Ok(RejectReason::ExceedsMaxNotional),
+        REJECT_TRADING_HALTED => Ok(RejectReason::TradingHalted),
+        REJECT_OUTSIDE_PRICE_BAND => Ok(RejectReason::OutsidePriceBand),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -721,6 +727,14 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(13),
                 reason: RejectReason::ExceedsMaxNotional,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(14),
+                reason: RejectReason::TradingHalted,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(15),
+                reason: RejectReason::OutsidePriceBand,
             }),
             ResponseKind::EngineError,
             ResponseKind::BatchEnd,
