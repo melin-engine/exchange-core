@@ -8,16 +8,17 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format
+//! ## File format (v6)
 //!
-//! | Field          | Type | Bytes | Purpose                       |
-//! |----------------|------|-------|-------------------------------|
-//! | file_magic     | u32  | 4     | `0x534E4150` ("SNAP")         |
-//! | format_version | u16  | 2     | Current version = 1           |
-//! | reserved       | u16  | 2     | Padding, zeroed               |
-//! | sequence       | u64  | 8     | Journal sequence at snapshot   |
-//! | data           | ...  | var   | Serialized Exchange state      |
-//! | crc32c         | u32  | 4     | CRC32C of everything above     |
+//! | Field          | Type    | Bytes | Purpose                            |
+//! |----------------|---------|-------|------------------------------------|
+//! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
+//! | format_version | u16     | 2     | Current version = 6                |
+//! | reserved       | u16     | 2     | Padding, zeroed                    |
+//! | sequence       | u64     | 8     | Journal sequence at snapshot       |
+//! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state (v6+)      |
+//! | data           | ...     | var   | Serialized Exchange state          |
+//! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
@@ -50,10 +51,11 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v2 → v3: added per-account OrderId high-water marks for client dedup.
 /// v3 → v4: added per-instrument RiskLimits for fat finger checks.
 /// v4 → v5: added per-instrument CircuitBreakerConfig for price bands + halts.
-const SNAP_VERSION: u16 = 5;
+/// v5 → v6: added chain_hash for BLAKE3 hash chain continuity across snapshots.
+const SNAP_VERSION: u16 = 6;
 
-/// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) = 16.
-const SNAP_HEADER_SIZE: usize = 16;
+/// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
+const SNAP_HEADER_SIZE: usize = 48;
 
 /// Maximum snapshot file size (256 MiB). Prevents OOM from malicious or corrupt
 /// files. A snapshot with millions of orders is well under this limit.
@@ -62,17 +64,25 @@ const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 /// Save a snapshot of the exchange state to disk.
 ///
 /// The `journal_sequence` records the journal position at snapshot time,
-/// so recovery knows where to start replaying.
-pub fn save(exchange: &Exchange, journal_sequence: u64, path: &Path) -> Result<(), JournalError> {
+/// so recovery knows where to start replaying. The `chain_hash` stores
+/// the BLAKE3 hash chain state so recovery can resume the chain without
+/// replaying from genesis.
+pub fn save(
+    exchange: &Exchange,
+    journal_sequence: u64,
+    chain_hash: [u8; 32],
+    path: &Path,
+) -> Result<(), JournalError> {
     // Vec used as a growable byte buffer — avoids multiple small writes
     // to disk. The entire snapshot is built in memory then written atomically.
     let mut buf = Vec::with_capacity(4096);
 
-    // Header.
+    // Header: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32).
     buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
     buf.extend_from_slice(&SNAP_VERSION.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
     buf.extend_from_slice(&journal_sequence.to_le_bytes());
+    buf.extend_from_slice(&chain_hash);
 
     // Serialize exchange state.
     let state = exchange.snapshot_state();
@@ -94,9 +104,9 @@ pub fn save(exchange: &Exchange, journal_sequence: u64, path: &Path) -> Result<(
     Ok(())
 }
 
-/// Load a snapshot from disk. Returns the Exchange and the journal sequence
-/// number at which to resume replay.
-pub fn load(path: &Path) -> Result<(Exchange, u64), JournalError> {
+/// Load a snapshot from disk. Returns the Exchange, the journal sequence
+/// number at which to resume replay, and the BLAKE3 chain hash.
+pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     let mut file = File::open(path)?;
 
     // Check file size before reading to prevent OOM on malicious files.
@@ -111,7 +121,25 @@ pub fn load(path: &Path) -> Result<(Exchange, u64), JournalError> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
 
-    if buf.len() < SNAP_HEADER_SIZE + 4 {
+    // Validate header magic first (before size check, since header size
+    // depends on version).
+    if buf.len() < 8 {
+        return Err(JournalError::TruncatedEntry);
+    }
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != SNAP_MAGIC {
+        return Err(JournalError::InvalidFile);
+    }
+    let version = u16::from_le_bytes([buf[4], buf[5]]);
+
+    // v5 header is 16 bytes, v6 header is 48 bytes (adds 32-byte chain_hash).
+    let (header_size, is_v6) = match version {
+        5 => (16usize, false),
+        6 => (SNAP_HEADER_SIZE, true),
+        _ => return Err(JournalError::UnsupportedVersion { version }),
+    };
+
+    if buf.len() < header_size + 4 {
         return Err(JournalError::TruncatedEntry);
     }
 
@@ -132,24 +160,24 @@ pub fn load(path: &Path) -> Result<(Exchange, u64), JournalError> {
         });
     }
 
-    // Validate header.
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != SNAP_MAGIC {
-        return Err(JournalError::InvalidFile);
-    }
-    let version = u16::from_le_bytes([buf[4], buf[5]]);
-    if version != SNAP_VERSION {
-        return Err(JournalError::UnsupportedVersion { version });
-    }
     let sequence = u64::from_le_bytes([
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
     ]);
 
+    // Read chain_hash (v6) or default to zeros (v5).
+    let chain_hash = if is_v6 {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&buf[16..48]);
+        h
+    } else {
+        [0u8; 32]
+    };
+
     // Decode exchange state.
-    let (_, state) = decode_exchange_state(&buf[SNAP_HEADER_SIZE..data_len])?;
+    let (_, state) = decode_exchange_state(&buf[header_size..data_len])?;
     let exchange = Exchange::restore_state(state);
 
-    Ok((exchange, sequence))
+    Ok((exchange, sequence, chain_hash))
 }
 
 /// Serialized exchange state — all the data needed to reconstruct an Exchange.
@@ -1139,9 +1167,9 @@ mod tests {
             &mut reports,
         );
 
-        save(&exchange, 42, &path).unwrap();
+        save(&exchange, 42, [0u8; 32], &path).unwrap();
 
-        let (restored, seq) = load(&path).unwrap();
+        let (restored, seq, _chain_hash) = load(&path).unwrap();
         assert_eq!(seq, 42);
         assert_eq!(
             restored.accounts().balance(ACCT_A, USD).available,
@@ -1188,9 +1216,9 @@ mod tests {
         );
         reports.clear();
 
-        save(&exchange, 10, &path).unwrap();
+        save(&exchange, 10, [0u8; 32], &path).unwrap();
 
-        let (mut restored, _seq) = load(&path).unwrap();
+        let (mut restored, _seq, _chain_hash) = load(&path).unwrap();
 
         // Buy should match against the resting sell from snapshot.
         let mut new_reports = Vec::new();
@@ -1223,8 +1251,8 @@ mod tests {
             },
         );
 
-        save(&exchange, 5, &path).unwrap();
-        let (mut restored, _) = load(&path).unwrap();
+        save(&exchange, 5, [0u8; 32], &path).unwrap();
+        let (mut restored, _, _) = load(&path).unwrap();
 
         // Halt should still be active after restore.
         let mut reports = Vec::new();
@@ -1281,7 +1309,7 @@ mod tests {
         let path = dir.path().join("corrupt.snapshot");
 
         let exchange = Exchange::new();
-        save(&exchange, 0, &path).unwrap();
+        save(&exchange, 0, [0u8; 32], &path).unwrap();
 
         // Corrupt a byte.
         let mut data = std::fs::read(&path).unwrap();
@@ -1292,5 +1320,73 @@ mod tests {
             load(&path),
             Err(JournalError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn snapshot_chain_hash_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.snapshot");
+
+        let chain_hash = [0xAB; 32];
+        let exchange = Exchange::new();
+        save(&exchange, 42, chain_hash, &path).unwrap();
+
+        let (_, seq, loaded_hash) = load(&path).unwrap();
+        assert_eq!(seq, 42);
+        assert_eq!(loaded_hash, chain_hash);
+    }
+
+    #[test]
+    fn snapshot_zero_chain_hash_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_chain.snapshot");
+
+        let exchange = Exchange::new();
+        save(&exchange, 10, [0u8; 32], &path).unwrap();
+
+        let (_, seq, loaded_hash) = load(&path).unwrap();
+        assert_eq!(seq, 10);
+        assert_eq!(loaded_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn v5_snapshot_loads_with_zero_chain_hash() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.snapshot");
+
+        // Build a v5 snapshot manually: header(16) + empty exchange data + CRC.
+        // Use a real v6 snapshot as base, then rewrite header to v5 format.
+        let exchange = Exchange::new();
+        let v6_path = dir.path().join("v6_tmp.snapshot");
+        save(&exchange, 5, [0xBB; 32], &v6_path).unwrap();
+
+        // Read the v6 snapshot, extract exchange data, rebuild as v5.
+        let v6_data = std::fs::read(&v6_path).unwrap();
+        // v6 header is 48 bytes, data starts after that, CRC is last 4 bytes.
+        let exchange_data = &v6_data[48..v6_data.len() - 4];
+
+        let mut buf = Vec::new();
+        // v5 header: magic(4) + version(2) + reserved(2) + sequence(8) = 16 bytes.
+        buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&5u16.to_le_bytes()); // v5
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&5u64.to_le_bytes());
+        buf.extend_from_slice(exchange_data);
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&buf).unwrap();
+        drop(file);
+
+        // Load should succeed and return zero chain_hash for v5.
+        let (_, seq, chain_hash) = load(&path).unwrap();
+        assert_eq!(seq, 5);
+        assert_eq!(
+            chain_hash, [0u8; 32],
+            "v5 snapshot should return zero chain hash"
+        );
     }
 }

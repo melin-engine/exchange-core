@@ -38,6 +38,11 @@ const BATCH_BUF_CAPACITY: usize = 128 * 1024;
 /// one chunk covers ~800K entries before the next allocation is needed.
 const PREALLOC_CHUNK: u64 = 64 * 1024 * 1024;
 
+/// Number of events between automatic hash chain checkpoints.
+/// 100K events × ~80 bytes = ~8 MB of journal data between checkpoints.
+/// The checkpoint itself is ~77 bytes — negligible overhead.
+pub const CHECKPOINT_INTERVAL: u64 = 100_000;
+
 /// Appends journal events to a file with CRC32C checksums and fsync durability.
 ///
 /// Uses positioned writes (`pwrite`) and pre-allocated storage to minimize
@@ -63,15 +68,31 @@ pub struct JournalWriter {
     /// Byte offset of the end of pre-allocated space. When `write_pos`
     /// approaches this, another `PREALLOC_CHUNK` is allocated.
     allocated_end: u64,
+    /// BLAKE3 hash chain state. `None` for v5 journals (no hash chain).
+    /// When active, each encoded entry's bytes (excluding CRC) are hashed
+    /// with the previous hash to form a tamper-evident chain.
+    hash_chain: Option<HashChain>,
+}
+
+/// Running BLAKE3 hash chain state for tamper evidence.
+struct HashChain {
+    /// Current chain hash: `hash_n = BLAKE3(encoded_bytes || hash_{n-1})`.
+    current_hash: [u8; 32],
+    /// Events since last checkpoint. When this reaches `CHECKPOINT_INTERVAL`,
+    /// a Checkpoint entry is auto-emitted.
+    events_since_checkpoint: u64,
 }
 
 impl JournalWriter {
-    /// Create a new journal file. Writes the file header, pre-allocates
-    /// storage, and returns a writer starting at sequence 1.
+    /// Create a new journal file. Writes the file header and a `GenesisHash`
+    /// entry with random bytes, pre-allocates storage, and returns a writer
+    /// starting at sequence 1.
     ///
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
-        Self::create_continuing(path, 1)
+        let mut genesis = [0u8; 32];
+        getrandom::fill(&mut genesis).map_err(|e| JournalError::Io(std::io::Error::other(e)))?;
+        Self::create_with_genesis(path, 1, genesis)
     }
 
     /// Create a new journal file that continues from a given sequence number.
@@ -81,7 +102,20 @@ impl JournalWriter {
     /// rotation boundaries so that snapshot + journal recovery works correctly.
     ///
     /// Fails if the file already exists.
-    pub fn create_continuing(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
+    pub fn create_continuing(
+        path: &Path,
+        starting_sequence: u64,
+        genesis_hash: [u8; 32],
+    ) -> Result<Self, JournalError> {
+        Self::create_with_genesis(path, starting_sequence, genesis_hash)
+    }
+
+    /// Internal: create a new journal with a specific genesis hash.
+    fn create_with_genesis(
+        path: &Path,
+        starting_sequence: u64,
+        genesis: [u8; 32],
+    ) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -103,7 +137,7 @@ impl JournalWriter {
         // This is a one-time cost at journal creation.
         file.sync_all()?;
 
-        Ok(Self {
+        let mut writer = Self {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
@@ -111,7 +145,32 @@ impl JournalWriter {
             path: path.to_path_buf(),
             write_pos,
             allocated_end,
-        })
+            hash_chain: None,
+        };
+
+        // Write genesis hash as the first entry and initialize the chain.
+        // The genesis entry itself is hashed into the chain.
+        let genesis_event = JournalEvent::GenesisHash { hash: genesis };
+        let seq = writer.next_sequence;
+        let timestamp_ns = wall_clock_nanos();
+        let written = codec::encode(seq, timestamp_ns, &genesis_event, &mut writer.buffer)?;
+
+        // Initialize chain: hash the genesis entry bytes (excluding CRC).
+        let entry_bytes = &writer.buffer[..written - 4]; // exclude CRC
+        let hash = blake3::hash(entry_bytes);
+        writer.hash_chain = Some(HashChain {
+            current_hash: *hash.as_bytes(),
+            events_since_checkpoint: 0,
+        });
+
+        // Write the genesis entry to the batch buffer.
+        writer
+            .batch_buf
+            .extend_from_slice(&writer.buffer[..written]);
+        writer.next_sequence += 1;
+        writer.flush_batch_sync()?;
+
+        Ok(writer)
     }
 
     /// Open an existing journal file for appending after recovery.
@@ -122,7 +181,16 @@ impl JournalWriter {
     /// `valid_end` is the byte offset of the end of the last valid entry
     /// (including file header). The file is truncated to this point to remove
     /// any trailing garbage or pre-allocated space, then re-allocated.
-    pub fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
+    ///
+    /// `chain_hash` resumes the BLAKE3 hash chain from the reader's final
+    /// state. `None` for v5 journals (no hash chain).
+    pub fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        chain_hash: Option<[u8; 32]>,
+        events_since_checkpoint: u64,
+    ) -> Result<Self, JournalError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         // Truncate to remove trailing garbage from crash + old pre-allocated space.
@@ -142,6 +210,10 @@ impl JournalWriter {
             path: path.to_path_buf(),
             write_pos: valid_end,
             allocated_end,
+            hash_chain: chain_hash.map(|h| HashChain {
+                current_hash: h,
+                events_since_checkpoint,
+            }),
         })
     }
 
@@ -175,12 +247,7 @@ impl JournalWriter {
     /// Uses one `wall_clock_nanos()` call per event for the journal timestamp.
     /// For batches sharing a timestamp, use `batch_append_with_ts`.
     pub fn batch_append(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
-        let seq = self.next_sequence;
-        let timestamp_ns = wall_clock_nanos();
-        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
-        self.batch_buf.extend_from_slice(&self.buffer[..written]);
-        self.next_sequence += 1;
-        Ok(seq)
+        self.batch_append_with_ts(event, wall_clock_nanos())
     }
 
     /// Encode an event into the batch buffer with a caller-provided timestamp.
@@ -195,9 +262,60 @@ impl JournalWriter {
     ) -> Result<u64, JournalError> {
         let seq = self.next_sequence;
         let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
+
+        // Update the BLAKE3 hash chain: hash entry bytes (excluding CRC)
+        // concatenated with the previous hash. ~15-30ns for ~112 bytes.
+        if let Some(chain) = &mut self.hash_chain {
+            let entry_bytes_len = written - 4; // exclude 4-byte CRC
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&self.buffer[..entry_bytes_len]);
+            hasher.update(&chain.current_hash);
+            chain.current_hash = *hasher.finalize().as_bytes();
+            chain.events_since_checkpoint += 1;
+        }
+
         self.batch_buf.extend_from_slice(&self.buffer[..written]);
         self.next_sequence += 1;
+
+        // Auto-emit a checkpoint if we've hit the interval.
+        if let Some(chain) = &self.hash_chain
+            && chain.events_since_checkpoint >= CHECKPOINT_INTERVAL
+        {
+            let checkpoint_hash = chain.current_hash;
+            let count = chain.events_since_checkpoint;
+            self.emit_checkpoint(checkpoint_hash, count)?;
+        }
+
         Ok(seq)
+    }
+
+    /// Emit a checkpoint entry into the batch buffer and reset the counter.
+    fn emit_checkpoint(
+        &mut self,
+        chain_hash: [u8; 32],
+        events_since_checkpoint: u64,
+    ) -> Result<(), JournalError> {
+        let checkpoint = JournalEvent::Checkpoint {
+            chain_hash,
+            events_since_checkpoint,
+        };
+        let seq = self.next_sequence;
+        let ts = wall_clock_nanos();
+        let written = codec::encode(seq, ts, &checkpoint, &mut self.buffer)?;
+
+        // Hash the checkpoint entry itself into the chain for continuity.
+        if let Some(chain) = &mut self.hash_chain {
+            let entry_bytes_len = written - 4;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&self.buffer[..entry_bytes_len]);
+            hasher.update(&chain.current_hash);
+            chain.current_hash = *hasher.finalize().as_bytes();
+            chain.events_since_checkpoint = 0;
+        }
+
+        self.batch_buf.extend_from_slice(&self.buffer[..written]);
+        self.next_sequence += 1;
+        Ok(())
     }
 
     /// Write the accumulated batch buffer to disk in a single `pwrite` syscall.
@@ -273,6 +391,19 @@ impl JournalWriter {
     /// Raw file descriptor for the journal file.
     pub fn fd(&self) -> std::os::unix::io::RawFd {
         self.file.as_raw_fd()
+    }
+
+    /// Current BLAKE3 chain hash, if hash chain is active (v6 journals).
+    /// Returns `None` for v5 journals or if no events have been written.
+    pub fn chain_hash(&self) -> Option<[u8; 32]> {
+        self.hash_chain.as_ref().map(|c| c.current_hash)
+    }
+
+    /// Events since last checkpoint, if hash chain is active.
+    pub fn events_since_checkpoint(&self) -> u64 {
+        self.hash_chain
+            .as_ref()
+            .map_or(0, |c| c.events_since_checkpoint)
     }
 
     /// Ensure enough pre-allocated space exists for the next write.
@@ -407,8 +538,11 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let writer = JournalWriter::create(&path).unwrap();
-        assert_eq!(writer.next_sequence(), 1);
+        // Genesis hash entry consumes sequence 1, so next is 2.
+        assert_eq!(writer.next_sequence(), 2);
         assert_eq!(writer.path(), path);
+        // Hash chain should be active.
+        assert!(writer.chain_hash().is_some());
 
         // File should be pre-allocated (64 MiB chunk).
         let file_len = std::fs::metadata(&path).unwrap().len();
@@ -439,14 +573,15 @@ mod tests {
         let mut writer = JournalWriter::create(&path).unwrap();
         let event = sample_event();
 
+        // Genesis consumed seq 1, so user events start at 2.
         let seq1 = writer.append(&event).unwrap();
         let seq2 = writer.append(&event).unwrap();
         let seq3 = writer.append(&event).unwrap();
 
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
-        assert_eq!(seq3, 3);
-        assert_eq!(writer.next_sequence(), 4);
+        assert_eq!(seq1, 2);
+        assert_eq!(seq2, 3);
+        assert_eq!(seq3, 4);
+        assert_eq!(writer.next_sequence(), 5);
     }
 
     #[test]
@@ -462,7 +597,7 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
         assert_eq!(entries[0].event, event);
         assert!(entries[0].timestamp_ns > 0);
     }
@@ -476,7 +611,7 @@ mod tests {
         {
             let mut writer = JournalWriter::create(&path).unwrap();
             let seq = writer.append_no_sync(&event).unwrap();
-            assert_eq!(seq, 1);
+            assert_eq!(seq, 2); // genesis consumed seq 1
         }
 
         let entries = read_all(&path);
@@ -515,7 +650,7 @@ mod tests {
         let entries = read_all(&path);
         assert_eq!(entries.len(), events.len());
         for (i, (entry, expected)) in entries.iter().zip(events.iter()).enumerate() {
-            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
             assert_eq!(&entry.event, expected);
         }
     }
@@ -531,7 +666,7 @@ mod tests {
         {
             let mut writer = JournalWriter::create(&path).unwrap();
             let seq = writer.batch_append_with_ts(&event, fixed_ts).unwrap();
-            assert_eq!(seq, 1);
+            assert_eq!(seq, 2); // genesis consumed seq 1
             writer.flush_batch().unwrap();
         }
 
@@ -556,8 +691,8 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].sequence, 1);
-        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
+        assert_eq!(entries[1].sequence, 3);
     }
 
     #[test]
@@ -595,9 +730,9 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].sequence, 1);
-        assert_eq!(entries[1].sequence, 2);
-        assert_eq!(entries[2].sequence, 3);
+        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
+        assert_eq!(entries[1].sequence, 3);
+        assert_eq!(entries[2].sequence, 4);
     }
 
     #[test]
@@ -626,16 +761,18 @@ mod tests {
             order_id: OrderId(42),
         };
         {
-            let mut writer = JournalWriter::open_append(&path, last_seq, valid_end).unwrap();
-            assert_eq!(writer.next_sequence(), 4);
+            let mut writer =
+                JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
+            // Genesis(1) + 3 user events(2,3,4) → last_seq=4, next=5
+            assert_eq!(writer.next_sequence(), 5);
             let seq = writer.append(&extra).unwrap();
-            assert_eq!(seq, 4);
+            assert_eq!(seq, 5);
         }
 
-        // Read back all 4 entries.
+        // Read back all 4 entries (3 original + 1 new, genesis is transparent).
         let entries = read_all(&path);
         assert_eq!(entries.len(), 4);
-        assert_eq!(entries[3].sequence, 4);
+        assert_eq!(entries[3].sequence, 5);
         assert_eq!(entries[3].event, extra);
     }
 
@@ -656,7 +793,7 @@ mod tests {
         };
 
         // open_append truncates to valid_end then re-preallocates.
-        let _writer = JournalWriter::open_append(&path, last_seq, valid_end).unwrap();
+        let _writer = JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
 
         // File should be re-preallocated from valid_end.
         let file_len = std::fs::metadata(&path).unwrap().len();
@@ -703,9 +840,231 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].sequence, 1);
-        assert_eq!(entries[1].sequence, 2);
-        assert_eq!(entries[2].sequence, 3);
+        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
+        assert_eq!(entries[1].sequence, 3);
+        assert_eq!(entries[2].sequence, 4);
         assert_eq!(entries[2].event, cancel);
+    }
+
+    #[test]
+    fn genesis_hash_written_as_first_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let writer = JournalWriter::create(&path).unwrap();
+        assert!(writer.chain_hash().is_some());
+        assert_eq!(writer.events_since_checkpoint(), 0);
+        drop(writer);
+
+        // Read the raw journal to confirm GenesisHash is the first entry.
+        let mut reader = JournalReader::open(&path).unwrap();
+        // next_entry() skips GenesisHash transparently — returns None
+        // for an empty journal (no user events).
+        assert!(reader.next_entry().unwrap().is_none());
+        // But the reader should have initialized the hash chain from genesis.
+        assert!(reader.chain_hash().is_some());
+    }
+
+    #[test]
+    fn chain_hash_changes_with_each_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = JournalWriter::create(&path).unwrap();
+        let h0 = writer.chain_hash().unwrap();
+
+        writer.append(&sample_event()).unwrap();
+        let h1 = writer.chain_hash().unwrap();
+        assert_ne!(h0, h1);
+
+        writer.append(&sample_event()).unwrap();
+        let h2 = writer.chain_hash().unwrap();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn reader_chain_hash_matches_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let writer_hash;
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..10 {
+                writer.append(&sample_event()).unwrap();
+            }
+            writer_hash = writer.chain_hash().unwrap();
+        }
+
+        let mut reader = JournalReader::open(&path).unwrap();
+        while reader.next_entry().unwrap().is_some() {}
+        assert_eq!(reader.chain_hash().unwrap(), writer_hash);
+    }
+
+    #[test]
+    fn checkpoint_auto_emitted_at_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let checkpoint_hash;
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..CHECKPOINT_INTERVAL {
+                writer.batch_append(&sample_event()).unwrap();
+            }
+            writer.flush_batch().unwrap();
+            // After exactly CHECKPOINT_INTERVAL events, a checkpoint should
+            // have been emitted and the counter reset.
+            assert_eq!(writer.events_since_checkpoint(), 0);
+            checkpoint_hash = writer.chain_hash().unwrap();
+        }
+
+        // Reader should transparently skip the checkpoint and genesis.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0u64;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, CHECKPOINT_INTERVAL);
+        // Reader's chain hash should match writer's.
+        assert_eq!(reader.chain_hash().unwrap(), checkpoint_hash);
+    }
+
+    #[test]
+    fn multiple_checkpoints_emitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let writer_hash;
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            // Write 2.5 intervals — should emit 2 checkpoints.
+            for _ in 0..CHECKPOINT_INTERVAL * 5 / 2 {
+                writer.batch_append(&sample_event()).unwrap();
+            }
+            writer.flush_batch().unwrap();
+            // 250K events / 100K interval = 2 checkpoints emitted.
+            // Counter should be at 50K (half of third interval).
+            assert_eq!(writer.events_since_checkpoint(), CHECKPOINT_INTERVAL / 2);
+            writer_hash = writer.chain_hash().unwrap();
+        }
+
+        // Reader must transparently skip both checkpoints + genesis.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0u64;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, CHECKPOINT_INTERVAL * 5 / 2);
+        assert_eq!(reader.chain_hash().unwrap(), writer_hash);
+    }
+
+    #[test]
+    fn open_append_with_chain_hash_resumes_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let (last_seq, valid_end, chain_hash, events_since);
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..50 {
+                writer.append(&sample_event()).unwrap();
+            }
+            chain_hash = writer.chain_hash();
+            events_since = writer.events_since_checkpoint();
+            drop(writer);
+
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            last_seq = reader.last_sequence().unwrap();
+            valid_end = reader.valid_file_end();
+        }
+
+        // Reopen with chain hash — chain should resume.
+        let mut writer =
+            JournalWriter::open_append(&path, last_seq, valid_end, chain_hash, events_since)
+                .unwrap();
+        assert_eq!(writer.chain_hash(), chain_hash);
+        assert_eq!(writer.events_since_checkpoint(), events_since);
+
+        // Append more events — chain should continue.
+        for _ in 0..10 {
+            writer.append(&sample_event()).unwrap();
+        }
+        let final_hash = writer.chain_hash().unwrap();
+        assert_ne!(final_hash, chain_hash.unwrap());
+        drop(writer);
+
+        // Reader should see all 60 events with correct chain.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0u64;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 60);
+        assert_eq!(reader.chain_hash().unwrap(), final_hash);
+    }
+
+    #[test]
+    fn open_append_without_chain_hash_has_no_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            writer.append(&sample_event()).unwrap();
+        }
+
+        let (last_seq, valid_end) = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            (reader.last_sequence().unwrap(), reader.valid_file_end())
+        };
+
+        // Open with None chain — simulates v5 recovery.
+        let mut writer = JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
+        assert!(writer.chain_hash().is_none());
+
+        // Appending events should work, just no hash chain.
+        writer.append(&sample_event()).unwrap();
+        assert!(writer.chain_hash().is_none());
+    }
+
+    #[test]
+    fn batch_crossing_checkpoint_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let writer_hash;
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            // Append 99_995 events (5 short of checkpoint).
+            for _ in 0..CHECKPOINT_INTERVAL - 5 {
+                writer.batch_append(&sample_event()).unwrap();
+            }
+            assert_eq!(writer.events_since_checkpoint(), CHECKPOINT_INTERVAL - 5);
+
+            // Append 10 more — should cross the checkpoint boundary
+            // mid-batch.
+            for _ in 0..10 {
+                writer.batch_append(&sample_event()).unwrap();
+            }
+            // 5 events pushed it to CHECKPOINT_INTERVAL, then
+            // checkpoint emitted and reset, then 5 more.
+            assert_eq!(writer.events_since_checkpoint(), 5);
+
+            // Flush everything in one pwrite.
+            writer.flush_batch().unwrap();
+            writer_hash = writer.chain_hash().unwrap();
+        }
+
+        // Reader should see exactly CHECKPOINT_INTERVAL + 5 user events.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0u64;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, CHECKPOINT_INTERVAL + 5);
+        assert_eq!(reader.chain_hash().unwrap(), writer_hash);
     }
 }

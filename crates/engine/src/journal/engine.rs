@@ -134,7 +134,15 @@ impl JournaledExchange {
 
         let last_seq = reader.last_sequence().unwrap_or(0);
         let valid_end = reader.valid_file_end();
-        let writer = JournalWriter::open_append(journal_path, last_seq, valid_end)?;
+        let chain_hash = reader.chain_hash();
+        let events_since_checkpoint = reader.events_since_checkpoint();
+        let writer = JournalWriter::open_append(
+            journal_path,
+            last_seq,
+            valid_end,
+            chain_hash,
+            events_since_checkpoint,
+        )?;
 
         Ok(Self { exchange, writer })
     }
@@ -148,8 +156,14 @@ impl JournaledExchange {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournalError> {
-        let (mut exchange, snap_sequence) = snapshot::load(snapshot_path)?;
+        let (mut exchange, snap_sequence, snap_chain_hash) = snapshot::load(snapshot_path)?;
         let mut reader = JournalReader::open(journal_path)?;
+
+        // Seed the reader's hash chain from the snapshot so verification
+        // continues from the snapshot boundary rather than requiring replay
+        // from genesis.
+        reader.seed_chain_hash(snap_chain_hash, snap_sequence);
+
         let mut reports = Vec::new();
 
         // Skip entries already captured by the snapshot.
@@ -162,19 +176,29 @@ impl JournaledExchange {
 
         let last_seq = reader.last_sequence().unwrap_or(snap_sequence);
         let valid_end = reader.valid_file_end();
-        let writer = JournalWriter::open_append(journal_path, last_seq, valid_end)?;
+        let chain_hash = reader.chain_hash();
+        let events_since_checkpoint = reader.events_since_checkpoint();
+        let writer = JournalWriter::open_append(
+            journal_path,
+            last_seq,
+            valid_end,
+            chain_hash,
+            events_since_checkpoint,
+        )?;
 
         Ok(Self { exchange, writer })
     }
 
     /// Save a snapshot of the current exchange state.
     ///
-    /// The snapshot records the current journal sequence so recovery knows
-    /// where to start replaying.
+    /// The snapshot records the current journal sequence and chain hash
+    /// so recovery knows where to start replaying and can resume the
+    /// hash chain without replaying from genesis.
     pub fn save_snapshot(&self, snapshot_path: &Path) -> Result<(), JournalError> {
         // Snapshot captures state as of the last journaled event.
         let seq = self.writer.next_sequence().saturating_sub(1);
-        snapshot::save(&self.exchange, seq, snapshot_path)
+        let chain_hash = self.writer.chain_hash().unwrap_or([0u8; 32]);
+        snapshot::save(&self.exchange, seq, chain_hash, snapshot_path)
     }
 
     /// Access the underlying exchange (for queries like balance checks).
@@ -190,6 +214,11 @@ impl JournaledExchange {
     /// Path to the journal file.
     pub fn journal_path(&self) -> &Path {
         self.writer.path()
+    }
+
+    /// Current BLAKE3 chain hash (for testing and diagnostics).
+    pub fn writer_chain_hash(&self) -> Option<[u8; 32]> {
+        self.writer.chain_hash()
     }
 
     /// Rotate the journal: save a snapshot, archive the old journal, and
@@ -213,8 +242,11 @@ impl JournaledExchange {
         rotate_file(&journal_path)?;
 
         // 3. Create a new journal continuing from the same sequence.
+        // Use the current chain hash as the genesis for the new journal,
+        // providing cryptographic continuity across rotation boundaries.
         let next_seq = self.writer.next_sequence();
-        self.writer = JournalWriter::create_continuing(&journal_path, next_seq)?;
+        let genesis = self.writer.chain_hash().unwrap_or([0u8; 32]);
+        self.writer = JournalWriter::create_continuing(&journal_path, next_seq, genesis)?;
 
         Ok(())
     }
@@ -306,6 +338,9 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
             // QueryStats is never journaled, so it should never appear
             // during replay. No-op if it somehow does.
         }
+        JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
+            // Hash chain metadata — no exchange state change.
+        }
     }
 }
 
@@ -354,7 +389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.journal");
 
-        // Build up some state.
+        // Build up some state. Genesis consumes seq 1; user events start at 2.
         let mut reports = Vec::new();
         {
             let mut je = JournaledExchange::create(&path).unwrap();
@@ -489,21 +524,22 @@ mod tests {
             let mut je = JournaledExchange::create(&path).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
-            assert_eq!(je.next_sequence(), 3);
+            // Genesis(1) + AddInstrument(2) + Deposit(3) = next is 4.
+            assert_eq!(je.next_sequence(), 4);
         }
 
         // Recover and append more.
         {
             let mut je = JournaledExchange::recover(&path).unwrap();
-            assert_eq!(je.next_sequence(), 3);
+            assert_eq!(je.next_sequence(), 4);
 
             je.deposit(ACCT_B, BTC, 500).unwrap();
-            assert_eq!(je.next_sequence(), 4);
+            assert_eq!(je.next_sequence(), 5);
         }
 
-        // Recover again — should see all 3 events.
+        // Recover again — should see all 3 user events + genesis.
         let je = JournaledExchange::recover(&path).unwrap();
-        assert_eq!(je.next_sequence(), 4);
+        assert_eq!(je.next_sequence(), 5);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             100_000
@@ -521,7 +557,8 @@ mod tests {
         }
 
         let je = JournaledExchange::recover(&path).unwrap();
-        assert_eq!(je.next_sequence(), 1);
+        // Genesis consumed seq 1, so next is 2.
+        assert_eq!(je.next_sequence(), 2);
     }
 
     #[test]
@@ -550,7 +587,8 @@ mod tests {
 
         // Recovery should replay the first event (AddInstrument) but not the truncated Deposit.
         let je = JournaledExchange::recover(&path).unwrap();
-        assert_eq!(je.next_sequence(), 2); // Only 1 event replayed.
+        // Genesis(1) + AddInstrument(2) survived, Deposit(3) truncated → next=3.
+        assert_eq!(je.next_sequence(), 3);
         assert_eq!(je.exchange().accounts().balance(ACCT_A, USD).available, 0);
     }
 
@@ -584,7 +622,9 @@ mod tests {
 
         // Full re-recovery should see both events cleanly (no garbage between).
         let je = JournaledExchange::recover(&path).unwrap();
-        assert_eq!(je.next_sequence(), 3);
+        // Genesis(1) + AddInstrument(2) + Deposit(3) → next=4
+        // (original Deposit was truncated, re-appended Deposit takes seq 3).
+        assert_eq!(je.next_sequence(), 4);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             50_000
@@ -611,7 +651,7 @@ mod tests {
             )
             .unwrap();
 
-            // Save snapshot at this point (seq=4).
+            // Save snapshot at this point (genesis=1, 3 user events → seq=4).
             je.save_snapshot(&snap_path).unwrap();
 
             // More events after snapshot.
@@ -625,7 +665,8 @@ mod tests {
 
         // Recover from snapshot + journal.
         let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
-        assert_eq!(je.next_sequence(), 6);
+        // Genesis(1) + 4 user events(2,3,4,5) + 1 post-snap(6) → next=7
+        assert_eq!(je.next_sequence(), 7);
         // Buyer got 20 BTC from fill.
         assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 20);
         // Seller still has 30 resting (50 - 20 filled).
@@ -708,8 +749,9 @@ mod tests {
         // New journal exists and is smaller.
         assert!(journal_path.exists());
         assert!(engine.journal_size() < size_before);
-        // Sequence continues.
-        assert_eq!(engine.next_sequence(), seq_before);
+        // Sequence continues. The new journal writes a genesis entry,
+        // consuming one sequence number.
+        assert_eq!(engine.next_sequence(), seq_before + 1);
 
         // Can still append to the new journal.
         engine
@@ -719,7 +761,7 @@ mod tests {
                 &mut reports,
             )
             .unwrap();
-        assert_eq!(engine.next_sequence(), seq_before + 1);
+        assert_eq!(engine.next_sequence(), seq_before + 2);
     }
 
     #[test]
@@ -799,8 +841,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cont.journal");
 
-        let mut writer = JournalWriter::create_continuing(&path, 42).unwrap();
-        assert_eq!(writer.next_sequence(), 42);
+        let mut writer = JournalWriter::create_continuing(&path, 42, [0xAA; 32]).unwrap();
+        // Genesis consumes seq 42, next is 43.
+        assert_eq!(writer.next_sequence(), 43);
 
         let event = JournalEvent::Deposit {
             account: ACCT_A,
@@ -808,12 +851,199 @@ mod tests {
             amount: 100,
         };
         let seq = writer.append(&event).unwrap();
-        assert_eq!(seq, 42);
-        assert_eq!(writer.next_sequence(), 43);
+        assert_eq!(seq, 43);
+        assert_eq!(writer.next_sequence(), 44);
 
-        // Read it back.
+        // Read it back. Genesis is transparent, first user entry is seq 43.
         let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
         let entry = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry.sequence, 42);
+        assert_eq!(entry.sequence, 43);
+    }
+
+    #[test]
+    fn recovery_preserves_chain_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.journal");
+
+        let original_hash;
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            original_hash = je.writer_chain_hash();
+        }
+
+        // Recover and verify chain hash is preserved.
+        let recovered = JournaledExchange::recover(&path).unwrap();
+        assert_eq!(recovered.writer_chain_hash(), original_hash);
+    }
+
+    #[test]
+    fn rotation_preserves_chain_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("rot.journal");
+        let snap_path = dir.path().join("rot.snapshot");
+
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 100_000).unwrap();
+
+        let hash_before_rotate = engine.writer_chain_hash();
+        assert!(hash_before_rotate.is_some());
+
+        engine.rotate(&snap_path).unwrap();
+
+        // After rotation, the new journal's genesis hash is the old chain hash.
+        // The new chain hash is computed over the genesis entry (which contains
+        // the old chain hash), so it will differ from the pre-rotation hash
+        // but the chain is cryptographically linked.
+        let hash_after_rotate = engine.writer_chain_hash();
+        assert!(hash_after_rotate.is_some());
+        // The hash should differ because the genesis entry was hashed.
+        assert_ne!(hash_before_rotate, hash_after_rotate);
+    }
+
+    #[test]
+    fn snapshot_stores_chain_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("snap_chain.journal");
+        let snap_path = dir.path().join("snap_chain.snapshot");
+
+        let chain_hash_at_snap;
+        {
+            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.save_snapshot(&snap_path).unwrap();
+            chain_hash_at_snap = je.writer_chain_hash().unwrap();
+        }
+
+        // Load snapshot and verify chain hash.
+        let (_, _, loaded_hash) = snapshot::load(&snap_path).unwrap();
+        assert_eq!(loaded_hash, chain_hash_at_snap);
+    }
+
+    #[test]
+    fn snapshot_recovery_chain_hash_matches_after_rotation() {
+        // Exercises the critical path: snapshot recovery with a post-rotation
+        // journal. The reader must reinitialize the chain from the genesis
+        // entry in the new journal, NOT use the snapshot's chain_hash seed.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("rot_chain.journal");
+        let snap_path = dir.path().join("rot_chain.snapshot");
+
+        // Build state, rotate (creates snapshot + new journal with genesis).
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
+        engine.rotate(&snap_path).unwrap();
+
+        // Append events to the new journal.
+        engine.deposit(ACCT_B, BTC, 500).unwrap();
+        let mut reports = Vec::new();
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 100, 50),
+                &mut reports,
+            )
+            .unwrap();
+        let writer_hash = engine.writer_chain_hash();
+        drop(engine);
+
+        // Recover from snapshot + new journal.
+        let recovered =
+            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        // Chain hash must match — this would fail if the reader used the
+        // snapshot seed instead of reinitializing from genesis.
+        assert_eq!(recovered.writer_chain_hash(), writer_hash);
+        assert_eq!(
+            recovered
+                .exchange()
+                .accounts()
+                .balance(ACCT_B, BTC)
+                .reserved,
+            50
+        );
+    }
+
+    #[test]
+    fn crash_recovery_chain_hash_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash_chain.journal");
+
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.deposit(ACCT_B, BTC, 500).unwrap();
+        }
+
+        // Simulate crash by truncating last entry.
+        {
+            let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            let valid_end = reader.valid_file_end();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(valid_end - 3).unwrap();
+        }
+
+        // Recover — chain should be valid for the surviving entries.
+        let mut je = JournaledExchange::recover(&path).unwrap();
+        let hash_after_crash = je.writer_chain_hash();
+        assert!(hash_after_crash.is_some());
+
+        // Append more events.
+        je.deposit(ACCT_A, BTC, 200).unwrap();
+        let hash_after_append = je.writer_chain_hash();
+        assert_ne!(hash_after_crash, hash_after_append);
+        drop(je);
+
+        // Re-recover — chain should match.
+        let je2 = JournaledExchange::recover(&path).unwrap();
+        assert_eq!(je2.writer_chain_hash(), hash_after_append);
+    }
+
+    #[test]
+    fn multiple_rotations_preserve_chain_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("multi_rot.journal");
+        let snap_path = dir.path().join("multi_rot.snapshot");
+
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
+
+        // Three rotations, each with events in between.
+        for i in 0..3 {
+            engine.deposit(ACCT_A, BTC, (i + 1) * 100).unwrap();
+            let hash_before = engine.writer_chain_hash();
+            assert!(hash_before.is_some());
+
+            engine.rotate(&snap_path).unwrap();
+
+            // Chain hash should change (genesis entry hashed).
+            let hash_after = engine.writer_chain_hash();
+            assert!(hash_after.is_some());
+            assert_ne!(hash_before, hash_after);
+        }
+
+        // Final deposit after all rotations.
+        engine.deposit(ACCT_B, BTC, 999).unwrap();
+        let final_hash = engine.writer_chain_hash();
+        drop(engine);
+
+        // Recovery from latest snapshot + journal should match.
+        let recovered =
+            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(recovered.writer_chain_hash(), final_hash);
+        assert_eq!(
+            recovered
+                .exchange()
+                .accounts()
+                .balance(ACCT_B, BTC)
+                .available,
+            999
+        );
     }
 }

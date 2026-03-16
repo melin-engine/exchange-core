@@ -474,8 +474,10 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
             snapshot = %snap_path.display(),
             "recovering from snapshot only (journal missing, post-rotation crash?)"
         );
-        let (exchange, snap_sequence) = trading_engine::journal::snapshot::load(snap_path)?;
-        let writer = JournalWriter::create_continuing(&config.journal, snap_sequence + 1)?;
+        let (exchange, snap_sequence, snap_chain_hash) =
+            trading_engine::journal::snapshot::load(snap_path)?;
+        let writer =
+            JournalWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
         JournaledExchange::from_parts(exchange, writer)
     } else if journal_exists {
         info!("recovering from journal");

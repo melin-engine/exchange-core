@@ -639,6 +639,9 @@ impl MatchingStage {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.
             }
+            JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
+                // Hash chain metadata — no exchange state change.
+            }
         }
     }
 }

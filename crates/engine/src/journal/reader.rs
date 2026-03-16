@@ -42,6 +42,18 @@ pub struct JournalReader {
     /// Byte offset in the file of the end of the last successfully decoded entry.
     /// Used by recovery to know where to truncate trailing garbage.
     valid_file_end: u64,
+    /// BLAKE3 hash chain verification state. Initialized when a GenesisHash
+    /// entry is read, updated on each normal entry, verified at Checkpoints.
+    /// `None` for v5 journals (no hash chain).
+    hash_chain: Option<ReaderHashChain>,
+}
+
+/// Hash chain state maintained by the reader for verification.
+struct ReaderHashChain {
+    /// Current running hash (recomputed from entry bytes during replay).
+    current_hash: [u8; 32],
+    /// Events since last checkpoint (for verification against Checkpoint entries).
+    events_since_checkpoint: u64,
 }
 
 impl JournalReader {
@@ -61,6 +73,7 @@ impl JournalReader {
             valid: 0,
             last_sequence: None,
             valid_file_end: FILE_HEADER_SIZE as u64,
+            hash_chain: None,
         })
     }
 
@@ -121,7 +134,11 @@ impl JournalReader {
         }
     }
 
-    /// Validate sequence continuity and advance read position.
+    /// Validate sequence continuity, update hash chain, and advance read position.
+    ///
+    /// For `GenesisHash` and `Checkpoint` entries, processes them internally
+    /// and returns the next real event via recursive call — they are
+    /// transparent to callers.
     fn validate_and_advance(
         &mut self,
         consumed: usize,
@@ -141,9 +158,77 @@ impl JournalReader {
                 });
             }
         }
+
+        // Raw entry bytes excluding CRC (for hash chain computation).
+        let entry_bytes_end = self.pos + consumed - 4;
+
+        // Handle GenesisHash: (re)initialize the chain.
+        // Always reinitialize — even if the chain was seeded from a snapshot.
+        // The writer computes chain = hash(genesis_entry_bytes), so the reader
+        // must do the same to stay in sync. A pre-existing seed (from snapshot
+        // recovery) is intentionally overwritten; the genesis entry provides
+        // the authoritative chain starting point for this journal.
+        if let JournalEvent::GenesisHash { .. } = &event {
+            let genesis_hash = blake3::hash(&self.buffer[self.pos..entry_bytes_end]);
+            self.hash_chain = Some(ReaderHashChain {
+                current_hash: *genesis_hash.as_bytes(),
+                events_since_checkpoint: 0,
+            });
+            self.last_sequence = Some(sequence);
+            self.pos += consumed;
+            self.valid_file_end += consumed as u64;
+            return self.next_entry();
+        }
+
+        // For Checkpoint entries: verify the recorded hash matches the
+        // current chain state BEFORE hashing the checkpoint itself.
+        if let JournalEvent::Checkpoint {
+            chain_hash,
+            events_since_checkpoint,
+        } = &event
+        {
+            if let Some(chain) = &self.hash_chain {
+                if chain.current_hash != *chain_hash {
+                    return Err(JournalError::HashChainMismatch {
+                        sequence,
+                        expected: *chain_hash,
+                        actual: chain.current_hash,
+                    });
+                }
+                if chain.events_since_checkpoint != *events_since_checkpoint {
+                    return Err(JournalError::CorruptEntry {
+                        sequence,
+                        reason: "checkpoint event count mismatch",
+                    });
+                }
+            }
+            // Now hash the checkpoint entry itself into the chain.
+            if let Some(chain) = &mut self.hash_chain {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&self.buffer[self.pos..entry_bytes_end]);
+                hasher.update(&chain.current_hash);
+                chain.current_hash = *hasher.finalize().as_bytes();
+                chain.events_since_checkpoint = 0;
+            }
+            self.last_sequence = Some(sequence);
+            self.pos += consumed;
+            self.valid_file_end += consumed as u64;
+            return self.next_entry();
+        }
+
+        // Normal event: update hash chain.
+        if let Some(chain) = &mut self.hash_chain {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&self.buffer[self.pos..entry_bytes_end]);
+            hasher.update(&chain.current_hash);
+            chain.current_hash = *hasher.finalize().as_bytes();
+            chain.events_since_checkpoint += 1;
+        }
+
         self.last_sequence = Some(sequence);
         self.pos += consumed;
         self.valid_file_end += consumed as u64;
+
         Ok(Some(JournalEntry {
             sequence,
             timestamp_ns,
@@ -160,6 +245,36 @@ impl JournalReader {
     /// Used by recovery to truncate trailing garbage before reopening for append.
     pub fn valid_file_end(&self) -> u64 {
         self.valid_file_end
+    }
+
+    /// Current BLAKE3 chain hash after all entries read so far.
+    /// Returns `None` for v5 journals (no hash chain).
+    pub fn chain_hash(&self) -> Option<[u8; 32]> {
+        self.hash_chain.as_ref().map(|c| c.current_hash)
+    }
+
+    /// Events since last checkpoint in the hash chain.
+    pub fn events_since_checkpoint(&self) -> u64 {
+        self.hash_chain
+            .as_ref()
+            .map_or(0, |c| c.events_since_checkpoint)
+    }
+
+    /// Seed the hash chain from a snapshot's chain hash.
+    ///
+    /// For v6 journals this seed is overwritten when the GenesisHash entry is
+    /// read (genesis always reinitializes the chain). The seed is kept for
+    /// forward-compatibility with hypothetical partial journal reads that
+    /// lack a genesis entry.
+    pub fn seed_chain_hash(&mut self, chain_hash: [u8; 32], _snap_sequence: u64) {
+        // Zero hash means no chain (v5 snapshot).
+        if chain_hash == [0u8; 32] {
+            return;
+        }
+        self.hash_chain = Some(ReaderHashChain {
+            current_hash: chain_hash,
+            events_since_checkpoint: 0,
+        });
     }
 
     /// Compact the buffer by moving unconsumed data to the front, then
@@ -263,11 +378,14 @@ mod tests {
         let mut reader = JournalReader::open(&path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 1);
+            // Genesis consumed seq 1, user events start at 2.
+            assert_eq!(entry.sequence, (i as u64) + 2);
             assert_eq!(&entry.event, expected);
             assert!(entry.timestamp_ns > 0);
         }
         assert!(reader.next_entry().unwrap().is_none());
+        // Hash chain should be active after reading a v6 journal.
+        assert!(reader.chain_hash().is_some());
     }
 
     #[test]
@@ -278,8 +396,10 @@ mod tests {
         let _writer = JournalWriter::create(&path).unwrap();
 
         let mut reader = JournalReader::open(&path).unwrap();
+        // Genesis entry is transparent — returns None for no user events.
         assert!(reader.next_entry().unwrap().is_none());
-        assert_eq!(reader.valid_file_end(), FILE_HEADER_SIZE as u64);
+        // valid_file_end includes the genesis entry.
+        assert!(reader.valid_file_end() > FILE_HEADER_SIZE as u64);
     }
 
     #[test]
@@ -310,9 +430,10 @@ mod tests {
 
         let mut reader = JournalReader::open(&path).unwrap();
         // Should read all but the last (truncated) entry.
+        // Genesis is transparent, so user events start at seq 2.
         for i in 0..events.len() - 1 {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(entry.sequence, (i as u64) + 2);
             assert_eq!(&entry.event, &events[i]);
         }
         // Truncated last entry returns None.
@@ -335,11 +456,20 @@ mod tests {
             }
         }
 
-        // Corrupt a byte in the middle of the file (after the header + first entry).
+        // Read the journal to find valid data end and entry positions.
+        // Then corrupt within the third entry's payload (second user entry).
+        let valid_data_end = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
+
+        // Corrupt a byte roughly in the middle of the valid data —
+        // well past the genesis + first user entry.
         {
             let mut data = std::fs::read(&path).unwrap();
-            // Corrupt somewhere in the second entry.
-            let corrupt_offset = FILE_HEADER_SIZE + 50;
+            let corrupt_offset = (FILE_HEADER_SIZE as u64 + valid_data_end) / 2;
+            let corrupt_offset = corrupt_offset as usize;
             if corrupt_offset < data.len() {
                 data[corrupt_offset] ^= 0xFF;
             }
@@ -348,12 +478,19 @@ mod tests {
         }
 
         let mut reader = JournalReader::open(&path).unwrap();
-        // First entry should be fine.
-        let result = reader.next_entry();
-        assert!(result.is_ok());
-        // Second entry should fail with CRC or corrupt error.
-        let result = reader.next_entry();
-        assert!(result.is_err() || result.unwrap().is_none());
+        // Read entries until we hit an error or unexpected end.
+        let mut found_error = false;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => {
+                    found_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_error, "expected corruption to be detected");
     }
 
     #[test]
@@ -378,10 +515,11 @@ mod tests {
         );
 
         // Reader should stop at the end of valid entries, ignoring zeros.
+        // Genesis entry is transparent.
         let mut reader = JournalReader::open(&path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
             assert_eq!(&entry.event, expected);
         }
         assert!(reader.next_entry().unwrap().is_none());
@@ -412,7 +550,7 @@ mod tests {
         // open_append should truncate pre-allocated space and re-allocate.
         let valid_end = reader.valid_file_end();
         let last_seq = reader.last_sequence().unwrap();
-        let mut writer = JournalWriter::open_append(&path, last_seq, valid_end).unwrap();
+        let mut writer = JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
 
         // Write one more event after recovery.
         let extra = JournalEvent::Deposit {
@@ -422,15 +560,15 @@ mod tests {
         };
         writer.append(&extra).unwrap();
 
-        // Re-read everything.
+        // Re-read everything. Genesis is transparent, user events start at seq 2.
         let mut reader = JournalReader::open(&path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(entry.sequence, (i as u64) + 2);
             assert_eq!(&entry.event, expected);
         }
         let entry = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry.sequence, (events.len() as u64) + 1);
+        assert_eq!(entry.sequence, (events.len() as u64) + 2);
         assert_eq!(entry.event, extra);
         assert!(reader.next_entry().unwrap().is_none());
     }
@@ -450,14 +588,14 @@ mod tests {
                     amount: (i as u64) * 100,
                 };
                 let seq = writer.append(&event).unwrap();
-                assert_eq!(seq, (i as u64) + 1);
+                assert_eq!(seq, (i as u64) + 2); // genesis consumed seq 1
             }
         }
 
         let mut reader = JournalReader::open(&path).unwrap();
         for i in 0..n {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
             assert_eq!(
                 entry.event,
                 JournalEvent::Deposit {
@@ -468,5 +606,356 @@ mod tests {
             );
         }
         assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupted_checkpoint_detected() {
+        use crate::journal::writer::CHECKPOINT_INTERVAL;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_checkpoint.journal");
+
+        // Write enough events to trigger a checkpoint.
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..CHECKPOINT_INTERVAL + 10 {
+                writer
+                    .batch_append(&JournalEvent::Deposit {
+                        account: AccountId(1),
+                        currency: CurrencyId(0),
+                        amount: 100,
+                    })
+                    .unwrap();
+            }
+            writer.flush_batch().unwrap();
+        }
+
+        // Find the checkpoint entry in the raw data and corrupt its chain_hash.
+        // The checkpoint has tag 10 (TAG_CHECKPOINT).
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            // Scan for the checkpoint tag. Entry format:
+            // magic(2) + length(2) + seq(8) + ts(8) + tag(1) + payload...
+            let mut offset = FILE_HEADER_SIZE;
+            let mut found = false;
+            while offset + 25 < data.len() {
+                let magic = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                if magic != 0x4A45 {
+                    break;
+                }
+                let length = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                let total = 20 + length + 4;
+                let tag = data[offset + 20];
+                if tag == 10 {
+                    // Corrupt the chain_hash in the checkpoint payload.
+                    // Payload starts at offset+21 (after tag).
+                    data[offset + 21] ^= 0xFF;
+                    // Fix CRC so it's not caught by CRC check first.
+                    let data_end = offset + 20 + length;
+                    let new_crc = crc32c::crc32c(&data[offset..data_end]);
+                    data[data_end..data_end + 4].copy_from_slice(&new_crc.to_le_bytes());
+                    found = true;
+                    break;
+                }
+                offset += total;
+            }
+            assert!(found, "checkpoint entry not found in journal");
+            std::fs::write(&path, &data).unwrap();
+        }
+
+        // Reading should fail with HashChainMismatch at the checkpoint.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut found_mismatch = false;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(JournalError::HashChainMismatch { .. }) => {
+                    found_mismatch = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(found_mismatch, "expected HashChainMismatch error");
+    }
+
+    #[test]
+    fn v5_journal_has_no_hash_chain() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.journal");
+
+        // Create a v5 journal manually: write v5 header + one raw entry.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+
+        // v5 file header: JOUR magic + version 5 + reserved.
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&0x4A4F_5552u32.to_le_bytes());
+        header[4..6].copy_from_slice(&5u16.to_le_bytes());
+        file.write_all_at(&header, 0).unwrap();
+
+        // Write a Deposit entry at sequence 1.
+        let event = JournalEvent::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(0),
+            amount: 100,
+        };
+        let mut buf = [0u8; 128];
+        let written = crate::journal::codec::encode(1, 1000, &event, &mut buf).unwrap();
+        file.write_all_at(&buf[..written], 8).unwrap();
+        drop(file);
+
+        // Read back: should work, chain_hash should be None.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let entry = reader.next_entry().unwrap().unwrap();
+        assert_eq!(entry.sequence, 1);
+        assert_eq!(entry.event, event);
+        assert!(reader.next_entry().unwrap().is_none());
+        assert!(
+            reader.chain_hash().is_none(),
+            "v5 journal should have no hash chain"
+        );
+    }
+
+    #[test]
+    fn checkpoint_event_count_mismatch_detected() {
+        use crate::journal::writer::CHECKPOINT_INTERVAL;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count_mismatch.journal");
+
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..CHECKPOINT_INTERVAL + 10 {
+                writer
+                    .batch_append(&JournalEvent::Deposit {
+                        account: AccountId(1),
+                        currency: CurrencyId(0),
+                        amount: 100,
+                    })
+                    .unwrap();
+            }
+            writer.flush_batch().unwrap();
+        }
+
+        // Find the checkpoint and corrupt its events_since_checkpoint field
+        // (at offset +32 in the payload, after the 32-byte chain_hash).
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            let mut offset = FILE_HEADER_SIZE;
+            let mut found = false;
+            while offset + 25 < data.len() {
+                let magic = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                if magic != 0x4A45 {
+                    break;
+                }
+                let length = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                let total = 20 + length + 4;
+                let tag = data[offset + 20];
+                if tag == 10 {
+                    // events_since_checkpoint is at payload offset 32 (after
+                    // 32-byte chain_hash). Payload starts at offset+21.
+                    let count_offset = offset + 21 + 32;
+                    // Write a wrong count (keep chain_hash correct).
+                    data[count_offset..count_offset + 8].copy_from_slice(&12345u64.to_le_bytes());
+                    // Fix CRC.
+                    let data_end = offset + 20 + length;
+                    let new_crc = crc32c::crc32c(&data[offset..data_end]);
+                    data[data_end..data_end + 4].copy_from_slice(&new_crc.to_le_bytes());
+                    found = true;
+                    break;
+                }
+                offset += total;
+            }
+            assert!(found, "checkpoint not found");
+            std::fs::write(&path, &data).unwrap();
+        }
+
+        // Reading should fail with CorruptEntry (event count mismatch).
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut found_error = false;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(JournalError::CorruptEntry {
+                    reason: "checkpoint event count mismatch",
+                    ..
+                }) => {
+                    found_error = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(found_error, "expected checkpoint event count mismatch");
+    }
+
+    #[test]
+    fn tamper_between_checkpoints_detected_at_next_checkpoint() {
+        use crate::journal::writer::CHECKPOINT_INTERVAL;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tamper.journal");
+
+        // Write 200K events (2 checkpoints).
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..CHECKPOINT_INTERVAL * 2 {
+                writer
+                    .batch_append(&JournalEvent::Deposit {
+                        account: AccountId(1),
+                        currency: CurrencyId(0),
+                        amount: 100,
+                    })
+                    .unwrap();
+            }
+            writer.flush_batch().unwrap();
+        }
+
+        // Corrupt a normal entry between the first and second checkpoints.
+        // Change the amount field, then fix CRC so the entry passes CRC
+        // validation. The hash chain will silently diverge, and the second
+        // checkpoint should detect the mismatch.
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            let mut offset = FILE_HEADER_SIZE;
+            let mut entry_count = 0u64;
+            let mut tampered = false;
+
+            while offset + 25 < data.len() {
+                let magic = u16::from_le_bytes([data[offset], data[offset + 1]]);
+                if magic != 0x4A45 {
+                    break;
+                }
+                let length = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                let total = 20 + length + 4;
+                let tag = data[offset + 20];
+
+                // Skip genesis (tag 9) and first checkpoint (tag 10).
+                if tag != 9 && tag != 10 {
+                    entry_count += 1;
+                }
+
+                // Tamper with an entry in the second interval (after first
+                // checkpoint, before second). Pick entry ~150K.
+                if entry_count == CHECKPOINT_INTERVAL + CHECKPOINT_INTERVAL / 2 && !tampered {
+                    // Flip a payload byte.
+                    data[offset + 22] ^= 0xFF;
+                    // Fix CRC so it passes CRC check.
+                    let data_end = offset + 20 + length;
+                    let new_crc = crc32c::crc32c(&data[offset..data_end]);
+                    data[data_end..data_end + 4].copy_from_slice(&new_crc.to_le_bytes());
+                    tampered = true;
+                }
+
+                offset += total;
+            }
+            assert!(tampered, "failed to tamper with entry");
+            std::fs::write(&path, &data).unwrap();
+        }
+
+        // Reading should succeed until the second checkpoint, then fail
+        // with HashChainMismatch.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut found_mismatch = false;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(JournalError::HashChainMismatch { .. }) => {
+                    found_mismatch = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            found_mismatch,
+            "tampered entry should be caught at next checkpoint"
+        );
+    }
+
+    #[test]
+    fn crash_recovery_preserves_chain_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash_chain.journal");
+
+        // Write some events, then simulate crash.
+        let chain_before_crash;
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..50 {
+                writer
+                    .append(&JournalEvent::Deposit {
+                        account: AccountId(1),
+                        currency: CurrencyId(0),
+                        amount: 100,
+                    })
+                    .unwrap();
+            }
+            chain_before_crash = writer.chain_hash().unwrap();
+        }
+
+        // Simulate crash by truncating the last entry.
+        let (last_seq, valid_end, chain_hash, events_since) = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            let valid_end = reader.valid_file_end();
+            // Truncate 5 bytes from the valid region to simulate partial write.
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(valid_end - 5).unwrap();
+            drop(file);
+
+            // Re-read to get state after truncation.
+            let mut reader2 = JournalReader::open(&path).unwrap();
+            let mut count = 0;
+            while reader2.next_entry().unwrap().is_some() {
+                count += 1;
+            }
+            assert_eq!(count, 49); // one entry lost to truncation
+            (
+                reader2.last_sequence().unwrap(),
+                reader2.valid_file_end(),
+                reader2.chain_hash(),
+                reader2.events_since_checkpoint(),
+            )
+        };
+
+        // Recover and continue writing.
+        let mut writer =
+            JournalWriter::open_append(&path, last_seq, valid_end, chain_hash, events_since)
+                .unwrap();
+        // Chain should NOT equal the pre-crash hash (lost one event).
+        assert_ne!(writer.chain_hash().unwrap(), chain_before_crash);
+
+        // Write 10 more events.
+        for _ in 0..10 {
+            writer
+                .append(&JournalEvent::Deposit {
+                    account: AccountId(1),
+                    currency: CurrencyId(0),
+                    amount: 100,
+                })
+                .unwrap();
+        }
+        let final_hash = writer.chain_hash().unwrap();
+        drop(writer);
+
+        // Full re-read should produce the same chain hash.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 59); // 49 + 10
+        assert_eq!(reader.chain_hash().unwrap(), final_hash);
     }
 }

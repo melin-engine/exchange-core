@@ -2,6 +2,15 @@
 
 use std::fmt;
 
+/// Format a 32-byte hash as a hex string (first 8 bytes for readability).
+fn hex(hash: &[u8; 32]) -> String {
+    hash.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        + "..."
+}
+
 /// Errors that can occur during journal operations.
 #[derive(Debug)]
 pub enum JournalError {
@@ -23,6 +32,12 @@ pub enum JournalError {
     SequenceGap { expected: u64, actual: u64 },
     /// Entry is incomplete (likely a crash during write).
     TruncatedEntry,
+    /// BLAKE3 hash chain verification failed at a checkpoint.
+    HashChainMismatch {
+        sequence: u64,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -48,6 +63,16 @@ impl fmt::Display for JournalError {
                 write!(f, "sequence gap: expected {expected}, got {actual}")
             }
             Self::TruncatedEntry => write!(f, "truncated entry at end of journal"),
+            Self::HashChainMismatch {
+                sequence,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "hash chain mismatch at sequence {sequence}: expected {}, got {}",
+                hex(expected),
+                hex(actual)
+            ),
         }
     }
 }

@@ -48,4 +48,25 @@ pub enum JournalEvent {
     /// stage skips this variant. Flows through the pipeline so the matching
     /// stage can read Exchange state without concurrency issues.
     QueryStats,
+    /// First entry in every v6 journal. Contains random bytes (fresh journal)
+    /// or the chain hash at the rotation boundary (rotated journal). Seeds
+    /// the BLAKE3 hash chain for tamper evidence and replica consistency.
+    GenesisHash { hash: [u8; 32] },
+    /// Periodic hash chain checkpoint emitted every 100K events. Contains the
+    /// running BLAKE3 chain hash so readers can verify integrity without
+    /// recomputing from genesis. Written to the journal like any other entry
+    /// and itself hashed into the chain for continuity.
+    Checkpoint {
+        chain_hash: [u8; 32],
+        events_since_checkpoint: u64,
+    },
 }
+
+// Compile-time guard: GenesisHash/Checkpoint must not inflate the enum.
+// SubmitOrder (with Order) is the largest variant. If this fires,
+// a new variant exceeded the previous max and InputSlot/ring buffer
+// cache performance will degrade.
+const _: () = assert!(
+    std::mem::size_of::<JournalEvent>() <= 64,
+    "JournalEvent grew beyond 64 bytes — check new variant sizes"
+);

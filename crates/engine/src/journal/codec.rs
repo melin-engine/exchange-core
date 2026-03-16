@@ -8,7 +8,7 @@
 //! | Field          | Type | Bytes | Purpose                                |
 //! |----------------|------|-------|----------------------------------------|
 //! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
-//! | format_version | u16  | 2     | Current version = 1                    |
+//! | format_version | u16  | 2     | Current version = 6                    |
 //! | reserved       | u16  | 2     | Padding for alignment, zeroed          |
 //!
 //! ## Entry layout (little-endian, repeats after file header)
@@ -45,7 +45,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v2 → v3: added SetRiskLimits event for fat finger checks.
 /// v3 → v4: added CancelAll event for kill switch.
 /// v4 → v5: added SetCircuitBreaker event for price bands + trading halts.
-pub const FORMAT_VERSION: u16 = 5;
+/// v5 → v6: added GenesisHash + Checkpoint events for BLAKE3 hash chain.
+pub const FORMAT_VERSION: u16 = 6;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -68,6 +69,8 @@ const TAG_SET_RISK_LIMITS: u8 = 5;
 const TAG_CANCEL_ALL: u8 = 6;
 const TAG_SET_CIRCUIT_BREAKER: u8 = 7;
 const TAG_CANCEL_REPLACE: u8 = 8;
+const TAG_GENESIS_HASH: u8 = 9;
+const TAG_CHECKPOINT: u8 = 10;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -93,7 +96,9 @@ pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
         return Err(JournalError::InvalidFile);
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
-    if version != FORMAT_VERSION {
+    // Accept v5 (pre-hash-chain) and v6 (current). v5 journals are still
+    // readable — the reader simply won't have hash chain verification.
+    if version != FORMAT_VERSION && version != 5 {
         return Err(JournalError::UnsupportedVersion { version });
     }
     Ok(version)
@@ -242,6 +247,21 @@ pub fn encode(
                 sequence,
                 reason: "QueryStats must not be journaled",
             });
+        }
+        JournalEvent::GenesisHash { hash } => {
+            buf[pos..pos + 32].copy_from_slice(hash);
+            pos += 32;
+            TAG_GENESIS_HASH
+        }
+        JournalEvent::Checkpoint {
+            chain_hash,
+            events_since_checkpoint,
+        } => {
+            buf[pos..pos + 32].copy_from_slice(chain_hash);
+            pos += 32;
+            le::put_u64(&mut buf[pos..], *events_since_checkpoint);
+            pos += 8;
+            TAG_CHECKPOINT
         }
     };
 
@@ -576,6 +596,33 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                 new_quantity: Quantity(new_quantity),
             }
         }
+        TAG_GENESIS_HASH => {
+            if payload.len() < 32 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "GenesisHash payload too short",
+                });
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&payload[..32]);
+            JournalEvent::GenesisHash { hash }
+        }
+        TAG_CHECKPOINT => {
+            // chain_hash(32) + events_since_checkpoint(8) = 40
+            if payload.len() < 40 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "Checkpoint payload too short",
+                });
+            }
+            let mut chain_hash = [0u8; 32];
+            chain_hash.copy_from_slice(&payload[..32]);
+            let events_since_checkpoint = le::get_u64(&payload[32..]);
+            JournalEvent::Checkpoint {
+                chain_hash,
+                events_since_checkpoint,
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -849,6 +896,11 @@ mod tests {
                 order_id: OrderId(100),
                 new_price: Price(nz(5500)),
                 new_quantity: Quantity(nz(8)),
+            },
+            JournalEvent::GenesisHash { hash: [0xAB; 32] },
+            JournalEvent::Checkpoint {
+                chain_hash: [0xCD; 32],
+                events_since_checkpoint: 100_000,
             },
         ]
     }
