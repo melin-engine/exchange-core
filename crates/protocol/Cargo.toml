@@ -12,4 +12,5 @@ ed25519-dalek = { workspace = true }
 trading-engine = { path = "../engine" }
 
 [dev-dependencies]
+bolero = "0.11"
 tempfile = "3"

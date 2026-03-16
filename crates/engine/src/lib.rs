@@ -8,4 +8,6 @@ pub mod orderbook;
 pub mod types;
 
 #[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
 mod proptests;
