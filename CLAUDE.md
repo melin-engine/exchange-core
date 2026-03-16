@@ -128,7 +128,7 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
 - `src/spsc.rs` — single-producer, single-consumer queue
 
 ### `crates/engine/` — matching engine and event sourcing
-- `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, etc.)
+- `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, CircuitBreakerConfig, etc.)
 - `src/account.rs` — account balance management (flat `Vec<Balance>` indexed by `account_id * stride + currency_id` for O(1) lookups; deposit, withdraw, reserve, fill, release)
 - `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic
 - `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation
@@ -157,7 +157,8 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
 - `src/uds.rs` — `BlockingUdsListener` (std `UnixListener`)
 
 ### `crates/gateway/` — client-facing proxy (planned)
-### `crates/client/` — typed blocking client library (std `TcpStream`)
+### `crates/admin/` — CLI admin tool (instrument management, deposits, circuit breakers, risk limits, key generation)
+### `crates/client/` — typed blocking client library (Ed25519 auth, std `TcpStream`)
 ### `crates/bench/` — pipelined end-to-end benchmark with latency histograms (TCP default, `--uds` flag)
 ### `crates/tui/` — terminal UI for interactive testing
 

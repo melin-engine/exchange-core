@@ -77,7 +77,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
 - [x] Multi-instrument exchange with shared account balances
 - [ ] Cancel-replace / order amendment (atomic modify without losing queue priority for unchanged price)
-- [ ] Circuit breakers (price bands, trading halts)
+- [x] Circuit breakers (price bands, trading halts — per-instrument `CircuitBreakerConfig`)
 - [ ] Auction mechanisms (opening/closing/volatility auctions)
 
 ### Fees
@@ -91,7 +91,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Fat finger checks (max order size, max notional value — per-instrument configurable `RiskLimits`)
 - [x] Kill switch (cancel all resting orders and pending stops for an account across all instruments)
 - [x] Client deduplication (per-account OrderId high-water mark — prevents double-execution on crash-recovery retry)
-- [ ] Price band checks (reject orders too far from reference price)
+- [x] Price band checks (static lower/upper bounds, per-instrument — part of circuit breaker config)
 - [ ] Position/exposure limits
 - [ ] Order throttling (per-account rate limiting)
 
@@ -129,9 +129,9 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Rate limiting and connection management (per-client throttling)
 
 ### Authentication & Authorization
-- [ ] Client authentication
+- [x] Client authentication (Ed25519 challenge-response handshake)
 - [ ] Per-account trading permissions
-- [ ] Admin API (instrument management, circuit breaker controls, kill switch)
+- [x] Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits)
 
 ### Operations & Reliability
 - [x] Structured logging (`tracing` crate, error-level for server malfunctions only)
@@ -160,9 +160,9 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 - [ ] Fee/PnL accounting (when fees and position tracking exist)
 
 ### Testing
-- [x] `proptest` invariant tests on order book (price-time priority, volume conservation, balance conservation, book index consistency, overflow safety)
+- [x] `proptest` invariant tests (price-time priority, volume conservation, balance conservation, book/reservation/order-sides consistency, overflow safety, STP enforcement — all order types including stops, all STP modes, circuit breaker toggling, cancel-all)
 - [x] Verified `price × quantity` intermediate calculations don't overflow `u64` (use `u128` for computed values)
-- [ ] `cargo-fuzz` crash discovery (arbitrary order sequences, overflow/saturation edge cases)
+- [ ] `cargo-fuzz` crash discovery (codec fuzzing for binary parsers)
 
 ### Redundancy & High Availability
 - [ ] Journal replication (WAL streaming to replica; sync for zero data loss, async for lower latency)
@@ -175,18 +175,19 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 
 Ordered by importance for commercial readiness (exchange operators and investors).
 
-1. **Circuit breakers** — price bands, trading halts. Table stakes for any production exchange.
+1. ~~**Circuit breakers**~~ ✅ — price bands, trading halts. Fully integrated with event sourcing.
 2. **Cancel-replace / order amendment** — market makers won't evaluate without it. Most active order flow on any venue.
 3. **Replication & HA** — journal streaming to a replica, deterministic replay, failover. No exchange runs a single node.
-4. **Fuzz testing** — `cargo-fuzz` crash discovery. Correctness credibility for technical due diligence.
+4. ~~**Fuzz testing**~~ ✅ — proptest coverage extended to all order types, STP modes, circuit breakers, stops. Found and fixed a reservation leak on price-improved fills.
 5. **Journal rotation + compaction** — unbounded disk growth is a non-starter operationally.
-6. **TLS + authentication** — mTLS with certificate-based authorization (admin/trader/read-only permissions). Required for non-VLAN deployments.
-7. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
-8. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
-9. **Fee model** — maker/taker fees on fills. Shows the engine can generate revenue.
-10. **Documentation** — architecture guide, API reference, operational runbook.
+6. ~~**Authentication**~~ ✅ — Ed25519 challenge-response. Admin API for instrument/deposit/risk/circuit-breaker management.
+7. **TLS** — encrypted client connections. Required for non-VLAN deployments.
+8. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
+9. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
+10. **Fee model** — maker/taker fees on fills. Shows the engine can generate revenue.
+11. **Documentation** — architecture guide, API reference, operational runbook.
 
-Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), admin API.
+Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions.
 
 ### Benchmarking & Measurements
 - [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
@@ -213,6 +214,7 @@ crates/
 ├── engine/        Matching engine, order books, event sourcing, journal pipeline
 ├── protocol/      Binary wire protocol, transport abstractions, blocking I/O
 ├── server/        Server, pipeline orchestration, dedicated I/O threads
+├── admin/         CLI admin tool (instrument management, deposits, circuit breakers)
 ├── bench/         Benchmark suite (engine, pipeline, and full round-trip modes)
 ├── client/        Typed client library
 └── tui/           Terminal UI for interactive testing
