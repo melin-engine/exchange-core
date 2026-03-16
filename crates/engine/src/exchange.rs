@@ -713,15 +713,20 @@ impl Exchange {
     }
 
     /// Find the account that owns the given order by scanning `order_sides`.
-    /// Returns `AccountId(0)` if the order is not found (best-effort for
-    /// reject reports where the order doesn't exist on any book).
+    ///
+    /// Returns `AccountId(u32::MAX)` if the order is not found. This sentinel
+    /// value is used in reject reports for cancel-replace on nonexistent orders;
+    /// the response stage routes by connection_id (not account), so the account
+    /// field is informational only. `u32::MAX` is preferred over `0` because
+    /// account 0 is a valid account in production.
+    ///
     /// Linear scan — only used by cancel_replace reject paths which are rare.
     fn find_account_for_order(&self, order_id: OrderId) -> AccountId {
         self.order_sides
             .keys()
             .find(|&&(_, oid)| oid == order_id)
             .map(|&(account, _)| account)
-            .unwrap_or(AccountId(0))
+            .unwrap_or(AccountId(u32::MAX))
     }
 }
 
@@ -4078,7 +4083,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(999),
-                account: AccountId(0),
+                account: AccountId(u32::MAX),
                 reason: RejectReason::UnknownOrder,
             }
         );
@@ -4098,7 +4103,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
-                account: AccountId(0),
+                account: AccountId(u32::MAX),
                 reason: RejectReason::UnknownSymbol,
             }
         );
