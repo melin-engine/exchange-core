@@ -225,6 +225,15 @@ pub enum ExecutionReport {
         order_id: OrderId,
         reason: RejectReason,
     },
+    /// Order was amended via cancel-replace. Emitted on success.
+    Replaced {
+        order_id: OrderId,
+        side: Side,
+        old_price: Price,
+        new_price: Price,
+        old_remaining: Quantity,
+        new_remaining: Quantity,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +264,11 @@ pub enum RejectReason {
     TradingHalted,
     /// Order price is outside the instrument's configured price bands.
     OutsidePriceBand,
+    /// Cancel-replace target order not found on the book.
+    UnknownOrder,
+    /// Cancel-replace new price would cross the opposite best price.
+    /// Cancel and submit a new order to aggress.
+    PriceWouldCross,
 }
 
 #[cfg(test)]

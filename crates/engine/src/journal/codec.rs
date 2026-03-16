@@ -67,6 +67,7 @@ const TAG_CANCEL_ORDER: u8 = 4;
 const TAG_SET_RISK_LIMITS: u8 = 5;
 const TAG_CANCEL_ALL: u8 = 6;
 const TAG_SET_CIRCUIT_BREAKER: u8 = 7;
+const TAG_CANCEL_REPLACE: u8 = 8;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -217,6 +218,22 @@ pub fn encode(
             buf[pos] = u8::from(config.halted);
             pos += 1;
             TAG_SET_CIRCUIT_BREAKER
+        }
+        JournalEvent::CancelReplace {
+            symbol,
+            order_id,
+            new_price,
+            new_quantity,
+        } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], order_id.0);
+            pos += 8;
+            le::put_u64(&mut buf[pos..], new_price.get());
+            pos += 8;
+            le::put_u64(&mut buf[pos..], new_quantity.get());
+            pos += 8;
+            TAG_CANCEL_REPLACE
         }
     };
 
@@ -524,6 +541,35 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                 },
             }
         }
+        TAG_CANCEL_REPLACE => {
+            // symbol(4) + order_id(8) + new_price(8) + new_quantity(8) = 28
+            if payload.len() < 28 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "CancelReplace payload too short",
+                });
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let order_id = OrderId(le::get_u64(&payload[4..]));
+            let new_price = NonZeroU64::new(le::get_u64(&payload[12..])).ok_or(
+                JournalError::CorruptEntry {
+                    sequence,
+                    reason: "CancelReplace new_price is zero",
+                },
+            )?;
+            let new_quantity = NonZeroU64::new(le::get_u64(&payload[20..])).ok_or(
+                JournalError::CorruptEntry {
+                    sequence,
+                    reason: "CancelReplace new_quantity is zero",
+                },
+            )?;
+            JournalEvent::CancelReplace {
+                symbol,
+                order_id,
+                new_price: Price(new_price),
+                new_quantity: Quantity(new_quantity),
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -791,6 +837,12 @@ mod tests {
                     price_band_upper: None,
                     halted: true,
                 },
+            },
+            JournalEvent::CancelReplace {
+                symbol: Symbol(1),
+                order_id: OrderId(100),
+                new_price: Price(nz(5500)),
+                new_quantity: Quantity(nz(8)),
             },
         ]
     }

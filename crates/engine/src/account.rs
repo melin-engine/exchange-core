@@ -339,6 +339,54 @@ impl AccountManager {
         self.reservations.contains_key(&order_id)
     }
 
+    /// Adjust an existing reservation in-place for cancel-replace.
+    ///
+    /// If the new amount is higher, checks that the account has sufficient
+    /// available balance for the delta. If insufficient, returns
+    /// `Err(InsufficientBalance)` and leaves the reservation unchanged.
+    ///
+    /// If the new amount is lower or equal, always succeeds.
+    pub fn try_adjust_reservation(
+        &mut self,
+        order_id: OrderId,
+        new_amount: u64,
+    ) -> Result<(), RejectReason> {
+        let res = self
+            .reservations
+            .get(&order_id)
+            .ok_or(RejectReason::UnknownOrder)?;
+        let old_amount = res.remaining;
+        let account = res.account;
+        let currency = res.currency;
+
+        if new_amount == old_amount {
+            return Ok(());
+        }
+
+        let bal = self
+            .get_mut(account, currency)
+            .ok_or(RejectReason::InsufficientBalance)?;
+
+        if new_amount > old_amount {
+            let delta = new_amount - old_amount;
+            if bal.available < delta {
+                return Err(RejectReason::InsufficientBalance);
+            }
+            bal.available -= delta;
+            bal.reserved += delta;
+        } else {
+            let delta = old_amount - new_amount;
+            bal.reserved = bal.reserved.saturating_sub(delta);
+            bal.available = bal.available.saturating_add(delta);
+        }
+
+        // Update the reservation.
+        let res = self.reservations.get_mut(&order_id).expect("checked above");
+        res.remaining = new_amount;
+
+        Ok(())
+    }
+
     /// Release all remaining reserved funds for an order (on cancel or reject).
     pub fn release(&mut self, order_id: OrderId) {
         if let Some(res) = self.reservations.remove(&order_id)
@@ -409,7 +457,9 @@ impl AccountManager {
                     self.release(order_id);
                     consumed.push(order_id);
                 }
-                ExecutionReport::Placed { .. } | ExecutionReport::Triggered { .. } => {}
+                ExecutionReport::Placed { .. }
+                | ExecutionReport::Triggered { .. }
+                | ExecutionReport::Replaced { .. } => {}
             }
         }
     }

@@ -377,6 +377,90 @@ impl OrderBook {
         self.stop_index.contains_key(&id)
     }
 
+    /// Look up a resting order's current state: (side, price, remaining).
+    /// Returns `None` if the order is not on the book.
+    pub(crate) fn get_resting_order(&self, order_id: OrderId) -> Option<(Side, Price, Quantity)> {
+        let &(side, price) = self.order_index.get(&order_id)?;
+        let book_side = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let level = book_side.levels.get(&price)?;
+        let order = level.iter().find(|o| o.id == order_id)?;
+        Some((side, price, order.remaining))
+    }
+
+    /// Best bid price (highest), or `None` if the bid side is empty.
+    pub(crate) fn best_bid(&self) -> Option<Price> {
+        self.bids.levels.last_key_value().map(|(&p, _)| p)
+    }
+
+    /// Best ask price (lowest), or `None` if the ask side is empty.
+    pub(crate) fn best_ask(&self) -> Option<Price> {
+        self.asks.levels.first_key_value().map(|(&p, _)| p)
+    }
+
+    /// Replace a resting order's price and/or quantity in-place.
+    ///
+    /// Time priority rules:
+    /// - Same price, qty decrease → keep position (in-place update)
+    /// - Same price, qty increase → lose position (back of queue)
+    /// - Price change → lose position (remove + re-add at new level)
+    ///
+    /// Returns `(old_price, old_remaining)` on success, or `None` if
+    /// the order is not found.
+    pub(crate) fn replace_order(
+        &mut self,
+        order_id: OrderId,
+        new_price: Price,
+        new_quantity: Quantity,
+    ) -> Option<(Price, Quantity)> {
+        let &(side, old_price) = self.order_index.get(&order_id)?;
+        let book_side = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+
+        if old_price == new_price {
+            // Same price level — check if we can keep time priority.
+            let level = book_side.levels.get_mut(&old_price)?;
+            let pos = level.iter().position(|o| o.id == order_id)?;
+            let old_remaining = level[pos].remaining;
+
+            if new_quantity <= old_remaining {
+                // Qty decrease (or same) → in-place update, keep priority.
+                level[pos].remaining = new_quantity;
+            } else {
+                // Qty increase → remove and push to back (lose priority).
+                let mut order = level.remove(pos).expect("position was valid");
+                order.remaining = new_quantity;
+                level.push_back(order);
+            }
+            Some((old_price, old_remaining))
+        } else {
+            // Price change → remove from old level, add to new level.
+            // Manipulate the VecDeque directly to preserve the RestingOrder
+            // (including account), since BookSide::remove only returns Quantity.
+            let old_level = book_side.levels.get_mut(&old_price)?;
+            let pos = old_level.iter().position(|o| o.id == order_id)?;
+            let mut order = old_level.remove(pos).expect("position was valid");
+            let old_remaining = order.remaining;
+            order.remaining = new_quantity;
+
+            if old_level.is_empty() {
+                book_side.levels.remove(&old_price);
+            }
+
+            // Add at back of new price level (loses time priority).
+            book_side.add(new_price, order);
+
+            // Update the order index to reflect the new price.
+            self.order_index.insert(order_id, (side, new_price));
+
+            Some((old_price, old_remaining))
+        }
+    }
+
     /// Process an incoming order, appending execution reports to `reports`.
     ///
     /// `quote_budget` limits the total quote currency cost for buy-side market

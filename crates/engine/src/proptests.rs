@@ -647,7 +647,9 @@ proptest! {
                         total_rejected += q;
                     }
                 }
-                ExecutionReport::Placed { .. } | ExecutionReport::Triggered { .. } => {}
+                ExecutionReport::Placed { .. }
+                | ExecutionReport::Triggered { .. }
+                | ExecutionReport::Replaced { .. } => {}
             }
         }
 

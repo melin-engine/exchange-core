@@ -543,6 +543,15 @@ impl MatchingStage {
             JournalEvent::SetCircuitBreaker { symbol, config } => {
                 self.exchange.set_circuit_breaker(symbol, config);
             }
+            JournalEvent::CancelReplace {
+                symbol,
+                order_id,
+                new_price,
+                new_quantity,
+            } => {
+                self.exchange
+                    .cancel_replace(symbol, order_id, new_price, new_quantity, reports);
+            }
         }
     }
 }

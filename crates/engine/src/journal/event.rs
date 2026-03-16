@@ -5,7 +5,8 @@
 //! This halves journal size and simplifies the format.
 
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, Order, OrderId, RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, Order, OrderId, Price, Quantity,
+    RiskLimits, Symbol,
 };
 
 /// An input event to be journaled for replay and crash recovery.
@@ -35,5 +36,12 @@ pub enum JournalEvent {
     SetCircuitBreaker {
         symbol: Symbol,
         config: CircuitBreakerConfig,
+    },
+    /// Atomically amend a resting limit order's price and/or quantity.
+    CancelReplace {
+        symbol: Symbol,
+        order_id: OrderId,
+        new_price: Price,
+        new_quantity: Quantity,
     },
 }

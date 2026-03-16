@@ -230,6 +230,14 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(symbol, config);
         }
+        JournalEvent::CancelReplace {
+            symbol,
+            order_id,
+            new_price,
+            new_quantity,
+        } => {
+            exchange.cancel_replace(symbol, order_id, new_price, new_quantity, reports);
+        }
     }
 }
 

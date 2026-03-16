@@ -14,7 +14,7 @@ use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    OrderType, RejectReason, RiskLimits, Side, Symbol,
+    OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
 };
 
 /// Top-level exchange managing multiple instruments.
@@ -463,6 +463,174 @@ impl Exchange {
         for &order_id in &self.consumed_buf {
             self.order_sides.remove(&order_id);
         }
+    }
+
+    /// Atomically amend a resting limit order's price and/or quantity.
+    ///
+    /// Validation order (all checks before any mutation):
+    /// 1. Instrument exists
+    /// 2. Order exists on the book (resting limit only — not stops, not market)
+    /// 3. Circuit breaker: halted or price band violation
+    /// 4. Risk limits: max qty, max notional
+    /// 5. Price-would-cross check: reject if new price crosses the spread
+    /// 6. Reservation adjustment: compute new required amount, check balance
+    ///
+    /// If any check fails, the original order remains untouched.
+    ///
+    /// Time priority rules:
+    /// - Same price, qty decrease → keep priority
+    /// - Same price, qty increase → lose priority
+    /// - Price change → lose priority
+    pub fn cancel_replace(
+        &mut self,
+        symbol: Symbol,
+        order_id: OrderId,
+        new_price: Price,
+        new_quantity: Quantity,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
+        // Verify instrument exists. The spec itself isn't needed since
+        // cancel-replace only modifies an existing order (reservation
+        // currency is already known from the original order).
+        if !self.instruments.contains_key(&symbol) {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                reason: RejectReason::UnknownSymbol,
+            });
+            return;
+        }
+
+        let Some(book) = self.books.get_mut(&symbol) else {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                reason: RejectReason::UnknownSymbol,
+            });
+            return;
+        };
+
+        // 1. Order must exist as a resting limit order.
+        let Some((side, old_price, old_remaining)) = book.get_resting_order(order_id) else {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                reason: RejectReason::UnknownOrder,
+            });
+            return;
+        };
+
+        // 2. Circuit breaker checks on the new price.
+        if let Some(cb) = self.circuit_breakers.get(&symbol) {
+            if cb.halted {
+                reports.push(ExecutionReport::Rejected {
+                    order_id,
+                    reason: RejectReason::TradingHalted,
+                });
+                return;
+            }
+            if let Some(lower) = cb.price_band_lower
+                && new_price < lower
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id,
+                    reason: RejectReason::OutsidePriceBand,
+                });
+                return;
+            }
+            if let Some(upper) = cb.price_band_upper
+                && new_price > upper
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id,
+                    reason: RejectReason::OutsidePriceBand,
+                });
+                return;
+            }
+        }
+
+        // 3. Risk limit checks on the new quantity/notional.
+        if let Some(limits) = self.risk_limits.get(&symbol) {
+            if let Some(max_qty) = limits.max_order_qty
+                && new_quantity.get() > max_qty.get()
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id,
+                    reason: RejectReason::ExceedsMaxOrderQty,
+                });
+                return;
+            }
+            if let Some(max_notional) = limits.max_order_notional {
+                let notional = new_price.get() as u128 * new_quantity.get() as u128;
+                if notional > max_notional as u128 {
+                    reports.push(ExecutionReport::Rejected {
+                        order_id,
+                        reason: RejectReason::ExceedsMaxNotional,
+                    });
+                    return;
+                }
+            }
+        }
+
+        // 4. Reject if the new price would cross the opposite best price.
+        // This prevents the replacement from becoming an aggressor. If the
+        // user wants to cross the spread, they should cancel and submit a
+        // new order.
+        let would_cross = match side {
+            Side::Buy => book
+                .best_ask()
+                .is_some_and(|best_ask| new_price >= best_ask),
+            Side::Sell => book
+                .best_bid()
+                .is_some_and(|best_bid| new_price <= best_bid),
+        };
+        if would_cross {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                reason: RejectReason::PriceWouldCross,
+            });
+            return;
+        }
+
+        // 5. Adjust reservation atomically. Compute the new required amount
+        // based on the new price/quantity. If insufficient balance, the
+        // original reservation (and order) stays intact.
+        let new_required = match side {
+            Side::Buy => {
+                let cost = new_price.get() as u128 * new_quantity.get() as u128;
+                match u64::try_from(cost) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        reports.push(ExecutionReport::Rejected {
+                            order_id,
+                            reason: RejectReason::InsufficientBalance,
+                        });
+                        return;
+                    }
+                }
+            }
+            Side::Sell => new_quantity.get(),
+        };
+
+        if let Err(reason) = self.accounts.try_adjust_reservation(order_id, new_required) {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                reason,
+            });
+            return;
+        }
+
+        // 6. All checks passed — perform the book replacement.
+        // This cannot fail since we verified the order exists above and
+        // matching is single-threaded (no concurrent removal possible).
+        book.replace_order(order_id, new_price, new_quantity)
+            .expect("order verified to exist");
+
+        reports.push(ExecutionReport::Replaced {
+            order_id,
+            side,
+            old_price,
+            new_price,
+            old_remaining,
+            new_remaining: new_quantity,
+        });
     }
 }
 
@@ -3589,5 +3757,661 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- Cancel-replace tests --
+
+    #[test]
+    fn cancel_replace_basic_price_change() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+
+        let mut reports = Vec::new();
+
+        // Place a limit buy at 100 for 10.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Cancel-replace to price 120 (same qty).
+        exchange.cancel_replace(btc, OrderId(1), price(120), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                side: Side::Buy,
+                old_price: price(100),
+                new_price: price(120),
+                old_remaining: qty(10),
+                new_remaining: qty(10),
+            }
+        );
+
+        // Old reservation was 100*10=1000, new is 120*10=1200.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_200);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 48_800);
+    }
+
+    #[test]
+    fn cancel_replace_qty_decrease_keeps_priority() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Place two buys at same price. Order 1 is first in queue.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Cancel-replace order 1 to lower qty (5). Should keep priority.
+        exchange.cancel_replace(btc, OrderId(1), price(100), qty(5), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
+        reports.clear();
+
+        // Sell 5 into the book — should match order 1 first (kept priority).
+        exchange.execute(
+            btc,
+            limit_order(3, ACCT_B, Side::Sell, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Expect a fill against order 1 (maker), not order 2.
+        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        assert!(fill.is_some());
+        assert!(matches!(
+            fill.unwrap(),
+            ExecutionReport::Fill {
+                maker_order_id: OrderId(1),
+                taker_order_id: OrderId(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancel_replace_qty_increase_loses_priority() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Place two buys at same price. Order 1 is first in queue.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Cancel-replace order 1 to higher qty (15). Should lose priority.
+        exchange.cancel_replace(btc, OrderId(1), price(100), qty(15), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
+        reports.clear();
+
+        // Sell 5 into the book — should match order 2 first (order 1 lost priority).
+        exchange.execute(
+            btc,
+            limit_order(3, ACCT_B, Side::Sell, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        assert!(fill.is_some());
+        assert!(matches!(
+            fill.unwrap(),
+            ExecutionReport::Fill {
+                maker_order_id: OrderId(2),
+                taker_order_id: OrderId(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancel_replace_insufficient_balance() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        // Only deposit enough for the initial order.
+        exchange.deposit(ACCT_A, USD, 1_100);
+
+        let mut reports = Vec::new();
+
+        // Place buy at 100 for 10 (reserves 1000).
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Cancel-replace to price 500 for 10 (would need 5000, only have 1100 total).
+        exchange.cancel_replace(btc, OrderId(1), price(500), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::InsufficientBalance,
+            }
+        );
+
+        // Original order must still be on the book with original reservation.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 100);
+    }
+
+    #[test]
+    fn cancel_replace_unknown_order() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+
+        // Cancel-replace on an order ID that was never placed.
+        exchange.cancel_replace(btc, OrderId(999), price(100), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(999),
+                reason: RejectReason::UnknownOrder,
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_replace_unknown_symbol() {
+        let mut exchange = Exchange::new();
+        // Don't add any instruments.
+
+        let mut reports = Vec::new();
+
+        exchange.cancel_replace(Symbol(42), OrderId(1), price(100), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::UnknownSymbol,
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_replace_price_would_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Place a buy at 100.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Place an ask at 110.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 110, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Cancel-replace the buy to price 110 — would cross the ask.
+        exchange.cancel_replace(btc, OrderId(1), price(110), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::PriceWouldCross,
+            }
+        );
+
+        // Original order must remain intact.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn cancel_replace_trading_halted() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+
+        let mut reports = Vec::new();
+
+        // Place a buy at 100.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Halt trading.
+        exchange.set_circuit_breaker(
+            btc,
+            CircuitBreakerConfig {
+                halted: true,
+                ..Default::default()
+            },
+        );
+
+        // Cancel-replace should be rejected.
+        exchange.cancel_replace(btc, OrderId(1), price(120), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::TradingHalted,
+            }
+        );
+
+        // Original order remains.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn cancel_replace_outside_price_band() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 500_000);
+
+        let mut reports = Vec::new();
+
+        // Place a buy at 100.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Set price bands [90, 110].
+        exchange.set_circuit_breaker(
+            btc,
+            CircuitBreakerConfig {
+                price_band_lower: Some(price(90)),
+                price_band_upper: Some(price(110)),
+                halted: false,
+            },
+        );
+
+        // Cancel-replace to price 120 — outside upper band.
+        exchange.cancel_replace(btc, OrderId(1), price(120), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::OutsidePriceBand,
+            }
+        );
+
+        // Original order remains.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn cancel_replace_exceeds_max_order_qty() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 500_000);
+
+        let mut reports = Vec::new();
+
+        // Place a buy at 100 for 10.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Set max order qty to 20.
+        exchange.set_risk_limits(
+            btc,
+            RiskLimits {
+                max_order_qty: Some(qty(20)),
+                max_order_notional: None,
+            },
+        );
+
+        // Cancel-replace to qty 25 — exceeds limit.
+        exchange.cancel_replace(btc, OrderId(1), price(100), qty(25), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::ExceedsMaxOrderQty,
+            }
+        );
+
+        // Original order remains with original qty.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn cancel_replace_partially_filled_order() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Place a limit buy for 100 at price 100 (reserves 10_000).
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 100, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Sell 30 into it — partial fill, remaining = 70.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 100, 30, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+        reports.clear();
+
+        // Cancel-replace remaining to qty 50 at price 90.
+        exchange.cancel_replace(btc, OrderId(1), price(90), qty(50), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                side: Side::Buy,
+                old_price: price(100),
+                new_price: price(90),
+                old_remaining: qty(70),
+                new_remaining: qty(50),
+            }
+        );
+
+        // New reservation should be 90*50=4500.
+        // Buyer started with 50_000, spent 30*100=3000 on fills.
+        // Remaining USD = 50_000 - 3000 = 47_000 total.
+        // Reserved = 4500, available = 42_500.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 4_500);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 42_500);
+        // Buyer received 30 BTC from the fill.
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 30);
+    }
+
+    #[test]
+    fn cancel_replace_sell_order() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Place a limit sell at 200 for 10 (reserves 10 BTC).
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Sell, 200, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Cancel-replace to price 180, qty 8.
+        exchange.cancel_replace(btc, OrderId(1), price(180), qty(8), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                side: Side::Sell,
+                old_price: price(200),
+                new_price: price(180),
+                old_remaining: qty(10),
+                new_remaining: qty(8),
+            }
+        );
+
+        // Sell reservation is qty-based: was 10, now 8. Released 2 back.
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).reserved, 8);
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 92);
+    }
+
+    #[test]
+    fn cancel_replace_noop_same_price_same_qty() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+
+        let mut reports = Vec::new();
+
+        // Place a limit buy at 100 for 10.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Cancel-replace with same price and qty — should succeed as a no-op.
+        exchange.cancel_replace(btc, OrderId(1), price(100), qty(10), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                side: Side::Buy,
+                old_price: price(100),
+                new_price: price(100),
+                old_remaining: qty(10),
+                new_remaining: qty(10),
+            }
+        );
+
+        // Balances unchanged.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 49_000);
+    }
+
+    #[test]
+    fn cancel_replace_above_upper_price_band() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.set_circuit_breaker(
+            btc,
+            CircuitBreakerConfig {
+                price_band_lower: Some(price(80)),
+                price_band_upper: Some(price(120)),
+                halted: false,
+            },
+        );
+
+        let mut reports = Vec::new();
+
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Replace to price 130 — above upper band.
+        exchange.cancel_replace(btc, OrderId(1), price(130), qty(10), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
+        ));
+        // Original order intact.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn cancel_replace_exceeds_max_notional() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 500_000);
+        exchange.set_risk_limits(
+            btc,
+            RiskLimits {
+                max_order_qty: None,
+                max_order_notional: Some(10_000),
+            },
+        );
+
+        let mut reports = Vec::new();
+
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Replace to 200*100 = 20_000 notional — exceeds 10_000 limit.
+        exchange.cancel_replace(btc, OrderId(1), price(200), qty(100), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ExceedsMaxNotional,
+                ..
+            }
+        ));
+        // Original order intact.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn cancel_replace_sell_price_would_cross_bid() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.deposit(ACCT_B, USD, 50_000);
+
+        let mut reports = Vec::new();
+
+        // Resting bid at 100.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        // Resting ask at 200.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_A, Side::Sell, 200, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Replace ask to price 100 — would cross the bid. Rejected.
+        exchange.cancel_replace(btc, OrderId(2), price(100), qty(10), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::PriceWouldCross,
+                ..
+            }
+        ));
+        // Original order intact.
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).reserved, 10);
+    }
+
+    #[test]
+    fn cancel_replace_price_overflow_rejected() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, u64::MAX / 2);
+
+        let mut reports = Vec::new();
+
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Replace to a price/qty combination that overflows u64.
+        // Price close to u64::MAX, qty > 1 → overflow.
+        let huge_price = Price(NonZeroU64::new(u64::MAX / 2).unwrap());
+        exchange.cancel_replace(btc, OrderId(1), huge_price, qty(3), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::InsufficientBalance,
+                ..
+            }
+        ));
+        // Original order intact.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
     }
 }
