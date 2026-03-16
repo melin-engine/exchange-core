@@ -187,8 +187,9 @@ Ordered by importance for commercial readiness (exchange operators and investors
 9. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
 10. **Fee model** — maker/taker fees on fills. Shows the engine can generate revenue.
 11. **Documentation** — architecture guide, API reference, operational runbook.
+12. **Security hardening** — remaining [audit findings](docs/security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
 
-Also needed: **security hardening** ([audit findings](docs/security-audit.md) — response write timeouts, connection limits, per-account order limits, order throttling, snapshot validation), backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions.
+Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions.
 
 ### Benchmarking & Measurements
 - [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
