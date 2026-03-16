@@ -29,8 +29,8 @@
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, CurrencyId, InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RiskLimits,
-    Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, Order, OrderId, OrderType, Price,
+    Quantity, RiskLimits, Symbol,
 };
 
 use super::error::JournalError;
@@ -44,7 +44,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v1 → v2: added SelfTradeProtection byte to Order encoding.
 /// v2 → v3: added SetRiskLimits event for fat finger checks.
 /// v3 → v4: added CancelAll event for kill switch.
-pub const FORMAT_VERSION: u16 = 4;
+/// v4 → v5: added SetCircuitBreaker event for price bands + trading halts.
+pub const FORMAT_VERSION: u16 = 5;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -65,6 +66,7 @@ const TAG_SUBMIT_ORDER: u8 = 3;
 const TAG_CANCEL_ORDER: u8 = 4;
 const TAG_SET_RISK_LIMITS: u8 = 5;
 const TAG_CANCEL_ALL: u8 = 6;
+const TAG_SET_CIRCUIT_BREAKER: u8 = 7;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -181,6 +183,40 @@ pub fn encode(
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             TAG_CANCEL_ALL
+        }
+        JournalEvent::SetCircuitBreaker { symbol, config } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            // price_band_lower: option tag (1) + value if Some (8).
+            match config.price_band_lower {
+                Some(price) => {
+                    buf[pos] = 1;
+                    pos += 1;
+                    le::put_u64(&mut buf[pos..], price.get());
+                    pos += 8;
+                }
+                None => {
+                    buf[pos] = 0;
+                    pos += 1;
+                }
+            }
+            // price_band_upper: option tag (1) + value if Some (8).
+            match config.price_band_upper {
+                Some(price) => {
+                    buf[pos] = 1;
+                    pos += 1;
+                    le::put_u64(&mut buf[pos..], price.get());
+                    pos += 8;
+                }
+                None => {
+                    buf[pos] = 0;
+                    pos += 1;
+                }
+            }
+            // halted: bool (1).
+            buf[pos] = u8::from(config.halted);
+            pos += 1;
+            TAG_SET_CIRCUIT_BREAKER
         }
     };
 
@@ -398,6 +434,96 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                 account: AccountId(le::get_u32(&payload[0..])),
             }
         }
+        TAG_SET_CIRCUIT_BREAKER => {
+            // symbol(4) + option_tag(1) [+ price(8)] + option_tag(1) [+ price(8)] + halted(1)
+            if payload.len() < 7 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "SetCircuitBreaker payload too short",
+                });
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let mut p = 4;
+            let price_band_lower = match payload[p] {
+                1 => {
+                    p += 1;
+                    if p + 8 > payload.len() {
+                        return Err(JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetCircuitBreaker price_band_lower truncated",
+                        });
+                    }
+                    let v = NonZeroU64::new(le::get_u64(&payload[p..])).ok_or(
+                        JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetCircuitBreaker price_band_lower is zero",
+                        },
+                    )?;
+                    p += 8;
+                    Some(Price(v))
+                }
+                0 => {
+                    p += 1;
+                    None
+                }
+                _ => {
+                    return Err(JournalError::CorruptEntry {
+                        sequence,
+                        reason: "SetCircuitBreaker invalid price_band_lower tag",
+                    });
+                }
+            };
+            if p >= payload.len() {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "SetCircuitBreaker price_band_upper tag missing",
+                });
+            }
+            let price_band_upper = match payload[p] {
+                1 => {
+                    p += 1;
+                    if p + 8 > payload.len() {
+                        return Err(JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetCircuitBreaker price_band_upper truncated",
+                        });
+                    }
+                    let v = NonZeroU64::new(le::get_u64(&payload[p..])).ok_or(
+                        JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetCircuitBreaker price_band_upper is zero",
+                        },
+                    )?;
+                    p += 8;
+                    Some(Price(v))
+                }
+                0 => {
+                    p += 1;
+                    None
+                }
+                _ => {
+                    return Err(JournalError::CorruptEntry {
+                        sequence,
+                        reason: "SetCircuitBreaker invalid price_band_upper tag",
+                    });
+                }
+            };
+            if p >= payload.len() {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "SetCircuitBreaker halted byte missing",
+                });
+            }
+            let halted = payload[p] != 0;
+            JournalEvent::SetCircuitBreaker {
+                symbol,
+                config: CircuitBreakerConfig {
+                    price_band_lower,
+                    price_band_upper,
+                    halted,
+                },
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -553,7 +679,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SelfTradeProtection, Side, TimeInForce};
+    use crate::types::{CircuitBreakerConfig, SelfTradeProtection, Side, TimeInForce};
     use std::num::NonZeroU64;
 
     fn nz(v: u64) -> NonZeroU64 {
@@ -649,6 +775,22 @@ mod tests {
             },
             JournalEvent::CancelAll {
                 account: AccountId(42),
+            },
+            JournalEvent::SetCircuitBreaker {
+                symbol: Symbol(1),
+                config: CircuitBreakerConfig {
+                    price_band_lower: Some(Price(nz(900))),
+                    price_band_upper: Some(Price(nz(1100))),
+                    halted: false,
+                },
+            },
+            JournalEvent::SetCircuitBreaker {
+                symbol: Symbol(2),
+                config: CircuitBreakerConfig {
+                    price_band_lower: None,
+                    price_band_upper: None,
+                    halted: true,
+                },
             },
         ]
     }

@@ -29,7 +29,8 @@ use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CurrencyId, InstrumentSpec, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, OrderId, Price, Quantity,
+    RiskLimits, Side, Symbol,
 };
 
 use super::error::JournalError;
@@ -48,7 +49,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v1 → v2: added SelfTradeProtection byte to PendingStopSnapshot.
 /// v2 → v3: added per-account OrderId high-water marks for client dedup.
 /// v3 → v4: added per-instrument RiskLimits for fat finger checks.
-const SNAP_VERSION: u16 = 4;
+/// v4 → v5: added per-instrument CircuitBreakerConfig for price bands + halts.
+const SNAP_VERSION: u16 = 5;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) = 16.
 const SNAP_HEADER_SIZE: usize = 16;
@@ -165,6 +167,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) max_order_id: Vec<(AccountId, u64)>,
     /// Per-instrument fat finger risk limits.
     pub(crate) risk_limits: Vec<(Symbol, RiskLimits)>,
+    /// Per-instrument circuit breaker configurations.
+    pub(crate) circuit_breakers: Vec<(Symbol, CircuitBreakerConfig)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -272,6 +276,27 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
             }
             None => buf.push(0),
         }
+    }
+
+    // Per-instrument circuit breakers (v5+).
+    le::push_u32(buf, state.circuit_breakers.len() as u32);
+    for (symbol, config) in &state.circuit_breakers {
+        le::push_u32(buf, symbol.0);
+        match config.price_band_lower {
+            Some(price) => {
+                buf.push(1);
+                le::push_u64(buf, price.get());
+            }
+            None => buf.push(0),
+        }
+        match config.price_band_upper {
+            Some(price) => {
+                buf.push(1);
+                le::push_u64(buf, price.get());
+            }
+            None => buf.push(0),
+        }
+        buf.push(u8::from(config.halted));
     }
 }
 
@@ -537,6 +562,61 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         ));
     }
 
+    // Per-instrument circuit breakers (v5+).
+    check(pos, 4)?;
+    let n_circuit_breakers = le::get_u32(&buf[pos..]) as usize;
+    pos += 4;
+    // Each entry is at least 7 bytes: symbol(4) + two option tags(1+1) + halted(1).
+    validate_count(buf.len() - pos, n_circuit_breakers, 7)?;
+    let mut circuit_breakers = Vec::with_capacity(n_circuit_breakers);
+    for _ in 0..n_circuit_breakers {
+        check(pos, 7)?;
+        let symbol = Symbol(le::get_u32(&buf[pos..]));
+        pos += 4;
+        let price_band_lower = match buf[pos] {
+            1 => {
+                pos += 1;
+                check(pos, 8)?;
+                let v = NonZeroU64::new(le::get_u64(&buf[pos..]))
+                    .ok_or(corrupt("zero price_band_lower in circuit breaker"))?;
+                pos += 8;
+                Some(Price(v))
+            }
+            0 => {
+                pos += 1;
+                None
+            }
+            _ => return Err(corrupt("invalid price_band_lower tag in circuit breaker")),
+        };
+        check(pos, 1)?;
+        let price_band_upper = match buf[pos] {
+            1 => {
+                pos += 1;
+                check(pos, 8)?;
+                let v = NonZeroU64::new(le::get_u64(&buf[pos..]))
+                    .ok_or(corrupt("zero price_band_upper in circuit breaker"))?;
+                pos += 8;
+                Some(Price(v))
+            }
+            0 => {
+                pos += 1;
+                None
+            }
+            _ => return Err(corrupt("invalid price_band_upper tag in circuit breaker")),
+        };
+        check(pos, 1)?;
+        let halted = buf[pos] != 0;
+        pos += 1;
+        circuit_breakers.push((
+            symbol,
+            CircuitBreakerConfig {
+                price_band_lower,
+                price_band_upper,
+                halted,
+            },
+        ));
+    }
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -547,6 +627,7 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
             books,
             max_order_id,
             risk_limits,
+            circuit_breakers,
         },
     ))
 }
@@ -826,6 +907,7 @@ impl Exchange {
 
         let max_order_id = self.snapshot_max_order_id();
         let risk_limits = self.snapshot_risk_limits();
+        let circuit_breakers = self.snapshot_circuit_breakers();
 
         ExchangeSnapshot {
             instruments,
@@ -835,6 +917,7 @@ impl Exchange {
             books,
             max_order_id,
             risk_limits,
+            circuit_breakers,
         }
     }
 
@@ -859,6 +942,8 @@ impl Exchange {
         let accounts = AccountManager::from_parts(state.balances, state.reservations);
         let order_sides: HashMap<OrderId, Side> = state.order_sides.into_iter().collect();
         let risk_limits: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
+        let circuit_breakers: HashMap<Symbol, CircuitBreakerConfig> =
+            state.circuit_breakers.into_iter().collect();
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
         Self::from_parts(
@@ -867,6 +952,7 @@ impl Exchange {
             accounts,
             order_sides,
             risk_limits,
+            circuit_breakers,
             max_order_id,
         )
     }
@@ -1116,6 +1202,77 @@ mod tests {
 
         assert!(matches!(new_reports[0], ExecutionReport::Fill { .. }));
         assert_eq!(restored.accounts().balance(ACCT_A, BTC).available, 20);
+    }
+
+    #[test]
+    fn snapshot_preserves_circuit_breaker_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cb.snapshot");
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        // Set circuit breaker with price bands + halt.
+        exchange.set_circuit_breaker(
+            Symbol(1),
+            CircuitBreakerConfig {
+                price_band_lower: Some(price_val(90)),
+                price_band_upper: Some(price_val(110)),
+                halted: true,
+            },
+        );
+
+        save(&exchange, 5, &path).unwrap();
+        let (mut restored, _) = load(&path).unwrap();
+
+        // Halt should still be active after restore.
+        let mut reports = Vec::new();
+        restored.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
+        ));
+
+        // Unhalt, price bands should still be active.
+        restored.set_circuit_breaker(
+            Symbol(1),
+            CircuitBreakerConfig {
+                price_band_lower: Some(price_val(90)),
+                price_band_upper: Some(price_val(110)),
+                halted: false,
+            },
+        );
+
+        reports.clear();
+        restored.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 80, 10),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
+        ));
+
+        // In-range order should succeed.
+        reports.clear();
+        restored.execute(
+            Symbol(1),
+            limit_order(3, ACCT_A, Side::Buy, 100, 10),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
     }
 
     #[test]

@@ -7,7 +7,8 @@ use std::path::Path;
 
 use crate::exchange::Exchange;
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
+    RiskLimits, Symbol,
 };
 
 use super::error::JournalError;
@@ -76,6 +77,18 @@ impl JournaledExchange {
         self.writer
             .append(&JournalEvent::SetRiskLimits { symbol, limits })?;
         self.exchange.set_risk_limits(symbol, limits);
+        Ok(())
+    }
+
+    /// Set circuit breaker configuration for an instrument. Journals before executing.
+    pub fn set_circuit_breaker(
+        &mut self,
+        symbol: Symbol,
+        config: CircuitBreakerConfig,
+    ) -> Result<(), JournalError> {
+        self.writer
+            .append(&JournalEvent::SetCircuitBreaker { symbol, config })?;
+        self.exchange.set_circuit_breaker(symbol, config);
         Ok(())
     }
 
@@ -213,6 +226,9 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         }
         JournalEvent::CancelAll { account } => {
             exchange.cancel_all(account, reports);
+        }
+        JournalEvent::SetCircuitBreaker { symbol, config } => {
+            exchange.set_circuit_breaker(symbol, config);
         }
     }
 }
@@ -538,5 +554,45 @@ mod tests {
         assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 20);
         // Seller still has 30 resting (50 - 20 filled).
         assert_eq!(je.exchange().accounts().balance(ACCT_B, BTC).reserved, 30);
+    }
+
+    #[test]
+    fn journal_replay_restores_circuit_breaker_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cb_replay.journal");
+
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+
+            // Set a trading halt.
+            je.set_circuit_breaker(
+                Symbol(1),
+                CircuitBreakerConfig {
+                    halted: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // Recover from journal — halt should be restored.
+        let mut recovered = JournaledExchange::recover(&path).unwrap();
+        let mut reports = Vec::new();
+        recovered
+            .execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 100, 10),
+                &mut reports,
+            )
+            .unwrap();
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
+        ));
     }
 }
