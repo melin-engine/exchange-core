@@ -551,18 +551,16 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
             let order_id = OrderId(le::get_u64(&payload[4..]));
-            let new_price = NonZeroU64::new(le::get_u64(&payload[12..])).ok_or(
-                JournalError::CorruptEntry {
+            let new_price =
+                NonZeroU64::new(le::get_u64(&payload[12..])).ok_or(JournalError::CorruptEntry {
                     sequence,
                     reason: "CancelReplace new_price is zero",
-                },
-            )?;
-            let new_quantity = NonZeroU64::new(le::get_u64(&payload[20..])).ok_or(
-                JournalError::CorruptEntry {
+                })?;
+            let new_quantity =
+                NonZeroU64::new(le::get_u64(&payload[20..])).ok_or(JournalError::CorruptEntry {
                     sequence,
                     reason: "CancelReplace new_quantity is zero",
-                },
-            )?;
+                })?;
             JournalEvent::CancelReplace {
                 symbol,
                 order_id,

@@ -368,10 +368,12 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
             let order_id = OrderId(le::get_u64(&payload[4..]));
-            let new_price = NonZeroU64::new(le::get_u64(&payload[12..]))
-                .ok_or(ProtocolError::InvalidField("cancel-replace new_price is zero"))?;
-            let new_quantity = NonZeroU64::new(le::get_u64(&payload[20..]))
-                .ok_or(ProtocolError::InvalidField("cancel-replace new_quantity is zero"))?;
+            let new_price = NonZeroU64::new(le::get_u64(&payload[12..])).ok_or(
+                ProtocolError::InvalidField("cancel-replace new_price is zero"),
+            )?;
+            let new_quantity = NonZeroU64::new(le::get_u64(&payload[20..])).ok_or(
+                ProtocolError::InvalidField("cancel-replace new_quantity is zero"),
+            )?;
             Ok(Request::CancelReplace {
                 symbol,
                 order_id,
@@ -788,16 +790,17 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let side =
-                le::decode_side(payload[8]).ok_or(ProtocolError::InvalidField("side"))?;
+            let side = le::decode_side(payload[8]).ok_or(ProtocolError::InvalidField("side"))?;
             let old_price = NonZeroU64::new(le::get_u64(&payload[9..]))
                 .ok_or(ProtocolError::InvalidField("replaced old_price is zero"))?;
             let new_price = NonZeroU64::new(le::get_u64(&payload[17..]))
                 .ok_or(ProtocolError::InvalidField("replaced new_price is zero"))?;
-            let old_remaining = NonZeroU64::new(le::get_u64(&payload[25..]))
-                .ok_or(ProtocolError::InvalidField("replaced old_remaining is zero"))?;
-            let new_remaining = NonZeroU64::new(le::get_u64(&payload[33..]))
-                .ok_or(ProtocolError::InvalidField("replaced new_remaining is zero"))?;
+            let old_remaining = NonZeroU64::new(le::get_u64(&payload[25..])).ok_or(
+                ProtocolError::InvalidField("replaced old_remaining is zero"),
+            )?;
+            let new_remaining = NonZeroU64::new(le::get_u64(&payload[33..])).ok_or(
+                ProtocolError::InvalidField("replaced new_remaining is zero"),
+            )?;
             Ok(ExecutionReport::Replaced {
                 order_id,
                 side,

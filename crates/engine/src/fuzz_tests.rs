@@ -82,21 +82,27 @@ fn nz64(data: &[u8], offset: usize) -> Option<NonZeroU64> {
     if data.len() < offset + 8 {
         return None;
     }
-    NonZeroU64::new(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))
+    NonZeroU64::new(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().ok()?,
+    ))
 }
 
 fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
     if data.len() < offset + 4 {
         return None;
     }
-    Some(u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))
+    Some(u32::from_le_bytes(
+        data[offset..offset + 4].try_into().ok()?,
+    ))
 }
 
 fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
     if data.len() < offset + 8 {
         return None;
     }
-    Some(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))
+    Some(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().ok()?,
+    ))
 }
 
 /// Construct a JournalEvent from arbitrary bytes. Returns None if the bytes
@@ -133,7 +139,11 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             let symbol = Symbol(u32_at(data, 1)?);
             let id = OrderId(u64_at(data, 5)?);
             let account = AccountId(u32_at(data, 13)?);
-            let side = if data[17] & 1 == 0 { Side::Buy } else { Side::Sell };
+            let side = if data[17] & 1 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             let qty = Quantity(nz64(data, 18)?);
             let tif = match data[26] % 3 {
                 0 => TimeInForce::GTC,
@@ -151,8 +161,12 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             }
             let order_type = match data[28] % 4 {
                 0 => OrderType::Market,
-                1 => OrderType::Limit { price: Price(nz64(data, 29)?) },
-                2 => OrderType::Stop { trigger_price: Price(nz64(data, 29)?) },
+                1 => OrderType::Limit {
+                    price: Price(nz64(data, 29)?),
+                },
+                2 => OrderType::Stop {
+                    trigger_price: Price(nz64(data, 29)?),
+                },
                 _ => OrderType::StopLimit {
                     trigger_price: Price(nz64(data, 29)?),
                     limit_price: Price(nz64(data, 37)?),
@@ -160,7 +174,15 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             };
             Some(JournalEvent::SubmitOrder {
                 symbol,
-                order: Order { id, account, side, order_type, time_in_force: tif, quantity: qty, stp },
+                order: Order {
+                    id,
+                    account,
+                    side,
+                    order_type,
+                    time_in_force: tif,
+                    quantity: qty,
+                    stp,
+                },
             })
         }
         3 => {
@@ -194,7 +216,10 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             };
             Some(JournalEvent::SetRiskLimits {
                 symbol,
-                limits: RiskLimits { max_order_qty, max_order_notional },
+                limits: RiskLimits {
+                    max_order_qty,
+                    max_order_notional,
+                },
             })
         }
         5 => {
@@ -231,7 +256,11 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             let halted = data.len() > p && data[p] & 1 == 1;
             Some(JournalEvent::SetCircuitBreaker {
                 symbol,
-                config: CircuitBreakerConfig { price_band_lower: lower, price_band_upper: upper, halted },
+                config: CircuitBreakerConfig {
+                    price_band_lower: lower,
+                    price_band_upper: upper,
+                    halted,
+                },
             })
         }
     }
