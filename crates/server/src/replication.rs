@@ -734,8 +734,12 @@ fn replay_event(
         JournalEvent::SubmitOrder { symbol, order } => {
             exchange.execute(*symbol, *order, reports);
         }
-        JournalEvent::CancelOrder { symbol, order_id } => {
-            exchange.cancel(*symbol, *order_id, reports);
+        JournalEvent::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        } => {
+            exchange.cancel(*symbol, *account, *order_id, reports);
         }
         JournalEvent::SetRiskLimits { symbol, limits } => {
             exchange.set_risk_limits(*symbol, *limits);
@@ -748,11 +752,22 @@ fn replay_event(
         }
         JournalEvent::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,
         } => {
-            exchange.cancel_replace(*symbol, *order_id, *new_price, *new_quantity, reports);
+            exchange.cancel_replace(
+                *symbol,
+                *account,
+                *order_id,
+                *new_price,
+                *new_quantity,
+                reports,
+            );
+        }
+        JournalEvent::SetFeeSchedule { symbol, schedule } => {
+            exchange.set_fee_schedule(*symbol, *schedule);
         }
         JournalEvent::QueryStats
         | JournalEvent::GenesisHash { .. }
