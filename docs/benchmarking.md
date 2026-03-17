@@ -12,7 +12,7 @@ Full end-to-end benchmark through the entire server. By default, an embedded ser
 
 What it measures: client-perceived round-trip latency including TCP/UDS transport, kernel network stack, the epoll/io_uring reader pool, CAS-based multi-producer publication to the disruptor, journal fsync, matching engine execution, response stage journal-cursor gating, and the return trip through the socket.
 
-This mode uses either an epoll-based multi-threaded event loop (default) or an io_uring-based single-threaded event loop (with the `io-uring` feature). Each bench thread runs its own epoll instance or io_uring ring and manages a subset of connections.
+This mode uses either an io_uring-based single-threaded event loop (default, via the `io-uring` feature) or an epoll-based multi-threaded event loop (with `--no-default-features`). Each bench thread runs its own io_uring ring or epoll instance and manages a subset of connections.
 
 ### `--mode=pipeline`
 
@@ -163,16 +163,16 @@ Without pipelining (`--window=1`), each order must complete the full round trip 
 
 ### CPU core pinning
 
-All threads are pinned to specific CPU cores via `sched_setaffinity`:
+All threads are pinned to specific CPU cores via `sched_setaffinity`. The layout is hardcoded (not CLI-configurable) for the benchmark:
 
 | Cores | Threads |
 |-------|---------|
 | 0 | OS, IRQ handling, RCU callbacks |
-| 1-3 | Pipeline (journal, matching, response) |
+| 1-3 | Pipeline (journal, matching, response) — set by server's `--cores` flag |
 | 4-5 | Reader pool threads |
-| 6+ | Bench client threads (`BENCH_CORE_START = 6`) |
+| 6+ | Bench client threads (`BENCH_CORE_START = 6`, hardcoded) |
 
-Bench thread `i` is pinned to core `6 + i`. With 4 bench threads (default), cores 6-9 are used.
+Bench thread `i` is pinned to core `6 + i`. With 4 bench threads (default), cores 6-9 are used. The server's pipeline cores are configurable via `--cores`; the bench client's core start offset is not.
 
 ### IRQ affinity (`bench-isolate.sh`)
 
