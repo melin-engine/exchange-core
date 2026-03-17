@@ -186,7 +186,7 @@ Ordered by importance for commercial readiness (exchange operators and investors
 8. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
 9. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
 10. ~~**Fee model**~~ ✅ — per-instrument maker/taker fees in basis points. Deducted from fill proceeds in quote currency. Configurable via admin API, journaled for deterministic replay.
-11. **Documentation** — architecture guide, API reference, operational runbook.
+11. ~~**Documentation**~~ ✅ — matching engine, fee model, risk checks, balance management, pipeline architecture, wire protocol, admin guide, operations runbook, benchmarking guide.
 12. **Security hardening** — remaining [audit findings](docs/security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
 
 Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions, crash injection tests (kill server at random points during load, verify recovery produces identical state — validates journal/snapshot/rotation crash safety end-to-end).

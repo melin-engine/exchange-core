@@ -24,21 +24,25 @@ trading-keygen <name> <permission>
 trading-keygen ops admin
 ```
 
-This produces three artifacts:
+This produces two files and prints instructions to stdout:
 
 | File | Contents |
 |------|----------|
 | `ops.key` | 32-byte raw Ed25519 private seed (keep secret) |
 | `ops.pub` | Base64-encoded public key |
-| stdout | An `authorized_keys` line to add to the server |
 
-The stdout line looks like:
+The stdout output includes the `authorized_keys` line to add to the server:
 
 ```
-admin AAAA...base64...== ops
+Generated keypair:
+  Private key: ops.key
+  Public key:  ops.pub
+
+Add this line to your authorized_keys file:
+  admin AAAA...base64...== ops
 ```
 
-Append that line to the server's `authorized_keys` file before starting the server. The tool refuses to overwrite an existing `.key` file to prevent accidental key loss.
+Copy that last line into the server's `authorized_keys` file before starting the server. The tool refuses to overwrite an existing `.key` file to prevent accidental key loss.
 
 ## Connecting
 
