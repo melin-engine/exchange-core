@@ -267,9 +267,9 @@ pub fn encode(
         JournalEvent::SetFeeSchedule { symbol, schedule } => {
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
-            le::put_u16(&mut buf[pos..], schedule.maker_fee_bps);
+            le::put_i16(&mut buf[pos..], schedule.maker_fee_bps);
             pos += 2;
-            le::put_u16(&mut buf[pos..], schedule.taker_fee_bps);
+            le::put_i16(&mut buf[pos..], schedule.taker_fee_bps);
             pos += 2;
             TAG_SET_FEE_SCHEDULE
         }
@@ -642,8 +642,8 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                 });
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
-            let maker_fee_bps = le::get_u16(&payload[4..]);
-            let taker_fee_bps = le::get_u16(&payload[6..]);
+            let maker_fee_bps = le::get_i16(&payload[4..]);
+            let taker_fee_bps = le::get_i16(&payload[6..]);
             JournalEvent::SetFeeSchedule {
                 symbol,
                 schedule: FeeSchedule {

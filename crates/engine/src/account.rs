@@ -290,8 +290,8 @@ impl AccountManager {
         price: Price,
         quantity: Quantity,
         maker_side: Side,
-        maker_fee: u64,
-        taker_fee: u64,
+        maker_fee: i64,
+        taker_fee: i64,
         spec: &InstrumentSpec,
     ) {
         // cost = price × quantity, using u128 to avoid overflow.
@@ -336,8 +336,14 @@ impl AccountManager {
         // with max_fee_bps), so cost + fee fits within the reservation.
         // ensure_capacity is a no-op after startup seeding (all currencies
         // already in range) — just two comparisons, no allocation.
+        //
+        // Signed fees: positive = fee deducted, negative = rebate credited.
+        // cost_i128 + buyer_fee_i128 is clamped to [0, u64::MAX] to handle
+        // rebates that exceed cost (defensive; shouldn't happen in practice).
         if let Some(res) = self.reservations.get_mut(&(buyer_account, buyer_order)) {
-            let total_deduct = cost_u64.saturating_add(buyer_fee);
+            let total_deduct_i128 = cost_u64 as i128 + buyer_fee as i128;
+            let total_deduct =
+                u64::try_from(total_deduct_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
             res.remaining = res.remaining.saturating_sub(total_deduct);
             let buyer_account = res.account;
             self.ensure_capacity(buyer_account, spec.base);
@@ -352,6 +358,7 @@ impl AccountManager {
         }
 
         // Seller: reserved base decreases, available quote increases by cost - fee.
+        // Signed: cost - positive_fee = less proceeds; cost - negative_fee = more proceeds (rebate).
         if let Some(res) = self.reservations.get_mut(&(seller_account, seller_order)) {
             res.remaining = res.remaining.saturating_sub(qty);
             let seller_account = res.account;
@@ -360,9 +367,10 @@ impl AccountManager {
             let base_idx = seller_account.0 as usize * stride + spec.base.0 as usize;
             self.balances[base_idx].reserved = self.balances[base_idx].reserved.saturating_sub(qty);
             let quote_idx = seller_account.0 as usize * stride + spec.quote.0 as usize;
-            self.balances[quote_idx].available = self.balances[quote_idx]
-                .available
-                .saturating_add(cost_u64.saturating_sub(seller_fee));
+            let proceeds_i128 = cost_u64 as i128 - seller_fee as i128;
+            let proceeds = u64::try_from(proceeds_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
+            self.balances[quote_idx].available =
+                self.balances[quote_idx].available.saturating_add(proceeds);
         }
 
         // Note: reservation cleanup is handled by process_reports(), which

@@ -207,9 +207,9 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
-            le::put_u16(&mut buf[pos..], schedule.maker_fee_bps);
+            le::put_i16(&mut buf[pos..], schedule.maker_fee_bps);
             pos += 2;
-            le::put_u16(&mut buf[pos..], schedule.taker_fee_bps);
+            le::put_i16(&mut buf[pos..], schedule.taker_fee_bps);
             pos += 2;
         }
         Request::QueryStats => {
@@ -405,8 +405,8 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
                 return Err(ProtocolError::Truncated);
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
-            let maker_fee_bps = le::get_u16(&payload[4..]);
-            let taker_fee_bps = le::get_u16(&payload[6..]);
+            let maker_fee_bps = le::get_i16(&payload[4..]);
+            let taker_fee_bps = le::get_i16(&payload[6..]);
             Ok(Request::SetFeeSchedule {
                 symbol,
                 schedule: FeeSchedule {
@@ -713,9 +713,9 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 8;
             le::put_u64(&mut buf[pos..], quantity.get());
             pos += 8;
-            le::put_u64(&mut buf[pos..], *maker_fee);
+            le::put_u64(&mut buf[pos..], *maker_fee as u64);
             pos += 8;
-            le::put_u64(&mut buf[pos..], *taker_fee);
+            le::put_u64(&mut buf[pos..], *taker_fee as u64);
             pos += 8;
         }
         ExecutionReport::Cancelled {
@@ -817,8 +817,8 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 .ok_or(ProtocolError::InvalidField("fill price is zero"))?;
             let quantity = NonZeroU64::new(le::get_u64(&payload[32..]))
                 .ok_or(ProtocolError::InvalidField("fill quantity is zero"))?;
-            let maker_fee = le::get_u64(&payload[40..]);
-            let taker_fee = le::get_u64(&payload[48..]);
+            let maker_fee = le::get_u64(&payload[40..]) as i64;
+            let taker_fee = le::get_u64(&payload[48..]) as i64;
             Ok(ExecutionReport::Fill {
                 maker_order_id,
                 taker_order_id,

@@ -335,8 +335,8 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     le::push_u32(buf, state.fee_schedules.len() as u32);
     for (symbol, schedule) in &state.fee_schedules {
         le::push_u32(buf, symbol.0);
-        le::push_u16(buf, schedule.maker_fee_bps);
-        le::push_u16(buf, schedule.taker_fee_bps);
+        le::push_i16(buf, schedule.maker_fee_bps);
+        le::push_i16(buf, schedule.taker_fee_bps);
     }
 }
 
@@ -689,9 +689,9 @@ fn decode_exchange_state(
             check(pos, 8)?;
             let symbol = Symbol(le::get_u32(&buf[pos..]));
             pos += 4;
-            let maker_fee_bps = le::get_u16(&buf[pos..]);
+            let maker_fee_bps = le::get_i16(&buf[pos..]);
             pos += 2;
-            let taker_fee_bps = le::get_u16(&buf[pos..]);
+            let taker_fee_bps = le::get_i16(&buf[pos..]);
             pos += 2;
             schedules.push((
                 symbol,

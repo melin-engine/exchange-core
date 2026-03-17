@@ -94,14 +94,18 @@ pub struct CircuitBreakerConfig {
 /// fee is deducted from their reservation; the seller's fee is deducted
 /// from their proceeds.
 ///
-/// Example: `maker_fee_bps = 5, taker_fee_bps = 10` means 0.05% maker
-/// and 0.10% taker fees.
+/// Negative values represent rebates — the exchange pays the trader.
+/// Example: `maker_fee_bps = -10, taker_fee_bps = 20` means the maker
+/// receives a 0.10% rebate while the taker pays 0.20%.
+///
+/// Uses `i16` to support the range -10000..10000, covering both fees
+/// and rebates within basis-point precision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FeeSchedule {
-    /// Maker fee in basis points (0-10000). 0 = no fee.
-    pub maker_fee_bps: u16,
-    /// Taker fee in basis points (0-10000). 0 = no fee.
-    pub taker_fee_bps: u16,
+    /// Maker fee in basis points (-10000..10000). Negative = rebate.
+    pub maker_fee_bps: i16,
+    /// Taker fee in basis points (-10000..10000). Negative = rebate.
+    pub taker_fee_bps: i16,
 }
 
 /// Price in ticks (fixed-point). A tick is the smallest price increment
@@ -226,10 +230,12 @@ pub enum ExecutionReport {
         taker_account: AccountId,
         price: Price,
         quantity: Quantity,
-        /// Fee charged to the maker in quote currency. 0 if no fee.
-        maker_fee: u64,
-        /// Fee charged to the taker in quote currency. 0 if no fee.
-        taker_fee: u64,
+        /// Fee charged to the maker in quote currency. Positive = fee
+        /// deducted from proceeds, negative = rebate credited to the maker.
+        maker_fee: i64,
+        /// Fee charged to the taker in quote currency. Positive = fee
+        /// deducted from proceeds, negative = rebate credited to the taker.
+        taker_fee: i64,
     },
     /// Order was cancelled (or remainder cancelled for IOC).
     Cancelled {

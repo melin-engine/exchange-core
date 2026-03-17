@@ -11,6 +11,12 @@ pub fn put_u16(buf: &mut [u8], v: u16) {
     buf[..2].copy_from_slice(&v.to_le_bytes());
 }
 
+/// Signed 16-bit LE write. Delegates to `put_u16` since the byte
+/// representation is identical — the type signature gives call-site clarity.
+pub fn put_i16(buf: &mut [u8], v: i16) {
+    put_u16(buf, v as u16);
+}
+
 pub fn put_u32(buf: &mut [u8], v: u32) {
     buf[..4].copy_from_slice(&v.to_le_bytes());
 }
@@ -23,6 +29,12 @@ pub fn put_u64(buf: &mut [u8], v: u64) {
 
 pub fn get_u16(buf: &[u8]) -> u16 {
     u16::from_le_bytes([buf[0], buf[1]])
+}
+
+/// Signed 16-bit LE read. Delegates to `get_u16` since the byte
+/// representation is identical — the type signature gives call-site clarity.
+pub fn get_i16(buf: &[u8]) -> i16 {
+    get_u16(buf) as i16
 }
 
 pub fn get_u32(buf: &[u8]) -> u32 {
@@ -39,6 +51,12 @@ pub fn get_u64(buf: &[u8]) -> u64 {
 
 pub fn push_u16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Signed 16-bit LE append. Delegates to `push_u16` since the byte
+/// representation is identical.
+pub fn push_i16(buf: &mut Vec<u8>, v: i16) {
+    push_u16(buf, v as u16);
 }
 
 pub fn push_u32(buf: &mut Vec<u8>, v: u32) {

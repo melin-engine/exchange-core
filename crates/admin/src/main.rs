@@ -207,7 +207,8 @@ enum NextStep {
     /// Fee schedule: entered symbol, enter maker fee bps.
     FeeScheduleMakerBps { symbol: u32 },
     /// Fee schedule: entered maker bps, enter taker fee bps.
-    FeeScheduleTakerBps { symbol: u32, maker_bps: u16 },
+    /// `i16` to support negative values (rebates).
+    FeeScheduleTakerBps { symbol: u32, maker_bps: i16 },
 }
 
 struct App {
@@ -456,7 +457,7 @@ impl App {
                         next: NextStep::FeeScheduleSymbol,
                     },
                     NextStep::FeeScheduleTakerBps { symbol, .. } => Screen::NumberInput {
-                        label: "Maker Fee (basis points, 0-10000)",
+                        label: "Maker Fee (bps, -10000..10000, negative=rebate)",
                         buf: String::new(),
                         next: NextStep::FeeScheduleMakerBps { symbol: *symbol },
                     },
@@ -549,15 +550,36 @@ impl App {
             }
 
             Screen::NumberInput { buf, next, .. } => {
-                let val: u64 = match buf.parse() {
-                    Ok(v) => v,
-                    _ => {
-                        self.log.push("Invalid input (expected a number).".into());
-                        return;
+                // Fee schedule fields allow negative values (rebates), so
+                // parse as i64 first and then convert. All other fields
+                // require non-negative values parsed as u64.
+                let is_fee_field = matches!(
+                    next,
+                    NextStep::FeeScheduleMakerBps { .. } | NextStep::FeeScheduleTakerBps { .. }
+                );
+                let val: u64 = if is_fee_field {
+                    // Parse as i64 to allow negatives, then store as u64
+                    // (the fee-specific match arms will re-interpret via `as i16`).
+                    match buf.parse::<i64>() {
+                        Ok(v) if (-10_000..=10_000).contains(&v) => v as u64,
+                        _ => {
+                            self.log
+                                .push("Invalid fee (expected -10000..10000).".into());
+                            return;
+                        }
+                    }
+                } else {
+                    match buf.parse() {
+                        Ok(v) => v,
+                        _ => {
+                            self.log.push("Invalid input (expected a number).".into());
+                            return;
+                        }
                     }
                 };
                 // Most fields require > 0 (symbol, account, price, qty).
                 // Risk limit fields allow 0 (meaning "no limit").
+                // Fee fields are handled above with signed parsing.
                 let allows_zero = matches!(
                     next,
                     NextStep::RiskLimitsMaxQty { .. }
@@ -902,32 +924,33 @@ impl App {
                     // --- Fee schedule flow ---
                     NextStep::FeeScheduleSymbol => {
                         self.screen = Screen::NumberInput {
-                            label: "Maker Fee (basis points, 0-10000)",
+                            label: "Maker Fee (bps, -10000..10000, negative=rebate)",
                             buf: String::new(),
                             next: NextStep::FeeScheduleMakerBps { symbol: val as u32 },
                         };
                     }
                     NextStep::FeeScheduleMakerBps { symbol } => {
                         self.screen = Screen::NumberInput {
-                            label: "Taker Fee (basis points, 0-10000)",
+                            label: "Taker Fee (bps, -10000..10000, negative=rebate)",
                             buf: String::new(),
                             next: NextStep::FeeScheduleTakerBps {
                                 symbol,
-                                maker_bps: val as u16,
+                                maker_bps: val as i16,
                             },
                         };
                     }
                     NextStep::FeeScheduleTakerBps { symbol, maker_bps } => {
+                        let taker_bps = val as i16;
                         let request = Request::SetFeeSchedule {
                             symbol: Symbol(symbol),
                             schedule: FeeSchedule {
                                 maker_fee_bps: maker_bps,
-                                taker_fee_bps: val as u16,
+                                taker_fee_bps: taker_bps,
                             },
                         };
                         self.log.push(format!(
                             "→ FEE SCHEDULE sym:{} maker:{}bps taker:{}bps",
-                            symbol, maker_bps, val
+                            symbol, maker_bps, taker_bps
                         ));
                         let _ = self.request_tx.send(request);
                         self.screen = Screen::ActionMenu;
@@ -1035,8 +1058,13 @@ impl App {
 
     fn type_char(&mut self, c: char) {
         match &mut self.screen {
-            Screen::NumberInput { buf, .. } => {
-                if c.is_ascii_digit() {
+            Screen::NumberInput { buf, next, .. } => {
+                // Allow minus sign for fee fields (rebates are negative).
+                let is_fee = matches!(
+                    next,
+                    NextStep::FeeScheduleMakerBps { .. } | NextStep::FeeScheduleTakerBps { .. }
+                );
+                if c.is_ascii_digit() || (is_fee && c == '-' && buf.is_empty()) {
                     buf.push(c);
                 }
             }
@@ -1111,7 +1139,7 @@ fn format_report(report: &ExecutionReport) -> String {
             taker_fee,
             ..
         } => {
-            let fee_str = if maker_fee > 0 || taker_fee > 0 {
+            let fee_str = if maker_fee != 0 || taker_fee != 0 {
                 format!(" fees:m={maker_fee}/t={taker_fee}")
             } else {
                 String::new()

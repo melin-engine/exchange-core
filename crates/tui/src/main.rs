@@ -424,7 +424,7 @@ fn format_report(report: &ExecutionReport) -> String {
             taker_fee,
             ..
         } => {
-            let fee_str = if *maker_fee > 0 || *taker_fee > 0 {
+            let fee_str = if *maker_fee != 0 || *taker_fee != 0 {
                 format!(" fees:m={maker_fee}/t={taker_fee}")
             } else {
                 String::new()

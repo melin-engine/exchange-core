@@ -347,10 +347,12 @@ impl Exchange {
         // Reserve funds before submitting to the matching engine.
         // Include a fee cushion for buy-side limit orders so fees can be
         // charged from the reservation even at the exact limit price.
+        // Only positive fees need a reservation cushion — rebates (negative)
+        // don't require upfront funds.
         let max_fee_bps = self
             .fee_schedules
             .get(&symbol)
-            .map(|f| f.maker_fee_bps.max(f.taker_fee_bps))
+            .map(|f| 0i16.max(f.maker_fee_bps).max(0i16.max(f.taker_fee_bps)) as u16)
             .unwrap_or(0);
         let reserved = match self.accounts.try_reserve(&order, &spec, max_fee_bps) {
             Ok(amount) => amount,
@@ -659,10 +661,12 @@ impl Exchange {
         // 5. Adjust reservation atomically. Compute the new required amount
         // based on the new price/quantity, including fee cushion for buys.
         // If insufficient balance, the original reservation stays intact.
+        // Only positive fees need a reservation cushion — rebates (negative)
+        // don't require upfront funds.
         let max_fee_bps = self
             .fee_schedules
             .get(&symbol)
-            .map(|f| f.maker_fee_bps.max(f.taker_fee_bps))
+            .map(|f| 0i16.max(f.maker_fee_bps).max(0i16.max(f.taker_fee_bps)) as u16)
             .unwrap_or(0);
         let new_required = match side {
             Side::Buy => {
@@ -755,9 +759,10 @@ fn apply_fees(reports: &mut [ExecutionReport], fees: &FeeSchedule) {
         {
             // Both fees are in quote currency (cost-based). This is the
             // standard model used by most centralized exchanges.
-            let cost = price.get() as u128 * quantity.get() as u128;
-            *maker_fee = (cost * fees.maker_fee_bps as u128 / 10_000) as u64;
-            *taker_fee = (cost * fees.taker_fee_bps as u128 / 10_000) as u64;
+            // Signed arithmetic: negative bps = rebate (exchange pays trader).
+            let cost = price.get() as i128 * quantity.get() as i128;
+            *maker_fee = (cost * fees.maker_fee_bps as i128 / 10_000) as i64;
+            *taker_fee = (cost * fees.taker_fee_bps as i128 / 10_000) as i64;
         }
     }
 }
@@ -4787,5 +4792,73 @@ mod tests {
         // No leftover — balance should be 0 available, 0 reserved.
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
         assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 100);
+    }
+
+    #[test]
+    fn maker_rebate_negative_fee() {
+        // Negative maker fee = rebate. The maker should pay less (or receive more)
+        // than the raw cost, and the fee field should be negative.
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        // -10 bps maker (rebate), 20 bps taker.
+        exchange.set_fee_schedule(
+            btc,
+            FeeSchedule {
+                maker_fee_bps: -10,
+                taker_fee_bps: 20,
+            },
+        );
+
+        let mut reports = Vec::new();
+
+        // Resting buy (maker) at 1000 for 10. cost = 10_000.
+        // max_fee_bps = max(0, -10).max(max(0, 20)) = 20.
+        // Reservation = 10_000 + 10_000 * 20 / 10_000 = 10_020.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Incoming sell (taker) hits the resting buy.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = fill
+        {
+            // cost = 10_000. maker_fee = 10_000 * (-10) / 10_000 = -10 (rebate).
+            // taker_fee = 10_000 * 20 / 10_000 = 20.
+            assert_eq!(*maker_fee, -10);
+            assert_eq!(*taker_fee, 20);
+        } else {
+            panic!("expected Fill");
+        }
+
+        // Buyer (maker): reserved 10_020, cost=10_000, maker_fee=-10.
+        // Buyer deduction = cost + fee = 10_000 + (-10) = 9_990 from reservation.
+        // Leftover = 10_020 - 9_990 = 30 released back.
+        // available = 50_000 - 10_020 + 30 = 40_010.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 40_010);
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 10);
+
+        // Seller (taker): received cost - taker_fee = 10_000 - 20 = 9_980.
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 9_980);
+        assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 90);
     }
 }
