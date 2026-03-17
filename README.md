@@ -169,8 +169,10 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 - [x] Security audit ([docs/security-audit.md](docs/security-audit.md))
 
 ### Redundancy & High Availability
-- [ ] Journal replication (WAL streaming to replica; sync for zero data loss, async for lower latency)
-- [ ] State machine replication (deterministic replay on replica)
+- [x] Synchronous journal replication ([docs/replication.md](docs/replication.md)) — live WAL streaming to replica via lock-free ring buffer, ack-gated responses, replica receiver with deterministic replay
+- [ ] Catch-up from journal files (late-joining replica reads historical entries before live stream)
+- [ ] Snapshot transfer (replica too far behind for journal catch-up)
+- [ ] Manual promotion (operator command to promote replica to primary)
 - [ ] Failover detection and promotion (leader election, split-brain prevention)
 - [ ] Client failover (reconnect to new primary, resume with sequence numbers)
 - [ ] Network partition handling (fencing, quorum-based decisions)
@@ -181,7 +183,7 @@ Ordered by importance for commercial readiness (exchange operators and investors
 
 1. ~~**Circuit breakers**~~ ✅ — price bands, trading halts. Fully integrated with event sourcing.
 2. ~~**Cancel-replace / order amendment**~~ ✅ — atomic price/qty amendment with reservation delta, time priority rules, price-would-cross rejection.
-3. **Replication & HA** — journal streaming to a replica, deterministic replay, failover. No exchange runs a single node.
+3. ~~**Replication & HA**~~ ✅ (phase 1) — synchronous journal streaming via lock-free ring buffer, ack-gated responses (zero data loss), replica receiver with deterministic replay. Next: journal catch-up, snapshot transfer, manual promotion, automatic failover.
 4. ~~**Fuzz testing**~~ ✅ — proptest coverage extended to all order types, STP modes, circuit breakers, stops. Found and fixed a reservation leak on price-improved fills.
 5. ~~**Journal rotation + integrity**~~ ✅ — automatic snapshot + journal archiving at startup when size threshold exceeded. BLAKE3 hash chain with periodic checkpoints for tamper evidence and replica consistency. Documented recovery scenarios for every crash timing.
 6. ~~**Authentication**~~ ✅ — Ed25519 challenge-response. Admin API for instrument/deposit/risk/circuit-breaker management.

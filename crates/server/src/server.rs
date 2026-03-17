@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
 
 use trading_engine::journal::JournaledExchange;
-use trading_engine::journal::pipeline::build_pipeline;
+use trading_engine::journal::pipeline::build_pipeline_with_replication;
 use trading_engine::journal::writer::JournalWriter;
 
 use trading_protocol::auth::{AuthorizedKeys, Permission};
@@ -98,6 +98,23 @@ pub struct ServerConfig {
     /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
+
+    /// Address to listen for replica connections (enables synchronous replication).
+    /// Mutually exclusive with `--standalone` and `--replica-of`.
+    #[arg(long)]
+    pub replication_bind: Option<std::net::SocketAddr>,
+
+    /// Disable replication (dev/test mode). Sets the replication cursor to
+    /// `u64::MAX` so `min(journal_cursor, MAX) = journal_cursor`.
+    /// Mutually exclusive with `--replication-bind` and `--replica-of`.
+    #[arg(long, default_value_t = false)]
+    pub standalone: bool,
+
+    /// Run as a replica connected to the given primary address.
+    /// In replica mode, the server does not accept client connections.
+    /// Mutually exclusive with `--replication-bind` and `--standalone`.
+    #[arg(long)]
+    pub replica_of: Option<std::net::SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -117,6 +134,9 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
+            replication_bind: None,
+            standalone: false,
+            replica_of: None,
         }
     }
 }
@@ -211,7 +231,42 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Used to enforce max_connections (SEC-02).
     let active_connections = Arc::new(AtomicU64::new(0));
 
-    // Build the disruptor pipeline.
+    // Determine replication mode.
+    let enable_replication = config.replication_bind.is_some();
+    if enable_replication && config.standalone {
+        return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+    if config.replica_of.is_some() && (enable_replication || config.standalone) {
+        return Err(
+            "--replica-of is mutually exclusive with --replication-bind and --standalone".into(),
+        );
+    }
+
+    // Read the raw genesis entry bytes from the journal file before
+    // moving the writer into the pipeline. Sent to the replica during
+    // handshake so it can write a byte-identical genesis, ensuring the
+    // BLAKE3 hash chain starts from the exact same encoded bytes.
+    let genesis_entry = if enable_replication {
+        use trading_engine::journal::codec::FILE_HEADER_SIZE;
+        let file_bytes = std::fs::read(writer.path())?;
+        // Genesis entry starts right after the 8-byte file header.
+        // Read entry length from bytes [offset+2..offset+4].
+        let offset = FILE_HEADER_SIZE;
+        if file_bytes.len() < offset + 4 {
+            return Err("journal file too short to contain genesis entry".into());
+        }
+        let entry_len =
+            u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
+        let total = 20 + entry_len + 4; // header(20) + payload + crc(4)
+        if file_bytes.len() < offset + total {
+            return Err("journal file truncated at genesis entry".into());
+        }
+        file_bytes[offset..offset + total].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // Build the disruptor pipeline with optional replication consumer.
     let (
         input_producer,
         journal_stage,
@@ -219,11 +274,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         output_consumer,
         journal_cursor,
         _events_processed,
-    ) = build_pipeline(
+        replication,
+        replication_cursor,
+    ) = build_pipeline_with_replication(
         exchange,
         writer,
         config.group_commit_delay(),
         Arc::clone(&active_connections),
+        enable_replication,
     );
 
     // Control channel for connect/disconnect events → response stage.
@@ -271,6 +329,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     #[cfg_attr(feature = "io-uring", allow(unused_variables))]
     let active_connections_response = Arc::clone(&active_connections);
 
+    let replication_cursor_response = Arc::clone(&replication_cursor);
     let s3 = Arc::clone(&shutdown);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
@@ -281,6 +340,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 output_consumer,
                 control_rx,
                 journal_cursor,
+                replication_cursor_response,
                 &s3,
                 heartbeat_interval,
                 active_connections_response,
@@ -290,11 +350,43 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 output_consumer,
                 control_rx,
                 journal_cursor,
+                replication_cursor_response,
                 &s3,
                 heartbeat_interval,
             );
         })
         .expect("failed to spawn response thread");
+
+    // Spawn replication sender thread if enabled. The journal stage publishes
+    // encoded batches to a pre-allocated ring; the sender thread consumes them.
+    let replication_handle = if let Some(repl_consumer) = replication {
+        let repl_bind = config
+            .replication_bind
+            .expect("replication_bind must be set");
+        let s_repl = Arc::clone(&shutdown);
+        let repl_cursor = Arc::clone(&replication_cursor);
+
+        let repl_sender_handle = std::thread::Builder::new()
+            .name("repl-sender".into())
+            .spawn(move || {
+                crate::replication::run_sender(
+                    repl_bind,
+                    repl_consumer,
+                    repl_cursor,
+                    genesis_entry,
+                    &s_repl,
+                );
+            })
+            .expect("failed to spawn replication sender thread");
+
+        info!(addr = %repl_bind, "replication listener started");
+        Some(repl_sender_handle)
+    } else {
+        if !config.standalone && config.replica_of.is_none() {
+            info!("running in standalone mode (no replication)");
+        }
+        None
+    };
 
     // Set the listener to non-blocking so accept() returns immediately
     // with WouldBlock when no connection is pending. This lets the accept
@@ -470,6 +562,11 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     if thread_panicked {
         error!("shutdown complete (with thread panic)");
         return Err("pipeline thread panicked".into());
+    }
+
+    // Join replication thread.
+    if let Some(repl_sender_handle) = replication_handle {
+        let _ = repl_sender_handle.join();
     }
 
     info!("shutdown complete");

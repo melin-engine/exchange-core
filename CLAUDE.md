@@ -156,14 +156,16 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
   - `writer.rs` — `JournalWriter` (append + fsync to disk, batch append API)
   - `reader.rs` — `JournalReader` (sequential read + validate)
   - `engine.rs` — `JournaledExchange` wrapper (journal-before-execute + replay recovery)
-  - `pipeline.rs` — disruptor pipeline stages (`JournalStage`, `MatchingStage`, slot types)
+  - `pipeline.rs` — disruptor pipeline stages (`JournalStage` with optional replication ring, `MatchingStage`, slot types)
+  - `replication.rs` — lock-free replication ring buffer (pre-allocated 128 KiB slots, single-producer multi-consumer)
   - `snapshot.rs` — snapshot save/load for Exchange state (version-boundary recovery)
   - `error.rs` — `JournalError` enum
 
 ### `crates/server/` — server and pipeline orchestration
-- `src/server.rs` — builds disruptor pipeline, spawns 3 OS threads, accept loop
-- `src/response.rs` — response stage thread (output SPSC → direct socket writes via `BlockingFrameWriter`)
+- `src/server.rs` — builds disruptor pipeline, spawns 3+ OS threads, accept loop
+- `src/response.rs` — response stage thread (output SPSC → direct socket writes, gates on `min(journal_cursor, replication_cursor)`)
 - `src/reader.rs` — epoll-based multiplexed reader pool (edge-triggered, non-blocking I/O → lock-free `MultiProducer`)
+- `src/replication.rs` — replication wire protocol, sender (primary), receiver (replica)
 - `src/affinity.rs` — CPU core pinning for pipeline and reader threads
 
 ### `crates/protocol/` — wire protocol (zero async, no tokio)
