@@ -279,7 +279,7 @@ Configures per-instrument maker/taker fees.
 2. **Maker Fee** -- fee in basis points (0-10000). A value of `0` means no maker fee. `10` means 0.10%.
 3. **Taker Fee** -- fee in basis points (0-10000).
 
-Fees are applied at fill time and reported in the execution report. Typical exchange configurations use negative maker fees (rebates) and positive taker fees, but the admin tool accepts any value in the 0-10000 range.
+Fees are applied at fill time and reported in the execution report. Both values are non-negative integers (0-10000 bps). Maker rebates (negative fees) are not currently supported.
 
 ## Live Dashboard
 
