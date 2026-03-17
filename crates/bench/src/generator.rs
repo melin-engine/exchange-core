@@ -1,7 +1,8 @@
 //! Realistic order flow generator based on empirical market microstructure.
 //!
 //! Generates synthetic order streams that mimic real exchange order flow
-//! patterns: a mix of limit orders and cancels with resting book depth.
+//! patterns: a mix of limit orders, cancels, amendments, market orders,
+//! and stop orders with resting book depth.
 //!
 //! ## Empirical basis
 //!
@@ -10,10 +11,13 @@
 //!
 //! Key properties reproduced:
 //! - **High cancel ratio** (~90% of orders are cancelled before filling)
+//! - **Cancel-replace amendments** (~15% of events — simulates market maker quote updates)
 //! - **Price placement** follows a power-law around the mid-price
 //! - **Order sizes** follow a power-law distribution
 //! - **Multiple accounts** with Zipf-distributed activity
 //! - **Book depth** builds up naturally across multiple price levels
+//! - **Order type diversity**: limit, market, stop, stop-limit, IOC, FOK
+//! - **Self-trade prevention** mode variety across orders
 
 use std::num::NonZeroU64;
 
@@ -34,8 +38,12 @@ pub struct GeneratorConfig {
     pub num_accounts: u32,
     /// Number of instruments to trade.
     pub num_instruments: u32,
-    /// Probability that an event is a cancel (vs a new order).
-    /// Real markets: ~0.85-0.95. Default: 0.90.
+    /// Conditional probability of a pure cancel when live orders exist.
+    /// Combined with `cancel_replace_ratio`, these determine the cancel+amend
+    /// rate. The remainder `1 - cancel_ratio - cancel_replace_ratio` produces
+    /// new submits that replenish the book. Must satisfy
+    /// `cancel_ratio + cancel_replace_ratio < 1.0`.
+    /// Default: 0.60 (with cancel_replace at 0.30, total cancel+amend = 0.90).
     pub cancel_ratio: f64,
     /// Mid-price around which limit orders are placed (in ticks).
     pub mid_price: u64,
@@ -64,6 +72,16 @@ pub struct GeneratorConfig {
     /// Probability that a limit order uses FOK time-in-force instead of GTC.
     /// Default: 0.02 (2% of limit submits).
     pub fok_ratio: f64,
+    /// Probability that a submit is a stop order (Stop or StopLimit).
+    /// Trigger price is placed on the opposite side of mid from the
+    /// limit price, simulating stop-loss protection.
+    /// Default: 0.03 (3% of submits).
+    pub stop_order_ratio: f64,
+    /// Conditional probability of a cancel-replace amendment when live orders
+    /// exist. In real markets, market makers rapidly amend resting quotes —
+    /// cancel-replace is more common than outright cancel.
+    /// Default: 0.30 (with cancel at 0.60, total cancel+amend = 0.90).
+    pub cancel_replace_ratio: f64,
     /// Starting order ID. Used to partition ID ranges across multiple
     /// bench clients to avoid collisions.
     pub start_order_id: u64,
@@ -74,7 +92,7 @@ impl Default for GeneratorConfig {
         Self {
             num_accounts: 100,
             num_instruments: 1,
-            cancel_ratio: 0.90,
+            cancel_ratio: 0.60,
             mid_price: 10_000,
             price_alpha: 1.5,
             max_price_offset: 200,
@@ -85,16 +103,31 @@ impl Default for GeneratorConfig {
             market_order_ratio: 0.05,
             ioc_ratio: 0.05,
             fok_ratio: 0.02,
+            stop_order_ratio: 0.03,
+            cancel_replace_ratio: 0.30,
             start_order_id: 1,
         }
     }
 }
 
-/// A generated event: either a new order or a cancel.
+/// A generated event: submit, cancel, or amend.
 #[derive(Debug, Clone, Copy)]
 pub enum GeneratedEvent {
-    Submit { symbol: Symbol, order: Order },
-    Cancel { symbol: Symbol, order_id: OrderId },
+    Submit {
+        symbol: Symbol,
+        order: Order,
+    },
+    Cancel {
+        symbol: Symbol,
+        order_id: OrderId,
+    },
+    /// Atomic price/quantity amendment of a resting order.
+    CancelReplace {
+        symbol: Symbol,
+        order_id: OrderId,
+        new_price: Price,
+        new_quantity: Quantity,
+    },
 }
 
 /// Generates a realistic stream of order events.
@@ -142,11 +175,16 @@ impl OrderFlowGenerator {
         if let Some(cancel) = self.pending_cancels.pop() {
             return cancel;
         }
-        if self.live_count > 0 && self.unit_dist.sample(&mut self.rng) < self.config.cancel_ratio {
-            self.generate_cancel()
-        } else {
-            self.generate_submit()
+        if self.live_count > 0 {
+            let roll: f64 = self.unit_dist.sample(&mut self.rng);
+            if roll < self.config.cancel_replace_ratio {
+                return self.generate_cancel_replace();
+            }
+            if roll < self.config.cancel_replace_ratio + self.config.cancel_ratio {
+                return self.generate_cancel();
+            }
         }
+        self.generate_submit()
     }
 
     /// Pre-generate a batch of events for engine-only benchmarks.
@@ -172,6 +210,17 @@ impl OrderFlowGenerator {
                 GeneratedEvent::Cancel { symbol, order_id } => {
                     Request::CancelOrder { symbol, order_id }
                 }
+                GeneratedEvent::CancelReplace {
+                    symbol,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                } => Request::CancelReplace {
+                    symbol,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                },
             };
 
             let written = codec::encode_request(&request, &mut encode_buf).expect("encode");
@@ -199,6 +248,38 @@ impl OrderFlowGenerator {
         let (order_type, time_in_force) = if roll < self.config.market_order_ratio {
             // Market order — no price, always IOC semantics.
             (OrderType::Market, TimeInForce::IOC)
+        } else if roll < self.config.market_order_ratio + self.config.stop_order_ratio {
+            // Stop order — trigger on the opposite side of the current position.
+            // Stop buys trigger above mid (protecting short positions),
+            // stop sells trigger below mid (protecting long positions).
+            let trigger = self.pick_price(side);
+            let stop_roll: f64 = self.unit_dist.sample(&mut self.rng);
+            if stop_roll < 0.5 {
+                // Plain stop → becomes market order on trigger.
+                (
+                    OrderType::Stop {
+                        trigger_price: trigger,
+                    },
+                    TimeInForce::GTC,
+                )
+            } else {
+                // Stop-limit → becomes limit order on trigger.
+                // Limit price is slightly worse than trigger to increase
+                // fill probability (buy: limit above trigger, sell: limit below).
+                let limit_offset = (self.config.max_price_offset / 10).max(1);
+                let limit_val = match side {
+                    Side::Buy => trigger.get().saturating_add(limit_offset),
+                    Side::Sell => trigger.get().saturating_sub(limit_offset).max(1),
+                };
+                let limit_price = Price(NonZeroU64::new(limit_val).expect("price > 0"));
+                (
+                    OrderType::StopLimit {
+                        trigger_price: trigger,
+                        limit_price,
+                    },
+                    TimeInForce::GTC,
+                )
+            }
         } else {
             let price = self.pick_price(side);
             let tif_roll: f64 = self.unit_dist.sample(&mut self.rng);
@@ -212,11 +293,13 @@ impl OrderFlowGenerator {
             (OrderType::Limit { price }, tif)
         };
 
-        // Only track GTC limit orders for cancellation — market/IOC/FOK
-        // orders don't rest on the book.
+        // Track orders that rest on the book (GTC limits and pending stops)
+        // for cancellation and amendment. Market/IOC/FOK don't rest.
         let rests = matches!(
             (&order_type, time_in_force),
             (OrderType::Limit { .. }, TimeInForce::GTC)
+                | (OrderType::Stop { .. }, TimeInForce::GTC)
+                | (OrderType::StopLimit { .. }, TimeInForce::GTC)
         );
         if rests {
             let cap = self.live_orders.len();
@@ -248,6 +331,35 @@ impl OrderFlowGenerator {
                 quantity,
                 stp: self.pick_stp(),
             },
+        }
+    }
+
+    fn generate_cancel_replace(&mut self) -> GeneratedEvent {
+        // Amend a recent resting order — simulates market maker quote updates.
+        // Biased toward newest orders (same as cancel).
+        let u: f64 = self.unit_dist.sample(&mut self.rng);
+        let biased = u * u;
+        let idx = (biased * self.live_count as f64) as usize;
+        let idx = idx.min(self.live_count - 1);
+
+        let cap = self.live_orders.len();
+        let ring_idx = (self.live_cursor + cap - self.live_count + idx) % cap;
+        let (order_id, symbol) = self.live_orders[ring_idx];
+
+        // New price: small random offset from mid (tighter than initial placement).
+        let side = if self.side_dist.sample(&mut self.rng) == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        let new_price = self.pick_price(side);
+        let new_quantity = self.pick_size();
+
+        GeneratedEvent::CancelReplace {
+            symbol,
+            order_id,
+            new_price,
+            new_quantity,
         }
     }
 
@@ -358,26 +470,24 @@ mod tests {
         let mut ofg = OrderFlowGenerator::new(GeneratorConfig::default());
         let mut submits = 0;
         let mut cancels = 0;
+        let mut amends = 0;
 
         for _ in 0..100_000 {
             match ofg.next_event() {
                 GeneratedEvent::Submit { .. } => submits += 1,
                 GeneratedEvent::Cancel { .. } => cancels += 1,
+                GeneratedEvent::CancelReplace { .. } => amends += 1,
             }
         }
 
         assert!(submits > 0, "should have submits");
         assert!(cancels > 0, "should have cancels");
-        // The realized cancel ratio is lower than the configured 0.9
-        // because each cancel consumes a live order — the pool drains
-        // quickly and forces new submits. In steady state, the ratio
-        // converges to ~0.47-0.52. This is correct: the *conditional*
-        // probability of cancel (when orders exist) is 0.9, but the
-        // *unconditional* ratio is bounded by the submit rate.
-        let ratio = cancels as f64 / (submits + cancels) as f64;
+        assert!(amends > 0, "should have cancel-replace amends");
+        let total = submits + cancels + amends;
+        let cancel_ratio = cancels as f64 / total as f64;
         assert!(
-            ratio > 0.3 && ratio < 0.7,
-            "unexpected cancel ratio {ratio}"
+            cancel_ratio > 0.2 && cancel_ratio < 0.7,
+            "unexpected cancel ratio {cancel_ratio}"
         );
     }
 
@@ -484,6 +594,8 @@ mod tests {
         let mut limit_gtc = 0u64;
         let mut limit_ioc = 0u64;
         let mut limit_fok = 0u64;
+        let mut stops = 0u64;
+        let mut stop_limits = 0u64;
 
         for _ in 0..100_000 {
             if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
@@ -492,6 +604,8 @@ mod tests {
                     (OrderType::Limit { .. }, TimeInForce::GTC) => limit_gtc += 1,
                     (OrderType::Limit { .. }, TimeInForce::IOC) => limit_ioc += 1,
                     (OrderType::Limit { .. }, TimeInForce::FOK) => limit_fok += 1,
+                    (OrderType::Stop { .. }, _) => stops += 1,
+                    (OrderType::StopLimit { .. }, _) => stop_limits += 1,
                     _ => {}
                 }
             }
@@ -501,10 +615,12 @@ mod tests {
         assert!(limit_gtc > 0, "should have limit GTC orders");
         assert!(limit_ioc > 0, "should have limit IOC orders");
         assert!(limit_fok > 0, "should have limit FOK orders");
-        // GTC should be the majority.
+        assert!(stops > 0, "should have stop orders");
+        assert!(stop_limits > 0, "should have stop-limit orders");
+        // GTC limits should be the majority.
         assert!(
-            limit_gtc > markets + limit_ioc + limit_fok,
-            "GTC should dominate"
+            limit_gtc > markets + limit_ioc + limit_fok + stops + stop_limits,
+            "GTC limits should dominate"
         );
     }
 
@@ -542,6 +658,20 @@ mod tests {
                 }
                 GeneratedEvent::Cancel { symbol, order_id } => {
                     exchange.cancel(symbol, order_id, &mut reports);
+                }
+                GeneratedEvent::CancelReplace {
+                    symbol,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                } => {
+                    exchange.cancel_replace(
+                        symbol,
+                        order_id,
+                        new_price,
+                        new_quantity,
+                        &mut reports,
+                    );
                 }
             }
             fills += reports
