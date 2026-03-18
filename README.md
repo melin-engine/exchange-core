@@ -209,6 +209,7 @@ Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexi
 - [x] CPU core pinning for all pipeline, reader, and bench threads
 - [x] IRQ affinity pinning (`bench-isolate.sh`)
 - [x] Kernel boot isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`)
+- [ ] Profile-Guided Optimization (PGO) — two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Typical gains 10-30% on branch-heavy matching loops. Payload-dependent: profiling against the synthetic generator will optimize for its branch patterns, not necessarily production traffic. Ideally profile against real market data replay (ITCH, Databento) or recorded production journals once available.
 
 ## Project Structure
 
