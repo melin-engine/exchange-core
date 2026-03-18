@@ -43,6 +43,15 @@ const PREALLOC_CHUNK: u64 = 64 * 1024 * 1024;
 /// The checkpoint itself is ~77 bytes — negligible overhead.
 pub const CHECKPOINT_INTERVAL: u64 = 100_000;
 
+/// A batch of encoded journal data ready for async write via io_uring.
+/// Owns the buffer to prevent aliasing while io_uring holds a pointer to it.
+pub struct AsyncWriteBatch {
+    /// The buffer containing encoded journal entries.
+    pub buf: Vec<u8>,
+    /// File offset where this batch should be written.
+    pub offset: u64,
+}
+
 /// Appends journal events to a file with CRC32C checksums and fsync durability.
 ///
 /// Uses positioned writes (`pwrite`) and pre-allocated storage to minimize
@@ -58,6 +67,10 @@ pub struct JournalWriter {
     /// then flushed in a single `pwrite` via `flush_batch()`. This reduces
     /// syscalls from N (one pwrite per event) to 1 per batch.
     batch_buf: Vec<u8>,
+    /// Spare buffer for double-buffering with io_uring. While one buffer is
+    /// in-flight, the other accumulates the next batch. `None` when the spare
+    /// is currently in-flight as part of an `AsyncWriteBatch`.
+    spare_buf: Option<Vec<u8>>,
     /// Next sequence number to assign (monotonically increasing, starts at 1).
     next_sequence: u64,
     /// Path to the journal file (kept for error messages / reopening).
@@ -141,6 +154,7 @@ impl JournalWriter {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
+            spare_buf: Some(Vec::with_capacity(BATCH_BUF_CAPACITY)),
             next_sequence: starting_sequence,
             path: path.to_path_buf(),
             write_pos,
@@ -206,6 +220,7 @@ impl JournalWriter {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
+            spare_buf: Some(Vec::with_capacity(BATCH_BUF_CAPACITY)),
             next_sequence: last_seq + 1,
             path: path.to_path_buf(),
             write_pos: valid_end,
@@ -361,6 +376,48 @@ impl JournalWriter {
         self.write_pos += self.batch_buf.len() as u64;
         self.batch_buf.clear();
         Ok(())
+    }
+
+    /// Take the current batch buffer for async writing via io_uring.
+    ///
+    /// Returns `None` if the batch buffer is empty (nothing to write).
+    /// Swaps in the spare buffer so `batch_append()` can continue
+    /// accumulating the next batch while this one is in-flight.
+    ///
+    /// The caller must call `confirm_async_write()` after the io_uring
+    /// CQE confirms durability, to return the buffer to the pool.
+    ///
+    /// `write_pos` is advanced immediately (not on confirm) so subsequent
+    /// `batch_append()` calls encode at the correct offset. The journal
+    /// cursor must NOT advance until `confirm_async_write()` — the data
+    /// is not yet durable.
+    pub fn take_batch_for_async_write(&mut self) -> Result<Option<AsyncWriteBatch>, JournalError> {
+        if self.batch_buf.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_allocated(self.batch_buf.len() as u64)?;
+
+        let offset = self.write_pos;
+        self.write_pos += self.batch_buf.len() as u64;
+
+        // Swap in the spare buffer (or allocate a new one if spare is in-flight).
+        let spare = self
+            .spare_buf
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(BATCH_BUF_CAPACITY));
+        let full_buf = std::mem::replace(&mut self.batch_buf, spare);
+
+        Ok(Some(AsyncWriteBatch {
+            buf: full_buf,
+            offset,
+        }))
+    }
+
+    /// Return a completed async write batch's buffer to the spare pool.
+    /// Call this after the io_uring CQE confirms the write is durable.
+    pub fn confirm_async_write(&mut self, mut batch: AsyncWriteBatch) {
+        batch.buf.clear();
+        self.spare_buf = Some(batch.buf);
     }
 
     /// Flush the journal to disk (fdatasync).

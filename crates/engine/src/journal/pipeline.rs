@@ -182,24 +182,45 @@ impl JournalStage {
 
     /// Run the journal stage loop.
     ///
+    /// Dispatches to the io_uring overlapped path when the `io-uring`
+    /// feature is enabled and fsync is active. Falls back to the
+    /// synchronous `pwritev2+RWF_DSYNC` path otherwise.
+    ///
+    /// Returns the `JournalWriter` on shutdown for clean resource release.
+    pub fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        #[cfg(all(
+            feature = "io-uring",
+            not(feature = "no-fsync"),
+            not(feature = "no-persist")
+        ))]
+        {
+            self.run_uring(shutdown)
+        }
+        #[cfg(not(all(
+            feature = "io-uring",
+            not(feature = "no-fsync"),
+            not(feature = "no-persist")
+        )))]
+        {
+            self.run_sync(shutdown)
+        }
+    }
+
+    /// Synchronous journal loop: `pwritev2+RWF_DSYNC` blocks until durable.
+    ///
     /// Uses `read_batch` + `commit` (not `consume_batch`) to ensure the
     /// journal cursor is only advanced **after** the write is durable.
     /// The response stage checks this cursor before sending — this is
     /// the persist-before-ack boundary.
-    ///
-    /// Durability uses `pwritev2` with `RWF_DSYNC` (FUA) instead of
-    /// separate pwrite + fdatasync. This combines write + sync into a
-    /// single syscall and leverages NVMe Force Unit Access for ~10-100 µs
-    /// sync latency instead of ~1-7 ms full cache flushes.
-    ///
-    /// With group commit delay > 0, the journal coalesces multiple reads
-    /// into a single sync: it keeps reading events until either the
-    /// batch is full (MAX_JOURNAL_BATCH) or the delay has elapsed since
-    /// the first unsynced write. Under high load the batch fills
-    /// naturally and the delay never fires.
-    ///
-    /// Returns the `JournalWriter` on shutdown for clean resource release.
-    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+    #[cfg_attr(
+        all(
+            feature = "io-uring",
+            not(feature = "no-fsync"),
+            not(feature = "no-persist")
+        ),
+        allow(dead_code)
+    )]
+    fn run_sync(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         #[cfg(not(feature = "no-fsync"))]
         use std::time::Instant;
 
@@ -360,6 +381,209 @@ impl JournalStage {
                 }
             }
             self.consumer.commit(count);
+        }
+    }
+
+    /// Overlapped io_uring journal loop: submits Write+RWF_DSYNC asynchronously
+    /// and accumulates the next batch in a second buffer while the NVMe FUA
+    /// write is in flight. Doubles effective throughput when journal I/O is
+    /// the bottleneck.
+    ///
+    /// Cursor only advances after the CQE confirms durability — the
+    /// persist-before-ack guarantee is preserved.
+    #[cfg(all(
+        feature = "io-uring",
+        not(feature = "no-fsync"),
+        not(feature = "no-persist")
+    ))]
+    fn run_uring(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        use io_uring::{IoUring, opcode, types};
+        use std::time::Instant;
+
+        let mut ring: IoUring = IoUring::new(4).expect("io_uring init failed");
+        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
+        let delay = self.group_commit_delay;
+        let mut idle_spins: u32 = 0;
+        let mut pending: usize = 0;
+        let mut first_write_ts: Option<Instant> = None;
+        let fd = self.writer.fd();
+
+        // In-flight state: the batch being written and the sequence to commit
+        // when the CQE arrives. `inflight_seq` is the consumer's `next_read`
+        // at the time of submission — committing it advances the cursor to
+        // exactly the events covered by the durable write.
+        let mut inflight: Option<(super::writer::AsyncWriteBatch, u64)> = None;
+
+        #[cfg(feature = "pipeline-stats")]
+        let mut busy_count: u64 = 0;
+        #[cfg(feature = "pipeline-stats")]
+        let mut idle_count: u64 = 0;
+
+        loop {
+            // --- Check shutdown ---
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                // Wait for in-flight write to complete.
+                if let Some((batch_data, seq)) = inflight.take() {
+                    self.wait_for_cqe(&mut ring, &batch_data);
+                    self.consumer.set_progress(seq);
+                    self.writer.confirm_async_write(batch_data);
+                }
+                // Flush any pending buffered data synchronously.
+                if pending > 0 {
+                    if let Err(e) = self.writer.flush_batch_sync() {
+                        tracing::error!(error = %e, "journal sync error on shutdown");
+                    }
+                    self.consumer.commit(pending);
+                }
+                self.drain_remaining(&mut batch);
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("journal", busy_count, idle_count);
+                return self.writer;
+            }
+
+            // --- Reap CQE from previous in-flight write (non-blocking) ---
+            if let Some((ref batch_data, seq)) = inflight
+                && let Some(cqe) = ring.completion().next()
+            {
+                let result = cqe.result();
+                if result < 0 {
+                    tracing::error!(errno = -result, "io_uring journal write failed");
+                } else if (result as usize) != batch_data.buf.len() {
+                    tracing::error!(
+                        written = result,
+                        expected = batch_data.buf.len(),
+                        "io_uring journal short write"
+                    );
+                }
+                // Advance cursor: these events are now durable.
+                self.consumer.set_progress(seq);
+                let completed = inflight.take().expect("checked above");
+                self.writer.confirm_async_write(completed.0);
+            }
+
+            // --- Read events from disruptor ---
+            let remaining = MAX_JOURNAL_BATCH.saturating_sub(pending);
+            let count = if remaining > 0 {
+                self.consumer.read_batch(&mut batch, remaining)
+            } else {
+                0
+            };
+
+            if count > 0 {
+                idle_spins = 0;
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    busy_count += 1;
+                }
+
+                for slot in &batch[..count] {
+                    if matches!(slot.event, JournalEvent::QueryStats) {
+                        continue;
+                    }
+                    if let Err(e) = self.writer.batch_append(&slot.event) {
+                        tracing::error!(error = %e, "journal encode error");
+                    }
+                }
+                pending += count;
+                if first_write_ts.is_none() {
+                    first_write_ts = Some(Instant::now());
+                }
+            }
+
+            // --- Decide whether to submit ---
+            if pending > 0 {
+                // With overlapping: only submit when either (a) there's no
+                // in-flight write (slot is free), or (b) batch is full
+                // (backpressure — must drain before accumulating more).
+                // When a write IS in-flight and the batch isn't full, we
+                // continue accumulating — the CQE reap at the top of the
+                // loop will free the slot, and the NEXT iteration submits.
+                let slot_free = inflight.is_none();
+                let batch_full = pending >= MAX_JOURNAL_BATCH;
+                let delay_expired =
+                    delay.is_zero() || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
+
+                let should_submit = (slot_free && delay_expired) || batch_full;
+
+                if should_submit {
+                    // If a write is still in-flight, block until it completes
+                    // (backpressure — both buffers full).
+                    if let Some((batch_data, seq)) = inflight.take() {
+                        self.wait_for_cqe(&mut ring, &batch_data);
+                        self.consumer.set_progress(seq);
+                        self.writer.confirm_async_write(batch_data);
+                    }
+
+                    // Take the batch buffer and submit async write.
+                    match self.writer.take_batch_for_async_write() {
+                        Ok(Some(async_batch)) => {
+                            let seq = self.consumer.next_read();
+                            let sqe = opcode::Write::new(
+                                types::Fd(fd),
+                                async_batch.buf.as_ptr(),
+                                async_batch.buf.len() as u32,
+                            )
+                            .offset(async_batch.offset)
+                            .rw_flags(libc::RWF_DSYNC)
+                            .build()
+                            .user_data(1);
+
+                            unsafe {
+                                ring.submission().push(&sqe).expect("SQ full");
+                            }
+                            ring.submit().expect("io_uring submit failed");
+
+                            inflight = Some((async_batch, seq));
+                        }
+                        Ok(None) => {
+                            // Buffer was empty (all QueryStats), just commit.
+                            self.consumer.commit(pending);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "journal take_batch error");
+                        }
+                    }
+                    pending = 0;
+                    first_write_ts = None;
+                }
+            } else {
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    idle_count += 1;
+                }
+                if idle_spins < 1000 {
+                    idle_spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Block until the in-flight io_uring CQE arrives.
+    #[cfg(all(
+        feature = "io-uring",
+        not(feature = "no-fsync"),
+        not(feature = "no-persist")
+    ))]
+    fn wait_for_cqe(
+        &self,
+        ring: &mut io_uring::IoUring,
+        batch_data: &super::writer::AsyncWriteBatch,
+    ) {
+        ring.submit_and_wait(1).expect("io_uring submit_and_wait");
+        if let Some(cqe) = ring.completion().next() {
+            let result = cqe.result();
+            if result < 0 {
+                tracing::error!(errno = -result, "io_uring journal write failed (drain)");
+            } else if (result as usize) != batch_data.buf.len() {
+                tracing::error!(
+                    written = result,
+                    expected = batch_data.buf.len(),
+                    "io_uring journal short write (drain)"
+                );
+            }
         }
     }
 }

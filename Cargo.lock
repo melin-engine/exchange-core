@@ -1651,6 +1651,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.3.4",
  "hdrhistogram",
+ "io-uring",
  "libc",
  "proptest",
  "rustc-hash",
