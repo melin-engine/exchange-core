@@ -1062,20 +1062,25 @@ impl Exchange {
             state.circuit_breakers.into_iter().collect();
         let fee_map: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
 
-        // Assemble consolidated InstrumentState per symbol.
-        let mut instruments: HashMap<Symbol, InstrumentState> = HashMap::new();
+        // Assemble consolidated InstrumentState Vec indexed by Symbol.0.
+        let max_sym = state
+            .instruments
+            .iter()
+            .map(|s| s.symbol.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut instruments: Vec<Option<Box<InstrumentState>>> = Vec::new();
+        instruments.resize_with(max_sym + 1, || None);
         for spec in &state.instruments {
+            let idx = spec.symbol.0 as usize;
             let book = books_map.remove(&spec.symbol).unwrap_or_default();
-            instruments.insert(
-                spec.symbol,
-                InstrumentState {
-                    spec: *spec,
-                    book,
-                    risk_limits: risk_map.get(&spec.symbol).copied().unwrap_or_default(),
-                    circuit_breaker: cb_map.get(&spec.symbol).copied().unwrap_or_default(),
-                    fee_schedule: fee_map.get(&spec.symbol).copied().unwrap_or_default(),
-                },
-            );
+            instruments[idx] = Some(Box::new(InstrumentState {
+                spec: *spec,
+                book,
+                risk_limits: risk_map.get(&spec.symbol).copied().unwrap_or_default(),
+                circuit_breaker: cb_map.get(&spec.symbol).copied().unwrap_or_default(),
+                fee_schedule: fee_map.get(&spec.symbol).copied().unwrap_or_default(),
+            }));
         }
 
         let (accounts, slot_assignments) =

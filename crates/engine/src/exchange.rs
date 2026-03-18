@@ -17,6 +17,28 @@ use crate::types::{
     Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
 };
 
+/// Helper: get an immutable reference to the InstrumentState at `symbol`.
+#[inline]
+fn inst_ref(
+    instruments: &[Option<Box<InstrumentState>>],
+    symbol: Symbol,
+) -> Option<&InstrumentState> {
+    instruments
+        .get(symbol.0 as usize)
+        .and_then(|o| o.as_deref())
+}
+
+/// Helper: get a mutable reference to the InstrumentState at `symbol`.
+#[inline]
+fn inst_mut(
+    instruments: &mut [Option<Box<InstrumentState>>],
+    symbol: Symbol,
+) -> Option<&mut InstrumentState> {
+    instruments
+        .get_mut(symbol.0 as usize)
+        .and_then(|o| o.as_deref_mut())
+}
+
 /// All per-instrument state in one struct for cache-friendly single-lookup
 /// access. On every order the engine does one HashMap lookup instead of 5,
 /// turning 5 potential cache misses into 1.
@@ -30,14 +52,11 @@ pub(crate) struct InstrumentState {
 
 /// Top-level exchange managing multiple instruments.
 pub struct Exchange {
-    /// HashMap for symbol → consolidated instrument state. O(1) amortized
-    /// lookup. One lookup gives access to the book, spec, risk limits,
-    /// circuit breaker config, and fee schedule — all in one cache-friendly
-    /// struct.
-    // TODO: If profiling shows hashing overhead on the hot path, consider
-    // replacing with a pre-allocated array indexed by Symbol(u32), giving
-    // true O(1) dispatch with no hashing.
-    instruments: HashMap<Symbol, InstrumentState>,
+    /// Flat Vec indexed by `Symbol.0` for true O(1) instrument dispatch with
+    /// zero hashing overhead. Boxed to keep empty slots at 8 bytes (null ptr)
+    /// since InstrumentState is large (contains OrderBook). Typical exchanges
+    /// have <100 instruments, so the Vec is tiny.
+    instruments: Vec<Option<Box<InstrumentState>>>,
     /// Shared account balance manager across all instruments.
     accounts: AccountManager,
     /// Tracks order side and reservation slot by (account, order_id).
@@ -61,7 +80,7 @@ pub struct Exchange {
 impl Exchange {
     pub fn new() -> Self {
         Self {
-            instruments: HashMap::new(),
+            instruments: Vec::new(),
             accounts: AccountManager::new(),
             order_info: HashMap::new(),
             max_order_id: HashMap::new(),
@@ -75,7 +94,8 @@ impl Exchange {
     /// RAM is cheap; tail latency is not.
     pub fn with_capacity() -> Self {
         Self {
-            instruments: HashMap::with_capacity(64),
+            // 64 instrument slots — each empty slot is 8 bytes (null Box ptr).
+            instruments: Vec::with_capacity(64),
             accounts: AccountManager::with_capacity(),
             order_info: HashMap::with_capacity(2_000_000),
             max_order_id: HashMap::with_capacity(10_000),
@@ -86,7 +106,7 @@ impl Exchange {
 
     /// Reconstruct from pre-built parts (used by snapshot restore).
     pub(crate) fn from_parts(
-        instruments: HashMap<Symbol, InstrumentState>,
+        instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
         order_info: HashMap<(AccountId, OrderId), OrderInfo>,
         max_order_id: HashMap<AccountId, u64>,
@@ -103,14 +123,18 @@ impl Exchange {
 
     /// Iterate over instrument specs (for snapshot serialization).
     pub(crate) fn instrument_specs(&self) -> impl Iterator<Item = &InstrumentSpec> {
-        self.instruments.values().map(|inst| &inst.spec)
+        self.instruments
+            .iter()
+            .filter_map(|slot| slot.as_deref())
+            .map(|inst| &inst.spec)
     }
 
     /// Iterate over (symbol, book) pairs (for snapshot serialization and proptests).
     pub(crate) fn books(&self) -> impl Iterator<Item = (Symbol, &OrderBook)> {
         self.instruments
             .iter()
-            .map(|(&sym, inst)| (sym, &inst.book))
+            .filter_map(|slot| slot.as_deref())
+            .map(|inst| (inst.spec.symbol, &inst.book))
     }
 
     /// Snapshot the order-side map as a Vec for serialization.
@@ -149,7 +173,7 @@ impl Exchange {
     /// Set fat finger risk limits for an instrument. No-op if the
     /// instrument doesn't exist (matches previous behavior).
     pub fn set_risk_limits(&mut self, symbol: Symbol, limits: RiskLimits) {
-        if let Some(inst) = self.instruments.get_mut(&symbol) {
+        if let Some(inst) = inst_mut(&mut self.instruments, symbol) {
             inst.risk_limits = limits;
         }
     }
@@ -158,14 +182,15 @@ impl Exchange {
     pub(crate) fn snapshot_risk_limits(&self) -> Vec<(Symbol, RiskLimits)> {
         self.instruments
             .iter()
-            .map(|(&symbol, inst)| (symbol, inst.risk_limits))
+            .filter_map(|slot| slot.as_deref())
+            .map(|inst| (inst.spec.symbol, inst.risk_limits))
             .collect()
     }
 
     /// Set circuit breaker configuration for an instrument. No-op if the
     /// instrument doesn't exist (matches previous behavior).
     pub fn set_circuit_breaker(&mut self, symbol: Symbol, config: CircuitBreakerConfig) {
-        if let Some(inst) = self.instruments.get_mut(&symbol) {
+        if let Some(inst) = inst_mut(&mut self.instruments, symbol) {
             inst.circuit_breaker = config;
         }
     }
@@ -173,7 +198,7 @@ impl Exchange {
     /// Set the maker/taker fee schedule for an instrument. No-op if the
     /// instrument doesn't exist (matches previous behavior).
     pub fn set_fee_schedule(&mut self, symbol: Symbol, schedule: FeeSchedule) {
-        if let Some(inst) = self.instruments.get_mut(&symbol) {
+        if let Some(inst) = inst_mut(&mut self.instruments, symbol) {
             inst.fee_schedule = schedule;
         }
     }
@@ -182,7 +207,8 @@ impl Exchange {
     pub(crate) fn snapshot_fee_schedules(&self) -> Vec<(Symbol, FeeSchedule)> {
         self.instruments
             .iter()
-            .map(|(&symbol, inst)| (symbol, inst.fee_schedule))
+            .filter_map(|slot| slot.as_deref())
+            .map(|inst| (inst.spec.symbol, inst.fee_schedule))
             .collect()
     }
 
@@ -190,7 +216,8 @@ impl Exchange {
     pub(crate) fn snapshot_circuit_breakers(&self) -> Vec<(Symbol, CircuitBreakerConfig)> {
         self.instruments
             .iter()
-            .map(|(&symbol, inst)| (symbol, inst.circuit_breaker))
+            .filter_map(|slot| slot.as_deref())
+            .map(|inst| (inst.spec.symbol, inst.circuit_breaker))
             .collect()
     }
 
@@ -222,28 +249,36 @@ impl Exchange {
 
         self.accounts.prefault();
 
-        for inst in self.instruments.values_mut() {
-            inst.book.prefault();
+        for slot in &mut self.instruments {
+            if let Some(inst) = slot.as_deref_mut() {
+                inst.book.prefault();
+            }
         }
     }
 
     /// Register a new instrument with its currency pair specification.
+    /// Grows the instrument Vec if needed (admin operation, not hot path).
     pub fn add_instrument(&mut self, spec: InstrumentSpec) {
-        let presized = self.presized;
-        self.instruments.entry(spec.symbol).or_insert_with(|| {
-            let book = if presized {
+        let idx = spec.symbol.0 as usize;
+        // Grow Vec to accommodate the new symbol index.
+        if idx >= self.instruments.len() {
+            self.instruments.resize_with(idx + 1, || None);
+        }
+        // Only insert if slot is empty (don't overwrite existing instrument).
+        if self.instruments[idx].is_none() {
+            let book = if self.presized {
                 OrderBook::with_capacity()
             } else {
                 OrderBook::new()
             };
-            InstrumentState {
+            self.instruments[idx] = Some(Box::new(InstrumentState {
                 spec,
                 book,
                 risk_limits: RiskLimits::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
                 fee_schedule: FeeSchedule::default(),
-            }
-        });
+            }));
+        }
     }
 
     /// Deposit funds into an account.
@@ -261,7 +296,7 @@ impl Exchange {
     /// Validates the instrument exists, reserves funds, then executes.
     /// On fill, balances are updated. On reject/cancel, reserves are released.
     pub fn execute(&mut self, symbol: Symbol, order: Order, reports: &mut Vec<ExecutionReport>) {
-        let Some(inst) = self.instruments.get(&symbol) else {
+        let Some(inst) = inst_ref(&self.instruments, symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
                 account: order.account,
@@ -293,10 +328,7 @@ impl Exchange {
 
         // Re-lookup for the remaining checks (immutable borrows above
         // ended; we need a fresh reference after max_order_id borrow).
-        let inst = self
-            .instruments
-            .get(&symbol)
-            .expect("instrument verified to exist above");
+        let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
 
         // Circuit breaker checks: trading halt rejects all orders; price
         // bands reject limit/stop-limit orders outside [lower, upper].
@@ -420,10 +452,8 @@ impl Exchange {
         let report_start = reports.len();
 
         // Single mutable lookup: book, fees all from the same struct.
-        let inst = self
-            .instruments
-            .get_mut(&symbol)
-            .expect("instrument verified to exist above");
+        let inst =
+            inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
         inst.book.execute(order, quote_budget, reports);
 
         // Compute fees on fills before balance updates.
@@ -447,10 +477,7 @@ impl Exchange {
         // reservation but is no longer on the book (fully filled), release
         // the unused portion. This also handles triggered stops whose fill
         // didn't exhaust their budget-based reservation.
-        let inst = self
-            .instruments
-            .get(&symbol)
-            .expect("instrument verified to exist above");
+        let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
         for report in &reports[report_start..] {
             if let ExecutionReport::Fill {
                 maker_order_id,
@@ -488,15 +515,13 @@ impl Exchange {
     /// Cancel all resting orders and pending stops for an account across
     /// all instruments (kill switch). Releases all associated reservations.
     pub fn cancel_all(&mut self, account: AccountId, reports: &mut Vec<ExecutionReport>) {
-        // Collect symbols first to avoid borrowing self.instruments while
-        // also needing self.accounts and self.order_info.
-        let symbols: Vec<Symbol> = self.instruments.keys().copied().collect();
-
-        for symbol in symbols {
-            let inst = self
-                .instruments
-                .get_mut(&symbol)
-                .expect("symbol came from instruments keys");
+        // Iterate by index to avoid collecting symbols into a Vec.
+        // We need mutable access to each instrument's book, but also need
+        // self.accounts and self.order_info, so we index explicitly.
+        for idx in 0..self.instruments.len() {
+            let Some(inst) = self.instruments[idx].as_deref_mut() else {
+                continue;
+            };
             let spec = inst.spec;
 
             let report_start = reports.len();
@@ -526,7 +551,7 @@ impl Exchange {
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
     ) {
-        let Some(inst) = self.instruments.get_mut(&symbol) else {
+        let Some(inst) = inst_mut(&mut self.instruments, symbol) else {
             return;
         };
         let spec = inst.spec;
@@ -572,8 +597,8 @@ impl Exchange {
         new_quantity: Quantity,
         reports: &mut Vec<ExecutionReport>,
     ) {
-        // Single lookup for all instrument state.
-        let Some(inst) = self.instruments.get(&symbol) else {
+        // Single lookup for all instrument state — O(1) Vec index, no hashing.
+        let Some(inst) = inst_ref(&self.instruments, symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -724,13 +749,11 @@ impl Exchange {
         }
 
         // 6. All checks passed — perform the book replacement (single VecDeque
-        // scan). This returns (account, old_price, old_remaining).
+        // scan). This returns (old_price, old_remaining).
         // Cannot fail since we verified the order exists above and matching is
         // single-threaded (no concurrent removal possible).
-        let inst = self
-            .instruments
-            .get_mut(&symbol)
-            .expect("instrument verified to exist above");
+        let inst =
+            inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
         let (old_price, old_remaining) = inst
             .book
             .replace_order(account, order_id, new_price, new_quantity)
