@@ -399,7 +399,7 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
     let sides_ids: std::collections::HashSet<OrderId> =
         order_sides.iter().map(|((_acct, id), _)| *id).collect();
 
-    let reservations = exchange.accounts().snapshot_reservations();
+    let reservations = exchange.snapshot_reservations();
     let reserved_ids: std::collections::HashSet<OrderId> =
         reservations.iter().map(|(id, _, _, _)| *id).collect();
 
@@ -1071,12 +1071,13 @@ proptest! {
             stp: SelfTradeProtection::Allow,
         };
 
-        let buy_ok = mgr.try_reserve(&buy, &spec, 0).is_ok();
-        let sell_ok = mgr.try_reserve(&sell, &spec, 0).is_ok();
+        let buy_res = mgr.try_reserve(&buy, &spec, 0);
+        let sell_res = mgr.try_reserve(&sell, &spec, 0);
 
-        if buy_ok && sell_ok {
+        if let (Ok((_amt, buy_slot)), Ok((_amt2, sell_slot))) = (buy_res, sell_res) {
             // Fill must not panic regardless of price × quantity magnitude.
-            mgr.fill(ACCT_B, OrderId(2), ACCT_A, OrderId(1), p, q, Side::Sell, 0, 0, &spec);
+            // Buyer = ACCT_A (buy_slot), Seller = ACCT_B (sell_slot).
+            mgr.fill(buy_slot, sell_slot, p, q, 0, 0, &spec);
         }
     }
 }
@@ -1097,7 +1098,7 @@ proptest! {
     fn reservation_matches_book(actions in arb_exchange_actions()) {
         let (exchange, _, _) = run_exchange_actions(&actions);
 
-        let reservations = exchange.accounts().snapshot_reservations();
+        let reservations = exchange.snapshot_reservations();
         let reserved_order_ids: std::collections::HashSet<OrderId> =
             reservations.iter().map(|(id, _, _, _)| *id).collect();
 

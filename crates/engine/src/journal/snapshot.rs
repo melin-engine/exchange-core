@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::Path;
 
-use crate::account::{AccountManager, Balance};
+use crate::account::{AccountManager, Balance, OrderInfo};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
@@ -1022,7 +1022,7 @@ impl Exchange {
     pub(crate) fn snapshot_state(&self) -> ExchangeSnapshot {
         let instruments: Vec<InstrumentSpec> = self.instrument_specs().copied().collect();
         let balances = self.accounts().snapshot_balances();
-        let reservations = self.accounts().snapshot_reservations();
+        let reservations = self.snapshot_reservations();
         let order_sides: Vec<((AccountId, OrderId), Side)> = self.snapshot_order_sides();
 
         let books: Vec<(Symbol, BookSnapshot)> = self
@@ -1078,12 +1078,29 @@ impl Exchange {
             );
         }
 
-        let accounts = AccountManager::from_parts(state.balances, state.reservations);
-        let order_sides: HashMap<(AccountId, OrderId), Side> =
-            state.order_sides.into_iter().collect();
+        let (accounts, slot_assignments) =
+            AccountManager::from_parts(state.balances, state.reservations);
+
+        // Build order_info by combining saved sides with restored reservation slots.
+        // Build a side lookup first, then merge with slot assignments.
+        let side_map: HashMap<(AccountId, OrderId), Side> = state.order_sides.into_iter().collect();
+        let mut order_info: HashMap<(AccountId, OrderId), OrderInfo> =
+            HashMap::with_capacity(side_map.len());
+        for (key, slot) in slot_assignments {
+            if let Some(&side) = side_map.get(&key) {
+                order_info.insert(
+                    key,
+                    OrderInfo {
+                        side,
+                        reservation: slot,
+                    },
+                );
+            }
+        }
+
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
-        Self::from_parts(instruments, accounts, order_sides, max_order_id)
+        Self::from_parts(instruments, accounts, order_info, max_order_id)
     }
 }
 

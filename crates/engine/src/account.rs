@@ -16,8 +16,6 @@
 //! when a new account or currency appears — this is an admin operation
 //! that happens outside the order-matching critical path.
 
-use std::collections::HashMap;
-
 use crate::types::{
     AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, OrderType, Price,
     Quantity, RejectReason, Side,
@@ -81,6 +79,28 @@ impl Reservation {
     }
 }
 
+/// Opaque handle to a reservation in the slab. O(1) Vec-indexed access,
+/// no hashing. Valid from `try_reserve` until `release` or fill completion.
+///
+/// u32 index: supports up to ~4 billion concurrent reservations. At 2M
+/// pre-allocated slots this is more than sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReservationSlot(u32);
+
+impl ReservationSlot {
+    /// Sentinel value for prefault dummy entries. Never used in production.
+    pub const DUMMY: Self = Self(u32::MAX);
+}
+
+/// Tracks order side and reservation slot for a resting or in-flight order.
+/// Stored in Exchange's order tracking map, providing O(1) reservation
+/// access via the slot index (instead of a second HashMap lookup).
+#[derive(Debug, Clone, Copy)]
+pub struct OrderInfo {
+    pub side: Side,
+    pub reservation: ReservationSlot,
+}
+
 /// Manages account balances across all currencies.
 ///
 /// Balances are stored in a flat `Vec<Balance>` indexed by
@@ -95,10 +115,14 @@ pub struct AccountManager {
     balances: Vec<Balance>,
     /// Number of currency slots per account row (max_currency_id + 1).
     currency_stride: usize,
-    /// Maps each open order to its reservation details. Keyed by
-    /// (AccountId, OrderId) because different accounts can independently
-    /// use the same OrderId. HashMap because keys are sparse.
-    reservations: HashMap<(AccountId, OrderId), Reservation>,
+    /// Slab of active reservations. Indexed by `ReservationSlot(u32)` for
+    /// O(1) access with no hashing. Freed slots are recycled via `free_slots`.
+    /// Vec: contiguous, cache-friendly, zero per-access overhead vs HashMap's
+    /// hash + probe + comparison per lookup.
+    reservation_slab: Vec<Reservation>,
+    /// Stack of recycled slot indices. Pop to allocate, push to free.
+    /// LIFO reuse keeps recently-freed (cache-hot) slots in rotation.
+    free_slots: Vec<u32>,
 }
 
 impl AccountManager {
@@ -106,41 +130,49 @@ impl AccountManager {
         Self {
             balances: Vec::new(),
             currency_stride: 0,
-            reservations: HashMap::new(),
+            reservation_slab: Vec::new(),
+            free_slots: Vec::new(),
         }
     }
 
     /// Create an AccountManager pre-sized for production workloads.
     pub fn with_capacity() -> Self {
+        // Pre-allocate 2M reservation slots. At 16 bytes each this is 32 MB —
+        // far less than the ~96 MB the old HashMap used (key + value + table
+        // overhead). Pages are faulted during prefault().
         Self {
             balances: Vec::new(),
             currency_stride: 0,
-            // One reservation per resting order across all instruments.
-            reservations: HashMap::with_capacity(2_000_000),
+            reservation_slab: Vec::with_capacity(2_000_000),
+            free_slots: Vec::with_capacity(2_000_000),
         }
     }
 
     /// Touch all pre-allocated pages so page faults happen at startup,
-    /// not on the hot path. Only needed for the reservations HashMap;
-    /// the flat balance Vec is already contiguous and sequentially faulted.
+    /// not on the hot path. Pre-fills the slab with dummy reservations and
+    /// builds the free list in reverse order (so slot 0 is allocated first).
     pub fn prefault(&mut self) {
-        if self.reservations.is_empty() {
-            let cap = self.reservations.capacity();
-            for i in 0..cap {
-                self.reservations.insert(
-                    (AccountId(0), OrderId(i as u64)),
-                    Reservation::new(AccountId(0), CurrencyId(0), 0),
-                );
+        if self.reservation_slab.is_empty() {
+            let cap = self.reservation_slab.capacity().max(2_000_000);
+            let dummy = Reservation::new(AccountId(0), CurrencyId(0), 0);
+            self.reservation_slab.resize(cap, dummy);
+            self.free_slots.clear();
+            self.free_slots.reserve(cap);
+            // Reverse order: slot 0 at top of stack, allocated first.
+            for i in (0..cap).rev() {
+                self.free_slots.push(i as u32);
             }
-            self.reservations.clear();
         }
     }
 
-    /// Reconstruct from snapshot data.
+    /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
+    /// where `slot_assignments` maps each `(AccountId, OrderId)` to its
+    /// `ReservationSlot` so the caller can build `OrderInfo` entries.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn from_parts(
         balance_entries: Vec<((AccountId, CurrencyId), Balance)>,
         reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
-    ) -> Self {
+    ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
         // Find dimensions from the balance entries.
         let mut max_account: u32 = 0;
         let mut max_currency: u32 = 0;
@@ -156,21 +188,22 @@ impl AccountManager {
             balances[idx] = balance;
         }
 
-        let reservation_map: HashMap<(AccountId, OrderId), Reservation> = reservations
-            .into_iter()
-            .map(|(order_id, account, currency, remaining)| {
-                (
-                    (account, order_id),
-                    Reservation::new(account, currency, remaining),
-                )
-            })
-            .collect();
+        // Build slab sequentially — slots 0..n for n reservations.
+        let mut slab = Vec::with_capacity(reservations.len());
+        let mut slot_assignments = Vec::with_capacity(reservations.len());
+        for (order_id, account, currency, remaining) in reservations {
+            let slot = ReservationSlot(slab.len() as u32);
+            slab.push(Reservation::new(account, currency, remaining));
+            slot_assignments.push(((account, order_id), slot));
+        }
 
-        Self {
+        let mgr = Self {
             balances,
             currency_stride,
-            reservations: reservation_map,
-        }
+            reservation_slab: slab,
+            free_slots: Vec::new(),
+        };
+        (mgr, slot_assignments)
     }
 
     /// Snapshot all non-zero balances for serialization.
@@ -189,11 +222,17 @@ impl AccountManager {
         out
     }
 
-    /// Snapshot all reservations for serialization.
-    pub(crate) fn snapshot_reservations(&self) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
-        self.reservations
+    /// Snapshot all active reservations for serialization. The caller
+    /// provides `(AccountId, OrderId, ReservationSlot)` tuples from its
+    /// order tracking map since the slab doesn't track which slots are live.
+    pub(crate) fn snapshot_reservations(
+        &self,
+        active: &[((AccountId, OrderId), ReservationSlot)],
+    ) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
+        active
             .iter()
-            .map(|(&(_account, order_id), res)| {
+            .map(|&((_, order_id), slot)| {
+                let res = &self.reservation_slab[slot.0 as usize];
                 (order_id, res.account(), res.currency(), res.remaining())
             })
             .collect()
@@ -240,7 +279,9 @@ impl AccountManager {
     ///   (refunded after execution, since final price is unknown).
     /// - **Sell market/stop-market**: reserves `quantity` in base currency.
     ///
-    /// Returns the reserved amount on success, or a `RejectReason` on failure.
+    /// Returns `(reserved_amount, slot)` on success, or a `RejectReason` on
+    /// failure. The `ReservationSlot` is an opaque handle for O(1) access to
+    /// the reservation in subsequent fill/release/adjust calls.
     /// `max_fee_bps` is the highest applicable fee rate (max of maker, taker).
     /// For buy limit orders, the reservation includes a fee cushion so that
     /// fees can always be charged from the reservation, even at the limit price.
@@ -249,7 +290,7 @@ impl AccountManager {
         order: &Order,
         spec: &InstrumentSpec,
         max_fee_bps: u16,
-    ) -> Result<u64, RejectReason> {
+    ) -> Result<(u64, ReservationSlot), RejectReason> {
         let (currency, amount) = self.required_reserve(order, spec, max_fee_bps)?;
 
         let bal = self
@@ -263,16 +304,13 @@ impl AccountManager {
         bal.available -= amount;
         bal.reserved += amount;
 
-        self.reservations.insert(
-            (order.account, order.id),
-            Reservation {
-                account: order.account,
-                currency,
-                remaining: amount,
-            },
-        );
+        let slot = self.alloc_slot(Reservation {
+            account: order.account,
+            currency,
+            remaining: amount,
+        });
 
-        Ok(amount)
+        Ok((amount, slot))
     }
 
     /// Update balances after a fill. Called once per `ExecutionReport::Fill`.
@@ -280,18 +318,16 @@ impl AccountManager {
     /// The buyer's reserved quote decreases by `cost + buyer_fee`, available
     /// base increases by `quantity`. The seller's reserved base decreases by
     /// `quantity`, available quote increases by `cost - seller_fee`.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Takes `ReservationSlot` handles for O(1) slab access (no hashing).
     pub fn fill(
         &mut self,
-        maker_account: AccountId,
-        maker_order_id: OrderId,
-        taker_account: AccountId,
-        taker_order_id: OrderId,
+        buyer_slot: ReservationSlot,
+        seller_slot: ReservationSlot,
         price: Price,
         quantity: Quantity,
-        maker_side: Side,
-        maker_fee: i64,
-        taker_fee: i64,
+        buyer_fee: i64,
+        seller_fee: i64,
         spec: &InstrumentSpec,
     ) {
         // cost = price × quantity, using u128 to avoid overflow.
@@ -309,28 +345,6 @@ impl AccountManager {
         let cost_u64 = u64::try_from(cost).unwrap_or(u64::MAX);
         let qty = quantity.get();
 
-        // Determine which fee applies to the buyer and seller.
-        // Fees are in quote currency for both sides.
-        let (buyer_account, buyer_order, seller_account, seller_order, buyer_fee, seller_fee) =
-            match maker_side {
-                Side::Buy => (
-                    maker_account,
-                    maker_order_id,
-                    taker_account,
-                    taker_order_id,
-                    maker_fee,
-                    taker_fee,
-                ),
-                Side::Sell => (
-                    taker_account,
-                    taker_order_id,
-                    maker_account,
-                    maker_order_id,
-                    taker_fee,
-                    maker_fee,
-                ),
-            };
-
         // Buyer: reserved quote decreases by cost + fee, available base increases.
         // The reservation includes a fee cushion (reserved at placement time
         // with max_fee_bps), so cost + fee fits within the reservation.
@@ -340,7 +354,8 @@ impl AccountManager {
         // Signed fees: positive = fee deducted, negative = rebate credited.
         // cost_i128 + buyer_fee_i128 is clamped to [0, u64::MAX] to handle
         // rebates that exceed cost (defensive; shouldn't happen in practice).
-        if let Some(res) = self.reservations.get_mut(&(buyer_account, buyer_order)) {
+        {
+            let res = &mut self.reservation_slab[buyer_slot.0 as usize];
             let total_deduct_i128 = cost_u64 as i128 + buyer_fee as i128;
             let total_deduct =
                 u64::try_from(total_deduct_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
@@ -359,7 +374,8 @@ impl AccountManager {
 
         // Seller: reserved base decreases, available quote increases by cost - fee.
         // Signed: cost - positive_fee = less proceeds; cost - negative_fee = more proceeds (rebate).
-        if let Some(res) = self.reservations.get_mut(&(seller_account, seller_order)) {
+        {
+            let res = &mut self.reservation_slab[seller_slot.0 as usize];
             res.remaining = res.remaining.saturating_sub(qty);
             let seller_account = res.account;
             self.ensure_capacity(seller_account, spec.quote);
@@ -376,12 +392,12 @@ impl AccountManager {
         // Note: reservation cleanup is handled by process_reports(), which
         // checks remaining == 0 after each fill and returns the consumed IDs.
         // Do NOT clean up here — process_reports needs the entry to exist
-        // so it can report consumed IDs back to Exchange for order_sides cleanup.
+        // so it can report consumed IDs back to Exchange for order_info cleanup.
     }
 
-    /// Check if a reservation exists for the given (account, order) pair.
-    pub fn has_reservation(&self, account: AccountId, order_id: OrderId) -> bool {
-        self.reservations.contains_key(&(account, order_id))
+    /// Check if a reservation's remaining amount is zero.
+    pub fn is_reservation_empty(&self, slot: ReservationSlot) -> bool {
+        self.reservation_slab[slot.0 as usize].remaining == 0
     }
 
     /// Adjust an existing reservation in-place for cancel-replace.
@@ -393,14 +409,10 @@ impl AccountManager {
     /// If the new amount is lower or equal, always succeeds.
     pub fn try_adjust_reservation(
         &mut self,
-        account: AccountId,
-        order_id: OrderId,
+        slot: ReservationSlot,
         new_amount: u64,
     ) -> Result<(), RejectReason> {
-        let res = self
-            .reservations
-            .get(&(account, order_id))
-            .ok_or(RejectReason::UnknownOrder)?;
+        let res = &self.reservation_slab[slot.0 as usize];
         let old_amount = res.remaining;
         let account = res.account;
         let currency = res.currency;
@@ -426,37 +438,33 @@ impl AccountManager {
             bal.available = bal.available.saturating_add(delta);
         }
 
-        // Update the reservation.
-        let res = self
-            .reservations
-            .get_mut(&(account, order_id))
-            .expect("checked above");
-        res.remaining = new_amount;
-
+        self.reservation_slab[slot.0 as usize].remaining = new_amount;
         Ok(())
     }
 
-    /// Release all remaining reserved funds for an order (on cancel or reject).
-    pub fn release(&mut self, account: AccountId, order_id: OrderId) {
-        if let Some(res) = self.reservations.remove(&(account, order_id))
-            && let Some(bal) = self.get_mut(res.account, res.currency)
-        {
+    /// Release all remaining reserved funds and free the slot.
+    pub fn release(&mut self, slot: ReservationSlot) {
+        let res = self.reservation_slab[slot.0 as usize];
+        if let Some(bal) = self.get_mut(res.account, res.currency) {
             bal.reserved = bal.reserved.saturating_sub(res.remaining);
             bal.available = bal.available.saturating_add(res.remaining);
         }
+        self.free_slots.push(slot.0);
     }
 
     /// Process execution reports to update balances.
     /// Call this after the order book processes an order.
     ///
+    /// Uses the `order_info` map to resolve `(AccountId, OrderId)` pairs from
+    /// execution reports into `ReservationSlot` handles for O(1) slab access.
+    ///
     /// Returns order IDs whose reservations are fully consumed (remaining
     /// reached zero on fill, or released on cancel/reject). The caller
-    /// should use this to clean up any per-order tracking maps (e.g.
-    /// `order_sides` in Exchange).
+    /// should use this to clean up any per-order tracking maps.
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
-        maker_sides: &HashMap<(AccountId, OrderId), Side>,
+        order_info: &std::collections::HashMap<(AccountId, OrderId), OrderInfo>,
         spec: &InstrumentSpec,
         consumed: &mut Vec<(AccountId, OrderId)>,
     ) {
@@ -472,57 +480,97 @@ impl AccountManager {
                     maker_fee,
                     taker_fee,
                 } => {
-                    // Look up the maker's side to determine buyer/seller.
                     let maker_key = (maker_account, maker_order_id);
-                    if let Some(&maker_side) = maker_sides.get(&maker_key) {
+                    let taker_key = (taker_account, taker_order_id);
+
+                    // Look up both sides' OrderInfo for slot + side resolution.
+                    if let (Some(maker_info), Some(taker_info)) =
+                        (order_info.get(&maker_key), order_info.get(&taker_key))
+                    {
+                        // Determine buyer/seller slots and fees from maker side.
+                        let (buyer_slot, seller_slot, buyer_fee, seller_fee) = match maker_info.side
+                        {
+                            Side::Buy => (
+                                maker_info.reservation,
+                                taker_info.reservation,
+                                maker_fee,
+                                taker_fee,
+                            ),
+                            Side::Sell => (
+                                taker_info.reservation,
+                                maker_info.reservation,
+                                taker_fee,
+                                maker_fee,
+                            ),
+                        };
                         self.fill(
-                            maker_account,
-                            maker_order_id,
-                            taker_account,
-                            taker_order_id,
+                            buyer_slot,
+                            seller_slot,
                             price,
                             quantity,
-                            maker_side,
-                            maker_fee,
-                            taker_fee,
+                            buyer_fee,
+                            seller_fee,
                             spec,
                         );
                     }
-                    // Remove fully consumed reservations (remaining == 0).
-                    let taker_key = (taker_account, taker_order_id);
-                    if self
-                        .reservations
-                        .get(&maker_key)
-                        .is_some_and(|r| r.remaining == 0)
+
+                    // Free fully consumed reservations (remaining == 0).
+                    if let Some(info) = order_info.get(&maker_key)
+                        && self.reservation_slab[info.reservation.0 as usize].remaining == 0
                     {
-                        self.reservations.remove(&maker_key);
+                        self.free_slots.push(info.reservation.0);
                         consumed.push(maker_key);
                     }
-                    if self
-                        .reservations
-                        .get(&taker_key)
-                        .is_some_and(|r| r.remaining == 0)
+                    if let Some(info) = order_info.get(&taker_key)
+                        && self.reservation_slab[info.reservation.0 as usize].remaining == 0
                     {
-                        self.reservations.remove(&taker_key);
+                        self.free_slots.push(info.reservation.0);
                         consumed.push(taker_key);
                     }
                 }
                 ExecutionReport::Cancelled {
                     order_id, account, ..
                 } => {
-                    self.release(account, order_id);
-                    consumed.push((account, order_id));
+                    let key = (account, order_id);
+                    // Skip if already consumed (e.g., fill set remaining to 0
+                    // earlier in this batch, then IOC cancelled the unfilled
+                    // remainder). Without this guard, we'd double-free the slab
+                    // slot and corrupt a future reservation.
+                    if !consumed.contains(&key) {
+                        if let Some(info) = order_info.get(&key) {
+                            self.release(info.reservation);
+                        }
+                        consumed.push(key);
+                    }
                 }
                 ExecutionReport::Rejected {
                     order_id, account, ..
                 } => {
-                    self.release(account, order_id);
-                    consumed.push((account, order_id));
+                    let key = (account, order_id);
+                    if !consumed.contains(&key) {
+                        if let Some(info) = order_info.get(&key) {
+                            self.release(info.reservation);
+                        }
+                        consumed.push(key);
+                    }
                 }
                 ExecutionReport::Placed { .. }
                 | ExecutionReport::Triggered { .. }
                 | ExecutionReport::Replaced { .. } => {}
             }
+        }
+    }
+
+    /// Allocate a slab slot for a new reservation. O(1): pops from the free
+    /// list, or extends the Vec if no recycled slots are available.
+    fn alloc_slot(&mut self, reservation: Reservation) -> ReservationSlot {
+        if let Some(idx) = self.free_slots.pop() {
+            self.reservation_slab[idx as usize] = reservation;
+            ReservationSlot(idx)
+        } else {
+            let idx = self.reservation_slab.len();
+            self.reservation_slab.push(reservation);
+            ReservationSlot(idx as u32)
         }
     }
 
@@ -764,7 +812,7 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 10_000);
 
         let order = limit_buy(1, ACCT_A, 100, 50); // cost = 100 * 50 = 5000
-        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
+        let (reserved, _slot) = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 5_000);
         let bal = mgr.balance(ACCT_A, USD);
@@ -778,7 +826,7 @@ mod tests {
         mgr.deposit(ACCT_A, BTC, 100);
 
         let order = limit_sell(1, ACCT_A, 50_000, 30);
-        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
+        let (reserved, _slot) = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 30);
         let bal = mgr.balance(ACCT_A, BTC);
@@ -806,7 +854,7 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 10_000);
 
         let order = market_buy(1, ACCT_A, 50);
-        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
+        let (reserved, _slot) = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 10_000);
         assert_eq!(mgr.balance(ACCT_A, USD).available, 0);
@@ -819,7 +867,7 @@ mod tests {
         mgr.deposit(ACCT_A, BTC, 100);
 
         let order = market_sell(1, ACCT_A, 30);
-        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
+        let (reserved, _slot) = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 30);
         assert_eq!(mgr.balance(ACCT_A, BTC).available, 70);
@@ -834,19 +882,11 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 10_000);
 
         let order = limit_buy(1, ACCT_A, 100, 50);
-        mgr.try_reserve(&order, &spec(), 0).unwrap();
-        mgr.release(ACCT_A, OrderId(1));
+        let (_amount, slot) = mgr.try_reserve(&order, &spec(), 0).unwrap();
+        mgr.release(slot);
 
         assert_eq!(mgr.balance(ACCT_A, USD).available, 10_000);
         assert_eq!(mgr.balance(ACCT_A, USD).reserved, 0);
-    }
-
-    #[test]
-    fn release_unknown_order_is_noop() {
-        let mut mgr = AccountManager::new();
-        mgr.deposit(ACCT_A, USD, 10_000);
-        mgr.release(ACCT_A, OrderId(999));
-        assert_eq!(mgr.balance(ACCT_A, USD).available, 10_000);
     }
 
     // -- Fill --
@@ -859,22 +899,11 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 10); // cost = 1000
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec(), 0).unwrap();
-        mgr.try_reserve(&sell, &spec(), 0).unwrap();
+        let (_amt, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_amt, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
-        // Maker is seller (order 2, ACCT_B), taker is buyer (order 1, ACCT_A).
-        mgr.fill(
-            ACCT_B,
-            OrderId(2),
-            ACCT_A,
-            OrderId(1),
-            price(100),
-            qty(10),
-            Side::Sell,
-            0,
-            0,
-            &spec(),
-        );
+        // Buyer = ACCT_A (buy_slot), Seller = ACCT_B (sell_slot).
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
 
         // Buyer: spent 1000 USD, got 10 BTC.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 9_000);
@@ -895,22 +924,11 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 20); // reserve 2000
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec(), 0).unwrap();
-        mgr.try_reserve(&sell, &spec(), 0).unwrap();
+        let (_amt, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_amt, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         // Partial fill: only 10 of 20 filled.
-        mgr.fill(
-            ACCT_B,
-            OrderId(2),
-            ACCT_A,
-            OrderId(1),
-            price(100),
-            qty(10),
-            Side::Sell,
-            0,
-            0,
-            &spec(),
-        );
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
 
         // Buyer: 1000 spent, 1000 still reserved for remaining 10 qty.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 8_000);
@@ -926,24 +944,13 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 20); // reserve 2000
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec(), 0).unwrap();
-        mgr.try_reserve(&sell, &spec(), 0).unwrap();
+        let (_amt, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_amt, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         // Fill 10 of 20.
-        mgr.fill(
-            ACCT_B,
-            OrderId(2),
-            ACCT_A,
-            OrderId(1),
-            price(100),
-            qty(10),
-            Side::Sell,
-            0,
-            0,
-            &spec(),
-        );
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
         // Cancel remaining 10.
-        mgr.release(ACCT_A, OrderId(1));
+        mgr.release(buy_slot);
 
         // Buyer: 1000 spent on fills, 1000 returned from cancel.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 9_000);
@@ -970,21 +977,11 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 10); // reserve 1000 USD
         let sell = limit_sell(2, ACCT_A, 100, 10); // reserve 10 BTC
-        mgr.try_reserve(&buy, &spec(), 0).unwrap();
-        mgr.try_reserve(&sell, &spec(), 0).unwrap();
+        let (_amt, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_amt, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
-        mgr.fill(
-            ACCT_A,
-            OrderId(1),
-            ACCT_A,
-            OrderId(2),
-            price(100),
-            qty(10),
-            Side::Buy,
-            0,
-            0,
-            &spec(),
-        );
+        // Buyer = buy_slot (ACCT_A buy), Seller = sell_slot (ACCT_A sell).
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
 
         // Self-trade: USD moves from reserved to available, BTC same.
         // Net effect: same balances as before (minus/plus cancel out).
@@ -1002,25 +999,14 @@ mod tests {
 
         let buy = market_buy(1, ACCT_A, 10);
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec(), 0).unwrap(); // reserves all 10_000
-        mgr.try_reserve(&sell, &spec(), 0).unwrap();
+        let (_amt, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap(); // reserves all 10_000
+        let (_amt, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         // Fill at price 100, qty 10 → cost = 1000.
-        mgr.fill(
-            ACCT_B,
-            OrderId(2),
-            ACCT_A,
-            OrderId(1),
-            price(100),
-            qty(10),
-            Side::Sell,
-            0,
-            0,
-            &spec(),
-        );
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
 
         // Market order is fully filled, release unused reservation.
-        mgr.release(ACCT_A, OrderId(1));
+        mgr.release(buy_slot);
 
         // Buyer: spent 1000, got back 9000 from unused reserve.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 9_000);
@@ -1035,39 +1021,17 @@ mod tests {
         mgr.deposit(ACCT_B, BTC, 100);
 
         let buy = limit_buy(1, ACCT_A, 200, 20); // reserve 200*20 = 4000
-        mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_amt, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
 
         // Sell 1: 10 @ 100.
         let sell1 = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&sell1, &spec(), 0).unwrap();
-        mgr.fill(
-            ACCT_B,
-            OrderId(2),
-            ACCT_A,
-            OrderId(1),
-            price(100),
-            qty(10),
-            Side::Sell,
-            0,
-            0,
-            &spec(),
-        );
+        let (_amt, sell1_slot) = mgr.try_reserve(&sell1, &spec(), 0).unwrap();
+        mgr.fill(buy_slot, sell1_slot, price(100), qty(10), 0, 0, &spec());
 
         // Sell 2: 5 @ 150.
         let sell2 = limit_sell(3, ACCT_B, 150, 5);
-        mgr.try_reserve(&sell2, &spec(), 0).unwrap();
-        mgr.fill(
-            ACCT_B,
-            OrderId(3),
-            ACCT_A,
-            OrderId(1),
-            price(150),
-            qty(5),
-            Side::Sell,
-            0,
-            0,
-            &spec(),
-        );
+        let (_amt, sell2_slot) = mgr.try_reserve(&sell2, &spec(), 0).unwrap();
+        mgr.fill(buy_slot, sell2_slot, price(150), qty(5), 0, 0, &spec());
 
         // Buyer spent 1000 + 750 = 1750, reserved 4000 - 1750 = 2250 remaining.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 46_000);

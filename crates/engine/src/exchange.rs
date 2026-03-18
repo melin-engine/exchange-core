@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::account::AccountManager;
+use crate::account::{AccountManager, OrderInfo, ReservationSlot};
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
@@ -40,10 +40,11 @@ pub struct Exchange {
     instruments: HashMap<Symbol, InstrumentState>,
     /// Shared account balance manager across all instruments.
     accounts: AccountManager,
-    /// Tracks order side by (account, order_id) so fills can determine
-    /// buyer/seller. Keyed by the pair because different accounts can
-    /// independently use the same OrderId.
-    order_sides: HashMap<(AccountId, OrderId), Side>,
+    /// Tracks order side and reservation slot by (account, order_id).
+    /// Keyed by the pair because different accounts can independently
+    /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
+    /// access to the reservation slab (eliminating a second HashMap lookup).
+    order_info: HashMap<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. HashMap for O(1) lookup keyed on
@@ -62,7 +63,7 @@ impl Exchange {
         Self {
             instruments: HashMap::new(),
             accounts: AccountManager::new(),
-            order_sides: HashMap::new(),
+            order_info: HashMap::new(),
             max_order_id: HashMap::new(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -76,7 +77,7 @@ impl Exchange {
         Self {
             instruments: HashMap::with_capacity(64),
             accounts: AccountManager::with_capacity(),
-            order_sides: HashMap::with_capacity(2_000_000),
+            order_info: HashMap::with_capacity(2_000_000),
             max_order_id: HashMap::with_capacity(10_000),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
@@ -87,13 +88,13 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: HashMap<Symbol, InstrumentState>,
         accounts: AccountManager,
-        order_sides: HashMap<(AccountId, OrderId), Side>,
+        order_info: HashMap<(AccountId, OrderId), OrderInfo>,
         max_order_id: HashMap<AccountId, u64>,
     ) -> Self {
         Self {
             instruments,
             accounts,
-            order_sides,
+            order_info,
             max_order_id,
             consumed_buf: Vec::new(),
             presized: false,
@@ -113,11 +114,28 @@ impl Exchange {
     }
 
     /// Snapshot the order-side map as a Vec for serialization.
+    /// Only serializes the side; reservation slots are ephemeral and
+    /// reassigned on restore.
     pub(crate) fn snapshot_order_sides(&self) -> Vec<((AccountId, OrderId), Side)> {
-        self.order_sides
+        self.order_info
             .iter()
-            .map(|(&key, &side)| (key, side))
+            .map(|(&key, info)| (key, info.side))
             .collect()
+    }
+
+    /// Collect active reservation slot assignments for snapshot serialization.
+    fn active_reservation_slots(&self) -> Vec<((AccountId, OrderId), ReservationSlot)> {
+        self.order_info
+            .iter()
+            .map(|(&key, info)| (key, info.reservation))
+            .collect()
+    }
+
+    /// Snapshot all active reservations. Delegates to AccountManager with
+    /// the live slot assignments from order_info.
+    pub(crate) fn snapshot_reservations(&self) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
+        let active = self.active_reservation_slots();
+        self.accounts.snapshot_reservations(&active)
     }
 
     /// Snapshot the per-account order ID high-water marks for serialization.
@@ -181,13 +199,17 @@ impl Exchange {
     /// orders. Skips maps that already contain data — their pages are already
     /// faulted from the insertions that populated them.
     pub fn prefault(&mut self) {
-        if self.order_sides.is_empty() {
-            let cap = self.order_sides.capacity();
+        if self.order_info.is_empty() {
+            let cap = self.order_info.capacity();
+            let dummy_info = OrderInfo {
+                side: Side::Buy,
+                reservation: ReservationSlot::DUMMY,
+            };
             for i in 0..cap {
-                self.order_sides
-                    .insert((AccountId(0), OrderId(i as u64)), Side::Buy);
+                self.order_info
+                    .insert((AccountId(0), OrderId(i as u64)), dummy_info);
             }
-            self.order_sides.clear();
+            self.order_info.clear();
         }
 
         if self.max_order_id.is_empty() {
@@ -365,8 +387,8 @@ impl Exchange {
         let max_fee_bps = 0i16
             .max(fees.maker_fee_bps)
             .max(0i16.max(fees.taker_fee_bps)) as u16;
-        let reserved = match self.accounts.try_reserve(&order, &spec, max_fee_bps) {
-            Ok(amount) => amount,
+        let (reserved, slot) = match self.accounts.try_reserve(&order, &spec, max_fee_bps) {
+            Ok(result) => result,
             Err(reason) => {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -386,9 +408,14 @@ impl Exchange {
             _ => None,
         };
 
-        // Track the order's side for fill processing.
-        self.order_sides
-            .insert((order.account, order.id), order.side);
+        // Track the order's side and reservation slot for fill processing.
+        self.order_info.insert(
+            (order.account, order.id),
+            OrderInfo {
+                side: order.side,
+                reservation: slot,
+            },
+        );
 
         let report_start = reports.len();
 
@@ -405,12 +432,8 @@ impl Exchange {
         // Process reports to update balances.
         let new_reports = &reports[report_start..];
         self.consumed_buf.clear();
-        self.accounts.process_reports(
-            new_reports,
-            &self.order_sides,
-            &spec,
-            &mut self.consumed_buf,
-        );
+        self.accounts
+            .process_reports(new_reports, &self.order_info, &spec, &mut self.consumed_buf);
 
         // Buy-side orders may have leftover reservation after fills due to
         // price improvement: a limit buy at price 100 filling at price 80
@@ -442,22 +465,23 @@ impl Exchange {
                     (*taker_account, *taker_order_id),
                 ] {
                     if !self.consumed_buf.contains(&(account, id))
-                        && self.accounts.has_reservation(account, id)
+                        && self.order_info.contains_key(&(account, id))
                         && !inst.book.has_order(account, id)
                         && !inst.book.has_stop(account, id)
                     {
-                        self.accounts.release(account, id);
+                        let info = self.order_info[&(account, id)];
+                        self.accounts.release(info.reservation);
                         self.consumed_buf.push((account, id));
                     }
                 }
             }
         }
 
-        // Clean up order_sides for fully consumed orders (filled, cancelled,
-        // or rejected). Without this, order_sides leaks entries and triggers
+        // Clean up order_info for fully consumed orders (filled, cancelled,
+        // or rejected). Without this, order_info leaks entries and triggers
         // increasingly expensive HashMap resizes on the hot path.
         for &key in &self.consumed_buf {
-            self.order_sides.remove(&key);
+            self.order_info.remove(&key);
         }
     }
 
@@ -465,7 +489,7 @@ impl Exchange {
     /// all instruments (kill switch). Releases all associated reservations.
     pub fn cancel_all(&mut self, account: AccountId, reports: &mut Vec<ExecutionReport>) {
         // Collect symbols first to avoid borrowing self.instruments while
-        // also needing self.accounts and self.order_sides.
+        // also needing self.accounts and self.order_info.
         let symbols: Vec<Symbol> = self.instruments.keys().copied().collect();
 
         for symbol in symbols {
@@ -483,13 +507,13 @@ impl Exchange {
             self.consumed_buf.clear();
             self.accounts.process_reports(
                 new_reports,
-                &self.order_sides,
+                &self.order_info,
                 &spec,
                 &mut self.consumed_buf,
             );
 
             for &key in &self.consumed_buf {
-                self.order_sides.remove(&key);
+                self.order_info.remove(&key);
             }
         }
     }
@@ -514,16 +538,12 @@ impl Exchange {
         // Release reserved funds if cancellation succeeded.
         let new_reports = &reports[report_start..];
         self.consumed_buf.clear();
-        self.accounts.process_reports(
-            new_reports,
-            &self.order_sides,
-            &spec,
-            &mut self.consumed_buf,
-        );
+        self.accounts
+            .process_reports(new_reports, &self.order_info, &spec, &mut self.consumed_buf);
 
-        // Clean up order_sides for cancelled orders.
+        // Clean up order_info for cancelled orders.
         for &key in &self.consumed_buf {
-            self.order_sides.remove(&key);
+            self.order_info.remove(&key);
         }
     }
 
@@ -681,10 +701,20 @@ impl Exchange {
             Side::Sell => new_quantity.get(),
         };
 
-        if let Err(reason) = self
-            .accounts
-            .try_adjust_reservation(account, order_id, new_required)
-        {
+        // Look up the reservation slot for this order.
+        let slot = match self.order_info.get(&(account, order_id)) {
+            Some(info) => info.reservation,
+            None => {
+                reports.push(ExecutionReport::Rejected {
+                    order_id,
+                    account,
+                    reason: RejectReason::UnknownOrder,
+                });
+                return;
+            }
+        };
+
+        if let Err(reason) = self.accounts.try_adjust_reservation(slot, new_required) {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
