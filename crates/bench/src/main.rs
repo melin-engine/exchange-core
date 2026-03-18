@@ -110,11 +110,30 @@ fn rdtscp() -> u64 {
     }
 }
 
-/// Calibrate TSC ticks per nanosecond by measuring a short sleep against
-/// `Instant::now()`. Returns the conversion factor (ticks / ns).
-#[cfg(target_arch = "x86_64")]
+/// Read the ARM virtual counter (`cntvct_el0`). ~2-5ns overhead,
+/// equivalent to x86's `rdtscp`. An `isb` (instruction synchronization
+/// barrier) serializes the pipeline to prevent reordering the read
+/// relative to the work being measured.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rdtscp() -> u64 {
+    let cnt: u64;
+    unsafe {
+        core::arch::asm!(
+            "isb",
+            "mrs {}, cntvct_el0",
+            out(reg) cnt,
+            options(nostack, nomem),
+        );
+    }
+    cnt
+}
+
+/// Calibrate TSC/counter ticks per nanosecond by measuring a short sleep
+/// against `Instant::now()`. Returns the conversion factor (ticks / ns).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn calibrate_tsc() -> f64 {
-    // Warm up the TSC path.
+    // Warm up the counter path.
     for _ in 0..100 {
         let _ = rdtscp();
     }
@@ -129,8 +148,8 @@ fn calibrate_tsc() -> f64 {
     elapsed_tsc / elapsed_ns
 }
 
-/// Convert TSC tick delta to nanoseconds using a pre-calibrated factor.
-#[cfg(target_arch = "x86_64")]
+/// Convert counter tick delta to nanoseconds using a pre-calibrated factor.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
     (ticks as f64 / ticks_per_ns) as u64
@@ -307,9 +326,9 @@ fn run_engine_bench(
 ) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let ticks_per_ns = calibrate_tsc();
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     eprintln!(
         "TSC calibration: {:.3} GHz ({:.2} ticks/ns)",
         ticks_per_ns, ticks_per_ns
@@ -404,9 +423,9 @@ fn run_engine_bench(
     for event in &events[warmup..] {
         reports.clear();
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let t0 = rdtscp();
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let t0 = Instant::now();
 
         match *event {
@@ -441,9 +460,9 @@ fn run_engine_bench(
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let elapsed_ns = tsc_to_ns(rdtscp() - t0, ticks_per_ns);
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
 
         histogram.record(elapsed_ns).expect("record");
