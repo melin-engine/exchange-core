@@ -25,6 +25,26 @@ use rand::SeedableRng;
 use rand::distr::{Distribution, Uniform};
 use rand::rngs::SmallRng;
 
+/// Fast power function for power-law sampling. Specializes common integer
+/// exponents to avoid libm `pow()` (~50-100ns). For fractional exponents,
+/// uses `exp2(exp * log2(base))` which is ~3-5x faster than `pow()` on
+/// most hardware (single transcendental vs two).
+#[inline(always)]
+fn fast_powf(base: f64, exp: f64) -> f64 {
+    // Check for common integer exponents used with typical alpha values.
+    // alpha=1.5 → exp=-2.0, alpha=2.0 → exp=-1.0, alpha=3.0 → exp=-0.5.
+    if exp == -1.0 {
+        1.0 / base
+    } else if exp == -2.0 {
+        1.0 / (base * base)
+    } else if exp == -0.5 {
+        1.0 / base.sqrt()
+    } else {
+        // General case: exp2(exp * log2(base)) is faster than pow().
+        f64::exp2(exp * base.log2())
+    }
+}
+
 use trading_engine::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
     TimeInForce,
@@ -160,6 +180,14 @@ pub struct OrderFlowGenerator {
     unit_dist: Uniform<f64>,
     /// Uniform distribution for side selection.
     side_dist: Uniform<u32>,
+    /// Pre-computed exponent for power-law price distribution.
+    /// `= -1.0 / (price_alpha - 1.0)`. Avoids recomputing per call.
+    price_exponent: f64,
+    /// Pre-computed exponent for power-law size distribution.
+    /// `= -1.0 / (size_alpha - 1.0)`. Avoids recomputing per call.
+    size_exponent: f64,
+    /// Pre-built uniform distribution for symbol selection.
+    symbol_dist: Uniform<u32>,
 }
 
 impl OrderFlowGenerator {
@@ -168,6 +196,9 @@ impl OrderFlowGenerator {
         let capacity = 100_000; // track up to 100K live orders for cancellation
         let start_id = config.start_order_id;
         let seed = config.seed;
+        let price_exponent = -1.0 / (config.price_alpha - 1.0);
+        let size_exponent = -1.0 / (config.size_alpha - 1.0);
+        let symbol_dist = Uniform::new(1, config.num_instruments + 1).expect("valid range");
         Self {
             config,
             rng: SmallRng::seed_from_u64(seed),
@@ -178,6 +209,9 @@ impl OrderFlowGenerator {
             pending_cancels: Vec::new(),
             unit_dist: Uniform::new(0.0, 1.0).expect("valid range"),
             side_dist: Uniform::new(0, 2).expect("valid range"),
+            price_exponent,
+            size_exponent,
+            symbol_dist,
         }
     }
 
@@ -427,9 +461,7 @@ impl OrderFlowGenerator {
         if self.config.num_instruments == 1 {
             Symbol(1)
         } else {
-            let idx = Uniform::new(1, self.config.num_instruments + 1)
-                .expect("valid range")
-                .sample(&mut self.rng);
+            let idx = self.symbol_dist.sample(&mut self.rng);
             Symbol(idx)
         }
     }
@@ -445,8 +477,7 @@ impl OrderFlowGenerator {
     /// mid (crossing into the bid side), producing immediate fills.
     fn pick_price(&mut self, side: Side) -> Price {
         let u: f64 = self.unit_dist.sample(&mut self.rng);
-        let alpha = self.config.price_alpha;
-        let raw = (1.0 - u).powf(-1.0 / (alpha - 1.0));
+        let raw = fast_powf(1.0 - u, self.price_exponent);
         let offset = (raw as u64).clamp(1, self.config.max_price_offset);
 
         // Aggressive orders cross the spread: buy above mid, sell below.
@@ -465,8 +496,7 @@ impl OrderFlowGenerator {
     /// Pick an order size from a power-law distribution.
     fn pick_size(&mut self) -> Quantity {
         let u: f64 = self.unit_dist.sample(&mut self.rng);
-        let alpha = self.config.size_alpha;
-        let raw = self.config.min_size as f64 * (1.0 - u).powf(-1.0 / (alpha - 1.0));
+        let raw = self.config.min_size as f64 * fast_powf(1.0 - u, self.size_exponent);
         let size = (raw as u64).clamp(self.config.min_size, self.config.max_size);
         Quantity(NonZeroU64::new(size).expect("size > 0"))
     }
