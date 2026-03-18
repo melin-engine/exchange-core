@@ -128,9 +128,9 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
 
 ### `crates/engine/` — matching engine and event sourcing
 - `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, CircuitBreakerConfig, FeeSchedule, etc.)
-- `src/account.rs` — account balance management (flat `Vec<Balance>` indexed by `account_id * stride + currency_id` for O(1) lookups; deposit, withdraw, reserve, fill, release)
-- `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic
-- `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation, fee computation, cancel-replace
+- `src/account.rs` — account balance management (flat `Vec<Balance>` indexed by `account_id * stride + currency_id` for O(1) lookups; deposit, withdraw, reserve, fill, release). Reservation slab (`Vec<Reservation>` + free list) for O(1) indexed access. `ReservationSlot` and `OrderInfo` types.
+- `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic. Price levels use sorted `Vec` with binary search (not BTreeMap) for cache locality. Order/stop indices use `FxHashMap` (rustc-hash).
+- `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation, fee computation, cancel-replace. Instruments stored in flat `Vec<Option<Box<InstrumentState>>>` indexed by `Symbol.0` (no hashing). `max_order_id` is flat `Vec<u64>` indexed by `AccountId.0`.
 - `src/journal/` — durable write-ahead log for event sourcing and crash recovery
   - `event.rs` — `JournalEvent` enum (input commands only)
   - `codec.rs` — binary encode/decode with CRC32C checksums
