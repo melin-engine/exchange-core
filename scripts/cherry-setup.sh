@@ -224,13 +224,13 @@ REPO_DIR="$USER_HOME/workspace/trading"
 
 if [[ -d "$REPO_DIR/.git" ]]; then
     echo "  Repo already exists at $REPO_DIR, pulling latest..."
-    run_as_user "cd $REPO_DIR && git checkout feat/af-xdp-kernel-bypass && git pull"
+    run_as_user "cd $REPO_DIR && git checkout main && git pull"
 else
     echo "  Cloning repo..."
     mkdir -p "$USER_HOME/workspace"
     chown "$USER_NAME:" "$USER_HOME/workspace"
     run_as_user "git clone git@github.com:pierre-l/trading.git $REPO_DIR"
-    run_as_user "cd $REPO_DIR && git checkout feat/af-xdp-kernel-bypass"
+    run_as_user "cd $REPO_DIR && git checkout main"
 fi
 
 echo "  Building default (TCP + io_uring)..."
