@@ -364,6 +364,14 @@ fn run_engine_bench(
             GeneratedEvent::Cancel { symbol, order_id } => {
                 exchange.cancel(symbol, order_id, &mut reports);
             }
+            GeneratedEvent::CancelReplace {
+                symbol,
+                order_id,
+                new_price,
+                new_quantity,
+            } => {
+                exchange.cancel_replace(symbol, order_id, new_price, new_quantity, &mut reports);
+            }
         }
     }
 
@@ -378,6 +386,7 @@ fn run_engine_bench(
 
     let mut submits: u64 = 0;
     let mut cancels: u64 = 0;
+    let mut amends: u64 = 0;
 
     let start = Instant::now();
     for event in &events[warmup..] {
@@ -397,6 +406,15 @@ fn run_engine_bench(
                 exchange.cancel(symbol, order_id, &mut reports);
                 cancels += 1;
             }
+            GeneratedEvent::CancelReplace {
+                symbol,
+                order_id,
+                new_price,
+                new_quantity,
+            } => {
+                exchange.cancel_replace(symbol, order_id, new_price, new_quantity, &mut reports);
+                amends += 1;
+            }
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -415,8 +433,14 @@ fn run_engine_bench(
     let wall = start.elapsed();
 
     let measured = events.len() - warmup;
-    let cancel_pct = if submits + cancels > 0 {
-        cancels as f64 / (submits + cancels) as f64 * 100.0
+    let total_events = submits + cancels + amends;
+    let cancel_pct = if total_events > 0 {
+        cancels as f64 / total_events as f64 * 100.0
+    } else {
+        0.0
+    };
+    let amend_pct = if total_events > 0 {
+        amends as f64 / total_events as f64 * 100.0
     } else {
         0.0
     };
@@ -429,7 +453,9 @@ fn run_engine_bench(
         wall,
         &[
             format!("  Accounts: {num_accounts}, Instruments: {num_instruments}"),
-            format!("  Submits: {submits}, Cancels: {cancels} ({cancel_pct:.1}% cancel)"),
+            format!(
+                "  Submits: {submits}, Cancels: {cancels} ({cancel_pct:.1}%), Amends: {amends} ({amend_pct:.1}%)"
+            ),
         ],
         json_path,
     );
