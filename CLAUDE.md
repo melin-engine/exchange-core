@@ -88,6 +88,18 @@ Group commit *does* help UDS (270K/s at 100µs, +34% over baseline) because UDS 
 
 **Conclusion**: Keep `group_commit_delay = 0` for TCP. Only use group commit with UDS or after making TCP response sends cheaper.
 
+### Overlapped io_uring journal writes (double-buffering)
+
+**Date**: 2026-03-18 | **Branch**: `perf/uring-tail-latency-tuning`
+
+Submit Write+RWF_DSYNC SQEs asynchronously via io_uring and accumulate the next batch in a spare buffer while the NVMe FUA write is in flight. The journal cursor only advances after the CQE confirms durability — the persist-before-ack guarantee is preserved.
+
+Implemented with `IORING_SETUP_SINGLE_ISSUER`, registered fd (`IORING_REGISTER_FILES`), busy-poll CQE reap, and eager mid-loop CQE reap. `COOP_TASKRUN` was tried and rejected — it defers CQE delivery to `io_uring_enter()` calls, requiring extra syscalls (~400ns/iteration) at every reap point. Without it, CQEs are posted directly to the shared CQ ring in interrupt context (on core 0 per IRQ affinity).
+
+**Problem**: the double-buffer design inherently delays cursor advancement for events accumulated during an inflight write by up to one extra NVMe write latency. This increased tail latency on the Cherry servers. Reverted from main; preserved on branch for future tuning.
+
+**Conclusion**: promising for throughput (expected 50-80% fsync-mode gain) but needs tail latency tuning on dedicated hardware. Consider making the overlapped path opt-in via a runtime flag.
+
 ### Response stage per-slot journal cursor gating with mid-batch flush
 
 **Date**: 2026-03-13
@@ -111,9 +123,16 @@ LAN benchmark at `5330d6f` (two Cherry AMD Ryzen 9950X servers, dedicated NVMe j
 
 ### Current bottleneck: TCP network stack
 
-The 3x gap between fsync (2.9M) and no-persist (9.0M) shows that journal I/O is a significant bottleneck. The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is the primary throughput limiter for no-persist mode.
+The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is the primary throughput limiter for no-persist mode. UDS is ~18% faster than TCP (4.6M vs 3.9M on loopback, no-persist) with dramatically tighter tail (p99.99 ~410µs vs ~1.9ms).
 
-**How to apply:** Further throughput gains require reducing TCP overhead (e.g., batched io_uring multishot send) and journal I/O optimization.
+Pipeline layer breakdown (loopback, Fedora dev machine, `fb3e959`):
+- **Engine only**: 12.1M/s, p50=40ns — matching engine has 6x headroom
+- **Pipeline (no network)**: 8.5M/s, p50=2.75µs — disruptor/SPSC overhead is small
+- **UDS no-persist**: 4.6M/s, p50=212µs — matching 31.7%, response 24.5%, journal 18%
+- **TCP no-persist**: 3.9M/s, p50=255µs — TCP stack is the wall
+- **TCP + fsync**: 1.9M/s, p50=530µs — journal fsync gating halves throughput again
+
+**How to apply:** The matching engine is not the bottleneck. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
 
 Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+=bench.
 

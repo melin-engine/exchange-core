@@ -215,8 +215,18 @@ Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexi
 - [x] Flat Vec max_order_id — `Vec<u64>` indexed by `AccountId.0`, eliminates per-submit hash
 - [x] FxHashMap (`rustc-hash`) for order_info, order_index, stop_index — ~4x faster hashing than SipHash for 12-byte composite keys
 - [x] Cache-friendly price levels — sorted `Vec<(Price, VecDeque)>` with binary search replaces `BTreeMap`. 5-20 levels fit in 1-3 L1 cache lines
-- [ ] **Monotonic sequence ID for order tracking** — assign a global `u32` sequence number at submission. Use it to index `order_info` (Exchange) and `order_index` (OrderBook) as flat `Vec` instead of `FxHashMap<(AccountId, OrderId), ...>`. Eliminates remaining hash lookups per execute/cancel. Requires threading the sequence ID through the wire protocol and orderbook
-- [ ] **Profile-Guided Optimization (PGO)** — two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Typical gains 10-30% on branch-heavy matching loops. Payload-dependent: profiling against the synthetic generator will optimize for its branch patterns, not necessarily production traffic. Ideally profile against real market data replay (ITCH, Databento) or recorded production journals once available
+- [x] Right-sized HashMap pre-allocation — order_index 4K, order_info 32K (was 1M/2M). Keeps hash tables cache-resident in L2/L3 instead of causing random misses across multi-GB virtual address ranges. ~5% matching utilization reduction.
+- [x] Batched matching stage consumption — `consume_batch(32)` replaces per-event `try_consume()`. Amortizes one atomic Release store over 32 events. Benchmarked sizes 1–256; 32 is the sweet spot (+3% throughput, -50% p99 vs unbatched, no burstiness penalty).
+
+#### Leads (estimated impact, not yet implemented)
+
+- [ ] **Embed `ReservationSlot` in `RestingOrder`** — eliminates the global `order_info` FxHashMap entirely. Every cancel/amend currently does 2 lookups + 1 remove on `order_info` (~15-30ns wasted). With the slot stored in the resting order itself, that drops to zero. Est. 5-10% throughput. Moderate complexity: needs to thread `ReservationSlot` through the OrderBook API.
+- [ ] **Overlapped io_uring journal writes** — double-buffer design hides NVMe FUA latency behind next-batch accumulation. Implemented on `perf/uring-tail-latency-tuning` branch with SINGLE_ISSUER, registered fd, busy-poll CQE reap. Est. 50-80% fsync-mode throughput gain. Needs tail latency tuning on dedicated hardware; consider runtime opt-in flag.
+- [ ] **Vectored response writes** — batch multiple responses to the same connection into one `writev` syscall. Response stage is 24.5% busy on UDS at 4.6M/s. Est. 5-10% throughput.
+- [ ] **Kernel bypass (AF_XDP)** — eliminates all syscall overhead for network I/O. The gap from UDS (4.6M) to pipeline-only (8.5M) is pure transport cost. Est. up to 2x throughput over TCP. Very high complexity.
+- [ ] **`#[inline(always)]` on hot-path exchange methods** — `cancel`, `cancel_replace`, `execute` are called millions of times through dispatch. Inlining lets LLVM optimize across boundaries. Est. 2-5% throughput. Very low complexity.
+- [ ] **Monotonic sequence ID for order tracking** — assign a global `u32` sequence number at submission. Use it to index `order_info` (Exchange) and `order_index` (OrderBook) as flat `Vec` instead of `FxHashMap<(AccountId, OrderId), ...>`. Eliminates remaining hash lookups per execute/cancel. Requires threading the sequence ID through the wire protocol and orderbook.
+- [ ] **Profile-Guided Optimization (PGO)** — two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Typical gains 10-30% on branch-heavy matching loops. Payload-dependent: profiling against the synthetic generator will optimize for its branch patterns, not necessarily production traffic. Ideally profile against real market data replay (ITCH, Databento) or recorded production journals once available.
 
 ## Project Structure
 
