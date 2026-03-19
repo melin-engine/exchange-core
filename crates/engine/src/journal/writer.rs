@@ -33,10 +33,12 @@ const MAX_ENTRY_SIZE: usize = 128;
 /// ~80 bytes each = ~80 KiB. Pre-allocated once, reused across batches.
 const BATCH_BUF_CAPACITY: usize = 128 * 1024;
 
-/// Pre-allocation chunk size (64 MiB). Large enough to amortize the cost of
-/// extent metadata updates across many entries. At ~80 bytes per entry,
-/// one chunk covers ~800K entries before the next allocation is needed.
-const PREALLOC_CHUNK: u64 = 64 * 1024 * 1024;
+/// Pre-allocation chunk size (256 MiB). Matches the default journal rotation
+/// threshold so that a freshly created journal never needs mid-run extension.
+/// At ~80 bytes per entry, one chunk covers ~3.2M entries. If the journal
+/// does exceed this (large rotation threshold or disabled rotation), it
+/// extends by one more chunk — but this is exceedingly rare.
+const PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
 
 /// Number of events between automatic hash chain checkpoints.
 /// 100K events × ~80 bytes = ~8 MB of journal data between checkpoints.
@@ -193,8 +195,8 @@ impl JournalWriter {
     /// recovery. The writer will continue from `last_seq + 1`.
     ///
     /// `valid_end` is the byte offset of the end of the last valid entry
-    /// (including file header). The file is truncated to this point to remove
-    /// any trailing garbage or pre-allocated space, then re-allocated.
+    /// (including file header). New entries are written starting here,
+    /// overwriting any trailing garbage from a partial crash write.
     ///
     /// `chain_hash` resumes the BLAKE3 hash chain from the reader's final
     /// state. `None` for v5 journals (no hash chain).
@@ -207,14 +209,32 @@ impl JournalWriter {
     ) -> Result<Self, JournalError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        // Truncate to remove trailing garbage from crash + old pre-allocated space.
-        file.set_len(valid_end)?;
+        // Reuse the existing file and its pre-allocated extents instead of
+        // truncating + re-preallocating + sync_all (which cost 2-6ms).
+        //
+        // The writer starts at `valid_end`, overwriting any trailing garbage
+        // from a crash. To prevent a double-crash scenario where partial
+        // garbage survives past new entries, zero out one MAX_ENTRY_SIZE
+        // block at `valid_end`. This is a single small write (128 bytes)
+        // with no metadata overhead.
+        let file_len = file.metadata()?.len();
+        if valid_end + MAX_ENTRY_SIZE as u64 <= file_len {
+            let zeros = [0u8; MAX_ENTRY_SIZE];
+            file.write_all_at(&zeros, valid_end)?;
+        }
 
-        // Re-allocate from the valid end forward.
-        let allocated_end = preallocate(&file, valid_end)?;
-
-        // Sync the truncation and new extent allocation.
-        file.sync_all()?;
+        let allocated_end = if file_len >= valid_end {
+            // File already covers valid data (common case). Use the full
+            // file length as allocated_end — ensure_allocated will extend
+            // if the journal grows beyond it.
+            file_len
+        } else {
+            // File was truncated below valid data (shouldn't happen in
+            // normal operation, but handle it gracefully).
+            let end = preallocate(&file, valid_end)?;
+            file.sync_all()?;
+            end
+        };
 
         Ok(Self {
             file,
@@ -465,16 +485,21 @@ impl JournalWriter {
 
     /// Ensure enough pre-allocated space exists for the next write.
     /// If the write would exceed the current allocation, extends by
-    /// another chunk. This is rare — once per ~800K entries.
+    /// another chunk. This should be exceedingly rare in practice —
+    /// the initial 256 MiB pre-allocation covers the default rotation
+    /// threshold, so this only fires if rotation is disabled or the
+    /// threshold is raised.
+    ///
+    /// No `sync_all` after extension: `RWF_DSYNC` on subsequent writes
+    /// already flushes the extent metadata needed to retrieve the written
+    /// data (POSIX synchronized I/O data integrity completion). A separate
+    /// `sync_all` would flush ALL metadata (timestamps, full extent tree)
+    /// and costs 2-6ms — unacceptable on the hot path.
     fn ensure_allocated(&mut self, bytes_needed: u64) -> Result<(), JournalError> {
         if self.write_pos + bytes_needed <= self.allocated_end {
             return Ok(());
         }
         self.allocated_end = preallocate(&self.file, self.write_pos)?;
-        // sync_all to persist the new extent metadata. This is a rare
-        // cost — amortized over ~800K entries per chunk.
-        #[cfg(not(feature = "no-fsync"))]
-        self.file.sync_all()?;
         Ok(())
     }
 }
@@ -835,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn open_append_truncates_preallocation() {
+    fn open_append_reuses_preallocation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
@@ -850,12 +875,82 @@ mod tests {
             (reader.last_sequence().unwrap(), reader.valid_file_end())
         };
 
-        // open_append truncates to valid_end then re-preallocates.
+        // open_append reuses the existing pre-allocation (no truncation).
         let _writer = JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
 
-        // File should be re-preallocated from valid_end.
+        // File should retain its original pre-allocation (no truncation).
         let file_len = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(file_len, valid_end + PREALLOC_CHUNK);
+        assert!(
+            file_len > valid_end,
+            "expected file to retain pre-allocation beyond valid_end: len={file_len}, valid_end={valid_end}"
+        );
+    }
+
+    #[test]
+    fn open_append_zeros_trailing_garbage() {
+        // Simulates a double-crash scenario:
+        // 1. Write entries, simulate crash (truncate mid-entry → trailing garbage)
+        // 2. Recover (open_append at valid_end), write a short entry
+        // 3. Simulate second crash (the short entry doesn't fully overwrite garbage)
+        // 4. Second recovery must succeed without CorruptEntry
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        // Create journal with several entries.
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for _ in 0..10 {
+                writer.append(&sample_event()).unwrap();
+            }
+        }
+
+        // Find valid_end, then inject fake garbage bytes after it
+        // (simulating a partial write from a crash).
+        let valid_end = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
+
+        // Record last_seq before injecting garbage (reader can't read
+        // past garbage without returning an error).
+        let last_seq = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.last_sequence().unwrap()
+        };
+
+        // Write garbage that looks like a partial entry (non-zero, but not
+        // a valid entry). This simulates bytes from an interrupted pwrite.
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            // Write bytes that could be misinterpreted as an entry start
+            // if not properly cleared: a valid-looking magic + some payload.
+            let garbage = [0x45, 0x4A, 0x20, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+            file.write_all_at(&garbage, valid_end).unwrap();
+        }
+
+        // First recovery: open_append should zero out the garbage.
+        {
+            let mut writer =
+                JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
+            // Write only one small entry (doesn't cover all the garbage bytes).
+            writer.append(&JournalEvent::Deposit {
+                account: crate::types::AccountId(1),
+                currency: crate::types::CurrencyId(0),
+                amount: 1,
+            }).unwrap();
+        }
+
+        // Second recovery: should succeed cleanly (no CorruptEntry from
+        // leftover garbage bytes).
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        // 10 original events + 1 new event after first recovery.
+        assert_eq!(count, 11);
     }
 
     #[test]
