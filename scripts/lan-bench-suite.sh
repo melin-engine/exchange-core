@@ -226,26 +226,30 @@ echo ""
 
 if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/plot.rs" ]]; then
     LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
+    PLOT_DIR="${LOCAL_REPO}/docs/plots"
+    mkdir -p "${PLOT_DIR}"
+
     echo "  Building plot tool..."
     (cd "$LOCAL_REPO" && cargo build --release -p trading-bench --features plot --bin trading-plot 2>&1 | tail -1)
     PLOT_TOOL="${LOCAL_REPO}/target/release/trading-plot"
 
     echo "  Generating latency CDF..."
-    "${PLOT_TOOL}" latency-cdf -o "${RESULTS_DIR}/latency-cdf.svg" \
+    "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" \
         "${RESULTS_DIR}/1-fsync.json" \
         "${RESULTS_DIR}/2-no-persist.json" \
         "${RESULTS_DIR}/3-single-order.json" 2>&1
 
-    for sweep in clients window accounts instruments; do
+    for sweep in window accounts instruments; do
         dir="${RESULTS_DIR}/sweep-${sweep}"
         if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
             echo "  Generating saturation curve: ${sweep}..."
-            "${PLOT_TOOL}" saturation -o "${RESULTS_DIR}/saturation-${sweep}.svg" \
+            "${PLOT_TOOL}" saturation -o "${PLOT_DIR}/saturation-${sweep}.svg" \
                 "${dir}"/*.json 2>&1
         fi
     done
 
     echo ""
+    echo "  Plots written to docs/plots/"
 fi
 
 # ---------------------------------------------------------------------------
