@@ -133,37 +133,89 @@ echo ""
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/3-single-order.json" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 4. Saturation sweep — full durability, varying load
+# Helper: run a sweep and collect results into a subdirectory.
+# Usage: run_sweep <sweep-name> <orders> <configs...>
+#   Each config is: "label:--clients N --window W --accounts A --instruments I"
+#   The label is used for the JSON filename.
 # ---------------------------------------------------------------------------
+ORDERS_PER_SWEEP=10000000
+
+run_sweep() {
+    local sweep_name="$1"
+    shift
+    local sweep_dir="${RESULTS_DIR}/sweep-${sweep_name}"
+    mkdir -p "${sweep_dir}"
+
+    echo ""
+    echo "============================================================"
+    echo "  Sweep: ${sweep_name}"
+    echo "  ${ORDERS_PER_SWEEP} orders per point"
+    echo "============================================================"
+    echo ""
+
+    for config in "$@"; do
+        local label="${config%%:*}"
+        local bench_args="${config#*:}"
+        echo "--- ${label} ---"
+
+        "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
+            -- --accounts 1000 --instruments 100 \
+            -- ${ORDERS_PER_SWEEP} ${bench_args}
+
+        cp /tmp/lan-bench-results.json "${sweep_dir}/${label}.json" 2>/dev/null || true
+        echo ""
+    done
+}
+
+# ---------------------------------------------------------------------------
+# 4. Sweeps — one parameter at a time, others held fixed
+# ---------------------------------------------------------------------------
+
+# 4a. Window sweep (fixed clients=16, accounts=1000, instruments=100)
+run_sweep "window" \
+    "w32:--clients 16 --window 32" \
+    "w64:--clients 16 --window 64" \
+    "w128:--clients 16 --window 128" \
+    "w256:--clients 16 --window 256" \
+    "w512:--clients 16 --window 512"
+
+# 4c. Accounts sweep (fixed clients=16, window=128, instruments=100)
+#     Server args vary — need to pass accounts to the server, not bench.
+#     Use a direct loop since server args differ per point.
+ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
+mkdir -p "${ACCT_SWEEP_DIR}"
 echo ""
 echo "============================================================"
-echo "  [4/4] Saturation sweep — full durability"
-echo "  10M pairs each, varying clients × window"
+echo "  Sweep: accounts"
+echo "  ${ORDERS_PER_SWEEP} orders per point"
 echo "============================================================"
 echo ""
-
-SWEEP_DIR="${RESULTS_DIR}/sweep"
-mkdir -p "${SWEEP_DIR}"
-
-SWEEP_CONFIGS=(
-    "1:1"
-    "4:16"
-    "8:64"
-    "16:128"
-    "16:256"
-    "32:256"
-)
-
-for config in "${SWEEP_CONFIGS[@]}"; do
-    clients="${config%%:*}"
-    window="${config##*:}"
-    echo "--- clients=${clients}, window=${window} ---"
-
+for acct in 1000000 10000000 100000000; do
+    label="a${acct}"
+    echo "--- accounts=${acct} ---"
     "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-        -- --accounts 1000 --instruments 100 \
-        -- 10000000 --clients "${clients}" --window "${window}"
+        -- --accounts "${acct}" --instruments 100 \
+        -- ${ORDERS_PER_SWEEP} --clients 16 --window 128
+    cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
+    echo ""
+done
 
-    cp /tmp/lan-bench-results.json "${SWEEP_DIR}/c${clients}-w${window}.json" 2>/dev/null || true
+# 4d. Instruments sweep (fixed clients=16, window=128, accounts=1000)
+INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
+mkdir -p "${INST_SWEEP_DIR}"
+echo ""
+echo "============================================================"
+echo "  Sweep: instruments"
+echo "  ${ORDERS_PER_SWEEP} orders per point"
+echo "============================================================"
+echo ""
+for inst in 10 100 1000; do
+    label="i${inst}"
+    echo "--- instruments=${inst} ---"
+    "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
+        -- --accounts 1000 --instruments "${inst}" \
+        -- ${ORDERS_PER_SWEEP} --clients 16 --window 128
+    cp /tmp/lan-bench-results.json "${INST_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
 done
 
@@ -176,19 +228,9 @@ echo "  Generating plots"
 echo "============================================================"
 echo ""
 
-# Build the plot tool if not already built.
-PLOT_BIN=""
-for HOST in "${SERVER}" "${BENCH}"; do
-    if ssh $SSH_OPTS "$HOST" "test -x ${REPO_DIR}/target/release/trading-plot" 2>/dev/null; then
-        PLOT_BIN="${HOST}"
-        break
-    fi
-done
-
-# Build locally if available, otherwise build on bench machine.
 if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/plot.rs" ]]; then
     LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
-    echo "  Building plot tool locally..."
+    echo "  Building plot tool..."
     (cd "$LOCAL_REPO" && cargo build --release -p trading-bench --features plot --bin trading-plot 2>&1 | tail -1)
     PLOT_TOOL="${LOCAL_REPO}/target/release/trading-plot"
 
@@ -198,9 +240,14 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         "${RESULTS_DIR}/2-no-persist.json" \
         "${RESULTS_DIR}/3-single-order.json" 2>&1
 
-    echo "  Generating saturation curve..."
-    "${PLOT_TOOL}" saturation -o "${RESULTS_DIR}/saturation.svg" \
-        "${SWEEP_DIR}"/*.json 2>&1
+    for sweep in clients window accounts instruments; do
+        dir="${RESULTS_DIR}/sweep-${sweep}"
+        if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
+            echo "  Generating saturation curve: ${sweep}..."
+            "${PLOT_TOOL}" saturation -o "${RESULTS_DIR}/saturation-${sweep}.svg" \
+                "${dir}"/*.json 2>&1
+        fi
+    done
 
     echo ""
 fi
@@ -213,5 +260,4 @@ echo "============================================================"
 echo "  Suite complete. Results in ${RESULTS_DIR}/"
 echo "============================================================"
 echo ""
-ls -la "${RESULTS_DIR}/"
-ls -la "${SWEEP_DIR}/" 2>/dev/null || true
+find "${RESULTS_DIR}" -type f | sort
