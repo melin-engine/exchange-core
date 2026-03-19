@@ -401,16 +401,16 @@ impl JournalStage {
         use std::time::Instant;
 
         // SINGLE_ISSUER: only one thread submits SQEs — lets the kernel skip
-        // internal locking on the SQ. COOP_TASKRUN: CQE delivery happens
-        // cooperatively during io_uring_enter() instead of via async interrupt,
-        // eliminating IRQ-driven jitter on the journal thread's core.
-        // NB: with COOP_TASKRUN, CQEs are only posted to the shared CQ ring
-        // during io_uring_enter() calls — pure userspace reads of the CQ will
-        // miss completions. All reap points must call ring.submit() first to
-        // flush kernel task_work.
+        // internal locking on the SQ.
+        //
+        // COOP_TASKRUN is deliberately NOT used: it defers CQE delivery to
+        // io_uring_enter() calls, requiring an extra syscall (~200ns) at
+        // every reap point. Without it, CQEs are posted directly to the
+        // shared CQ ring in interrupt context (on core 0 per IRQ affinity),
+        // and the journal thread reads them via the memory-mapped CQ with
+        // zero syscall overhead.
         let mut ring: IoUring = IoUring::builder()
             .setup_single_issuer()
-            .setup_coop_taskrun()
             .build(4)
             .expect("io_uring init failed");
 
@@ -462,12 +462,8 @@ impl JournalStage {
             }
 
             // --- Reap CQE from previous in-flight write (non-blocking) ---
-            // With COOP_TASKRUN, CQEs sit in kernel task_work until flushed
-            // by io_uring_enter(). submit() with 0 pending SQEs still enters
-            // the kernel and processes task_work (fast no-op path).
-            if inflight.is_some() {
-                ring.submit().expect("io_uring flush failed");
-            }
+            // CQEs are posted directly to the shared CQ ring in interrupt
+            // context — no syscall needed to make them visible.
             if let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
             {
@@ -518,12 +514,9 @@ impl JournalStage {
 
             // --- Eagerly reap CQE after encoding ---
             // The non-blocking check at the top of the loop may have missed
-            // a CQE that arrived while we were encoding events. Flush
-            // task_work and reap it now so the cursor advances sooner and
-            // the slot frees up for immediate submission.
-            if inflight.is_some() {
-                ring.submit().expect("io_uring flush failed");
-            }
+            // a CQE that arrived while we were encoding events. Reap it now
+            // so the cursor advances sooner and the slot frees up for
+            // immediate submission.
             if inflight.is_some()
                 && let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
@@ -616,11 +609,11 @@ impl JournalStage {
 
     /// Busy-poll until the in-flight io_uring CQE arrives.
     ///
-    /// Each iteration calls `ring.submit()` (no pending SQEs) to enter the
-    /// kernel and flush COOP_TASKRUN task_work — without this, the CQE would
-    /// never appear in the shared CQ ring. This is a fast no-op syscall
-    /// (~200ns) that avoids the sleep/wake scheduler jitter of
-    /// `submit_and_wait(1)`.
+    /// Pure userspace spin on the memory-mapped CQ ring — no syscalls.
+    /// CQEs are posted by the kernel in interrupt context (on core 0 per
+    /// IRQ affinity) and become visible here via the shared memory mapping.
+    /// The journal thread is pinned to a dedicated core, so busy-polling
+    /// is appropriate and avoids kernel sleep/wake jitter entirely.
     #[cfg(all(
         feature = "io-uring",
         not(feature = "no-fsync"),
@@ -632,8 +625,6 @@ impl JournalStage {
         batch_data: &super::writer::AsyncWriteBatch,
     ) {
         loop {
-            // Flush kernel task_work so any completed CQEs become visible.
-            ring.submit().expect("io_uring flush failed");
             if let Some(cqe) = ring.completion().next() {
                 let result = cqe.result();
                 if result < 0 {
