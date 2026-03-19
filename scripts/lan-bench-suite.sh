@@ -84,7 +84,7 @@ cp /tmp/lan-bench-results.json "${RESULTS_DIR}/1-fsync.json" 2>/dev/null || true
 echo ""
 echo "============================================================"
 echo "  [2/3] Peak throughput — no persistence"
-echo "  100M pairs, 32 clients, window 192"
+echo "  100M pairs, 16 clients, window 384"
 echo "============================================================"
 echo ""
 
@@ -104,7 +104,7 @@ ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
     cp target/release/trading-server.nopersist target/release/trading-server"
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 100000000 --clients 32 --window 192
+    -- -- 100000000 --clients 16 --window 384
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/2-no-persist.json" 2>/dev/null || true
 
