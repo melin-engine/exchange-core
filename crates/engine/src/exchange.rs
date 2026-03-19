@@ -89,15 +89,22 @@ impl Exchange {
         }
     }
 
-    /// Create an Exchange pre-sized for production workloads. Avoids
-    /// HashMap resize spikes on the hot path by allocating upfront.
-    /// RAM is cheap; tail latency is not.
+    /// Create an Exchange pre-sized for production workloads.
+    ///
+    /// HashMap capacities are kept small enough to stay cache-resident.
+    /// Oversized tables (millions of slots) cause every probe to miss
+    /// L2/L3 cache, adding ~40-80 ns per HashMap operation. A 32K-slot
+    /// order_info table is ~1 MB and fits in L3; resize at 32K is ~50 µs
+    /// (rare, appears in p99.99 at most).
     pub fn with_capacity() -> Self {
         Self {
             // 64 instrument slots — each empty slot is 8 bytes (null Box ptr).
             instruments: Vec::with_capacity(64),
             accounts: AccountManager::with_capacity(),
-            order_info: FxHashMap::with_capacity_and_hasher(2_000_000, Default::default()),
+            // Global across all instruments. Typical steady-state: 100
+            // instruments × 200 resting orders = 20K entries. 32K slots
+            // ≈ 1 MB — fits in L3 cache.
+            order_info: FxHashMap::with_capacity_and_hasher(32_768, Default::default()),
             // 10K accounts × 8 bytes = 80 KB — negligible.
             max_order_id: vec![0; 10_000],
             consumed_buf: Vec::with_capacity(256),

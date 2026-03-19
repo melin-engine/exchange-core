@@ -321,18 +321,27 @@ impl OrderBook {
         }
     }
 
-    /// Create an OrderBook pre-sized for production workloads. Avoids
-    /// HashMap resize spikes under heavy quoting by allocating upfront.
+    /// Create an OrderBook pre-sized for production workloads.
+    ///
+    /// Capacity is intentionally modest (4K order slots, 1K stop slots) so
+    /// the hash tables fit in L2 cache (~160 KB). Oversized tables cause
+    /// random probes to miss L2 on every access (~40-80 ns per miss),
+    /// dominating the cost of cancel and cancel-replace operations.
+    /// Hashbrown resizes by doubling, so a 4K→8K resize moves ~128 KB —
+    /// a one-time ~5 µs stall that appears in p99.99 at most.
     pub fn with_capacity() -> Self {
         Self {
             bids: BookSide::default(),
             asks: BookSide::default(),
             // One entry per resting order for O(1) cancel lookups.
-            order_index: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            // 4096 slots ≈ 128 KB (key 12 B + value 16 B + control 1 B per
+            // slot) — fits in L2 cache for fast probes. Typical book depth
+            // is 100-2000 orders; resize cost at 4K is ~5 µs.
+            order_index: FxHashMap::with_capacity_and_hasher(4_096, Default::default()),
             // BTreeMap is node-allocated — no resize spikes.
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: FxHashMap::with_capacity_and_hasher(100_000, Default::default()),
+            stop_index: FxHashMap::with_capacity_and_hasher(1_024, Default::default()),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
