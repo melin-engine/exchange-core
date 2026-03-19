@@ -94,6 +94,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Price band checks (static lower/upper bounds, per-instrument — part of circuit breaker config)
 - [ ] Position/exposure limits
 - [ ] Order throttling (per-account rate limiting)
+- [ ] Bulk account provisioning — direct state construction (bypass journal) or binary manifest import for fast seeding of 100M+ accounts. Current O(accounts × instruments) deposit loop takes ~40 min at 1M accounts.
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums

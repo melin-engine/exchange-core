@@ -80,8 +80,10 @@ pub struct ServerConfig {
     /// reached. 0 means unlimited. Prevents fd/memory exhaustion (SEC-02).
     #[arg(long, default_value_t = 1024)]
     pub max_connections: u64,
-    /// Number of accounts to seed on first startup.
-    #[arg(long, default_value_t = 1_000_000)]
+    /// Number of accounts to seed on first startup. Each account gets
+    /// deposits in all instrument currencies, so startup time scales as
+    /// O(accounts × instruments). 1000 accounts × 100 instruments ≈ 2s.
+    #[arg(long, default_value_t = 1_000)]
     pub accounts: u32,
     /// Number of instruments to seed on first startup.
     #[arg(long, default_value_t = 100)]

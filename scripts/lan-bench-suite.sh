@@ -175,28 +175,11 @@ run_sweep "window" \
     "w256:--clients 16 --window 256" \
     "w512:--clients 16 --window 512"
 
-# 4c. Accounts sweep (fixed clients=16, window=128)
-#     Server args vary — need to pass accounts to the server, not bench.
-#     Use a direct loop since server args differ per point.
-ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
-mkdir -p "${ACCT_SWEEP_DIR}"
-echo ""
-echo "============================================================"
-echo "  Sweep: accounts"
-echo "  ${ORDERS_PER_SWEEP} orders per point"
-echo "============================================================"
-echo ""
-for acct in 1000000 10000000 100000000; do
-    label="a${acct}"
-    echo "--- accounts=${acct} ---"
-    "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-        -- --accounts "${acct}" \
-        -- ${ORDERS_PER_SWEEP} --clients 16 --window 128
-    cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
-    echo ""
-done
+# Accounts sweep removed: seeding cost is O(accounts × instruments),
+# so 10M+ accounts take hours to seed. Needs lazy account creation
+# or fast-path seeding before this is viable.
 
-# 4d. Instruments sweep (fixed clients=16, window=128)
+# 4c. Instruments sweep (fixed clients=16, window=128)
 INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
 mkdir -p "${INST_SWEEP_DIR}"
 echo ""
@@ -239,7 +222,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         "${RESULTS_DIR}/2-no-persist.json" \
         "${RESULTS_DIR}/3-single-order.json" 2>&1
 
-    for sweep in window accounts instruments; do
+    for sweep in window instruments; do
         dir="${RESULTS_DIR}/sweep-${sweep}"
         if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
             echo "  Generating saturation curve: ${sweep}..."
