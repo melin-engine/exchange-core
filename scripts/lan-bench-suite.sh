@@ -50,10 +50,19 @@ echo ""
 # ---------------------------------------------------------------------------
 # Build both binaries upfront (release + no-persist variant)
 # ---------------------------------------------------------------------------
-echo "=== Building release binaries on both machines ==="
-for HOST in "${SERVER}" "${BENCH}"; do
+# BENCH_BRANCH env var: checkout a specific branch on all machines.
+# Usage: BENCH_BRANCH=feat/replication ./scripts/lan-bench-suite.sh ...
+GIT_CMD="git pull --ff-only"
+if [[ -n "${BENCH_BRANCH:-}" ]]; then
+    GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git pull origin ${BENCH_BRANCH}"
+    echo "=== Using branch: ${BENCH_BRANCH} ==="
+    echo ""
+fi
+
+echo "=== Building release binaries on all machines ==="
+for HOST in "${BUILD_HOSTS[@]}"; do
     echo "  Building on ${HOST}..."
-    ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && git pull --ff-only && source ~/.cargo/env && \
+    ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
         cargo build --release && \
         cargo build --release --features no-persist" 2>&1 | tail -3
 done

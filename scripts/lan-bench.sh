@@ -109,7 +109,13 @@ build_remote() {
     local host="$1"
     local label="$2"
     echo "=== Building on ${label} (${host}) ==="
-    ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && git pull --ff-only && source ~/.cargo/env && cargo build ${CARGO_BUILD_FLAGS}" 2>&1 | tail -3
+    # BENCH_BRANCH env var: checkout a specific branch instead of pulling main.
+    # Usage: BENCH_BRANCH=feat/replication ./scripts/lan-bench.sh ...
+    local git_cmd="git pull --ff-only"
+    if [[ -n "${BENCH_BRANCH:-}" ]]; then
+        git_cmd="git fetch origin && git checkout ${BENCH_BRANCH} && git pull origin ${BENCH_BRANCH}"
+    fi
+    ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && ${git_cmd} && source ~/.cargo/env && cargo build ${CARGO_BUILD_FLAGS}" 2>&1 | tail -3
     echo "  ${label} build: OK"
     echo ""
 }
