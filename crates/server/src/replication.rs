@@ -29,7 +29,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use trading_engine::journal::replication::ReplicationConsumer;
 
@@ -350,13 +350,13 @@ pub fn run_sender(
             &genesis_entry,
             shutdown,
         ) {
-            Ok(()) => info!("replica disconnected cleanly"),
-            Err(e) => error!(error = %e, "replica connection error"),
+            Ok(()) => warn!("replica disconnected cleanly"),
+            Err(e) => warn!(error = %e, "replica connection error"),
         }
 
         // On disconnect, set cursor to u64::MAX to degrade to local-only.
         replication_cursor.store(u64::MAX, Ordering::Release);
-        info!("replica disconnected — degraded to local-only durability");
+        warn!("replica disconnected — degraded to local-only durability");
     }
 }
 

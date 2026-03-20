@@ -329,7 +329,7 @@ impl JournalStage {
                             continue;
                         }
                         if let Err(e) = self.writer.batch_append(&slot.event) {
-                            tracing::error!(error = %e, "journal encode error");
+                            panic!("fatal journal encode error: {e}");
                         }
                     }
                 }
@@ -373,7 +373,11 @@ impl JournalStage {
                         }
 
                         if let Err(e) = self.writer.flush_batch_sync() {
-                            tracing::error!(error = %e, "journal flush_batch_sync error");
+                            // Fatal: journal I/O failure means we can't
+                            // guarantee durability. Panic to prevent the
+                            // pipeline from spinning forever on a broken
+                            // disk (e.g., ENOSPC).
+                            panic!("fatal journal I/O error: {e}");
                         }
                     }
 
@@ -568,7 +572,7 @@ impl JournalStage {
                         continue;
                     }
                     if let Err(e) = self.writer.batch_append(&slot.event) {
-                        tracing::error!(error = %e, "journal encode error");
+                        panic!("fatal journal encode error: {e}");
                     }
                 }
                 pending += count;
@@ -624,6 +628,17 @@ impl JournalStage {
                         self.writer.confirm_async_write(batch_data);
                     }
 
+                    // Snapshot batch bytes for replication BEFORE
+                    // take_batch_for_async_write (which swaps the buffer).
+                    if let Some(producer) = &mut self.replication_producer {
+                        let bytes = self.writer.pending_batch_bytes();
+                        if !bytes.is_empty() {
+                            let end_seq = self.writer.next_sequence() - 1;
+                            let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
+                            producer.publish(bytes, end_seq, chain);
+                        }
+                    }
+
                     // Take the batch buffer and submit async write.
                     match self.writer.take_batch_for_async_write() {
                         Ok(Some(async_batch)) => {
@@ -650,7 +665,7 @@ impl JournalStage {
                             self.consumer.commit(pending);
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "journal take_batch error");
+                            panic!("fatal journal I/O error: {e}");
                         }
                     }
                     pending = 0;

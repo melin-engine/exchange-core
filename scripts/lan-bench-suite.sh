@@ -241,6 +241,11 @@ if [[ -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; then
     ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
     ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
 
+    # Verify replica can reach primary on VLAN.
+    if ! ssh $SSH_OPTS "$REPLICA" "nc -z -w 3 ${SERVER_VLAN} 22" 2>/dev/null; then
+        echo "  WARNING: replica cannot reach ${SERVER_VLAN} on VLAN — replication may fail"
+    fi
+
     # Start primary first — it listens for replica connections on REPL_PORT.
     echo "  Starting primary on ${SERVER} with --replication-bind..."
     ssh $SSH_OPTS "$SERVER" "pkill -x trading-server 2>/dev/null; true"
@@ -298,7 +303,6 @@ if [[ -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; then
             --json /tmp/bench-results.json \
             100000000 --clients 16 --window 256"
 
-    cp /tmp/lan-bench-results.json "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true
 
     # Stop both servers.

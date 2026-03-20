@@ -106,7 +106,8 @@ impl JournalWriter {
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
         let mut genesis = [0u8; 32];
-        getrandom::fill(&mut genesis).map_err(|e| JournalError::Io(std::io::Error::other(e)))?;
+        getrandom::fill(&mut genesis)
+            .map_err(|e| JournalError::Io(std::io::Error::other(e.to_string())))?;
         Self::create_with_genesis(path, 1, genesis)
     }
 
