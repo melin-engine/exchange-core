@@ -90,8 +90,9 @@ pub struct ServerConfig {
     pub instruments: u32,
     /// Path to the authorized keys file for Ed25519 challenge-response
     /// authentication. Every connection must authenticate before trading.
+    /// Required for primary mode; ignored in replica mode (--replica-of).
     /// See `AuthorizedKeys` for file format.
-    #[arg(long)]
+    #[arg(long, default_value = "authorized_keys")]
     pub authorized_keys: PathBuf,
     /// Maximum journal size in MiB before automatic rotation at startup.
     /// When the journal exceeds this threshold, the server saves a snapshot
@@ -231,8 +232,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         "loaded authorized keys"
     );
 
-    // Initialize or recover the exchange.
-    let engine = init_engine(&config)?;
+    // Initialize or recover the exchange. `needs_seeding` is true on
+    // first startup — seed events will flow through the pipeline later.
+    let (engine, needs_seeding) = init_engine(&config)?;
 
     // Decompose into parts for the pipeline.
     let (mut exchange, writer) = engine.into_parts();
@@ -305,6 +307,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let connection_timeout = config.connection_timeout();
     let heartbeat_interval = config.heartbeat_interval();
 
+    // Clone the input producer for seeding. Seed events flow through the
+    // disruptor like regular events so they're journaled, replicated, and
+    // processed by the matching engine via the normal pipeline.
+    let seed_producer = if needs_seeding {
+        Some(input_producer.clone())
+    } else {
+        None
+    };
+
     let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = reader::spawn_reader_pool(
         config.readers,
@@ -369,12 +380,16 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 
     // Spawn replication sender thread if enabled. The journal stage publishes
     // encoded batches to a pre-allocated ring; the sender thread consumes them.
+    // `replica_ready` is set when the first replica connects — seeding waits
+    // on this to ensure seed events aren't drained before the replica arrives.
+    let replica_ready = Arc::new(AtomicBool::new(false));
     let replication_handle = if let Some(repl_consumer) = replication {
         let repl_bind = config
             .replication_bind
             .expect("replication_bind must be set");
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
+        let ready_flag = Arc::clone(&replica_ready);
 
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
@@ -385,6 +400,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     repl_cursor,
                     genesis_entry,
                     &s_repl,
+                    &ready_flag,
                 );
             })
             .expect("failed to spawn replication sender thread");
@@ -397,6 +413,76 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         }
         None
     };
+
+    // Seed instruments and accounts through the pipeline on first startup.
+    // Events flow through journal + matching + replication like regular
+    // trading events. Must happen after pipeline threads start (they
+    // consume from the disruptor) but before accepting client connections.
+    //
+    // When replication is enabled, wait for the first replica to connect
+    // before publishing. The replication ring is bounded (64 slots) and
+    // the sender drains it while waiting — seed data would be lost.
+    if enable_replication && needs_seeding {
+        info!("waiting for replica to connect before seeding...");
+        while !replica_ready.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if let Some(producer) = seed_producer {
+        use trading_engine::journal::event::JournalEvent;
+        use trading_engine::journal::pipeline::InputSlot;
+        use trading_engine::journal::trace::trace_ts;
+        use trading_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+
+        for i in 1..=config.instruments {
+            producer.publish(InputSlot {
+                connection_id: 0,
+                event: JournalEvent::AddInstrument {
+                    spec: InstrumentSpec {
+                        symbol: Symbol(i),
+                        base: CurrencyId(i * 2 - 1),
+                        quote: CurrencyId(i * 2),
+                    },
+                },
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        }
+
+        for acct in 1..=config.accounts {
+            for i in 1..=config.instruments {
+                producer.publish(InputSlot {
+                    connection_id: 0,
+                    event: JournalEvent::Deposit {
+                        account: AccountId(acct),
+                        currency: CurrencyId(i * 2 - 1),
+                        amount: u64::MAX / 4,
+                    },
+                    publish_ts: trace_ts(),
+                    recv_ts: trace_ts(),
+                });
+                producer.publish(InputSlot {
+                    connection_id: 0,
+                    event: JournalEvent::Deposit {
+                        account: AccountId(acct),
+                        currency: CurrencyId(i * 2),
+                        amount: u64::MAX / 4,
+                    },
+                    publish_ts: trace_ts(),
+                    recv_ts: trace_ts(),
+                });
+            }
+        }
+
+        info!(
+            accounts = config.accounts,
+            instruments = config.instruments,
+            "seeded test data through pipeline"
+        );
+    }
 
     // Set the listener to non-blocking so accept() returns immediately
     // with WouldBlock when no connection is pending. This lets the accept
@@ -584,7 +670,11 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 }
 
 /// Initialize or recover the JournaledExchange from disk.
-fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::error::Error>> {
+/// Returns (engine, needs_seeding). `needs_seeding` is true on first startup
+/// (fresh journal) — the caller must publish seed events through the pipeline.
+fn init_engine(
+    config: &ServerConfig,
+) -> Result<(JournaledExchange, bool), Box<dyn std::error::Error>> {
     // Check for a snapshot: either the explicit --snapshot path, or the
     // default derived path (used by auto-rotation when --snapshot is not set).
     let derived_snap = config.journal.with_extension("snapshot");
@@ -624,10 +714,10 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
         JournaledExchange::recover(&config.journal)?
     } else {
         info!("creating new journal");
-        let mut engine = JournaledExchange::create(&config.journal)?;
-        seed_test_data(&mut engine, config.accounts, config.instruments)?;
-        engine
+        JournaledExchange::create(&config.journal)?
     };
+
+    let needs_seeding = !journal_exists;
 
     // Rotate journal if it exceeds the configured size threshold.
     // This saves a snapshot, archives the old journal, and starts
@@ -651,7 +741,7 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
         }
     }
 
-    Ok(engine)
+    Ok((engine, needs_seeding))
 }
 
 /// Apply CPU core affinity for a pipeline thread, logging the result.
@@ -660,42 +750,6 @@ fn apply_affinity(thread_name: &str, core_id: usize) {
         Ok(c) => info!(core = c, thread = thread_name, "pinned to core"),
         Err(e) => tracing::warn!(thread = thread_name, error = e, "core pinning failed"),
     }
-}
-
-/// Seed the exchange with test instruments and accounts so the TUI can
-/// be used immediately. This runs only on first startup (fresh journal).
-fn seed_test_data(
-    engine: &mut JournaledExchange,
-    num_accounts: u32,
-    num_instruments: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use trading_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
-
-    // Register instruments. Each instrument has a unique base/quote currency
-    // pair using the same convention as the bench generator:
-    // symbol i → base = CurrencyId(i*2 - 1), quote = CurrencyId(i*2).
-    for i in 1..=num_instruments {
-        engine.add_instrument(InstrumentSpec {
-            symbol: Symbol(i),
-            base: CurrencyId(i * 2 - 1),
-            quote: CurrencyId(i * 2),
-        })?;
-    }
-
-    // Seed accounts with generous balances in all currencies.
-    for acct in 1..=num_accounts {
-        for i in 1..=num_instruments {
-            engine.deposit(AccountId(acct), CurrencyId(i * 2 - 1), u64::MAX / 4)?;
-            engine.deposit(AccountId(acct), CurrencyId(i * 2), u64::MAX / 4)?;
-        }
-    }
-
-    info!(
-        accounts = num_accounts,
-        instruments = num_instruments,
-        "seeded test data"
-    );
-    Ok(())
 }
 
 /// Perform challenge-response authentication on a new connection.

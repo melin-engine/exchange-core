@@ -295,6 +295,7 @@ pub fn run_sender(
     replication_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     shutdown: &AtomicBool,
+    replica_ready: &AtomicBool,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -321,12 +322,18 @@ pub fn run_sender(
         let stream = match listener.accept() {
             Ok((stream, addr)) => {
                 info!(addr = %addr, "replica connected");
+                // Signal that a replica is connected — unblocks seed event
+                // publishing in the main thread.
+                replica_ready.store(true, Ordering::Release);
                 stream
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // No pending connection — drain batches to avoid blocking the
-                // replication stage, then sleep briefly.
-                drain_batches_while_waiting(&mut repl_consumer);
+                // replication ring. Only drain after the first replica has
+                // connected; before that, seed data must be preserved.
+                if replica_ready.load(Ordering::Relaxed) {
+                    drain_batches_while_waiting(&mut repl_consumer);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
