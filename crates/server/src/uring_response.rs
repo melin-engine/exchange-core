@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
-use tracing::debug;
+use tracing::{debug, error};
 
 use trading_disruptor::padding::Sequence;
 use trading_disruptor::spsc;
@@ -401,7 +401,7 @@ fn flush_sends(
 
     // Submit and wait for all completions.
     if let Err(e) = ring.submit_and_wait(pending) {
-        debug!(error = %e, "io_uring submit_and_wait failed in response stage");
+        error!(error = %e, "io_uring submit_and_wait failed in response stage");
         return;
     }
 

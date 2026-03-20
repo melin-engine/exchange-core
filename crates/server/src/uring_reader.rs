@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
-use tracing::debug;
+use tracing::{debug, error};
 
 use trading_disruptor::ring;
 use trading_engine::journal::event::JournalEvent;
@@ -91,6 +91,9 @@ pub struct UringReaderHandle<R> {
 
 impl<R> UringReaderHandle<R> {
     /// Register a new connection with the reader thread.
+    ///
+    /// If the reader thread's channel is dead (thread panicked), logs an
+    /// error and signals shutdown so the server can restart cleanly.
     pub fn register(&mut self, registration: ReaderRegistration<R>) {
         if self.tx.send(registration).is_ok() {
             // Signal the eventfd to wake the reader from io_uring_enter.
@@ -98,6 +101,9 @@ impl<R> UringReaderHandle<R> {
             unsafe {
                 libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
             }
+        } else {
+            error!("reader thread dead, cannot register connection");
+            self.shutdown.store(true, Ordering::Relaxed);
         }
     }
 
@@ -112,8 +118,15 @@ impl<R> UringReaderHandle<R> {
 
     /// Join the reader thread. Call after `shutdown()`.
     pub fn join(mut self) {
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.join_handle.take()
+            && let Err(panic) = handle.join()
+        {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic>");
+            error!(message = msg, "reader thread panicked");
         }
     }
 }
@@ -293,7 +306,7 @@ fn uring_reader_loop<R: AsRawFd>(
             Ok(_) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) => {
-                debug!(error = %e, "io_uring submit_and_wait error");
+                error!(error = %e, "io_uring submit_and_wait error");
                 break;
             }
         }
@@ -311,7 +324,7 @@ fn uring_reader_loop<R: AsRawFd>(
             // ── ProvideBuffers completion ──
             if token == PROVIDE_BUFS_TOKEN {
                 if result < 0 {
-                    debug!(error = result, "ProvideBuffers failed");
+                    error!(error = result, "ProvideBuffers failed");
                 }
                 continue;
             }
@@ -339,7 +352,7 @@ fn uring_reader_loop<R: AsRawFd>(
                         push_recv_multi(&mut ring, &mut slab, idx);
                     }
                 } else {
-                    debug!(error = result, "eventfd read error");
+                    error!(error = result, "eventfd read error");
                 }
 
                 // Re-submit eventfd read for the next wakeup.

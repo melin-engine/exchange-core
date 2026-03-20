@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tracing::debug;
+use tracing::{debug, error};
 
 use trading_disruptor::ring;
 use trading_engine::journal::event::JournalEvent;
@@ -72,6 +72,9 @@ pub struct EpollReaderHandle<R> {
 
 impl<R> EpollReaderHandle<R> {
     /// Register a new connection with the next reader thread (round-robin).
+    ///
+    /// If the reader thread's channel is dead (thread panicked), logs an
+    /// error and signals shutdown so the server can restart cleanly.
     pub fn register(&mut self, registration: ReaderRegistration<R>) {
         let idx = self.next % self.threads.len();
         self.next += 1;
@@ -87,6 +90,12 @@ impl<R> EpollReaderHandle<R> {
                     8,
                 );
             }
+        } else {
+            error!(
+                thread = idx,
+                "reader thread dead, cannot register connection"
+            );
+            self.shutdown.store(true, Ordering::Relaxed);
         }
     }
 
@@ -108,8 +117,15 @@ impl<R> EpollReaderHandle<R> {
 
     /// Join all reader threads. Call after `shutdown()`.
     pub fn join(self) {
-        for handle in self.join_handles {
-            let _ = handle.join();
+        for (i, handle) in self.join_handles.into_iter().enumerate() {
+            if let Err(panic) = handle.join() {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>");
+                error!(thread = i, message = msg, "reader thread panicked");
+            }
         }
     }
 }
@@ -255,7 +271,7 @@ fn epoll_reader_loop<R: AsRawFd>(
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            debug!(error = %err, "epoll_wait error");
+            error!(error = %err, "epoll_wait error");
             break;
         }
 

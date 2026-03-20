@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use trading_engine::journal::JournaledExchange;
 use trading_engine::journal::pipeline::build_pipeline;
@@ -319,6 +319,20 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             break;
         }
 
+        // Detect pipeline thread death early so we don't keep accepting
+        // connections into a broken pipeline. These threads only exit on
+        // shutdown or panic — if one is finished while shutdown is false,
+        // it panicked. Re-check shutdown to avoid a TOCTOU race where a
+        // clean shutdown signal arrives between the two checks.
+        if (journal_handle.is_finished()
+            || matching_handle.is_finished()
+            || response_handle.is_finished())
+            && !shutdown.load(Ordering::Relaxed)
+        {
+            error!("pipeline thread died, initiating shutdown");
+            break;
+        }
+
         let (mut std_read, mut std_write, addr) = match listener.accept() {
             Ok(conn) => conn,
             Err(e) => {
@@ -338,7 +352,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         if config.max_connections > 0
             && active_connections.load(Ordering::Relaxed) >= config.max_connections
         {
-            debug!(addr = %addr, "connection rejected: max_connections reached");
+            warn!(addr = %addr, "connection rejected: max_connections reached");
             drop(std_read);
             drop(std_write);
             continue;
@@ -437,9 +451,26 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     info!("shutdown: draining pipeline");
     shutdown.store(true, Ordering::Relaxed);
 
-    let _ = journal_handle.join();
-    let _ = matching_handle.join();
-    let _ = response_handle.join();
+    let mut thread_panicked = false;
+    let mut check_join = |name: &str, result: std::thread::Result<_>| {
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic>");
+            error!(thread = name, message = msg, "pipeline thread panicked");
+            thread_panicked = true;
+        }
+    };
+    check_join("journal", journal_handle.join().map(|_| ()));
+    check_join("matching", matching_handle.join().map(|_| ()));
+    check_join("response", response_handle.join().map(|_| ()));
+
+    if thread_panicked {
+        error!("shutdown complete (with thread panic)");
+        return Err("pipeline thread panicked".into());
+    }
 
     info!("shutdown complete");
     Ok(())
