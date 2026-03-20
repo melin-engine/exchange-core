@@ -170,6 +170,7 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 
 ### Redundancy & High Availability
 - [x] Synchronous journal replication ([docs/replication.md](docs/replication.md)) — live WAL streaming to replica via lock-free ring buffer, ack-gated responses, replica receiver with deterministic replay
+- [ ] Halt trading on replica disconnect (currently degrades silently to local-only, acking un-replicated orders)
 - [ ] Catch-up from journal files (late-joining replica reads historical entries before live stream)
 - [ ] Snapshot transfer (replica too far behind for journal catch-up)
 - [ ] Manual promotion (operator command to promote replica to primary)
