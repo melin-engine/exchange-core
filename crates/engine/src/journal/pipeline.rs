@@ -1095,6 +1095,7 @@ pub fn build_pipeline(
         matching_stage,
         output_consumer,
         journal_cursor,
+        _matching_cursor,
         events_processed,
         _,
         _,
@@ -1139,6 +1140,7 @@ pub fn build_pipeline_with_replication(
     MatchingStage,
     spsc::Consumer<OutputSlot>,
     Arc<Sequence>,
+    Arc<Sequence>,
     Arc<AtomicU64>,
     Option<ReplicationConsumer>,
     Arc<AtomicU64>,
@@ -1158,6 +1160,10 @@ pub fn build_pipeline_with_replication(
     // Grab the journal's progress cursor before moving it into the stage.
     // The response stage will read this to gate on sync completion.
     let journal_cursor = journal_consumer.progress_counter();
+    // Grab the matching consumer's progress cursor for seed drain gating.
+    // The server waits for both journal and matching to advance past the
+    // last seed sequence before accepting clients.
+    let matching_cursor = matching_consumer.progress_counter();
 
     // Output SPSC: matching → response.
     let (output_producer, output_consumer) = spsc::channel::<OutputSlot>(OUTPUT_RING_CAPACITY);
@@ -1199,6 +1205,7 @@ pub fn build_pipeline_with_replication(
         matching_stage,
         output_consumer,
         journal_cursor,
+        matching_cursor,
         events_processed,
         replication_consumer,
         replication_cursor,
@@ -1467,6 +1474,7 @@ mod tests {
             matching_stage,
             mut output_consumer,
             journal_cursor,
+            _matching_cursor,
             _events_processed,
             replication_rx,
             replication_cursor,
@@ -1600,7 +1608,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, replication, replication_cursor) =
+            let (_, _, _, _, _, _, _, replication, replication_cursor) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -1619,7 +1627,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, replication, replication_cursor) =
+            let (_, _, _, _, _, _, _, replication, replication_cursor) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,

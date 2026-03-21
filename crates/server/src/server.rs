@@ -284,6 +284,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         matching_stage,
         output_consumer,
         journal_cursor,
+        matching_cursor,
         _events_processed,
         replication,
         replication_cursor,
@@ -349,6 +350,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     #[cfg_attr(feature = "io-uring", allow(unused_variables))]
     let active_connections_response = Arc::clone(&active_connections);
 
+    // Clone cursors for the response thread — the originals are needed
+    // later for seed drain gating.
+    let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_cursor_response = Arc::clone(&replication_cursor);
     let s3 = Arc::clone(&shutdown);
     let response_handle = std::thread::Builder::new()
@@ -359,7 +363,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             crate::response::run(
                 output_consumer,
                 control_rx,
-                journal_cursor,
+                journal_cursor_response,
                 replication_cursor_response,
                 &s3,
                 heartbeat_interval,
@@ -369,7 +373,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             crate::uring_response::run(
                 output_consumer,
                 control_rx,
-                journal_cursor,
+                journal_cursor_response,
                 replication_cursor_response,
                 &s3,
                 heartbeat_interval,
@@ -451,8 +455,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             });
         }
 
+        let mut last_published_seq = 0u64;
         for acct in 1..=config.accounts {
-            producer.publish(InputSlot {
+            last_published_seq = producer.publish(InputSlot {
                 connection_id: 0,
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
@@ -461,6 +466,30 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
+        }
+
+        // Wait for all seed events to be fully processed by the entire
+        // pipeline before accepting clients. Without this, early client
+        // orders compete with seed events for pipeline time (journal fsync,
+        // matching, replication), contaminating benchmark results.
+        //
+        // Gates on three cursors (all in disruptor sequence space):
+        // - journal_cursor: journal stage has written + fsynced all seeds
+        // - matching_cursor: matching stage has processed all seeds
+        // - replication_cursor: replica has acked all seeds (u64::MAX if
+        //   no replica is connected, so the check passes instantly)
+        let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
+        while journal_cursor
+            .get()
+            .load(std::sync::atomic::Ordering::Acquire)
+            < last_seed_seq
+            || matching_cursor
+                .get()
+                .load(std::sync::atomic::Ordering::Acquire)
+                < last_seed_seq
+            || replication_cursor.load(std::sync::atomic::Ordering::Acquire) < last_seed_seq
+        {
+            std::hint::spin_loop();
         }
 
         info!(
