@@ -141,10 +141,13 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6=
 
 | Priority | Optimization | Est. gain | Complexity |
 |----------|-------------|-----------|------------|
-| 1 | Higher window depth on Cherry (512, 1024) | Up to 2x repl throughput | Config only |
-| 2 | Embed ReservationSlot in RestingOrder | 5-10% matching | Moderate |
-| 3 | io_uring for replication TCP (SEND/RECV) | Reduce syscall overhead | High |
-| 4 | Kernel bypass (AF_XDP) | Up to 2x over TCP | Very high |
+| 1 | Embed ReservationSlot in RestingOrder | 5-10% matching | Moderate |
+| 2 | io_uring improvements (kernel 6.12+) | 15-25% throughput | Low (kernel upgrade) |
+| 3 | OpenOnload (Solarflare NIC) | 2-4x throughput, 60-80% latency | Zero code (LD_PRELOAD), NIC cost |
+| 4 | AF_XDP + smoltcp userspace TCP | 20-40% latency | Very high (6+ months) |
+| 5 | DPDK + F-Stack | 2-3x throughput | Extreme, GPL concern |
+
+Options 2-5 are mutually exclusive kernel bypass paths (pick one). See README Performance Tuning leads for details.
 
 **Benchmarking constraint**: do NOT optimize by batching multiple client requests into a single write — real clients send one order at a time. Batch submission is unrealistic and inflates throughput numbers artificially.
 
