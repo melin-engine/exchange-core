@@ -276,9 +276,9 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 | Mode | Throughput | p50 | p99 | p99.9 | max |
 |------|-----------|-----|-----|-------|-----|
 | **Full durability** (fsync) | **4.0M orders/sec** | 920 µs | 1,035 µs | 1,082 µs | 1,560 µs |
-| **No persistence** | **8.0M orders/sec** | 441 µs | 629 µs | 661 µs | 1,969 µs |
-| **Single-order latency** | 13.5K orders/sec | **73 µs** | 105 µs | 108 µs | 6,472 µs |
 | **Synchronous replication** | **2.7M orders/sec** | 1,059 µs | 1,311 µs | 1,393 µs | 1,794 µs |
+| **Single-order latency** | 13.5K orders/sec | **73 µs** | 105 µs | 108 µs | 6,472 µs |
+| **No persistence** | **8.0M orders/sec** | 441 µs | 629 µs | 661 µs | 1,969 µs |
 
 ### Peak-load throughput — full durability
 
@@ -294,36 +294,6 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 | **p99.99** | 1,113 µs |
 | **p99.999** | 1,338 µs |
 | **max** | 1,560 µs |
-
-### Peak-load throughput — no persistence
-
-100M order pairs, 16 clients, 256 pipelined:
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 8.0M orders/sec |
-| **p50** | 441 µs |
-| **p90** | 514 µs |
-| **p99** | 629 µs |
-| **p99.9** | 661 µs |
-| **p99.99** | 760 µs |
-| **p99.999** | 1,748 µs |
-| **max** | 1,969 µs |
-
-### Single-order latency — full durability
-
-1M order pairs, 1 client, no pipelining (window=1):
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 13.5K orders/sec |
-| **p50** | 73 µs |
-| **p90** | 74 µs |
-| **p99** | 105 µs |
-| **p99.9** | 108 µs |
-| **p99.99** | 127 µs |
-| **p99.999** | 200 µs |
-| **max** | 6,472 µs |
 
 ### Synchronous replication — full durability
 
@@ -341,6 +311,36 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 | **max** | 1,794 µs |
 
 Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
+
+### Single-order latency — full durability
+
+1M order pairs, 1 client, no pipelining (window=1):
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 13.5K orders/sec |
+| **p50** | 73 µs |
+| **p90** | 74 µs |
+| **p99** | 105 µs |
+| **p99.9** | 108 µs |
+| **p99.99** | 127 µs |
+| **p99.999** | 200 µs |
+| **max** | 6,472 µs |
+
+### Peak-load throughput — no persistence
+
+100M order pairs, 16 clients, 256 pipelined:
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 8.0M orders/sec |
+| **p50** | 441 µs |
+| **p90** | 514 µs |
+| **p99** | 629 µs |
+| **p99.9** | 661 µs |
+| **p99.99** | 760 µs |
+| **p99.999** | 1,748 µs |
+| **max** | 1,969 µs |
 
 ### Plots
 
