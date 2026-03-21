@@ -227,6 +227,15 @@ Throughput (orders/sec)
 <circle cx="811" cy="119" r="4" opacity="1" fill="#FF9100" stroke="none" stroke-width="1"/>
 <circle cx="811" cy="114" r="4" opacity="1" fill="#FF9100" stroke="none" stroke-width="1"/>
 <circle cx="811" cy="119" r="4" opacity="1" fill="#FF9100" stroke="none" stroke-width="1"/>
+<text x="811" y="103" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#000000">
+i100
+</text>
+<text x="811" y="98" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#000000">
+i1000
+</text>
+<text x="811" y="103" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#000000">
+i10
+</text>
 <rect x="90" y="47" width="77" height="60" opacity="0.8" fill="#FFFFFF" stroke="none"/>
 <rect x="90" y="47" width="77" height="60" opacity="0.3" fill="none" stroke="#000000"/>
 <text x="130" y="57" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#000000">

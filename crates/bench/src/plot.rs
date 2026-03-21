@@ -137,7 +137,13 @@ fn parse_args(args: &[String], default_output: &str) -> PlotArgs {
     }
 }
 
-fn load_results(files: &[PathBuf]) -> Vec<BenchResult> {
+/// A loaded benchmark result paired with its source filename.
+struct LoadedResult {
+    result: BenchResult,
+    filename: String,
+}
+
+fn load_results(files: &[PathBuf]) -> Vec<LoadedResult> {
     let mut results = Vec::new();
     for path in files {
         let data = fs::read_to_string(path).unwrap_or_else(|e| {
@@ -148,7 +154,16 @@ fn load_results(files: &[PathBuf]) -> Vec<BenchResult> {
             continue;
         }
         match serde_json::from_str::<BenchResult>(&data) {
-            Ok(r) => results.push(r),
+            Ok(r) => {
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                results.push(LoadedResult {
+                    result: r,
+                    filename,
+                });
+            }
             Err(e) => eprintln!("warning: cannot parse {}: {}", path.display(), e),
         }
     }
@@ -181,16 +196,62 @@ fn extract_percentiles(result: &BenchResult) -> Vec<(f64, f64)> {
     points
 }
 
-/// Build a friendly label from the JSON filename or label field.
-fn friendly_label(result: &BenchResult, idx: usize) -> String {
-    let throughput = result.throughput_ops / 1_000_000.0;
-    if result.throughput_ops > 100_000.0 {
-        format!("{:.1}M ops/s", throughput)
-    } else if result.throughput_ops > 1_000.0 {
-        format!("{:.1}K ops/s", result.throughput_ops / 1_000.0)
+/// Format throughput as a compact string (e.g. "4.0M/s").
+fn format_throughput(ops: f64) -> String {
+    if ops >= 1_000_000.0 {
+        format!("{:.1}M/s", ops / 1_000_000.0)
+    } else if ops >= 1_000.0 {
+        format!("{:.0}K/s", ops / 1_000.0)
     } else {
-        format!("run {}", idx + 1)
+        format!("{:.0}/s", ops)
     }
+}
+
+/// Extract a human-readable mode name from a filename like "1-fsync.json".
+///
+/// Strips the leading number prefix and extension, then title-cases the
+/// remainder: "1-fsync.json" -> "Fsync", "4-replication.json" -> "Replication",
+/// "2-no-persist.json" -> "No-persist".
+fn mode_from_filename(filename: &str) -> String {
+    let stem = filename.strip_suffix(".json").unwrap_or(filename);
+    // Strip leading digit-dash prefix (e.g. "1-", "42-").
+    let name = stem
+        .find('-')
+        .and_then(|pos| {
+            if stem[..pos].chars().all(|c| c.is_ascii_digit()) {
+                Some(&stem[pos + 1..])
+            } else {
+                None
+            }
+        })
+        .unwrap_or(stem);
+    // Title-case the first character.
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+        None => name.to_string(),
+    }
+}
+
+/// Build a label for the latency CDF plot: "Mode (throughput)".
+///
+/// Uses the source filename to infer the mode name, then appends throughput.
+/// Example: "1-fsync.json" with 4.0M ops/s -> "Fsync (4.0M/s)".
+fn cdf_label(loaded: &LoadedResult) -> String {
+    let mode = mode_from_filename(&loaded.filename);
+    let tp = format_throughput(loaded.result.throughput_ops);
+    format!("{mode} ({tp})")
+}
+
+/// Build a label for saturation plots using the filename stem directly.
+///
+/// Example: "w256.json" -> "w256", "i100.json" -> "i100".
+fn saturation_label(loaded: &LoadedResult) -> String {
+    loaded
+        .filename
+        .strip_suffix(".json")
+        .unwrap_or(&loaded.filename)
+        .to_string()
 }
 
 // =====================================================================
@@ -207,14 +268,25 @@ fn cmd_latency_cdf(args: &[String]) {
     plot_latency_cdf(&results, &opts.output);
 }
 
-fn plot_latency_cdf(results: &[BenchResult], output: &PathBuf) {
+fn plot_latency_cdf(results: &[LoadedResult], output: &PathBuf) {
+    // Filter out low-throughput results (e.g. single-order latency at ~13K ops/s)
+    // that are incomparable with peak-load benchmarks on the same CDF axes.
+    let results: Vec<&LoadedResult> = results
+        .iter()
+        .filter(|r| r.result.throughput_ops >= 100_000.0)
+        .collect();
+    if results.is_empty() {
+        eprintln!("warning: no results >= 100K ops/s for CDF plot, skipping");
+        return;
+    }
+
     let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
     root.fill(&WHITE).unwrap();
 
     // Find max latency across all results for Y-axis range.
     let max_lat = results
         .iter()
-        .flat_map(|r| r.latency.values())
+        .flat_map(|r| r.result.latency.values())
         .cloned()
         .fold(0.0f64, f64::max)
         * 1.1;
@@ -245,10 +317,10 @@ fn plot_latency_cdf(results: &[BenchResult], output: &PathBuf) {
         .draw()
         .unwrap();
 
-    for (i, result) in results.iter().enumerate() {
-        let points = extract_percentiles(result);
+    for (i, loaded) in results.iter().enumerate() {
+        let points = extract_percentiles(&loaded.result);
         let color = COLORS[i % COLORS.len()];
-        let label = friendly_label(result, i);
+        let label = cdf_label(loaded);
 
         // Map percentile values to x-indices.
         let indexed: Vec<(usize, f64)> = points
@@ -297,26 +369,35 @@ fn plot_latency_cdf(results: &[BenchResult], output: &PathBuf) {
 
 fn cmd_saturation(args: &[String]) {
     let opts = parse_args(args, "saturation.svg");
-    let results = load_results(&opts.files);
-    if results.len() < 2 {
+    let loaded = load_results(&opts.files);
+    if loaded.len() < 2 {
         eprintln!("error: need at least 2 result files for saturation curve");
         std::process::exit(1);
     }
-    plot_saturation(&results, &opts.output);
+    plot_saturation(&loaded, &opts.output);
 }
 
-fn plot_saturation(results: &[BenchResult], output: &PathBuf) {
+fn plot_saturation(results: &[LoadedResult], output: &PathBuf) {
     let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
     root.fill(&WHITE).unwrap();
 
     // Sort by throughput for the curve.
-    let mut sorted: Vec<&BenchResult> = results.iter().collect();
-    sorted.sort_by(|a, b| a.throughput_ops.partial_cmp(&b.throughput_ops).unwrap());
+    let mut sorted: Vec<&LoadedResult> = results.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.result
+            .throughput_ops
+            .partial_cmp(&b.result.throughput_ops)
+            .unwrap()
+    });
 
-    let max_throughput = sorted.last().map(|r| r.throughput_ops).unwrap_or(1.0) * 1.1;
+    let max_throughput = sorted
+        .last()
+        .map(|r| r.result.throughput_ops)
+        .unwrap_or(1.0)
+        * 1.1;
     let max_latency = sorted
         .iter()
-        .filter_map(|r| r.latency.get("p99_us"))
+        .filter_map(|r| r.result.latency.get("p99_us"))
         .cloned()
         .fold(0.0f64, f64::max)
         * 1.3;
@@ -358,7 +439,12 @@ fn plot_saturation(results: &[BenchResult], output: &PathBuf) {
     // Plot p50 line.
     let p50_points: Vec<(f64, f64)> = sorted
         .iter()
-        .filter_map(|r| r.latency.get("p50_us").map(|lat| (r.throughput_ops, *lat)))
+        .filter_map(|r| {
+            r.result
+                .latency
+                .get("p50_us")
+                .map(|lat| (r.result.throughput_ops, *lat))
+        })
         .collect();
 
     if !p50_points.is_empty() {
@@ -384,7 +470,12 @@ fn plot_saturation(results: &[BenchResult], output: &PathBuf) {
     // Plot p99 line.
     let p99_points: Vec<(f64, f64)> = sorted
         .iter()
-        .filter_map(|r| r.latency.get("p99_us").map(|lat| (r.throughput_ops, *lat)))
+        .filter_map(|r| {
+            r.result
+                .latency
+                .get("p99_us")
+                .map(|lat| (r.result.throughput_ops, *lat))
+        })
         .collect();
 
     if !p99_points.is_empty() {
@@ -411,9 +502,10 @@ fn plot_saturation(results: &[BenchResult], output: &PathBuf) {
     let p999_points: Vec<(f64, f64)> = sorted
         .iter()
         .filter_map(|r| {
-            r.latency
+            r.result
+                .latency
                 .get("p99.9_us")
-                .map(|lat| (r.throughput_ops, *lat))
+                .map(|lat| (r.result.throughput_ops, *lat))
         })
         .collect();
 
@@ -434,6 +526,30 @@ fn plot_saturation(results: &[BenchResult], output: &PathBuf) {
                     .iter()
                     .map(|&(x, y)| Circle::new((x, y), 4, COLOR_SINGLE.filled())),
             )
+            .unwrap();
+    }
+
+    // Label each data point with its filename stem (e.g. "w32", "w256")
+    // above the p99.9 dot for readability.
+    let labels: Vec<(f64, f64, String)> = sorted
+        .iter()
+        .filter_map(|r| {
+            r.result
+                .latency
+                .get("p99.9_us")
+                .or_else(|| r.result.latency.get("p99_us"))
+                .map(|lat| (r.result.throughput_ops, *lat, saturation_label(r)))
+        })
+        .collect();
+    if !labels.is_empty() {
+        chart
+            .draw_series(labels.iter().map(|(x, y, label)| {
+                Text::new(
+                    label.clone(),
+                    (*x, *y + max_latency * 0.04),
+                    ("sans-serif", 11).into_font(),
+                )
+            }))
             .unwrap();
     }
 
@@ -585,7 +701,7 @@ fn cmd_all(args: &[String]) {
         std::process::exit(1);
     }
 
-    // 1. Latency CDF
+    // 1. Latency CDF (plot_latency_cdf filters out < 100K ops/s internally).
     let cdf_path = dir.join("latency-cdf.svg");
     plot_latency_cdf(&results, &cdf_path);
 

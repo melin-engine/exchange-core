@@ -344,7 +344,7 @@ Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
 
 ### Plots
 
-**Latency CDF** — all four modes on the same axes:
+**Latency CDF** — three peak-load modes on the same axes:
 
 ![Latency CDF](docs/plots/latency-cdf.svg)
 

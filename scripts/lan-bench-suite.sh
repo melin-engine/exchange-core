@@ -399,7 +399,6 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     CDF_FILES=(
         "${RESULTS_DIR}/1-fsync.json"
         "${RESULTS_DIR}/2-no-persist.json"
-        "${RESULTS_DIR}/3-single-order.json"
     )
     if [[ -f "${RESULTS_DIR}/4-replication.json" ]]; then
         CDF_FILES+=("${RESULTS_DIR}/4-replication.json")
