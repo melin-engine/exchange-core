@@ -73,7 +73,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Post-Only (maker-only, reject if would take)
 
 ### Matching Engine ([docs/matching-engine.md](docs/matching-engine.md))
-- [x] Strict price-time priority (BTreeMap + VecDeque order book)
+- [x] Strict price-time priority (sorted Vec + binary search order book)
 - [x] Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced
 - [x] Multi-instrument exchange with shared account balances
 - [x] Cancel-replace / order amendment (atomic price/qty modify; preserves queue priority when price unchanged, loses priority on price change)
@@ -94,7 +94,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Price band checks (static lower/upper bounds, per-instrument — part of circuit breaker config)
 - [ ] Position/exposure limits
 - [ ] Order throttling (per-account rate limiting)
-- [ ] Bulk account provisioning — direct state construction (bypass journal) or binary manifest import for fast seeding of 100M+ accounts. Current O(accounts × instruments) deposit loop takes ~40 min at 1M accounts.
+- [x] Bulk account provisioning (`ProvisionAccount` journal event — O(accounts) seeding, ~0.5s for 1M accounts)
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums
@@ -225,7 +225,7 @@ Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexi
 #### Leads (estimated impact, not yet implemented)
 
 - [ ] **Embed `ReservationSlot` in `RestingOrder`** — eliminates the global `order_info` FxHashMap entirely. Every cancel/amend currently does 2 lookups + 1 remove on `order_info` (~15-30ns wasted). With the slot stored in the resting order itself, that drops to zero. Est. 5-10% throughput. Moderate complexity: needs to thread `ReservationSlot` through the OrderBook API.
-- [ ] **Overlapped io_uring journal writes** — double-buffer design hides NVMe FUA latency behind next-batch accumulation. Implemented on `perf/uring-tail-latency-tuning` branch with SINGLE_ISSUER, registered fd, busy-poll CQE reap. Est. 50-80% fsync-mode throughput gain. Needs tail latency tuning on dedicated hardware; consider runtime opt-in flag.
+- [x] **Overlapped io_uring journal writes** — double-buffer design hides NVMe FUA latency behind next-batch accumulation. SINGLE_ISSUER, registered fd, busy-poll CQE reap. Active by default when `io-uring` feature is enabled.
 - [ ] **Vectored response writes** — batch multiple responses to the same connection into one `writev` syscall. Response stage is 24.5% busy on UDS at 4.6M/s. Est. 5-10% throughput.
 - [ ] **Kernel bypass (AF_XDP)** — eliminates all syscall overhead for network I/O. The gap from UDS (4.6M) to pipeline-only (8.5M) is pure transport cost. Est. up to 2x throughput over TCP. Very high complexity.
 - [ ] **`#[inline(always)]` on hot-path exchange methods** — `cancel`, `cancel_replace`, `execute` are called millions of times through dispatch. Inlining lets LLVM optimize across boundaries. Est. 2-5% throughput. Very low complexity.
@@ -248,7 +248,7 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks at [`331c089`](../../commit/331c089). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`afbf043`](../../commit/afbf043). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
 ### Headline numbers
 
