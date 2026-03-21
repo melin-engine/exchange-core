@@ -20,10 +20,12 @@ use melin_disruptor::padding::Sequence;
 const CHUNK_SIZE: usize = 128 * 1024;
 
 /// Capacity of the replication ring (number of batch slots).
-/// 2^6 = 64 slots. At 128 KiB per slot, total buffer = 8 MiB.
-/// Provides buffering for ~64K events (64 batches * 1024 events/batch)
-/// before backpressure reaches the journal stage.
-pub const REPLICATION_RING_CAPACITY: usize = 1 << 6;
+/// 2^8 = 256 slots. At 128 KiB per slot, total buffer = 32 MiB.
+/// Provides buffering for ~256K events (256 batches * 1024 events/batch)
+/// before backpressure reaches the journal stage. Larger than the
+/// minimum (64 slots) to absorb sender/replica latency spikes without
+/// stalling the journal stage.
+pub const REPLICATION_RING_CAPACITY: usize = 1 << 8;
 
 /// Metadata for one replication batch. Small and `Copy` — carried in the
 /// disruptor ring slot. The actual byte data lives in the shared buffer
@@ -32,6 +34,8 @@ pub const REPLICATION_RING_CAPACITY: usize = 1 << 6;
 pub struct ReplicationMeta {
     /// Number of valid bytes in the corresponding buffer chunk.
     pub len: u32,
+    /// Number of journal entries in this batch.
+    pub entry_count: u32,
     /// Sequence number of the last journal entry in this batch.
     pub end_sequence: u64,
     /// BLAKE3 chain hash after all entries in this batch.
@@ -75,7 +79,13 @@ impl ReplicationProducer {
     ///
     /// # Panics
     /// Panics if `data.len() > CHUNK_SIZE` (128 KiB).
-    pub fn publish(&mut self, data: &[u8], end_sequence: u64, chain_hash: [u8; 32]) {
+    pub fn publish(
+        &mut self,
+        data: &[u8],
+        end_sequence: u64,
+        chain_hash: [u8; 32],
+        entry_count: u32,
+    ) {
         assert!(
             data.len() <= CHUNK_SIZE,
             "replication batch too large: {} > {CHUNK_SIZE}",
@@ -124,6 +134,7 @@ impl ReplicationProducer {
                         seq,
                         ReplicationMeta {
                             len: data.len() as u32,
+                            entry_count,
                             end_sequence,
                             chain_hash,
                         },
@@ -204,24 +215,27 @@ impl ReplicationConsumer {
 /// (one per replica sender thread).
 pub fn build_replication_ring(
     num_consumers: usize,
+    capacity: usize,
 ) -> (ReplicationProducer, Vec<ReplicationConsumer>) {
     assert!(num_consumers > 0, "need at least one consumer");
+    assert!(
+        capacity.is_power_of_two(),
+        "replication ring capacity must be a power of two, got {capacity}"
+    );
 
-    let mut builder =
-        melin_disruptor::ring::DisruptorBuilder::<ReplicationMeta>::new(REPLICATION_RING_CAPACITY);
+    let mut builder = melin_disruptor::ring::DisruptorBuilder::<ReplicationMeta>::new(capacity);
     for _ in 0..num_consumers {
         builder = builder.add_consumer();
     }
     let (inner_producer, inner_consumers) = builder.build();
 
     // Pre-allocate byte buffers — one 128 KiB chunk per ring slot.
-    // Total: 64 * 128 KiB = 8 MiB.
-    let chunks: Vec<UnsafeCell<[u8; CHUNK_SIZE]>> = (0..REPLICATION_RING_CAPACITY)
+    let chunks: Vec<UnsafeCell<[u8; CHUNK_SIZE]>> = (0..capacity)
         .map(|_| UnsafeCell::new([0u8; CHUNK_SIZE]))
         .collect();
     let buffers = Arc::new(SharedBuffers {
         chunks: chunks.into_boxed_slice(),
-        mask: (REPLICATION_RING_CAPACITY - 1) as u64,
+        mask: (capacity - 1) as u64,
     });
 
     let producer = ReplicationProducer {
@@ -248,12 +262,12 @@ mod tests {
 
     #[test]
     fn single_batch_round_trip() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         let data = b"hello replication ring";
         let chain = [0xAB; 32];
-        producer.publish(data, 42, chain);
+        producer.publish(data, 42, chain, 1);
 
         let (meta, received) = consumer.try_read().unwrap();
         assert_eq!(meta.end_sequence, 42);
@@ -264,12 +278,12 @@ mod tests {
 
     #[test]
     fn multiple_batches() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         for i in 0..10u64 {
             let data = format!("batch {i}");
-            producer.publish(data.as_bytes(), i, [i as u8; 32]);
+            producer.publish(data.as_bytes(), i, [i as u8; 32], 1);
         }
 
         for i in 0..10u64 {
@@ -285,12 +299,12 @@ mod tests {
 
     #[test]
     fn two_consumers_independent_progress() {
-        let (mut producer, mut consumers) = build_replication_ring(2);
+        let (mut producer, mut consumers) = build_replication_ring(2, REPLICATION_RING_CAPACITY);
         let mut c1 = consumers.pop().unwrap();
         let mut c0 = consumers.pop().unwrap();
 
-        producer.publish(b"first", 1, [0; 32]);
-        producer.publish(b"second", 2, [0; 32]);
+        producer.publish(b"first", 1, [0; 32], 1);
+        producer.publish(b"second", 2, [0; 32], 1);
 
         // c0 reads both.
         let (m, d) = c0.try_read().unwrap();
@@ -316,11 +330,11 @@ mod tests {
 
     #[test]
     fn large_batch_fills_chunk() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         let data = vec![0xFFu8; CHUNK_SIZE];
-        producer.publish(&data, 99, [0x11; 32]);
+        producer.publish(&data, 99, [0x11; 32], 1);
 
         let (meta, received) = consumer.try_read().unwrap();
         assert_eq!(meta.len as usize, CHUNK_SIZE);
@@ -332,12 +346,12 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         for i in 0..REPLICATION_RING_CAPACITY as u64 * 3 {
             let data = i.to_le_bytes();
-            producer.publish(&data, i, [0; 32]);
+            producer.publish(&data, i, [0; 32], 1);
             let (meta, received) = consumer.try_read().unwrap();
             assert_eq!(meta.end_sequence, i);
             assert_eq!(received, &data);
@@ -347,7 +361,7 @@ mod tests {
 
     #[test]
     fn concurrent_producer_consumer() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let mut consumer = consumers.pop().unwrap();
 
         let count = 10_000u64;
@@ -371,7 +385,7 @@ mod tests {
         });
 
         for i in 0..count {
-            producer.publish(&i.to_le_bytes(), i, [0; 32]);
+            producer.publish(&i.to_le_bytes(), i, [0; 32], 1);
         }
 
         let received = consumer_thread.join().unwrap();

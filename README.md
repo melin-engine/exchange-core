@@ -222,7 +222,28 @@ Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexi
 - [x] Right-sized HashMap pre-allocation — order_index 4K, order_info 32K (was 1M/2M). Keeps hash tables cache-resident in L2/L3 instead of causing random misses across multi-GB virtual address ranges. ~5% matching utilization reduction.
 - [x] Batched matching stage consumption — `consume_batch(32)` replaces per-event `try_consume()`. Amortizes one atomic Release store over 32 events. Benchmarked sizes 1–256; 32 is the sweet spot (+3% throughput, -50% p99 vs unbatched, no burstiness penalty).
 
+#### Bottleneck stack
+
+```
+Engine only:     12.1M/s  ← matching engine has 6x headroom
+Pipeline:         8.5M/s  ← disruptor/SPSC overhead is small
+UDS no-persist:   4.6M/s  ← transport is the wall
+TCP no-persist:   3.9M/s  ← TCP stack overhead
+TCP + fsync:      1.9M/s  ← journal fsync gating halves it
+TCP + repl:       1.1M/s  ← replica RTT halves it again
+```
+
+The matching engine is not the bottleneck. Further throughput gains require reducing transport overhead, journal I/O optimization, or replication protocol improvements.
+
 #### Leads (estimated impact, not yet implemented)
+
+**Replication throughput** (current: 1.1M/s with sync replication):
+
+- [ ] **Higher window depth** (512, 1024) — throughput under replication is bounded by Little's Law: `throughput = inflight / RTT`. With replica fsync ~80µs over VLAN, more in-flight orders directly translates to higher throughput. Config-only change. Est. up to 2x replication throughput.
+- [x] **Pin sender thread to dedicated core** — replication sender pinned via `--cores` 4th value (default core 6). Eliminates scheduling jitter.
+- [ ] **io_uring for replication TCP** (`SEND`/`RECV` SQEs) — replace syscall-based send/recv with io_uring on the sender thread. Reduces per-batch syscall overhead (~400ns/batch). High complexity.
+
+**Engine/pipeline throughput** (current: 4.0M/s with fsync, 8.0M/s no-persist):
 
 - [ ] **Embed `ReservationSlot` in `RestingOrder`** — eliminates the global `order_info` FxHashMap entirely. Every cancel/amend currently does 2 lookups + 1 remove on `order_info` (~15-30ns wasted). With the slot stored in the resting order itself, that drops to zero. Est. 5-10% throughput. Moderate complexity: needs to thread `ReservationSlot` through the OrderBook API.
 - [x] **Overlapped io_uring journal writes** — double-buffer design hides NVMe FUA latency behind next-batch accumulation. SINGLE_ISSUER, registered fd, busy-poll CQE reap. Active by default when `io-uring` feature is enabled.

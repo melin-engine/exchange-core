@@ -58,9 +58,6 @@ const MAX_CONTROL_FRAME: usize = 256;
 /// at ~80 bytes each = ~80 KiB, plus header overhead.
 const MAX_DATA_FRAME: usize = 256 * 1024;
 
-/// Heartbeat interval for the replication connection (5 seconds).
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 // --- Wire protocol encode/decode ---
 
 /// Handshake message sent by the replica on connection.
@@ -90,6 +87,7 @@ pub enum PrimaryMessage {
     DataBatch {
         end_sequence: u64,
         chain_hash: [u8; 32],
+        entry_count: u32,
         journal_bytes: Vec<u8>,
     },
     Heartbeat {
@@ -158,15 +156,17 @@ fn encode_hash_mismatch(buf: &mut Vec<u8>) {
 fn encode_data_batch(
     end_sequence: u64,
     chain_hash: &[u8; 32],
+    entry_count: u32,
     journal_bytes: &[u8],
     buf: &mut Vec<u8>,
 ) {
-    // type(1) + end_sequence(8) + chain_hash(32) + journal_bytes
-    let payload_len: u32 = (1 + 8 + 32 + journal_bytes.len()) as u32;
+    // type(1) + end_sequence(8) + chain_hash(32) + entry_count(4) + journal_bytes
+    let payload_len: u32 = (1 + 8 + 32 + 4 + journal_bytes.len()) as u32;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_DATA_BATCH);
     buf.extend_from_slice(&end_sequence.to_le_bytes());
     buf.extend_from_slice(chain_hash);
+    buf.extend_from_slice(&entry_count.to_le_bytes());
     buf.extend_from_slice(journal_bytes);
 }
 
@@ -195,6 +195,26 @@ fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// Read a length-prefixed frame into a reusable buffer. Avoids per-frame
+/// heap allocation — the caller owns the Vec and it grows to high-water
+/// mark then stays there.
+fn read_frame_into(reader: &mut impl Read, buf: &mut Vec<u8>, max_size: usize) -> io::Result<()> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > max_size {
+        return Err(io::Error::other(format!(
+            "frame too large: {len} > {max_size}"
+        )));
+    }
+    if len == 0 {
+        return Err(io::Error::other("empty frame"));
+    }
+    buf.resize(len, 0);
+    reader.read_exact(buf)?;
+    Ok(())
 }
 
 /// Decode a replica message from a frame payload.
@@ -252,16 +272,18 @@ fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),
         MSG_HASH_MISMATCH => Ok(PrimaryMessage::HashMismatch),
         MSG_DATA_BATCH => {
-            if payload.len() < 1 + 8 + 32 {
+            if payload.len() < 1 + 8 + 32 + 4 {
                 return Err(io::Error::other("DataBatch too short"));
             }
             let end_sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
             let mut chain_hash = [0u8; 32];
             chain_hash.copy_from_slice(&payload[9..41]);
-            let journal_bytes = payload[41..].to_vec();
+            let entry_count = u32::from_le_bytes(payload[41..45].try_into().unwrap());
+            let journal_bytes = payload[45..].to_vec();
             Ok(PrimaryMessage::DataBatch {
                 end_sequence,
                 chain_hash,
+                entry_count,
                 journal_bytes,
             })
         }
@@ -302,6 +324,8 @@ pub fn run_sender(
     genesis_entry: Vec<u8>,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
+    batch_size: usize,
+    heartbeat_secs: u64,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -362,6 +386,8 @@ pub fn run_sender(
             &replication_cursor,
             &genesis_entry,
             shutdown,
+            batch_size,
+            heartbeat_secs,
         ) {
             Ok(()) => warn!("replica disconnected cleanly"),
             Err(e) => warn!(error = %e, "replica connection error"),
@@ -389,6 +415,8 @@ fn handle_replica_connection(
     replication_cursor: &Arc<AtomicU64>,
     genesis_entry: &[u8],
     shutdown: &AtomicBool,
+    batch_size: usize,
+    heartbeat_secs: u64,
 ) -> io::Result<()> {
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -448,6 +476,7 @@ fn handle_replica_connection(
     // Events after that will gate until the replica acks them.
     replication_cursor.store(handshake.last_sequence + 1, Ordering::Release);
 
+    let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();
     let mut last_sequence = handshake.last_sequence;
     let mut last_chain_hash = handshake.chain_hash;
@@ -468,15 +497,27 @@ fn handle_replica_connection(
             // amortize syscall overhead. Drain up to 16 batches from
             // the ring before flushing. Each batch is encoded into the
             // send buffer; a single write_all+flush sends them all.
-            encode_data_batch(meta.end_sequence, &meta.chain_hash, data, &mut send_buf);
+            encode_data_batch(
+                meta.end_sequence,
+                &meta.chain_hash,
+                meta.entry_count,
+                data,
+                &mut send_buf,
+            );
             repl_consumer.commit();
             last_sequence = meta.end_sequence;
             last_chain_hash = meta.chain_hash;
 
-            // Drain more batches if available (up to 15 more).
-            for _ in 0..15 {
+            // Drain more batches if available.
+            for _ in 1..batch_size {
                 if let Some((meta, data)) = repl_consumer.try_read() {
-                    encode_data_batch(meta.end_sequence, &meta.chain_hash, data, &mut send_buf);
+                    encode_data_batch(
+                        meta.end_sequence,
+                        &meta.chain_hash,
+                        meta.entry_count,
+                        data,
+                        &mut send_buf,
+                    );
                     repl_consumer.commit();
                     last_sequence = meta.end_sequence;
                     last_chain_hash = meta.chain_hash;
@@ -495,7 +536,7 @@ fn handle_replica_connection(
             last_send = std::time::Instant::now();
         } else {
             // No batch available — send heartbeat if idle.
-            if last_send.elapsed() >= HEARTBEAT_INTERVAL {
+            if last_send.elapsed() >= heartbeat_interval {
                 encode_heartbeat(last_sequence, &last_chain_hash, &mut send_buf);
                 if let Err(e) = writer.write_all(&send_buf) {
                     return Err(io::Error::other(format!("write Heartbeat: {e}")));
@@ -690,6 +731,9 @@ pub fn run_receiver(
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_entry_count: u64 = 0;
     let mut accum_end_sequence: u64;
+    // Reusable frame buffer — grows to high-water mark, avoids per-frame
+    // heap allocation in the hot receive loop.
+    let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     // Main receive loop.
     loop {
@@ -700,8 +744,8 @@ pub fn run_receiver(
 
         // Read the first frame (blocking, with the 5s timeout for
         // shutdown checking).
-        let frame = match read_frame(&mut reader, MAX_DATA_FRAME) {
-            Ok(f) => f,
+        match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
+            Ok(()) => {}
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
@@ -710,23 +754,22 @@ pub fn run_receiver(
             Err(e) => {
                 return Err(format!("read error from primary: {e}").into());
             }
-        };
+        }
 
-        let message = decode_primary_message(&frame)?;
+        let message = decode_primary_message(&frame_buf)?;
         match message {
             PrimaryMessage::DataBatch {
                 end_sequence,
                 chain_hash: _batch_chain_hash,
+                entry_count,
                 journal_bytes,
             } => {
-                // Decode + replay + accumulate for coalesced fsync.
-                decode_replay_accum(
-                    &journal_bytes,
-                    &mut exchange,
-                    &mut reports,
-                    &mut journal_accum,
-                    &mut accum_entry_count,
-                )?;
+                // Accumulate raw bytes for coalesced fsync. Replay is
+                // deferred until after the ack — the ack only guarantees
+                // durability (bytes on disk), not state application.
+                // Entry count comes from the wire frame — no data scanning.
+                journal_accum.extend_from_slice(&journal_bytes);
+                accum_entry_count += entry_count as u64;
                 accum_end_sequence = end_sequence;
 
                 // Drain additional frames already in the TCP buffer.
@@ -744,32 +787,28 @@ pub fn run_receiver(
                     if !ready {
                         break;
                     }
-                    let frame = match read_frame(&mut reader, MAX_DATA_FRAME) {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
-                    match decode_primary_message(&frame)? {
+                    if read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME).is_err() {
+                        break;
+                    }
+                    match decode_primary_message(&frame_buf)? {
                         PrimaryMessage::DataBatch {
                             end_sequence,
+                            entry_count,
                             journal_bytes,
                             ..
                         } => {
-                            decode_replay_accum(
-                                &journal_bytes,
-                                &mut exchange,
-                                &mut reports,
-                                &mut journal_accum,
-                                &mut accum_entry_count,
-                            )?;
+                            journal_accum.extend_from_slice(&journal_bytes);
+                            accum_entry_count += entry_count as u64;
                             accum_end_sequence = end_sequence;
                         }
                         _ => break,
                     }
                 }
-                // One fsync for all accumulated batches.
+
+                // Fsync all accumulated batches.
                 journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
 
-                // One ack for the highest sequence.
+                // Ack immediately — data is durable on disk.
                 let ack = Ack {
                     acked_sequence: accum_end_sequence,
                 };
@@ -777,6 +816,13 @@ pub fn run_receiver(
                 tcp_writer.write_all(&send_buf)?;
                 tcp_writer.flush()?;
                 send_buf.clear();
+
+                // Replay AFTER acking. The primary's replication cursor
+                // advances as soon as the ack arrives, unblocking the
+                // response stage. Replay is not on the critical path —
+                // on crash recovery, the replica replays from its journal.
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+
                 journal_accum.clear();
                 accum_entry_count = 0;
             }
@@ -804,15 +850,12 @@ pub fn run_receiver(
 ///
 /// The reports Vec is caller-owned and reused across calls to avoid
 /// per-event heap allocation.
-/// Decode journal entries, replay into exchange, accumulate raw bytes for
-/// coalesced fsync. Used by the replica to batch multiple DataBatch frames
-/// into one pwritev2+RWF_DSYNC call.
-fn decode_replay_accum(
+/// Decode and replay journal entries from raw bytes into the exchange.
+/// Called AFTER the ack is sent — not on the critical path.
+fn replay_journal_bytes(
     journal_bytes: &[u8],
     exchange: &mut melin_engine::exchange::Exchange,
     reports: &mut Vec<melin_engine::types::ExecutionReport>,
-    accum: &mut Vec<u8>,
-    entry_count: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut offset = 0;
     while offset < journal_bytes.len() {
@@ -821,7 +864,6 @@ fn decode_replay_accum(
             Ok((consumed, _sequence, _timestamp_ns, event)) => {
                 replay_event(exchange, &event, reports);
                 offset += consumed;
-                *entry_count += 1;
             }
             Err(e) => {
                 return Err(
@@ -830,7 +872,6 @@ fn decode_replay_accum(
             }
         }
     }
-    accum.extend_from_slice(journal_bytes);
     Ok(())
 }
 
@@ -969,12 +1010,13 @@ mod tests {
         let journal_bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let chain_hash = [0xCD; 32];
         let mut buf = Vec::new();
-        encode_data_batch(500, &chain_hash, &journal_bytes, &mut buf);
+        encode_data_batch(500, &chain_hash, 1, &journal_bytes, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         match msg {
             PrimaryMessage::DataBatch {
+                entry_count: _,
                 end_sequence,
                 chain_hash: h,
                 journal_bytes: data,
@@ -1125,7 +1167,7 @@ mod tests {
         // Send a DataBatch with some fake journal bytes.
         let journal_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let chain_hash = [0x11; 32];
-        encode_data_batch(42, &chain_hash, &journal_bytes, &mut buf);
+        encode_data_batch(42, &chain_hash, 1, &journal_bytes, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1267,7 +1309,7 @@ mod tests {
 
         // Send 3 DataBatches with increasing sequence numbers.
         for seq in [10u64, 20, 30] {
-            encode_data_batch(seq, &[0x11; 32], &[0xAA; 8], &mut buf);
+            encode_data_batch(seq, &[0x11; 32], 1, &[0xAA; 8], &mut buf);
             p_writer.write_all(&buf).unwrap();
             p_writer.flush().unwrap();
             buf.clear();
@@ -1381,7 +1423,7 @@ mod tests {
         buf.clear();
 
         // Send DataBatch with sequence 150 (after replica's 100).
-        encode_data_batch(150, &[0x11; 32], &[0xAA; 8], &mut buf);
+        encode_data_batch(150, &[0x11; 32], 1, &[0xAA; 8], &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
 
