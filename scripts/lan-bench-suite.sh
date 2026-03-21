@@ -192,12 +192,12 @@ if [[ "$RUN_SINGLE" == "1" ]]; then
 echo ""
 echo "============================================================"
 echo "  [3/3] Single-order latency — full durability"
-echo "  1M pairs, 1 client, window 1"
+echo "  500K pairs, 1 client, window 1"
 echo "============================================================"
 echo ""
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 1000000 --clients 1 --window 1
+    -- -- 500000 --clients 1 --window 1
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/3-single-order.json" 2>/dev/null || true
 fi
@@ -281,7 +281,7 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     echo ""
     echo "============================================================"
     echo "  [5] Peak throughput — full durability + sync replication"
-    echo "  20M pairs, 16 clients, window 256"
+    echo "  100M pairs, 16 clients, window 256"
     echo "============================================================"
     echo ""
 
@@ -355,7 +355,7 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
             --addr ${SERVER_VLAN}:9876 \
             --key bench.key \
             --json /tmp/bench-results.json \
-            20000000 --clients 16 --window 256"
+            100000000 --clients 16 --window 256"
 
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true
 
