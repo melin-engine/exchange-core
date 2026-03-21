@@ -115,6 +115,12 @@ pub struct ServerConfig {
     /// Mutually exclusive with `--replication-bind` and `--standalone`.
     #[arg(long)]
     pub replica_of: Option<std::net::SocketAddr>,
+
+    /// Maximum number of replication ring batches to coalesce into a
+    /// single TCP write+flush. Higher values reduce syscall overhead
+    /// but increase per-write latency. Default: 32.
+    #[arg(long, default_value_t = 32)]
+    pub replication_batch_size: usize,
 }
 
 impl Default for ServerConfig {
@@ -137,6 +143,7 @@ impl Default for ServerConfig {
             replication_bind: None,
             standalone: false,
             replica_of: None,
+            replication_batch_size: 32,
         }
     }
 }
@@ -394,6 +401,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
 
+        let batch_size = config.replication_batch_size;
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -404,6 +412,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     genesis_entry,
                     &s_repl,
                     &ready_flag,
+                    batch_size,
                 );
             })
             .expect("failed to spawn replication sender thread");

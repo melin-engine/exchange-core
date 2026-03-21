@@ -368,7 +368,7 @@ impl JournalStage {
                             if !bytes.is_empty() {
                                 let end_seq = self.writer.next_sequence() - 1;
                                 let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                                producer.publish(bytes, end_seq, chain);
+                                producer.publish(bytes, end_seq, chain, pending as u32);
                             }
                         }
 
@@ -427,7 +427,7 @@ impl JournalStage {
                     if !bytes.is_empty() {
                         let end_seq = self.writer.next_sequence() - 1;
                         let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                        producer.publish(bytes, end_seq, chain);
+                        producer.publish(bytes, end_seq, chain, count as u32);
                     }
                 }
 
@@ -635,7 +635,7 @@ impl JournalStage {
                         if !bytes.is_empty() {
                             let end_seq = self.writer.next_sequence() - 1;
                             let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                            producer.publish(bytes, end_seq, chain);
+                            producer.publish(bytes, end_seq, chain, pending as u32);
                         }
                     }
 

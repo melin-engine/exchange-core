@@ -34,6 +34,8 @@ pub const REPLICATION_RING_CAPACITY: usize = 1 << 8;
 pub struct ReplicationMeta {
     /// Number of valid bytes in the corresponding buffer chunk.
     pub len: u32,
+    /// Number of journal entries in this batch.
+    pub entry_count: u32,
     /// Sequence number of the last journal entry in this batch.
     pub end_sequence: u64,
     /// BLAKE3 chain hash after all entries in this batch.
@@ -77,7 +79,13 @@ impl ReplicationProducer {
     ///
     /// # Panics
     /// Panics if `data.len() > CHUNK_SIZE` (128 KiB).
-    pub fn publish(&mut self, data: &[u8], end_sequence: u64, chain_hash: [u8; 32]) {
+    pub fn publish(
+        &mut self,
+        data: &[u8],
+        end_sequence: u64,
+        chain_hash: [u8; 32],
+        entry_count: u32,
+    ) {
         assert!(
             data.len() <= CHUNK_SIZE,
             "replication batch too large: {} > {CHUNK_SIZE}",
@@ -126,6 +134,7 @@ impl ReplicationProducer {
                         seq,
                         ReplicationMeta {
                             len: data.len() as u32,
+                            entry_count,
                             end_sequence,
                             chain_hash,
                         },
@@ -255,7 +264,7 @@ mod tests {
 
         let data = b"hello replication ring";
         let chain = [0xAB; 32];
-        producer.publish(data, 42, chain);
+        producer.publish(data, 42, chain, 1);
 
         let (meta, received) = consumer.try_read().unwrap();
         assert_eq!(meta.end_sequence, 42);
@@ -271,7 +280,7 @@ mod tests {
 
         for i in 0..10u64 {
             let data = format!("batch {i}");
-            producer.publish(data.as_bytes(), i, [i as u8; 32]);
+            producer.publish(data.as_bytes(), i, [i as u8; 32], 1);
         }
 
         for i in 0..10u64 {
@@ -291,8 +300,8 @@ mod tests {
         let mut c1 = consumers.pop().unwrap();
         let mut c0 = consumers.pop().unwrap();
 
-        producer.publish(b"first", 1, [0; 32]);
-        producer.publish(b"second", 2, [0; 32]);
+        producer.publish(b"first", 1, [0; 32], 1);
+        producer.publish(b"second", 2, [0; 32], 1);
 
         // c0 reads both.
         let (m, d) = c0.try_read().unwrap();
@@ -322,7 +331,7 @@ mod tests {
         let consumer = &mut consumers[0];
 
         let data = vec![0xFFu8; CHUNK_SIZE];
-        producer.publish(&data, 99, [0x11; 32]);
+        producer.publish(&data, 99, [0x11; 32], 1);
 
         let (meta, received) = consumer.try_read().unwrap();
         assert_eq!(meta.len as usize, CHUNK_SIZE);
@@ -339,7 +348,7 @@ mod tests {
 
         for i in 0..REPLICATION_RING_CAPACITY as u64 * 3 {
             let data = i.to_le_bytes();
-            producer.publish(&data, i, [0; 32]);
+            producer.publish(&data, i, [0; 32], 1);
             let (meta, received) = consumer.try_read().unwrap();
             assert_eq!(meta.end_sequence, i);
             assert_eq!(received, &data);
@@ -373,7 +382,7 @@ mod tests {
         });
 
         for i in 0..count {
-            producer.publish(&i.to_le_bytes(), i, [0; 32]);
+            producer.publish(&i.to_le_bytes(), i, [0; 32], 1);
         }
 
         let received = consumer_thread.join().unwrap();
