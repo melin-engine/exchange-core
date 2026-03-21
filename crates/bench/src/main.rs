@@ -575,6 +575,7 @@ fn run_pipeline_bench(
     // VecDeque for FIFO: push_back on publish, pop_front on BatchEnd.
     let mut inflight_ts: VecDeque<Instant> = VecDeque::with_capacity(window);
     let mut completed = 0usize;
+    let mut measured_start: Option<Instant> = None;
 
     let start = Instant::now();
 
@@ -590,6 +591,7 @@ fn run_pipeline_bench(
                 &mut histogram,
                 &mut completed,
                 warmup,
+                &mut measured_start,
             );
         }
 
@@ -624,10 +626,14 @@ fn run_pipeline_bench(
             &mut histogram,
             &mut completed,
             warmup,
+            &mut measured_start,
         );
     }
 
-    let wall = start.elapsed();
+    let end = Instant::now();
+    let measured_wall = measured_start
+        .map(|s| end.duration_since(s))
+        .unwrap_or_else(|| start.elapsed());
 
     // Shutdown pipeline threads.
     shutdown.store(true, Ordering::Relaxed);
@@ -643,7 +649,7 @@ fn run_pipeline_bench(
         total_pairs * 2,
         warmup,
         &histogram,
-        wall,
+        measured_wall,
         &extra_lines,
         json_path,
     );
@@ -667,6 +673,7 @@ fn drain_output(
     histogram: &mut Histogram<u64>,
     completed: &mut usize,
     warmup: usize,
+    measured_start: &mut Option<Instant>,
 ) {
     use melin_engine::journal::pipeline::OutputPayload;
 
@@ -679,6 +686,9 @@ fn drain_output(
             let sent_at = inflight_ts.pop_front().expect("inflight timestamp");
             let latency_ns = sent_at.elapsed().as_nanos() as u64;
             if *completed >= warmup {
+                if measured_start.is_none() {
+                    *measured_start = Some(Instant::now());
+                }
                 histogram.record(latency_ns).expect("record");
             }
             *completed += 1;
@@ -1111,7 +1121,7 @@ fn run_epoll_loop<W: Write>(
     mut connections: Vec<BenchConnection<W>>,
     window: usize,
     progress: Arc<AtomicU64>,
-) -> Histogram<u64> {
+) -> (Histogram<u64>, Option<Instant>) {
     let num_conns = connections.len();
 
     // Create epoll instance for this thread.
@@ -1130,6 +1140,7 @@ fn run_epoll_loop<W: Write>(
 
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+    let mut measured_start: Option<Instant> = None;
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EPOLL_EVENTS];
     let mut done_count: usize = 0;
 
@@ -1181,6 +1192,9 @@ fn run_epoll_loop<W: Write>(
                             let latency_ns = sent_at.elapsed().as_nanos() as u64;
 
                             if conn.batch_count >= warmup {
+                                if measured_start.is_none() {
+                                    measured_start = Some(Instant::now());
+                                }
                                 histogram.record(latency_ns).expect("record");
                             }
 
@@ -1208,7 +1222,7 @@ fn run_epoll_loop<W: Write>(
         libc::close(epoll_fd);
     }
 
-    histogram
+    (histogram, measured_start)
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,19 +1421,28 @@ fn run_epoll_roundtrip<R, W, F>(
     barrier.wait();
     let blast_start = Instant::now();
 
-    // Collect and merge histograms.
+    // Collect and merge histograms. Track the latest measured_start across
+    // threads — measurement begins when the last thread exits warmup.
     let mut merged_histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+    let mut latest_measured_start: Option<Instant> = None;
     for handle in handles {
-        let histogram = handle.join().expect("bench thread panicked");
+        let (histogram, ms) = handle.join().expect("bench thread panicked");
         merged_histogram.add(&histogram).expect("merge histograms");
+        if let Some(t) = ms {
+            latest_measured_start =
+                Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
+        }
     }
 
     // Stop progress reporter.
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    let blast_duration = blast_start.elapsed();
+    let end = Instant::now();
+    let measured_wall = latest_measured_start
+        .map(|s| end.duration_since(s))
+        .unwrap_or_else(|| blast_start.elapsed());
 
     let mut extra_lines = Vec::new();
     if group_commit_us > 0 {
@@ -1434,7 +1457,7 @@ fn run_epoll_roundtrip<R, W, F>(
         total_pairs * 2,
         warmup * num_clients,
         &merged_histogram,
-        blast_duration,
+        measured_wall,
         &extra_lines,
         json_path,
     );
@@ -1633,17 +1656,24 @@ fn run_uring_roundtrip<R, W, F>(
         })
         .collect();
 
-    // Collect and merge histograms from all threads.
+    // Collect and merge histograms from all threads. Track the latest
+    // measured_start across threads — measurement begins when the last
+    // thread exits warmup.
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+    let mut latest_measured_start: Option<Instant> = None;
     #[cfg(feature = "chart")]
     let mut _series: TimeSeries = Vec::new();
     #[cfg(not(feature = "chart"))]
     let _series: TimeSeries = Vec::new();
 
     for handle in handles {
-        let (h, s) = handle.join().expect("bench thread panicked");
+        let (h, s, ms) = handle.join().expect("bench thread panicked");
         histogram.add(&h).expect("merge histograms");
+        if let Some(t) = ms {
+            latest_measured_start =
+                Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
+        }
         #[cfg(feature = "chart")]
         _series.extend(s);
         #[cfg(not(feature = "chart"))]
@@ -1654,7 +1684,13 @@ fn run_uring_roundtrip<R, W, F>(
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    let wall = start.elapsed();
+    // Measure throughput over the measured phase only — from when the last
+    // thread finished warmup until now. This excludes warmup orders and any
+    // seed event processing from the throughput calculation.
+    let end = Instant::now();
+    let measured_wall = latest_measured_start
+        .map(|s| end.duration_since(s))
+        .unwrap_or_else(|| start.elapsed());
 
     let mut extra_lines = Vec::new();
     if group_commit_us > 0 {
@@ -1672,7 +1708,7 @@ fn run_uring_roundtrip<R, W, F>(
         total_pairs * 2,
         warmup * num_clients,
         &histogram,
-        wall,
+        measured_wall,
         &extra_lines,
         json_path,
     );
@@ -1735,7 +1771,7 @@ fn run_uring_loop(
     bench_start: Instant,
     warmup: usize,
     progress: Arc<AtomicU64>,
-) -> (Histogram<u64>, TimeSeries) {
+) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
     use io_uring::{IoUring, opcode, types};
 
     let n = connections.len();
@@ -1743,6 +1779,9 @@ fn run_uring_loop(
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut done_count: usize = 0;
+    // Timestamp of the first measured (post-warmup) latency recording.
+    // Used to compute throughput over the measured phase only.
+    let mut measured_start: Option<Instant> = None;
 
     #[cfg(feature = "chart")]
     let mut interval_hist =
@@ -1845,6 +1884,9 @@ fn run_uring_loop(
                         );
                         let latency_ns = sent_at.elapsed().as_nanos() as u64;
                         if conn.batch_count >= warmup {
+                            if measured_start.is_none() {
+                                measured_start = Some(Instant::now());
+                            }
                             histogram.record(latency_ns).expect("record");
                             #[cfg(feature = "chart")]
                             {
@@ -1896,7 +1938,7 @@ fn run_uring_loop(
         uring_fill_windows(&mut ring, &mut connections, window);
     }
 
-    (histogram, series)
+    (histogram, series, measured_start)
 }
 
 /// Fill send windows for all connections that have capacity and no pending send.
@@ -1984,8 +2026,7 @@ fn print_results(
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
 ) {
-    let total_orders = measured_orders + warmup_orders;
-    let throughput = (total_orders as f64) / wall.as_secs_f64();
+    let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
 
     println!("=== {label} Benchmark ({measured_orders} measured, {warmup_orders} warmup) ===");
@@ -2035,7 +2076,7 @@ fn print_results(
     if let Some(path) = json_path {
         use std::io::Write;
 
-        let throughput = (total_orders as f64) / wall.as_secs_f64();
+        let throughput = (measured_orders as f64) / wall.as_secs_f64();
         let mut percentiles = String::from("{");
         percentiles.push_str(&format!(
             "\"min_us\":{:.2},\"p50_us\":{:.2},\"p90_us\":{:.2}",
