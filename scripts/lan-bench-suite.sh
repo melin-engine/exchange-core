@@ -88,7 +88,7 @@ echo ""
 # Usage: BENCH_BRANCH=feat/replication ./scripts/lan-bench-suite.sh ...
 GIT_CMD="git pull --ff-only"
 if [[ -n "${BENCH_BRANCH:-}" ]]; then
-    GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git pull origin ${BENCH_BRANCH}"
+    GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git reset --hard origin/${BENCH_BRANCH}"
     echo "=== Using branch: ${BENCH_BRANCH} ==="
     echo ""
 fi
