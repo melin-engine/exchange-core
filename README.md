@@ -269,16 +269,16 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks at [`afbf043`](../../commit/afbf043). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, SMT disabled, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
 ### Headline numbers
 
 | Mode | Throughput | p50 | p99 | p99.9 | max |
 |------|-----------|-----|-----|-------|-----|
-| **Full durability** (fsync) | **4.0M orders/sec** | 916 µs | 1,026 µs | 1,072 µs | 1,595 µs |
-| **No persistence** | **8.0M orders/sec** | 636 µs | 827 µs | 897 µs | 1,396 µs |
-| **Single-order latency** | 13.1K orders/sec | **74 µs** | 110 µs | 114 µs | 329 µs |
-| **Synchronous replication** | **1.1M orders/sec** | 1,040 µs | 1,297 µs | 1,342 µs | 1,442 µs |
+| **Full durability** (fsync) | **4.0M orders/sec** | 920 µs | 1,035 µs | 1,082 µs | 1,560 µs |
+| **No persistence** | **4.5M orders/sec** | 1,297 µs | 1,372 µs | 1,448 µs | 3,557 µs |
+| **Single-order latency** | 13.5K orders/sec | **73 µs** | 105 µs | 108 µs | 6,472 µs |
+| **Synchronous replication** | **2.7M orders/sec** | 1,059 µs | 1,311 µs | 1,393 µs | 1,794 µs |
 
 ### Peak-load throughput — full durability
 
@@ -287,13 +287,13 @@ LAN round-trip benchmarks at [`afbf043`](../../commit/afbf043). Two or three Che
 | Metric | Value |
 |--------|-------|
 | **Throughput** | 4.0M orders/sec |
-| **p50** | 916 µs |
-| **p90** | 947 µs |
-| **p99** | 1,026 µs |
-| **p99.9** | 1,072 µs |
-| **p99.99** | 1,104 µs |
-| **p99.999** | 1,477 µs |
-| **max** | 1,595 µs |
+| **p50** | 920 µs |
+| **p90** | 952 µs |
+| **p99** | 1,035 µs |
+| **p99.9** | 1,082 µs |
+| **p99.99** | 1,113 µs |
+| **p99.999** | 1,338 µs |
+| **max** | 1,560 µs |
 
 ### Peak-load throughput — no persistence
 
@@ -301,14 +301,14 @@ LAN round-trip benchmarks at [`afbf043`](../../commit/afbf043). Two or three Che
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 8.0M orders/sec |
-| **p50** | 636 µs |
-| **p90** | 757 µs |
-| **p99** | 827 µs |
-| **p99.9** | 897 µs |
-| **p99.99** | 998 µs |
-| **p99.999** | 1,029 µs |
-| **max** | 1,396 µs |
+| **Throughput** | 4.5M orders/sec |
+| **p50** | 1,297 µs |
+| **p90** | 1,327 µs |
+| **p99** | 1,372 µs |
+| **p99.9** | 1,448 µs |
+| **p99.99** | 1,483 µs |
+| **p99.999** | 1,930 µs |
+| **max** | 3,557 µs |
 
 ### Single-order latency — full durability
 
@@ -316,31 +316,31 @@ LAN round-trip benchmarks at [`afbf043`](../../commit/afbf043). Two or three Che
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 13.1K orders/sec |
-| **p50** | 74 µs |
-| **p90** | 75 µs |
-| **p99** | 110 µs |
-| **p99.9** | 114 µs |
-| **p99.99** | 119 µs |
-| **p99.999** | 186 µs |
-| **max** | 329 µs |
+| **Throughput** | 13.5K orders/sec |
+| **p50** | 73 µs |
+| **p90** | 74 µs |
+| **p99** | 105 µs |
+| **p99.9** | 108 µs |
+| **p99.99** | 127 µs |
+| **p99.999** | 200 µs |
+| **max** | 6,472 µs |
 
 ### Synchronous replication — full durability
 
-2M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
+20M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 1.1M orders/sec |
-| **p50** | 1,040 µs |
-| **p90** | 1,236 µs |
-| **p99** | 1,297 µs |
-| **p99.9** | 1,342 µs |
-| **p99.99** | 1,401 µs |
-| **p99.999** | 1,428 µs |
-| **max** | 1,442 µs |
+| **Throughput** | 2.7M orders/sec |
+| **p50** | 1,059 µs |
+| **p90** | 1,225 µs |
+| **p99** | 1,311 µs |
+| **p99.9** | 1,393 µs |
+| **p99.99** | 1,530 µs |
+| **p99.999** | 1,567 µs |
+| **max** | 1,794 µs |
 
-Journals verified byte-identical (BLAKE3 chain hash match, 5.8M entries).
+Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
 
 ### Plots
 

@@ -116,11 +116,11 @@ Without the mid-batch flush (per-slot check only), results were identical to bas
 
 Performance figures are in the [README](README.md#performance). Keep them up to date when making performance-related changes.
 
-LAN benchmark at `331c089` (two or three Cherry AMD Ryzen 9950X servers, dedicated NVMe journal disk):
-- **With fsync/FUA**: 4.0M orders/sec, p50 = 916 µs, p99.9 = 1072 µs, max = 1595 µs
-- **Without persistence**: 8.0M orders/sec, p50 = 636 µs, p99.9 = 897 µs, max = 1396 µs
-- **Single-order latency**: 74 µs p50 (1 client, no pipelining, full durability)
-- **With fsync + sync replication**: 1.1M orders/sec, p50 = 1040 µs, p99.9 = 1342 µs, max = 1442 µs
+LAN benchmark at `093d59e` (two or three Cherry AMD Ryzen 9950X servers, SMT disabled, dedicated NVMe journal disk):
+- **With fsync/FUA**: 4.0M orders/sec, p50 = 920 µs, p99.9 = 1082 µs, max = 1560 µs
+- **Without persistence**: 4.5M orders/sec, p50 = 1297 µs, p99.9 = 1448 µs, max = 3557 µs
+- **Single-order latency**: 73 µs p50 (1 client, no pipelining, full durability)
+- **With fsync + sync replication**: 2.7M orders/sec, p50 = 1059 µs, p99.9 = 1393 µs, max = 1794 µs
 
 ### Current bottleneck: TCP network stack
 
