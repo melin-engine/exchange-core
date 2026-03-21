@@ -719,14 +719,11 @@ pub fn run_receiver(
                 chain_hash: _batch_chain_hash,
                 journal_bytes,
             } => {
-                // Decode + replay + accumulate for coalesced fsync.
-                decode_replay_accum(
-                    &journal_bytes,
-                    &mut exchange,
-                    &mut reports,
-                    &mut journal_accum,
-                    &mut accum_entry_count,
-                )?;
+                // Accumulate raw bytes for coalesced fsync. Replay is
+                // deferred until after the ack — the ack only guarantees
+                // durability (bytes on disk), not state application.
+                journal_accum.extend_from_slice(&journal_bytes);
+                accum_entry_count += count_entries(&journal_bytes)?;
                 accum_end_sequence = end_sequence;
 
                 // Drain additional frames already in the TCP buffer.
@@ -754,22 +751,18 @@ pub fn run_receiver(
                             journal_bytes,
                             ..
                         } => {
-                            decode_replay_accum(
-                                &journal_bytes,
-                                &mut exchange,
-                                &mut reports,
-                                &mut journal_accum,
-                                &mut accum_entry_count,
-                            )?;
+                            journal_accum.extend_from_slice(&journal_bytes);
+                            accum_entry_count += count_entries(&journal_bytes)?;
                             accum_end_sequence = end_sequence;
                         }
                         _ => break,
                     }
                 }
-                // One fsync for all accumulated batches.
+
+                // Fsync all accumulated batches.
                 journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
 
-                // One ack for the highest sequence.
+                // Ack immediately — data is durable on disk.
                 let ack = Ack {
                     acked_sequence: accum_end_sequence,
                 };
@@ -777,6 +770,13 @@ pub fn run_receiver(
                 tcp_writer.write_all(&send_buf)?;
                 tcp_writer.flush()?;
                 send_buf.clear();
+
+                // Replay AFTER acking. The primary's replication cursor
+                // advances as soon as the ack arrives, unblocking the
+                // response stage. Replay is not on the critical path —
+                // on crash recovery, the replica replays from its journal.
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+
                 journal_accum.clear();
                 accum_entry_count = 0;
             }
@@ -804,15 +804,44 @@ pub fn run_receiver(
 ///
 /// The reports Vec is caller-owned and reused across calls to avoid
 /// per-event heap allocation.
-/// Decode journal entries, replay into exchange, accumulate raw bytes for
-/// coalesced fsync. Used by the replica to batch multiple DataBatch frames
-/// into one pwritev2+RWF_DSYNC call.
-fn decode_replay_accum(
+/// Count journal entries by scanning length-prefixed headers.
+/// Avoids full decode — just reads the u16 payload length from each
+/// entry header and skips forward. Much faster than decode() on the
+/// ack fast path.
+///
+/// Entry format: [magic:u16][length:u16][sequence:u64][timestamp:u64][..payload..][crc:u32]
+fn count_entries(journal_bytes: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+    // Entry header: magic(2) + length(2) + sequence(8) + timestamp(8) = 20.
+    // Total entry size: header(20) + payload(length) + crc(4).
+    const HEADER: usize = 20;
+    const CRC: usize = 4;
+
+    let mut offset = 0;
+    let mut count = 0u64;
+    while offset + HEADER + CRC <= journal_bytes.len() {
+        // Length field is at offset 2 (after magic:2).
+        let length =
+            u16::from_le_bytes([journal_bytes[offset + 2], journal_bytes[offset + 3]]) as usize;
+        let entry_size = HEADER + length + CRC;
+        if offset + entry_size > journal_bytes.len() {
+            return Err(format!(
+                "truncated entry at offset {offset}: need {entry_size}, have {}",
+                journal_bytes.len() - offset
+            )
+            .into());
+        }
+        offset += entry_size;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Decode and replay journal entries from raw bytes into the exchange.
+/// Called AFTER the ack is sent — not on the critical path.
+fn replay_journal_bytes(
     journal_bytes: &[u8],
     exchange: &mut melin_engine::exchange::Exchange,
     reports: &mut Vec<melin_engine::types::ExecutionReport>,
-    accum: &mut Vec<u8>,
-    entry_count: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut offset = 0;
     while offset < journal_bytes.len() {
@@ -821,7 +850,6 @@ fn decode_replay_accum(
             Ok((consumed, _sequence, _timestamp_ns, event)) => {
                 replay_event(exchange, &event, reports);
                 offset += consumed;
-                *entry_count += 1;
             }
             Err(e) => {
                 return Err(
@@ -830,7 +858,6 @@ fn decode_replay_accum(
             }
         }
     }
-    accum.extend_from_slice(journal_bytes);
     Ok(())
 }
 
