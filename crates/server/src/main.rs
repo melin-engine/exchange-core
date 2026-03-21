@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
-use trading_protocol::tcp::BlockingTcpListener;
-use trading_server::server::ServerConfig;
+use melin_protocol::tcp::BlockingTcpListener;
+use melin_server::server::ServerConfig;
 
 /// Pointer to the shared shutdown flag, set once before signals can fire.
 /// `AtomicUsize` stores the raw pointer as an integer — signal-safe.
@@ -55,5 +55,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
     let listener = BlockingTcpListener::bind(config.bind)?;
-    trading_server::server::run_with_shutdown(listener, config, shutdown)
+    melin_server::server::run_with_shutdown(listener, config, shutdown)
 }

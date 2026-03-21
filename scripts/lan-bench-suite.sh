@@ -117,7 +117,7 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p trading-admin --bin trading-keygen -- bench admin && \
+        cargo run --release -p melin-admin --bin melin-keygen -- bench admin && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
@@ -159,19 +159,19 @@ echo "============================================================"
 echo ""
 
 # For no-persist, we need to swap the server binary. The lan-bench.sh script
-# always uses target/release/trading-server, so we swap it temporarily.
+# always uses target/release/melin-server, so we swap it temporarily.
 echo "  Swapping in no-persist server binary..."
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-    cp target/release/trading-server target/release/trading-server.bak && \
-    cp target/release/trading-server target/release/trading-server.persist && \
-    find target/release/deps -name 'trading_server-*' -newer target/release/trading-server -executable 2>/dev/null | head -1 | xargs -I{} cp {} target/release/trading-server || true"
+    cp target/release/melin-server target/release/melin-server.bak && \
+    cp target/release/melin-server target/release/melin-server.persist && \
+    find target/release/deps -name 'trading_server-*' -newer target/release/melin-server -executable 2>/dev/null | head -1 | xargs -I{} cp {} target/release/melin-server || true"
 
 # The no-persist build produces the binary with the no-persist feature compiled in.
 # We need to explicitly copy it. The feature flag is compiled into the binary at build time.
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
     cargo build --release --features no-persist 2>&1 | tail -1 && \
-    cp target/release/trading-server target/release/trading-server.nopersist && \
-    cp target/release/trading-server.nopersist target/release/trading-server"
+    cp target/release/melin-server target/release/melin-server.nopersist && \
+    cp target/release/melin-server.nopersist target/release/melin-server"
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
     -- -- 100000000 --clients 16 --window 384
@@ -181,8 +181,8 @@ cp /tmp/lan-bench-results.json "${RESULTS_DIR}/2-no-persist.json" 2>/dev/null ||
 # Restore the normal (durable) binary.
 echo "  Restoring durable server binary..."
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-    cp target/release/trading-server.persist target/release/trading-server 2>/dev/null || true && \
-    rm -f target/release/trading-server.bak target/release/trading-server.persist target/release/trading-server.nopersist"
+    cp target/release/melin-server.persist target/release/melin-server 2>/dev/null || true && \
+    rm -f target/release/melin-server.bak target/release/melin-server.persist target/release/melin-server.nopersist"
 fi
 
 # ---------------------------------------------------------------------------
@@ -301,34 +301,34 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     # completes. Start order: primary → wait for repl port → replica →
     # wait for "listening" (seeding done, accept loop running).
     echo "  Starting primary on ${SERVER} with --replication-bind..."
-    ssh $SSH_OPTS "$SERVER" "pkill -x trading-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/trading-server \
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
-        >/tmp/trading-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     # Wait for the replication listener to be ready before starting the replica.
     echo "  Waiting for replication listener..."
     for i in $(seq 1 30); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/trading-server.log 2>/dev/null"; then
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/melin-server.log 2>/dev/null"; then
             echo "  Replication listener ready (took ${i}s)."
             break
         fi
         if [[ $i -eq 30 ]]; then
-            echo "  ERROR: Replication listener did not start. Check /tmp/trading-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/trading-server.log" 2>/dev/null || true
+            echo "  ERROR: Replication listener did not start. Check /tmp/melin-server.log"
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
         fi
         sleep 1
     done
 
     # Start replica — connects to primary's replication port.
     echo "  Starting replica on ${REPLICA}..."
-    ssh $SSH_OPTS "$REPLICA" "pkill -x trading-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/trading-server \
+    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --journal ${REPLICA_JOURNAL} \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
@@ -337,13 +337,13 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     # and the accept loop starts. This is the true "ready for clients" signal.
     echo "  Waiting for primary to seed and start accepting clients..."
     for i in $(seq 1 120); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/trading-server.log 2>/dev/null"; then
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/melin-server.log 2>/dev/null"; then
             echo "  Primary is ready (took ${i}s)."
             break
         fi
         if [[ $i -eq 120 ]]; then
-            echo "  ERROR: Primary did not become ready. Check /tmp/trading-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/trading-server.log" 2>/dev/null || true
+            echo "  ERROR: Primary did not become ready. Check /tmp/melin-server.log"
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
         fi
         sleep 1
     done
@@ -351,7 +351,7 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     # Run the benchmark against the primary (same as fsync benchmark).
     echo "  Running benchmark..."
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/trading-bench \
+        ./target/release/melin-bench \
             --addr ${SERVER_VLAN}:9876 \
             --key bench.key \
             --json /tmp/bench-results.json \
@@ -360,8 +360,8 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true
 
     # Stop both servers.
-    ssh $SSH_OPTS "$SERVER" "pkill -INT -x trading-server 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x trading-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x melin-server 2>/dev/null; true"
     sleep 2
     echo "  Servers stopped."
 
@@ -392,8 +392,8 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     mkdir -p "${PLOT_DIR}"
 
     echo "  Building plot tool..."
-    (cd "$LOCAL_REPO" && cargo build --release -p trading-bench --features plot --bin trading-plot 2>&1 | tail -1)
-    PLOT_TOOL="${LOCAL_REPO}/target/release/trading-plot"
+    (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
+    PLOT_TOOL="${LOCAL_REPO}/target/release/melin-plot"
 
     echo "  Generating latency CDF..."
     CDF_FILES=(

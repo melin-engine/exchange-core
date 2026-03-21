@@ -1,6 +1,6 @@
-# Matching Engine
+# Melin
 
-A matching engine built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html), written in Rust.
+A high-performance exchange engine built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html), written in Rust.
 
 ## Architecture
 

@@ -71,7 +71,7 @@ Each client connection gets its own generator instance with a partitioned `start
 ## CLI Parameters
 
 ```
-cargo run --release -p trading-bench [-- [OPTIONS] [PAIRS]]
+cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 ```
 
 ### Positional arguments
@@ -248,12 +248,12 @@ All published numbers use two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RA
 
 Engine server:
 ```sh
-./trading-server --bind 0.0.0.0:9876 --journal /mnt/journal/trading.journal
+./melin-server --bind 0.0.0.0:9876 --journal /mnt/journal/melin.journal
 ```
 
 Bench client (separate machine):
 ```sh
-./trading-bench 100000000 --addr <engine-ip>:9876 --window=256
+./melin-bench 100000000 --addr <engine-ip>:9876 --window=256
 ```
 
 Uses 16 clients (default), 256 pipelined requests per client, 100M order pairs (200M orders).
@@ -262,13 +262,13 @@ Uses 16 clients (default), 256 pipelined requests per client, 100M order pairs (
 
 Engine server started without journal persistence. Bench client:
 ```sh
-./trading-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32
+./melin-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32
 ```
 
 ### Single-order latency (70 us p50)
 
 ```sh
-./trading-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
+./melin-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
 ```
 
 No pipelining, no batching. Measures the true single-order round-trip time with full durability.
@@ -276,7 +276,7 @@ No pipelining, no batching. Measures the true single-order round-trip time with 
 ### Engine-only (17.3M orders/sec)
 
 ```sh
-./trading-bench 100000000 --mode=engine
+./melin-bench 100000000 --mode=engine
 ```
 
 Runs on the engine server itself. No network, no journal, no pipeline.
@@ -292,10 +292,10 @@ The release profile is configured for maximum performance:
 
 Build with:
 ```sh
-cargo build --release -p trading-bench
+cargo build --release -p melin-bench
 ```
 
-The binary is at `target/release/trading-bench`.
+The binary is at `target/release/melin-bench`.
 
 ## Limitations and Caveats
 

@@ -8,10 +8,10 @@ use std::net::SocketAddr;
 
 use ed25519_dalek::{Signer, SigningKey};
 
-use trading_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
-use trading_protocol::codec;
-use trading_protocol::error::ProtocolError;
-use trading_protocol::message::{Request, ResponseKind};
+use melin_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
+use melin_protocol::codec;
+use melin_protocol::error::ProtocolError;
+use melin_protocol::message::{Request, ResponseKind};
 
 /// Error returned by client operations.
 #[derive(Debug)]
@@ -188,7 +188,7 @@ pub struct StatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trading_protocol::types::{OrderId, Symbol};
+    use melin_protocol::types::{OrderId, Symbol};
 
     /// Generate a test signing key from a fixed seed for deterministic tests.
     fn test_key() -> SigningKey {
@@ -262,7 +262,7 @@ mod tests {
         let responses = client
             .send_request(&Request::CancelOrder {
                 symbol: Symbol(1),
-                account: trading_protocol::types::AccountId(1),
+                account: melin_protocol::types::AccountId(1),
                 order_id: OrderId(42),
             })
             .unwrap();
@@ -406,7 +406,7 @@ mod tests {
         let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
-            account: trading_protocol::types::AccountId(1),
+            account: melin_protocol::types::AccountId(1),
             order_id: OrderId(42),
         });
 

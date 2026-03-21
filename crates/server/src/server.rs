@@ -19,16 +19,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
-use trading_engine::journal::JournaledExchange;
-use trading_engine::journal::pipeline::build_pipeline_with_replication;
-use trading_engine::journal::writer::JournalWriter;
+use melin_engine::journal::JournaledExchange;
+use melin_engine::journal::pipeline::build_pipeline_with_replication;
+use melin_engine::journal::writer::JournalWriter;
 
-use trading_protocol::auth::{AuthorizedKeys, Permission};
-use trading_protocol::message::ConnectionId;
-use trading_protocol::transport::BlockingTransportListener;
+use melin_protocol::auth::{AuthorizedKeys, Permission};
+use melin_protocol::message::ConnectionId;
+use melin_protocol::transport::BlockingTransportListener;
 
 #[cfg(not(feature = "io-uring"))]
-use trading_protocol::blocking::BlockingFrameWriter;
+use melin_protocol::blocking::BlockingFrameWriter;
 
 #[cfg(not(feature = "io-uring"))]
 use crate::reader::{self, ReaderRegistration};
@@ -42,7 +42,7 @@ use crate::uring_response::ControlEvent;
 
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
-#[command(name = "trading-server", about = "Low-latency matching engine server")]
+#[command(name = "melin-server", about = "Low-latency matching engine server")]
 pub struct ServerConfig {
     /// Address to bind the TCP listener.
     #[arg(long, default_value = "127.0.0.1:9876")]
@@ -259,7 +259,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // handshake so it can write a byte-identical genesis, ensuring the
     // BLAKE3 hash chain starts from the exact same encoded bytes.
     let genesis_entry = if enable_replication {
-        use trading_engine::journal::codec::FILE_HEADER_SIZE;
+        use melin_engine::journal::codec::FILE_HEADER_SIZE;
         let file_bytes = std::fs::read(writer.path())?;
         // Genesis entry starts right after the 8-byte file header.
         // Read entry length from bytes [offset+2..offset+4].
@@ -432,10 +432,10 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         }
     }
     if let Some(producer) = seed_producer {
-        use trading_engine::journal::event::JournalEvent;
-        use trading_engine::journal::pipeline::InputSlot;
-        use trading_engine::journal::trace::trace_ts;
-        use trading_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_engine::journal::event::JournalEvent;
+        use melin_engine::journal::pipeline::InputSlot;
+        use melin_engine::journal::trace::trace_ts;
+        use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         for i in 1..=config.instruments {
             producer.publish(InputSlot {
@@ -705,7 +705,7 @@ fn init_engine(
             "recovering from snapshot only (journal missing, post-rotation crash?)"
         );
         let (exchange, snap_sequence, snap_chain_hash) =
-            trading_engine::journal::snapshot::load(snap_path)?;
+            melin_engine::journal::snapshot::load(snap_path)?;
         let writer =
             JournalWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
         JournaledExchange::from_parts(exchange, writer)
@@ -772,8 +772,8 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     use std::io;
 
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use trading_protocol::codec;
-    use trading_protocol::message::{Request, ResponseKind};
+    use melin_protocol::codec;
+    use melin_protocol::message::{Request, ResponseKind};
 
     // Generate a 32-byte random nonce for this connection.
     // Explicit OsRng for cryptographic material (SEC-10).
@@ -932,8 +932,8 @@ fn set_write_timeout<F: std::os::unix::io::AsRawFd>(
 /// Best-effort send of AuthFailed before dropping a connection.
 fn send_auth_failed(writer: &mut impl std::io::Write) {
     let mut buf = [0u8; 8];
-    if let Ok(written) = trading_protocol::codec::encode_response(
-        &trading_protocol::message::ResponseKind::AuthFailed,
+    if let Ok(written) = melin_protocol::codec::encode_response(
+        &melin_protocol::message::ResponseKind::AuthFailed,
         &mut buf,
     ) {
         let _ = writer.write_all(&buf[..written]);
@@ -947,9 +947,9 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use ed25519_dalek::{Signer, SigningKey};
-    use trading_protocol::auth::{AuthorizedKeys, Permission};
-    use trading_protocol::codec;
-    use trading_protocol::message::{ConnectionId, Request, ResponseKind};
+    use melin_protocol::auth::{AuthorizedKeys, Permission};
+    use melin_protocol::codec;
+    use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 
     use super::authenticate_connection;
 
@@ -960,7 +960,7 @@ mod tests {
 
     /// Build an `AuthorizedKeys` containing the test key with the given permission.
     fn keys_with_test_key(perm: &str) -> AuthorizedKeys {
-        // Use trading_protocol's base64 re-export via AuthorizedKeys::parse.
+        // Use melin_protocol's base64 re-export via AuthorizedKeys::parse.
         // Encode the public key bytes as base64 manually using the simple
         // alphabet (all test keys produce valid base64).
         let pub_bytes = test_key().verifying_key().to_bytes();

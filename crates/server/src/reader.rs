@@ -26,13 +26,13 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, error};
 
-use trading_disruptor::ring;
-use trading_engine::journal::event::JournalEvent;
-use trading_engine::journal::pipeline::InputSlot;
-use trading_engine::journal::trace::trace_ts;
-use trading_protocol::auth::Permission;
-use trading_protocol::codec;
-use trading_protocol::message::{ConnectionId, Request};
+use melin_disruptor::ring;
+use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::pipeline::InputSlot;
+use melin_engine::journal::trace::trace_ts;
+use melin_protocol::auth::Permission;
+use melin_protocol::codec;
+use melin_protocol::message::{ConnectionId, Request};
 
 use crate::response::ControlEvent;
 
@@ -238,7 +238,7 @@ fn epoll_reader_loop<R: AsRawFd>(
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EPOLL_EVENTS];
 
     #[cfg(feature = "latency-trace")]
-    let mut publish_hist = trading_engine::journal::trace::StageHistogram::new(
+    let mut publish_hist = melin_engine::journal::trace::StageHistogram::new(
         "reader: publish (decode → disruptor publish)",
     );
 
@@ -423,7 +423,7 @@ fn process_connection<R>(
     conn: &mut ConnectionState<R>,
     producer: &ring::MultiProducer<InputSlot>,
     #[cfg(feature = "latency-trace")]
-    publish_hist: &mut trading_engine::journal::trace::StageHistogram,
+    publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
     loop {
         // Step 1: Read 4-byte length prefix.
@@ -532,7 +532,7 @@ fn process_connection<R>(
                     });
 
                     #[cfg(feature = "latency-trace")]
-                    publish_hist.record_ns(trading_engine::journal::trace::trace_elapsed_ns(
+                    publish_hist.record_ns(melin_engine::journal::trace::trace_elapsed_ns(
                         pre_publish,
                         trace_ts(),
                     ));

@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
-use trading_engine::journal::replication::ReplicationConsumer;
+use melin_engine::journal::replication::ReplicationConsumer;
 
 // --- Wire protocol message types ---
 
@@ -572,8 +572,8 @@ pub fn run_receiver(
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use trading_engine::exchange::Exchange;
-    use trading_engine::journal::writer::JournalWriter;
+    use melin_engine::exchange::Exchange;
+    use melin_engine::journal::writer::JournalWriter;
 
     info!(primary = %primary_addr, "connecting to primary as replica");
 
@@ -591,7 +591,7 @@ pub fn run_receiver(
     // so we can use the primary's genesis hash.
     let (mut exchange, mut journal_writer, last_sequence, chain_hash) = if journal_path.exists() {
         // Recover from existing journal.
-        let engine = trading_engine::journal::JournaledExchange::recover(journal_path)?;
+        let engine = melin_engine::journal::JournaledExchange::recover(journal_path)?;
         // next_sequence is the next to assign, so last written = next - 1.
         // If next_sequence is 1, no user events have been written (only genesis).
         let next = engine.next_sequence();
@@ -641,9 +641,9 @@ pub fn run_receiver(
     // the BLAKE3 hash chain is byte-identical, so checkpoint verification
     // works on replica recovery.
     if journal_writer.is_none() {
+        use melin_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
         use std::fs::OpenOptions;
         use std::os::unix::fs::FileExt;
-        use trading_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
 
         let file = OpenOptions::new()
             .read(true)
@@ -680,7 +680,7 @@ pub fn run_receiver(
 
     // Pre-allocated report buffer, reused across events to avoid per-event
     // heap allocation. Same pattern as MatchingStage.
-    let mut reports: Vec<trading_engine::types::ExecutionReport> = Vec::with_capacity(256);
+    let mut reports: Vec<melin_engine::types::ExecutionReport> = Vec::with_capacity(256);
 
     // Accumulation buffer for coalescing multiple DataBatch frames into
     // one fsync. The replica reads all available frames from the TCP
@@ -809,15 +809,15 @@ pub fn run_receiver(
 /// into one pwritev2+RWF_DSYNC call.
 fn decode_replay_accum(
     journal_bytes: &[u8],
-    exchange: &mut trading_engine::exchange::Exchange,
-    reports: &mut Vec<trading_engine::types::ExecutionReport>,
+    exchange: &mut melin_engine::exchange::Exchange,
+    reports: &mut Vec<melin_engine::types::ExecutionReport>,
     accum: &mut Vec<u8>,
     entry_count: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut offset = 0;
     while offset < journal_bytes.len() {
         let remaining = &journal_bytes[offset..];
-        match trading_engine::journal::codec::decode(remaining) {
+        match melin_engine::journal::codec::decode(remaining) {
             Ok((consumed, _sequence, _timestamp_ns, event)) => {
                 replay_event(exchange, &event, reports);
                 offset += consumed;
@@ -835,11 +835,11 @@ fn decode_replay_accum(
 }
 
 fn replay_event(
-    exchange: &mut trading_engine::exchange::Exchange,
-    event: &trading_engine::journal::event::JournalEvent,
-    reports: &mut Vec<trading_engine::types::ExecutionReport>,
+    exchange: &mut melin_engine::exchange::Exchange,
+    event: &melin_engine::journal::event::JournalEvent,
+    reports: &mut Vec<melin_engine::types::ExecutionReport>,
 ) {
-    use trading_engine::journal::event::JournalEvent;
+    use melin_engine::journal::event::JournalEvent;
 
     reports.clear();
     match event {

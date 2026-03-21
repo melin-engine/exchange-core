@@ -68,8 +68,8 @@ fn fuzz_wire_response_roundtrip() {
 // ---------------------------------------------------------------------------
 
 use crate::message::{Request, ResponseKind};
+use melin_engine::types::*;
 use std::num::NonZeroU64;
-use trading_engine::types::*;
 
 fn nz64(data: &[u8], offset: usize) -> Option<NonZeroU64> {
     if data.len() < offset + 8 {

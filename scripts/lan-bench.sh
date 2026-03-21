@@ -71,8 +71,8 @@ if [[ ${#POSITIONAL[@]} -lt 3 ]]; then
     echo "  server-vlan-ip    VLAN/private IP of the engine server (used for trading traffic)"
     echo "  user              SSH username (default: root)"
     echo ""
-    echo "  After '--', extra args are passed to trading-server."
-    echo "  After a second '--', extra args are passed to trading-bench."
+    echo "  After '--', extra args are passed to melin-server."
+    echo "  After a second '--', extra args are passed to melin-bench."
     echo ""
     echo "examples:"
     echo "  $0 84.32.176.142 84.32.176.143 10.0.0.1"
@@ -130,7 +130,7 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p trading-admin --bin trading-keygen -- bench admin && \
+        cargo run --release -p melin-admin --bin melin-keygen -- bench admin && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
@@ -153,18 +153,18 @@ echo ""
 # 4. Start the engine on the server
 # ---------------------------------------------------------------------------
 echo "=== Starting engine on server ==="
-# Kill any existing trading-server process.
-ssh $SSH_OPTS "$SERVER" "pkill -x trading-server 2>/dev/null; true"
+# Kill any existing melin-server process.
+ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
 sleep 1
 
 # Start the server in the background. For production-grade numbers, run
 # bench-isolate.sh separately before this script (CPU governor, IRQ pinning).
-ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/trading-server \
+ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
         --bind ${BIND_ADDR} \
         --journal ${JOURNAL_PATH} \
         --authorized-keys ${REPO_DIR}/authorized_keys \
         ${SERVER_EXTRA_ARGS} \
-    >/tmp/trading-server.log 2>&1 </dev/null &" </dev/null
+    >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
 # Wait for the server to be ready.
 echo "  Waiting for server to start..."
@@ -174,8 +174,8 @@ for i in $(seq 1 120); do
         break
     fi
     if [[ $i -eq 120 ]]; then
-        echo "  ERROR: Server did not start within 120s. Check /tmp/trading-server.log on server."
-        ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/trading-server.log" 2>/dev/null || true
+        echo "  ERROR: Server did not start within 120s. Check /tmp/melin-server.log on server."
+        ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
         exit 1
     fi
     sleep 1
@@ -189,7 +189,7 @@ echo "=== Running benchmark ==="
 echo ""
 
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-    ./target/release/trading-bench \
+    ./target/release/melin-bench \
         --addr ${BIND_ADDR} \
         --key bench.key \
         --json /tmp/bench-results.json \
@@ -213,7 +213,7 @@ echo ""
 # 7. Stop the server
 # ---------------------------------------------------------------------------
 echo "=== Stopping server ==="
-ssh $SSH_OPTS "$SERVER" "pkill -INT -x trading-server 2>/dev/null; true"
+ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
 sleep 2
 echo "  Server stopped."
 

@@ -1,14 +1,14 @@
 //! Generate SVG plots from benchmark JSON results.
 //!
-//! Reads JSON files produced by `trading-bench --json` and generates:
+//! Reads JSON files produced by `melin-bench --json` and generates:
 //! 1. **Latency CDF** — percentile plot comparing benchmark configs
 //! 2. **Saturation curve** — throughput vs latency at multiple load levels
 //! 3. **Pipeline breakdown** — stage utilization bar chart
 //!
 //! Usage:
-//!   trading-plot latency-cdf -o latency.svg results/*.json
-//!   trading-plot saturation -o saturation.svg sweep/*.json
-//!   trading-plot pipeline -o pipeline.svg --stats pipeline-stats.log
+//!   melin-plot latency-cdf -o latency.svg results/*.json
+//!   melin-plot saturation -o saturation.svg sweep/*.json
+//!   melin-plot pipeline -o pipeline.svg --stats pipeline-stats.log
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use plotters::prelude::*;
 use serde::Deserialize;
 
-// --- JSON schema matching trading-bench output ---
+// --- JSON schema matching melin-bench output ---
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -76,7 +76,7 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("Usage: trading-plot <command> [options] <files...>");
+    eprintln!("Usage: melin-plot <command> [options] <files...>");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  latency-cdf  Percentile plot comparing benchmark configs");
@@ -89,10 +89,10 @@ fn print_usage() {
     eprintln!("  --stats <f>  Pipeline stats log file (for pipeline command)");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  trading-plot latency-cdf results/1-fsync.json results/2-no-persist.json");
-    eprintln!("  trading-plot saturation sweep/*.json");
-    eprintln!("  trading-plot pipeline --stats /tmp/trading-server.log");
-    eprintln!("  trading-plot all results/");
+    eprintln!("  melin-plot latency-cdf results/1-fsync.json results/2-no-persist.json");
+    eprintln!("  melin-plot saturation sweep/*.json");
+    eprintln!("  melin-plot pipeline --stats /tmp/melin-server.log");
+    eprintln!("  melin-plot all results/");
 }
 
 // --- Argument parsing (minimal, no clap dependency for this tool) ---
@@ -598,7 +598,7 @@ fn cmd_all(args: &[String]) {
     }
 
     // 3. Pipeline breakdown (look for server log).
-    let log_candidates = ["server.log", "trading-server.log"];
+    let log_candidates = ["server.log", "melin-server.log"];
     for log_name in &log_candidates {
         let log_path = dir.join(log_name);
         if log_path.exists() {

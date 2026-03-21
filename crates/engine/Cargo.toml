@@ -1,5 +1,5 @@
 [package]
-name = "trading-engine"
+name = "melin-engine"
 version = "0.1.0"
 edition = "2024"
 
@@ -31,7 +31,7 @@ hdrhistogram = { version = "7", optional = true }
 io-uring = { version = "0.7", optional = true }
 libc = { workspace = true }
 tracing = { workspace = true }
-trading-disruptor = { path = "../disruptor" }
+melin-disruptor = { path = "../disruptor" }
 
 [dev-dependencies]
 bolero = "0.11"

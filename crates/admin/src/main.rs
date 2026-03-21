@@ -5,7 +5,7 @@
 //! displayed in a scrolling log behind the menu overlays.
 //!
 //! Usage:
-//!     trading-admin <addr> <key-file>
+//!     melin-admin <addr> <key-file>
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -19,9 +19,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use trading_client::{Client, StatsSnapshot};
-use trading_protocol::message::{Request, ResponseKind};
-use trading_protocol::types::{
+use melin_client::{Client, StatsSnapshot};
+use melin_protocol::message::{Request, ResponseKind};
+use melin_protocol::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
     Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection,
     Side, Symbol, TimeInForce,
@@ -1559,7 +1559,7 @@ fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: trading-admin <addr> <key-file>");
+        eprintln!("usage: melin-admin <addr> <key-file>");
         std::process::exit(1);
     }
 

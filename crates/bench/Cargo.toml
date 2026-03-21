@@ -1,32 +1,32 @@
 [package]
-name = "trading-bench"
+name = "melin-bench"
 version = "0.1.0"
 edition = "2024"
 
 [features]
 default = ["io-uring"]
-no-fsync = ["trading-engine/no-fsync"]
-no-persist = ["trading-server/no-persist"]
-latency-trace = ["trading-server/latency-trace"]
-io-uring = ["trading-server/io-uring", "dep:io-uring"]
-pipeline-stats = ["trading-server/pipeline-stats"]
+no-fsync = ["melin-engine/no-fsync"]
+no-persist = ["melin-server/no-persist"]
+latency-trace = ["melin-server/latency-trace"]
+io-uring = ["melin-server/io-uring", "dep:io-uring"]
+pipeline-stats = ["melin-server/pipeline-stats"]
 chart = ["dep:ratatui", "dep:crossterm"]
 plot = ["dep:plotters"]
 
 [[bin]]
-name = "trading-bench"
+name = "melin-bench"
 path = "src/main.rs"
 
 [[bin]]
-name = "trading-plot"
+name = "melin-plot"
 path = "src/plot.rs"
 required-features = ["plot"]
 
 [dependencies]
-trading-engine = { path = "../engine" }
-trading-disruptor = { path = "../disruptor" }
-trading-protocol = { path = "../protocol" }
-trading-server = { path = "../server" }
+melin-engine = { path = "../engine" }
+melin-disruptor = { path = "../disruptor" }
+melin-protocol = { path = "../protocol" }
+melin-server = { path = "../server" }
 base64 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }

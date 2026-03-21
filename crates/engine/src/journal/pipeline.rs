@@ -29,9 +29,9 @@ use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
 use crate::types::ExecutionReport;
 
-use trading_disruptor::padding::Sequence;
-use trading_disruptor::ring;
-use trading_disruptor::spsc;
+use melin_disruptor::padding::Sequence;
+use melin_disruptor::ring;
+use melin_disruptor::spsc;
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
 /// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in

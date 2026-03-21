@@ -92,7 +92,7 @@ sudo ./scripts/bench-isolate.sh  # needs adaptation for remote mode
 #   - Set CPU governor to performance
 #   - Pin IRQs to core 0
 #   - Stop irqbalance
-#   - Run: ./target/release/trading-server --bind=0.0.0.0:9876
+#   - Run: ./target/release/melin-server --bind=0.0.0.0:9876
 ```
 
 ### Bench Server
@@ -123,7 +123,7 @@ Establishes the pipeline + network ceiling without journal I/O.
 sudo ./scripts/bench-isolate.sh --features no-persist -- --bind=0.0.0.0:9876
 
 # Bench server:
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
 ```
 
 Expected: throughput will be lower than loopback (3.61M) due to real network latency. The gap reveals the network cost.
@@ -137,7 +137,7 @@ The production configuration.
 sudo ./scripts/bench-isolate.sh -- --bind=0.0.0.0:9876
 
 # Bench server:
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
 ```
 
 Expected: throughput similar to loopback (830K) since the bottleneck is NVMe FUA latency, not network. If network latency is < FUA latency (~50-100 us), throughput should be roughly the same.
@@ -148,10 +148,10 @@ Vary client count to show how throughput scales.
 
 ```sh
 # Bench server — run each:
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=1 --window=64
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=4 --window=64
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=64 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=1 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=4 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=64 --window=64
 ```
 
 ### Run 4: Crash Recovery Demo
@@ -165,7 +165,7 @@ sudo ./scripts/bench-isolate.sh -- --bind=0.0.0.0:9876
 # 2. Run benchmark for a few million orders, then Ctrl-C the bench client mid-run
 
 # 3. Kill the engine hard (simulating a crash)
-sudo kill -9 $(pidof trading-server)
+sudo kill -9 $(pidof melin-server)
 
 # 4. Restart the engine — it replays the journal automatically
 sudo ./scripts/bench-isolate.sh -- --bind=0.0.0.0:9876
@@ -180,10 +180,10 @@ sudo ./scripts/bench-isolate.sh -- --bind=0.0.0.0:9876
 Show how pipelining depth affects throughput and tail latency.
 
 ```sh
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=1
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=8
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
-./target/release/trading-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=256
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=1
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=8
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=64
+./target/release/melin-bench --addr=<engine-ip>:9876 10000000 --clients=16 --window=256
 ```
 
 ## Expected Results

@@ -13,7 +13,7 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use trading_disruptor::padding::Sequence;
+use melin_disruptor::padding::Sequence;
 
 /// Maximum batch buffer size. Matches `BATCH_BUF_CAPACITY` in writer.rs.
 /// Each ring slot has one pre-allocated chunk of this size.
@@ -62,7 +62,7 @@ unsafe impl Sync for SharedBuffers {}
 /// Step 1 happens BEFORE step 2's Release store, ensuring the consumer
 /// sees the buffer data when it reads the metadata.
 pub struct ReplicationProducer {
-    inner: trading_disruptor::ring::Producer<ReplicationMeta>,
+    inner: melin_disruptor::ring::Producer<ReplicationMeta>,
     buffers: Arc<SharedBuffers>,
 }
 
@@ -142,7 +142,7 @@ impl ReplicationProducer {
 /// advancing the cursor, and `commit` releases the slot back to the producer.
 /// The byte slice from `try_read` is valid until `commit` is called.
 pub struct ReplicationConsumer {
-    inner: trading_disruptor::ring::Consumer<ReplicationMeta>,
+    inner: melin_disruptor::ring::Consumer<ReplicationMeta>,
     buffers: Arc<SharedBuffers>,
     /// Metadata from the last `try_read`, held until `commit`.
     pending_meta: Option<ReplicationMeta>,
@@ -207,9 +207,8 @@ pub fn build_replication_ring(
 ) -> (ReplicationProducer, Vec<ReplicationConsumer>) {
     assert!(num_consumers > 0, "need at least one consumer");
 
-    let mut builder = trading_disruptor::ring::DisruptorBuilder::<ReplicationMeta>::new(
-        REPLICATION_RING_CAPACITY,
-    );
+    let mut builder =
+        melin_disruptor::ring::DisruptorBuilder::<ReplicationMeta>::new(REPLICATION_RING_CAPACITY);
     for _ in 0..num_consumers {
         builder = builder.add_consumer();
     }

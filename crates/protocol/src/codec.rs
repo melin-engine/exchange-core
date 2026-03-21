@@ -19,8 +19,8 @@
 
 use std::num::NonZeroU64;
 
-use trading_engine::le;
-use trading_engine::types::{
+use melin_engine::le;
+use melin_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
     Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
 };
@@ -954,7 +954,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trading_engine::types::{SelfTradeProtection, Side, TimeInForce};
+    use melin_engine::types::{SelfTradeProtection, Side, TimeInForce};
 
     fn nz(v: u64) -> NonZeroU64 {
         NonZeroU64::new(v).unwrap()

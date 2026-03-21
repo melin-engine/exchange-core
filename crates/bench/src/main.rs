@@ -20,7 +20,7 @@
 //! resting book depth. Events are pre-generated before the measured run.
 //!
 //! Usage:
-//!     cargo run --release -p trading-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
+//!     cargo run --release -p melin-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
@@ -44,13 +44,13 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-use trading_engine::types::*;
+use melin_engine::types::*;
 #[cfg(not(feature = "io-uring"))]
-use trading_protocol::blocking::BlockingFrameWriter;
-use trading_protocol::codec;
-use trading_protocol::message::ResponseKind;
-use trading_protocol::transport::BlockingTransportListener;
-use trading_server::server::ServerConfig;
+use melin_protocol::blocking::BlockingFrameWriter;
+use melin_protocol::codec;
+use melin_protocol::message::ResponseKind;
+use melin_protocol::transport::BlockingTransportListener;
+use melin_server::server::ServerConfig;
 
 /// Number of completed orders between latency time-series samples.
 /// Each sample captures interval p99/p99.9 (reset after each sample),
@@ -203,7 +203,7 @@ fn maybe_sample(
 
 /// Benchmark CLI arguments.
 #[derive(clap::Parser)]
-#[command(name = "trading-bench", about = "Matching engine benchmark suite")]
+#[command(name = "melin-bench", about = "Matching engine benchmark suite")]
 struct BenchArgs {
     /// Benchmark mode: roundtrip (full server), pipeline (no network), engine (matching only).
     #[arg(long, default_value = "roundtrip")]
@@ -340,7 +340,7 @@ fn run_engine_bench(
         ..Default::default()
     };
 
-    let mut exchange = trading_engine::exchange::Exchange::with_capacity();
+    let mut exchange = melin_engine::exchange::Exchange::with_capacity();
 
     // Register instruments.
     for i in 1..=num_instruments {
@@ -522,15 +522,15 @@ fn run_pipeline_bench(
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
 ) {
-    use trading_engine::journal::JournalWriter;
-    use trading_engine::journal::event::JournalEvent;
-    use trading_engine::journal::pipeline::{InputSlot, build_pipeline};
-    use trading_engine::journal::trace::trace_ts;
+    use melin_engine::journal::JournalWriter;
+    use melin_engine::journal::event::JournalEvent;
+    use melin_engine::journal::pipeline::{InputSlot, build_pipeline};
+    use melin_engine::journal::trace::trace_ts;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
     // Set up exchange with one instrument and funded account.
-    let mut exchange = trading_engine::exchange::Exchange::with_capacity();
+    let mut exchange = melin_engine::exchange::Exchange::with_capacity();
     exchange.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -665,13 +665,13 @@ fn run_pipeline_bench(
 /// Drain available OutputSlots from the SPSC consumer, recording latency
 /// for each BatchEnd response.
 fn drain_output(
-    consumer: &mut trading_disruptor::spsc::Consumer<trading_engine::journal::pipeline::OutputSlot>,
+    consumer: &mut melin_disruptor::spsc::Consumer<melin_engine::journal::pipeline::OutputSlot>,
     inflight_ts: &mut VecDeque<Instant>,
     histogram: &mut Histogram<u64>,
     completed: &mut usize,
     warmup: usize,
 ) {
-    use trading_engine::journal::pipeline::OutputPayload;
+    use melin_engine::journal::pipeline::OutputPayload;
 
     loop {
         let Some((_seq, slot)) = consumer.try_consume() else {
@@ -781,7 +781,7 @@ fn run_roundtrip_bench(
     let shutdown = Arc::new(AtomicBool::new(false));
 
     if use_uds {
-        use trading_protocol::uds::BlockingUdsListener;
+        use melin_protocol::uds::BlockingUdsListener;
 
         let sock_path = tmp_dir.join("bench.sock");
         let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
@@ -808,7 +808,7 @@ fn run_roundtrip_bench(
             &bench_key,
         );
     } else {
-        use trading_protocol::tcp::BlockingTcpListener;
+        use melin_protocol::tcp::BlockingTcpListener;
 
         let listener = BlockingTcpListener::bind("127.0.0.1:0".parse().expect("valid addr"))
             .expect("bind TCP");
@@ -866,7 +866,7 @@ fn start_server<L: BlockingTransportListener>(
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            if let Err(e) = trading_server::server::run_with_shutdown(listener, config, shutdown) {
+            if let Err(e) = melin_server::server::run_with_shutdown(listener, config, shutdown) {
                 eprintln!("server error: {e}");
             }
         })
@@ -895,7 +895,7 @@ fn auth_handshake(
     key: &ed25519_dalek::SigningKey,
 ) {
     use ed25519_dalek::Signer;
-    use trading_protocol::message::Request;
+    use melin_protocol::message::Request;
 
     // Read Challenge frame.
     let mut len_buf = [0u8; 4];
@@ -1382,7 +1382,7 @@ fn run_epoll_roundtrip<R, W, F>(
         let handle = std::thread::Builder::new()
             .name(format!("bench-{i}"))
             .spawn(move || {
-                if let Err(e) = trading_server::affinity::pin_to_core(core_id) {
+                if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
                     eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
                 }
                 barrier.wait();
@@ -1610,7 +1610,7 @@ fn run_uring_roundtrip<R, W, F>(
             std::thread::Builder::new()
                 .name(format!("bench-{i}"))
                 .spawn(move || {
-                    if let Err(e) = trading_server::affinity::pin_to_core(core_id) {
+                    if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
                     run_uring_loop(conns, window, bench_start, warmup, thread_progress)
@@ -2254,7 +2254,7 @@ fn show_chart(series: &TimeSeries, histogram: &Histogram<u64>) {
 
 /// Create a temporary directory that persists for the process lifetime.
 fn tempdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("trading-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("melin-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }

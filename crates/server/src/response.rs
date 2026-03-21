@@ -15,16 +15,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use trading_disruptor::padding::Sequence;
-use trading_disruptor::spsc;
+use melin_disruptor::padding::Sequence;
+use melin_disruptor::spsc;
 
-use trading_engine::journal::pipeline::{OutputPayload, OutputSlot};
+use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
-use trading_engine::journal::trace;
+use melin_engine::journal::trace;
 
-use trading_protocol::blocking::BlockingFrameWriter;
-use trading_protocol::codec;
-use trading_protocol::message::ResponseKind;
+use melin_protocol::blocking::BlockingFrameWriter;
+use melin_protocol::codec;
+use melin_protocol::message::ResponseKind;
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;

@@ -25,7 +25,7 @@ Production operations guide for the trading engine. Written for the person runni
 
 ```sh
 cargo build --release
-./target/release/trading-server [OPTIONS]
+./target/release/melin-server [OPTIONS]
 ```
 
 The server uses jemalloc by default (thread-local caches eliminate allocator lock contention).
@@ -35,7 +35,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--bind` | `127.0.0.1:9876` | TCP address to bind. Use `0.0.0.0:9876` for LAN access. |
-| `--journal` | `trading.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
+| `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `trading.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. |
 | `--cores` | `1,2,3` | Pipeline core IDs: `journal,matching,response` (comma-separated). Core 0 should be reserved for OS/IRQ. |
@@ -63,9 +63,9 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 ### Minimal Production Launch
 
 ```sh
-./target/release/trading-server \
+./target/release/melin-server \
     --bind 0.0.0.0:9876 \
-    --journal /mnt/nvme/trading.journal \
+    --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/trading/authorized_keys \
     --cores 1,2,3 \
     --readers 2 \
@@ -118,7 +118,7 @@ Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (d
 
 1. **Save snapshot**: Writes the full exchange state (accounts, order books, instruments, circuit breakers, risk limits) to the snapshot file. Written atomically via `.tmp` + rename.
 2. **Archive old journal**: Renames the current journal using a numeric suffix scheme:
-   - `trading.journal` becomes `trading.journal.1`
+   - `melin.journal` becomes `melin.journal.1`
    - Existing `.1` becomes `.2`, `.2` becomes `.3`, etc.
    - Renames happen in reverse order to avoid overwriting.
 3. **Create new journal**: Opens a fresh journal file continuing the sequence numbering and BLAKE3 hash chain from where the old journal left off.
@@ -126,10 +126,10 @@ Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (d
 ### Archive Naming
 
 ```
-trading.journal      <-- current (active)
-trading.journal.1    <-- previous rotation
-trading.journal.2    <-- two rotations ago
-trading.journal.3    <-- three rotations ago
+melin.journal      <-- current (active)
+melin.journal.1    <-- previous rotation
+melin.journal.2    <-- two rotations ago
+melin.journal.3    <-- three rotations ago
 ...
 ```
 
@@ -198,13 +198,13 @@ Examples:
 
 ```sh
 # Production: info level (default)
-RUST_LOG=info ./target/release/trading-server ...
+RUST_LOG=info ./target/release/melin-server ...
 
 # Debugging client issues:
-RUST_LOG=debug ./target/release/trading-server ...
+RUST_LOG=debug ./target/release/melin-server ...
 
 # Debugging specific crate:
-RUST_LOG=trading_server=debug,trading_engine=info ./target/release/trading-server ...
+RUST_LOG=trading_server=debug,trading_engine=info ./target/release/melin-server ...
 ```
 
 ---
@@ -305,7 +305,7 @@ systemctl disable --now irqbalance
 
 ### Admin Dashboard (QueryStats)
 
-The admin TUI (`trading-admin`) connects to a running server and can send a `QueryStats` request. This returns a live snapshot of server state:
+The admin TUI (`melin-admin`) connects to a running server and can send a `QueryStats` request. This returns a live snapshot of server state:
 
 - **Active connections**: current authenticated client count
 - **Events processed**: total events handled by the matching engine
@@ -314,7 +314,7 @@ The admin TUI (`trading-admin`) connects to a running server and can send a `Que
 QueryStats is not journaled (no state change) and does not affect the hot path. It reads counters via relaxed atomics.
 
 ```sh
-trading-admin <server-addr> <admin-key-file>
+melin-admin <server-addr> <admin-key-file>
 ```
 
 ### Pipeline Stats Feature
@@ -344,7 +344,7 @@ This records timestamps at each pipeline stage transition and builds histograms 
 Histograms are reported on shutdown. The bench crate passes these features through:
 
 ```sh
-cargo run --release -p trading-bench --features latency-trace,pipeline-stats
+cargo run --release -p melin-bench --features latency-trace,pipeline-stats
 ```
 
 **Warning**: Latency trace adds overhead (~tens of nanoseconds per event for `rdtsc` calls). Do not enable in production unless actively diagnosing a latency issue.
@@ -358,7 +358,7 @@ cargo run --release -p trading-bench --features latency-trace,pipeline-stats
 Use the admin tool to send `CancelAll` for a specific account. This cancels all resting orders across all instruments for that account. The command is journaled before execution.
 
 ```
-trading-admin <server-addr> <admin-key-file>
+melin-admin <server-addr> <admin-key-file>
 # Select "Cancel All" from the menu
 # Enter account ID
 ```
@@ -368,7 +368,7 @@ trading-admin <server-addr> <admin-key-file>
 Use the admin tool to set a circuit breaker with `halted=true` on a specific instrument. All new orders for that instrument will be rejected with `TradingHalted`. Existing resting orders remain on the book but will not match.
 
 ```
-trading-admin <server-addr> <admin-key-file>
+melin-admin <server-addr> <admin-key-file>
 # Select "Set Circuit Breaker" from the menu
 # Enter symbol, set halted = true
 ```

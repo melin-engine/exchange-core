@@ -5,7 +5,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::net::SocketAddr;
 
-use trading_gateway::proxy::{self, GatewayConfig};
+use melin_gateway::proxy::{self, GatewayConfig};
 
 fn main() {
     tracing_subscriber::fmt()

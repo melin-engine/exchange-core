@@ -1,8 +1,8 @@
 [package]
-name = "trading-client"
+name = "melin-client"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
-trading-protocol = { path = "../protocol" }
+melin-protocol = { path = "../protocol" }

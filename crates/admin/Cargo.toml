@@ -1,19 +1,19 @@
 [package]
-name = "trading-admin"
+name = "melin-admin"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "trading-admin"
+name = "melin-admin"
 path = "src/main.rs"
 
 [[bin]]
-name = "trading-keygen"
+name = "melin-keygen"
 path = "src/keygen.rs"
 
 [dependencies]
-trading-client = { path = "../client" }
-trading-protocol = { path = "../protocol" }
+melin-client = { path = "../client" }
+melin-protocol = { path = "../protocol" }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }

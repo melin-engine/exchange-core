@@ -116,10 +116,10 @@ fn forward(mut src: impl Read, mut dst: impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trading_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
-    use trading_protocol::codec;
-    use trading_protocol::message::{Request, ResponseKind};
-    use trading_protocol::types::*;
+    use melin_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
+    use melin_protocol::codec;
+    use melin_protocol::message::{Request, ResponseKind};
+    use melin_protocol::types::*;
 
     /// Start a mock engine that echoes back a BatchEnd for each request.
     fn mock_engine(listener: TcpListener) {

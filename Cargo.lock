@@ -876,6 +876,126 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-admin"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "crossterm",
+ "ed25519-dalek",
+ "melin-client",
+ "melin-protocol",
+ "rand 0.9.2",
+ "ratatui",
+]
+
+[[package]]
+name = "melin-bench"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "crossterm",
+ "ed25519-dalek",
+ "hdrhistogram",
+ "io-uring",
+ "libc",
+ "melin-disruptor",
+ "melin-engine",
+ "melin-protocol",
+ "melin-server",
+ "plotters",
+ "rand 0.9.2",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tikv-jemallocator",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "melin-client"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "melin-protocol",
+]
+
+[[package]]
+name = "melin-disruptor"
+version = "0.1.0"
+
+[[package]]
+name = "melin-engine"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bolero",
+ "crc32c",
+ "getrandom 0.3.4",
+ "hdrhistogram",
+ "io-uring",
+ "libc",
+ "melin-disruptor",
+ "proptest",
+ "rustc-hash",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "melin-gateway"
+version = "0.1.0"
+dependencies = [
+ "melin-protocol",
+ "tikv-jemallocator",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "melin-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bolero",
+ "ed25519-dalek",
+ "melin-engine",
+ "tempfile",
+]
+
+[[package]]
+name = "melin-server"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "io-uring",
+ "libc",
+ "melin-disruptor",
+ "melin-engine",
+ "melin-protocol",
+ "rand 0.9.2",
+ "tempfile",
+ "tikv-jemallocator",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "melin-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ed25519-dalek",
+ "melin-client",
+ "melin-protocol",
+ "ratatui",
+ "tikv-jemallocator",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1639,126 +1759,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "trading-admin"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "crossterm",
- "ed25519-dalek",
- "rand 0.9.2",
- "ratatui",
- "trading-client",
- "trading-protocol",
-]
-
-[[package]]
-name = "trading-bench"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "crossterm",
- "ed25519-dalek",
- "hdrhistogram",
- "io-uring",
- "libc",
- "plotters",
- "rand 0.9.2",
- "ratatui",
- "serde",
- "serde_json",
- "tikv-jemallocator",
- "tracing-subscriber",
- "trading-disruptor",
- "trading-engine",
- "trading-protocol",
- "trading-server",
-]
-
-[[package]]
-name = "trading-client"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "trading-protocol",
-]
-
-[[package]]
-name = "trading-disruptor"
-version = "0.1.0"
-
-[[package]]
-name = "trading-engine"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bolero",
- "crc32c",
- "getrandom 0.3.4",
- "hdrhistogram",
- "io-uring",
- "libc",
- "proptest",
- "rustc-hash",
- "tempfile",
- "tracing",
- "trading-disruptor",
-]
-
-[[package]]
-name = "trading-gateway"
-version = "0.1.0"
-dependencies = [
- "tikv-jemallocator",
- "tracing",
- "tracing-subscriber",
- "trading-protocol",
-]
-
-[[package]]
-name = "trading-protocol"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bolero",
- "ed25519-dalek",
- "tempfile",
- "trading-engine",
-]
-
-[[package]]
-name = "trading-server"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "clap",
- "ed25519-dalek",
- "getrandom 0.3.4",
- "io-uring",
- "libc",
- "rand 0.9.2",
- "tempfile",
- "tikv-jemallocator",
- "tracing",
- "tracing-subscriber",
- "trading-disruptor",
- "trading-engine",
- "trading-protocol",
-]
-
-[[package]]
-name = "trading-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ed25519-dalek",
- "ratatui",
- "tikv-jemallocator",
- "trading-client",
- "trading-protocol",
 ]
 
 [[package]]

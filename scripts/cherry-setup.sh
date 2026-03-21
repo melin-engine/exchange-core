@@ -262,7 +262,7 @@ run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --relea
 echo "  Default build: OK"
 
 echo "  Building with --features no-persist,pipeline-stats..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release -p trading-server --features no-persist,pipeline-stats" 2>&1 | tail -3
+run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release -p melin-server --features no-persist,pipeline-stats" 2>&1 | tail -3
 echo "  Bench build: OK"
 
 echo ""

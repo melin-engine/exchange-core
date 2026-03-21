@@ -19,7 +19,7 @@ mod fuzz_tests;
 /// interpret responses, so they don't need a direct dependency on the
 /// engine crate.
 pub mod types {
-    pub use trading_engine::types::{
+    pub use melin_engine::types::{
         AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
         Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection,
         Side, Symbol, TimeInForce,

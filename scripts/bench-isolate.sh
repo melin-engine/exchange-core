@@ -230,7 +230,7 @@ echo ""
 # cores 1-3 pipeline, 4-5 readers, 6+ bench threads.
 CARGO_BIN="$(sudo -u "${SUDO_USER}" bash -lc 'which cargo')"
 sudo -u "${SUDO_USER}" \
-    "$CARGO_BIN" run --release -p trading-bench "$@"
+    "$CARGO_BIN" run --release -p melin-bench "$@"
 
 # --- Stop perf and show summary ---
 if [[ -n "$PERF_PID" ]]; then
