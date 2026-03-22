@@ -12,3 +12,6 @@ pub mod server;
 mod uring_reader;
 #[cfg(feature = "io-uring")]
 mod uring_response;
+
+#[cfg(feature = "dpdk")]
+pub mod dpdk_transport;

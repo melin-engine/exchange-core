@@ -1,0 +1,27 @@
+[package]
+name = "melin-dpdk"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+# Userspace TCP/IP stack — replaces the kernel TCP stack when using DPDK.
+# `std` feature needed for smoltcp to link against system time; `medium-ethernet`
+# for Ethernet frame processing; `proto-ipv4` + `socket-tcp` for TCP/IPv4.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "log",
+] }
+tracing = "0.1"
+libc = "0.2"
+
+[build-dependencies]
+# bindgen generates Rust FFI bindings from DPDK C headers at build time.
+# Requires DPDK to be installed (pkg-config --cflags --libs libdpdk).
+bindgen = "0.71"
+pkg-config = "0.3"
