@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
@@ -34,6 +35,8 @@ use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request};
 use smoltcp::iface::SocketHandle;
 use tracing::debug;
+
+use crate::dpdk_response::{ControlEvent, TxFrame};
 
 /// Maximum frame payload size (matches epoll reader).
 const MAX_FRAME_SIZE: usize = 1024;
@@ -52,15 +55,21 @@ struct ConnectionState {
 /// Run the DPDK poll loop.
 ///
 /// This replaces the epoll reader pool. It accepts connections, parses
-/// frames, and publishes events to the disruptor. Called from a dedicated
-/// OS thread pinned to its own core.
+/// frames, publishes events to the disruptor, and drains the TX channel
+/// from the response stage into smoltcp sockets.
+///
+/// Called from a dedicated OS thread pinned to its own core.
 pub fn run_dpdk_poll(
     mut transport: DpdkTransport,
     producer: ring::MultiProducer<InputSlot>,
+    control_tx: mpsc::Sender<ControlEvent>,
+    tx_rx: mpsc::Receiver<TxFrame>,
     shutdown: &AtomicBool,
 ) {
     // Map from smoltcp SocketHandle index → connection state.
     let mut connections: HashMap<usize, ConnectionState> = HashMap::with_capacity(256);
+    // Reverse map: connection_id → socket handle index (for TX routing).
+    let mut id_to_handle: HashMap<u64, usize> = HashMap::with_capacity(256);
     let mut next_connection_id: u64 = 1;
 
     // Scratch buffer for reading from smoltcp sockets.
@@ -96,9 +105,24 @@ pub fn run_dpdk_poll(
                     parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
                 },
             );
+            id_to_handle.insert(conn_id.0, handle_idx);
+
+            // Notify the response stage about the new connection.
+            let _ = control_tx.send(ControlEvent::Connected {
+                connection_id: conn_id.0,
+            });
         }
 
-        // 3. Read data from all active connections.
+        // 3. Drain TX frames from the response stage into smoltcp sockets.
+        while let Ok(frame) = tx_rx.try_recv() {
+            if let Some(&handle_idx) = id_to_handle.get(&frame.connection_id) {
+                if let Some(conn) = connections.get(&handle_idx) {
+                    transport.queue_send(conn.handle, &frame.data);
+                }
+            }
+        }
+
+        // 4. Read data from all active connections.
         // Collect handles to avoid borrow conflict with `transport`.
         let handle_indices: Vec<usize> = connections.keys().copied().collect();
 
@@ -118,6 +142,10 @@ pub fn run_dpdk_poll(
                         addr = %conn.addr,
                         "DPDK: connection closed"
                     );
+                    let _ = control_tx.send(ControlEvent::Disconnected {
+                        connection_id: conn.connection_id.0,
+                    });
+                    id_to_handle.remove(&conn.connection_id.0);
                     connections.remove(&handle_idx);
                 }
                 continue;
@@ -141,6 +169,10 @@ pub fn run_dpdk_poll(
                         frame_len, "DPDK: oversized frame, dropping connection"
                     );
                     transport.close(conn.handle);
+                    let _ = control_tx.send(ControlEvent::Disconnected {
+                        connection_id: conn.connection_id.0,
+                    });
+                    id_to_handle.remove(&conn.connection_id.0);
                     connections.remove(&handle_idx);
                     break;
                 }

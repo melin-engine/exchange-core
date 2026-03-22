@@ -14,4 +14,6 @@ mod uring_reader;
 mod uring_response;
 
 #[cfg(feature = "dpdk")]
+pub mod dpdk_response;
+#[cfg(feature = "dpdk")]
 pub mod dpdk_transport;
