@@ -34,7 +34,11 @@ use crate::{TimeSeries, maybe_sample, print_results, spawn_progress_reporter};
 const SOCKET_BUF_SIZE: usize = 65536;
 
 /// How often to refresh the smoltcp timestamp (poll iterations).
-const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
+/// During connection setup (ARP + TCP handshake), smoltcp needs
+/// advancing timestamps to drive retransmit timers. Using 1 here
+/// (refresh every poll) to avoid stalls. The SystemTime call is
+/// vDSO-accelerated (~20ns) so the overhead is negligible.
+const TIMESTAMP_REFRESH_INTERVAL: u32 = 1;
 
 /// Per-connection state for the DPDK benchmark.
 struct DpdkBenchConn {
