@@ -144,7 +144,7 @@ pub struct ServerConfig {
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
     pub dpdk_eal_args: String,
 
     /// DPDK port ID (the NIC bound to DPDK). Default: 0 (first available port).

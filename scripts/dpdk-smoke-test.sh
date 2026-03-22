@@ -24,15 +24,15 @@
 
 set -euo pipefail
 
-# Ensure cargo is on PATH when running under sudo.
-# sudo sets HOME to /root, so check the invoking user's home first.
-REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")
-for candidate in "$REAL_HOME/.cargo/env" "$HOME/.cargo/env" "/root/.cargo/env"; do
-    if [[ -f "$candidate" ]]; then
-        source "$candidate"
-        break
-    fi
-done
+# Ensure cargo/rustup work when running under sudo.
+# sudo sets HOME to /root, so rustup can't find the toolchain.
+# Point both PATH and RUSTUP_HOME/CARGO_HOME at the invoking user's install.
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_HOME=$(eval echo "~$SUDO_USER")
+    export PATH="$REAL_HOME/.cargo/bin:$PATH"
+    export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
+    export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
+fi
 
 if [[ $EUID -ne 0 ]]; then
     echo "error: must run as root (hugepages + TAP interface)" >&2
@@ -65,6 +65,11 @@ cleanup() {
     # Remove TAP interface IP (interface is auto-removed when DPDK exits).
     ip addr del "$TAP_IP/$DPDK_PREFIX" dev "$TAP_IFACE" 2>/dev/null || true
 
+    # Unmount 2MB hugepages if we mounted them.
+    if [[ "${MOUNTED_HUGE_2M:-}" == "1" ]]; then
+        umount "$HUGE_2M_MOUNT" 2>/dev/null || true
+    fi
+
     # Clean up temp dir.
     rm -rf "$TMPDIR"
     echo "  Temp dir cleaned: $TMPDIR"
@@ -89,11 +94,17 @@ if [[ "$HUGEPAGE_COUNT" -lt 256 ]]; then
 fi
 echo "  Hugepages available: $HUGEPAGE_COUNT x 2MB"
 
-# Ensure hugepage mount exists.
-if ! mount | grep -q hugetlbfs; then
-    mkdir -p /dev/hugepages
-    mount -t hugetlbfs nodev /dev/hugepages
-    echo "  Mounted hugetlbfs at /dev/hugepages"
+# Ensure a 2MB hugetlbfs mount exists. Some systems (e.g., ARM/Asahi)
+# default to larger page sizes. DPDK needs an explicit 2MB mount.
+HUGE_2M_MOUNT="/mnt/huge_2m"
+if ! mount | grep -q "pagesize=2M"; then
+    mkdir -p "$HUGE_2M_MOUNT"
+    mount -t hugetlbfs -o pagesize=2M nodev "$HUGE_2M_MOUNT"
+    MOUNTED_HUGE_2M=1
+    echo "  Mounted 2MB hugetlbfs at $HUGE_2M_MOUNT"
+else
+    HUGE_2M_MOUNT=$(mount | grep "pagesize=2M" | awk '{print $3}' | head -1)
+    echo "  2MB hugetlbfs already mounted at $HUGE_2M_MOUNT"
 fi
 echo ""
 
@@ -113,8 +124,9 @@ echo ""
 # --- 3. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" bench admin 2>/dev/null
-echo "admin $(cat admin.pub | tr -d '\n') bench" > authorized_keys
+"$PROJECT_DIR/target/release/melin-keygen" bench admin
+# keygen creates bench.key and bench.pub
+echo "admin $(cat bench.pub | tr -d '\n') bench" > authorized_keys
 echo "  Generated bench.key + authorized_keys"
 echo ""
 
@@ -128,7 +140,7 @@ RUST_LOG=info,melin_server=debug,melin_dpdk=debug \
     --standalone \
     --accounts 100 \
     --instruments 10 \
-    --dpdk-eal-args "--vdev net_tap0 --no-pci --log-level 6" \
+    --dpdk-eal-args="--vdev=net_tap0 --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT" \
     --dpdk-ip "$DPDK_IP" \
     --dpdk-prefix-len "$DPDK_PREFIX" \
     > "$TMPDIR/server.log" 2>&1 &
