@@ -118,7 +118,7 @@ Performance figures are in the [README](README.md#performance). Keep them up to 
 
 LAN benchmark at `66fed71` (two or three Cherry AMD Ryzen 9950X servers, SMT disabled, dedicated NVMe journal disk):
 - **With fsync/FUA**: 4.0M orders/sec, p50 = 971 µs, p99.9 = 1083 µs, max = 1759 µs
-- **Without persistence**: 4.0M orders/sec, p50 = 937 µs, p99.9 = 1098 µs, max = 2361 µs
+- **Without persistence**: 10.0M orders/sec, p50 = 762 µs, p99.9 = 1015 µs, max = 2767 µs (window 512)
 - **Single-order latency**: 78 µs p50 (1 client, no pipelining, full durability)
 - **With fsync + sync replication**: 3.7M orders/sec, p50 = 984 µs, p99.9 = 1332 µs, max = 2482 µs
 - **Engine only**: 12.9M orders/sec, p50 = 50 ns
@@ -132,7 +132,7 @@ Pipeline layer breakdown (Cherry LAN, `66fed71`):
 - **Engine only**: 12.9M/s, p50=50ns — matching engine has ~3x headroom
 - **Pipeline (no network)**: 1.9M/s, p50=16µs — journal fsync is the primary gate
 - **TCP + fsync**: 4.0M/s, p50=971µs — pipelining hides fsync latency at high window depths
-- **TCP no-persist**: 4.0M/s, p50=937µs — TCP stack is near-identical to fsync at saturation
+- **TCP no-persist**: 10.0M/s, p50=762µs (window 512) — removing fsync unlocks 2.5x throughput
 
 **How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
 
