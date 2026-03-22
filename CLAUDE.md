@@ -116,24 +116,25 @@ Without the mid-batch flush (per-slot check only), results were identical to bas
 
 Performance figures are in the [README](README.md#performance). Keep them up to date when making performance-related changes.
 
-LAN benchmark at `093d59e` (two or three Cherry AMD Ryzen 9950X servers, SMT disabled, dedicated NVMe journal disk):
-- **With fsync/FUA**: 4.0M orders/sec, p50 = 920 µs, p99.9 = 1082 µs, max = 1560 µs
-- **Without persistence**: 8.0M orders/sec, p50 = 441 µs, p99.9 = 661 µs, max = 1969 µs
-- **Single-order latency**: 73 µs p50 (1 client, no pipelining, full durability)
-- **With fsync + sync replication**: 2.7M orders/sec, p50 = 1059 µs, p99.9 = 1393 µs, max = 1794 µs
+LAN benchmark at `66fed71` (two or three Cherry AMD Ryzen 9950X servers, SMT disabled, dedicated NVMe journal disk):
+- **With fsync/FUA**: 4.0M orders/sec, p50 = 971 µs, p99.9 = 1083 µs, max = 1759 µs
+- **Without persistence**: 4.0M orders/sec, p50 = 937 µs, p99.9 = 1098 µs, max = 2361 µs
+- **Single-order latency**: 78 µs p50 (1 client, no pipelining, full durability)
+- **With fsync + sync replication**: 3.7M orders/sec, p50 = 984 µs, p99.9 = 1332 µs, max = 2482 µs
+- **Engine only**: 12.9M orders/sec, p50 = 50 ns
+- **Pipeline (no network)**: 1.9M orders/sec, p50 = 16 µs
 
 ### Current bottleneck: TCP network stack
 
 The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is the primary throughput limiter for no-persist mode. UDS is ~18% faster than TCP (4.6M vs 3.9M on loopback, no-persist) with dramatically tighter tail (p99.99 ~410µs vs ~1.9ms).
 
-Pipeline layer breakdown (loopback, Fedora dev machine, `fb3e959`):
-- **Engine only**: 12.1M/s, p50=40ns — matching engine has 6x headroom
-- **Pipeline (no network)**: 8.5M/s, p50=2.75µs — disruptor/SPSC overhead is small
-- **UDS no-persist**: 4.6M/s, p50=212µs — matching 31.7%, response 24.5%, journal 18%
-- **TCP no-persist**: 3.9M/s, p50=255µs — TCP stack is the wall
-- **TCP + fsync**: 1.9M/s, p50=530µs — journal fsync gating halves throughput again
+Pipeline layer breakdown (Cherry LAN, `66fed71`):
+- **Engine only**: 12.9M/s, p50=50ns — matching engine has ~3x headroom
+- **Pipeline (no network)**: 1.9M/s, p50=16µs — journal fsync is the primary gate
+- **TCP + fsync**: 4.0M/s, p50=971µs — pipelining hides fsync latency at high window depths
+- **TCP no-persist**: 4.0M/s, p50=937µs — TCP stack is near-identical to fsync at saturation
 
-**How to apply:** The matching engine is not the bottleneck. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
+**How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
 
 Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6=repl-sender, 7+=bench.
 

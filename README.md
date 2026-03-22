@@ -266,18 +266,18 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, SMT disabled, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`66fed71`](../../commit/66fed71). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, SMT disabled, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
 ### Headline numbers
 
 | Mode | Throughput | p50 | p99 | p99.9 | max |
 |------|-----------|-----|-----|-------|-----|
-| **Full durability** (fsync) | **4.0M orders/sec** | 920 µs | 1,035 µs | 1,082 µs | 1,560 µs |
-| **Synchronous replication** | **2.7M orders/sec** | 1,059 µs | 1,311 µs | 1,393 µs | 1,794 µs |
-| **Single-order latency** | 13.5K orders/sec | **73 µs** | 105 µs | 108 µs | 6,472 µs |
-| **No persistence** | **8.0M orders/sec** | 441 µs | 629 µs | 661 µs | 1,969 µs |
-| **Pipeline** (no network) | *TBD* | | | | |
-| **Engine only** | *TBD* | | | | |
+| **Full durability** (fsync) | **4.0M orders/sec** | 971 µs | 1,048 µs | 1,083 µs | 1,759 µs |
+| **Synchronous replication** | **3.7M orders/sec** | 984 µs | 1,265 µs | 1,332 µs | 2,482 µs |
+| **Single-order latency** | 12.2K orders/sec | **78 µs** | 110 µs | 112 µs | 1,215 µs |
+| **No persistence** | **4.0M orders/sec** | 937 µs | 1,028 µs | 1,098 µs | 2,361 µs |
+| **Pipeline** (no network) | **1.9M orders/sec** | 16 µs | 523 µs | 532 µs | 6,767 µs |
+| **Engine only** | **12.9M orders/sec** | 0.05 µs | 0.20 µs | 0.47 µs | 400 µs |
 
 ### Peak-load throughput — full durability
 
@@ -286,45 +286,45 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 | Metric | Value |
 |--------|-------|
 | **Throughput** | 4.0M orders/sec |
-| **p50** | 920 µs |
-| **p90** | 952 µs |
-| **p99** | 1,035 µs |
-| **p99.9** | 1,082 µs |
-| **p99.99** | 1,113 µs |
-| **p99.999** | 1,338 µs |
-| **max** | 1,560 µs |
+| **p50** | 971 µs |
+| **p90** | 1,014 µs |
+| **p99** | 1,048 µs |
+| **p99.9** | 1,083 µs |
+| **p99.99** | 1,157 µs |
+| **p99.999** | 1,672 µs |
+| **max** | 1,759 µs |
 
 ### Synchronous replication — full durability
 
-20M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
+100M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 2.7M orders/sec |
-| **p50** | 1,059 µs |
-| **p90** | 1,225 µs |
-| **p99** | 1,311 µs |
-| **p99.9** | 1,393 µs |
-| **p99.99** | 1,530 µs |
-| **p99.999** | 1,567 µs |
-| **max** | 1,794 µs |
+| **Throughput** | 3.7M orders/sec |
+| **p50** | 984 µs |
+| **p90** | 1,132 µs |
+| **p99** | 1,265 µs |
+| **p99.9** | 1,332 µs |
+| **p99.99** | 1,480 µs |
+| **p99.999** | 1,841 µs |
+| **max** | 2,482 µs |
 
-Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
+Journals verified byte-identical (BLAKE3 chain hash match, 202.6M entries).
 
 ### Single-order latency — full durability
 
-1M order pairs, 1 client, no pipelining (window=1):
+500K order pairs, 1 client, no pipelining (window=1):
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 13.5K orders/sec |
-| **p50** | 73 µs |
-| **p90** | 74 µs |
-| **p99** | 105 µs |
-| **p99.9** | 108 µs |
-| **p99.99** | 127 µs |
-| **p99.999** | 200 µs |
-| **max** | 6,472 µs |
+| **Throughput** | 12.2K orders/sec |
+| **p50** | 78 µs |
+| **p90** | 79 µs |
+| **p99** | 110 µs |
+| **p99.9** | 112 µs |
+| **p99.99** | 125 µs |
+| **p99.999** | 611 µs |
+| **max** | 1,215 µs |
 
 ### Peak-load throughput — no persistence
 
@@ -332,14 +332,26 @@ Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 8.0M orders/sec |
-| **p50** | 441 µs |
-| **p90** | 514 µs |
-| **p99** | 629 µs |
-| **p99.9** | 661 µs |
-| **p99.99** | 760 µs |
-| **p99.999** | 1,748 µs |
-| **max** | 1,969 µs |
+| **Throughput** | 4.0M orders/sec |
+| **p50** | 937 µs |
+| **p90** | 974 µs |
+| **p99** | 1,028 µs |
+| **p99.9** | 1,098 µs |
+| **p99.99** | 1,261 µs |
+| **p99.999** | 2,304 µs |
+| **max** | 2,361 µs |
+
+### Pipeline layer breakdown
+
+Engine-only and pipeline benchmarks run on the server machine (same CPU as production benchmarks). Pipeline uses the dedicated NVMe journal disk.
+
+| Layer | Throughput | p50 | p99.9 | Notes |
+|-------|-----------|-----|-------|-------|
+| **Engine only** | 12.9M/s | 0.05 µs | 0.47 µs | Matching engine, no journal or network |
+| **Pipeline** (no network) | 1.9M/s | 16 µs | 532 µs | Journal + matching, no TCP |
+| **Full durability** (TCP) | 4.0M/s | 971 µs | 1,083 µs | End-to-end with fsync |
+
+The matching engine has ~3x headroom over the end-to-end pipeline. The journal fsync stage is the primary throughput gate; TCP network overhead adds latency but not throughput cost at this load.
 
 ### Plots
 
@@ -362,6 +374,10 @@ Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
 **Throughput vs. account count** (fsync mode, 16 clients, window 128):
 
 ![Saturation — accounts](docs/plots/saturation-accounts.svg)
+
+**Latency stability over time** (fsync and replication modes):
+
+![Latency stability](docs/plots/latency-stability.svg)
 
 ## License
 
