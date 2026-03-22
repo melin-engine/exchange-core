@@ -1010,7 +1010,14 @@ pub fn run_dpdk(
 
     // Run the DPDK poll loop on this thread (the main thread).
     // This blocks until shutdown.
-    crate::dpdk_transport::run_dpdk_poll(transport, input_producer, control_tx, tx_rx, &shutdown);
+    crate::dpdk_transport::run_dpdk_poll(
+        transport,
+        input_producer,
+        control_tx,
+        tx_rx,
+        &shutdown,
+        authorized_keys,
+    );
 
     // Shutdown sequence.
     info!("shutdown: draining pipeline");
