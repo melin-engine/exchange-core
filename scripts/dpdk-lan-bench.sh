@@ -179,9 +179,13 @@ for host_label in "server:$SERVER" "bench:$BENCH"; do
     fi
     echo "  ${label} (${host}):"
     ssh $SSH_OPTS "$host" "\
-        echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages; \
-        if ! mount | grep -q 'pagesize=2M'; then \
-            mkdir -p ${HUGE_DIR} && mount -t hugetlbfs -o pagesize=2M nodev ${HUGE_DIR}; \
+        HP=\$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0); \
+        if [[ \"\$HP\" -lt 256 ]]; then \
+            echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages; \
+        fi; \
+        mkdir -p ${HUGE_DIR}; \
+        if ! mount | grep -q '${HUGE_DIR}'; then \
+            mount -t hugetlbfs -o pagesize=2M nodev ${HUGE_DIR} 2>/dev/null || true; \
             echo '    Mounted 2MB hugetlbfs at ${HUGE_DIR}'; \
         fi; \
         echo \"    Hugepages: \$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) x 2MB\""

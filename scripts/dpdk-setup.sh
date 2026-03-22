@@ -135,10 +135,15 @@ echo "--- Configuring hugepages (${HUGEPAGES} x 2MB) ---"
 echo "$HUGEPAGES" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 
 # Mount 2MB hugetlbfs if not already mounted.
-if ! mount | grep -q "pagesize=2M"; then
-    mkdir -p /mnt/huge_2m
+mkdir -p /mnt/huge_2m
+if ! mount | grep -q "/mnt/huge_2m"; then
     mount -t hugetlbfs -o pagesize=2M nodev /mnt/huge_2m
     echo "  Mounted 2MB hugetlbfs at /mnt/huge_2m"
+fi
+# Make persistent across reboots.
+if ! grep -q "/mnt/huge_2m" /etc/fstab 2>/dev/null; then
+    echo "nodev /mnt/huge_2m hugetlbfs pagesize=2M 0 0" >> /etc/fstab
+    echo "  Added /mnt/huge_2m to /etc/fstab"
 fi
 
 ACTUAL=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
