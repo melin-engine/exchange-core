@@ -1813,7 +1813,9 @@ fn run_uring_loop(
     use io_uring::{IoUring, opcode, types};
 
     let n = connections.len();
-    let mut ring = IoUring::new(1024).expect("create io_uring for bench");
+    // 4096 entries: supports up to 1024 connections per thread (RECV +
+    // SEND per connection, plus headroom for partial-send resubmissions).
+    let mut ring = IoUring::new(4096).expect("create io_uring for bench");
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut done_count: usize = 0;

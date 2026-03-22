@@ -37,8 +37,9 @@ const MAX_RESPONSE_BUF: usize = 128;
 
 /// io_uring submission queue depth for sends. Must be ≥ max concurrent
 /// connections to avoid SQ overflow when all connections are dirty.
-/// Power of 2 for io_uring alignment.
-const RING_SIZE: u32 = 1024;
+/// Power of 2 for io_uring alignment. 4096 supports 1024+ client
+/// benchmarks where all connections flush simultaneously.
+const RING_SIZE: u32 = 4096;
 
 /// Maximum accumulated send buffer per connection (64 KiB). If a client
 /// falls behind and the buffer exceeds this, the connection is dropped.
