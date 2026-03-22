@@ -24,6 +24,16 @@
 
 set -euo pipefail
 
+# Ensure cargo is on PATH when running under sudo.
+# sudo sets HOME to /root, so check the invoking user's home first.
+REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")
+for candidate in "$REAL_HOME/.cargo/env" "$HOME/.cargo/env" "/root/.cargo/env"; do
+    if [[ -f "$candidate" ]]; then
+        source "$candidate"
+        break
+    fi
+done
+
 if [[ $EUID -ne 0 ]]; then
     echo "error: must run as root (hugepages + TAP interface)" >&2
     echo "usage: sudo $0" >&2
