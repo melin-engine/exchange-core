@@ -57,6 +57,13 @@ apt-get install -y --no-install-recommends \
     libelf-dev \
     bpftool
 
+# DPDK kernel-bypass networking (optional — only needed with --features dpdk).
+# libdpdk-dev provides headers + pkg-config for bindgen FFI generation.
+apt-get install -y --no-install-recommends \
+    libdpdk-dev \
+    dpdk-dev \
+    || true  # may not be available on all distros/versions
+
 # Benchmarking / diagnostics
 apt-get install -y --no-install-recommends \
     ethtool \

@@ -163,6 +163,12 @@ pub struct ServerConfig {
     /// IPv4 gateway for the DPDK interface (optional, needed for cross-subnet traffic).
     #[arg(long)]
     pub dpdk_gateway: Option<String>,
+
+    /// CPU core for the DPDK poll thread. This thread handles all NIC I/O
+    /// and smoltcp TCP processing — it should be on an isolated core.
+    /// Default: 7 (after the 3 pipeline cores + 2 reader cores).
+    #[arg(long, default_value_t = 7)]
+    pub dpdk_core: usize,
 }
 
 impl Default for ServerConfig {
@@ -199,6 +205,7 @@ impl Default for ServerConfig {
             dpdk_ip: "10.0.0.1".into(),
             dpdk_prefix_len: 24,
             dpdk_gateway: None,
+            dpdk_core: 7,
         }
     }
 }
@@ -1016,6 +1023,11 @@ pub fn run_dpdk(
         port = dpdk_config.listen_port,
         "DPDK transport listening"
     );
+
+    // Pin the DPDK poll thread to its dedicated core. This thread
+    // handles all NIC I/O and smoltcp TCP processing — must not share
+    // a core with pipeline threads.
+    apply_affinity("dpdk-poll", config.dpdk_core);
 
     // Run the DPDK poll loop on this thread (the main thread).
     // This blocks until shutdown.
