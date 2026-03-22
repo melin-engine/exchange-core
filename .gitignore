@@ -1,3 +1,4 @@
 /target
+crates/dpdk/target/
 *.journal
 proptest-regressions/

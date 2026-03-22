@@ -74,6 +74,15 @@ fn main() {
             uint32_t dpdk_mbuf_pkt_len(const struct rte_mbuf *m);\n\
             void dpdk_mbuf_set_pkt_len(struct rte_mbuf *m, uint32_t len);\n\
             void *dpdk_mbuf_buf_addr(const struct rte_mbuf *m);\n\
+            uint64_t dpdk_mbuf_ol_flags(const struct rte_mbuf *m);\n\
+            void dpdk_mbuf_set_ol_flags(struct rte_mbuf *m, uint64_t flags);\n\
+            void dpdk_mbuf_set_tx_offload(struct rte_mbuf *m,\n\
+                                           uint64_t l2_len, uint64_t l3_len,\n\
+                                           uint64_t l4_len);\n\
+            uint64_t dpdk_tx_offload_ipv4_cksum(void);\n\
+            uint64_t dpdk_tx_offload_tcp_cksum(void);\n\
+            uint64_t dpdk_rx_offload_checksum(void);\n\
+            uint64_t dpdk_tx_offload_checksum(void);\n\
             ",
         )
         .clang_args(&include_args)
@@ -106,6 +115,13 @@ fn main() {
         .allowlist_function("dpdk_mbuf_pkt_len")
         .allowlist_function("dpdk_mbuf_set_pkt_len")
         .allowlist_function("dpdk_mbuf_buf_addr")
+        .allowlist_function("dpdk_mbuf_ol_flags")
+        .allowlist_function("dpdk_mbuf_set_ol_flags")
+        .allowlist_function("dpdk_mbuf_set_tx_offload")
+        .allowlist_function("dpdk_tx_offload_ipv4_cksum")
+        .allowlist_function("dpdk_tx_offload_tcp_cksum")
+        .allowlist_function("dpdk_rx_offload_checksum")
+        .allowlist_function("dpdk_tx_offload_checksum")
         // Types.
         .allowlist_type("rte_mbuf")
         .allowlist_type("rte_mempool")

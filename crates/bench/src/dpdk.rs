@@ -106,7 +106,7 @@ pub fn run_dpdk_roundtrip(
     port.start().expect("port start failed");
 
     let mac = port.mac_addr();
-    let mut device = DpdkDevice::new(config.port_id, mempool.as_raw());
+    let mut device = DpdkDevice::new(config.port_id, mempool.as_raw(), port.offloads);
 
     let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
     let iface_config = Config::new(hw_addr);

@@ -19,10 +19,21 @@ const RX_DESC: u16 = 1024;
 /// Number of TX descriptors per queue.
 const TX_DESC: u16 = 1024;
 
+/// Which checksum offloads the NIC supports.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChecksumOffloads {
+    pub rx_ip: bool,
+    pub rx_tcp: bool,
+    pub tx_ip: bool,
+    pub tx_tcp: bool,
+}
+
 /// Configured DPDK ethernet port, ready for `start()`.
 pub struct Port {
     port_id: u16,
     started: bool,
+    /// Hardware checksum offloads enabled on this port.
+    pub offloads: ChecksumOffloads,
 }
 
 impl Port {
@@ -38,9 +49,25 @@ impl Port {
             return Err(PortError::InfoFailed(ret));
         }
 
-        // Minimal port configuration: no RSS (single queue), no offloads.
-        // Zero-initialized rte_eth_conf disables all optional features.
-        let port_conf: ffi::rte_eth_conf = unsafe { std::mem::zeroed() };
+        // Query NIC capabilities and enable hardware checksum offloads
+        // where supported. Checksum offload eliminates per-packet software
+        // checksum computation in smoltcp — the NIC computes/verifies instead.
+        let rx_cksum_wanted = unsafe { ffi::dpdk_rx_offload_checksum() };
+        let tx_cksum_wanted = unsafe { ffi::dpdk_tx_offload_checksum() };
+
+        let rx_offloads = dev_info.rx_offload_capa & rx_cksum_wanted;
+        let tx_offloads = dev_info.tx_offload_capa & tx_cksum_wanted;
+
+        let mut port_conf: ffi::rte_eth_conf = unsafe { std::mem::zeroed() };
+        port_conf.rxmode.offloads = rx_offloads;
+        port_conf.txmode.offloads = tx_offloads;
+
+        let offloads = ChecksumOffloads {
+            rx_ip: rx_offloads & (1u64 << 1) != 0, // RTE_ETH_RX_OFFLOAD_IPV4_CKSUM
+            rx_tcp: rx_offloads & (1u64 << 3) != 0, // RTE_ETH_RX_OFFLOAD_TCP_CKSUM
+            tx_ip: tx_offloads & (1u64 << 1) != 0, // RTE_ETH_TX_OFFLOAD_IPV4_CKSUM
+            tx_tcp: tx_offloads & (1u64 << 3) != 0, // RTE_ETH_TX_OFFLOAD_TCP_CKSUM
+        };
 
         // Configure port with 1 RX queue + 1 TX queue.
         let ret = unsafe { ffi::rte_eth_dev_configure(port_id, 1, 1, &port_conf) };
@@ -92,12 +119,14 @@ impl Port {
             port_id,
             rx_desc = RX_DESC,
             tx_desc = TX_DESC,
+            ?offloads,
             "DPDK port configured"
         );
 
         Ok(Port {
             port_id,
             started: false,
+            offloads,
         })
     }
 

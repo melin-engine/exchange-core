@@ -64,3 +64,46 @@ void dpdk_mbuf_set_pkt_len(struct rte_mbuf *m, uint32_t len) {
 void *dpdk_mbuf_buf_addr(const struct rte_mbuf *m) {
     return m->buf_addr;
 }
+
+/* --- Offload flag accessors ---
+ * ol_flags is a uint64_t but lives alongside bitfields in a union,
+ * so we wrap it to avoid bindgen layout issues. */
+uint64_t dpdk_mbuf_ol_flags(const struct rte_mbuf *m) {
+    return m->ol_flags;
+}
+
+void dpdk_mbuf_set_ol_flags(struct rte_mbuf *m, uint64_t flags) {
+    m->ol_flags = flags;
+}
+
+/* --- TX offload header length setters ---
+ * l2_len and l3_len are bitfields inside a union — the NIC needs these
+ * to locate IP/TCP headers for hardware checksum computation. */
+void dpdk_mbuf_set_tx_offload(struct rte_mbuf *m,
+                               uint64_t l2_len, uint64_t l3_len,
+                               uint64_t l4_len) {
+    m->l2_len = l2_len;
+    m->l3_len = l3_len;
+    m->l4_len = l4_len;
+}
+
+/* --- TX offload flag constants ---
+ * Macros can't be accessed by bindgen, so expose them as functions. */
+uint64_t dpdk_tx_offload_ipv4_cksum(void) {
+    return RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
+}
+
+uint64_t dpdk_tx_offload_tcp_cksum(void) {
+    return RTE_MBUF_F_TX_TCP_CKSUM;
+}
+
+/* --- RX/TX ethdev offload capability constants --- */
+uint64_t dpdk_rx_offload_checksum(void) {
+    return RTE_ETH_RX_OFFLOAD_IPV4_CKSUM |
+           RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
+}
+
+uint64_t dpdk_tx_offload_checksum(void) {
+    return RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
+           RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+}

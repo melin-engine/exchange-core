@@ -8,10 +8,11 @@
 //! The device is single-threaded — it's called from the DPDK poll thread
 //! only. No synchronization needed.
 
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
 use crate::ffi;
+use crate::port::ChecksumOffloads;
 
 /// Maximum burst size for rx_burst / tx_burst.
 /// 32 is the typical sweet spot: amortizes per-call overhead without
@@ -29,6 +30,10 @@ pub struct DpdkDevice {
     rx_buf: [*mut ffi::rte_mbuf; BURST_SIZE],
     rx_count: usize,
     rx_cursor: usize,
+    /// Hardware checksum offloads supported by the NIC.
+    offloads: ChecksumOffloads,
+    /// Cached TX offload flags (computed once at init, reused per packet).
+    tx_ol_flags: u64,
 }
 
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
@@ -36,13 +41,28 @@ unsafe impl Send for DpdkDevice {}
 
 impl DpdkDevice {
     /// Create a new device for the given DPDK port.
-    pub fn new(port_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
+    pub fn new(port_id: u16, mempool: *mut ffi::rte_mempool, offloads: ChecksumOffloads) -> Self {
+        // Pre-compute TX offload flags once — these are the same for every
+        // outbound IPv4/TCP packet.
+        let mut tx_ol_flags: u64 = 0;
+        if offloads.tx_ip {
+            tx_ol_flags |= unsafe { ffi::dpdk_tx_offload_ipv4_cksum() };
+        }
+        if offloads.tx_tcp {
+            tx_ol_flags |= unsafe { ffi::dpdk_tx_offload_tcp_cksum() };
+        }
+        if tx_ol_flags != 0 {
+            tracing::info!("DPDK TX checksum offload enabled (flags=0x{tx_ol_flags:x})");
+        }
+
         DpdkDevice {
             port_id,
             mempool,
             rx_buf: [std::ptr::null_mut(); BURST_SIZE],
             rx_count: 0,
             rx_cursor: 0,
+            offloads,
+            tx_ol_flags,
         }
     }
 
@@ -67,6 +87,26 @@ impl DpdkDevice {
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = MTU;
         caps.max_burst_size = Some(BURST_SIZE);
+
+        // Tell smoltcp which checksums the NIC handles in hardware.
+        // `Checksum::None` means "don't compute or verify" — the NIC does it.
+        let mut checksums = ChecksumCapabilities::default();
+        if self.offloads.rx_ip && self.offloads.tx_ip {
+            checksums.ipv4 = Checksum::None;
+        } else if self.offloads.tx_ip {
+            checksums.ipv4 = Checksum::Rx; // verify on RX only
+        } else if self.offloads.rx_ip {
+            checksums.ipv4 = Checksum::Tx; // compute on TX only
+        }
+        if self.offloads.rx_tcp && self.offloads.tx_tcp {
+            checksums.tcp = Checksum::None;
+        } else if self.offloads.tx_tcp {
+            checksums.tcp = Checksum::Rx;
+        } else if self.offloads.rx_tcp {
+            checksums.tcp = Checksum::Tx;
+        }
+        caps.checksum = checksums;
+
         caps
     }
 }
@@ -105,6 +145,7 @@ impl Device for DpdkDevice {
         let tx_token = DpdkTxToken {
             port_id: self.port_id,
             mempool: self.mempool,
+            tx_ol_flags: self.tx_ol_flags,
         };
 
         Some((rx_token, tx_token))
@@ -114,6 +155,7 @@ impl Device for DpdkDevice {
         Some(DpdkTxToken {
             port_id: self.port_id,
             mempool: self.mempool,
+            tx_ol_flags: self.tx_ol_flags,
         })
     }
 
@@ -151,6 +193,8 @@ impl phy::RxToken for DpdkRxToken {
 pub struct DpdkTxToken {
     port_id: u16,
     mempool: *mut ffi::rte_mempool,
+    /// Pre-computed TX offload flags (IPv4 + TCP checksum offload).
+    tx_ol_flags: u64,
 }
 
 impl phy::TxToken for DpdkTxToken {
@@ -176,6 +220,16 @@ impl phy::TxToken for DpdkTxToken {
         unsafe {
             ffi::dpdk_mbuf_set_data_len(mbuf, len as u16);
             ffi::dpdk_mbuf_set_pkt_len(mbuf, len as u32);
+
+            // Set hardware checksum offload flags if the NIC supports it.
+            // The NIC needs ol_flags to know what to offload, and l2_len/l3_len
+            // to locate the IP and TCP headers within the frame.
+            if self.tx_ol_flags != 0 && len > 14 + 20 {
+                // Ethernet header = 14 bytes, IPv4 header = 20 bytes (no options).
+                // smoltcp doesn't use IP options or VLAN tags at L2.
+                ffi::dpdk_mbuf_set_ol_flags(mbuf, self.tx_ol_flags);
+                ffi::dpdk_mbuf_set_tx_offload(mbuf, 14, 20, 0);
+            }
         }
 
         let mut tx_mbuf = mbuf;

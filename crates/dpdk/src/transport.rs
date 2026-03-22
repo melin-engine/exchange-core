@@ -147,7 +147,7 @@ impl DpdkTransport {
         port.start()?;
 
         let mac = port.mac_addr();
-        let device = DpdkDevice::new(config.port_id, mempool.as_raw());
+        let device = DpdkDevice::new(config.port_id, mempool.as_raw(), port.offloads);
 
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
         let iface_config = Config::new(hw_addr);
