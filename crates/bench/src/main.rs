@@ -26,16 +26,21 @@
 
 mod generator;
 
+#[cfg(feature = "dpdk")]
+mod dpdk;
+
 /// jemalloc: thread-local caches eliminate allocator lock contention,
 /// giving more predictable latency than glibc malloc under high throughput.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::collections::VecDeque;
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 use std::io;
+#[cfg(not(feature = "dpdk"))]
 use std::io::Write;
 use std::num::NonZeroU64;
+#[cfg(not(feature = "dpdk"))]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,11 +50,15 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 
 use melin_engine::types::*;
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 use melin_protocol::blocking::BlockingFrameWriter;
+#[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
+#[cfg(not(feature = "dpdk"))]
 use melin_protocol::message::ResponseKind;
+#[cfg(not(feature = "dpdk"))]
 use melin_protocol::transport::BlockingTransportListener;
+#[cfg(not(feature = "dpdk"))]
 use melin_server::server::ServerConfig;
 
 /// Number of completed orders between latency time-series samples.
@@ -82,13 +91,15 @@ const DEFAULT_BENCH_THREADS: usize = 4;
 /// 4-5 (readers), and 6 (repl-sender), so bench threads start at core 7 to
 /// avoid contention for L1/L2 cache and reduce involuntary context switches.
 /// Thread i is pinned to core `BENCH_CORE_START + i`.
+#[cfg(not(feature = "dpdk"))]
 const BENCH_CORE_START: usize = 7;
 
 /// Maximum frame payload size (matches protocol).
+#[cfg(not(feature = "dpdk"))]
 const MAX_FRAME_SIZE: usize = 1024;
 
 /// Maximum epoll events per wait call.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 const MAX_EPOLL_EVENTS: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -158,7 +169,7 @@ fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
 /// Captured every `SAMPLE_INTERVAL` completed orders using an interval
 /// histogram (snapshot + reset), so each sample reflects recent behavior
 /// rather than cumulative averages.
-struct LatencySample {
+pub(crate) struct LatencySample {
     /// Seconds elapsed since measurement start.
     elapsed_secs: f64,
     /// Interval p99 latency in microseconds.
@@ -170,11 +181,11 @@ struct LatencySample {
 }
 
 /// Time-series of latency samples for chart display and stability plots.
-type TimeSeries = Vec<LatencySample>;
+pub(crate) type TimeSeries = Vec<LatencySample>;
 
 /// Record a latency sample if `SAMPLE_INTERVAL` orders have accumulated
 /// in the interval histogram. Resets the interval histogram after sampling.
-fn maybe_sample(
+pub(crate) fn maybe_sample(
     interval_hist: &mut Histogram<u64>,
     interval_count: &mut usize,
     series: &mut TimeSeries,
@@ -244,6 +255,26 @@ struct BenchArgs {
     /// (required for remote mode with --addr, auto-generated for embedded).
     #[arg(long)]
     key: Option<std::path::PathBuf>,
+
+    // --- DPDK options (only with --features dpdk) ---
+    /// DPDK EAL arguments (space-separated).
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
+    dpdk_eal_args: String,
+    /// DPDK port ID (default: 0).
+    #[arg(long, default_value_t = 0)]
+    dpdk_port: u16,
+    /// Local IPv4 address for the DPDK bench interface.
+    #[arg(long, default_value = "10.0.0.2")]
+    dpdk_ip: String,
+    /// IPv4 prefix length for the DPDK bench interface.
+    #[arg(long, default_value_t = 24)]
+    dpdk_prefix_len: u8,
+    /// IPv4 gateway for the DPDK bench interface.
+    #[arg(long)]
+    dpdk_gateway: Option<String>,
+    /// CPU core for the DPDK bench poll thread.
+    #[arg(long, default_value_t = 7)]
+    dpdk_core: usize,
 }
 
 fn main() {
@@ -277,21 +308,64 @@ fn main() {
             );
         }
         "roundtrip" => {
-            run_roundtrip_bench(
-                args.uds,
-                args.pairs,
-                args.window,
-                args.clients,
-                args.bench_threads,
-                args.group_commit_us,
-                args.addr,
-                args.warmup,
-                args.journal,
-                args.accounts,
-                args.instruments,
-                json_path,
-                args.key.as_deref(),
-            );
+            #[cfg(feature = "dpdk")]
+            {
+                let addr = args.addr.unwrap_or_else(|| {
+                    eprintln!("error: --addr is required for DPDK mode (no embedded server)");
+                    std::process::exit(1);
+                });
+                let key_path = args.key.as_deref().unwrap_or_else(|| {
+                    eprintln!("error: --key is required for DPDK mode");
+                    std::process::exit(1);
+                });
+                let key = load_signing_key(key_path);
+
+                dpdk::run_dpdk_roundtrip(
+                    dpdk::DpdkBenchConfig {
+                        eal_args: args
+                            .dpdk_eal_args
+                            .split_whitespace()
+                            .map(String::from)
+                            .collect(),
+                        port_id: args.dpdk_port,
+                        local_ip: args.dpdk_ip.parse().expect("invalid --dpdk-ip"),
+                        prefix_len: args.dpdk_prefix_len,
+                        gateway: args
+                            .dpdk_gateway
+                            .as_deref()
+                            .map(|s| s.parse().expect("invalid --dpdk-gateway")),
+                        server_addr: addr,
+                    },
+                    args.pairs,
+                    args.window,
+                    args.clients,
+                    args.warmup,
+                    json_path,
+                    &key,
+                    args.accounts,
+                    args.instruments,
+                    args.dpdk_core,
+                );
+            }
+
+            #[cfg(not(feature = "dpdk"))]
+            {
+                run_roundtrip_bench(
+                    args.uds,
+                    args.pairs,
+                    args.window,
+                    args.clients,
+                    args.bench_threads,
+                    args.group_commit_us,
+                    args.addr,
+                    args.warmup,
+                    args.journal,
+                    args.accounts,
+                    args.instruments,
+                    json_path,
+                    args.key.as_deref(),
+                );
+            }
         }
         other => {
             eprintln!("unknown mode: {other} (expected: engine, pipeline, roundtrip)");
@@ -695,6 +769,7 @@ fn drain_output(
 /// spawning an embedded server. This is the mode used for LAN benchmarks
 /// where the engine runs on a separate machine.
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "dpdk"))]
 fn run_roundtrip_bench(
     use_uds: bool,
     pairs: usize,
@@ -860,6 +935,7 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 /// Start the server on a background thread. The listener is already bound,
 /// so the client can connect immediately (connections queue in the kernel
 /// backlog until the server calls `accept()`).
+#[cfg(not(feature = "dpdk"))]
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
@@ -876,6 +952,7 @@ fn start_server<L: BlockingTransportListener>(
 }
 
 /// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
+#[cfg(not(feature = "dpdk"))]
 fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
     let mut last_err = None;
     for _ in 0..50 {
@@ -892,6 +969,7 @@ fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
 
 /// Perform challenge-response auth handshake on a new connection.
 /// Must be called before the stream is set to non-blocking mode.
+#[cfg(not(feature = "dpdk"))]
 fn auth_handshake(
     stream: &mut (impl std::io::Read + std::io::Write),
     key: &ed25519_dalek::SigningKey,
@@ -936,6 +1014,7 @@ fn auth_handshake(
 }
 
 /// Connect to UDS server with retry (up to 50 attempts, 10ms apart).
+#[cfg(not(feature = "dpdk"))]
 fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
     let mut last_err = None;
     for _ in 0..50 {
@@ -955,7 +1034,7 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 // ---------------------------------------------------------------------------
 
 /// State for one benchmark connection in the epoll event loop.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 struct BenchConnection<W: Write> {
     // --- Write side (blocking, buffered) ---
     writer: BlockingFrameWriter<W>,
@@ -991,9 +1070,9 @@ struct BenchConnection<W: Write> {
 
 /// Trait alias for types that are both `AsRawFd` and `Send`.
 /// Used to erase the concrete stream type (TCP or UDS) behind a trait object.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 trait AsRawFdSend: AsRawFd + Send {}
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 impl<T: AsRawFd + Send> AsRawFdSend for T {}
 
 // ---------------------------------------------------------------------------
@@ -1001,7 +1080,7 @@ impl<T: AsRawFd + Send> AsRawFdSend for T {}
 // ---------------------------------------------------------------------------
 
 /// Result of attempting to read a complete frame.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 enum FrameResult {
     /// A complete frame was read; valid bytes are in the connection's payload_buf.
     Complete,
@@ -1016,7 +1095,7 @@ enum FrameResult {
 /// Try to read one complete frame from a non-blocking fd.
 /// On `FrameResult::Complete`, the frame payload is in
 /// `conn.payload_buf[..conn.payload_len]`.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 fn try_read_frame<W: Write>(conn: &mut BenchConnection<W>) -> FrameResult {
     // Step 1: Read 4-byte length prefix.
     if !conn.reading_payload {
@@ -1065,7 +1144,7 @@ fn try_read_frame<W: Write>(conn: &mut BenchConnection<W>) -> FrameResult {
     }
 }
 
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 enum FillResult {
     /// Progressed to `filled` bytes. If `filled < target`, EAGAIN.
     Complete(usize),
@@ -1074,7 +1153,7 @@ enum FillResult {
 }
 
 /// Non-blocking read into `buf[filled..target]`.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize) -> FillResult {
     while filled < target {
         let n = unsafe {
@@ -1105,7 +1184,7 @@ fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 
 /// Run the epoll event loop for a subset of connections. Returns the
 /// latency histogram for this thread's connections.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 fn run_epoll_loop<W: Write>(
     mut connections: Vec<BenchConnection<W>>,
     window: usize,
@@ -1220,6 +1299,7 @@ fn run_epoll_loop<W: Write>(
 
 /// Create connections, distribute across bench threads, run, report results.
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "dpdk"))]
 fn run_roundtrip_inner<R, W, F>(
     connect: F,
     transport_name: &str,
@@ -1260,7 +1340,7 @@ fn run_roundtrip_inner<R, W, F>(
     }
 
     // Epoll path: multi-threaded event loop using epoll reads + blocking writes.
-    #[cfg(not(feature = "io-uring"))]
+    #[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
     {
         run_epoll_roundtrip(
             connect,
@@ -1282,7 +1362,7 @@ fn run_roundtrip_inner<R, W, F>(
 
 /// Epoll-based roundtrip benchmark. Uses epoll for reads and blocking
 /// writes via BlockingFrameWriter.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 fn run_epoll_roundtrip<R, W, F>(
     connect: F,
     transport_name: &str,
@@ -1468,7 +1548,7 @@ fn run_epoll_roundtrip<R, W, F>(
 
 /// Spawn a background thread that prints periodic progress to stderr.
 /// Returns a handle; the thread exits when `shutdown` is set to true.
-fn spawn_progress_reporter(
+pub(crate) fn spawn_progress_reporter(
     completed: Arc<AtomicU64>,
     total_orders: u64,
     shutdown: Arc<AtomicBool>,
@@ -1966,7 +2046,7 @@ fn uring_fill_windows(
 /// Send frames on all connections that have window capacity.
 /// Each connection is flushed independently after its batch, simulating
 /// real clients that send and flush without coordinating with each other.
-#[cfg(not(feature = "io-uring"))]
+#[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 fn send_pending<W: Write>(connections: &mut [BenchConnection<W>], window: usize) {
     for conn in connections.iter_mut() {
         if conn.done {
@@ -1996,7 +2076,7 @@ fn send_pending<W: Write>(connections: &mut [BenchConnection<W>], window: usize)
 
 /// Print benchmark results: header, throughput, latency histogram.
 /// Optionally writes results to a JSON file for post-processing.
-fn print_results(
+pub(crate) fn print_results(
     label: &str,
     measured_orders: usize,
     warmup_orders: usize,

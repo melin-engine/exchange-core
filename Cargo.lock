@@ -1028,6 +1028,7 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-disruptor",
+ "melin-dpdk",
  "melin-engine",
  "melin-protocol",
  "melin-server",
@@ -1036,6 +1037,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "smoltcp",
  "tikv-jemallocator",
  "tracing-subscriber",
 ]
