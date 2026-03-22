@@ -27,12 +27,11 @@ use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
 use melin_disruptor::ring;
-use melin_engine::journal::event::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
-use melin_protocol::message::{ConnectionId, Request};
+use melin_protocol::message::ConnectionId;
 
 use crate::uring_response::ControlEvent;
 
@@ -642,33 +641,14 @@ fn process_frames<R>(
             }
         };
 
-        // Heartbeat requests are keepalives — they reset last_activity
-        // (caller updates it on recv) but must not enter the pipeline.
-        if matches!(request, Request::Heartbeat) {
+        if crate::request::should_filter(&request) {
             continue;
         }
 
-        // ChallengeResponse after auth is invalid — ignore.
-        if matches!(request, Request::ChallengeResponse { .. }) {
+        if let Err(reason) = crate::request::check_permission(&request, conn.permission) {
             debug!(
                 connection_id = conn.connection_id,
-                "ChallengeResponse after auth, ignoring"
-            );
-            continue;
-        }
-
-        // Enforce permissions.
-        if request.requires_admin() && !conn.permission.is_admin() {
-            debug!(
-                connection_id = conn.connection_id,
-                "non-admin attempted admin command, dropping request"
-            );
-            continue;
-        }
-        if !request.requires_admin() && !conn.permission.can_trade() {
-            debug!(
-                connection_id = conn.connection_id,
-                "read-only connection attempted trade, dropping request"
+                reason, "permission denied, dropping request"
             );
             continue;
         }
@@ -676,7 +656,7 @@ fn process_frames<R>(
         #[allow(clippy::let_unit_value)]
         let recv_ts = trace_ts();
 
-        let event = request_to_event(&request);
+        let event = crate::request::to_event(&request);
 
         #[cfg(feature = "latency-trace")]
         let pre_publish = trace_ts();
@@ -705,57 +685,4 @@ fn process_frames<R>(
     }
 
     false
-}
-
-/// Convert a wire `Request` to a `JournalEvent` for the pipeline.
-///
-/// `Request::Heartbeat` is filtered out before reaching this function.
-fn request_to_event(request: &Request) -> JournalEvent {
-    match *request {
-        Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
-        Request::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        } => JournalEvent::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        },
-        Request::CancelAll { account } => JournalEvent::CancelAll { account },
-        Request::AddInstrument { spec } => JournalEvent::AddInstrument { spec },
-        Request::Deposit {
-            account,
-            currency,
-            amount,
-        } => JournalEvent::Deposit {
-            account,
-            currency,
-            amount,
-        },
-        Request::SetRiskLimits { symbol, limits } => JournalEvent::SetRiskLimits { symbol, limits },
-        Request::SetCircuitBreaker { symbol, config } => {
-            JournalEvent::SetCircuitBreaker { symbol, config }
-        }
-        Request::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        } => JournalEvent::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        },
-        Request::SetFeeSchedule { symbol, schedule } => {
-            JournalEvent::SetFeeSchedule { symbol, schedule }
-        }
-        Request::QueryStats => JournalEvent::QueryStats,
-        Request::Heartbeat | Request::ChallengeResponse { .. } => {
-            unreachable!("heartbeats and auth messages filtered before request_to_event")
-        }
-    }
 }

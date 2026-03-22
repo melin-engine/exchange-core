@@ -38,12 +38,13 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_engine::journal::event::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
+
+use crate::request as shared_request;
 use smoltcp::iface::SocketHandle;
 use tracing::debug;
 
@@ -410,13 +411,10 @@ fn process_trading_frames(
 
         match codec::decode_request(payload) {
             Ok(request) => {
-                if !matches!(
-                    request,
-                    Request::Heartbeat | Request::ChallengeResponse { .. }
-                ) {
+                if !shared_request::should_filter(&request) {
                     #[allow(clippy::let_unit_value)] // trace_ts() returns () without latency-trace
                     let recv_ts = trace_ts();
-                    let event = request_to_event(&request);
+                    let event = shared_request::to_event(&request);
                     producer.publish(InputSlot {
                         connection_id: conn.connection_id.0,
                         event,
@@ -436,59 +434,6 @@ fn process_trading_frames(
         }
 
         conn.parse_buf.drain(..4 + frame_len);
-    }
-}
-
-/// Convert a decoded `Request` to a `JournalEvent`.
-/// Mirrors the epoll reader's `request_to_event` — all variants are
-/// mapped 1:1 except heartbeats/auth (filtered by the caller).
-fn request_to_event(request: &Request) -> JournalEvent {
-    match *request {
-        Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
-        Request::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        } => JournalEvent::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        },
-        Request::CancelAll { account } => JournalEvent::CancelAll { account },
-        Request::AddInstrument { spec } => JournalEvent::AddInstrument { spec },
-        Request::Deposit {
-            account,
-            currency,
-            amount,
-        } => JournalEvent::Deposit {
-            account,
-            currency,
-            amount,
-        },
-        Request::SetRiskLimits { symbol, limits } => JournalEvent::SetRiskLimits { symbol, limits },
-        Request::SetCircuitBreaker { symbol, config } => {
-            JournalEvent::SetCircuitBreaker { symbol, config }
-        }
-        Request::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        } => JournalEvent::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        },
-        Request::SetFeeSchedule { symbol, schedule } => {
-            JournalEvent::SetFeeSchedule { symbol, schedule }
-        }
-        Request::QueryStats => JournalEvent::QueryStats,
-        Request::Heartbeat | Request::ChallengeResponse { .. } => {
-            unreachable!("heartbeats and auth filtered before request_to_event")
-        }
     }
 }
 
@@ -631,7 +576,7 @@ mod tests {
             symbol: Symbol(1),
             order,
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(matches!(event, JournalEvent::SubmitOrder { symbol, .. } if symbol == Symbol(1)));
     }
 
@@ -642,7 +587,7 @@ mod tests {
             account: AccountId(5),
             order_id: OrderId(42),
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(
             matches!(event, JournalEvent::CancelOrder { symbol, account, order_id }
                 if symbol == Symbol(2) && account == AccountId(5) && order_id == OrderId(42))
@@ -654,7 +599,7 @@ mod tests {
         let req = Request::CancelAll {
             account: AccountId(7),
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(matches!(event, JournalEvent::CancelAll { account } if account == AccountId(7)));
     }
 
@@ -665,7 +610,7 @@ mod tests {
             currency: CurrencyId(2),
             amount: 1000,
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(
             matches!(event, JournalEvent::Deposit { account, currency, amount }
                 if account == AccountId(1) && currency == CurrencyId(2) && amount == 1000)
@@ -680,7 +625,7 @@ mod tests {
             quote: CurrencyId(2),
         };
         let req = Request::AddInstrument { spec };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(matches!(event, JournalEvent::AddInstrument { spec: s } if s.symbol == Symbol(10)));
     }
 
@@ -693,7 +638,7 @@ mod tests {
             new_price: Price(NonZeroU64::new(200).unwrap()),
             new_quantity: Quantity(NonZeroU64::new(50).unwrap()),
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(
             matches!(event, JournalEvent::CancelReplace { order_id, .. } if order_id == OrderId(5))
         );
@@ -705,7 +650,7 @@ mod tests {
             symbol: Symbol(1),
             limits: RiskLimits::default(),
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(matches!(event, JournalEvent::SetRiskLimits { symbol, .. } if symbol == Symbol(1)));
     }
 
@@ -715,7 +660,7 @@ mod tests {
             symbol: Symbol(1),
             config: CircuitBreakerConfig::default(),
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(
             matches!(event, JournalEvent::SetCircuitBreaker { symbol, .. } if symbol == Symbol(1))
         );
@@ -727,7 +672,7 @@ mod tests {
             symbol: Symbol(3),
             schedule: FeeSchedule::default(),
         };
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(
             matches!(event, JournalEvent::SetFeeSchedule { symbol, .. } if symbol == Symbol(3))
         );
@@ -736,20 +681,20 @@ mod tests {
     #[test]
     fn request_to_event_query_stats() {
         let req = Request::QueryStats;
-        let event = request_to_event(&req);
+        let event = shared_request::to_event(&req);
         assert!(matches!(event, JournalEvent::QueryStats));
     }
 
     #[test]
     #[should_panic(expected = "heartbeats and auth filtered")]
     fn request_to_event_heartbeat_panics() {
-        request_to_event(&Request::Heartbeat);
+        shared_request::to_event(&Request::Heartbeat);
     }
 
     #[test]
     #[should_panic(expected = "heartbeats and auth filtered")]
     fn request_to_event_challenge_response_panics() {
-        request_to_event(&Request::ChallengeResponse {
+        shared_request::to_event(&Request::ChallengeResponse {
             signature: [0u8; 64],
             public_key: [0u8; 32],
         });
