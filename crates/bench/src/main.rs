@@ -1035,6 +1035,7 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 /// to keep already-connected clients alive while remaining clients connect.
 /// The server's idle timeout (default 30s) would otherwise drop early
 /// connections during slow setup phases (e.g., 512 clients × ~100ms each).
+#[cfg(not(feature = "dpdk"))]
 fn heartbeat_frame() -> [u8; 5] {
     let mut buf = [0u8; 128];
     let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, &mut buf)
@@ -1048,6 +1049,7 @@ fn heartbeat_frame() -> [u8; 5] {
 /// idle timer. Uses raw `write(2)` on the write fd — sockets are still in
 /// blocking mode during setup, so the small 5-byte write completes
 /// immediately.
+#[cfg(not(feature = "dpdk"))]
 fn keepalive_established(write_fds: &[RawFd], heartbeat: &[u8; 5]) {
     for &fd in write_fds {
         unsafe {
