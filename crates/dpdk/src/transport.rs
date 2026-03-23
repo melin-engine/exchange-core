@@ -22,11 +22,18 @@ use crate::port::{ChecksumOffloads, Port};
 /// Called on every socket (listen + accepted) to configure for trading:
 /// - Nagle disabled (TCP_NODELAY): send small messages immediately
 /// - Delayed ACK disabled: ACK every segment without waiting 10ms
+/// - RTO floor lowered to 10ms (default 1s is 10,000x the LAN RTT)
+/// - Initial RTO lowered to 50ms (first retransmit before any RTT sample)
+/// - Initial congestion window raised to 64 KiB (skip slow start on LAN)
 ///
-/// These settings sacrifice marginal bandwidth efficiency for latency.
+/// These settings sacrifice marginal bandwidth efficiency and RFC
+/// compliance for latency on a trusted, dedicated LAN.
 fn tune_socket(socket: &mut tcp::Socket<'_>) {
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
+    socket.set_min_rto(smoltcp::time::Duration::from_millis(10));
+    socket.set_initial_rto(smoltcp::time::Duration::from_millis(50));
+    socket.set_initial_congestion_window(64 * 1024);
 }
 
 /// Maximum concurrent TCP connections.
