@@ -63,6 +63,10 @@ pub struct DpdkDevice {
     learned_neighbors: Vec<([u8; 6], [u8; 4])>,
     /// Set of IPs we've already seeded to avoid repeated injections.
     known_neighbors: std::collections::HashSet<[u8; 4]>,
+    /// Reusable mbuf buffer for collect_rx_batch() to avoid per-poll allocation.
+    batch_mbufs: Vec<*mut ffi::rte_mbuf>,
+    /// Reusable injected-frames buffer for collect_rx_batch().
+    batch_injected: Vec<Vec<u8>>,
 }
 
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
@@ -115,6 +119,8 @@ impl DpdkDevice {
             inject_queue: Vec::new(),
             learned_neighbors: Vec::new(),
             known_neighbors: std::collections::HashSet::new(),
+            batch_mbufs: Vec::with_capacity(BURST_SIZE * port_ids.len()),
+            batch_injected: Vec::new(),
         }
     }
 
@@ -167,7 +173,9 @@ impl DpdkDevice {
     /// owns all received frames. Call `iface.poll()` after processing
     /// the batch for egress and maintenance (ingress will be a no-op).
     pub fn collect_rx_batch(&mut self) -> RxBatch {
-        let mut mbufs = Vec::with_capacity(BURST_SIZE * self.rx_ports.len());
+        // Reuse pre-allocated buffers to avoid per-poll heap allocation.
+        let mut mbufs = std::mem::take(&mut self.batch_mbufs);
+        mbufs.clear();
 
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
@@ -552,8 +560,28 @@ impl RxBatch {
     }
 }
 
+impl RxBatch {
+    /// Free mbufs and return the reusable Vec buffers to the device.
+    /// Must be called instead of dropping to avoid per-poll allocation.
+    pub fn recycle(mut self, device: &mut DpdkDevice) {
+        for &mbuf in &self.mbufs {
+            unsafe {
+                ffi::dpdk_pktmbuf_free(mbuf);
+            }
+        }
+        let mut mbufs = std::mem::take(&mut self.mbufs);
+        mbufs.clear();
+        device.batch_mbufs = mbufs;
+        let mut injected = std::mem::take(&mut self.injected);
+        injected.clear();
+        device.batch_injected = injected;
+        // Drop runs but mbufs/injected are now empty Vecs — no double-free.
+    }
+}
+
 impl Drop for RxBatch {
     fn drop(&mut self) {
+        // Fallback if recycle() wasn't called (e.g., panic unwinding).
         for &mbuf in &self.mbufs {
             unsafe {
                 ffi::dpdk_pktmbuf_free(mbuf);

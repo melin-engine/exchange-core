@@ -310,7 +310,7 @@ impl DpdkTransport {
                 &slices,
             );
         }
-        drop(batch);
+        batch.recycle(&mut self.device);
 
         // Egress + maintenance. Device::receive() returns None since
         // collect_rx_batch() drained all rx state — only socket_egress
