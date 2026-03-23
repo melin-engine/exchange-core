@@ -87,13 +87,6 @@ const DEFAULT_CLIENTS: usize = 16;
 /// = 10 pinned threads total, leaving core 0 for OS/IRQ.
 const DEFAULT_BENCH_THREADS: usize = 4;
 
-/// First CPU core for bench thread pinning. Server uses cores 1-3 (pipeline),
-/// 4-5 (readers), and 6 (repl-sender), so bench threads start at core 7 to
-/// avoid contention for L1/L2 cache and reduce involuntary context switches.
-/// Thread i is pinned to core `BENCH_CORE_START + i`.
-#[cfg(not(feature = "dpdk"))]
-const BENCH_CORE_START: usize = 7;
-
 /// Maximum frame payload size (matches protocol).
 #[cfg(not(feature = "dpdk"))]
 const MAX_FRAME_SIZE: usize = 1024;
@@ -281,6 +274,13 @@ struct BenchArgs {
     /// CPU core for the DPDK bench poll thread.
     #[arg(long, default_value_t = 7)]
     dpdk_core: usize,
+    /// First CPU core for bench thread pinning. Thread i is pinned to core
+    /// bench_cores + i. When omitted, bench threads are not pinned (OS
+    /// scheduler decides). For local benchmarks use 7 (avoids server cores
+    /// 1-6). For remote benchmarks on a dedicated machine, use 1 with
+    /// isolcpus for tighter measurements.
+    #[arg(long)]
+    bench_cores: Option<usize>,
 }
 
 fn main() {
@@ -372,6 +372,7 @@ fn main() {
                     args.instruments,
                     json_path,
                     args.key.as_deref(),
+                    args.bench_cores,
                 );
             }
         }
@@ -781,6 +782,7 @@ fn run_roundtrip_bench(
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
     key_path: Option<&std::path::Path>,
+    bench_core_start: Option<usize>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -817,6 +819,7 @@ fn run_roundtrip_bench(
             &key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
         return;
     }
@@ -878,6 +881,7 @@ fn run_roundtrip_bench(
             &bench_key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
     } else {
         use melin_protocol::tcp::BlockingTcpListener;
@@ -908,6 +912,7 @@ fn run_roundtrip_bench(
             &bench_key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
     }
 
@@ -1286,10 +1291,10 @@ fn run_epoll_loop<W: Write>(
                                     measured_start = Some(Instant::now());
                                 }
                                 histogram.record(latency_ns).expect("record");
+                                progress.fetch_add(1, Ordering::Relaxed);
                             }
 
                             conn.batch_count += 1;
-                            progress.fetch_add(1, Ordering::Relaxed);
                             if conn.batch_count >= conn.total_orders {
                                 conn.done = true;
                                 done_count += 1;
@@ -1336,6 +1341,7 @@ fn run_roundtrip_inner<R, W, F>(
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
     num_instruments: u32,
+    bench_core_start: Option<usize>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1358,6 +1364,7 @@ fn run_roundtrip_inner<R, W, F>(
             key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
     }
 
@@ -1378,6 +1385,7 @@ fn run_roundtrip_inner<R, W, F>(
             warmup,
             json_path,
             key,
+            bench_core_start,
         );
     }
 }
@@ -1399,6 +1407,7 @@ fn run_epoll_roundtrip<R, W, F>(
     warmup: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
+    bench_core_start: Option<usize>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1490,8 +1499,8 @@ fn run_epoll_roundtrip<R, W, F>(
         thread_conns[client_id % num_threads].push(conn);
     }
 
-    // Total orders across all clients (including warmup) for progress reporting.
-    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
+    // Total measured orders (excluding warmup) for progress reporting.
+    let total_all_orders: u64 = (total_pairs * 2) as u64;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = spawn_progress_reporter(
@@ -1506,12 +1515,14 @@ fn run_epoll_roundtrip<R, W, F>(
 
     for (i, conns) in thread_conns.into_iter().enumerate() {
         let barrier = Arc::clone(&barrier);
-        let core_id = BENCH_CORE_START + i;
+        let pin_core = bench_core_start.map(|s| s + i);
         let thread_progress = Arc::clone(&progress);
         let handle = std::thread::Builder::new()
             .name(format!("bench-{i}"))
             .spawn(move || {
-                if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
+                if let Some(core_id) = pin_core
+                    && let Err(e) = melin_server::affinity::pin_to_core(core_id)
+                {
                     eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
                 }
                 barrier.wait();
@@ -1525,17 +1536,18 @@ fn run_epoll_roundtrip<R, W, F>(
     barrier.wait();
     let blast_start = Instant::now();
 
-    // Collect and merge histograms. Track the latest measured_start across
-    // threads — measurement begins when the last thread exits warmup.
+    // Collect and merge histograms. Track the earliest measured_start across
+    // threads — measurement begins when the first thread exits warmup, so
+    // the wall time covers all measured orders from all threads.
     let mut merged_histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut latest_measured_start: Option<Instant> = None;
+    let mut earliest_measured_start: Option<Instant> = None;
     for handle in handles {
         let (histogram, ms) = handle.join().expect("bench thread panicked");
         merged_histogram.add(&histogram).expect("merge histograms");
         if let Some(t) = ms {
-            latest_measured_start =
-                Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
+            earliest_measured_start =
+                Some(earliest_measured_start.map_or(t, |prev: Instant| prev.min(t)));
         }
     }
 
@@ -1544,7 +1556,7 @@ fn run_epoll_roundtrip<R, W, F>(
     let _ = progress_handle.join();
 
     let end = Instant::now();
-    let measured_wall = latest_measured_start
+    let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| blast_start.elapsed());
 
@@ -1644,6 +1656,7 @@ fn run_uring_roundtrip<R, W, F>(
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
     num_instruments: u32,
+    bench_core_start: Option<usize>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1741,8 +1754,8 @@ fn run_uring_roundtrip<R, W, F>(
         thread_conns[i % num_threads].push(conn);
     }
 
-    // Total orders across all clients (including warmup) for progress reporting.
-    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
+    // Total measured orders (excluding warmup) for progress reporting.
+    let total_all_orders: u64 = (total_pairs * 2) as u64;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = spawn_progress_reporter(
@@ -1758,13 +1771,15 @@ fn run_uring_roundtrip<R, W, F>(
         .into_iter()
         .enumerate()
         .map(|(i, conns)| {
-            let core_id = BENCH_CORE_START + i;
+            let pin_core = bench_core_start.map(|s| s + i);
             let bench_start = start;
             let thread_progress = Arc::clone(&progress);
             std::thread::Builder::new()
                 .name(format!("bench-{i}"))
                 .spawn(move || {
-                    if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
+                    if let Some(core_id) = pin_core
+                        && let Err(e) = melin_server::affinity::pin_to_core(core_id)
+                    {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
                     run_uring_loop(conns, window, bench_start, warmup, thread_progress)
@@ -1773,20 +1788,20 @@ fn run_uring_roundtrip<R, W, F>(
         })
         .collect();
 
-    // Collect and merge histograms from all threads. Track the latest
-    // measured_start across threads — measurement begins when the last
-    // thread exits warmup.
+    // Collect and merge histograms from all threads. Track the earliest
+    // measured_start — measurement begins when the first thread exits
+    // warmup, so the wall time covers all measured orders from all threads.
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut latest_measured_start: Option<Instant> = None;
+    let mut earliest_measured_start: Option<Instant> = None;
     let mut all_series: TimeSeries = Vec::new();
 
     for handle in handles {
         let (h, s, ms) = handle.join().expect("bench thread panicked");
         histogram.add(&h).expect("merge histograms");
         if let Some(t) = ms {
-            latest_measured_start =
-                Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
+            earliest_measured_start =
+                Some(earliest_measured_start.map_or(t, |prev: Instant| prev.min(t)));
         }
         all_series.extend(s);
     }
@@ -1795,11 +1810,11 @@ fn run_uring_roundtrip<R, W, F>(
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    // Measure throughput over the measured phase only — from when the last
-    // thread finished warmup until now. This excludes warmup orders and any
-    // seed event processing from the throughput calculation.
+    // Measure throughput over the measured phase only — from when the first
+    // thread finished warmup until now. This covers all measured orders
+    // from all threads without undercounting.
     let end = Instant::now();
-    let measured_wall = latest_measured_start
+    let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| start.elapsed());
 
@@ -1808,10 +1823,14 @@ fn run_uring_roundtrip<R, W, F>(
         extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
     }
     extra_lines.push(format!("  Transport: {transport_name}"));
-    extra_lines.push(format!(
-        "  Bench threads: {num_threads} (io_uring, cores {BENCH_CORE_START}-{})",
-        BENCH_CORE_START + num_threads - 1
-    ));
+    extra_lines.push(if let Some(start) = bench_core_start {
+        format!(
+            "  Bench threads: {num_threads} (io_uring, cores {start}-{})",
+            start + num_threads - 1,
+        )
+    } else {
+        format!("  Bench threads: {num_threads} (io_uring, unpinned)")
+    });
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
 
     // Sort time-series by elapsed time for stable plot output.
@@ -2007,9 +2026,9 @@ fn run_uring_loop(
                                 &mut series,
                                 bench_start,
                             );
+                            progress.fetch_add(1, Ordering::Relaxed);
                         }
                         conn.batch_count += 1;
-                        progress.fetch_add(1, Ordering::Relaxed);
                         if conn.batch_count >= conn.total_orders {
                             conn.done = true;
                             done_count += 1;
