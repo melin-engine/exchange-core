@@ -112,6 +112,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Cargo's built-in libgit2 can't authenticate private git SSH deps.
+# Tell it to shell out to git which uses the SSH agent/key.
+# The env var is more reliable than git config under sudo/root.
+if ! grep -q "CARGO_NET_GIT_FETCH_WITH_CLI" /etc/environment 2>/dev/null; then
+    echo 'CARGO_NET_GIT_FETCH_WITH_CLI=true' >> /etc/environment
+    echo "  Added CARGO_NET_GIT_FETCH_WITH_CLI=true to /etc/environment"
+fi
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 # Check IOMMU is enabled.
 if ! dmesg | grep -qi "DMAR\|IOMMU"; then
     echo "warning: IOMMU may not be enabled. Add 'intel_iommu=on iommu=pt' to kernel cmdline."

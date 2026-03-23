@@ -4,10 +4,12 @@ Step-by-step procedure for testing the DPDK kernel-bypass transport on Cherry Se
 
 ## Machines
 
-| Role   | Public IP      | VLAN IP        |
-|--------|---------------|----------------|
-| Server | 185.8.107.12  | 10.170.84.124  |
-| Bench  | 185.8.107.22  | 10.170.84.25   |
+Two Cherry Servers on the same VLAN. IPs change per rental — check the Cherry dashboard for public IPs and `ip addr show bond0.*` for VLAN IPs.
+
+Throughout this guide:
+- `SERVER` = server public IP
+- `BENCH` = bench public IP
+- `SERVER_VLAN` = server VLAN IP (from `dpdk-setup.sh` output or `/etc/melin-dpdk.conf`)
 
 ## 1. Setup (run once after reboot)
 
@@ -15,14 +17,14 @@ SR-IOV VF creation, driver binding, hugepages, and MTU are all runtime state —
 
 **On the server:**
 ```sh
-ssh root@185.8.107.12
+ssh root@SERVER
 cd ~/workspace/trading
 sudo ./scripts/dpdk-setup.sh          # creates VFs, binds to vfio-pci, sets MTU 9000
 ```
 
 **On the bench machine** (if using DPDK bench client):
 ```sh
-ssh root@185.8.107.22
+ssh root@BENCH
 cd ~/workspace/trading
 sudo ./scripts/dpdk-setup.sh
 ```
@@ -64,20 +66,20 @@ cargo run --release --bin melin-admin -- keygen bench admin
 # Creates bench.key (private) and bench.pub (public)
 
 # Copy public key to server's authorized_keys:
-scp bench.pub root@185.8.107.12:~/workspace/trading/
-ssh root@185.8.107.12 "cd ~/workspace/trading && echo 'admin $(cat bench.pub) bench' > authorized_keys"
+scp bench.pub root@SERVER:~/workspace/trading/
+ssh root@SERVER "cd ~/workspace/trading && echo 'admin $(cat bench.pub) bench' > authorized_keys"
 ```
 
 Or if keys already exist, just sync:
 ```sh
-scp root@185.8.107.12:~/workspace/trading/authorized_keys ./
-scp root@185.8.107.12:~/workspace/trading/bench.key ./
+scp root@SERVER:~/workspace/trading/authorized_keys ./
+scp root@SERVER:~/workspace/trading/bench.key ./
 ```
 
 ## 4. Start the server
 
 ```sh
-ssh root@185.8.107.12
+ssh root@SERVER
 cd ~/workspace/trading
 
 # Clean old journal
@@ -91,7 +93,7 @@ RUST_LOG=info ./target/release/melin-server \
     --standalone \
     --dpdk-eal-args='--huge-dir=/mnt/huge_2m' \
     --dpdk-ports 0,1 \
-    --dpdk-ip 10.170.84.124 \
+    --dpdk-ip SERVER_VLAN \
     --dpdk-prefix-len 24 \
     --dpdk-mtu 9000
 ```
@@ -107,11 +109,11 @@ DPDK port started
 
 ### Kernel TCP bench client (simplest)
 ```sh
-ssh root@185.8.107.22
+ssh root@BENCH
 cd ~/workspace/trading
 
 ./target/release/melin-bench \
-    --addr 10.170.84.124:9876 \
+    --addr SERVER_VLAN:9876 \
     --key bench.key \
     --clients 1 \
     --window 256 \
@@ -121,13 +123,13 @@ cd ~/workspace/trading
 ### DPDK bench client (both sides bypass kernel)
 ```sh
 ./target/release/melin-bench \
-    --addr 10.170.84.124:9876 \
+    --addr SERVER_VLAN:9876 \
     --key bench.key \
     --clients 1 \
     --window 256 \
     --dpdk-eal-args='--huge-dir=/mnt/huge_2m' \
     --dpdk-ports 0,1 \
-    --dpdk-ip 10.170.84.25 \
+    --dpdk-ip BENCH_VLAN \
     --dpdk-prefix-len 24 \
     --dpdk-mtu 9000 \
     10000000
@@ -165,14 +167,14 @@ Run the same workload with kernel TCP to get a baseline:
 ```sh
 # On server (no DPDK):
 ./target/release/melin-server \
-    --bind 10.170.84.124:9876 \
+    --bind SERVER_VLAN:9876 \
     --journal /mnt/journal/bench.journal \
     --authorized-keys authorized_keys \
     --standalone
 
 # On bench:
 ./target/release/melin-bench \
-    --addr 10.170.84.124:9876 \
+    --addr SERVER_VLAN:9876 \
     --key bench.key \
     --clients 1 --window 256 \
     10000000
