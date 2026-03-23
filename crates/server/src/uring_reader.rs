@@ -42,8 +42,9 @@ const BUF_SIZE: usize = 4096;
 /// Number of provided buffers in the shared pool. Must be large enough
 /// to handle concurrent in-flight recvs across all connections. When the
 /// pool is exhausted, multishot terminates and is resubmitted after buffers
-/// are re-provided.
-const NUM_BUFFERS: u16 = 512;
+/// are re-provided. 2048 supports up to ~1024 connections per reader
+/// thread with headroom for burst re-provision lag.
+const NUM_BUFFERS: u16 = 2048;
 
 /// Buffer group ID for the provided recv buffer pool.
 const BUF_GROUP_ID: u16 = 0;
@@ -51,9 +52,10 @@ const BUF_GROUP_ID: u16 = 0;
 /// Maximum frame payload size (matches `BlockingFrameReader`).
 const MAX_FRAME_SIZE: usize = 1024;
 
-/// io_uring submission queue depth. Power of 2, sized for hundreds of
-/// connections (multishot RECVs + eventfd read + buffer re-provisions).
-const RING_SIZE: u32 = 1024;
+/// io_uring submission queue depth. Power of 2, sized for up to ~1024
+/// connections per reader thread (multishot RECVs + eventfd read +
+/// buffer re-provisions).
+const RING_SIZE: u32 = 4096;
 
 /// User data sentinel for the eventfd read SQE.
 const EVENTFD_TOKEN: u64 = u64::MAX;

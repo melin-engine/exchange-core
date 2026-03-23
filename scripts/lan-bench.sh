@@ -200,11 +200,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # 6. Collect results
 # ---------------------------------------------------------------------------
-echo "=== Results ==="
-ssh $SSH_OPTS "$BENCH" "cat /tmp/bench-results.json" 2>/dev/null | tee /tmp/lan-bench-results.json
-echo ""
-
-# Copy results locally.
+echo "=== Collecting results ==="
 scp $SSH_OPTS -q "$BENCH":/tmp/bench-results.json /tmp/lan-bench-results.json 2>/dev/null || true
 echo "  Results saved to /tmp/lan-bench-results.json"
 echo ""

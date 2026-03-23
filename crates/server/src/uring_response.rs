@@ -37,8 +37,9 @@ const MAX_RESPONSE_BUF: usize = 128;
 
 /// io_uring submission queue depth for sends. Must be ≥ max concurrent
 /// connections to avoid SQ overflow when all connections are dirty.
-/// Power of 2 for io_uring alignment.
-const RING_SIZE: u32 = 1024;
+/// Power of 2 for io_uring alignment. 4096 supports 1024+ client
+/// benchmarks where all connections flush simultaneously.
+const RING_SIZE: u32 = 4096;
 
 /// Maximum accumulated send buffer per connection (64 KiB). If a client
 /// falls behind and the buffer exceeds this, the connection is dropped.
@@ -89,6 +90,7 @@ pub fn run(
     replication_cursor: Arc<std::sync::atomic::AtomicU64>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
+    busy_spin: bool,
 ) {
     let mut ring =
         IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
@@ -250,8 +252,8 @@ pub fn run(
             {
                 idle_count += 1;
             }
-            if idle_spins < 1000 {
-                idle_spins += 1;
+            if busy_spin || idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();

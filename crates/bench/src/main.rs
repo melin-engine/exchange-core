@@ -634,67 +634,87 @@ fn run_pipeline_bench(
         .expect("spawn matching thread");
 
     let total_orders = warmup + total_pairs * 2;
+
+    // Split publish and drain into separate threads so the publisher
+    // keeps the disruptor fed while the drainer processes BatchEnds.
+    // Without this, a single thread alternates publish→drain, starving
+    // the journal stage between drain phases and halving throughput.
+    //
+    // Coordination: inflight counter (AtomicU64) for window gating,
+    // SPSC channel for timestamps (publisher → drainer).
+    let inflight = Arc::new(AtomicU64::new(0));
+    let (ts_tx, ts_rx) = std::sync::mpsc::sync_channel::<Instant>(window);
+
+    // Publisher thread: continuously feeds events into the disruptor.
+    let inflight_pub = Arc::clone(&inflight);
+    let publish_handle = std::thread::Builder::new()
+        .name("pipeline-pub".into())
+        .spawn(move || {
+            for i in 0..total_orders {
+                let order_id = OrderId((i as u64) + 1);
+                let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+
+                // Spin-wait for window capacity.
+                while inflight_pub.load(Ordering::Acquire) >= window as u64 {
+                    std::hint::spin_loop();
+                }
+
+                let ts = Instant::now();
+                producer.publish(InputSlot {
+                    connection_id: 0,
+                    event: JournalEvent::SubmitOrder {
+                        symbol: Symbol(1),
+                        order: Order {
+                            id: order_id,
+                            account: AccountId(1),
+                            side,
+                            order_type: OrderType::Limit {
+                                price: Price(nz(100)),
+                            },
+                            time_in_force: TimeInForce::GTC,
+                            quantity: Quantity(nz(1)),
+                            stp: SelfTradeProtection::Allow,
+                        },
+                    },
+                    publish_ts: trace_ts(),
+                    recv_ts: trace_ts(),
+                });
+                inflight_pub.fetch_add(1, Ordering::Release);
+                let _ = ts_tx.send(ts);
+            }
+        })
+        .expect("spawn pipeline publish thread");
+
+    // Drain thread (this thread): consume output SPSC and record latency.
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-
-    // Track in-flight timestamps for windowed pipelining.
-    // VecDeque for FIFO: push_back on publish, pop_front on BatchEnd.
-    let mut inflight_ts: VecDeque<Instant> = VecDeque::with_capacity(window);
     let mut completed = 0usize;
     let mut measured_start: Option<Instant> = None;
-
     let start = Instant::now();
 
-    for i in 0..total_orders {
-        let order_id = OrderId((i as u64) + 1);
-        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
-
-        // Wait for window capacity before publishing.
-        while inflight_ts.len() >= window {
-            drain_output(
-                &mut output_consumer,
-                &mut inflight_ts,
-                &mut histogram,
-                &mut completed,
-                warmup,
-                &mut measured_start,
-            );
-        }
-
-        let ts = Instant::now();
-        producer.publish(InputSlot {
-            connection_id: 0,
-            event: JournalEvent::SubmitOrder {
-                symbol: Symbol(1),
-                order: Order {
-                    id: order_id,
-                    account: AccountId(1),
-                    side,
-                    order_type: OrderType::Limit {
-                        price: Price(nz(100)),
-                    },
-                    time_in_force: TimeInForce::GTC,
-                    quantity: Quantity(nz(1)),
-                    stp: SelfTradeProtection::Allow,
-                },
-            },
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
-        });
-        inflight_ts.push_back(ts);
-    }
-
-    // Drain remaining responses.
     while completed < total_orders {
-        drain_output(
-            &mut output_consumer,
-            &mut inflight_ts,
-            &mut histogram,
-            &mut completed,
-            warmup,
-            &mut measured_start,
-        );
+        let Some((_seq, slot)) = output_consumer.try_consume() else {
+            std::hint::spin_loop();
+            continue;
+        };
+        if matches!(
+            slot.payload,
+            melin_engine::journal::pipeline::OutputPayload::BatchEnd
+        ) {
+            let sent_at = ts_rx.recv().expect("timestamp channel");
+            inflight.fetch_sub(1, Ordering::Release);
+            let latency_ns = sent_at.elapsed().as_nanos() as u64;
+            if completed >= warmup {
+                if measured_start.is_none() {
+                    measured_start = Some(Instant::now());
+                }
+                histogram.record(latency_ns).expect("record");
+            }
+            completed += 1;
+        }
     }
+
+    publish_handle.join().expect("publisher thread");
 
     let end = Instant::now();
     let measured_wall = measured_start
@@ -730,37 +750,6 @@ fn run_pipeline_bench(
     let _ = matching_handle.join();
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
-}
-
-/// Drain available OutputSlots from the SPSC consumer, recording latency
-/// for each BatchEnd response.
-fn drain_output(
-    consumer: &mut melin_disruptor::spsc::Consumer<melin_engine::journal::pipeline::OutputSlot>,
-    inflight_ts: &mut VecDeque<Instant>,
-    histogram: &mut Histogram<u64>,
-    completed: &mut usize,
-    warmup: usize,
-    measured_start: &mut Option<Instant>,
-) {
-    use melin_engine::journal::pipeline::OutputPayload;
-
-    loop {
-        let Some((_seq, slot)) = consumer.try_consume() else {
-            std::hint::spin_loop();
-            return;
-        };
-        if matches!(slot.payload, OutputPayload::BatchEnd) {
-            let sent_at = inflight_ts.pop_front().expect("inflight timestamp");
-            let latency_ns = sent_at.elapsed().as_nanos() as u64;
-            if *completed >= warmup {
-                if measured_start.is_none() {
-                    *measured_start = Some(Instant::now());
-                }
-                histogram.record(latency_ns).expect("record");
-            }
-            *completed += 1;
-        }
-    }
 }
 
 // ===========================================================================
@@ -1031,6 +1020,31 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
         }
     }
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
+}
+
+/// Pre-encoded heartbeat wire frame (length prefix + tag). Used during setup
+/// to keep already-connected clients alive while remaining clients connect.
+/// The server's idle timeout (default 30s) would otherwise drop early
+/// connections during slow setup phases (e.g., 512 clients × ~100ms each).
+fn heartbeat_frame() -> [u8; 5] {
+    let mut buf = [0u8; 128];
+    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, &mut buf)
+        .expect("encode heartbeat");
+    let mut frame = [0u8; 5];
+    frame.copy_from_slice(&buf[..n]);
+    frame
+}
+
+/// Send a heartbeat on every established connection to reset the server's
+/// idle timer. Uses raw `write(2)` on the write fd — sockets are still in
+/// blocking mode during setup, so the small 5-byte write completes
+/// immediately.
+fn keepalive_established(write_fds: &[RawFd], heartbeat: &[u8; 5]) {
+    for &fd in write_fds {
+        unsafe {
+            libc::write(fd, heartbeat.as_ptr().cast(), heartbeat.len());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,14 +1407,27 @@ fn run_epoll_roundtrip<R, W, F>(
     let num_threads = bench_threads.min(num_clients);
     let mut thread_conns: Vec<Vec<BenchConnection<W>>> =
         (0..num_threads).map(|_| Vec::new()).collect();
+    let heartbeat = heartbeat_frame();
+    // Track write fds for keepalive heartbeats during setup.
+    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
+    let mut last_keepalive = Instant::now();
 
     for client_id in 0..num_clients {
+        // Send heartbeats on all established connections every 10s to
+        // prevent the server's 30s idle timeout from dropping them.
+        if last_keepalive.elapsed() >= Duration::from_secs(10) {
+            keepalive_established(&write_fds, &heartbeat);
+            last_keepalive = Instant::now();
+        }
+
         let (mut read_stream, write_stream) = connect();
 
         // Challenge-response auth while the socket is still blocking.
         auth_handshake(&mut read_stream, key);
 
         let fd = read_stream.as_raw_fd();
+        let write_fd = write_stream.as_raw_fd();
+        write_fds.push(write_fd);
         let writer = BlockingFrameWriter::new(write_stream);
 
         // Set non-blocking on the read fd.
@@ -1623,8 +1650,19 @@ fn run_uring_roundtrip<R, W, F>(
 
     let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
+    let heartbeat = heartbeat_frame();
+    // Track write fds for keepalive heartbeats during setup.
+    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
+    let mut last_keepalive = Instant::now();
 
     for client_id in 0..num_clients {
+        // Send heartbeats on all established connections every 10s to
+        // prevent the server's 30s idle timeout from dropping them.
+        if last_keepalive.elapsed() >= Duration::from_secs(10) {
+            keepalive_established(&write_fds, &heartbeat);
+            last_keepalive = Instant::now();
+        }
+
         let (mut read_stream, write_stream) = connect();
 
         // Challenge-response auth while the socket is still blocking.
@@ -1632,6 +1670,7 @@ fn run_uring_roundtrip<R, W, F>(
 
         let read_fd = read_stream.as_raw_fd();
         let write_fd = write_stream.as_raw_fd();
+        write_fds.push(write_fd);
 
         let client_pairs = if client_id == num_clients - 1 {
             pairs_per_client + remainder
@@ -1847,7 +1886,9 @@ fn run_uring_loop(
     use io_uring::{IoUring, opcode, types};
 
     let n = connections.len();
-    let mut ring = IoUring::new(1024).expect("create io_uring for bench");
+    // 4096 entries: supports up to 1024 connections per thread (RECV +
+    // SEND per connection, plus headroom for partial-send resubmissions).
+    let mut ring = IoUring::new(4096).expect("create io_uring for bench");
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut done_count: usize = 0;

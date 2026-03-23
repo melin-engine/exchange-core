@@ -55,7 +55,7 @@ REPL_PORT=9877
 RUN_FSYNC="${RUN_FSYNC:-1}"
 RUN_NOPERSIST="${RUN_NOPERSIST:-1}"
 RUN_SINGLE="${RUN_SINGLE:-1}"
-RUN_PIPELINE="${RUN_PIPELINE:-1}"
+RUN_PIPELINE="${RUN_PIPELINE:-0}"
 RUN_SWEEPS="${RUN_SWEEPS:-1}"
 RUN_REPLICATION="${RUN_REPLICATION:-1}"
 RUN_PLOTS="${RUN_PLOTS:-1}"
@@ -155,7 +155,7 @@ if [[ "$RUN_NOPERSIST" == "1" ]]; then
 echo ""
 echo "============================================================"
 echo "  [2/3] Peak throughput — no persistence"
-echo "  100M pairs, 16 clients, window 256"
+echo "  250M pairs, 16 clients, window 512"
 echo "============================================================"
 echo ""
 
@@ -175,7 +175,7 @@ ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
     cp target/release/melin-server.nopersist target/release/melin-server"
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 100000000 --clients 16 --window 256
+    -- -- 250000000 --clients 16 --window 512
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/2-no-persist.json" 2>/dev/null || true
 
