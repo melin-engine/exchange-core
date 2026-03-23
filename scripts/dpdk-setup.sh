@@ -64,9 +64,10 @@ DPDK_IP="${DPDK_IP:-auto}"
 # Number of hugepages (2MB each). 1024 = 2GB, enough for DPDK mempool.
 HUGEPAGES="${HUGEPAGES:-1024}"
 
-# MTU for trading interfaces. 9000 = jumbo frames (6x fewer TCP segments
-# vs 1500). Requires switch support — most Cherry VLAN switches allow it.
-MTU="${MTU:-9000}"
+# MTU for trading interfaces. 1500 = standard Ethernet (default).
+# Use 9000 for jumbo frames if the switch supports it (Cherry VLAN
+# switches typically do NOT — test before deploying).
+MTU="${MTU:-1500}"
 
 # Parse CLI overrides.
 while [[ $# -gt 0 ]]; do
