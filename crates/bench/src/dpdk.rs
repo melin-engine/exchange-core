@@ -218,12 +218,18 @@ pub fn run_dpdk_roundtrip(
         iface.poll(*cached_ts, device, sockets);
     };
 
-    // --- Create and connect all sockets ---
+    // --- Connect, auth, and set up each client sequentially ---
+    //
+    // Each socket must be created, connected, and authenticated one at a
+    // time. smoltcp's connect() sends the SYN on the next poll — if we
+    // create all sockets upfront, all SYNs go out simultaneously and the
+    // server may accept them in arbitrary order, causing auth deadlocks.
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
     let mut connections: Vec<DpdkBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
 
+    eprintln!("  connecting {num_clients} clients via DPDK...");
     for client_id in 0..num_clients {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
@@ -276,7 +282,7 @@ pub fn run_dpdk_roundtrip(
 
         connections.push(DpdkBenchConn {
             handle,
-            parse_buf: Vec::with_capacity(1028), // MAX_FRAME_SIZE (1024) + 4-byte length prefix
+            parse_buf: Vec::with_capacity(1028),
             frames,
             send_cursor: 0,
             send_pending: Vec::new(),
@@ -285,16 +291,8 @@ pub fn run_dpdk_roundtrip(
             total_orders,
             done: false,
         });
-    }
 
-    // Connect and authenticate one client at a time. With smoltcp's
-    // single-threaded poll loop, we can't wait for all connections to
-    // reach Established before starting auth — the server sends the
-    // Challenge immediately on accept, and its 5-second auth timeout
-    // fires if we don't respond while waiting for other connections.
-    eprintln!("  connecting {num_clients} clients via DPDK...");
-    for i in 0..num_clients {
-        // Wait for this connection to establish.
+        // Wait for TCP handshake to complete.
         loop {
             poll(
                 &mut device,
@@ -303,15 +301,15 @@ pub fn run_dpdk_roundtrip(
                 &mut poll_count,
                 &mut cached_ts,
             );
-            let s = sockets.get_mut::<tcp::Socket>(connections[i].handle);
+            let s = sockets.get_mut::<tcp::Socket>(handle);
             if s.state() == State::Established {
                 break;
             }
         }
 
-        // Auth handshake for this connection.
+        // Auth handshake.
         {
-            let conn = std::slice::from_mut(&mut connections[i]);
+            let conn = std::slice::from_mut(connections.last_mut().unwrap());
             dpdk_auth_all(
                 conn,
                 &mut device,
@@ -325,8 +323,8 @@ pub fn run_dpdk_roundtrip(
 
         eprintln!(
             "  client {}/{num_clients}: connected, {} frames generated",
-            i + 1,
-            connections[i].total_orders,
+            client_id + 1,
+            total_orders,
         );
     }
     eprintln!(
