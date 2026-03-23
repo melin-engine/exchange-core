@@ -121,6 +121,11 @@ cd ~/workspace/trading
 ```
 
 ### DPDK bench client (both sides bypass kernel)
+
+Core layout on the bench machine: core 0 = OS, core 7 = DPDK poll
+thread (`--dpdk-core 7`). No server threads on this machine, so
+`--bench-cores` is not needed (only relevant for embedded mode).
+
 ```sh
 ./target/release/melin-bench \
     --addr SERVER_VLAN:9876 \
@@ -131,7 +136,6 @@ cd ~/workspace/trading
     --dpdk-ports 0,1 \
     --dpdk-ip BENCH_VLAN \
     --dpdk-prefix-len 24 \
-    --dpdk-mtu 9000 \
     10000000
 ```
 
