@@ -444,10 +444,13 @@ impl DpdkTransport {
         socket.is_active()
     }
 
-    /// Close a connection.
+    /// Close a connection (sends FIN) and remove from the socket set.
+    /// The socket is fully removed so its tuple doesn't block future
+    /// connections from the same source port.
     pub fn close(&mut self, handle: SocketHandle) {
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-        socket.close();
+        socket.abort();
+        self.sockets.remove(handle);
         self.tx_queues.remove(&handle);
     }
 

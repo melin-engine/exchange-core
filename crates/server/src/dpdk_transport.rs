@@ -223,6 +223,7 @@ pub fn run_dpdk_poll(
                             connection_id: conn.connection_id.0,
                         });
                     }
+                    transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
                     connections.remove(&handle);
                 }
