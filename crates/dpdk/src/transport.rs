@@ -349,8 +349,14 @@ impl DpdkTransport {
     }
 
     fn check_listener(&mut self) {
-        let socket = self.sockets.get_mut::<tcp::Socket>(self.listen_handle);
-        if socket.state() == State::Established {
+        // Loop to accept all pending connections, not just one per poll.
+        // Multiple SYNs can complete in a single iface.poll() cycle.
+        loop {
+            let socket = self.sockets.get_mut::<tcp::Socket>(self.listen_handle);
+            if socket.state() != State::Established {
+                return;
+            }
+
             let peer = if let Some(remote) = socket.remote_endpoint() {
                 match remote.addr {
                     IpAddress::Ipv4(ip) => {
