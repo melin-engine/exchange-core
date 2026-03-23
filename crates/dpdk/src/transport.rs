@@ -197,6 +197,10 @@ impl DpdkTransport {
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+            // Disable Nagle (equivalent to TCP_NODELAY). Trading messages
+            // are small and latency-sensitive — buffering them to coalesce
+            // into MSS-sized segments adds unacceptable delay.
+            socket.set_nagle_enabled(false);
             socket
                 .listen(config.listen_port)
                 .map_err(|e| format!("TCP listen failed: {e}"))?;
@@ -284,6 +288,7 @@ impl DpdkTransport {
                 let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+                socket.set_nagle_enabled(false);
                 socket
                     .listen(self.listen_port)
                     .expect("re-listen after accept");
