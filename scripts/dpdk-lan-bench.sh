@@ -222,7 +222,7 @@ ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-se
         --dpdk-eal-args='${EAL_FULL}' \
         --dpdk-ip ${DPDK_IP} \
         --dpdk-prefix-len ${DPDK_PREFIX} \
-        --dpdk-port ${DPDK_PORT} \
+        --dpdk-ports ${DPDK_PORT} \
         --dpdk-core ${DPDK_CORE} \
     >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -272,7 +272,7 @@ else
         BENCH_EAL_FULL="--huge-dir=${HUGE_DIR}"
     fi
 
-    BENCH_DPDK_ARGS="--dpdk-eal-args='${BENCH_EAL_FULL}' --dpdk-port ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+    BENCH_DPDK_ARGS="--dpdk-eal-args='${BENCH_EAL_FULL}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
     if [[ -n "$BENCH_DPDK_IP" ]]; then
         BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX_VAL}"
     fi
