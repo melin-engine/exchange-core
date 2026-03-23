@@ -124,7 +124,7 @@ pub fn run(
                     connections.insert(
                         connection_id,
                         ConnectionHeartbeat {
-                            last_send: Instant::now(),
+                            last_send: last_heartbeat_scan,
                         },
                     );
                 }
@@ -199,6 +199,10 @@ pub fn run(
             }
         }
 
+        // One Instant::now() per batch for heartbeat tracking instead of
+        // per response — heartbeat interval is 10s, sub-ms precision is plenty.
+        let batch_now = Instant::now();
+
         // Encode and queue responses.
         for slot in &batch[..count] {
             let kind = match slot.payload {
@@ -241,7 +245,7 @@ pub fn run(
             tx_out.publish(frame);
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
-                state.last_send = Instant::now();
+                state.last_send = batch_now;
             }
         }
     }
