@@ -90,6 +90,7 @@ pub fn run(
     replication_cursor: Arc<std::sync::atomic::AtomicU64>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
+    busy_spin: bool,
 ) {
     let mut ring =
         IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
@@ -251,8 +252,8 @@ pub fn run(
             {
                 idle_count += 1;
             }
-            if idle_spins < 1000 {
-                idle_spins += 1;
+            if busy_spin || idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();

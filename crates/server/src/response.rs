@@ -76,6 +76,7 @@ pub fn run(
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
+    busy_spin: bool,
 ) {
     // Connection table: maps connection IDs to their state (writer + last_send).
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
@@ -239,8 +240,8 @@ pub fn run(
             {
                 idle_count += 1;
             }
-            if idle_spins < 1000 {
-                idle_spins += 1;
+            if busy_spin || idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();

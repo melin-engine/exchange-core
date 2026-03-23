@@ -48,6 +48,20 @@ pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 /// Limits the time spent encoding before sync, keeping tail latency bounded.
 const MAX_JOURNAL_BATCH: usize = 1024;
 
+/// Spin-wait idle hint. When `busy_spin` is false (default), falls back to
+/// `sched_yield` after 1000 spins — courteous on shared cores but expensive
+/// on EPYC (~1-5µs per yield). When true, spins indefinitely with PAUSE —
+/// the thread owns the core (requires `isolcpus`).
+#[inline(always)]
+fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
+    if busy_spin || *idle_spins < 1000 {
+        *idle_spins = idle_spins.wrapping_add(1);
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+}
+
 /// Maximum events consumed per disruptor batch in the matching stage.
 /// Amortizes one atomic Release store over N events. Keep small to avoid
 /// burstiness that causes the response stage to wait on the journal cursor.
@@ -177,6 +191,9 @@ pub struct JournalStage {
     /// `flush_batch_sync()`. No heap allocation — just a memcpy into the
     /// ring's pre-allocated buffer. When `None`, replication is disabled.
     replication_producer: Option<ReplicationProducer>,
+    /// When true, never yield to the OS scheduler — spin indefinitely with
+    /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
+    busy_spin: bool,
 }
 
 impl JournalStage {
@@ -191,6 +208,7 @@ impl JournalStage {
         consumer: ring::Consumer<InputSlot>,
         group_commit_delay: Duration,
         max_batch: usize,
+        busy_spin: bool,
     ) -> Self {
         Self {
             writer,
@@ -198,6 +216,7 @@ impl JournalStage {
             group_commit_delay,
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
             replication_producer: None,
+            busy_spin,
         }
     }
 
@@ -398,12 +417,7 @@ impl JournalStage {
                 {
                     idle_count += 1;
                 }
-                if idle_spins < 1000 {
-                    idle_spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
+                idle_wait(&mut idle_spins, self.busy_spin);
             }
         }
     }
@@ -681,12 +695,7 @@ impl JournalStage {
                 {
                     idle_count += 1;
                 }
-                if idle_spins < 1000 {
-                    idle_spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
+                idle_wait(&mut idle_spins, self.busy_spin);
             }
         }
     }
@@ -748,6 +757,8 @@ pub struct MatchingStage {
     /// Active connection count, shared with the server accept loop.
     /// Read only when processing `QueryStats` (once per second at most).
     active_connections: Arc<AtomicU64>,
+    /// When true, never yield — spin indefinitely. See [`idle_wait`].
+    busy_spin: bool,
 }
 
 impl MatchingStage {
@@ -759,6 +770,7 @@ impl MatchingStage {
         events_processed: Arc<AtomicU64>,
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
+        busy_spin: bool,
     ) -> Self {
         Self {
             exchange,
@@ -767,6 +779,7 @@ impl MatchingStage {
             events_processed,
             journal_cursor,
             active_connections,
+            busy_spin,
         }
     }
 
@@ -832,12 +845,7 @@ impl MatchingStage {
                 {
                     idle_count += 1;
                 }
-                if idle_spins < 1000 {
-                    idle_spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
+                idle_wait(&mut idle_spins, self.busy_spin);
                 continue;
             }
             idle_spins = 0;
@@ -1112,6 +1120,7 @@ pub fn build_pipeline(
         false,
         MAX_JOURNAL_BATCH,
         crate::journal::replication::REPLICATION_RING_CAPACITY,
+        false,
     );
     (
         producer,
@@ -1143,6 +1152,7 @@ pub fn build_pipeline_with_replication(
     enable_replication: bool,
     max_journal_batch: usize,
     replication_ring_size: usize,
+    busy_spin: bool,
 ) -> (
     ring::MultiProducer<InputSlot>,
     JournalStage,
@@ -1184,6 +1194,7 @@ pub fn build_pipeline_with_replication(
         journal_consumer,
         group_commit_delay,
         max_journal_batch,
+        busy_spin,
     );
 
     // Build the replication ring if enabled. Each slot holds up to 128 KiB.
@@ -1204,6 +1215,7 @@ pub fn build_pipeline_with_replication(
         Arc::clone(&events_processed),
         Arc::clone(&journal_cursor),
         active_connections,
+        busy_spin,
     );
 
     // Replication cursor: shared atomic read by the response stage.
@@ -1262,7 +1274,7 @@ mod tests {
             .build();
 
         let consumer = consumers.pop().unwrap();
-        let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH);
+        let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
@@ -1337,6 +1349,7 @@ mod tests {
             events_counter,
             dummy_cursor,
             active_conns,
+            false,
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1502,6 +1515,7 @@ mod tests {
             true,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            false,
         );
 
         let mut repl_consumer = replication_rx.expect("replication should be enabled");
@@ -1641,6 +1655,7 @@ mod tests {
                     false,
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
+                    false,
                 );
             assert!(replication.is_none());
             assert_eq!(replication_cursor.load(Ordering::Relaxed), u64::MAX);
@@ -1662,6 +1677,7 @@ mod tests {
                     true,
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
+                    false,
                 );
             assert!(replication.is_some());
             assert_eq!(

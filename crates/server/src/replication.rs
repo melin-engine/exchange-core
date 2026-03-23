@@ -317,6 +317,7 @@ fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
 /// BLAKE3 hash chain starts from the exact same encoded bytes.
 ///
 /// Runs on a dedicated thread. Blocks until shutdown.
+#[allow(clippy::too_many_arguments)]
 pub fn run_sender(
     bind_addr: SocketAddr,
     mut repl_consumer: ReplicationConsumer,
@@ -326,6 +327,7 @@ pub fn run_sender(
     replica_ready: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
+    busy_spin: bool,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -388,6 +390,7 @@ pub fn run_sender(
             shutdown,
             batch_size,
             heartbeat_secs,
+            busy_spin,
         ) {
             Ok(()) => warn!("replica disconnected cleanly"),
             Err(e) => warn!(error = %e, "replica connection error"),
@@ -417,6 +420,7 @@ fn handle_replica_connection(
     shutdown: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
+    busy_spin: bool,
 ) -> io::Result<()> {
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -554,7 +558,11 @@ fn handle_replica_connection(
             if let Err(e) = process_acks(&mut reader, replication_cursor, &mut pollfd) {
                 return Err(io::Error::other(format!("replica ack read error: {e}")));
             }
-            std::thread::yield_now();
+            if busy_spin {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }

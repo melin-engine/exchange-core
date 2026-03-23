@@ -140,6 +140,13 @@ pub struct ServerConfig {
     /// before the journal stage backpressures. Default: 256 (32 MiB).
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
+
+    /// Spin-wait without yielding to the OS scheduler. Eliminates
+    /// sched_yield overhead (~1-5µs on EPYC) on pipeline threads.
+    /// Requires isolated cores (isolcpus) — without isolation, spinning
+    /// threads will starve other processes.
+    #[arg(long, default_value_t = false)]
+    pub busy_spin: bool,
 }
 
 impl Default for ServerConfig {
@@ -171,6 +178,7 @@ impl Default for ServerConfig {
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
             replication_ring_size: 256,
+            busy_spin: false,
         }
     }
 }
@@ -348,6 +356,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
+        config.busy_spin,
     );
 
     // Control channel for connect/disconnect events → response stage.
@@ -409,6 +418,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_cursor_response = Arc::clone(&replication_cursor);
     let s3 = Arc::clone(&shutdown);
+    let busy_spin = config.busy_spin;
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -422,6 +432,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 &s3,
                 heartbeat_interval,
                 active_connections_response,
+                busy_spin,
             );
             #[cfg(feature = "io-uring")]
             crate::uring_response::run(
@@ -431,6 +442,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 replication_cursor_response,
                 &s3,
                 heartbeat_interval,
+                busy_spin,
             );
         })
         .expect("failed to spawn response thread");
@@ -463,6 +475,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     &ready_flag,
                     batch_size,
                     heartbeat_secs,
+                    busy_spin,
                 );
             })
             .expect("failed to spawn replication sender thread");
