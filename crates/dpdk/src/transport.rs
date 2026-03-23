@@ -17,6 +17,18 @@ use crate::eal::Eal;
 use crate::mempool::Mempool;
 use crate::port::{ChecksumOffloads, Port};
 
+/// Apply low-latency TCP tuning to a smoltcp socket.
+///
+/// Called on every socket (listen + accepted) to configure for trading:
+/// - Nagle disabled (TCP_NODELAY): send small messages immediately
+/// - Delayed ACK disabled: ACK every segment without waiting 10ms
+///
+/// These settings sacrifice marginal bandwidth efficiency for latency.
+fn tune_socket(socket: &mut tcp::Socket<'_>) {
+    socket.set_nagle_enabled(false);
+    socket.set_ack_delay(None);
+}
+
 /// Maximum concurrent TCP connections.
 const MAX_CONNECTIONS: usize = 1024;
 
@@ -231,10 +243,7 @@ impl DpdkTransport {
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-            // Disable Nagle (equivalent to TCP_NODELAY). Trading messages
-            // are small and latency-sensitive — buffering them to coalesce
-            // into MSS-sized segments adds unacceptable delay.
-            socket.set_nagle_enabled(false);
+            tune_socket(&mut socket);
             socket
                 .listen(config.listen_port)
                 .map_err(|e| format!("TCP listen failed: {e}"))?;
@@ -340,7 +349,7 @@ impl DpdkTransport {
                 let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-                socket.set_nagle_enabled(false);
+                tune_socket(&mut socket);
                 socket
                     .listen(self.listen_port)
                     .expect("re-listen after accept");

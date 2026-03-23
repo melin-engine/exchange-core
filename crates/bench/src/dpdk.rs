@@ -222,7 +222,10 @@ pub fn run_dpdk_roundtrip(
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        // Low-latency TCP tuning: disable Nagle (send immediately) and
+        // delayed ACK (ACK every segment without waiting 10ms).
         socket.set_nagle_enabled(false);
+        socket.set_ack_delay(None);
 
         let local_port = 50000 + client_id as u16;
         socket
