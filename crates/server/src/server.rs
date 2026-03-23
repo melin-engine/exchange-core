@@ -125,8 +125,8 @@ pub struct ServerConfig {
 
     /// Maximum events per journal fsync batch. Smaller values reduce
     /// tail latency (less work per sync), larger values improve throughput
-    /// (fewer fsyncs). Default: 1024.
-    #[arg(long, default_value_t = 1024)]
+    /// (fewer fsyncs). Default: 4096.
+    #[arg(long, default_value_t = 4096)]
     pub max_journal_batch: usize,
 
     /// Replication heartbeat interval in seconds. The primary sends a
@@ -136,9 +136,9 @@ pub struct ServerConfig {
     pub replication_heartbeat_secs: u64,
 
     /// Number of slots in the replication ring buffer. Must be a power
-    /// of two. Each slot holds up to 128 KiB. More slots = more buffering
-    /// before the journal stage backpressures. Default: 256 (32 MiB).
-    #[arg(long, default_value_t = 256)]
+    /// of two. Each slot holds up to 512 KiB. More slots = more buffering
+    /// before the journal stage backpressures. Default: 64 (32 MiB).
+    #[arg(long, default_value_t = 64)]
     pub replication_ring_size: usize,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
@@ -175,7 +175,7 @@ impl Default for ServerConfig {
             standalone: false,
             replica_of: None,
             replication_batch_size: 32,
-            max_journal_batch: 1024,
+            max_journal_batch: 4096,
             replication_heartbeat_secs: 5,
             replication_ring_size: 256,
             yield_idle: false,

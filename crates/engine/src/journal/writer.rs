@@ -29,9 +29,11 @@ use super::event::JournalEvent;
 /// Fixed-size array avoids per-write heap allocation on the hot path.
 const MAX_ENTRY_SIZE: usize = 128;
 
-/// Batch buffer capacity. Sized for MAX_JOURNAL_BATCH (1024) entries at
-/// ~80 bytes each = ~80 KiB. Pre-allocated once, reused across batches.
-const BATCH_BUF_CAPACITY: usize = 128 * 1024;
+/// Batch buffer capacity. Sized for MAX_JOURNAL_BATCH (4096) entries at
+/// ~104 bytes each (payload + 24-byte header/CRC) ≈ 416 KiB. Rounded up
+/// to 512 KiB for headroom (checkpoint entries, variable-size events).
+/// Pre-allocated once, reused across batches.
+const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
 /// Pre-allocation chunk size (256 MiB). Matches the default journal rotation
 /// threshold so that a freshly created journal never needs mid-run extension.

@@ -45,8 +45,12 @@ pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// Maximum number of events processed in one journal batch.
-/// Limits the time spent encoding before sync, keeping tail latency bounded.
-const MAX_JOURNAL_BATCH: usize = 1024;
+/// Larger batches amortize the fixed cost of each NVMe FUA write over more
+/// events. FUA cost is roughly constant up to ~128 KiB (one NVMe command),
+/// so 4096 events × ~104 bytes ≈ 416 KiB still fits in a single write.
+/// Under low load, batches are naturally small (drain what's available);
+/// the cap only matters at sustained high throughput.
+const MAX_JOURNAL_BATCH: usize = 4096;
 
 /// Spin-wait idle hint. When `busy_spin` is false (default), falls back to
 /// `sched_yield` after 1000 spins — courteous on shared cores but expensive

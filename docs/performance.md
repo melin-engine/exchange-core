@@ -57,7 +57,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 | # | Optimization | Est. gain | Effort | Status |
 |---|-------------|-----------|--------|--------|
 | 1 | **Adaptive overlapped io_uring writes** | 30-50% throughput | Medium | Reverted — needs tail fix |
-| 2 | **Auto-tune max batch size** | Up to 2-4x at sustained load | Low | Not started |
+| 2 | **Raise max batch size to 4096** | Up to 2-4x at sustained load | Low | Done |
 | 3 | **NVMe block device tuning** | Jitter reduction (p99.9/max) | Trivial | Done |
 | 4 | **WRITE_FIXED for journal** | ~200ns/batch | Low | Not started |
 | 5 | **Optane / persistent memory** | 3-10x journal latency | Hardware | Not started |
@@ -65,7 +65,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 
 **1. Adaptive overlapped io_uring writes.** Double-buffer design: submit `WRITE` + `RWF_DSYNC` asynchronously, accumulate next batch in spare buffer while NVMe write is inflight. Already built and reverted — the problem is events accumulated during an inflight write have their cursor delayed by one extra NVMe write latency, increasing tail. Fix: only overlap when the batch is large enough (e.g., >16 events) that NVMe write time exceeds accumulation time. For small batches, write synchronously — the FUA is ~10µs anyway. This eliminates the tail penalty at low load (where tail matters most) while getting the throughput win under high load.
 
-**2. Auto-tune max batch size.** Currently `MAX_JOURNAL_BATCH = 1024` is static. FUA cost is roughly constant regardless of payload size (up to ~128 KB = one NVMe command). Draining all available events from the ring (up to a higher cap, e.g., 4096) before writing means fewer FUA operations per second. At sustained high load, 4096 events in one FUA vs 4 × 1024-event FUA writes = 4x fewer syncs, directly increasing throughput. No latency penalty — events aren't delayed, they're already in the ring.
+**2. Raise max batch size to 4096.** `MAX_JOURNAL_BATCH` raised from 1024 to 4096. FUA cost is roughly constant regardless of payload size (up to ~128 KB = one NVMe command), so draining more events per FUA means fewer syncs. At sustained high load, one 4096-event FUA vs 4 × 1024-event FUA writes = 4x fewer syncs. Under low load, batches are naturally small (drain what's available) — the cap only matters at peak throughput. Replication chunk size raised to 512 KiB to match; ring capacity reduced from 256 to 64 slots to keep total memory at 32 MiB.
 
 **3. NVMe block device tuning.** Implemented in `scripts/cherry-setup.sh` (sysfs writes + udev rule for persistence). Settings: `scheduler=none`, `nr_requests=2`, `nomerges=2`, `wbt_lat_usec=0`, `add_random=0`. Eliminates non-deterministic block layer overhead (scheduler sorting, merge scans, writeback throttling, entropy pool locks). Targets jitter (p99.9/max), not median throughput. Also worth checking NVMe volatile write cache: `nvme get-feature -f 0x06 /dev/nvmeXn1` — if disabled, FUA is already a no-op.
 
