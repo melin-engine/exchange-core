@@ -538,15 +538,20 @@ impl RxBatch {
         self.mbufs.is_empty() && self.injected.is_empty()
     }
 
-    /// Build a Vec of frame slices for `poll_ingress_batch()`.
-    /// Injected frames first (ARP), then NIC frames.
-    pub fn as_slices(&self) -> Vec<&[u8]> {
-        let mut slices = Vec::with_capacity(self.len());
+    /// Write frame slices into a caller-provided `MaybeUninit` array.
+    /// Returns the number of slices written. Injected frames first (ARP),
+    /// then NIC frames. Zero heap allocation.
+    ///
+    /// # Safety
+    /// The caller must ensure `out` has at least `self.len()` elements.
+    pub fn write_slices<'a>(&'a self, out: &mut [std::mem::MaybeUninit<&'a [u8]>]) -> usize {
+        let mut i = 0;
         for frame in &self.injected {
-            slices.push(frame.as_slice());
+            out[i] = std::mem::MaybeUninit::new(frame.as_slice());
+            i += 1;
         }
         for &mbuf in &self.mbufs {
-            // SAFETY: mbuf data is valid until drop frees it.
+            // SAFETY: mbuf data is valid until drop/recycle frees it.
             let data = unsafe {
                 let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
                 let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
@@ -554,9 +559,10 @@ impl RxBatch {
                 let len = ffi::dpdk_mbuf_data_len(mbuf) as usize;
                 std::slice::from_raw_parts(ptr, len)
             };
-            slices.push(data);
+            out[i] = std::mem::MaybeUninit::new(data);
+            i += 1;
         }
-        slices
+        i
     }
 }
 

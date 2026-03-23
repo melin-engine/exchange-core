@@ -302,12 +302,21 @@ impl DpdkTransport {
         // Device::receive() trait dispatch.
         let batch = self.device.collect_rx_batch();
         if !batch.is_empty() {
-            let slices = batch.as_slices();
+            // Stack-allocated slice array — no heap allocation.
+            // Max = BURST_SIZE(32) × 2 ports + injected ARP frames.
+            const MAX_SLICES: usize = 128;
+            let mut slices_buf: [std::mem::MaybeUninit<&[u8]>; MAX_SLICES] =
+                [std::mem::MaybeUninit::uninit(); MAX_SLICES];
+            let count = batch.write_slices(&mut slices_buf);
+
+            // SAFETY: write_slices initialized exactly `count` elements.
+            let slices =
+                unsafe { std::slice::from_raw_parts(slices_buf.as_ptr().cast::<&[u8]>(), count) };
             self.iface.poll_ingress_batch(
                 self.cached_timestamp,
                 &mut self.device,
                 &mut self.sockets,
-                &slices,
+                slices,
             );
         }
         batch.recycle(&mut self.device);
