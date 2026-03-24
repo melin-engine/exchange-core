@@ -31,6 +31,7 @@
 #   RUN_SWEEP_ACCOUNTS=0|1    Account count sweep (default: off)
 #   RUN_REPLICATION=0|1  Synchronous replication benchmark
 #   RUN_PLOTS=0|1        Generate plots from results
+#   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
 #
 # Prerequisites:
@@ -72,7 +73,7 @@ SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 REPO_DIR="~/workspace/trading"
 
-RESULTS_DIR="/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="${RESULTS_DIR:-/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${RESULTS_DIR}"
 
 echo "============================================================"
@@ -512,16 +513,16 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         fi
     done
 
-    # Latency stability over time (from time-series data in JSON).
-    STABILITY_FILES=()
-    for f in "${RESULTS_DIR}/1-fsync.json" "${RESULTS_DIR}/2-no-persist.json" "${RESULTS_DIR}/4-replication.json"; do
-        [[ -f "$f" ]] && STABILITY_FILES+=("$f")
+    # Latency stability over time — one plot per mode.
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication"; do
+        f="${f_label%%:*}"
+        label="${f_label##*:}"
+        if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
+            echo "  Generating latency stability: ${label}..."
+            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" \
+                "${RESULTS_DIR}/${f}.json" 2>&1
+        fi
     done
-    if [[ ${#STABILITY_FILES[@]} -gt 0 ]]; then
-        echo "  Generating latency stability..."
-        "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability.svg" \
-            "${STABILITY_FILES[@]}" 2>&1
-    fi
 
     echo ""
     echo "  Plots written to docs/plots/"
