@@ -5521,4 +5521,66 @@ mod tests {
         exchange.cancel_all(ACCT_A, &mut reports);
         assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
     }
+
+    #[test]
+    fn order_counts_zero_after_ioc_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Seller places resting order.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // IOC buy fills immediately — should not leave resting count.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::IOC),
+            &mut reports,
+        );
+
+        // ACCT_A should have no resting orders — withdraw should work.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn withdraw_after_partial_fill_and_cancel() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // ACCT_A places GTC buy for 20 @ 100.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 20, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // ACCT_B fills 10 of 20.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Cancel remaining, then withdraw all.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        let usd_avail = exchange.accounts().balance(ACCT_A, USD).available;
+        exchange.withdraw(ACCT_A, USD, usd_avail).unwrap();
+        let btc_avail = exchange.accounts().balance(ACCT_A, BTC).available;
+        exchange.withdraw(ACCT_A, BTC, btc_avail).unwrap();
+
+        assert!(!exchange.accounts().has_balances(ACCT_A));
+    }
 }

@@ -1117,4 +1117,60 @@ mod tests {
             999
         );
     }
+
+    #[test]
+    fn journal_replay_with_withdraw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("withdraw.journal");
+
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.withdraw(ACCT_A, USD, 50_000).unwrap();
+        }
+
+        // Replay should produce the same state.
+        let je = JournaledExchange::recover(&path).unwrap();
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            50_000
+        );
+    }
+
+    #[test]
+    fn journal_replay_rejected_withdraw_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("withdraw_rejected.journal");
+
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+
+            // Place a resting order, then attempt withdraw (should fail).
+            let mut reports = Vec::new();
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 100, 10),
+                &mut reports,
+            )
+            .unwrap();
+
+            // This withdraw is journaled but rejected at execution.
+            let _ = je.withdraw(ACCT_A, USD, 1_000);
+        }
+
+        // Replay: the rejected withdraw should be a no-op.
+        let je = JournaledExchange::recover(&path).unwrap();
+        // Balance: 100K deposited, 1000 reserved by order, withdraw rejected.
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            99_000
+        );
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).reserved,
+            1_000
+        );
+    }
 }

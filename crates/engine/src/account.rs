@@ -207,8 +207,13 @@ impl AccountManager {
 
     /// Snapshot all non-zero balances for serialization.
     pub(crate) fn snapshot_balances(&self) -> Vec<((AccountId, CurrencyId), Balance)> {
-        // HashMap only contains non-zero entries, so no filtering needed.
-        self.balances.iter().map(|(&k, &v)| (k, v)).collect()
+        // fill() can create zero-balance entries via entry().or_default(),
+        // so filter them out to keep snapshots compact.
+        self.balances
+            .iter()
+            .filter(|(_, v)| !v.is_zero())
+            .map(|(&k, &v)| (k, v))
+            .collect()
     }
 
     /// Snapshot all active reservations for serialization. The caller
@@ -617,10 +622,13 @@ impl AccountManager {
     }
 
     /// Check if an account has any non-zero balances.
+    ///
+    /// O(n) scan of all entries — not for the hot path. Use for admin
+    /// operations, tests, and diagnostics only.
     pub fn has_balances(&self, account: AccountId) -> bool {
-        // Scan all entries for this account. With sparse storage, only
-        // non-zero entries exist, so any match means the account is active.
-        self.balances.keys().any(|(a, _)| *a == account)
+        self.balances
+            .iter()
+            .any(|(&(a, _), v)| a == account && !v.is_zero())
     }
 }
 
@@ -1019,6 +1027,61 @@ mod tests {
 
         let snap = mgr.snapshot_balances();
         assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn withdraw_unknown_account_fails() {
+        let mgr = AccountManager::new();
+        let err = mgr.balance(AccountId(999), USD);
+        assert_eq!(err, Balance::default());
+        // Withdraw from non-existent account.
+        let mut mgr = AccountManager::new();
+        let err = mgr.withdraw(AccountId(999), USD, 100).unwrap_err();
+        assert_eq!(err, RejectReason::UnknownAccount);
+    }
+
+    #[test]
+    fn zero_amount_deposit_creates_entry() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 0);
+        // Zero deposit creates an entry (available=0, reserved=0).
+        // has_balances filters zero entries, so this should be false.
+        assert!(!mgr.has_balances(ACCT_A));
+    }
+
+    #[test]
+    fn withdraw_multiple_currencies_partial() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_A, BTC, 100);
+
+        // Withdraw all USD, keep BTC.
+        mgr.withdraw(ACCT_A, USD, 10_000).unwrap();
+        assert!(mgr.has_balances(ACCT_A)); // Still has BTC.
+        assert_eq!(mgr.balance(ACCT_A, USD), Balance::default());
+        assert_eq!(mgr.balance(ACCT_A, BTC).available, 100);
+    }
+
+    #[test]
+    fn fill_zero_entries_filtered_in_snapshot() {
+        let mut mgr = AccountManager::new();
+        // Buyer has quote only, seller has base only.
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
+
+        // Fill creates base entry for buyer, quote entry for seller.
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
+
+        // Snapshot should only include non-zero entries.
+        let snap = mgr.snapshot_balances();
+        for ((_, _), bal) in &snap {
+            assert!(!bal.is_zero(), "snapshot contains zero-balance entry");
+        }
     }
 
     #[test]
