@@ -39,6 +39,7 @@ io-uring = { version = "0.7", optional = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 melin-disruptor = { path = "../disruptor" }
+griddle = "0.6.0"
 
 [dev-dependencies]
 bolero = "0.11"

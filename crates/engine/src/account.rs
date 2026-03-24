@@ -5,22 +5,20 @@
 //! cancellation. Runs on the same single thread as the matching engine
 //! (no locks needed).
 //!
-//! Balances are stored in a sparse `FxHashMap<(AccountId, CurrencyId), Balance>`.
+//! Balances are stored in a sparse `HashMap<(AccountId, CurrencyId), Balance>`.
 //! Only accounts with non-zero balances consume memory, scaling with active
 //! accounts rather than `max(account_id) × max(currency_id)`. This enables
 //! the gateway deposit/withdraw lifecycle pattern for extreme scale (see
 //! `docs/account-lifecycle.md`).
 //!
-//! FxHashMap lookups (~20-50ns) are slower than flat Vec indexing (~1-3ns),
+//! HashMap lookups (~20-50ns) are slower than flat Vec indexing (~1-3ns),
 //! but the engine remains sub-microsecond per order. The self-contained
 //! design (no gateway cooperation needed for correctness) is the right
 //! commercial tradeoff.
 
-use rustc_hash::FxHashMap;
-
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, OrderType, Price,
-    Quantity, RejectReason, Side,
+    AccountId, CurrencyId, ExecutionReport, HashMap, InstrumentSpec, Order, OrderId, OrderType,
+    Price, Quantity, RejectReason, Side,
 };
 
 /// Per-currency balance for an account.
@@ -105,18 +103,18 @@ pub struct OrderInfo {
 
 /// Manages account balances across all currencies.
 ///
-/// Balances are stored in a sparse `FxHashMap<(AccountId, CurrencyId), Balance>`.
+/// Balances are stored in a sparse `HashMap<(AccountId, CurrencyId), Balance>`.
 /// Only accounts with non-zero balances consume memory. Zero-balance entries
 /// are removed on withdraw/release, so memory scales with active accounts.
 ///
-/// FxHashMap: fast non-cryptographic hashing (~20-50ns per lookup). Chosen
+/// HashMap: fast non-cryptographic hashing (~20-50ns per lookup). Chosen
 /// over BTreeMap (log-n), std HashMap (SipHash overhead), and flat Vec
 /// (can't handle sparse account ID space without wasting memory).
 pub struct AccountManager {
     /// Sparse balance map. Only (account, currency) pairs with non-zero
     /// balances are present. Entries are removed when both available and
     /// reserved reach zero.
-    balances: FxHashMap<(AccountId, CurrencyId), Balance>,
+    balances: HashMap<(AccountId, CurrencyId), Balance>,
     /// Slab of active reservations. Indexed by `ReservationSlot(u32)` for
     /// O(1) access with no hashing. Freed slots are recycled via `free_slots`.
     /// Vec: contiguous, cache-friendly, zero per-access overhead vs HashMap's
@@ -130,7 +128,7 @@ pub struct AccountManager {
 impl AccountManager {
     pub fn new() -> Self {
         Self {
-            balances: FxHashMap::default(),
+            balances: HashMap::default(),
             reservation_slab: Vec::new(),
             free_slots: Vec::new(),
         }
@@ -144,7 +142,7 @@ impl AccountManager {
         // Balance HashMap starts empty — deposits insert entries on demand.
         // No pre-allocation needed since deposit is an admin operation.
         Self {
-            balances: FxHashMap::default(),
+            balances: HashMap::default(),
             reservation_slab: Vec::with_capacity(2_000_000),
             free_slots: Vec::with_capacity(2_000_000),
         }
@@ -181,7 +179,7 @@ impl AccountManager {
     ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
         // Build balance HashMap directly from sparse entries.
         let mut balances =
-            FxHashMap::with_capacity_and_hasher(balance_entries.len(), Default::default());
+            HashMap::with_capacity_and_hasher(balance_entries.len(), Default::default());
         for (key, balance) in balance_entries {
             if !balance.is_zero() {
                 balances.insert(key, balance);
@@ -470,7 +468,7 @@ impl AccountManager {
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
-        order_info: &rustc_hash::FxHashMap<(AccountId, OrderId), OrderInfo>,
+        order_info: &HashMap<(AccountId, OrderId), OrderInfo>,
         spec: &InstrumentSpec,
         consumed: &mut Vec<(AccountId, OrderId)>,
     ) {
@@ -491,7 +489,7 @@ impl AccountManager {
 
                     // Look up both sides' OrderInfo for slot + side resolution.
                     // Cache the reservation slots to avoid re-querying order_info
-                    // for the remaining==0 check below (saves 2 FxHashMap lookups
+                    // for the remaining==0 check below (saves 2 HashMap lookups
                     // per fill — was 30% of this function's cost).
                     if let (Some(maker_info), Some(taker_info)) =
                         (order_info.get(&maker_key), order_info.get(&taker_key))

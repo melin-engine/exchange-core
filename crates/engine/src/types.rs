@@ -5,6 +5,25 @@
 
 use std::num::NonZeroU64;
 
+/// HashMap with FxHash and incremental resizing (via `griddle`).
+///
+/// Uses `FxBuildHasher` (fast non-cryptographic hash) with `griddle::HashMap`
+/// which spreads rehash cost across subsequent inserts instead of one O(n)
+/// spike. During resize, both old and new tables are live; each insert
+/// migrates a few entries. Reads check both tables until migration completes.
+///
+/// Replaces `rustc_hash::FxHashMap` (hashbrown) which rehashes all entries
+/// at once when load factor is exceeded — causing deterministic latency
+/// spikes on the hot path when account population exceeds pre-allocated
+/// capacity.
+///
+/// TODO: replace with custom extendible hash table (grows one bucket at a
+/// time) once griddle's dependency on hashbrown 0.14 becomes a problem.
+pub type HashMap<K, V> = griddle::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
+/// HashSet with FxHash and incremental resizing (via `griddle`).
+pub type HashSet<V> = griddle::HashSet<V, rustc_hash::FxBuildHasher>;
+
 /// Instrument/pair identifier.
 ///
 /// Uses a `u32` rather than a string to avoid heap allocation and enable

@@ -3,6 +3,10 @@
 > **This file must be kept up to date** as the project evolves — update structure, dependencies, and conventions whenever they change.
 >
 > **TODO**: Clean up this file once the sparse accounts feature (branch `feat/sparse-accounts`) is fully landed — update performance profile numbers with the HashMap overhead, verify the Dead Ends section doesn't reference flat Vec assumptions.
+>
+> **TODO**: Add a 4th permission role **Custodian** — can only Deposit and Withdraw, cannot trade or perform other admin ops (instrument management, circuit breakers, risk limits, kill switch). This separates fund management from trading and exchange administration. Current roles: `Admin` (full access), `Trader` (submit/cancel orders), `ReadOnly` (heartbeats, future market data). The Custodian role enables the gateway deposit/withdraw lifecycle pattern (see `docs/account-lifecycle.md`) without granting trading or admin privileges.
+>
+> **TODO**: Evaluate alternatives to `FxHashMap` for hot-path account lookups (`max_order_id`, `order_counts`, `balances`) — current HashMap can rehash on the hot path when account population exceeds pre-allocated capacity. Candidates: incremental-resize HashMap (amortizes rehash across operations), dense ID remapping at deposit time (Custodian assigns dense `u32` index → flat Vec for all hot-path data, one HashMap lookup at deposit only). See conversation notes in `docs/account-lifecycle.md`.
 
 ## Project
 
