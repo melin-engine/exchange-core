@@ -63,7 +63,7 @@ RUN_PLOTS="${RUN_PLOTS:-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LAN_BENCH="${SCRIPT_DIR}/lan-bench.sh"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 REPO_DIR="~/workspace/trading"
@@ -506,7 +506,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
 
     # Latency stability over time (from time-series data in JSON).
     STABILITY_FILES=()
-    for f in "${RESULTS_DIR}/1-fsync.json" "${RESULTS_DIR}/4-replication.json"; do
+    for f in "${RESULTS_DIR}/1-fsync.json" "${RESULTS_DIR}/2-no-persist.json" "${RESULTS_DIR}/4-replication.json"; do
         [[ -f "$f" ]] && STABILITY_FILES+=("$f")
     done
     if [[ ${#STABILITY_FILES[@]} -gt 0 ]]; then
