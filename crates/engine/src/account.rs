@@ -578,7 +578,7 @@ impl AccountManager {
             Side::Buy => {
                 let currency = spec.quote;
                 let amount = match order.order_type {
-                    OrderType::Limit { price }
+                    OrderType::Limit { price, .. }
                     | OrderType::StopLimit {
                         limit_price: price, ..
                     } => {
@@ -714,7 +714,10 @@ mod tests {
             id: OrderId(id),
             account,
             side: Side::Buy,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
@@ -726,7 +729,10 @@ mod tests {
             id: OrderId(id),
             account,
             side: Side::Sell,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,

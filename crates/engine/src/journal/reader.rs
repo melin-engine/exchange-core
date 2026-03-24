@@ -379,6 +379,7 @@ mod tests {
                     side: Side::Buy,
                     order_type: OrderType::Limit {
                         price: Price(nz(100)),
+                        post_only: false,
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),

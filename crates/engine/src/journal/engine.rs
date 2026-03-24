@@ -398,7 +398,10 @@ mod tests {
             id: OrderId(id),
             account,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,

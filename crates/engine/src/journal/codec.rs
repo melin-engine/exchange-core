@@ -80,6 +80,7 @@ const ORDER_TYPE_MARKET: u8 = 0;
 const ORDER_TYPE_LIMIT: u8 = 1;
 const ORDER_TYPE_STOP: u8 = 2;
 const ORDER_TYPE_STOP_LIMIT: u8 = 3;
+const ORDER_TYPE_LIMIT_POST_ONLY: u8 = 4;
 
 /// Encode the file header into `buf`.
 pub fn encode_file_header(buf: &mut [u8]) {
@@ -714,8 +715,12 @@ fn encode_order(order: &Order, buf: &mut [u8]) -> usize {
             buf[pos] = ORDER_TYPE_MARKET;
             pos += 1;
         }
-        OrderType::Limit { price } => {
-            buf[pos] = ORDER_TYPE_LIMIT;
+        OrderType::Limit { price, post_only } => {
+            buf[pos] = if post_only {
+                ORDER_TYPE_LIMIT_POST_ONLY
+            } else {
+                ORDER_TYPE_LIMIT
+            };
             pos += 1;
             le::put_u64(&mut buf[pos..], price.get());
             pos += 8;
@@ -770,7 +775,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
 
     let order_type = match order_type_tag {
         ORDER_TYPE_MARKET => OrderType::Market,
-        ORDER_TYPE_LIMIT => {
+        ORDER_TYPE_LIMIT | ORDER_TYPE_LIMIT_POST_ONLY => {
             if buf.len() < pos + 8 {
                 return Err(corrupt("limit order missing price"));
             }
@@ -779,6 +784,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
             pos += 8;
             OrderType::Limit {
                 price: Price(price),
+                post_only: order_type_tag == ORDER_TYPE_LIMIT_POST_ONLY,
             }
         }
         ORDER_TYPE_STOP => {
@@ -869,6 +875,7 @@ mod tests {
                     side: Side::Buy,
                     order_type: OrderType::Limit {
                         price: Price(nz(5000)),
+                        post_only: false,
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),

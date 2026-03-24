@@ -133,6 +133,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
                 0 => OrderType::Market,
                 1 => OrderType::Limit {
                     price: Price(nz64(data, 29)?),
+                    post_only: false,
                 },
                 2 => OrderType::Stop {
                     trigger_price: Price(nz64(data, 29)?),

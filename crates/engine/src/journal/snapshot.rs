@@ -1277,6 +1277,7 @@ mod tests {
             side,
             order_type: OrderType::Limit {
                 price: price_val(p),
+                post_only: false,
             },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),

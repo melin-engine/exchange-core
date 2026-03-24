@@ -365,6 +365,7 @@ impl App {
         let order_type = if let Some(p) = price {
             OrderType::Limit {
                 price: Price(NonZeroU64::new(p).expect("validated > 0")),
+                post_only: false,
             }
         } else {
             OrderType::Market
@@ -484,6 +485,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::OutsidePriceBand => "outside price band",
                 RejectReason::UnknownOrder => "unknown order",
                 RejectReason::PriceWouldCross => "price would cross spread",
+                RejectReason::PostOnlyWouldCross => "post-only would cross",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

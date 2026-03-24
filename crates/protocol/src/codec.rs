@@ -62,6 +62,7 @@ const ORDER_TYPE_MARKET: u8 = 0;
 const ORDER_TYPE_LIMIT: u8 = 1;
 const ORDER_TYPE_STOP: u8 = 2;
 const ORDER_TYPE_STOP_LIMIT: u8 = 3;
+const ORDER_TYPE_LIMIT_POST_ONLY: u8 = 4;
 
 // --- RejectReason tags ---
 const REJECT_NO_LIQUIDITY: u8 = 0;
@@ -77,6 +78,7 @@ const REJECT_TRADING_HALTED: u8 = 9;
 const REJECT_OUTSIDE_PRICE_BAND: u8 = 10;
 const REJECT_UNKNOWN_ORDER: u8 = 11;
 const REJECT_PRICE_WOULD_CROSS: u8 = 12;
+const REJECT_POST_ONLY_WOULD_CROSS: u8 = 13;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -552,8 +554,12 @@ fn encode_order(order: &Order, buf: &mut [u8]) -> usize {
             buf[pos] = ORDER_TYPE_MARKET;
             pos += 1;
         }
-        OrderType::Limit { price } => {
-            buf[pos] = ORDER_TYPE_LIMIT;
+        OrderType::Limit { price, post_only } => {
+            buf[pos] = if post_only {
+                ORDER_TYPE_LIMIT_POST_ONLY
+            } else {
+                ORDER_TYPE_LIMIT
+            };
             pos += 1;
             le::put_u64(&mut buf[pos..], price.get());
             pos += 8;
@@ -606,7 +612,7 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
 
     let order_type = match order_type_tag {
         ORDER_TYPE_MARKET => OrderType::Market,
-        ORDER_TYPE_LIMIT => {
+        ORDER_TYPE_LIMIT | ORDER_TYPE_LIMIT_POST_ONLY => {
             if buf.len() < pos + 8 {
                 return Err(ProtocolError::Truncated);
             }
@@ -615,6 +621,7 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
             pos += 8;
             OrderType::Limit {
                 price: Price(price),
+                post_only: order_type_tag == ORDER_TYPE_LIMIT_POST_ONLY,
             }
         }
         ORDER_TYPE_STOP => {
@@ -929,6 +936,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::OutsidePriceBand => REJECT_OUTSIDE_PRICE_BAND,
         RejectReason::UnknownOrder => REJECT_UNKNOWN_ORDER,
         RejectReason::PriceWouldCross => REJECT_PRICE_WOULD_CROSS,
+        RejectReason::PostOnlyWouldCross => REJECT_POST_ONLY_WOULD_CROSS,
     }
 }
 
@@ -947,6 +955,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_OUTSIDE_PRICE_BAND => Ok(RejectReason::OutsidePriceBand),
         REJECT_UNKNOWN_ORDER => Ok(RejectReason::UnknownOrder),
         REJECT_PRICE_WOULD_CROSS => Ok(RejectReason::PriceWouldCross),
+        REJECT_POST_ONLY_WOULD_CROSS => Ok(RejectReason::PostOnlyWouldCross),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -970,6 +979,7 @@ mod tests {
                     side: Side::Buy,
                     order_type: OrderType::Limit {
                         price: Price(nz(5000)),
+                        post_only: false,
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
@@ -1195,6 +1205,11 @@ mod tests {
                 order_id: OrderId(17),
                 account: AccountId(10),
                 reason: RejectReason::PriceWouldCross,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(18),
+                account: AccountId(10),
+                reason: RejectReason::PostOnlyWouldCross,
             }),
             ResponseKind::Report(ExecutionReport::Replaced {
                 order_id: OrderId(42),

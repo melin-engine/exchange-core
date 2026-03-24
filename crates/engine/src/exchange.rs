@@ -371,7 +371,7 @@ impl Exchange {
         // trading halt flag, or implement automatic volatility halts
         // (Phase 3 of the circuit breaker plan).
         let limit_price = match order.order_type {
-            OrderType::Limit { price } => Some(price),
+            OrderType::Limit { price, .. } => Some(price),
             OrderType::StopLimit { limit_price, .. } => Some(limit_price),
             OrderType::Market | OrderType::Stop { .. } => None,
         };
@@ -415,7 +415,7 @@ impl Exchange {
             // Market and Stop orders have no submission-time price.
             // StopLimit uses limit_price (worst-case resting price).
             let limit_price = match order.order_type {
-                OrderType::Limit { price } => Some(price),
+                OrderType::Limit { price, .. } => Some(price),
                 OrderType::StopLimit { limit_price, .. } => Some(limit_price),
                 OrderType::Market | OrderType::Stop { .. } => None,
             };
@@ -880,7 +880,10 @@ mod tests {
             id: OrderId(id),
             account,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
@@ -1192,7 +1195,10 @@ mod tests {
             id: OrderId(id),
             account,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: tif,
             quantity: qty(q),
             stp,
@@ -5101,5 +5107,226 @@ mod tests {
         // Seller (taker): received cost - taker_fee = 10_000 - 20 = 9_980.
         assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 9_980);
         assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 90);
+    }
+
+    // -- Post-only tests --
+
+    fn post_only_order(id: u64, account: AccountId, side: Side, p: u64, q: u64) -> Order {
+        Order {
+            id: OrderId(id),
+            account,
+            side,
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: true,
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
+        }
+    }
+
+    #[test]
+    fn post_only_rests_on_empty_book() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            post_only_order(1, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+            "post-only should rest on empty book"
+        );
+    }
+
+    #[test]
+    fn post_only_rests_when_no_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1100.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 — does not cross ask at 1100.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+            "post-only buy below best ask should rest"
+        );
+    }
+
+    #[test]
+    fn post_only_rejected_when_would_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 — would cross the ask.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::PostOnlyWouldCross,
+                    ..
+                }
+            )),
+            "post-only buy at ask should be rejected"
+        );
+    }
+
+    #[test]
+    fn post_only_rejected_releases_reservation() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 — rejected.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        // Balance should be fully restored (no funds locked).
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 50_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn post_only_sell_rejected_when_would_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting bid at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only sell at 1000 — would cross the bid.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_B, Side::Sell, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::PostOnlyWouldCross,
+                    ..
+                }
+            )),
+            "post-only sell at bid should be rejected"
+        );
+    }
+
+    #[test]
+    fn post_only_rejected_still_consumes_order_id() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 with order_id=2 — rejected.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Resubmitting order_id=2 should be rejected as duplicate.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_A, Side::Buy, 900, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::DuplicateOrderId,
+                    ..
+                }
+            )),
+            "rejected post-only should still consume the order ID"
+        );
     }
 }

@@ -159,7 +159,9 @@ pub enum OrderType {
     /// Execute immediately at the best available price.
     Market,
     /// Execute at the specified price or better.
-    Limit { price: Price },
+    /// When `post_only` is true, the order is rejected if it would
+    /// immediately match (cross the spread) — guarantees maker-only execution.
+    Limit { price: Price, post_only: bool },
     /// Becomes a market order when the last trade price reaches the trigger.
     /// Stop buy triggers when price >= trigger; stop sell when price <= trigger.
     Stop { trigger_price: Price },
@@ -298,6 +300,8 @@ pub enum RejectReason {
     /// Cancel-replace new price would cross the opposite best price.
     /// Cancel and submit a new order to aggress.
     PriceWouldCross,
+    /// Post-only order would immediately match against resting liquidity.
+    PostOnlyWouldCross,
 }
 
 #[cfg(test)]

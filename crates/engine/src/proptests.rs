@@ -152,6 +152,7 @@ enum ExchangeAction {
         quantity: Quantity,
         tif: TimeInForce,
         stp: SelfTradeProtection,
+        post_only: bool,
     },
     Market {
         account: AccountId,
@@ -194,9 +195,9 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
             .prop_map(|(account, currency, amount)| ExchangeAction::Deposit {
                 account, currency, amount,
             }),
-        4 => (arb_account(), arb_side(), arb_price(), arb_quantity(), arb_tif(), arb_stp())
-            .prop_map(|(account, side, price, quantity, tif, stp)| ExchangeAction::Limit {
-                account, side, price, quantity, tif, stp,
+        4 => (arb_account(), arb_side(), arb_price(), arb_quantity(), arb_tif(), arb_stp(), proptest::bool::ANY)
+            .prop_map(|(account, side, price, quantity, tif, stp, post_only)| ExchangeAction::Limit {
+                account, side, price, quantity, tif, stp, post_only,
             }),
         2 => (arb_account(), arb_side(), arb_quantity(), arb_stp())
             .prop_map(|(account, side, quantity, stp)| ExchangeAction::Market {
@@ -253,7 +254,10 @@ fn run_book_actions(
                     id,
                     account: ACCT_A,
                     side: *side,
-                    order_type: OrderType::Limit { price: *price },
+                    order_type: OrderType::Limit {
+                        price: *price,
+                        post_only: false,
+                    },
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
@@ -483,6 +487,7 @@ fn run_exchange_actions(
                 quantity,
                 tif,
                 stp,
+                post_only,
             } => {
                 let id = OrderId(next_id);
                 next_id += 1;
@@ -491,7 +496,10 @@ fn run_exchange_actions(
                     id,
                     account: *account,
                     side: *side,
-                    order_type: OrderType::Limit { price: *price },
+                    order_type: OrderType::Limit {
+                        price: *price,
+                        post_only: *post_only,
+                    },
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
@@ -839,7 +847,7 @@ proptest! {
                 id: OrderId(i as u64 + 1),
                 account: ACCT_A,
                 side: Side::Sell,
-                order_type: OrderType::Limit { price: *p },
+                order_type: OrderType::Limit { price: *p, post_only: false },
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
@@ -904,7 +912,7 @@ proptest! {
                 id: OrderId(i as u64 + 1),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Limit { price: *p },
+                order_type: OrderType::Limit { price: *p, post_only: false },
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
@@ -1017,7 +1025,7 @@ proptest! {
             id: OrderId(1),
             account: ACCT_A,
             side: Side::Buy,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1029,7 +1037,7 @@ proptest! {
             id: OrderId(2),
             account: ACCT_A,
             side: Side::Sell,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1056,7 +1064,7 @@ proptest! {
             id: OrderId(1),
             account: ACCT_A,
             side: Side::Buy,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1065,7 +1073,7 @@ proptest! {
             id: OrderId(2),
             account: ACCT_B,
             side: Side::Sell,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,

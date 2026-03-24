@@ -1273,6 +1273,7 @@ mod tests {
             side,
             order_type: OrderType::Limit {
                 price: Price(NonZeroU64::new(price).unwrap()),
+                post_only: false,
             },
             time_in_force: TimeInForce::GTC,
             quantity: Quantity(NonZeroU64::new(qty).unwrap()),

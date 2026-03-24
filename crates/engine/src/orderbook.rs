@@ -570,7 +570,7 @@ impl OrderBook {
         reports: &mut Vec<ExecutionReport>,
     ) {
         match order.order_type {
-            OrderType::Limit { price } => self.execute_limit(order, price, reports),
+            OrderType::Limit { price, .. } => self.execute_limit(order, price, reports),
             OrderType::Market => self.execute_market(order, quote_budget, reports),
             OrderType::Stop { trigger_price } => {
                 self.add_stop(order, trigger_price, None, quote_budget);
@@ -685,6 +685,25 @@ impl OrderBook {
     }
 
     fn execute_limit(&mut self, order: Order, price: Price, reports: &mut Vec<ExecutionReport>) {
+        // Post-only: reject if the order would cross the spread.
+        if let OrderType::Limit {
+            post_only: true, ..
+        } = order.order_type
+        {
+            let would_cross = match order.side {
+                Side::Buy => self.best_ask().is_some_and(|ask| price >= ask),
+                Side::Sell => self.best_bid().is_some_and(|bid| price <= bid),
+            };
+            if would_cross {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: order.id,
+                    account: order.account,
+                    reason: RejectReason::PostOnlyWouldCross,
+                });
+                return;
+            }
+        }
+
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely before doing anything.
@@ -1088,8 +1107,13 @@ impl OrderBook {
                 trigger_price: stop.trigger_price,
             });
 
+            // Triggered stops become regular limit/market orders — never post-only,
+            // since the intent is to execute when the trigger fires.
             let order_type = match stop.limit_price {
-                Some(price) => OrderType::Limit { price },
+                Some(price) => OrderType::Limit {
+                    price,
+                    post_only: false,
+                },
                 None => OrderType::Market,
             };
 
@@ -1106,7 +1130,7 @@ impl OrderBook {
             // Re-enter execute but skip check_triggers to avoid recursion —
             // triggered orders are market/limit, so they won't re-add stops.
             match order.order_type {
-                OrderType::Limit { price } => self.execute_limit(order, price, reports),
+                OrderType::Limit { price, .. } => self.execute_limit(order, price, reports),
                 OrderType::Market => {
                     self.execute_market(order, stop.quote_budget, reports);
                 }
@@ -1193,7 +1217,10 @@ mod tests {
             id: OrderId(id),
             account: TEST_ACCOUNT,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
