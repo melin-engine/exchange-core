@@ -95,10 +95,10 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Position/exposure limits
 - [ ] Order throttling (per-account rate limiting)
 - [x] Bulk account provisioning (`ProvisionAccount` journal event — O(accounts) seeding, ~0.5s for 1M accounts)
-- [x] Sparse account storage (`FxHashMap` for balances, max_order_id, order_counts — memory scales with active accounts). Uses `griddle` for incremental HashMap resizing (no rehash spikes on the hot path). See [docs/account-lifecycle.md](docs/account-lifecycle.md).
+- [x] Sparse account storage (memory scales with active accounts). Uses `astenn` extendible hashing (grows one bucket at a time, no full-table rehash spikes). See [docs/account-lifecycle.md](docs/account-lifecycle.md).
 - [x] Withdraw event (debit funds, auto-evict zero-balance entries)
 - [ ] Custodian permission role (Deposit/Withdraw only — no trading, no admin ops)
-- [ ] Extendible hashing for account lookup tables — replace `griddle` (stuck on hashbrown 0.14) with a custom extendible hash table that grows one bucket at a time with bounded per-operation cost. Eliminates hot-path rehash spikes without depending on an unmaintained crate.
+- [x] Extendible hashing for account lookup tables (`astenn` — custom extendible hash table, grows one bucket at a time with bounded per-operation cost)
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums
