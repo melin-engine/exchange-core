@@ -308,11 +308,7 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 
 ![Latency CDF](docs/plots/latency-cdf.svg)
 
-**Latency stability over time** (p99.99):
-
-![Latency stability — fsync](docs/plots/latency-stability-fsync.svg)
-
-![Latency stability — no persistence](docs/plots/latency-stability-no-persist.svg)
+**Latency stability over time** (p99.99, replication mode):
 
 ![Latency stability — replication](docs/plots/latency-stability-replication.svg)
 
