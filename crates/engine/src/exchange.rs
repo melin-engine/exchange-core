@@ -111,10 +111,11 @@ impl Exchange {
             // instruments × 200 resting orders = 20K entries. 32K slots
             // ≈ 1 MB — fits in L3 cache.
             order_info: FxHashMap::with_capacity_and_hasher(32_768, Default::default()),
-            // Sparse: only accounts that submit orders get entries.
-            // 10K initial capacity ≈ 120 KB — grows on demand.
-            max_order_id: FxHashMap::with_capacity_and_hasher(10_000, Default::default()),
-            order_counts: FxHashMap::with_capacity_and_hasher(10_000, Default::default()),
+            // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
+            // the default benchmark (1M accounts) with no hot-path resizes.
+            // Pages are faulted during prefault() via insert/clear.
+            max_order_id: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
@@ -264,9 +265,23 @@ impl Exchange {
             self.order_info.clear();
         }
 
-        // max_order_id and order_counts are sparse HashMaps — pages are
-        // faulted on first insert (during order submission). No prefault
-        // needed since HashMap resizes are small and incremental.
+        // Fault max_order_id and order_counts pages. with_capacity()
+        // allocated the backing table but didn't write to it — insert
+        // dummy entries and clear to touch every page before the hot path.
+        if self.max_order_id.is_empty() {
+            let cap = self.max_order_id.capacity();
+            for i in 0..cap as u32 {
+                self.max_order_id.insert(AccountId(i), 0);
+            }
+            self.max_order_id.clear();
+        }
+        if self.order_counts.is_empty() {
+            let cap = self.order_counts.capacity();
+            for i in 0..cap as u32 {
+                self.order_counts.insert(AccountId(i), 0);
+            }
+            self.order_counts.clear();
+        }
 
         self.accounts.prefault();
 
