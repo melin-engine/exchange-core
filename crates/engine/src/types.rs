@@ -5,6 +5,19 @@
 
 use std::num::NonZeroU64;
 
+/// HashMap with FxHash and extendible hashing (via `astenn`).
+///
+/// Uses `FxBuildHasher` (fast non-cryptographic hash) with `astenn::HashMap`
+/// which grows one bucket at a time instead of rehashing the entire table.
+/// Each insert that triggers growth only touches entries in the splitting
+/// bucket — bounded O(bucket_size) cost regardless of total table size.
+///
+/// Replaces `rustc_hash::FxHashMap` (hashbrown) which rehashes all entries
+/// at once when load factor is exceeded — causing deterministic latency
+/// spikes on the hot path when account population exceeds pre-allocated
+/// capacity.
+pub type HashMap<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
 /// Instrument/pair identifier.
 ///
 /// Uses a `u32` rather than a string to avoid heap allocation and enable
@@ -159,7 +172,9 @@ pub enum OrderType {
     /// Execute immediately at the best available price.
     Market,
     /// Execute at the specified price or better.
-    Limit { price: Price },
+    /// When `post_only` is true, the order is rejected if it would
+    /// immediately match (cross the spread) — guarantees maker-only execution.
+    Limit { price: Price, post_only: bool },
     /// Becomes a market order when the last trade price reaches the trigger.
     /// Stop buy triggers when price >= trigger; stop sell when price <= trigger.
     Stop { trigger_price: Price },
@@ -298,6 +313,15 @@ pub enum RejectReason {
     /// Cancel-replace new price would cross the opposite best price.
     /// Cancel and submit a new order to aggress.
     PriceWouldCross,
+    /// Post-only order would immediately match against resting liquidity.
+    PostOnlyWouldCross,
+    /// Withdrawal rejected because the account has resting orders.
+    /// Must CancelAll first.
+    HasRestingOrders,
+    /// Duplicate request — a request with this sequence number (or higher)
+    /// was already processed for this authentication key. Prevents
+    /// double-execution on retry after network failure.
+    DuplicateRequest,
 }
 
 #[cfg(test)]

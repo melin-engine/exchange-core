@@ -8,13 +8,12 @@
 //! stays single-threaded. Note: portfolio risk checks then require
 //! cross-shard message passing, adding latency and complexity.
 
-use rustc_hash::FxHashMap;
-
 use crate::account::{AccountManager, OrderInfo, ReservationSlot};
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap,
+    InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side,
+    Symbol,
 };
 
 /// Helper: get an immutable reference to the InstrumentState at `symbol`.
@@ -63,12 +62,22 @@ pub struct Exchange {
     /// Keyed by the pair because different accounts can independently
     /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
     /// access to the reservation slab (eliminating a second HashMap lookup).
-    order_info: FxHashMap<(AccountId, OrderId), OrderInfo>,
+    order_info: HashMap<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
-    /// on crash-recovery retry. Flat Vec indexed by AccountId.0 for true
-    /// O(1) with zero hashing — one access per submit.
-    max_order_id: Vec<u64>,
+    /// on crash-recovery retry. Sparse HashMap: only accounts that have
+    /// submitted orders consume memory. Never evicted — prevents order ID
+    /// replay after account withdrawal.
+    max_order_id: HashMap<AccountId, u64>,
+    /// Per-account count of resting orders (entries in `order_info`).
+    /// Used to reject withdrawals while orders are outstanding.
+    /// Entries are removed when the count reaches zero.
+    order_counts: HashMap<AccountId, u32>,
+    /// Per-key high-water mark for request sequences. Prevents duplicate
+    /// processing on retry after network failure. Keyed by u64 hash of
+    /// the client's Ed25519 public key. Never evicted — key count is
+    /// small (~100 max for any exchange).
+    key_hwm: HashMap<u64, u64>,
     /// Reusable buffer for consumed (account, order) keys from
     /// `process_reports()`. Avoids per-order Vec allocation on the hot path.
     consumed_buf: Vec<(AccountId, OrderId)>,
@@ -82,8 +91,10 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            order_info: FxHashMap::default(),
-            max_order_id: Vec::new(),
+            order_info: HashMap::default(),
+            max_order_id: HashMap::default(),
+            order_counts: HashMap::default(),
+            key_hwm: HashMap::default(),
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -104,9 +115,13 @@ impl Exchange {
             // Global across all instruments. Typical steady-state: 100
             // instruments × 200 resting orders = 20K entries. 32K slots
             // ≈ 1 MB — fits in L3 cache.
-            order_info: FxHashMap::with_capacity_and_hasher(32_768, Default::default()),
-            // 10K accounts × 8 bytes = 80 KB — negligible.
-            max_order_id: vec![0; 10_000],
+            order_info: HashMap::with_capacity_and_hasher(32_768, Default::default()),
+            // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
+            // the default benchmark (1M accounts) with no hot-path resizes.
+            // Pages are faulted during prefault() via insert/clear.
+            max_order_id: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            key_hwm: HashMap::default(),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
@@ -116,17 +131,51 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        order_info: FxHashMap<(AccountId, OrderId), OrderInfo>,
-        max_order_id: Vec<u64>,
+        order_info: HashMap<(AccountId, OrderId), OrderInfo>,
+        max_order_id: HashMap<AccountId, u64>,
+        key_hwm: HashMap<u64, u64>,
     ) -> Self {
+        // Derive order_counts from order_info (count entries per account).
+        let mut order_counts: HashMap<AccountId, u32> =
+            HashMap::with_capacity_and_hasher(order_info.len(), Default::default());
+        for &(account, _) in order_info.keys() {
+            *order_counts.entry(account).or_default() += 1;
+        }
         Self {
             instruments,
             accounts,
             order_info,
             max_order_id,
+            order_counts,
+            key_hwm,
             consumed_buf: Vec::new(),
             presized: false,
         }
+    }
+
+    /// Check per-key request sequence for idempotency dedup.
+    /// Returns true if this is a new request (should be processed).
+    /// Returns false if duplicate (caller should reject with DuplicateRequest).
+    /// Exempt when key_hash == 0 (internal/seed events with no authenticated key).
+    pub fn check_request_seq(&mut self, key_hash: u64, request_seq: u64) -> bool {
+        if key_hash == 0 {
+            return true; // exempt: internal/seed events
+        }
+        let hwm = self.key_hwm.entry(key_hash).or_insert(0);
+        if request_seq <= *hwm {
+            return false; // duplicate
+        }
+        *hwm = request_seq;
+        true
+    }
+
+    /// Snapshot per-key request sequence HWMs for serialization.
+    pub(crate) fn snapshot_key_hwm(&self) -> Vec<(u64, u64)> {
+        self.key_hwm
+            .iter()
+            .filter(|(_, hwm)| **hwm > 0)
+            .map(|(&key, &hwm)| (key, hwm))
+            .collect()
     }
 
     /// Iterate over instrument specs (for snapshot serialization).
@@ -175,9 +224,8 @@ impl Exchange {
     pub(crate) fn snapshot_max_order_id(&self) -> Vec<(AccountId, u64)> {
         self.max_order_id
             .iter()
-            .enumerate()
             .filter(|(_, hwm)| **hwm > 0)
-            .map(|(i, hwm)| (AccountId(i as u32), *hwm))
+            .map(|(&account, &hwm)| (account, hwm))
             .collect()
     }
 
@@ -250,8 +298,23 @@ impl Exchange {
             self.order_info.clear();
         }
 
-        // max_order_id is a flat Vec — pages already faulted by vec![0; N]
-        // in with_capacity(). No prefault needed.
+        // Fault max_order_id and order_counts pages. with_capacity()
+        // allocated the backing table but didn't write to it — insert
+        // dummy entries and clear to touch every page before the hot path.
+        if self.max_order_id.is_empty() {
+            let cap = self.max_order_id.capacity();
+            for i in 0..cap as u32 {
+                self.max_order_id.insert(AccountId(i), 0);
+            }
+            self.max_order_id.clear();
+        }
+        if self.order_counts.is_empty() {
+            let cap = self.order_counts.capacity();
+            for i in 0..cap as u32 {
+                self.order_counts.insert(AccountId(i), 0);
+            }
+            self.order_counts.clear();
+        }
 
         self.accounts.prefault();
 
@@ -331,13 +394,7 @@ impl Exchange {
         // outcome — a replayed InsufficientBalance rejection is harmless,
         // but a replayed fill is not. Clients must use a new OrderId for
         // genuinely new orders, even if the previous one was rejected.
-        // Grow the HWM Vec if this is a new account (admin-seeded accounts
-        // are covered by with_capacity; runtime growth is rare).
-        let acct_idx = order.account.0 as usize;
-        if acct_idx >= self.max_order_id.len() {
-            self.max_order_id.resize(acct_idx + 1, 0);
-        }
-        let hwm = &mut self.max_order_id[acct_idx];
+        let hwm = self.max_order_id.entry(order.account).or_insert(0);
         if order.id.0 <= *hwm {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
@@ -371,7 +428,7 @@ impl Exchange {
         // trading halt flag, or implement automatic volatility halts
         // (Phase 3 of the circuit breaker plan).
         let limit_price = match order.order_type {
-            OrderType::Limit { price } => Some(price),
+            OrderType::Limit { price, .. } => Some(price),
             OrderType::StopLimit { limit_price, .. } => Some(limit_price),
             OrderType::Market | OrderType::Stop { .. } => None,
         };
@@ -415,7 +472,7 @@ impl Exchange {
             // Market and Stop orders have no submission-time price.
             // StopLimit uses limit_price (worst-case resting price).
             let limit_price = match order.order_type {
-                OrderType::Limit { price } => Some(price),
+                OrderType::Limit { price, .. } => Some(price),
                 OrderType::StopLimit { limit_price, .. } => Some(limit_price),
                 OrderType::Market | OrderType::Stop { .. } => None,
             };
@@ -470,6 +527,7 @@ impl Exchange {
                 reservation: slot,
             },
         );
+        *self.order_counts.entry(order.account).or_default() += 1;
 
         let report_start = reports.len();
 
@@ -529,8 +587,14 @@ impl Exchange {
         // Clean up order_info for fully consumed orders (filled, cancelled,
         // or rejected). Without this, order_info leaks entries and triggers
         // increasingly expensive HashMap resizes on the hot path.
-        for &key in &self.consumed_buf {
-            self.order_info.remove(&key);
+        for &(account, order_id) in &self.consumed_buf {
+            self.order_info.remove(&(account, order_id));
+            if let Some(count) = self.order_counts.get_mut(&account) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.order_counts.remove(&account);
+                }
+            }
         }
     }
 
@@ -559,8 +623,14 @@ impl Exchange {
                 &mut self.consumed_buf,
             );
 
-            for &key in &self.consumed_buf {
-                self.order_info.remove(&key);
+            for &(account, order_id) in &self.consumed_buf {
+                self.order_info.remove(&(account, order_id));
+                if let Some(count) = self.order_counts.get_mut(&account) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.order_counts.remove(&account);
+                    }
+                }
             }
         }
     }
@@ -589,9 +659,32 @@ impl Exchange {
             .process_reports(new_reports, &self.order_info, &spec, &mut self.consumed_buf);
 
         // Clean up order_info for cancelled orders.
-        for &key in &self.consumed_buf {
-            self.order_info.remove(&key);
+        for &(account, order_id) in &self.consumed_buf {
+            self.order_info.remove(&(account, order_id));
+            if let Some(count) = self.order_counts.get_mut(&account) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.order_counts.remove(&account);
+                }
+            }
         }
+    }
+
+    /// Withdraw funds from an account. Rejects if the account has resting
+    /// orders (must `CancelAll` first) or insufficient available balance.
+    /// Removes the balance entry if it reaches zero (memory cleanup).
+    pub fn withdraw(
+        &mut self,
+        account: AccountId,
+        currency: CurrencyId,
+        amount: u64,
+    ) -> Result<(), RejectReason> {
+        // Reject withdrawal if the account has resting orders — funds might
+        // be reserved. Caller must CancelAll first.
+        if self.order_counts.get(&account).copied().unwrap_or(0) > 0 {
+            return Err(RejectReason::HasRestingOrders);
+        }
+        self.accounts.withdraw(account, currency, amount)
     }
 
     /// Atomically amend a resting limit order's price and/or quantity.
@@ -880,7 +973,10 @@ mod tests {
             id: OrderId(id),
             account,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
@@ -1192,7 +1288,10 @@ mod tests {
             id: OrderId(id),
             account,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: tif,
             quantity: qty(q),
             stp,
@@ -5101,5 +5200,961 @@ mod tests {
         // Seller (taker): received cost - taker_fee = 10_000 - 20 = 9_980.
         assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 9_980);
         assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 90);
+    }
+
+    // -- Post-only tests --
+
+    fn post_only_order(id: u64, account: AccountId, side: Side, p: u64, q: u64) -> Order {
+        Order {
+            id: OrderId(id),
+            account,
+            side,
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: true,
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
+        }
+    }
+
+    #[test]
+    fn post_only_rests_on_empty_book() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            post_only_order(1, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+            "post-only should rest on empty book"
+        );
+    }
+
+    #[test]
+    fn post_only_rests_when_no_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1100.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 — does not cross ask at 1100.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+            "post-only buy below best ask should rest"
+        );
+    }
+
+    #[test]
+    fn post_only_rejected_when_would_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 — would cross the ask.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::PostOnlyWouldCross,
+                    ..
+                }
+            )),
+            "post-only buy at ask should be rejected"
+        );
+    }
+
+    #[test]
+    fn post_only_rejected_releases_reservation() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 — rejected.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+
+        // Balance should be fully restored (no funds locked).
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 50_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn post_only_sell_rejected_when_would_cross() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting bid at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only sell at 1000 — would cross the bid.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_B, Side::Sell, 1000, 10),
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::PostOnlyWouldCross,
+                    ..
+                }
+            )),
+            "post-only sell at bid should be rejected"
+        );
+    }
+
+    #[test]
+    fn post_only_rejected_still_consumes_order_id() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Resting ask at 1000.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Post-only buy at 1000 with order_id=2 — rejected.
+        exchange.execute(
+            btc,
+            post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Resubmitting order_id=2 should be rejected as duplicate.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_A, Side::Buy, 900, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::DuplicateOrderId,
+                    ..
+                }
+            )),
+            "rejected post-only should still consume the order ID"
+        );
+    }
+
+    // --- Withdraw and account lifecycle ---
+
+    #[test]
+    fn withdraw_reduces_available() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        exchange.withdraw(ACCT_A, USD, 3_000).unwrap();
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 7_000);
+    }
+
+    #[test]
+    fn withdraw_insufficient_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000);
+
+        let err = exchange.withdraw(ACCT_A, USD, 5_000).unwrap_err();
+        assert_eq!(err, RejectReason::InsufficientBalance);
+    }
+
+    #[test]
+    fn withdraw_with_resting_orders_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+
+        // Can't withdraw while orders are resting.
+        let err = exchange.withdraw(ACCT_A, USD, 1_000).unwrap_err();
+        assert_eq!(err, RejectReason::HasRestingOrders);
+    }
+
+    #[test]
+    fn withdraw_after_cancel_all_succeeds() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Cancel all, then withdraw.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        exchange.withdraw(ACCT_A, USD, 10_000).unwrap();
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
+    }
+
+    #[test]
+    fn max_order_id_retained_after_full_withdrawal() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        // Submit and fill an order.
+        let mut reports = Vec::new();
+        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Withdraw everything.
+        exchange
+            .withdraw(
+                ACCT_A,
+                USD,
+                exchange.accounts().balance(ACCT_A, USD).available,
+            )
+            .unwrap();
+        exchange
+            .withdraw(
+                ACCT_A,
+                BTC,
+                exchange.accounts().balance(ACCT_A, BTC).available,
+            )
+            .unwrap();
+
+        // Account has no balances, but HWM is retained.
+        assert!(!exchange.accounts().has_balances(ACCT_A));
+
+        // Re-deposit and try to reuse OrderId 1 — should be rejected.
+        exchange.deposit(ACCT_A, USD, 10_000);
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn order_counts_track_resting_orders() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // Place 3 orders.
+        for i in 1..=3 {
+            exchange.execute(
+                Symbol(1),
+                limit_order(i, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+
+        // All 3 resting — withdraw should fail.
+        assert_eq!(
+            exchange.withdraw(ACCT_A, USD, 1).unwrap_err(),
+            RejectReason::HasRestingOrders
+        );
+
+        // Cancel all — withdraw should succeed.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_zero_after_ioc_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Seller places resting order.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // IOC buy fills immediately — should not leave resting count.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::IOC),
+            &mut reports,
+        );
+
+        // ACCT_A should have no resting orders — withdraw should work.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn withdraw_after_partial_fill_and_cancel() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // ACCT_A places GTC buy for 20 @ 100.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 20, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // ACCT_B fills 10 of 20.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Cancel remaining, then withdraw all.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        let usd_avail = exchange.accounts().balance(ACCT_A, USD).available;
+        exchange.withdraw(ACCT_A, USD, usd_avail).unwrap();
+        let btc_avail = exchange.accounts().balance(ACCT_A, BTC).available;
+        exchange.withdraw(ACCT_A, BTC, btc_avail).unwrap();
+
+        assert!(!exchange.accounts().has_balances(ACCT_A));
+    }
+
+    #[test]
+    fn order_counts_zero_after_fok_no_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // FOK buy on empty book — rejected, no fill.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::FOK),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::FOKCannotFill,
+                ..
+            }
+        ));
+
+        // No resting orders — withdraw should succeed.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_zero_after_fok_full_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Seller rests.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // FOK buy fills entirely.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::FOK),
+            &mut reports,
+        );
+
+        // ACCT_A has no resting orders.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_after_stp_cancel_newest() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelNewest,
+            },
+            &mut reports,
+        );
+
+        // Self-trade: buy crosses the sell. CancelNewest rejects the taker (buy).
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelNewest,
+            },
+            &mut reports,
+        );
+
+        // The maker (sell) still rests. Cancel it, then withdraw should succeed.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_after_stp_cancel_oldest() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelOldest,
+            },
+            &mut reports,
+        );
+
+        // Self-trade: buy crosses. CancelOldest cancels the maker (sell).
+        // The taker buy may rest if GTC.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelOldest,
+            },
+            &mut reports,
+        );
+
+        // Cancel remaining, then withdraw.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    // --- Per-key request sequence dedup tests ---
+
+    #[test]
+    fn duplicate_request_rejected() {
+        let mut exchange = Exchange::new();
+        let key_hash: u64 = 0xDEAD_BEEF;
+
+        // First request with seq=1 should succeed.
+        assert!(exchange.check_request_seq(key_hash, 1));
+        // Same key, same seq=1 should be rejected.
+        assert!(!exchange.check_request_seq(key_hash, 1));
+        // Lower seq should also be rejected.
+        assert!(!exchange.check_request_seq(key_hash, 0));
+    }
+
+    #[test]
+    fn different_keys_overlapping_seqs() {
+        let mut exchange = Exchange::new();
+        let key_a: u64 = 0xAAAA;
+        let key_b: u64 = 0xBBBB;
+
+        // Both keys can use seq=1 independently.
+        assert!(exchange.check_request_seq(key_a, 1));
+        assert!(exchange.check_request_seq(key_b, 1));
+        // key_a advancing to seq=2 doesn't affect key_b.
+        assert!(exchange.check_request_seq(key_a, 2));
+        assert!(!exchange.check_request_seq(key_b, 1)); // still duplicate for key_b
+        assert!(exchange.check_request_seq(key_b, 2));
+    }
+
+    #[test]
+    fn key_hash_zero_exempt_from_dedup() {
+        let mut exchange = Exchange::new();
+
+        // key_hash=0 is exempt (internal/seed events) — always returns true.
+        assert!(exchange.check_request_seq(0, 1));
+        assert!(exchange.check_request_seq(0, 1)); // same seq, still passes
+        assert!(exchange.check_request_seq(0, 0)); // seq=0 also passes
+    }
+
+    #[test]
+    fn key_hwm_snapshot_round_trip() {
+        let mut exchange = Exchange::new();
+        let key_a: u64 = 0x1111;
+        let key_b: u64 = 0x2222;
+
+        exchange.check_request_seq(key_a, 5);
+        exchange.check_request_seq(key_b, 10);
+
+        let snap = exchange.snapshot_key_hwm();
+        assert_eq!(snap.len(), 2);
+
+        // Verify both entries are present (order may vary).
+        let mut sorted = snap.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![(key_a, 5), (key_b, 10)]);
+    }
+
+    #[test]
+    fn request_seq_must_be_strictly_increasing() {
+        let mut exchange = Exchange::new();
+        let key: u64 = 0xABCD;
+
+        // Gap in sequence is fine (3, then 10).
+        assert!(exchange.check_request_seq(key, 3));
+        assert!(exchange.check_request_seq(key, 10));
+        // seq=4..9 are now below HWM (10).
+        assert!(!exchange.check_request_seq(key, 4));
+        assert!(!exchange.check_request_seq(key, 9));
+        assert!(!exchange.check_request_seq(key, 10)); // equal = dup
+        assert!(exchange.check_request_seq(key, 11)); // strictly greater
+    }
+
+    #[test]
+    fn request_seq_zero_on_real_key_is_duplicate_after_any_request() {
+        let mut exchange = Exchange::new();
+        let key: u64 = 0xFF00;
+
+        // First request at seq=1 sets HWM to 1.
+        assert!(exchange.check_request_seq(key, 1));
+        // seq=0 is below HWM (1) — rejected as duplicate.
+        assert!(!exchange.check_request_seq(key, 0));
+    }
+
+    #[test]
+    fn request_seq_u64_max_accepted() {
+        let mut exchange = Exchange::new();
+        let key: u64 = 0x42;
+
+        // u64::MAX should be accepted as a valid seq.
+        assert!(exchange.check_request_seq(key, u64::MAX));
+        // Nothing can be strictly greater than u64::MAX.
+        assert!(!exchange.check_request_seq(key, u64::MAX));
+        assert!(!exchange.check_request_seq(key, u64::MAX - 1));
+    }
+
+    #[test]
+    fn dedup_interleaved_with_orders() {
+        // Verify that per-key dedup and per-account max_order_id are independent.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+
+        let key: u64 = 0xAAAA;
+        let mut reports = Vec::new();
+
+        // Submit order via check_request_seq first (as the pipeline would).
+        assert!(exchange.check_request_seq(key, 1));
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(100),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::default(),
+            },
+            &mut reports,
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. }))
+        );
+
+        // Duplicate per-key seq should be caught before execute.
+        assert!(!exchange.check_request_seq(key, 1));
+
+        // But a new key seq with a duplicate order ID is caught by max_order_id.
+        reports.clear();
+        assert!(exchange.check_request_seq(key, 2));
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(100), // same order ID as above
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::default(),
+            },
+            &mut reports,
+        );
+        assert!(reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        )));
+    }
+
+    // -----------------------------------------------------------------------
+    // Same OrderId, different accounts at same price level
+    //
+    // Two accounts may independently use the same OrderId. When both rest at
+    // the same price level, cancel/replace/stop-cancel must operate on the
+    // correct account's order without disturbing the other.
+    // -----------------------------------------------------------------------
+
+    /// Place OrderId(1) for both ACCT_A and ACCT_B as buy limits at the same
+    /// price. Returns the exchange ready for disambiguation tests.
+    fn setup_same_id_same_price() -> Exchange {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // ACCT_A places OrderId(1) buy @ 100, qty 10.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // ACCT_B places OrderId(1) buy @ 100, qty 5.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Buy, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        exchange
+    }
+
+    #[test]
+    fn cancel_disambiguates_by_account_at_same_price() {
+        let mut exchange = setup_same_id_same_price();
+        let mut reports = Vec::new();
+
+        // Cancel ACCT_B's OrderId(1) — ACCT_A's should survive.
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_B
+        ));
+        reports.clear();
+
+        // ACCT_A's order is still resting — a sell should fill against it.
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        assert!(fill.is_some(), "ACCT_A's order should still be resting and fillable");
+    }
+
+    #[test]
+    fn cancel_replace_same_price_disambiguates_by_account() {
+        let mut exchange = setup_same_id_same_price();
+        let mut reports = Vec::new();
+
+        // Amend ACCT_A's OrderId(1): reduce qty from 10 to 3 (same price).
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(1),
+            price(100),
+            qty(3),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        // Verify the replaced order reports the correct old/new quantities.
+        if let ExecutionReport::Replaced {
+            old_remaining,
+            new_remaining,
+            ..
+        } = &reports[0]
+        {
+            assert_eq!(*old_remaining, qty(10));
+            assert_eq!(*new_remaining, qty(3));
+        }
+        reports.clear();
+
+        // ACCT_B's order should be untouched — cancel it and verify qty 5.
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                remaining_quantity,
+                ..
+            } if account == ACCT_B && remaining_quantity == qty(5)
+        ));
+    }
+
+    #[test]
+    fn cancel_replace_different_price_disambiguates_by_account() {
+        let mut exchange = setup_same_id_same_price();
+        let mut reports = Vec::new();
+
+        // Move ACCT_A's OrderId(1) from price 100 to price 90.
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(1),
+            price(90),
+            qty(10),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        reports.clear();
+
+        // Sell at 100 should only fill ACCT_B's order (still at 100),
+        // not ACCT_A's (now at 90).
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Sell, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        assert_eq!(fills.len(), 1, "should only fill ACCT_B's order at price 100");
+    }
+
+    #[test]
+    fn cancel_stop_disambiguates_by_account() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // Both accounts place a stop buy with OrderId(1), same trigger price.
+        let stop_a = Order {
+            id: OrderId(1),
+            account: ACCT_A,
+            side: Side::Buy,
+            order_type: OrderType::Stop {
+                trigger_price: price(200),
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(10),
+            stp: SelfTradeProtection::Allow,
+        };
+        exchange.execute(Symbol(1), stop_a, &mut reports);
+        reports.clear();
+
+        let stop_b = Order {
+            id: OrderId(1),
+            account: ACCT_B,
+            side: Side::Buy,
+            order_type: OrderType::Stop {
+                trigger_price: price(200),
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(5),
+            stp: SelfTradeProtection::Allow,
+        };
+        exchange.execute(Symbol(1), stop_b, &mut reports);
+        reports.clear();
+
+        // Cancel ACCT_A's stop — ACCT_B's should survive.
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_A
+        ));
+        reports.clear();
+
+        // Verify ACCT_B's stop is still pending: cancel it to confirm it exists.
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_B
+        ));
     }
 }

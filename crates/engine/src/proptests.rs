@@ -152,6 +152,7 @@ enum ExchangeAction {
         quantity: Quantity,
         tif: TimeInForce,
         stp: SelfTradeProtection,
+        post_only: bool,
     },
     Market {
         account: AccountId,
@@ -181,6 +182,10 @@ enum ExchangeAction {
     CancelAll {
         account: AccountId,
     },
+    /// Withdraw all balances for an account (CancelAll first, then drain).
+    WithdrawAll {
+        account: AccountId,
+    },
     SetCircuitBreaker {
         halted: bool,
         lower: Option<Price>,
@@ -194,9 +199,9 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
             .prop_map(|(account, currency, amount)| ExchangeAction::Deposit {
                 account, currency, amount,
             }),
-        4 => (arb_account(), arb_side(), arb_price(), arb_quantity(), arb_tif(), arb_stp())
-            .prop_map(|(account, side, price, quantity, tif, stp)| ExchangeAction::Limit {
-                account, side, price, quantity, tif, stp,
+        4 => (arb_account(), arb_side(), arb_price(), arb_quantity(), arb_tif(), arb_stp(), proptest::bool::ANY)
+            .prop_map(|(account, side, price, quantity, tif, stp, post_only)| ExchangeAction::Limit {
+                account, side, price, quantity, tif, stp, post_only,
             }),
         2 => (arb_account(), arb_side(), arb_quantity(), arb_stp())
             .prop_map(|(account, side, quantity, stp)| ExchangeAction::Market {
@@ -212,6 +217,7 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
             }),
         1 => (0usize..200).prop_map(|target_idx| ExchangeAction::Cancel { target_idx }),
         1 => arb_account().prop_map(|account| ExchangeAction::CancelAll { account }),
+        1 => arb_account().prop_map(|account| ExchangeAction::WithdrawAll { account }),
         1 => (proptest::bool::ANY, proptest::option::of(arb_price()), proptest::option::of(arb_price()))
             .prop_map(|(halted, lower, upper)| ExchangeAction::SetCircuitBreaker {
                 halted, lower, upper,
@@ -253,7 +259,10 @@ fn run_book_actions(
                     id,
                     account: ACCT_A,
                     side: *side,
-                    order_type: OrderType::Limit { price: *price },
+                    order_type: OrderType::Limit {
+                        price: *price,
+                        post_only: false,
+                    },
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
@@ -396,33 +405,34 @@ fn book_total_quantity(book: &OrderBook) -> u64 {
 #[cfg(test)]
 fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_desc: &str) {
     let order_sides = exchange.snapshot_order_sides();
-    let sides_ids: std::collections::HashSet<OrderId> =
-        order_sides.iter().map(|((_acct, id), _)| *id).collect();
+    // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+    let sides_ids: std::collections::HashSet<(AccountId, OrderId)> =
+        order_sides.iter().map(|((acct, id), _)| (*acct, *id)).collect();
 
     let reservations = exchange.snapshot_reservations();
-    let reserved_ids: std::collections::HashSet<OrderId> =
-        reservations.iter().map(|(id, _, _, _)| *id).collect();
+    let reserved_ids: std::collections::HashSet<(AccountId, OrderId)> =
+        reservations.iter().map(|(id, acct, _, _)| (*acct, *id)).collect();
 
-    let mut book_ids = std::collections::HashSet::new();
+    let mut book_ids: std::collections::HashSet<(AccountId, OrderId)> = std::collections::HashSet::new();
     for (_sym, book) in exchange.books() {
         for (_price, level) in book.bids().levels_iter() {
             for order in level {
-                book_ids.insert(order.id());
+                book_ids.insert((order.account(), order.id()));
             }
         }
         for (_price, level) in book.asks().levels_iter() {
             for order in level {
-                book_ids.insert(order.id());
+                book_ids.insert((order.account(), order.id()));
             }
         }
         for (_price, stops) in book.stop_buys() {
             for stop in stops {
-                book_ids.insert(stop.id());
+                book_ids.insert((stop.account(), stop.id()));
             }
         }
         for (_price, stops) in book.stop_sells() {
             for stop in stops {
-                book_ids.insert(stop.id());
+                book_ids.insert((stop.account(), stop.id()));
             }
         }
     }
@@ -450,19 +460,25 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
 }
 
 /// Run a sequence of ExchangeActions and return final exchange state plus all reports.
+/// Also returns total withdrawn amounts per currency (from WithdrawAll actions).
 fn run_exchange_actions(
     actions: &[ExchangeAction],
 ) -> (
     Exchange,
     Vec<Option<(OrderId, AccountId)>>,
     Vec<ExecutionReport>,
+    HashMap<CurrencyId, u128>,
 ) {
     let mut exchange = Exchange::new();
     exchange.add_instrument(btc_usd_spec());
     let mut reports = Vec::new();
     let mut all_reports = Vec::new();
-    let mut next_id = 1u64;
+    // Per-account order ID counters so two accounts can independently use the
+    // same OrderId value — this is realistic (e.g., LOBSTER replay) and tests
+    // that the engine correctly disambiguates by (account, order_id).
+    let mut next_id_per_account: HashMap<AccountId, u64> = HashMap::new();
     let mut action_order_ids: Vec<Option<(OrderId, AccountId)>> = Vec::new();
+    let mut withdrawn: HashMap<CurrencyId, u128> = HashMap::new();
     let sym = Symbol(1);
 
     for action in actions {
@@ -483,15 +499,20 @@ fn run_exchange_actions(
                 quantity,
                 tif,
                 stp,
+                post_only,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
                     account: *account,
                     side: *side,
-                    order_type: OrderType::Limit { price: *price },
+                    order_type: OrderType::Limit {
+                        price: *price,
+                        post_only: *post_only,
+                    },
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
@@ -506,8 +527,9 @@ fn run_exchange_actions(
                 quantity,
                 stp,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -529,8 +551,9 @@ fn run_exchange_actions(
                 quantity,
                 stp,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -556,8 +579,9 @@ fn run_exchange_actions(
                 tif,
                 stp,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -591,6 +615,21 @@ fn run_exchange_actions(
                 all_reports.extend_from_slice(&reports);
                 reports.clear();
             }
+            ExchangeAction::WithdrawAll { account } => {
+                action_order_ids.push(None);
+                // CancelAll first to clear resting orders.
+                exchange.cancel_all(*account, &mut reports);
+                all_reports.extend_from_slice(&reports);
+                reports.clear();
+                // Drain all balances for this account, tracking amounts.
+                for &currency in &[BTC, USD] {
+                    let avail = exchange.accounts().balance(*account, currency).available;
+                    if avail > 0 {
+                        exchange.withdraw(*account, currency, avail).unwrap();
+                        *withdrawn.entry(currency).or_default() += avail as u128;
+                    }
+                }
+            }
             ExchangeAction::SetCircuitBreaker {
                 halted,
                 lower,
@@ -610,7 +649,7 @@ fn run_exchange_actions(
         // Uncomment for debugging reservation/order_sides leaks:
         // assert_exchange_consistent(&exchange, action_idx, &format!("{:?}", action));
     }
-    (exchange, action_order_ids, all_reports)
+    (exchange, action_order_ids, all_reports, withdrawn)
 }
 
 // ===========================================================================
@@ -692,17 +731,18 @@ proptest! {
 
         for (_price, level) in book.bids().levels_iter() {
             for order in level {
-                ids_from_book.insert(order.id());
+                ids_from_book.insert((order.account(), order.id()));
             }
         }
         for (_price, level) in book.asks().levels_iter() {
             for order in level {
-                ids_from_book.insert(order.id());
+                ids_from_book.insert((order.account(), order.id()));
             }
         }
 
-        let ids_from_index: std::collections::HashSet<OrderId> =
-            index.iter().map(|&(id, _, _, _)| id).collect();
+        // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+        let ids_from_index: std::collections::HashSet<(AccountId, OrderId)> =
+            index.iter().map(|&(id, acct, _, _)| (acct, id)).collect();
 
         prop_assert_eq!(
             ids_from_book.len(),
@@ -731,17 +771,17 @@ proptest! {
 
         for (_price, stops) in book.stop_buys() {
             for stop in stops {
-                stop_ids_from_book.insert(stop.id());
+                stop_ids_from_book.insert((stop.account(), stop.id()));
             }
         }
         for (_price, stops) in book.stop_sells() {
             for stop in stops {
-                stop_ids_from_book.insert(stop.id());
+                stop_ids_from_book.insert((stop.account(), stop.id()));
             }
         }
 
-        let stop_ids_from_index: std::collections::HashSet<OrderId> =
-            stop_idx.iter().map(|&(id, _, _, _)| id).collect();
+        let stop_ids_from_index: std::collections::HashSet<(AccountId, OrderId)> =
+            stop_idx.iter().map(|&(id, acct, _, _)| (acct, id)).collect();
 
         prop_assert_eq!(
             stop_ids_from_book,
@@ -759,22 +799,24 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     /// System-wide balance conservation: the sum of (available + reserved) across
-    /// all accounts and currencies only changes via explicit deposits. Orders,
-    /// fills, and cancels transfer value between available/reserved or between
-    /// accounts, but never create or destroy value.
+    /// all accounts and currencies only changes via explicit deposits and
+    /// withdrawals. Orders, fills, and cancels transfer value between
+    /// available/reserved or between accounts, but never create or destroy value.
+    ///
+    ///   system_total == total_deposited - total_withdrawn - total_fees
+    ///
+    /// Since we don't track fees here, we use the weaker invariant:
+    ///   system_total <= total_deposited - total_withdrawn
     #[test]
     fn balance_conservation(actions in arb_exchange_actions()) {
-        let (exchange, _, _) = run_exchange_actions(&actions);
+        let (exchange, _, _, withdrawn) = run_exchange_actions(&actions);
 
         // Track total deposited per currency.
         let mut total_deposited_btc: u128 = 0;
         let mut total_deposited_usd: u128 = 0;
 
         for action in &actions {
-            if let ExchangeAction::Deposit {
-                currency, amount, ..
-            } = action
-            {
+            if let ExchangeAction::Deposit { currency, amount, .. } = action {
                 if *currency == BTC {
                     total_deposited_btc += *amount as u128;
                 } else {
@@ -782,6 +824,9 @@ proptest! {
                 }
             }
         }
+
+        let total_withdrawn_btc = *withdrawn.get(&BTC).unwrap_or(&0);
+        let total_withdrawn_usd = *withdrawn.get(&USD).unwrap_or(&0);
 
         let accounts = exchange.accounts();
         let system_btc: u128 = [ACCT_A, ACCT_B]
@@ -799,18 +844,24 @@ proptest! {
             })
             .sum();
 
+        let net_btc = total_deposited_btc.saturating_sub(total_withdrawn_btc);
+        let net_usd = total_deposited_usd.saturating_sub(total_withdrawn_usd);
+
         // Skip check when deposits would saturate u64 (saturating_add clips
         // individual balances, so the system total diverges from deposited).
+        // Strict equality: no FeeSchedule is set in the proptest, so fees
+        // are always zero. If fees are added to the strategy, track
+        // total_fees and use `system == net - fees` instead.
         if total_deposited_btc <= u64::MAX as u128 && total_deposited_usd <= u64::MAX as u128 {
             prop_assert_eq!(
-                system_btc, total_deposited_btc,
-                "BTC conservation violated: system={} != deposited={}",
-                system_btc, total_deposited_btc
+                system_btc, net_btc,
+                "BTC conservation violated: system={} != net(deposited-withdrawn)={}",
+                system_btc, net_btc
             );
             prop_assert_eq!(
-                system_usd, total_deposited_usd,
-                "USD conservation violated: system={} != deposited={}",
-                system_usd, total_deposited_usd
+                system_usd, net_usd,
+                "USD conservation violated: system={} != net(deposited-withdrawn)={}",
+                system_usd, net_usd
             );
         }
     }
@@ -839,7 +890,7 @@ proptest! {
                 id: OrderId(i as u64 + 1),
                 account: ACCT_A,
                 side: Side::Sell,
-                order_type: OrderType::Limit { price: *p },
+                order_type: OrderType::Limit { price: *p, post_only: false },
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
@@ -904,7 +955,7 @@ proptest! {
                 id: OrderId(i as u64 + 1),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Limit { price: *p },
+                order_type: OrderType::Limit { price: *p, post_only: false },
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
@@ -978,8 +1029,8 @@ proptest! {
             result
         };
 
-        let (exchange1, _, _) = run_exchange_actions(&actions);
-        let (exchange2, _, _) = run_exchange_actions(&actions);
+        let (exchange1, _, _, _) = run_exchange_actions(&actions);
+        let (exchange2, _, _, _) = run_exchange_actions(&actions);
 
         prop_assert_eq!(
             balances_of(&exchange1),
@@ -1017,7 +1068,7 @@ proptest! {
             id: OrderId(1),
             account: ACCT_A,
             side: Side::Buy,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1029,7 +1080,7 @@ proptest! {
             id: OrderId(2),
             account: ACCT_A,
             side: Side::Sell,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1056,7 +1107,7 @@ proptest! {
             id: OrderId(1),
             account: ACCT_A,
             side: Side::Buy,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1065,7 +1116,7 @@ proptest! {
             id: OrderId(2),
             account: ACCT_B,
             side: Side::Sell,
-            order_type: OrderType::Limit { price: p },
+            order_type: OrderType::Limit { price: p, post_only: false },
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
@@ -1096,52 +1147,53 @@ proptest! {
     /// risk (missing reservation).
     #[test]
     fn reservation_matches_book(actions in arb_exchange_actions()) {
-        let (exchange, _, _) = run_exchange_actions(&actions);
+        let (exchange, _, _, _) = run_exchange_actions(&actions);
 
         let reservations = exchange.snapshot_reservations();
-        let reserved_order_ids: std::collections::HashSet<OrderId> =
-            reservations.iter().map(|(id, _, _, _)| *id).collect();
+        // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+        let reserved_order_ids: std::collections::HashSet<(AccountId, OrderId)> =
+            reservations.iter().map(|(id, acct, _, _)| (*acct, *id)).collect();
 
-        // Collect all order IDs on the book (resting + pending stops).
+        // Collect all (account, order_id) pairs on the book (resting + pending stops).
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {
             for (_price, level) in book.bids().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, level) in book.asks().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, stops) in book.stop_buys() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
             for (_price, stops) in book.stop_sells() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
         }
 
         // Every book order must have a reservation.
-        for &id in &book_order_ids {
+        for &(acct, id) in &book_order_ids {
             prop_assert!(
-                reserved_order_ids.contains(&id),
-                "order {} is on the book but has no reservation",
-                id.0
+                reserved_order_ids.contains(&(acct, id)),
+                "order ({:?}, {}) is on the book but has no reservation",
+                acct, id.0
             );
         }
 
         // Every reservation must correspond to a book order.
-        for &id in &reserved_order_ids {
+        for &(acct, id) in &reserved_order_ids {
             prop_assert!(
-                book_order_ids.contains(&id),
-                "reservation exists for order {} but it is not on the book",
-                id.0
+                book_order_ids.contains(&(acct, id)),
+                "reservation exists for ({:?}, {}) but it is not on the book",
+                acct, id.0
             );
         }
     }
@@ -1160,32 +1212,33 @@ proptest! {
     /// to skip balance updates.
     #[test]
     fn order_sides_matches_book(actions in arb_exchange_actions()) {
-        let (exchange, _, _) = run_exchange_actions(&actions);
+        let (exchange, _, _, _) = run_exchange_actions(&actions);
 
         let order_sides = exchange.snapshot_order_sides();
-        let sides_ids: std::collections::HashSet<OrderId> =
-            order_sides.iter().map(|((_acct, id), _)| *id).collect();
+        // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+        let sides_ids: std::collections::HashSet<(AccountId, OrderId)> =
+            order_sides.iter().map(|((acct, id), _)| (*acct, *id)).collect();
 
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {
             for (_price, level) in book.bids().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, level) in book.asks().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, stops) in book.stop_buys() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
             for (_price, stops) in book.stop_sells() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
         }
@@ -1211,10 +1264,10 @@ proptest! {
     /// the STP mode for each order ID and verify this across all reports.
     #[test]
     fn no_self_trades_under_stp(actions in arb_exchange_actions()) {
-        let (_, order_ids, all_reports) = run_exchange_actions(&actions);
+        let (_, order_ids, all_reports, _) = run_exchange_actions(&actions);
 
-        // Build a map from OrderId → STP mode.
-        let mut stp_map: HashMap<OrderId, SelfTradeProtection> = HashMap::new();
+        // Build a map from (AccountId, OrderId) → STP mode.
+        let mut stp_map: HashMap<(AccountId, OrderId), SelfTradeProtection> = HashMap::new();
         let mut id_idx = 0usize;
         for action in &actions {
             match action {
@@ -1222,8 +1275,8 @@ proptest! {
                 | ExchangeAction::Market { stp, .. }
                 | ExchangeAction::Stop { stp, .. }
                 | ExchangeAction::StopLimit { stp, .. } => {
-                    if let Some((id, _account)) = order_ids[id_idx] {
-                        stp_map.insert(id, *stp);
+                    if let Some((id, account)) = order_ids[id_idx] {
+                        stp_map.insert((account, id), *stp);
                     }
                     id_idx += 1;
                 }
@@ -1242,16 +1295,18 @@ proptest! {
                 ..
             } = report
             {
-                prop_assert_ne!(
-                    maker_order_id, taker_order_id,
-                    "fill has maker_order_id == taker_order_id: {:?}",
-                    report
-                );
-
-                // If same account, the taker's STP must have been Allow.
+                // Two different accounts may share the same OrderId, so only
+                // assert inequality when they're the same account.
                 if maker_account == taker_account {
+                    prop_assert_ne!(
+                        maker_order_id, taker_order_id,
+                        "self-fill has maker_order_id == taker_order_id on {:?}: {:?}",
+                        maker_account, report
+                    );
+
+                    // The taker's STP must have been Allow for a self-trade to occur.
                     let taker_stp = stp_map
-                        .get(taker_order_id)
+                        .get(&(*taker_account, *taker_order_id))
                         .copied()
                         .unwrap_or(SelfTradeProtection::Allow);
                     prop_assert_eq!(
@@ -1260,6 +1315,55 @@ proptest! {
                         "self-trade fill between same account {:?} but taker {:?} had STP={:?}",
                         maker_account, taker_order_id, taker_stp
                     );
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 10. Withdrawal invariants
+// ===========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// After any sequence of deposits, orders, cancels, and withdrawals:
+    ///
+    /// 1. No funds are created from thin air: total in system <= total deposited.
+    /// 2. No account has negative available or reserved funds (enforced by u64).
+    /// 3. WithdrawAll followed by no further deposits for that account
+    ///    leaves zero balances.
+    #[test]
+    fn withdrawal_preserves_invariants(actions in arb_exchange_actions()) {
+        let (exchange, _ids, _reports, _withdrawn) = run_exchange_actions(&actions);
+
+        // If the last action for an account is WithdrawAll (no subsequent
+        // deposits), that account must have zero balances.
+        for &account in &[ACCT_A, ACCT_B] {
+            let last_withdraw_idx = actions.iter().rposition(|a| {
+                matches!(a, ExchangeAction::WithdrawAll { account: a } if *a == account)
+            });
+            let last_deposit_idx = actions.iter().rposition(|a| {
+                matches!(a, ExchangeAction::Deposit { account: a, .. } if *a == account)
+            });
+            // If there's a WithdrawAll and no deposit after it:
+            if let Some(w) = last_withdraw_idx {
+                let has_later_deposit = last_deposit_idx.is_some_and(|d| d > w);
+                if !has_later_deposit {
+                    for &currency in &[BTC, USD] {
+                        let bal = exchange.accounts().balance(account, currency);
+                        prop_assert_eq!(
+                            bal.available, 0,
+                            "account {:?} has available {} in {:?} after final WithdrawAll",
+                            account, bal.available, currency
+                        );
+                        prop_assert_eq!(
+                            bal.reserved, 0,
+                            "account {:?} has reserved {} in {:?} after final WithdrawAll",
+                            account, bal.reserved, currency
+                        );
+                    }
                 }
             }
         }

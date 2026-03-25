@@ -1070,6 +1070,7 @@ impl App {
         } else if let Some(p) = f.price {
             OrderType::Limit {
                 price: Price(NonZeroU64::new(p).expect("validated > 0")),
+                post_only: false,
             }
         } else {
             OrderType::Market
@@ -1090,7 +1091,7 @@ impl App {
         let side_str = if f.side() == Side::Buy { "BUY" } else { "SELL" };
         let type_str = match &order_type {
             OrderType::Market => "MARKET".into(),
-            OrderType::Limit { price } => format!("LIMIT @{}", price.0),
+            OrderType::Limit { price, .. } => format!("LIMIT @{}", price.0),
             OrderType::Stop { trigger_price } => format!("STOP trigger @{}", trigger_price.0),
             OrderType::StopLimit {
                 trigger_price,
@@ -1237,6 +1238,9 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::OutsidePriceBand => "outside price band",
                 RejectReason::UnknownOrder => "unknown order",
                 RejectReason::PriceWouldCross => "price would cross spread",
+                RejectReason::PostOnlyWouldCross => "post-only would cross",
+                RejectReason::HasRestingOrders => "has resting orders",
+                RejectReason::DuplicateRequest => "duplicate request",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

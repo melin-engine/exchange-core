@@ -20,9 +20,7 @@
 //! | data           | ...     | var   | Serialized Exchange state          |
 //! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-
-use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, HashMap as StdHashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -56,7 +54,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v5 → v6: added chain_hash for BLAKE3 hash chain continuity across snapshots.
 /// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
 /// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
-const SNAP_VERSION: u16 = 8;
+/// v8 → v9: added per-key request sequence HWMs for admin idempotency.
+const SNAP_VERSION: u16 = 9;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -139,7 +138,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6..=8 => (SNAP_HEADER_SIZE, true),
+        6..=9 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -203,6 +202,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) circuit_breakers: Vec<(Symbol, CircuitBreakerConfig)>,
     /// Per-instrument maker/taker fee schedules.
     pub(crate) fee_schedules: Vec<(Symbol, FeeSchedule)>,
+    /// Per-key request sequence HWMs for admin idempotency (v9+).
+    pub(crate) key_hwm: Vec<(u64, u64)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -340,6 +341,13 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
         le::push_u32(buf, symbol.0);
         le::push_i16(buf, schedule.maker_fee_bps);
         le::push_i16(buf, schedule.taker_fee_bps);
+    }
+
+    // Per-key request sequence HWMs (v9+).
+    le::push_u32(buf, state.key_hwm.len() as u32);
+    for (key_hash, hwm) in &state.key_hwm {
+        le::push_u64(buf, *key_hash);
+        le::push_u64(buf, *hwm);
     }
 }
 
@@ -711,6 +719,26 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Per-key request sequence HWMs (v9+).
+    let key_hwm = if version >= 9 && pos < buf.len() {
+        check(pos, 4)?;
+        let n = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        // Each entry: key_hash(8) + hwm(8) = 16 bytes.
+        validate_count(buf.len() - pos, n, 16)?;
+        let mut hwms = Vec::with_capacity(n);
+        for _ in 0..n {
+            check(pos, 16)?;
+            let key_hash = le::get_u64(&buf[pos..]);
+            let hwm = le::get_u64(&buf[pos + 8..]);
+            hwms.push((key_hash, hwm));
+            pos += 16;
+        }
+        hwms
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -723,6 +751,7 @@ fn decode_exchange_state(
             risk_limits,
             circuit_breakers,
             fee_schedules,
+            key_hwm,
         },
     ))
 }
@@ -1036,6 +1065,7 @@ impl Exchange {
         let risk_limits = self.snapshot_risk_limits();
         let circuit_breakers = self.snapshot_circuit_breakers();
         let fee_schedules = self.snapshot_fee_schedules();
+        let key_hwm = self.snapshot_key_hwm();
 
         ExchangeSnapshot {
             instruments,
@@ -1047,6 +1077,7 @@ impl Exchange {
             risk_limits,
             circuit_breakers,
             fee_schedules,
+            key_hwm,
         }
     }
 
@@ -1055,14 +1086,14 @@ impl Exchange {
         use crate::exchange::InstrumentState;
 
         // Build per-symbol lookup tables from the flat snapshot Vecs.
-        let mut books_map: HashMap<Symbol, OrderBook> = HashMap::new();
+        let mut books_map: StdHashMap<Symbol, OrderBook> = StdHashMap::new();
         for (symbol, book_snap) in state.books {
             books_map.insert(symbol, OrderBook::restore(book_snap));
         }
-        let risk_map: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
-        let cb_map: HashMap<Symbol, CircuitBreakerConfig> =
+        let risk_map: StdHashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
+        let cb_map: StdHashMap<Symbol, CircuitBreakerConfig> =
             state.circuit_breakers.into_iter().collect();
-        let fee_map: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
+        let fee_map: StdHashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
 
         // Assemble consolidated InstrumentState Vec indexed by Symbol.0.
         let max_sym = state
@@ -1090,9 +1121,10 @@ impl Exchange {
 
         // Build order_info by combining saved sides with restored reservation slots.
         // Build a side lookup first, then merge with slot assignments.
-        let side_map: HashMap<(AccountId, OrderId), Side> = state.order_sides.into_iter().collect();
-        let mut order_info: FxHashMap<(AccountId, OrderId), OrderInfo> =
-            FxHashMap::with_capacity_and_hasher(side_map.len(), Default::default());
+        let side_map: StdHashMap<(AccountId, OrderId), Side> =
+            state.order_sides.into_iter().collect();
+        let mut order_info: crate::types::HashMap<(AccountId, OrderId), OrderInfo> =
+            crate::types::HashMap::with_capacity_and_hasher(side_map.len(), Default::default());
         for (key, slot) in slot_assignments {
             if let Some(&side) = side_map.get(&key) {
                 order_info.insert(
@@ -1105,19 +1137,26 @@ impl Exchange {
             }
         }
 
-        // Build flat Vec indexed by AccountId.0.
-        let max_acct = state
-            .max_order_id
-            .iter()
-            .map(|(a, _)| a.0 as usize)
-            .max()
-            .unwrap_or(0);
-        let mut max_order_id = vec![0u64; max_acct + 1];
+        // Build sparse HashMap from snapshot entries.
+        let mut max_order_id = crate::types::HashMap::with_capacity_and_hasher(
+            state.max_order_id.len(),
+            Default::default(),
+        );
         for (account, hwm) in state.max_order_id {
-            max_order_id[account.0 as usize] = hwm;
+            max_order_id.insert(account, hwm);
         }
 
-        Self::from_parts(instruments, accounts, order_info, max_order_id)
+        // Build per-key request sequence HWM map from snapshot entries (v9+).
+        let mut key_hwm: crate::types::HashMap<u64, u64> =
+            crate::types::HashMap::with_capacity_and_hasher(
+                state.key_hwm.len(),
+                Default::default(),
+            );
+        for (key_hash, hwm) in state.key_hwm {
+            key_hwm.insert(key_hash, hwm);
+        }
+
+        Self::from_parts(instruments, accounts, order_info, max_order_id, key_hwm)
     }
 }
 
@@ -1217,13 +1256,13 @@ impl OrderBook {
             btree
         };
 
-        let order_index: FxHashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let order_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
-        let stop_index: FxHashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let stop_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
             .stop_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))
@@ -1277,6 +1316,7 @@ mod tests {
             side,
             order_type: OrderType::Limit {
                 price: price_val(p),
+                post_only: false,
             },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),

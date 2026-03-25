@@ -27,7 +27,7 @@ use crate::journal::event::JournalEvent;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
-use crate::types::ExecutionReport;
+use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -45,8 +45,12 @@ pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// Maximum number of events processed in one journal batch.
-/// Limits the time spent encoding before sync, keeping tail latency bounded.
-const MAX_JOURNAL_BATCH: usize = 1024;
+/// Larger batches amortize the fixed cost of each NVMe FUA write over more
+/// events. FUA cost is roughly constant up to ~128 KiB (one NVMe command),
+/// so 4096 events × ~104 bytes ≈ 416 KiB still fits in a single write.
+/// Under low load, batches are naturally small (drain what's available);
+/// the cap only matters at sustained high throughput.
+const MAX_JOURNAL_BATCH: usize = 4096;
 
 /// Spin-wait idle hint. When `busy_spin` is false (default), falls back to
 /// `sched_yield` after 1000 spins — courteous on shared cores but expensive
@@ -79,6 +83,12 @@ const MAX_MATCHING_BATCH: usize = 32;
 pub struct InputSlot {
     /// Which client connection submitted this command.
     pub connection_id: u64,
+    /// FxHash of the client's Ed25519 public key. Used with `request_seq`
+    /// for per-key idempotency dedup. 0 for seed/internal events.
+    pub key_hash: u64,
+    /// Per-key monotonic request sequence number from the wire protocol.
+    /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
+    pub request_seq: u64,
     /// The journaled event (order submit, cancel, etc.).
     pub event: JournalEvent,
     /// Timestamp when the publisher wrote this slot to the disruptor.
@@ -97,6 +107,8 @@ impl Default for InputSlot {
         // so the default value is never observed.
         Self {
             connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::Deposit {
                 account: crate::types::AccountId(0),
                 currency: crate::types::CurrencyId(0),
@@ -185,6 +197,8 @@ pub struct JournalStage {
     group_commit_delay: Duration,
     /// Maximum events per journal fsync batch. Capped at MAX_JOURNAL_BATCH
     /// (the stack array size). Smaller values reduce tail latency.
+    /// Only read when fsync is enabled (not `no-fsync` feature).
+    #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     max_batch: usize,
     /// Optional replication ring producer. When `Some`, the journal stage
     /// copies encoded batch bytes into a pre-allocated ring slot after each
@@ -358,7 +372,12 @@ impl JournalStage {
                         if matches!(slot.event, JournalEvent::QueryStats) {
                             continue;
                         }
-                        if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
+                        if let Err(e) = self.writer.batch_append_with_ts(
+                            &slot.event,
+                            ts,
+                            slot.key_hash,
+                            slot.request_seq,
+                        ) {
                             panic!("fatal journal encode error: {e}");
                         }
                     }
@@ -442,7 +461,12 @@ impl JournalStage {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
+                    if let Err(e) = self.writer.batch_append_with_ts(
+                        &slot.event,
+                        ts,
+                        slot.key_hash,
+                        slot.request_seq,
+                    ) {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
                 }
@@ -598,7 +622,12 @@ impl JournalStage {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
+                    if let Err(e) = self.writer.batch_append_with_ts(
+                        &slot.event,
+                        ts,
+                        slot.key_hash,
+                        slot.request_seq,
+                    ) {
                         panic!("fatal journal encode error: {e}");
                     }
                 }
@@ -921,7 +950,25 @@ impl MatchingStage {
                 }
 
                 local_events += 1;
-                self.process_event(slot, &mut reports);
+
+                // Per-key request dedup: check if this request's seq is
+                // strictly greater than the HWM for this key. Skip internal
+                // events (key_hash == 0) and QueryStats (already handled above).
+                if !self
+                    .exchange
+                    .check_request_seq(slot.key_hash, slot.request_seq)
+                {
+                    // Duplicate request — produce Rejected response.
+                    // Use OrderId(0) and AccountId(0) as placeholders since
+                    // we don't parse the specific order/account from the slot.
+                    reports.push(ExecutionReport::Rejected {
+                        order_id: OrderId(0),
+                        account: AccountId(0),
+                        reason: RejectReason::DuplicateRequest,
+                    });
+                } else {
+                    self.process_event(slot, &mut reports);
+                }
 
                 #[cfg(feature = "latency-trace")]
                 let exec_end = trace_ts();
@@ -974,7 +1021,20 @@ impl MatchingStage {
                 continue;
             }
             reports.clear();
-            self.process_event(&slot, reports);
+
+            // Per-key request dedup (same as the main run loop).
+            if !self
+                .exchange
+                .check_request_seq(slot.key_hash, slot.request_seq)
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: OrderId(0),
+                    account: AccountId(0),
+                    reason: RejectReason::DuplicateRequest,
+                });
+            } else {
+                self.process_event(&slot, reports);
+            }
 
             #[allow(clippy::let_unit_value)]
             let match_complete_ts = trace_ts();
@@ -1051,6 +1111,13 @@ impl MatchingStage {
             }
             JournalEvent::ProvisionAccount { account, amount } => {
                 self.exchange.provision_account(account, amount);
+            }
+            JournalEvent::Withdraw {
+                account,
+                currency,
+                amount,
+            } => {
+                let _ = self.exchange.withdraw(account, currency, amount);
             }
             JournalEvent::QueryStats => {
                 // Handled inline in the run loop before process_event is called.
@@ -1269,6 +1336,7 @@ mod tests {
             side,
             order_type: OrderType::Limit {
                 price: Price(NonZeroU64::new(price).unwrap()),
+                post_only: false,
             },
             time_in_force: TimeInForce::GTC,
             quantity: Quantity(NonZeroU64::new(qty).unwrap()),
@@ -1295,6 +1363,8 @@ mod tests {
 
         producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
@@ -1307,6 +1377,8 @@ mod tests {
         });
         producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
@@ -1371,6 +1443,8 @@ mod tests {
 
         input_producer.publish(InputSlot {
             connection_id: 42,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -1448,6 +1522,8 @@ mod tests {
         // Submit an order through the pipeline.
         input_producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -1544,6 +1620,8 @@ mod tests {
         // Submit an order through the pipeline.
         input_producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -1597,7 +1675,9 @@ mod tests {
 
         // Verify the replication batch contains valid journal entries with
         // the same sequence numbers as the on-disk journal.
-        let (consumed, seq, _ts, event) = crate::journal::codec::decode(&repl_data).unwrap();
+        let (consumed, seq, _ts, _kh, _rs, event) =
+            crate::journal::codec::decode(&repl_data, crate::journal::codec::FORMAT_VERSION)
+                .unwrap();
         assert!(consumed > 0);
         assert_eq!(
             seq, FIRST_SEQ,

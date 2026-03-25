@@ -57,6 +57,15 @@ pub fn to_event(request: &Request) -> JournalEvent {
             currency,
             amount,
         },
+        Request::Withdraw {
+            account,
+            currency,
+            amount,
+        } => JournalEvent::Withdraw {
+            account,
+            currency,
+            amount,
+        },
         Request::SetRiskLimits { symbol, limits } => JournalEvent::SetRiskLimits { symbol, limits },
         Request::SetCircuitBreaker { symbol, config } => {
             JournalEvent::SetCircuitBreaker { symbol, config }
@@ -114,6 +123,7 @@ mod tests {
                 side: Side::Buy,
                 order_type: OrderType::Limit {
                     price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
                 },
                 quantity: Quantity(NonZeroU64::new(10).unwrap()),
                 time_in_force: TimeInForce::GTC,

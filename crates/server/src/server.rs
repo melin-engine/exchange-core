@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use std::hash::{Hash, Hasher};
+
 use tracing::{debug, error, info, warn};
 
 use melin_engine::journal::JournaledExchange;
@@ -84,7 +86,7 @@ pub struct ServerConfig {
     pub max_connections: u64,
     /// Number of accounts to seed on first startup. Uses the
     /// ProvisionAccount event for O(accounts) seeding (~0.5s for 1M).
-    #[arg(long, default_value_t = 1_000_000)]
+    #[arg(long, default_value_t = 100_000)]
     pub accounts: u32,
     /// Number of instruments to seed on first startup.
     #[arg(long, default_value_t = 100)]
@@ -126,8 +128,8 @@ pub struct ServerConfig {
 
     /// Maximum events per journal fsync batch. Smaller values reduce
     /// tail latency (less work per sync), larger values improve throughput
-    /// (fewer fsyncs). Default: 1024.
-    #[arg(long, default_value_t = 1024)]
+    /// (fewer fsyncs). Default: 4096.
+    #[arg(long, default_value_t = 4096)]
     pub max_journal_batch: usize,
 
     /// Replication heartbeat interval in seconds. The primary sends a
@@ -137,9 +139,9 @@ pub struct ServerConfig {
     pub replication_heartbeat_secs: u64,
 
     /// Number of slots in the replication ring buffer. Must be a power
-    /// of two. Each slot holds up to 128 KiB. More slots = more buffering
-    /// before the journal stage backpressures. Default: 256 (32 MiB).
-    #[arg(long, default_value_t = 256)]
+    /// of two. Each slot holds up to 512 KiB. More slots = more buffering
+    /// before the journal stage backpressures. Default: 64 (32 MiB).
+    #[arg(long, default_value_t = 64)]
     pub replication_ring_size: usize,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
@@ -190,8 +192,15 @@ pub struct ServerConfig {
     pub dpdk_core: usize,
 }
 
+/// Delegates to clap so `#[arg(default_value...)]` is the single source of
+/// truth for every default.  Used by the bench crate for struct-literal
+/// construction with `..ServerConfig::default()`.
 impl Default for ServerConfig {
     fn default() -> Self {
+        // On the dpdk branch we spell out every field so that dpdk-specific
+        // fields (not known to clap on plain builds) get their defaults.
+        // Main uses `Self::parse_from(["melin-server"])` — the values below
+        // mirror those clap defaults plus the dpdk extras.
         Self {
             bind: "127.0.0.1:9876".parse().expect("valid default addr"),
             journal: PathBuf::from("trading.journal"),
@@ -561,9 +570,13 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
+        let seed_start = std::time::Instant::now();
+
         for i in 1..=config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -576,10 +589,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             });
         }
 
+        let instrument_elapsed = seed_start.elapsed();
+
+        let account_start = std::time::Instant::now();
         let mut last_published_seq = 0u64;
         for acct in 1..=config.accounts {
             last_published_seq = producer.publish(InputSlot {
                 connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,
@@ -588,6 +606,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 recv_ts: trace_ts(),
             });
         }
+        let publish_elapsed = account_start.elapsed();
 
         // Wait for all seed events to be fully processed by the entire
         // pipeline before accepting clients. Without this, early client
@@ -599,7 +618,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         // - matching_cursor: matching stage has processed all seeds
         // - replication_cursor: replica has acked all seeds (u64::MAX if
         //   no replica is connected, so the check passes instantly)
+        let drain_start = std::time::Instant::now();
         let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
+
         while journal_cursor
             .get()
             .load(std::sync::atomic::Ordering::Acquire)
@@ -612,10 +633,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         {
             std::hint::spin_loop();
         }
+        let drain_elapsed = drain_start.elapsed();
 
         info!(
             accounts = config.accounts,
             instruments = config.instruments,
+            instrument_ms = instrument_elapsed.as_millis(),
+            publish_ms = publish_elapsed.as_millis(),
+            drain_ms = drain_elapsed.as_millis(),
+            total_ms = seed_start.elapsed().as_millis(),
             "seeded test data through pipeline"
         );
     }
@@ -697,18 +723,27 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         // 2. Read ChallengeResponse (signature + public key)
         // 3. Verify signature and look up key in authorized_keys
         // 4. Send ServerReady on success, AuthFailed on failure
-        let permission = match authenticate_connection(
+        let (permission, public_key_bytes) = match authenticate_connection(
             connection_id,
             addr,
             &mut std_read,
             &mut std_write,
             &authorized_keys,
         ) {
-            Ok(perm) => perm,
+            Ok(pair) => pair,
             Err(e) => {
                 debug!(connection_id = connection_id.0, addr = %addr, error = %e, "auth failed, dropping");
                 continue;
             }
+        };
+
+        // Hash the client's public key for per-key idempotency dedup.
+        // FxHash is fast and non-cryptographic — sufficient for dedup
+        // table keying (the public key itself is already authenticated).
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            public_key_bytes.hash(&mut hasher);
+            hasher.finish()
         };
 
         active_connections.fetch_add(1, Ordering::Relaxed);
@@ -761,6 +796,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             reader: std_read,
             addr,
             permission,
+            key_hash,
         });
     }
 
@@ -1198,14 +1234,14 @@ fn apply_affinity(thread_name: &str, core_id: usize) {
 /// Uses raw `read_exact` instead of `BufReader` to avoid over-reading
 /// bytes that belong to the first post-auth request.
 ///
-/// Returns the authenticated `Permission` on success.
+/// Returns `(Permission, public_key_bytes)` on success.
 fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     connection_id: ConnectionId,
     addr: SocketAddr,
     reader: &mut R,
     writer: &mut W,
     authorized_keys: &AuthorizedKeys,
-) -> Result<Permission, Box<dyn std::error::Error>> {
+) -> Result<(Permission, [u8; 32]), Box<dyn std::error::Error>> {
     use std::io;
 
     use ed25519_dalek::{Verifier, VerifyingKey};
@@ -1243,8 +1279,8 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         .read_exact(&mut frame_buf[..frame_len])
         .map_err(|e| io::Error::other(format!("read auth frame payload: {e}")))?;
 
-    let request = match codec::decode_request(&frame_buf[..frame_len]) {
-        Ok(req) => req,
+    let (_seq, request) = match codec::decode_request(&frame_buf[..frame_len]) {
+        Ok(pair) => pair,
         Err(e) => {
             send_auth_failed(writer);
             return Err(io::Error::other(format!("decode ChallengeResponse: {e}")).into());
@@ -1299,7 +1335,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         "authenticated"
     );
 
-    Ok(permission)
+    Ok((permission, public_key_bytes))
 }
 
 /// Set a read timeout on a raw fd via `setsockopt(SO_RCVTIMEO)`.
@@ -1447,6 +1483,7 @@ mod tests {
                 &mut writer,
                 &keys,
             )
+            .map(|(perm, _pk)| perm)
             .map_err(|e| e.to_string())
         })
     }
@@ -1472,7 +1509,7 @@ mod tests {
             public_key: key.verifying_key().to_bytes(),
         };
         let mut buf = [0u8; 256];
-        let written = codec::encode_request(&request, &mut buf).unwrap();
+        let written = codec::encode_request(&request, 0, &mut buf).unwrap();
         stream.write_all(&buf[..written]).unwrap();
         stream.flush().unwrap();
     }
@@ -1499,7 +1536,7 @@ mod tests {
             public_key: key.verifying_key().to_bytes(),
         };
         let mut buf = [0u8; 256];
-        let written = codec::encode_request(&request, &mut buf).unwrap();
+        let written = codec::encode_request(&request, 0, &mut buf).unwrap();
         stream.write_all(&buf[..written]).unwrap();
         stream.flush().unwrap();
     }
@@ -1591,7 +1628,7 @@ mod tests {
 
         // Send a Heartbeat instead of ChallengeResponse.
         let mut buf = [0u8; 16];
-        let written = codec::encode_request(&Request::Heartbeat, &mut buf).unwrap();
+        let written = codec::encode_request(&Request::Heartbeat, 0, &mut buf).unwrap();
         s2.write_all(&buf[..written]).unwrap();
         s2.flush().unwrap();
 

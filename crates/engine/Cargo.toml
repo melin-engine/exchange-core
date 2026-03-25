@@ -39,8 +39,9 @@ io-uring = { version = "0.7", optional = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 melin-disruptor = { path = "../disruptor" }
+astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 
 [dev-dependencies]
-bolero = "0.11"
+bolero = "0.13"
 proptest = "1"
 tempfile = "3"

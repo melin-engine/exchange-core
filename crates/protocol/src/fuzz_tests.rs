@@ -31,14 +31,16 @@ fn fuzz_wire_request_roundtrip() {
         };
 
         let mut buf = [0u8; 256];
-        let written = match codec::encode_request(&request, &mut buf) {
+        let seq = 42u64;
+        let written = match codec::encode_request(&request, seq, &mut buf) {
             Ok(n) => n,
             Err(_) => return,
         };
 
         // decode_request expects payload after the 4-byte length prefix.
-        let decoded = codec::decode_request(&buf[4..written])
+        let (decoded_seq, decoded) = codec::decode_request(&buf[4..written])
             .expect("decode of freshly encoded request must succeed");
+        assert_eq!(decoded_seq, seq, "seq round-trip mismatch");
         assert_eq!(decoded, request, "request round-trip mismatch");
     });
 }
@@ -133,6 +135,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
                 0 => OrderType::Market,
                 1 => OrderType::Limit {
                     price: Price(nz64(data, 29)?),
+                    post_only: false,
                 },
                 2 => OrderType::Stop {
                     trigger_price: Price(nz64(data, 29)?),

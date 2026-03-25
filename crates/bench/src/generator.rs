@@ -99,6 +99,12 @@ pub struct GeneratorConfig {
     /// limit price, simulating stop-loss protection.
     /// Default: 0.03 (3% of submits).
     pub stop_order_ratio: f64,
+    /// Probability that a non-aggressive limit GTC order is post-only.
+    /// Post-only orders are rejected if they would cross the spread,
+    /// guaranteeing maker-only execution. Only applied to non-aggressive
+    /// GTC limits since post-only + IOC/FOK is pointless.
+    /// Default: 0.05 (5% of eligible limits).
+    pub post_only_ratio: f64,
     /// Conditional probability of a cancel-replace amendment when live orders
     /// exist. In real markets, market makers rapidly amend resting quotes —
     /// cancel-replace is more common than outright cancel.
@@ -130,6 +136,7 @@ impl Default for GeneratorConfig {
             ioc_ratio: 0.05,
             fok_ratio: 0.02,
             stop_order_ratio: 0.03,
+            post_only_ratio: 0.05,
             cancel_replace_ratio: 0.30,
             start_order_id: 1,
             seed: 42,
@@ -248,7 +255,9 @@ impl OrderFlowGenerator {
     /// Generates all events upfront so RNG overhead doesn't pollute timing.
     pub fn generate_frames(&mut self, count: usize) -> Vec<Vec<u8>> {
         let mut frames = Vec::with_capacity(count);
-        let mut encode_buf = [0u8; 128];
+        let mut encode_buf = [0u8; 136];
+        // Per-connection monotonic sequence for idempotency dedup.
+        let mut seq: u64 = 0;
 
         for _ in 0..count {
             let event = self.next_event();
@@ -278,7 +287,8 @@ impl OrderFlowGenerator {
                 },
             };
 
-            let written = codec::encode_request(&request, &mut encode_buf).expect("encode");
+            seq += 1;
+            let written = codec::encode_request(&request, seq, &mut encode_buf).expect("encode");
             frames.push(encode_buf[4..written].to_vec());
         }
 
@@ -345,7 +355,14 @@ impl OrderFlowGenerator {
             } else {
                 TimeInForce::GTC
             };
-            (OrderType::Limit { price }, tif)
+            // Post-only is only generated for GTC limits — IOC/FOK post-only
+            // is pointless (the order would just rest or get rejected).
+            // Aggressive post-only orders will be rejected by the engine,
+            // which is realistic (clients sometimes submit post-only orders
+            // that race against incoming fills and get rejected).
+            let post_only = tif == TimeInForce::GTC
+                && self.unit_dist.sample(&mut self.rng) < self.config.post_only_ratio;
+            (OrderType::Limit { price, post_only }, tif)
         };
 
         // Track orders that rest on the book (GTC limits and pending stops)
@@ -570,7 +587,7 @@ mod tests {
 
         for _ in 0..10_000 {
             if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
-                let OrderType::Limit { price } = order.order_type else {
+                let OrderType::Limit { price, .. } = order.order_type else {
                     continue;
                 };
                 let price = price.get();
@@ -598,6 +615,8 @@ mod tests {
         for frame in &frames {
             let result = codec::decode_request(frame);
             assert!(result.is_ok(), "frame should decode: {result:?}");
+            let (seq, _request) = result.unwrap();
+            assert!(seq > 0, "frame seq should be > 0");
         }
     }
 

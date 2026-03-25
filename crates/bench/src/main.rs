@@ -235,7 +235,7 @@ struct BenchArgs {
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
     /// Number of trading accounts.
-    #[arg(long, default_value_t = 1_000_000)]
+    #[arg(long, default_value_t = 10_000)]
     accounts: u32,
     /// Number of instruments.
     #[arg(long, default_value_t = 100)]
@@ -570,8 +570,6 @@ fn run_engine_bench(
         json_path,
         &series,
     );
-    #[cfg(feature = "chart")]
-    show_chart(&series, &histogram);
 }
 
 // ===========================================================================
@@ -667,6 +665,8 @@ fn run_pipeline_bench(
                 let ts = Instant::now();
                 producer.publish(InputSlot {
                     connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
                     event: JournalEvent::SubmitOrder {
                         symbol: Symbol(1),
                         order: Order {
@@ -675,6 +675,7 @@ fn run_pipeline_bench(
                             side,
                             order_type: OrderType::Limit {
                                 price: Price(nz(100)),
+                                post_only: false,
                             },
                             time_in_force: TimeInForce::GTC,
                             quantity: Quantity(nz(1)),
@@ -999,7 +1000,7 @@ fn auth_handshake(
         public_key: key.verifying_key().to_bytes(),
     };
     let mut buf = [0u8; 256];
-    let written = codec::encode_request(&request, &mut buf).expect("encode ChallengeResponse");
+    let written = codec::encode_request(&request, 0, &mut buf).expect("encode ChallengeResponse");
     std::io::Write::write_all(stream, &buf[..written]).expect("send ChallengeResponse");
     std::io::Write::flush(stream).expect("flush ChallengeResponse");
 
@@ -1038,7 +1039,7 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 #[cfg(not(feature = "dpdk"))]
 fn heartbeat_frame() -> [u8; 5] {
     let mut buf = [0u8; 128];
-    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, &mut buf)
+    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, 0, &mut buf)
         .expect("encode heartbeat");
     let mut frame = [0u8; 5];
     frame.copy_from_slice(&buf[..n]);
@@ -1057,7 +1058,6 @@ fn keepalive_established(write_fds: &[RawFd], heartbeat: &[u8; 5]) {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Per-connection state
 // ---------------------------------------------------------------------------
@@ -1217,6 +1217,7 @@ fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 fn run_epoll_loop<W: Write>(
     mut connections: Vec<BenchConnection<W>>,
     window: usize,
+    warmup: usize,
     progress: Arc<AtomicU64>,
 ) -> (Histogram<u64>, Option<Instant>) {
     let num_conns = connections.len();
@@ -1347,7 +1348,7 @@ fn run_roundtrip_inner<R, W, F>(
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
-    F: Fn() -> (R, W),
+    F: Fn() -> (R, W) + Sync,
 {
     // io_uring path: single-threaded event loop using io_uring RECV/SEND.
     #[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
@@ -1413,71 +1414,74 @@ fn run_epoll_roundtrip<R, W, F>(
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
-    F: Fn() -> (R, W),
+    F: Fn() -> (R, W) + Sync,
 {
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
 
-    // Create all connections upfront, then distribute round-robin to threads.
-    let num_threads = bench_threads.min(num_clients);
-    let mut thread_conns: Vec<Vec<BenchConnection<W>>> =
-        (0..num_threads).map(|_| Vec::new()).collect();
-    let heartbeat = heartbeat_frame();
-    // Track write fds for keepalive heartbeats during setup.
-    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
-    let mut last_keepalive = Instant::now();
-
-    for client_id in 0..num_clients {
-        // Send heartbeats on all established connections every 10s to
-        // prevent the server's 30s idle timeout from dropping them.
-        if last_keepalive.elapsed() >= Duration::from_secs(10) {
-            keepalive_established(&write_fds, &heartbeat);
-            last_keepalive = Instant::now();
-        }
-
-        let (mut read_stream, write_stream) = connect();
-
-        // Challenge-response auth while the socket is still blocking.
-        auth_handshake(&mut read_stream, key);
-
-        let fd = read_stream.as_raw_fd();
-        let write_fd = write_stream.as_raw_fd();
-        write_fds.push(write_fd);
-        let writer = BlockingFrameWriter::new(write_stream);
-
-        // Set non-blocking on the read fd.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        let client_pairs = if client_id == num_clients - 1 {
-            pairs_per_client + remainder
-        } else {
-            pairs_per_client
-        };
-        let total_orders = warmup + client_pairs * 2;
-
-        let order_id_offset: u64 = (0..client_id)
-            .map(|c| {
-                let p = if c == num_clients - 1 {
-                    pairs_per_client + remainder
-                } else {
-                    pairs_per_client
-                };
-                (warmup + p * 2) as u64
-            })
-            .sum();
-
-        let frames = {
+    // Pre-generate frames for all clients in parallel. This is CPU-bound
+    // (RNG + encode) and dominates setup time.
+    use rayon::prelude::*;
+    let all_frames: Vec<_> = (0..num_clients)
+        .into_par_iter()
+        .map(|client_id| {
+            let client_pairs = if client_id == num_clients - 1 {
+                pairs_per_client + remainder
+            } else {
+                pairs_per_client
+            };
+            let total_orders = warmup + client_pairs * 2;
+            let order_id_offset: u64 = (0..client_id)
+                .map(|c| {
+                    let p = if c == num_clients - 1 {
+                        pairs_per_client + remainder
+                    } else {
+                        pairs_per_client
+                    };
+                    (warmup + p * 2) as u64
+                })
+                .sum();
             let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
-            flow.generate_frames(total_orders)
-        };
+            (flow.generate_frames(total_orders), total_orders)
+        })
+        .collect();
+    eprintln!("  frames generated for all {num_clients} clients");
+
+    // Connect and auth all clients in parallel (reuses the rayon pool).
+    let setup_start = Instant::now();
+    let connected: Vec<(R, W)> = (0..num_clients)
+        .into_par_iter()
+        .map(|_| {
+            let (mut read_stream, write_stream) = connect();
+            auth_handshake(&mut read_stream, key);
+            (read_stream, write_stream)
+        })
+        .collect();
+    eprintln!(
+        "  all {num_clients} clients connected ({:.1}s)",
+        setup_start.elapsed().as_secs_f64(),
+    );
+
+    // Attach pre-generated frames and distribute round-robin across bench threads.
+    let num_threads = bench_threads.min(num_clients);
+    let mut thread_conns: Vec<Vec<BenchConnection<W>>> =
+        (0..num_threads).map(|_| Vec::new()).collect();
+
+    for (client_id, ((read_stream, write_stream), (frames, total_orders))) in
+        connected.into_iter().zip(all_frames).enumerate()
+    {
+        let fd = read_stream.as_raw_fd();
+        let writer = BlockingFrameWriter::new(write_stream);
+
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
 
         let conn = BenchConnection {
             writer,
@@ -1497,7 +1501,6 @@ fn run_epoll_roundtrip<R, W, F>(
             done: false,
         };
 
-        // Round-robin distribution across threads.
         thread_conns[client_id % num_threads].push(conn);
     }
 
@@ -1528,7 +1531,7 @@ fn run_epoll_roundtrip<R, W, F>(
                     eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
                 }
                 barrier.wait();
-                run_epoll_loop(conns, window, thread_progress)
+                run_epoll_loop(conns, window, warmup, thread_progress)
             })
             .expect("spawn bench thread");
         handles.push(handle);
@@ -1662,69 +1665,69 @@ fn run_uring_roundtrip<R, W, F>(
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
-    F: Fn() -> (R, W),
+    F: Fn() -> (R, W) + Sync,
 {
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
 
-    let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
-    let setup_start = Instant::now();
-    let heartbeat = heartbeat_frame();
-    // Track write fds for keepalive heartbeats during setup.
-    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
-    let mut last_keepalive = Instant::now();
-
-    for client_id in 0..num_clients {
-        // Send heartbeats on all established connections every 10s to
-        // prevent the server's 30s idle timeout from dropping them.
-        if last_keepalive.elapsed() >= Duration::from_secs(10) {
-            keepalive_established(&write_fds, &heartbeat);
-            last_keepalive = Instant::now();
-        }
-
-        let (mut read_stream, write_stream) = connect();
-
-        // Challenge-response auth while the socket is still blocking.
-        auth_handshake(&mut read_stream, key);
-
-        let read_fd = read_stream.as_raw_fd();
-        let write_fd = write_stream.as_raw_fd();
-        write_fds.push(write_fd);
-
-        let client_pairs = if client_id == num_clients - 1 {
-            pairs_per_client + remainder
-        } else {
-            pairs_per_client
-        };
-        let total_orders = warmup + client_pairs * 2;
-
-        let order_id_offset: u64 = (0..client_id)
-            .map(|c| {
-                let p = if c == num_clients - 1 {
-                    pairs_per_client + remainder
-                } else {
-                    pairs_per_client
-                };
-                (warmup + p * 2) as u64
-            })
-            .sum();
-
-        let frames = {
+    // Pre-generate frames for all clients in parallel.
+    use rayon::prelude::*;
+    let all_frames: Vec<_> = (0..num_clients)
+        .into_par_iter()
+        .map(|client_id| {
+            let client_pairs = if client_id == num_clients - 1 {
+                pairs_per_client + remainder
+            } else {
+                pairs_per_client
+            };
+            let total_orders = warmup + client_pairs * 2;
+            let order_id_offset: u64 = (0..client_id)
+                .map(|c| {
+                    let p = if c == num_clients - 1 {
+                        pairs_per_client + remainder
+                    } else {
+                        pairs_per_client
+                    };
+                    (warmup + p * 2) as u64
+                })
+                .sum();
             let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
-            flow.generate_frames(total_orders)
-        };
+            (flow.generate_frames(total_orders), total_orders)
+        })
+        .collect();
+    eprintln!("  frames generated for all {num_clients} clients");
 
-        eprintln!(
-            "  client {}/{num_clients}: connected, {total_orders} frames generated",
-            client_id + 1,
-        );
+    // Connect and auth all clients in parallel (reuses the rayon pool).
+    let setup_start = Instant::now();
+    let connected: Vec<(R, W)> = (0..num_clients)
+        .into_par_iter()
+        .map(|_| {
+            let (mut read_stream, write_stream) = connect();
+            auth_handshake(&mut read_stream, key);
+            (read_stream, write_stream)
+        })
+        .collect();
+    eprintln!(
+        "  all {num_clients} clients connected ({:.1}s)",
+        setup_start.elapsed().as_secs_f64(),
+    );
 
-        connections.push(UringBenchConn {
+    let num_threads = bench_threads.min(num_clients);
+
+    // Attach pre-generated frames and distribute round-robin across bench threads.
+    let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
+    for (i, ((read_stream, write_stream), (frames, total_orders))) in
+        connected.into_iter().zip(all_frames).enumerate()
+    {
+        let read_fd = read_stream.as_raw_fd();
+        let write_fd = write_stream.as_raw_fd();
+
+        thread_conns[i % num_threads].push(UringBenchConn {
             read_fd,
             write_fd,
             _read_owner: Box::new(read_stream),
@@ -1741,19 +1744,6 @@ fn run_uring_roundtrip<R, W, F>(
             total_orders,
             done: false,
         });
-    }
-
-    eprintln!(
-        "  all {num_clients} clients ready ({:.1}s setup)",
-        setup_start.elapsed().as_secs_f64(),
-    );
-
-    let num_threads = bench_threads.min(num_clients);
-
-    // Distribute connections round-robin across bench threads.
-    let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
-    for (i, conn) in connections.into_iter().enumerate() {
-        thread_conns[i % num_threads].push(conn);
     }
 
     // Total measured orders (excluding warmup) for progress reporting.
@@ -1854,9 +1844,6 @@ fn run_uring_roundtrip<R, W, F>(
     println!();
     shutdown.store(true, Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(200));
-
-    #[cfg(feature = "chart")]
-    show_chart(&_series, &histogram);
 }
 
 /// Size of per-connection recv buffer for io_uring RECV.
@@ -2154,7 +2141,7 @@ pub(crate) fn print_results(
     wall: Duration,
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
-    series: &TimeSeries,
+    series: &[LatencySample],
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
@@ -2263,194 +2250,6 @@ pub(crate) fn print_results(
         file.write_all(b"\n").expect("write newline");
         eprintln!("Results written to {}", path.display());
     }
-}
-
-/// Display a latency percentile chart using ratatui, then wait for a keypress.
-#[cfg(feature = "chart")]
-fn show_chart(series: &TimeSeries, histogram: &Histogram<u64>) {
-    use std::io::stdout;
-
-    use crossterm::event::{self, Event, KeyCode};
-    use crossterm::execute;
-    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-    use ratatui::Terminal;
-    use ratatui::backend::CrosstermBackend;
-    use ratatui::layout::{Constraint, Layout};
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::symbols::Marker;
-    use ratatui::text::Span;
-    use ratatui::widgets::{
-        Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType,
-    };
-
-    if series.is_empty() && histogram.is_empty() {
-        return;
-    }
-
-    // --- Prepare tail stability data ---
-    let p99_data: Vec<(f64, f64)> = series.iter().map(|s| (s.elapsed_secs, s.p99_us)).collect();
-    let p999_data: Vec<(f64, f64)> = series.iter().map(|s| (s.elapsed_secs, s.p999_us)).collect();
-    let p9999_data: Vec<(f64, f64)> = series
-        .iter()
-        .map(|s| (s.elapsed_secs, s.p9999_us))
-        .collect();
-
-    let x_max = series.last().map(|s| s.elapsed_secs).unwrap_or(1.0);
-    let y_max = series
-        .iter()
-        .map(|s| s.p9999_us)
-        .fold(0.0f64, f64::max)
-        .max(1.0)
-        * 1.1;
-
-    // --- Prepare histogram data ---
-    // Build log-scale buckets from the HDR histogram for display.
-    let hist_buckets: Vec<(String, u64)> = {
-        let quantiles = [
-            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 0.9999,
-        ];
-        let mut buckets = Vec::new();
-        for window in quantiles.windows(2) {
-            let lo = histogram.value_at_quantile(window[0]) as f64 / 1000.0;
-            let hi = histogram.value_at_quantile(window[1]) as f64 / 1000.0;
-            let pct = ((window[1] - window[0]) * 100.0) as u64;
-            let label = format!("{:.0}-{:.0}µs", lo, hi);
-            buckets.push((label, pct));
-        }
-        buckets
-    };
-
-    // Enter TUI.
-    crossterm::terminal::enable_raw_mode().expect("enable raw mode");
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).expect("create terminal");
-
-    let mut tab: usize = 0; // 0 = tail stability, 1 = histogram
-
-    loop {
-        terminal
-            .draw(|frame| {
-                let area = Layout::default()
-                    .constraints([Constraint::Percentage(100)])
-                    .split(frame.area())[0];
-
-                match tab {
-                    0 => {
-                        // Tail latency stability over time.
-                        let datasets = vec![
-                            Dataset::default()
-                                .name("p99")
-                                .marker(Marker::Braille)
-                                .graph_type(GraphType::Line)
-                                .style(Style::default().fg(Color::Cyan))
-                                .data(&p99_data),
-                            Dataset::default()
-                                .name("p99.9")
-                                .marker(Marker::Braille)
-                                .graph_type(GraphType::Line)
-                                .style(Style::default().fg(Color::Yellow))
-                                .data(&p999_data),
-                            Dataset::default()
-                                .name("p99.99")
-                                .marker(Marker::Braille)
-                                .graph_type(GraphType::Line)
-                                .style(Style::default().fg(Color::Red))
-                                .data(&p9999_data),
-                        ];
-
-                        let x_labels = vec![
-                            Span::raw("0s"),
-                            Span::raw(format!("{:.1}s", x_max / 2.0)),
-                            Span::raw(format!("{:.1}s", x_max)),
-                        ];
-                        let y_labels = vec![
-                            Span::raw("0"),
-                            Span::raw(format!("{:.0} µs", y_max / 2.0)),
-                            Span::raw(format!("{:.0} µs", y_max)),
-                        ];
-
-                        let chart = Chart::new(datasets)
-                            .block(
-                                Block::default()
-                                    .title(
-                                        " Tail Latency Stability [Tab: switch view | q: exit] ",
-                                    )
-                                    .title_style(
-                                        Style::default()
-                                            .fg(Color::White)
-                                            .add_modifier(Modifier::BOLD),
-                                    )
-                                    .borders(Borders::ALL),
-                            )
-                            .x_axis(
-                                Axis::default()
-                                    .title("Time")
-                                    .bounds([0.0, x_max])
-                                    .labels(x_labels),
-                            )
-                            .y_axis(
-                                Axis::default()
-                                    .title("Latency")
-                                    .bounds([0.0, y_max])
-                                    .labels(y_labels),
-                            );
-
-                        frame.render_widget(chart, area);
-                    }
-                    1 => {
-                        // Latency distribution histogram.
-                        let bars: Vec<Bar> = hist_buckets
-                            .iter()
-                            .map(|(label, pct)| {
-                                Bar::default()
-                                    .label(label.as_str().into())
-                                    .value(*pct)
-                                    .style(Style::default().fg(Color::Cyan))
-                            })
-                            .collect();
-
-                        let bar_chart = BarChart::default()
-                            .block(
-                                Block::default()
-                                    .title(
-                                        " Latency Distribution (% of orders) [Tab: switch | q: exit] ",
-                                    )
-                                    .title_style(
-                                        Style::default()
-                                            .fg(Color::White)
-                                            .add_modifier(Modifier::BOLD),
-                                    )
-                                    .borders(Borders::ALL),
-                            )
-                            .data(BarGroup::default().bars(&bars))
-                            .bar_width(
-                                ((area.width as usize).saturating_sub(4) / bars.len().max(1))
-                                    .max(3) as u16,
-                            )
-                            .bar_gap(1);
-
-                        frame.render_widget(bar_chart, area);
-                    }
-                    _ => {}
-                }
-            })
-            .expect("draw chart");
-
-        // Handle input.
-        if let Ok(Event::Key(key)) = event::read() {
-            match key.code {
-                KeyCode::Tab => tab = (tab + 1) % 2,
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                _ => break,
-            }
-        }
-    }
-
-    // Restore terminal.
-    crossterm::terminal::disable_raw_mode().expect("disable raw mode");
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("leave alternate screen");
 }
 
 /// Create a temporary directory that persists for the process lifetime.

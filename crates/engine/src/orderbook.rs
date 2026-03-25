@@ -5,11 +5,10 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use rustc_hash::FxHashMap;
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    AccountId, ExecutionReport, HashMap, Order, OrderId, OrderType, Price, Quantity, RejectReason,
     SelfTradeProtection, Side, TimeInForce,
 };
 
@@ -201,11 +200,16 @@ impl BookSide {
     fn remove_with_account(
         &mut self,
         price: Price,
+        account: AccountId,
         order_id: OrderId,
     ) -> Option<(AccountId, Quantity)> {
         let idx = self.search(price).ok()?;
         let level = &mut self.levels[idx].1;
-        let pos = level.iter().position(|o| o.id == order_id)?;
+        // Match on both account and order_id — two accounts may have the
+        // same OrderId resting at the same price level.
+        let pos = level
+            .iter()
+            .position(|o| o.id == order_id && o.account == account)?;
         let order = level.remove(pos).expect("position was valid");
         if level.is_empty() {
             self.levels.remove(idx);
@@ -275,7 +279,7 @@ pub struct OrderBook {
     /// need to scan the book. Keyed by (AccountId, OrderId) to eliminate
     /// cross-account collisions — different accounts can independently
     /// use the same OrderId without index conflicts.
-    order_index: FxHashMap<(AccountId, OrderId), (Side, Price)>,
+    order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
     /// BTreeMap keyed by trigger price so we can efficiently find all stops
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
@@ -285,7 +289,7 @@ pub struct OrderBook {
     /// Tracks which order IDs are pending stops, for cancel support.
     /// Keyed by (AccountId, OrderId) to match order_index and eliminate
     /// cross-account collisions.
-    stop_index: FxHashMap<(AccountId, OrderId), (Side, Price)>,
+    stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
     /// Reusable buffers to avoid per-order allocations on the hot path.
@@ -310,10 +314,10 @@ impl OrderBook {
         Self {
             bids: BookSide::default(),
             asks: BookSide::default(),
-            order_index: FxHashMap::default(),
+            order_index: HashMap::default(),
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: FxHashMap::default(),
+            stop_index: HashMap::default(),
             last_trade_price: None,
             trigger_price_buf: Vec::new(),
             triggered_buf: Vec::new(),
@@ -337,11 +341,11 @@ impl OrderBook {
             // 4096 slots ≈ 128 KB (key 12 B + value 16 B + control 1 B per
             // slot) — fits in L2 cache for fast probes. Typical book depth
             // is 100-2000 orders; resize cost at 4K is ~5 µs.
-            order_index: FxHashMap::with_capacity_and_hasher(4_096, Default::default()),
+            order_index: HashMap::with_capacity_and_hasher(4_096, Default::default()),
             // BTreeMap is node-allocated — no resize spikes.
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: FxHashMap::with_capacity_and_hasher(1_024, Default::default()),
+            stop_index: HashMap::with_capacity_and_hasher(1_024, Default::default()),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
@@ -382,10 +386,10 @@ impl OrderBook {
     pub(crate) fn from_parts(
         bids: BookSide,
         asks: BookSide,
-        order_index: FxHashMap<(AccountId, OrderId), (Side, Price)>,
+        order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
         stop_buys: BTreeMap<Price, Vec<PendingStop>>,
         stop_sells: BTreeMap<Price, Vec<PendingStop>>,
-        stop_index: FxHashMap<(AccountId, OrderId), (Side, Price)>,
+        stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {
@@ -479,7 +483,9 @@ impl OrderBook {
             Side::Sell => &self.asks,
         };
         let level = book_side.get(price)?;
-        let order = level.iter().find(|o| o.id == order_id)?;
+        let order = level
+            .iter()
+            .find(|o| o.id == order_id && o.account == account)?;
         Some((side, price, order.remaining))
     }
 
@@ -519,7 +525,9 @@ impl OrderBook {
         if old_price == new_price {
             // Same price level — check if we can keep time priority.
             let level = book_side.get_mut(old_price)?;
-            let pos = level.iter().position(|o| o.id == order_id)?;
+            let pos = level
+                .iter()
+                .position(|o| o.id == order_id && o.account == account)?;
             let old_remaining = level[pos].remaining;
 
             if new_quantity <= old_remaining {
@@ -537,7 +545,9 @@ impl OrderBook {
             // Manipulate the VecDeque directly to preserve the RestingOrder
             // (including account), since BookSide::remove only returns Quantity.
             let old_level = book_side.get_mut(old_price)?;
-            let pos = old_level.iter().position(|o| o.id == order_id)?;
+            let pos = old_level
+                .iter()
+                .position(|o| o.id == order_id && o.account == account)?;
             let mut order = old_level.remove(pos).expect("position was valid");
             let old_remaining = order.remaining;
             order.remaining = new_quantity;
@@ -570,7 +580,7 @@ impl OrderBook {
         reports: &mut Vec<ExecutionReport>,
     ) {
         match order.order_type {
-            OrderType::Limit { price } => self.execute_limit(order, price, reports),
+            OrderType::Limit { price, .. } => self.execute_limit(order, price, reports),
             OrderType::Market => self.execute_market(order, quote_budget, reports),
             OrderType::Stop { trigger_price } => {
                 self.add_stop(order, trigger_price, None, quote_budget);
@@ -598,7 +608,9 @@ impl OrderBook {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
             };
-            if let Some((_acct, remaining)) = book_side.remove_with_account(price, order_id) {
+            if let Some((_acct, remaining)) =
+                book_side.remove_with_account(price, account, order_id)
+            {
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
                     account,
@@ -615,7 +627,9 @@ impl OrderBook {
                 Side::Sell => &mut self.stop_sells,
             };
             if let Some(level) = stops.get_mut(&trigger_price)
-                && let Some(pos) = level.iter().position(|s| s.id == order_id)
+                && let Some(pos) = level
+                    .iter()
+                    .position(|s| s.id == order_id && s.account == account)
             {
                 let stop = level.remove(pos);
                 if level.is_empty() {
@@ -685,6 +699,25 @@ impl OrderBook {
     }
 
     fn execute_limit(&mut self, order: Order, price: Price, reports: &mut Vec<ExecutionReport>) {
+        // Post-only: reject if the order would cross the spread.
+        if let OrderType::Limit {
+            post_only: true, ..
+        } = order.order_type
+        {
+            let would_cross = match order.side {
+                Side::Buy => self.best_ask().is_some_and(|ask| price >= ask),
+                Side::Sell => self.best_bid().is_some_and(|bid| price <= bid),
+            };
+            if would_cross {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: order.id,
+                    account: order.account,
+                    reason: RejectReason::PostOnlyWouldCross,
+                });
+                return;
+            }
+        }
+
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely before doing anything.
@@ -1088,8 +1121,13 @@ impl OrderBook {
                 trigger_price: stop.trigger_price,
             });
 
+            // Triggered stops become regular limit/market orders — never post-only,
+            // since the intent is to execute when the trigger fires.
             let order_type = match stop.limit_price {
-                Some(price) => OrderType::Limit { price },
+                Some(price) => OrderType::Limit {
+                    price,
+                    post_only: false,
+                },
                 None => OrderType::Market,
             };
 
@@ -1106,7 +1144,7 @@ impl OrderBook {
             // Re-enter execute but skip check_triggers to avoid recursion —
             // triggered orders are market/limit, so they won't re-add stops.
             match order.order_type {
-                OrderType::Limit { price } => self.execute_limit(order, price, reports),
+                OrderType::Limit { price, .. } => self.execute_limit(order, price, reports),
                 OrderType::Market => {
                     self.execute_market(order, stop.quote_budget, reports);
                 }
@@ -1193,7 +1231,10 @@ mod tests {
             id: OrderId(id),
             account: TEST_ACCOUNT,
             side,
-            order_type: OrderType::Limit { price: price(p) },
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
