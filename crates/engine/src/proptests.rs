@@ -472,7 +472,10 @@ fn run_exchange_actions(
     exchange.add_instrument(btc_usd_spec());
     let mut reports = Vec::new();
     let mut all_reports = Vec::new();
-    let mut next_id = 1u64;
+    // Per-account order ID counters so two accounts can independently use the
+    // same OrderId value — this is realistic (e.g., LOBSTER replay) and tests
+    // that the engine correctly disambiguates by (account, order_id).
+    let mut next_id_per_account: HashMap<AccountId, u64> = HashMap::new();
     let mut action_order_ids: Vec<Option<(OrderId, AccountId)>> = Vec::new();
     let mut withdrawn: HashMap<CurrencyId, u128> = HashMap::new();
     let sym = Symbol(1);
@@ -497,8 +500,9 @@ fn run_exchange_actions(
                 stp,
                 post_only,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -522,8 +526,9 @@ fn run_exchange_actions(
                 quantity,
                 stp,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -545,8 +550,9 @@ fn run_exchange_actions(
                 quantity,
                 stp,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -572,8 +578,9 @@ fn run_exchange_actions(
                 tif,
                 stp,
             } => {
-                let id = OrderId(next_id);
-                next_id += 1;
+                let counter = next_id_per_account.entry(*account).or_insert(0);
+                *counter += 1;
+                let id = OrderId(*counter);
                 action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
@@ -1255,8 +1262,8 @@ proptest! {
     fn no_self_trades_under_stp(actions in arb_exchange_actions()) {
         let (_, order_ids, all_reports, _) = run_exchange_actions(&actions);
 
-        // Build a map from OrderId → STP mode.
-        let mut stp_map: HashMap<OrderId, SelfTradeProtection> = HashMap::new();
+        // Build a map from (AccountId, OrderId) → STP mode.
+        let mut stp_map: HashMap<(AccountId, OrderId), SelfTradeProtection> = HashMap::new();
         let mut id_idx = 0usize;
         for action in &actions {
             match action {
@@ -1264,8 +1271,8 @@ proptest! {
                 | ExchangeAction::Market { stp, .. }
                 | ExchangeAction::Stop { stp, .. }
                 | ExchangeAction::StopLimit { stp, .. } => {
-                    if let Some((id, _account)) = order_ids[id_idx] {
-                        stp_map.insert(id, *stp);
+                    if let Some((id, account)) = order_ids[id_idx] {
+                        stp_map.insert((account, id), *stp);
                     }
                     id_idx += 1;
                 }
@@ -1284,16 +1291,18 @@ proptest! {
                 ..
             } = report
             {
-                prop_assert_ne!(
-                    maker_order_id, taker_order_id,
-                    "fill has maker_order_id == taker_order_id: {:?}",
-                    report
-                );
-
-                // If same account, the taker's STP must have been Allow.
+                // Two different accounts may share the same OrderId, so only
+                // assert inequality when they're the same account.
                 if maker_account == taker_account {
+                    prop_assert_ne!(
+                        maker_order_id, taker_order_id,
+                        "self-fill has maker_order_id == taker_order_id on {:?}: {:?}",
+                        maker_account, report
+                    );
+
+                    // The taker's STP must have been Allow for a self-trade to occur.
                     let taker_stp = stp_map
-                        .get(taker_order_id)
+                        .get(&(*taker_account, *taker_order_id))
                         .copied()
                         .unwrap_or(SelfTradeProtection::Allow);
                     prop_assert_eq!(
