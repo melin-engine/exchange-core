@@ -35,7 +35,7 @@ libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = { version = "0.7", optional = true }
-plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "line_series"] }
+plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "bitmap_backend", "bitmap_encoder", "ttf", "line_series"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

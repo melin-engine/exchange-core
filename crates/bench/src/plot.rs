@@ -1,4 +1,4 @@
-//! Generate SVG plots from benchmark JSON results.
+//! Generate SVG and PNG plots from benchmark JSON results.
 //!
 //! Reads JSON files produced by `melin-bench --json` and generates:
 //! 1. **Latency CDF** — percentile plot comparing benchmark configs
@@ -16,6 +16,30 @@ use std::path::PathBuf;
 
 use plotters::prelude::*;
 use serde::Deserialize;
+
+/// Render a chart to both SVG and PNG. The block receives `root` as a
+/// `DrawingArea` and should build the full chart on it. The macro expands
+/// the body twice — once for each backend — so all chart-building code
+/// works through the backend-agnostic `DrawingBackend` trait.
+macro_rules! render_both {
+    ($path:expr, $size:expr, |$root:ident| $body:block) => {{
+        // SVG
+        {
+            let $root = SVGBackend::new(&$path, $size).into_drawing_area();
+            $body
+            $root.present().unwrap();
+            eprintln!("wrote {}", $path.display());
+        }
+        // PNG
+        {
+            let png_path = $path.with_extension("png");
+            let $root = BitMapBackend::new(&png_path, $size).into_drawing_area();
+            $body
+            $root.present().unwrap();
+            eprintln!("wrote {}", png_path.display());
+        }
+    }};
+}
 
 // --- JSON schema matching melin-bench output ---
 
@@ -311,87 +335,85 @@ fn plot_latency_cdf(results: &[LoadedResult], output: &PathBuf) {
         return;
     }
 
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    // Find max latency across all results for Y-axis range.
-    let max_lat = results
-        .iter()
-        .flat_map(|r| r.result.latency.values())
-        .cloned()
-        .fold(0.0f64, f64::max)
-        * 1.1;
-
-    // Percentile labels for X-axis.
-    let pct_labels: Vec<&str> = PERCENTILES.iter().map(|&(_, label, _)| label).collect();
-
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Latency by Percentile", ("sans-serif", 22).into_font())
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(70)
-        .build_cartesian_2d(0usize..pct_labels.len().saturating_sub(1), 0.0..max_lat)
-        .unwrap();
-
-    chart
-        .configure_mesh()
-        .x_desc("Percentile")
-        .y_desc("Latency (µs)")
-        .x_label_formatter(&|idx| pct_labels.get(*idx).copied().unwrap_or("").to_string())
-        .y_label_formatter(&|v| {
-            if *v >= 1000.0 {
-                format!("{:.1}ms", v / 1000.0)
-            } else {
-                format!("{:.0}µs", v)
-            }
-        })
-        .draw()
-        .unwrap();
-
-    for (i, loaded) in results.iter().enumerate() {
-        let points = extract_percentiles(&loaded.result);
-        let color = COLORS[i % COLORS.len()];
-        let label = cdf_label(loaded);
-
-        // Map percentile values to x-indices.
-        let indexed: Vec<(usize, f64)> = points
+        // Find max latency across all results for Y-axis range.
+        let max_lat = results
             .iter()
-            .filter_map(|(pct, val)| {
-                PERCENTILES
-                    .iter()
-                    .position(|&(_, _, p)| (p - pct).abs() < 0.000001)
-                    .map(|idx| (idx, *val))
-            })
-            .collect();
+            .flat_map(|r| r.result.latency.values())
+            .cloned()
+            .fold(0.0f64, f64::max)
+            * 1.1;
 
-        chart
-            .draw_series(LineSeries::new(indexed.clone(), color.stroke_width(2)))
-            .unwrap()
-            .label(label)
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
+        // Percentile labels for X-axis.
+        let pct_labels: Vec<&str> = PERCENTILES.iter().map(|&(_, label, _)| label).collect();
 
-        // Draw dots at each data point.
-        chart
-            .draw_series(
-                indexed
-                    .iter()
-                    .map(|&(x, y)| Circle::new((x, y), 3, color.filled())),
-            )
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Latency by Percentile", ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .build_cartesian_2d(0usize..pct_labels.len().saturating_sub(1), 0.0..max_lat)
             .unwrap();
-    }
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        chart
+            .configure_mesh()
+            .x_desc("Percentile")
+            .y_desc("Latency (µs)")
+            .x_label_formatter(&|idx| pct_labels.get(*idx).copied().unwrap_or("").to_string())
+            .y_label_formatter(&|v| {
+                if *v >= 1000.0 {
+                    format!("{:.1}ms", v / 1000.0)
+                } else {
+                    format!("{:.0}µs", v)
+                }
+            })
+            .draw()
+            .unwrap();
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+        for (i, loaded) in results.iter().enumerate() {
+            let points = extract_percentiles(&loaded.result);
+            let color = COLORS[i % COLORS.len()];
+            let label = cdf_label(loaded);
+
+            // Map percentile values to x-indices.
+            let indexed: Vec<(usize, f64)> = points
+                .iter()
+                .filter_map(|(pct, val)| {
+                    PERCENTILES
+                        .iter()
+                        .position(|&(_, _, p)| (p - pct).abs() < 0.000001)
+                        .map(|idx| (idx, *val))
+                })
+                .collect();
+
+            chart
+                .draw_series(LineSeries::new(indexed.clone(), color.stroke_width(2)))
+                .unwrap()
+                .label(label)
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                });
+
+            // Draw dots at each data point.
+            chart
+                .draw_series(
+                    indexed
+                        .iter()
+                        .map(|&(x, y)| Circle::new((x, y), 3, color.filled())),
+                )
+                .unwrap();
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
 }
 
 // =====================================================================
@@ -409,9 +431,6 @@ fn cmd_saturation(args: &[String]) {
 }
 
 fn plot_saturation(results: &[LoadedResult], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     // Sort by throughput for the curve.
     let mut sorted: Vec<&LoadedResult> = results.iter().collect();
     sorted.sort_by(|a, b| {
@@ -433,167 +452,168 @@ fn plot_saturation(results: &[LoadedResult], output: &PathBuf) {
         .fold(0.0f64, f64::max)
         * 1.3;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(
-            "Throughput vs Latency (Saturation Curve)",
-            ("sans-serif", 22).into_font(),
-        )
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(70)
-        .build_cartesian_2d(0.0..max_throughput, 0.0..max_latency)
-        .unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Throughput (orders/sec)")
-        .y_desc("Latency (µs)")
-        .x_label_formatter(&|v| {
-            if *v >= 1_000_000.0 {
-                format!("{:.1}M", v / 1_000_000.0)
-            } else if *v >= 1_000.0 {
-                format!("{:.0}K", v / 1_000.0)
-            } else {
-                format!("{:.0}", v)
-            }
-        })
-        .y_label_formatter(&|v| {
-            if *v >= 1000.0 {
-                format!("{:.1}ms", v / 1000.0)
-            } else {
-                format!("{:.0}µs", v)
-            }
-        })
-        .draw()
-        .unwrap();
-
-    // Plot p50 line.
-    let p50_points: Vec<(f64, f64)> = sorted
-        .iter()
-        .filter_map(|r| {
-            r.result
-                .latency
-                .get("p50_us")
-                .map(|lat| (r.result.throughput_ops, *lat))
-        })
-        .collect();
-
-    if !p50_points.is_empty() {
-        chart
-            .draw_series(LineSeries::new(
-                p50_points.clone(),
-                COLOR_FSYNC.stroke_width(2),
-            ))
-            .unwrap()
-            .label("p50")
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], COLOR_FSYNC.stroke_width(2))
-            });
-        chart
-            .draw_series(
-                p50_points
-                    .iter()
-                    .map(|&(x, y)| Circle::new((x, y), 4, COLOR_FSYNC.filled())),
+        let mut chart = ChartBuilder::on(&root)
+            .caption(
+                "Throughput vs Latency (Saturation Curve)",
+                ("sans-serif", 22).into_font(),
             )
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .build_cartesian_2d(0.0..max_throughput, 0.0..max_latency)
             .unwrap();
-    }
 
-    // Plot p99 line.
-    let p99_points: Vec<(f64, f64)> = sorted
-        .iter()
-        .filter_map(|r| {
-            r.result
-                .latency
-                .get("p99_us")
-                .map(|lat| (r.result.throughput_ops, *lat))
-        })
-        .collect();
-
-    if !p99_points.is_empty() {
         chart
-            .draw_series(LineSeries::new(
-                p99_points.clone(),
-                COLOR_NO_PERSIST.stroke_width(2),
-            ))
-            .unwrap()
-            .label("p99")
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], COLOR_NO_PERSIST.stroke_width(2))
-            });
-        chart
-            .draw_series(
-                p99_points
-                    .iter()
-                    .map(|&(x, y)| Circle::new((x, y), 4, COLOR_NO_PERSIST.filled())),
-            )
+            .configure_mesh()
+            .x_desc("Throughput (orders/sec)")
+            .y_desc("Latency (µs)")
+            .x_label_formatter(&|v| {
+                if *v >= 1_000_000.0 {
+                    format!("{:.1}M", v / 1_000_000.0)
+                } else if *v >= 1_000.0 {
+                    format!("{:.0}K", v / 1_000.0)
+                } else {
+                    format!("{:.0}", v)
+                }
+            })
+            .y_label_formatter(&|v| {
+                if *v >= 1000.0 {
+                    format!("{:.1}ms", v / 1000.0)
+                } else {
+                    format!("{:.0}µs", v)
+                }
+            })
+            .draw()
             .unwrap();
-    }
 
-    // Plot p99.9 line.
-    let p999_points: Vec<(f64, f64)> = sorted
-        .iter()
-        .filter_map(|r| {
-            r.result
-                .latency
-                .get("p99.9_us")
-                .map(|lat| (r.result.throughput_ops, *lat))
-        })
-        .collect();
+        // Plot p50 line.
+        let p50_points: Vec<(f64, f64)> = sorted
+            .iter()
+            .filter_map(|r| {
+                r.result
+                    .latency
+                    .get("p50_us")
+                    .map(|lat| (r.result.throughput_ops, *lat))
+            })
+            .collect();
 
-    if !p999_points.is_empty() {
-        chart
-            .draw_series(LineSeries::new(
-                p999_points.clone(),
-                COLOR_SINGLE.stroke_width(2),
-            ))
-            .unwrap()
-            .label("p99.9")
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], COLOR_SINGLE.stroke_width(2))
-            });
-        chart
-            .draw_series(
-                p999_points
-                    .iter()
-                    .map(|&(x, y)| Circle::new((x, y), 4, COLOR_SINGLE.filled())),
-            )
-            .unwrap();
-    }
-
-    // Label each data point with its filename stem (e.g. "w32", "w256")
-    // above the p99.9 dot for readability.
-    let labels: Vec<(f64, f64, String)> = sorted
-        .iter()
-        .filter_map(|r| {
-            r.result
-                .latency
-                .get("p99.9_us")
-                .or_else(|| r.result.latency.get("p99_us"))
-                .map(|lat| (r.result.throughput_ops, *lat, saturation_label(r)))
-        })
-        .collect();
-    if !labels.is_empty() {
-        chart
-            .draw_series(labels.iter().map(|(x, y, label)| {
-                Text::new(
-                    label.clone(),
-                    (*x, *y + max_latency * 0.04),
-                    ("sans-serif", 11).into_font(),
+        if !p50_points.is_empty() {
+            chart
+                .draw_series(LineSeries::new(
+                    p50_points.clone(),
+                    COLOR_FSYNC.stroke_width(2),
+                ))
+                .unwrap()
+                .label("p50")
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], COLOR_FSYNC.stroke_width(2))
+                });
+            chart
+                .draw_series(
+                    p50_points
+                        .iter()
+                        .map(|&(x, y)| Circle::new((x, y), 4, COLOR_FSYNC.filled())),
                 )
-            }))
+                .unwrap();
+        }
+
+        // Plot p99 line.
+        let p99_points: Vec<(f64, f64)> = sorted
+            .iter()
+            .filter_map(|r| {
+                r.result
+                    .latency
+                    .get("p99_us")
+                    .map(|lat| (r.result.throughput_ops, *lat))
+            })
+            .collect();
+
+        if !p99_points.is_empty() {
+            chart
+                .draw_series(LineSeries::new(
+                    p99_points.clone(),
+                    COLOR_NO_PERSIST.stroke_width(2),
+                ))
+                .unwrap()
+                .label("p99")
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], COLOR_NO_PERSIST.stroke_width(2))
+                });
+            chart
+                .draw_series(
+                    p99_points
+                        .iter()
+                        .map(|&(x, y)| Circle::new((x, y), 4, COLOR_NO_PERSIST.filled())),
+                )
+                .unwrap();
+        }
+
+        // Plot p99.9 line.
+        let p999_points: Vec<(f64, f64)> = sorted
+            .iter()
+            .filter_map(|r| {
+                r.result
+                    .latency
+                    .get("p99.9_us")
+                    .map(|lat| (r.result.throughput_ops, *lat))
+            })
+            .collect();
+
+        if !p999_points.is_empty() {
+            chart
+                .draw_series(LineSeries::new(
+                    p999_points.clone(),
+                    COLOR_SINGLE.stroke_width(2),
+                ))
+                .unwrap()
+                .label("p99.9")
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], COLOR_SINGLE.stroke_width(2))
+                });
+            chart
+                .draw_series(
+                    p999_points
+                        .iter()
+                        .map(|&(x, y)| Circle::new((x, y), 4, COLOR_SINGLE.filled())),
+                )
+                .unwrap();
+        }
+
+        // Label each data point with its filename stem (e.g. "w32", "w256")
+        // above the p99.9 dot for readability.
+        let labels: Vec<(f64, f64, String)> = sorted
+            .iter()
+            .filter_map(|r| {
+                r.result
+                    .latency
+                    .get("p99.9_us")
+                    .or_else(|| r.result.latency.get("p99_us"))
+                    .map(|lat| (r.result.throughput_ops, *lat, saturation_label(r)))
+            })
+            .collect();
+        if !labels.is_empty() {
+            chart
+                .draw_series(labels.iter().map(|(x, y, label)| {
+                    Text::new(
+                        label.clone(),
+                        (*x, *y + max_latency * 0.04),
+                        ("sans-serif", 11).into_font(),
+                    )
+                }))
+                .unwrap();
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
             .unwrap();
-    }
-
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
-
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+    });
 }
 
 // =====================================================================
@@ -637,9 +657,6 @@ fn sweep_x_label(filename: &str) -> &'static str {
 }
 
 fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     // Build (parameter_value, throughput, p99_latency) points.
     let mut points: Vec<(f64, f64, f64)> = results
         .iter()
@@ -661,111 +678,112 @@ fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
     let max_throughput = points.iter().map(|p| p.1).fold(0.0f64, f64::max) * 1.15;
     let max_latency = points.iter().map(|p| p.2).fold(0.0f64, f64::max) * 1.3;
 
-    // Split into left (throughput) and right (latency) areas.
-    let (left, right) = root.split_horizontally(800);
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    let mut chart = ChartBuilder::on(&left)
-        .caption(
-            format!("Throughput & Latency vs {x_label}"),
-            ("sans-serif", 22).into_font(),
-        )
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(70)
-        .right_y_label_area_size(70)
-        .build_cartesian_2d(0.0..max_x, 0.0..max_throughput)
-        .unwrap()
-        .set_secondary_coord(0.0..max_x, 0.0..max_latency);
+        // Split into left (throughput) and right (latency) areas.
+        let (left, right) = root.split_horizontally(800);
 
-    chart
-        .configure_mesh()
-        .x_desc(x_label)
-        .y_desc("Throughput (orders/sec)")
-        .x_label_formatter(&|v| {
-            if *v >= 1000.0 {
-                format!("{:.0}K", v / 1000.0)
-            } else {
-                format!("{:.0}", v)
-            }
-        })
-        .y_label_formatter(&|v| {
-            if *v >= 1_000_000.0 {
-                format!("{:.1}M", v / 1_000_000.0)
-            } else if *v >= 1_000.0 {
-                format!("{:.0}K", v / 1_000.0)
-            } else {
-                format!("{:.0}", v)
-            }
-        })
-        .draw()
-        .unwrap();
+        let mut chart = ChartBuilder::on(&left)
+            .caption(
+                format!("Throughput & Latency vs {x_label}"),
+                ("sans-serif", 22).into_font(),
+            )
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .right_y_label_area_size(70)
+            .build_cartesian_2d(0.0..max_x, 0.0..max_throughput)
+            .unwrap()
+            .set_secondary_coord(0.0..max_x, 0.0..max_latency);
 
-    chart
-        .configure_secondary_axes()
-        .y_desc("p99 Latency (µs)")
-        .y_label_formatter(&|v| {
-            if *v >= 1000.0 {
-                format!("{:.1}ms", v / 1000.0)
-            } else {
-                format!("{:.0}µs", v)
-            }
-        })
-        .draw()
-        .unwrap();
+        chart
+            .configure_mesh()
+            .x_desc(x_label)
+            .y_desc("Throughput (orders/sec)")
+            .x_label_formatter(&|v| {
+                if *v >= 1000.0 {
+                    format!("{:.0}K", v / 1000.0)
+                } else {
+                    format!("{:.0}", v)
+                }
+            })
+            .y_label_formatter(&|v| {
+                if *v >= 1_000_000.0 {
+                    format!("{:.1}M", v / 1_000_000.0)
+                } else if *v >= 1_000.0 {
+                    format!("{:.0}K", v / 1_000.0)
+                } else {
+                    format!("{:.0}", v)
+                }
+            })
+            .draw()
+            .unwrap();
 
-    // Throughput line (primary Y-axis).
-    let tp_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.1)).collect();
-    chart
-        .draw_series(LineSeries::new(
-            tp_points.clone(),
-            COLOR_FSYNC.stroke_width(2),
-        ))
-        .unwrap()
-        .label("Throughput")
-        .legend(move |(x, y)| {
-            PathElement::new(vec![(x, y), (x + 20, y)], COLOR_FSYNC.stroke_width(2))
-        });
-    chart
-        .draw_series(
-            tp_points
-                .iter()
-                .map(|&(x, y)| Circle::new((x, y), 4, COLOR_FSYNC.filled())),
-        )
-        .unwrap();
+        chart
+            .configure_secondary_axes()
+            .y_desc("p99 Latency (µs)")
+            .y_label_formatter(&|v| {
+                if *v >= 1000.0 {
+                    format!("{:.1}ms", v / 1000.0)
+                } else {
+                    format!("{:.0}µs", v)
+                }
+            })
+            .draw()
+            .unwrap();
 
-    // p99 latency line (secondary Y-axis).
-    let lat_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.2)).collect();
-    chart
-        .draw_secondary_series(LineSeries::new(
-            lat_points.clone(),
-            COLOR_SINGLE.stroke_width(2),
-        ))
-        .unwrap()
-        .label("p99 Latency")
-        .legend(move |(x, y)| {
-            PathElement::new(vec![(x, y), (x + 20, y)], COLOR_SINGLE.stroke_width(2))
-        });
-    chart
-        .draw_secondary_series(
-            lat_points
-                .iter()
-                .map(|&(x, y)| Circle::new((x, y), 4, COLOR_SINGLE.filled())),
-        )
-        .unwrap();
+        // Throughput line (primary Y-axis).
+        let tp_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.1)).collect();
+        chart
+            .draw_series(LineSeries::new(
+                tp_points.clone(),
+                COLOR_FSYNC.stroke_width(2),
+            ))
+            .unwrap()
+            .label("Throughput")
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], COLOR_FSYNC.stroke_width(2))
+            });
+        chart
+            .draw_series(
+                tp_points
+                    .iter()
+                    .map(|&(x, y)| Circle::new((x, y), 4, COLOR_FSYNC.filled())),
+            )
+            .unwrap();
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        // p99 latency line (secondary Y-axis).
+        let lat_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.2)).collect();
+        chart
+            .draw_secondary_series(LineSeries::new(
+                lat_points.clone(),
+                COLOR_SINGLE.stroke_width(2),
+            ))
+            .unwrap()
+            .label("p99 Latency")
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], COLOR_SINGLE.stroke_width(2))
+            });
+        chart
+            .draw_secondary_series(
+                lat_points
+                    .iter()
+                    .map(|&(x, y)| Circle::new((x, y), 4, COLOR_SINGLE.filled())),
+            )
+            .unwrap();
 
-    // We don't draw on the right area — it's just padding for the secondary axis.
-    let _ = right;
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+        // We don't draw on the right area — it's just padding for the secondary axis.
+        let _ = right;
+    });
 }
 
 // =====================================================================
@@ -834,9 +852,6 @@ fn cmd_stability(args: &[String]) {
 }
 
 fn plot_stability(results: &[(TimeSeriesResult, String)], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     let max_time = results
         .iter()
         .flat_map(|(r, _)| r.time_series.iter().map(|p| p.elapsed_secs))
@@ -849,62 +864,63 @@ fn plot_stability(results: &[(TimeSeriesResult, String)], output: &PathBuf) {
         .fold(0.0f64, f64::max)
         * 1.2;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(
-            "Latency Stability Over Time",
-            ("sans-serif", 22).into_font(),
-        )
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(70)
-        .build_cartesian_2d(0.0..max_time, 0.0..max_lat)
-        .unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Time (seconds)")
-        .y_desc("Latency (µs)")
-        .x_label_formatter(&|v| format!("{:.0}s", v))
-        .y_label_formatter(&|v| {
-            if *v >= 1000.0 {
-                format!("{:.1}ms", v / 1000.0)
-            } else {
-                format!("{:.0}µs", v)
-            }
-        })
-        .draw()
-        .unwrap();
+        let mut chart = ChartBuilder::on(&root)
+            .caption(
+                "Latency Stability Over Time",
+                ("sans-serif", 22).into_font(),
+            )
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .build_cartesian_2d(0.0..max_time, 0.0..max_lat)
+            .unwrap();
 
-    for (i, (result, filename)) in results.iter().enumerate() {
-        let color = COLORS[i % COLORS.len()];
-        let mode = mode_from_filename(filename);
-        let tp = format_throughput(result.throughput_ops);
-
-        // p99.99 line — fewer points than p99.9, easier to read.
-        let p9999_points: Vec<(f64, f64)> = result
-            .time_series
-            .iter()
-            .map(|p| (p.elapsed_secs, p.p9999_us))
-            .collect();
         chart
-            .draw_series(LineSeries::new(p9999_points, color.stroke_width(2)))
-            .unwrap()
-            .label(format!("{mode} p99.99 ({tp})"))
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
-    }
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc("Latency (µs)")
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| {
+                if *v >= 1000.0 {
+                    format!("{:.1}ms", v / 1000.0)
+                } else {
+                    format!("{:.0}µs", v)
+                }
+            })
+            .draw()
+            .unwrap();
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let color = COLORS[i % COLORS.len()];
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+            // p99.99 line — fewer points than p99.9, easier to read.
+            let p9999_points: Vec<(f64, f64)> = result
+                .time_series
+                .iter()
+                .map(|p| (p.elapsed_secs, p.p9999_us))
+                .collect();
+            chart
+                .draw_series(LineSeries::new(p9999_points, color.stroke_width(2)))
+                .unwrap()
+                .label(format!("{mode} p99.99 ({tp})"))
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                });
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperRight)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
 }
 
 // =====================================================================
@@ -973,9 +989,6 @@ fn cmd_health(args: &[String]) {
 /// Plot input queue depth over time — the primary saturation indicator.
 /// Shows depth as a percentage of capacity when capacity is available.
 fn plot_health_queue_depth(results: &[(HealthResult, String)], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     let max_time = health_max_time(results) * 1.05;
     // Use capacity from the first sample as y-axis max when available.
     let capacity = results
@@ -993,69 +1006,67 @@ fn plot_health_queue_depth(results: &[(HealthResult, String)], output: &PathBuf)
             * 1.2
     };
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption(
-            "Input Queue Depth Over Time",
-            ("sans-serif", 22).into_font(),
-        )
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(80)
-        .build_cartesian_2d(0.0..max_time, 0.0..max_depth)
-        .unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Time (seconds)")
-        .y_desc("Queue Depth")
-        .x_label_formatter(&|v| format!("{:.0}s", v))
-        .y_label_formatter(&|v| {
-            if capacity > 0 {
-                format!("{:.1}%", v / capacity as f64 * 100.0)
-            } else {
-                format_large_number(*v)
-            }
-        })
-        .draw()
-        .unwrap();
-
-    for (i, (result, filename)) in results.iter().enumerate() {
-        let color = COLORS[i % COLORS.len()];
-        let mode = mode_from_filename(filename);
-        let tp = format_throughput(result.throughput_ops);
-
-        let points: Vec<(f64, f64)> = result
-            .health
-            .iter()
-            .map(|h| (h.elapsed_secs, h.input_queue_depth as f64))
-            .collect();
+        let mut chart = ChartBuilder::on(&root)
+            .caption(
+                "Input Queue Depth Over Time",
+                ("sans-serif", 22).into_font(),
+            )
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(80)
+            .build_cartesian_2d(0.0..max_time, 0.0..max_depth)
+            .unwrap();
 
         chart
-            .draw_series(LineSeries::new(points, color.stroke_width(2)))
-            .unwrap()
-            .label(format!("{mode} ({tp})"))
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
-    }
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc("Queue Depth")
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| {
+                if capacity > 0 {
+                    format!("{:.1}%", v / capacity as f64 * 100.0)
+                } else {
+                    format_large_number(*v)
+                }
+            })
+            .draw()
+            .unwrap();
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let color = COLORS[i % COLORS.len()];
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+            let points: Vec<(f64, f64)> = result
+                .health
+                .iter()
+                .map(|h| (h.elapsed_secs, h.input_queue_depth as f64))
+                .collect();
+
+            chart
+                .draw_series(LineSeries::new(points, color.stroke_width(2)))
+                .unwrap()
+                .label(format!("{mode} ({tp})"))
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                });
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
 }
 
 /// Plot events processed over time — shows throughput ramp-up and steady state.
 fn plot_health_events(results: &[(HealthResult, String)], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     let max_time = health_max_time(results) * 1.05;
     let max_events = results
         .iter()
@@ -1063,60 +1074,58 @@ fn plot_health_events(results: &[(HealthResult, String)], output: &PathBuf) {
         .fold(1.0f64, f64::max)
         * 1.1;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Events Processed Over Time", ("sans-serif", 22).into_font())
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(80)
-        .build_cartesian_2d(0.0..max_time, 0.0..max_events)
-        .unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Time (seconds)")
-        .y_desc("Events Processed")
-        .x_label_formatter(&|v| format!("{:.0}s", v))
-        .y_label_formatter(&|v| format_large_number(*v))
-        .draw()
-        .unwrap();
-
-    for (i, (result, filename)) in results.iter().enumerate() {
-        let color = COLORS[i % COLORS.len()];
-        let mode = mode_from_filename(filename);
-        let tp = format_throughput(result.throughput_ops);
-
-        let points: Vec<(f64, f64)> = result
-            .health
-            .iter()
-            .map(|h| (h.elapsed_secs, h.events_processed as f64))
-            .collect();
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Events Processed Over Time", ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(80)
+            .build_cartesian_2d(0.0..max_time, 0.0..max_events)
+            .unwrap();
 
         chart
-            .draw_series(LineSeries::new(points, color.stroke_width(2)))
-            .unwrap()
-            .label(format!("{mode} ({tp})"))
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
-    }
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc("Events Processed")
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| format_large_number(*v))
+            .draw()
+            .unwrap();
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let color = COLORS[i % COLORS.len()];
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+            let points: Vec<(f64, f64)> = result
+                .health
+                .iter()
+                .map(|h| (h.elapsed_secs, h.events_processed as f64))
+                .collect();
+
+            chart
+                .draw_series(LineSeries::new(points, color.stroke_width(2)))
+                .unwrap()
+                .label(format!("{mode} ({tp})"))
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                });
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
 }
 
 /// Plot journal sequence over time — shows durability progress and fsync cadence.
 fn plot_health_journal_seq(results: &[(HealthResult, String)], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     let max_time = health_max_time(results) * 1.05;
     let max_seq = results
         .iter()
@@ -1124,60 +1133,58 @@ fn plot_health_journal_seq(results: &[(HealthResult, String)], output: &PathBuf)
         .fold(1.0f64, f64::max)
         * 1.1;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Journal Sequence Over Time", ("sans-serif", 22).into_font())
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(80)
-        .build_cartesian_2d(0.0..max_time, 0.0..max_seq)
-        .unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Time (seconds)")
-        .y_desc("Journal Sequence")
-        .x_label_formatter(&|v| format!("{:.0}s", v))
-        .y_label_formatter(&|v| format_large_number(*v))
-        .draw()
-        .unwrap();
-
-    for (i, (result, filename)) in results.iter().enumerate() {
-        let color = COLORS[i % COLORS.len()];
-        let mode = mode_from_filename(filename);
-        let tp = format_throughput(result.throughput_ops);
-
-        let points: Vec<(f64, f64)> = result
-            .health
-            .iter()
-            .map(|h| (h.elapsed_secs, h.journal_sequence as f64))
-            .collect();
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Journal Sequence Over Time", ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(80)
+            .build_cartesian_2d(0.0..max_time, 0.0..max_seq)
+            .unwrap();
 
         chart
-            .draw_series(LineSeries::new(points, color.stroke_width(2)))
-            .unwrap()
-            .label(format!("{mode} ({tp})"))
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
-    }
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc("Journal Sequence")
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| format_large_number(*v))
+            .draw()
+            .unwrap();
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let color = COLORS[i % COLORS.len()];
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+            let points: Vec<(f64, f64)> = result
+                .health
+                .iter()
+                .map(|h| (h.elapsed_secs, h.journal_sequence as f64))
+                .collect();
+
+            chart
+                .draw_series(LineSeries::new(points, color.stroke_width(2)))
+                .unwrap()
+                .label(format!("{mode} ({tp})"))
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                });
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
 }
 
 /// Plot replication lag over time — only generated when non-zero lag exists.
 fn plot_health_replication_lag(results: &[(HealthResult, String)], output: &PathBuf) {
-    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     let max_time = health_max_time(results) * 1.05;
     let max_lag = results
         .iter()
@@ -1185,53 +1192,54 @@ fn plot_health_replication_lag(results: &[(HealthResult, String)], output: &Path
         .fold(1.0f64, f64::max)
         * 1.2;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Replication Lag Over Time", ("sans-serif", 22).into_font())
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(80)
-        .build_cartesian_2d(0.0..max_time, 0.0..max_lag)
-        .unwrap();
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Time (seconds)")
-        .y_desc("Replication Lag (events)")
-        .x_label_formatter(&|v| format!("{:.0}s", v))
-        .y_label_formatter(&|v| format_large_number(*v))
-        .draw()
-        .unwrap();
-
-    for (i, (result, filename)) in results.iter().enumerate() {
-        let color = COLORS[i % COLORS.len()];
-        let mode = mode_from_filename(filename);
-        let tp = format_throughput(result.throughput_ops);
-
-        let points: Vec<(f64, f64)> = result
-            .health
-            .iter()
-            .map(|h| (h.elapsed_secs, h.replication_lag as f64))
-            .collect();
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Replication Lag Over Time", ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(80)
+            .build_cartesian_2d(0.0..max_time, 0.0..max_lag)
+            .unwrap();
 
         chart
-            .draw_series(LineSeries::new(points, color.stroke_width(2)))
-            .unwrap()
-            .label(format!("{mode} ({tp})"))
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
-    }
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc("Replication Lag (events)")
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| format_large_number(*v))
+            .draw()
+            .unwrap();
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(WHITE.mix(0.8))
-        .border_style(BLACK.mix(0.3))
-        .draw()
-        .unwrap();
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let color = COLORS[i % COLORS.len()];
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+            let points: Vec<(f64, f64)> = result
+                .health
+                .iter()
+                .map(|h| (h.elapsed_secs, h.replication_lag as f64))
+                .collect();
+
+            chart
+                .draw_series(LineSeries::new(points, color.stroke_width(2)))
+                .unwrap()
+                .label(format!("{mode} ({tp})"))
+                .legend(move |(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                });
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
 }
 
 /// Maximum elapsed time across all health samples.
@@ -1302,9 +1310,6 @@ fn parse_pipeline_stats(log: &str) -> Vec<PipelineStage> {
 }
 
 fn plot_pipeline(stages: &[PipelineStage], output: &PathBuf) {
-    let root = SVGBackend::new(output, (700, 400)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-
     let max_pct = stages
         .iter()
         .map(|s| s.pct_busy)
@@ -1312,45 +1317,46 @@ fn plot_pipeline(stages: &[PipelineStage], output: &PathBuf) {
         .max(10.0)
         * 1.3;
 
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Pipeline Stage Utilization", ("sans-serif", 22).into_font())
-        .margin(15)
-        .x_label_area_size(50)
-        .y_label_area_size(70)
-        .build_cartesian_2d(0usize..stages.len(), 0.0..max_pct)
-        .unwrap();
+    render_both!(output, (700, 400), |root| {
+        root.fill(&WHITE).unwrap();
 
-    chart
-        .configure_mesh()
-        .x_desc("Stage")
-        .y_desc("Busy %")
-        .x_label_formatter(&|idx| stages.get(*idx).map(|s| s.name.clone()).unwrap_or_default())
-        .y_label_formatter(&|v| format!("{:.0}%", v))
-        .draw()
-        .unwrap();
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Pipeline Stage Utilization", ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .build_cartesian_2d(0usize..stages.len(), 0.0..max_pct)
+            .unwrap();
 
-    chart
-        .draw_series(stages.iter().enumerate().map(|(i, stage)| {
-            let color = COLORS[i % COLORS.len()];
-            let x0 = i;
-            let x1 = i + 1;
-            Rectangle::new([(x0, 0.0), (x1, stage.pct_busy)], color.filled())
-        }))
-        .unwrap();
+        chart
+            .configure_mesh()
+            .x_desc("Stage")
+            .y_desc("Busy %")
+            .x_label_formatter(&|idx| stages.get(*idx).map(|s| s.name.clone()).unwrap_or_default())
+            .y_label_formatter(&|v| format!("{:.0}%", v))
+            .draw()
+            .unwrap();
 
-    // Value labels on top of bars.
-    chart
-        .draw_series(stages.iter().enumerate().map(|(i, stage)| {
-            Text::new(
-                format!("{:.1}%", stage.pct_busy),
-                (i, stage.pct_busy + max_pct * 0.03),
-                ("sans-serif", 14).into_font(),
-            )
-        }))
-        .unwrap();
+        chart
+            .draw_series(stages.iter().enumerate().map(|(i, stage)| {
+                let color = COLORS[i % COLORS.len()];
+                let x0 = i;
+                let x1 = i + 1;
+                Rectangle::new([(x0, 0.0), (x1, stage.pct_busy)], color.filled())
+            }))
+            .unwrap();
 
-    root.present().unwrap();
-    eprintln!("wrote {}", output.display());
+        // Value labels on top of bars.
+        chart
+            .draw_series(stages.iter().enumerate().map(|(i, stage)| {
+                Text::new(
+                    format!("{:.1}%", stage.pct_busy),
+                    (i, stage.pct_busy + max_pct * 0.03),
+                    ("sans-serif", 14).into_font(),
+                )
+            }))
+            .unwrap();
+    });
 }
 
 // =====================================================================
