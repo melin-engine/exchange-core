@@ -25,7 +25,7 @@ pub enum ClientError {
     /// Server rejected the Ed25519 challenge-response authentication
     /// (unknown key, invalid signature, or wrong key permissions).
     AuthFailed,
-    /// Server pipeline is full — the client should retry after a brief backoff.
+    /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,
 }
 

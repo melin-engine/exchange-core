@@ -135,6 +135,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Unix domain socket transport
 - Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
 - io_uring transport (separate read/write rings, multishot RECV with provided buffer groups)
+- Backpressure handling (explicit `ServerBusy` reject when the input pipeline is full — no silent drops or reader thread stalls)
 
 ### Authentication & Authorization ([docs/admin-guide.md](docs/admin-guide.md))
 - Client authentication (Ed25519 challenge-response handshake)

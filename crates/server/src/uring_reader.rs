@@ -717,15 +717,23 @@ fn process_frames<R>(
             .is_err()
         {
             // Pipeline full — send ServerBusy directly on the socket.
+            // Best-effort: if the write fails, the client will timeout.
             debug!(
                 connection_id = conn.connection_id,
                 "pipeline full, sending ServerBusy"
             );
-            unsafe {
+            let n = unsafe {
                 libc::write(
                     conn.fd,
                     server_busy_frame.as_ptr().cast(),
                     server_busy_frame.len(),
+                )
+            };
+            if n != server_busy_frame.len() as isize {
+                debug!(
+                    connection_id = conn.connection_id,
+                    written = n,
+                    "ServerBusy write incomplete"
                 );
             }
             // Stop processing further frames — leave them in parse_buf

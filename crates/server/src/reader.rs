@@ -562,21 +562,33 @@ fn process_connection<R>(
                         .is_err()
                     {
                         // Pipeline full — send ServerBusy directly on the socket.
-                        // The 5-byte frame is atomic (well under SO_SNDBUF minimum).
+                        // Best-effort: if the write fails (broken pipe, full send
+                        // buffer), the client will timeout and reconnect.
                         debug!(
                             connection_id = conn.connection_id,
                             "pipeline full, sending ServerBusy"
                         );
-                        unsafe {
+                        let n = unsafe {
                             libc::write(
                                 conn.fd,
                                 server_busy_frame.as_ptr().cast(),
                                 server_busy_frame.len(),
+                            )
+                        };
+                        if n != server_busy_frame.len() as isize {
+                            debug!(
+                                connection_id = conn.connection_id,
+                                written = n,
+                                "ServerBusy write incomplete"
                             );
                         }
                         // Stop draining this connection for this epoll round.
-                        // Remaining bytes stay in the kernel recv buffer; epoll
-                        // edge-trigger will re-fire on the next recv.
+                        // Edge-trigger caveat: any bytes already in the kernel
+                        // recv buffer won't generate a new EPOLLIN (edge-trigger
+                        // only fires on new arrivals). Those frames are stranded
+                        // until the client sends new data — which it will, since
+                        // it just received ServerBusy and will retry or send the
+                        // next request.
                         return false;
                     }
 

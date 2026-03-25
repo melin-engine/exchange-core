@@ -1172,11 +1172,11 @@ fn run_epoll_loop<W: Write>(
                         let response = codec::decode_response(frame).expect("decode response");
 
                         // ServerBusy = pipeline full, request was not processed.
-                        // Discard the inflight timestamp (no BatchEnd will come)
-                        // and let the window refill with a retry.
+                        // Discard the inflight timestamp (no BatchEnd will come).
+                        // Don't retry — the next frame in sequence will be sent
+                        // naturally as the window refills.
                         if matches!(response, ResponseKind::ServerBusy) {
                             conn.inflight_ts.pop_front();
-                            conn.send_cursor = conn.send_cursor.saturating_sub(1);
                         }
 
                         if matches!(response, ResponseKind::BatchEnd) {
