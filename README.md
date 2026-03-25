@@ -143,7 +143,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))
 - Structured logging (`tracing` crate, error-level for server malfunctions only)
-- Health checks / readiness probes (`ServerReady` wire handshake on connect)
+- Health/liveness TCP endpoint (`--health-bind`, returns `OK <conns> <seq> <lag>`)
 - Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md).
 
 ### Metrics & Observability

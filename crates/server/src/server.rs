@@ -150,6 +150,12 @@ pub struct ServerConfig {
     /// which gives lowest latency on isolated cores (isolcpus).
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
+
+    /// Address for the health/liveness TCP endpoint. On connect, returns
+    /// a one-line status (`OK <conns> <journal_seq> <repl_lag>\n`) and
+    /// closes. No auth required. Set to empty string to disable.
+    #[arg(long, default_value = "127.0.0.1:9877")]
+    pub health_bind: Option<SocketAddr>,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -567,6 +573,26 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         );
     }
 
+    // Pipeline health flag: true while all pipeline threads are alive.
+    // Flipped to false when a thread dies or on shutdown. Read by the
+    // health endpoint to distinguish OK from ERR.
+    let pipeline_healthy = Arc::new(AtomicBool::new(true));
+
+    // Spawn health/liveness endpoint before the accept loop so it's
+    // reachable as soon as the server is ready to accept connections.
+    let health_handle = if let Some(health_addr) = config.health_bind {
+        Some(crate::health::spawn(
+            health_addr,
+            Arc::clone(&active_connections),
+            Arc::clone(&journal_cursor),
+            Arc::clone(&replication_cursor),
+            Arc::clone(&pipeline_healthy),
+            Arc::clone(&shutdown),
+        )?)
+    } else {
+        None
+    };
+
     // Set the listener to non-blocking so accept() returns immediately
     // with WouldBlock when no connection is pending. This lets the accept
     // loop check the shutdown flag without blocking indefinitely.
@@ -601,6 +627,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             && !shutdown.load(Ordering::Relaxed)
         {
             error!("pipeline thread died, initiating shutdown");
+            pipeline_healthy.store(false, Ordering::Relaxed);
             break;
         }
 
@@ -730,6 +757,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // 2. Now signal the pipeline. The journal and matching stages will
     //    drain any remaining events before exiting.
     info!("shutdown: draining pipeline");
+    pipeline_healthy.store(false, Ordering::Relaxed);
     shutdown.store(true, Ordering::Relaxed);
 
     let mut thread_panicked = false;
@@ -756,6 +784,11 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Join replication thread.
     if let Some(repl_sender_handle) = replication_handle {
         let _ = repl_sender_handle.join();
+    }
+
+    // Join health endpoint thread.
+    if let Some(h) = health_handle {
+        let _ = h.join();
     }
 
     info!("shutdown complete");

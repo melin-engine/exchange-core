@@ -352,6 +352,31 @@ systemctl disable --now irqbalance
 
 ## Monitoring
 
+### Health/Liveness Endpoint
+
+Plain TCP health check on a dedicated port (default `127.0.0.1:9877`). On connect, the server writes a one-line status and closes the connection. No authentication required.
+
+```sh
+# Quick liveness check (TCP connect succeeds = alive)
+nc -z 127.0.0.1 9877
+
+# Read status line
+nc 127.0.0.1 9877
+OK 42 1234567 0
+```
+
+**Response format**: `OK <active_connections> <journal_seq> <replication_lag>\n`
+
+| Field | Description |
+|-------|-------------|
+| `active_connections` | Currently authenticated client connections |
+| `journal_seq` | Latest durable journal sequence number |
+| `replication_lag` | `journal_seq - replication_cursor` (0 in standalone mode) |
+
+**Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9877`). Omit the flag to disable.
+
+**Kubernetes**: Use as a TCP liveness probe on the health port. The probe succeeds if the TCP connect completes.
+
 ### Admin Dashboard (QueryStats)
 
 The admin TUI (`melin-admin`) connects to a running server and can send a `QueryStats` request. This returns a live snapshot of server state:

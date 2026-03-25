@@ -4,7 +4,7 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|
-| 1 | Health/liveness endpoint | High | Very low | ★★★★★ | Every ops team expects this. Trivial HTTP or TCP check. |
+| ~~1~~ | ~~Health/liveness endpoint~~ | ~~High~~ | ~~Very low~~ | ~~★★★★★~~ | **Done.** TCP health check on `--health-bind` (default `:9877`). Returns `OK <conns> <journal_seq> <repl_lag>\n`. |
 | 2 | Halt trading on replica disconnect | High | Low | ★★★★★ | "What happens if the replica dies?" is a due diligence question. A flag + check in the accept path. |
 | 3 | Metrics transport (Prometheus) | High | Low | ★★★★☆ | Operators won't run blind. Expose counters already tracked via a side-channel. |
 | 4 | Disruptor queue depth monitoring | Medium | Very low | ★★★★☆ | Read the ring buffer cursors, expose as a metric. Near-free once metrics transport exists. |
