@@ -248,6 +248,8 @@ JOURNAL_MOUNT="/mnt/journal"
 # the journal disk is a raw whole-disk device with no partitions.
 JOURNAL_DISK=""
 for dev in /dev/nvme*n1; do
+    # Skip unexpanded globs (no NVMe devices found).
+    [[ -e "$dev" ]] || continue
     # Skip if it has partitions (OS disk).
     if ls "${dev}p"* &>/dev/null; then
         continue

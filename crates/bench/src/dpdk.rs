@@ -622,7 +622,7 @@ fn dpdk_auth_all(
                         public_key: key.verifying_key().to_bytes(),
                     };
                     let mut buf = [0u8; 256];
-                    let written = codec::encode_request(&request, &mut buf)
+                    let written = codec::encode_request(&request, 0, &mut buf)
                         .expect("encode ChallengeResponse");
 
                     let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
