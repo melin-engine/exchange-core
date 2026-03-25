@@ -5947,4 +5947,214 @@ mod tests {
             }
         )));
     }
+
+    // -----------------------------------------------------------------------
+    // Same OrderId, different accounts at same price level
+    //
+    // Two accounts may independently use the same OrderId. When both rest at
+    // the same price level, cancel/replace/stop-cancel must operate on the
+    // correct account's order without disturbing the other.
+    // -----------------------------------------------------------------------
+
+    /// Place OrderId(1) for both ACCT_A and ACCT_B as buy limits at the same
+    /// price. Returns the exchange ready for disambiguation tests.
+    fn setup_same_id_same_price() -> Exchange {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // ACCT_A places OrderId(1) buy @ 100, qty 10.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // ACCT_B places OrderId(1) buy @ 100, qty 5.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Buy, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        exchange
+    }
+
+    #[test]
+    fn cancel_disambiguates_by_account_at_same_price() {
+        let mut exchange = setup_same_id_same_price();
+        let mut reports = Vec::new();
+
+        // Cancel ACCT_B's OrderId(1) — ACCT_A's should survive.
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_B
+        ));
+        reports.clear();
+
+        // ACCT_A's order is still resting — a sell should fill against it.
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        assert!(fill.is_some(), "ACCT_A's order should still be resting and fillable");
+    }
+
+    #[test]
+    fn cancel_replace_same_price_disambiguates_by_account() {
+        let mut exchange = setup_same_id_same_price();
+        let mut reports = Vec::new();
+
+        // Amend ACCT_A's OrderId(1): reduce qty from 10 to 3 (same price).
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(1),
+            price(100),
+            qty(3),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        // Verify the replaced order reports the correct old/new quantities.
+        if let ExecutionReport::Replaced {
+            old_remaining,
+            new_remaining,
+            ..
+        } = &reports[0]
+        {
+            assert_eq!(*old_remaining, qty(10));
+            assert_eq!(*new_remaining, qty(3));
+        }
+        reports.clear();
+
+        // ACCT_B's order should be untouched — cancel it and verify qty 5.
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                remaining_quantity,
+                ..
+            } if account == ACCT_B && remaining_quantity == qty(5)
+        ));
+    }
+
+    #[test]
+    fn cancel_replace_different_price_disambiguates_by_account() {
+        let mut exchange = setup_same_id_same_price();
+        let mut reports = Vec::new();
+
+        // Move ACCT_A's OrderId(1) from price 100 to price 90.
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(1),
+            price(90),
+            qty(10),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Replaced {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        reports.clear();
+
+        // Sell at 100 should only fill ACCT_B's order (still at 100),
+        // not ACCT_A's (now at 90).
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Sell, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        assert_eq!(fills.len(), 1, "should only fill ACCT_B's order at price 100");
+    }
+
+    #[test]
+    fn cancel_stop_disambiguates_by_account() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // Both accounts place a stop buy with OrderId(1), same trigger price.
+        let stop_a = Order {
+            id: OrderId(1),
+            account: ACCT_A,
+            side: Side::Buy,
+            order_type: OrderType::Stop {
+                trigger_price: price(200),
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(10),
+            stp: SelfTradeProtection::Allow,
+        };
+        exchange.execute(Symbol(1), stop_a, &mut reports);
+        reports.clear();
+
+        let stop_b = Order {
+            id: OrderId(1),
+            account: ACCT_B,
+            side: Side::Buy,
+            order_type: OrderType::Stop {
+                trigger_price: price(200),
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(5),
+            stp: SelfTradeProtection::Allow,
+        };
+        exchange.execute(Symbol(1), stop_b, &mut reports);
+        reports.clear();
+
+        // Cancel ACCT_A's stop — ACCT_B's should survive.
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_A
+        ));
+        reports.clear();
+
+        // Verify ACCT_B's stop is still pending: cancel it to confirm it exists.
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_B
+        ));
+    }
 }
