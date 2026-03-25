@@ -33,6 +33,7 @@
 #   RUN_PLOTS=0|1        Generate plots from results
 #   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
+#   BENCH_COMMIT=<hash>  Checkout a specific commit on all machines (mutually exclusive with BENCH_BRANCH)
 #
 # Prerequisites:
 #   - Same as lan-bench.sh (SSH access, cherry-deploy.sh setup, VLAN)
@@ -90,12 +91,22 @@ echo ""
 # ---------------------------------------------------------------------------
 # Build both binaries upfront (release + no-persist variant)
 # ---------------------------------------------------------------------------
-# BENCH_BRANCH env var: checkout a specific branch on all machines.
-# Usage: BENCH_BRANCH=feat/replication ./scripts/lan-bench-suite.sh ...
+# BENCH_BRANCH: checkout a specific branch on all machines.
+# BENCH_COMMIT: checkout a specific commit hash on all machines.
+# Only one may be specified.
+if [[ -n "${BENCH_BRANCH:-}" && -n "${BENCH_COMMIT:-}" ]]; then
+    echo "error: BENCH_BRANCH and BENCH_COMMIT are mutually exclusive" >&2
+    exit 1
+fi
+
 GIT_CMD="git pull --ff-only"
 if [[ -n "${BENCH_BRANCH:-}" ]]; then
     GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git reset --hard origin/${BENCH_BRANCH}"
     echo "=== Using branch: ${BENCH_BRANCH} ==="
+    echo ""
+elif [[ -n "${BENCH_COMMIT:-}" ]]; then
+    GIT_CMD="git fetch origin && git checkout ${BENCH_COMMIT}"
+    echo "=== Using commit: ${BENCH_COMMIT} ==="
     echo ""
 fi
 
