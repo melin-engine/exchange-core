@@ -1,6 +1,6 @@
 # Melin
 
-Melin is a high-performance exchange matching engine written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers 5M orders/sec with synchronous replication and full fsync durability, maintaining sub-millisecond p99.9 latency by pipelining persistence with execution without cutting corners. Its single-threaded core ensures deterministic behavior, with lock-free I/O and event sourcing providing replayability and optional BLAKE3 hash chains providing tamper-evident audit trails. Core exchange features such as risk controls, circuit breakers, fee models, and replication, are already implemented, with the system progressing toward full production readiness.
+Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers 5M orders/sec with synchronous replication and full fsync durability, maintaining sub-millisecond p99.9 latency by pipelining persistence with execution without cutting corners. Beyond order matching, Melin handles account management, risk controls, circuit breakers, fee schedules, authentication, journaling, and replication — everything an exchange needs between the network edge and the trading API. Its single-threaded matching core ensures deterministic behavior, with lock-free I/O and event sourcing providing replayability and optional BLAKE3 hash chains providing tamper-evident audit trails.
 
 ## Correct
 
@@ -8,7 +8,7 @@ Melin is a high-performance exchange matching engine written in Rust on the [LMA
 - **Deterministic replay** — given the same journal, replay produces identical state bit-for-bit; the foundation of crash recovery, replication, and auditability
 - **Balance conservation** — funds are never created or destroyed; every reserve, fill, release, and withdrawal is tracked and verified by proptest invariants
 - **Client deduplication** — per-account order ID high-water mark prevents double execution on crash-recovery retry
-- **Extensive testing** — 344 tests including property-based (proptest), fuzz (bolero), snapshot round-trip, journal replay, and crash recovery scenarios
+- **Extensive testing** — 360 tests including property-based (proptest), fuzz (bolero), snapshot round-trip, journal replay, and crash recovery scenarios
 
 ## Durable
 
@@ -63,7 +63,7 @@ Melin is a high-performance exchange matching engine written in Rust on the [LMA
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
 - **LMAX-style disruptor pipeline** ([docs/pipeline-architecture.md](docs/pipeline-architecture.md)) — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
-- **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 64 MiB chunks so sync only flushes data pages, not extent metadata
+- **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 256 MiB chunks so sync only flushes data pages, not extent metadata
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
 
 - **Dedicated I/O threads** — epoll/io_uring reader pool with edge-triggered non-blocking I/O; response stage writes directly to sockets; zero async runtime (no tokio)
