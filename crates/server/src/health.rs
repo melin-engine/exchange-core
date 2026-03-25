@@ -179,24 +179,33 @@ enum RequestKind {
     Metrics,
 }
 
-/// Read up to 16 bytes with a 50ms timeout to detect HTTP vs plain TCP.
-/// The 50ms timeout only affects the health thread (not the hot path).
+/// Peek at the first bytes to detect HTTP vs plain TCP.
+///
+/// Strategy: try a non-blocking read first. If data is already buffered
+/// (HTTP client sent request before we accepted), we classify immediately
+/// with zero delay. Only if the non-blocking read returns WouldBlock do
+/// we fall back to a short blocking read — 5ms is enough for loopback
+/// HTTP headers to arrive, and keeps plain TCP probes fast (~5ms worst
+/// case instead of the old 50ms).
 fn detect_request(stream: &mut TcpStream) -> RequestKind {
     // 16 bytes is enough to distinguish "GET /m" from "GET /" from nothing.
     let mut buf = [0u8; 16];
 
-    // Ensure the socket is in blocking mode — the listener is non-blocking
-    // but we need a timed-blocking read here.
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-
+    // First try: non-blocking. Data is usually already in the kernel
+    // buffer by the time we accept() the connection.
+    let _ = stream.set_nonblocking(true);
     let n = match stream.read(&mut buf) {
         Ok(n) => n,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
-        {
-            return RequestKind::PlainTcp;
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // No data yet — fall back to a short blocking wait.
+            // 5ms is generous for loopback; plain TCP probes (nc, k8s)
+            // never send data, so this is their worst-case delay.
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(5)));
+            match stream.read(&mut buf) {
+                Ok(n) => n,
+                Err(_) => return RequestKind::PlainTcp,
+            }
         }
         Err(_) => return RequestKind::PlainTcp,
     };
