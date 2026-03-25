@@ -413,6 +413,7 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
     sleep 1
     ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
+            --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
@@ -461,6 +462,7 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${SERVER_VLAN}:9876 \
+            --health-addr ${SERVER_VLAN}:9878 \
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
@@ -531,6 +533,17 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
             echo "  Generating latency stability: ${label}..."
             "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" \
+                "${RESULTS_DIR}/${f}.json" 2>&1
+        fi
+    done
+
+    # Server health metrics over time — one set of plots per mode.
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication"; do
+        f="${f_label%%:*}"
+        label="${f_label##*:}"
+        if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
+            echo "  Generating health plots: ${label}..."
+            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" \
                 "${RESULTS_DIR}/${f}.json" 2>&1
         fi
     done
