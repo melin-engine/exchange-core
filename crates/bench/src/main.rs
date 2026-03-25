@@ -225,7 +225,7 @@ struct BenchArgs {
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
     /// Number of trading accounts.
-    #[arg(long, default_value_t = 1_000_000)]
+    #[arg(long, default_value_t = 10_000)]
     accounts: u32,
     /// Number of instruments.
     #[arg(long, default_value_t = 100)]
@@ -948,31 +948,6 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
-/// Pre-encoded heartbeat wire frame (length prefix + tag). Used during setup
-/// to keep already-connected clients alive while remaining clients connect.
-/// The server's idle timeout (default 30s) would otherwise drop early
-/// connections during slow setup phases (e.g., 512 clients × ~100ms each).
-fn heartbeat_frame() -> [u8; 5] {
-    let mut buf = [0u8; 128];
-    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, 0, &mut buf)
-        .expect("encode heartbeat");
-    let mut frame = [0u8; 5];
-    frame.copy_from_slice(&buf[..n]);
-    frame
-}
-
-/// Send a heartbeat on every established connection to reset the server's
-/// idle timer. Uses raw `write(2)` on the write fd — sockets are still in
-/// blocking mode during setup, so the small 5-byte write completes
-/// immediately.
-fn keepalive_established(write_fds: &[RawFd], heartbeat: &[u8; 5]) {
-    for &fd in write_fds {
-        unsafe {
-            libc::write(fd, heartbeat.as_ptr().cast(), heartbeat.len());
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-connection state
 // ---------------------------------------------------------------------------
@@ -1261,7 +1236,7 @@ fn run_roundtrip_inner<R, W, F>(
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
-    F: Fn() -> (R, W),
+    F: Fn() -> (R, W) + Sync,
 {
     // io_uring path: single-threaded event loop using io_uring RECV/SEND.
     #[cfg(feature = "io-uring")]
@@ -1327,7 +1302,7 @@ fn run_epoll_roundtrip<R, W, F>(
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
-    F: Fn() -> (R, W),
+    F: Fn() -> (R, W) + Sync,
 {
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
@@ -1365,38 +1340,36 @@ fn run_epoll_roundtrip<R, W, F>(
         .collect();
     eprintln!("  frames generated for all {num_clients} clients");
 
-    // Connect and auth sequentially, attach pre-generated frames.
+    // Connect and auth all clients in parallel (reuses the rayon pool).
+    let setup_start = Instant::now();
+    let connected: Vec<(R, W)> = (0..num_clients)
+        .into_par_iter()
+        .map(|_| {
+            let (mut read_stream, write_stream) = connect();
+            auth_handshake(&mut read_stream, key);
+            (read_stream, write_stream)
+        })
+        .collect();
+    eprintln!(
+        "  all {num_clients} clients connected ({:.1}s)",
+        setup_start.elapsed().as_secs_f64(),
+    );
+
+    // Attach pre-generated frames and distribute round-robin across bench threads.
     let num_threads = bench_threads.min(num_clients);
     let mut thread_conns: Vec<Vec<BenchConnection<W>>> =
         (0..num_threads).map(|_| Vec::new()).collect();
-    let heartbeat = heartbeat_frame();
-    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
-    let mut last_keepalive = Instant::now();
 
-    for (client_id, (frames, total_orders)) in all_frames.into_iter().enumerate() {
-        if last_keepalive.elapsed() >= Duration::from_secs(10) {
-            keepalive_established(&write_fds, &heartbeat);
-            last_keepalive = Instant::now();
-        }
-
-        let (mut read_stream, write_stream) = connect();
-        auth_handshake(&mut read_stream, key);
-
+    for (client_id, ((read_stream, write_stream), (frames, total_orders))) in
+        connected.into_iter().zip(all_frames).enumerate()
+    {
         let fd = read_stream.as_raw_fd();
-        let write_fd = write_stream.as_raw_fd();
-        write_fds.push(write_fd);
         let writer = BlockingFrameWriter::new(write_stream);
 
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-
-        let client_pairs = if client_id == num_clients - 1 {
-            pairs_per_client + remainder
-        } else {
-            pairs_per_client
-        };
 
         let conn = BenchConnection {
             writer,
@@ -1580,7 +1553,7 @@ fn run_uring_roundtrip<R, W, F>(
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
-    F: Fn() -> (R, W),
+    F: Fn() -> (R, W) + Sync,
 {
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
@@ -1617,27 +1590,32 @@ fn run_uring_roundtrip<R, W, F>(
         .collect();
     eprintln!("  frames generated for all {num_clients} clients");
 
-    // Connect and auth sequentially, attach pre-generated frames.
-    let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
+    // Connect and auth all clients in parallel (reuses the rayon pool).
     let setup_start = Instant::now();
-    let heartbeat = heartbeat_frame();
-    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
-    let mut last_keepalive = Instant::now();
+    let connected: Vec<(R, W)> = (0..num_clients)
+        .into_par_iter()
+        .map(|_| {
+            let (mut read_stream, write_stream) = connect();
+            auth_handshake(&mut read_stream, key);
+            (read_stream, write_stream)
+        })
+        .collect();
+    eprintln!(
+        "  all {num_clients} clients connected ({:.1}s)",
+        setup_start.elapsed().as_secs_f64(),
+    );
 
-    for (frames, total_orders) in all_frames {
-        if last_keepalive.elapsed() >= Duration::from_secs(10) {
-            keepalive_established(&write_fds, &heartbeat);
-            last_keepalive = Instant::now();
-        }
+    let num_threads = bench_threads.min(num_clients);
 
-        let (mut read_stream, write_stream) = connect();
-        auth_handshake(&mut read_stream, key);
-
+    // Attach pre-generated frames and distribute round-robin across bench threads.
+    let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
+    for (i, ((read_stream, write_stream), (frames, total_orders))) in
+        connected.into_iter().zip(all_frames).enumerate()
+    {
         let read_fd = read_stream.as_raw_fd();
         let write_fd = write_stream.as_raw_fd();
-        write_fds.push(write_fd);
 
-        connections.push(UringBenchConn {
+        thread_conns[i % num_threads].push(UringBenchConn {
             read_fd,
             write_fd,
             _read_owner: Box::new(read_stream),
@@ -1654,19 +1632,6 @@ fn run_uring_roundtrip<R, W, F>(
             total_orders,
             done: false,
         });
-    }
-
-    eprintln!(
-        "  all {num_clients} clients ready ({:.1}s setup)",
-        setup_start.elapsed().as_secs_f64(),
-    );
-
-    let num_threads = bench_threads.min(num_clients);
-
-    // Distribute connections round-robin across bench threads.
-    let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
-    for (i, conn) in connections.into_iter().enumerate() {
-        thread_conns[i % num_threads].push(conn);
     }
 
     // Total measured orders (excluding warmup) for progress reporting.
