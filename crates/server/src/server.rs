@@ -151,37 +151,13 @@ pub struct ServerConfig {
     pub yield_idle: bool,
 }
 
+/// Delegates to clap so `#[arg(default_value...)]` is the single source of
+/// truth for every default.  Used by the bench crate for struct-literal
+/// construction with `..ServerConfig::default()`.
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self {
-            bind: "127.0.0.1:9876".parse().expect("valid default addr"),
-            journal: PathBuf::from("trading.journal"),
-            snapshot: None,
-            cores: PipelineCores {
-                journal: 1,
-                matching: 2,
-                response: 3,
-                repl_sender: 6,
-            },
-            readers: 2,
-            reader_cores: 4,
-            group_commit_us: 0,
-            heartbeat_interval_secs: 10,
-            connection_timeout_secs: 30,
-            max_connections: 1024,
-            accounts: 2,
-            instruments: 2,
-            authorized_keys: PathBuf::from("authorized_keys"),
-            max_journal_mib: 256,
-            replication_bind: None,
-            standalone: false,
-            replica_of: None,
-            replication_batch_size: 32,
-            max_journal_batch: 4096,
-            replication_heartbeat_secs: 5,
-            replication_ring_size: 256,
-            yield_idle: false,
-        }
+        use clap::Parser;
+        Self::parse_from(["melin-server"])
     }
 }
 
