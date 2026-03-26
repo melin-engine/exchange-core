@@ -13,9 +13,11 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 5 | Failover tests | High | Medium | ★★★☆☆ | Kill primary during load, promote replica, verify no data loss and clients can reconnect. Validates the manual promotion path under realistic conditions. |
 | 6 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
 | 7 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
-| 8 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
-| 9 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
-| 10 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
+| 8 | AF_XDP transport | High | High | ★★☆☆☆ | Kernel bypass via XDP sockets. Eliminates TCP syscall overhead. Requires decoupling the `io-uring` feature flag: currently it gates both journal I/O and transport. Must be able to use io_uring for journal fsync with AF_XDP for transport to benefit from both. |
+| 9 | DPDK transport | High | Very high | ★☆☆☆☆ | Full userspace networking via DPDK + smoltcp. Prototype on `feat/dpdk-bench` but blocked on Cherry's LACP/IOMMU. Needs bare metal with non-bonded switch ports. Same io_uring decoupling requirement as AF_XDP. |
+| 10 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
+| 11 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
+| 12 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
 
 ## Deferred
 
