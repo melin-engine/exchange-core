@@ -415,6 +415,8 @@ fn run_as_primary<L: BlockingTransportListener>(
         replication,
         replication_cursor,
         replica_connected,
+        _shadow_consumer,
+        _chain_hash_lock,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -425,6 +427,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         config.replication_ring_size,
         !config.yield_idle,
         enable_event_publisher,
+        false, // shadow snapshots: not yet wired
     );
     // Consumer 0 is always the response stage. Consumer 1 (if present)
     // is the event publisher — only created when --event-bind is set.
