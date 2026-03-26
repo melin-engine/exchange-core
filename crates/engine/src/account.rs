@@ -17,8 +17,8 @@
 //! commercial tradeoff.
 
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, HashMap, HashMap4, InstrumentSpec, Order, OrderId,
-    OrderType, Price, Quantity, RejectReason, Side,
+    AccountId, CurrencyId, ExecutionReport, HashMap4, InstrumentSpec, Order, OrderId, OrderType,
+    Price, Quantity, RejectReason, Side,
 };
 
 /// Per-currency balance for an account.

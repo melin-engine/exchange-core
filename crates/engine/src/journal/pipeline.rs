@@ -879,7 +879,7 @@ impl MatchingStage {
         let mut idle_spins: u32 = 0;
         // Thread-local events counter — plain u64 increment (~0.3ns) instead
         // of atomic fetch_add (~5-8ns). Flushed to the shared Arc<AtomicU64>
-        // only when QueryStats fires (~1/sec) or on shutdown.
+        // once per batch, on QueryStats, and on shutdown.
         let mut local_events: u64 = 0;
 
         let mut batch = [InputSlot::default(); MAX_MATCHING_BATCH];
@@ -1046,6 +1046,11 @@ impl MatchingStage {
                     recv_ts: slot.recv_ts,
                 });
             }
+
+            // Flush the thread-local counter once per batch so the health
+            // endpoint can observe progress. One Relaxed store per batch
+            // (~1ns) is negligible compared to per-event atomic increment.
+            self.events_processed.store(local_events, Ordering::Relaxed);
         }
     }
 

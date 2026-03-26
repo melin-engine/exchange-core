@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, ExecutionReport, HashMap, HashMap4, Order, OrderId, OrderType, Price, Quantity,
-    RejectReason, SelfTradeProtection, Side, TimeInForce,
+    AccountId, ExecutionReport, HashMap4, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    SelfTradeProtection, Side, TimeInForce,
 };
 
 /// A resting order on the book (the unfilled portion of a limit order).
