@@ -39,7 +39,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `trading.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `trading.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,6,7` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher` (comma-separated). Core 0 should be reserved for OS/IRQ. |
+| `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow` (comma-separated). Core 0 should be reserved for OS/IRQ. |
 | `--readers` | `2` | Number of epoll reader threads. Each multiplexes connections via epoll. |
 | `--reader-cores` | `4` | First CPU core for reader threads. Reader thread `i` is pinned to core `reader_cores + i`. |
 | `--max-journal-mib` | `256` | Maximum journal size in MiB before automatic rotation at startup. Set to `0` to disable. |
@@ -86,7 +86,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
     --health-bind 0.0.0.0:9877 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
-    --cores 1,2,3,6,7 \
+    --cores 1,2,3,6,7,8 \
     --readers 2 \
     --reader-cores 4 \
     --max-journal-mib 512 \
@@ -102,7 +102,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
     --health-bind 0.0.0.0:9877 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
-    --cores 1,2,3,6,7 \
+    --cores 1,2,3,6,7,8 \
     --readers 2 \
     --reader-cores 4 \
     --max-journal-mib 512 \
@@ -111,7 +111,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/trading.journal \
-    --cores 1,2,3,6,7 \
+    --cores 1,2,3,6,7,8 \
     --replica-of <primary-ip>:9878
 ```
 
@@ -126,7 +126,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
-    --cores 1,2,3,6,7 \
+    --cores 1,2,3,6,7,8 \
     --readers 2 \
     --reader-cores 4 \
     --standalone
@@ -357,7 +357,7 @@ The recommended core assignment for a production server:
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-- `--cores 1,2,3,6,7` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7.
+- `--cores 1,2,3,6,7,8` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7, shadow to core 8.
 - `--readers 2 --reader-cores 4` pins reader 0 to core 4, reader 1 to core 5.
 
 ### Kernel Boot Parameters (GRUB)
