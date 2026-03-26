@@ -34,5 +34,6 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Subscription management | Gateway concern — the engine broadcasts, the gateway filters per-subscriber. |
 | Iceberg orders | Niche — only matters for venues with institutional flow. |
 | Auction mechanisms | Regulated venues only. Massive complexity (state machine, indicative pricing, uncrossing). |
+| Dual / chain replication | Replicate to 2+ replicas for stronger durability guarantees. Chain replication (primary → replica A → replica B) reduces primary fan-out. Current architecture supports one replica only. |
 | Position/exposure limits | Important for derivatives, less so for spot. Defer until a derivatives buyer needs it. |
 | TLS | Most exchange deployments use VLAN instead. Only needed for compliance-driven buyers. |
