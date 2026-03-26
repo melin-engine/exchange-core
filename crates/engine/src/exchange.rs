@@ -13,7 +13,7 @@ use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
     InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side,
-    Symbol,
+    Symbol, TimeInForce,
 };
 
 /// Helper: get an immutable reference to the InstrumentState at `symbol`.
@@ -489,6 +489,25 @@ impl Exchange {
             }
         }
 
+        // GTD validation: GTD orders must have a non-zero expiry, and
+        // non-GTD orders must not carry an expiry timestamp.
+        if order.time_in_force == TimeInForce::GTD && order.expiry_ns == 0 {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                account: order.account,
+                reason: RejectReason::InvalidExpiry,
+            });
+            return;
+        }
+        if order.time_in_force != TimeInForce::GTD && order.expiry_ns != 0 {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                account: order.account,
+                reason: RejectReason::InvalidExpiry,
+            });
+            return;
+        }
+
         // Reserve funds before submitting to the matching engine.
         // Include a fee cushion for buy-side limit orders so fees can be
         // charged from the reservation even at the exact limit price.
@@ -647,6 +666,41 @@ impl Exchange {
             let report_start = reports.len();
 
             inst.book.cancel_day_orders(reports);
+
+            let new_reports = &reports[report_start..];
+            self.consumed_buf.clear();
+            self.accounts.process_reports(
+                new_reports,
+                &self.order_info,
+                &spec,
+                &mut self.consumed_buf,
+            );
+
+            for &(account, order_id) in &self.consumed_buf {
+                self.order_info.remove(&(account, order_id));
+                if let Some(count) = self.order_counts.get_mut(&account) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.order_counts.remove(&account);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel all GTD orders whose expiry time has passed across all
+    /// instruments. Same pattern as `end_of_day` — iterate instruments,
+    /// cancel expired orders on each book, then release reservations.
+    pub fn expire_orders(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
+        for idx in 0..self.instruments.len() {
+            let Some(inst) = self.instruments[idx].as_deref_mut() else {
+                continue;
+            };
+            let spec = inst.spec;
+
+            let report_start = reports.len();
+
+            inst.book.cancel_expired_orders(now_ns, reports);
 
             let new_reports = &reports[report_start..];
             self.consumed_buf.clear();
@@ -6400,5 +6454,260 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- GTD expiration tests --
+
+    #[test]
+    fn gtd_order_rejected_with_zero_expiry() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::InvalidExpiry,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_gtd_order_rejected_with_nonzero_expiry() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 5000,
+            },
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::InvalidExpiry,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expire_orders_cancels_gtd_and_releases_reservations() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 20_000);
+        exchange.deposit(ACCT_B, USD, 20_000);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: GTD order expiring at t=1000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 1000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_B: GTC order (should not be affected).
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Buy, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Expire at t=1000 — ACCT_A's GTD order should be cancelled.
+        exchange.expire_orders(1000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_A
+        ));
+
+        // ACCT_A's reservation fully released.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 20_000);
+        // ACCT_B's reservation still held.
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).reserved, 500);
+    }
+
+    #[test]
+    fn expire_orders_does_not_cancel_before_expiry() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+
+        // GTD order expiring at t=2000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 2000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Expire at t=1999 — should NOT cancel.
+        exchange.expire_orders(1999, &mut reports);
+        assert!(reports.is_empty());
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1000);
+    }
+
+    #[test]
+    fn cancel_replace_preserves_gtd_expiry() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 20_000);
+
+        let mut reports = Vec::new();
+
+        // Place GTD order expiring at t=5000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 5000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Cancel-replace to a new price.
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(90), qty(10), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
+        reports.clear();
+
+        // The order should still expire at t=5000 after the replace.
+        exchange.expire_orders(5000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn expire_orders_cancels_gtd_stop_order() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // GTD stop order expiring at t=3000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop {
+                    trigger_price: price(200),
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 3000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Expire at t=3000 — stop should be cancelled.
+        exchange.expire_orders(3000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+
+        // Reservation released.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
     }
 }
