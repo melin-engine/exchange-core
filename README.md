@@ -139,8 +139,8 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Authentication & Authorization ([docs/admin-guide.md](docs/admin-guide.md))
 - Client authentication (Ed25519 challenge-response handshake)
-- Four permission roles: Admin (full access), Trader (submit/cancel orders), Custodian (deposit/withdraw only), ReadOnly (heartbeats)
-- Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits, fee schedules, cancel-replace, live stats dashboard)
+- Four permission roles with separation of duties: Operator (exchange configuration), Trader (order submission/cancellation), Custodian (deposit/withdraw), ReadOnly (heartbeats)
+- Operator API (instrument management, circuit breaker controls, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
 - Idempotency for admin operations (per-key sequence numbers with duplicate rejection — safe to retry on timeout without double-applying)
 
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))

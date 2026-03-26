@@ -681,12 +681,12 @@ fn process_frames<R>(
             continue;
         }
 
-        // Enforce permissions: admin ops → Admin only,
-        // fund management → Admin or Custodian, trading → Admin or Trader.
-        if request.requires_admin() && !conn.permission.is_admin() {
+        // Enforce permissions: operator ops → Operator only,
+        // fund management → Custodian only, trading → Trader only.
+        if request.requires_operator() && !conn.permission.is_operator() {
             debug!(
                 connection_id = conn.connection_id,
-                "non-admin attempted admin command, dropping request"
+                "non-operator attempted admin command, dropping request"
             );
             continue;
         }
@@ -697,7 +697,7 @@ fn process_frames<R>(
             );
             continue;
         }
-        if !request.requires_admin()
+        if !request.requires_operator()
             && !request.is_fund_management()
             && !conn.permission.can_trade()
         {

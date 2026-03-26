@@ -2,7 +2,7 @@
 //!
 //! Includes both trading operations (submit/cancel) and administrative
 //! commands (add instrument, deposit, set risk limits). Administrative
-//! commands require `Permission::Admin` and are gated on the reader thread.
+//! commands require `Permission::Operator` and are gated on the reader thread.
 
 use melin_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
@@ -103,10 +103,10 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether this request requires `Permission::Admin`.
+    /// Whether this request requires `Permission::Operator`.
     /// Deposit and Withdraw are excluded — they require `can_manage_funds`
-    /// instead, which is satisfied by both Admin and Custodian.
-    pub fn requires_admin(&self) -> bool {
+    /// instead, which is satisfied by Custodian only.
+    pub fn requires_operator(&self) -> bool {
         matches!(
             self,
             Request::AddInstrument { .. }
@@ -119,7 +119,7 @@ impl Request {
     }
 
     /// Whether this request is a fund management operation (deposit/withdraw).
-    /// Requires `Permission::Admin` or `Permission::Custodian`.
+    /// Requires `Permission::Custodian`.
     pub fn is_fund_management(&self) -> bool {
         matches!(
             self,

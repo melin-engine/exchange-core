@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn auth_admin_permission() {
-        let keys = keys_with_test_key("admin");
+        let keys = keys_with_test_key("operator");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
 
@@ -1242,7 +1242,7 @@ mod tests {
         let resp = read_response(&mut s2);
         assert!(matches!(resp, ResponseKind::ServerReady));
 
-        assert_eq!(handle.join().unwrap().unwrap(), Permission::Admin);
+        assert_eq!(handle.join().unwrap().unwrap(), Permission::Operator);
     }
 
     #[test]
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn auth_bad_signature_sends_auth_failed() {
-        let keys = keys_with_test_key("admin");
+        let keys = keys_with_test_key("operator");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
 
