@@ -338,16 +338,19 @@ impl DpdkTransport {
         }
         batch.recycle(&mut self.device);
 
-        // Egress + maintenance. Device::receive() returns None since
-        // collect_rx_batch() drained all rx state — only socket_egress
-        // (dispatch_burst for multi-segment TX) and ARP/timer maintenance
-        // run.
-        self.iface
-            .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);
-        // Flush batched TX mbufs in a single tx_burst(N) call.
-        self.device.flush_tx();
-        self.check_listener();
-        self.flush_tx_queues();
+        // Egress + maintenance (TCP timers, ARP, socket_egress).
+        // Skip when idle: no RX data, no pending TX, and timers not due.
+        // Piggyback timer checks on the timestamp refresh interval.
+        let rx_had_data = !batch.is_empty();
+        let has_pending_tx = !self.tx_queues.is_empty()
+            && self.tx_queues.values().any(|q| q.queued_bytes() > 0);
+        if rx_had_data || has_pending_tx || self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
+            self.flush_tx_queues();
+            self.iface
+                .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);
+            self.device.flush_tx();
+            self.check_listener();
+        }
 
         self.cached_timestamp
     }
