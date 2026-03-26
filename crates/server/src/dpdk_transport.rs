@@ -108,9 +108,6 @@ pub fn run_dpdk_poll(
     let mut id_to_handle: HashMap<u64, SocketHandle> = HashMap::with_capacity(256);
     let mut next_connection_id: u64 = 1;
 
-    // Scratch buffer for reading from smoltcp sockets.
-    let mut read_buf = [0u8; MAX_FRAME_SIZE + 4];
-
     // Reusable handle buffer to avoid per-poll allocation.
     let mut handle_buf: Vec<SocketHandle> = Vec::with_capacity(256);
 
@@ -228,34 +225,10 @@ pub fn run_dpdk_poll(
                 continue;
             }
 
-            // Read available data from smoltcp socket.
-            let n = transport.recv(conn.handle, &mut read_buf);
-            if n == 0 {
-                if !transport.is_active(conn.handle) {
-                    debug!(
-                        connection_id = conn.connection_id.0,
-                        addr = %conn.addr,
-                        "DPDK: connection closed"
-                    );
-                    // Only notify response stage if auth completed.
-                    if matches!(conn.auth, AuthState::Authenticated { .. }) {
-                        let _ = control_tx.send(ControlEvent::Disconnected {
-                            connection_id: conn.connection_id.0,
-                        });
-                    }
-                    transport.close(conn.handle);
-                    id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections.remove(&handle) {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
-                }
-                }
-                continue;
-            }
-
             // Guard against unbounded buffer growth from slow/malicious clients.
+            // Check BEFORE recv so we don't append past the limit.
             const MAX_PARSE_BUF: usize = 65536;
-            if conn.parse_buf.len() + n > MAX_PARSE_BUF {
+            if conn.parse_buf.len() >= MAX_PARSE_BUF {
                 debug!(
                     connection_id = conn.connection_id.0,
                     buf_len = conn.parse_buf.len(),
@@ -272,7 +245,32 @@ pub fn run_dpdk_poll(
                 }
                 continue;
             }
-            conn.parse_buf.extend_from_slice(&read_buf[..n]);
+
+            // Read available data directly into the connection's parse buffer,
+            // skipping the intermediate read_buf copy.
+            let n = transport.recv_into_vec(conn.handle, &mut conn.parse_buf);
+            if n == 0 {
+                if !transport.is_active(conn.handle) {
+                    debug!(
+                        connection_id = conn.connection_id.0,
+                        addr = %conn.addr,
+                        "DPDK: connection closed"
+                    );
+                    // Only notify response stage if auth completed.
+                    if matches!(conn.auth, AuthState::Authenticated { .. }) {
+                        let _ = control_tx.send(ControlEvent::Disconnected {
+                            connection_id: conn.connection_id.0,
+                        });
+                    }
+                    transport.close(conn.handle);
+                    id_to_handle.remove(&conn.connection_id.0);
+                    if let Some(mut removed) = connections.remove(&handle) {
+                        removed.parse_buf.clear();
+                        parse_buf_pool.push(removed.parse_buf);
+                    }
+                }
+                continue;
+            }
 
             // Process frames based on auth state.
             match &conn.auth {

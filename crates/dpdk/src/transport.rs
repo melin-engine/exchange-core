@@ -432,13 +432,38 @@ impl DpdkTransport {
         std::mem::take(&mut self.accepted)
     }
 
-    /// Read available data from a connection.
+    /// Read available data from a connection into an external buffer.
     pub fn recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> usize {
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
         if !socket.can_recv() {
             return 0;
         }
         socket.recv_slice(buf).unwrap_or(0)
+    }
+
+    /// Append available data from a connection directly into a Vec,
+    /// eliminating the intermediate copy through a stack buffer.
+    /// Returns the number of bytes appended, or 0 if nothing available
+    /// or the dest buffer can't grow (allocation failure).
+    pub fn recv_into_vec(&mut self, handle: SocketHandle, dest: &mut Vec<u8>) -> usize {
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        if !socket.can_recv() {
+            return 0;
+        }
+        // Use recv() with closure to access smoltcp's internal buffer
+        // directly and copy once into dest.
+        socket
+            .recv(|data| {
+                // Pre-reserve to avoid panic inside the closure. If the
+                // Vec can't grow, consume 0 bytes so smoltcp retains
+                // them for the next poll — no data loss.
+                if dest.try_reserve(data.len()).is_err() {
+                    return (0, 0);
+                }
+                dest.extend_from_slice(data);
+                (data.len(), data.len())
+            })
+            .unwrap_or(0)
     }
 
     /// Queue data to be sent on a connection. Returns false if the
