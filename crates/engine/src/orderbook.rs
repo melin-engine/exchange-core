@@ -20,8 +20,10 @@ pub(crate) struct RestingOrder {
     remaining: Quantity,
     /// Stored to support selective cancellation (e.g., EndOfDay cancels
     /// only Day orders, not GTC). IOC/FOK orders never rest, so this
-    /// is always GTC or Day in practice.
+    /// is always GTC, Day, or GTD in practice.
     time_in_force: TimeInForce,
+    /// Expiry time in nanoseconds (GTD orders). Zero for non-GTD.
+    expiry_ns: u64,
 }
 
 /// A pending stop order waiting to be triggered.
@@ -42,6 +44,8 @@ pub(crate) struct PendingStop {
     quote_budget: Option<u64>,
     /// Self-trade prevention mode, preserved from the original order.
     stp: SelfTradeProtection,
+    /// Expiry time in nanoseconds (GTD orders). Zero for non-GTD.
+    expiry_ns: u64,
 }
 
 /// One side of the order book (either all bids or all asks).
@@ -66,12 +70,14 @@ impl RestingOrder {
         account: AccountId,
         remaining: Quantity,
         time_in_force: TimeInForce,
+        expiry_ns: u64,
     ) -> Self {
         Self {
             id,
             account,
             remaining,
             time_in_force,
+            expiry_ns,
         }
     }
 
@@ -90,6 +96,10 @@ impl RestingOrder {
     pub(crate) fn time_in_force(&self) -> TimeInForce {
         self.time_in_force
     }
+
+    pub(crate) fn expiry_ns(&self) -> u64 {
+        self.expiry_ns
+    }
 }
 
 impl PendingStop {
@@ -105,6 +115,7 @@ impl PendingStop {
         limit_price: Option<Price>,
         quote_budget: Option<u64>,
         stp: SelfTradeProtection,
+        expiry_ns: u64,
     ) -> Self {
         Self {
             id,
@@ -116,6 +127,7 @@ impl PendingStop {
             limit_price,
             quote_budget,
             stp,
+            expiry_ns,
         }
     }
 
@@ -153,6 +165,10 @@ impl PendingStop {
 
     pub(crate) fn stp(&self) -> SelfTradeProtection {
         self.stp
+    }
+
+    pub(crate) fn expiry_ns(&self) -> u64 {
+        self.expiry_ns
     }
 }
 
@@ -816,9 +832,10 @@ impl OrderBook {
                     });
                 } else {
                     match order.time_in_force {
-                        // GTC and Day both rest on the book. Day orders are
-                        // bulk-cancelled later by EndOfDay.
-                        TimeInForce::GTC | TimeInForce::Day => {
+                        // GTC, Day, and GTD all rest on the book. Day orders
+                        // are bulk-cancelled by EndOfDay; GTD orders are
+                        // bulk-cancelled by ExpireOrders.
+                        TimeInForce::GTC | TimeInForce::Day | TimeInForce::GTD => {
                             self.place_on_book(
                                 order.id,
                                 order.account,
@@ -826,6 +843,7 @@ impl OrderBook {
                                 price,
                                 rem,
                                 order.time_in_force,
+                                order.expiry_ns,
                                 reports,
                             );
                         }
@@ -1106,6 +1124,7 @@ impl OrderBook {
             limit_price,
             quote_budget,
             stp: order.stp,
+            expiry_ns: order.expiry_ns,
         };
         let stops = match order.side {
             Side::Buy => &mut self.stop_buys,
@@ -1196,6 +1215,7 @@ impl OrderBook {
                 time_in_force: stop.time_in_force,
                 quantity: stop.quantity,
                 stp: stop.stp,
+                expiry_ns: stop.expiry_ns,
             };
 
             // Re-enter execute but skip check_triggers to avoid recursion —
@@ -1213,6 +1233,7 @@ impl OrderBook {
         self.triggered_buf = triggered;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn place_on_book(
         &mut self,
         id: OrderId,
@@ -1221,6 +1242,7 @@ impl OrderBook {
         price: Price,
         quantity: Quantity,
         time_in_force: TimeInForce,
+        expiry_ns: u64,
         reports: &mut Vec<ExecutionReport>,
     ) {
         let book_side = match side {
@@ -1234,6 +1256,7 @@ impl OrderBook {
                 account,
                 remaining: quantity,
                 time_in_force,
+                expiry_ns,
             },
         );
         self.order_index.insert((account, id), (side, price));
@@ -1297,6 +1320,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -1309,6 +1333,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -2059,6 +2084,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -2081,6 +2107,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 

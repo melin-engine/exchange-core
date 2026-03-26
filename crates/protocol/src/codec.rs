@@ -95,6 +95,7 @@ const REJECT_POST_ONLY_WOULD_CROSS: u8 = 13;
 const REJECT_HAS_RESTING_ORDERS: u8 = 14;
 const REJECT_DUPLICATE_REQUEST: u8 = 15;
 const REJECT_REPLICA_DISCONNECTED: u8 = 16;
+const REJECT_INVALID_EXPIRY: u8 = 17;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
@@ -768,6 +769,7 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
             time_in_force,
             quantity: Quantity(quantity),
             stp,
+            expiry_ns: 0,
         },
     ))
 }
@@ -1027,6 +1029,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::HasRestingOrders => REJECT_HAS_RESTING_ORDERS,
         RejectReason::DuplicateRequest => REJECT_DUPLICATE_REQUEST,
         RejectReason::ReplicaDisconnected => REJECT_REPLICA_DISCONNECTED,
+        RejectReason::InvalidExpiry => REJECT_INVALID_EXPIRY,
     }
 }
 
@@ -1049,6 +1052,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_HAS_RESTING_ORDERS => Ok(RejectReason::HasRestingOrders),
         REJECT_DUPLICATE_REQUEST => Ok(RejectReason::DuplicateRequest),
         REJECT_REPLICA_DISCONNECTED => Ok(RejectReason::ReplicaDisconnected),
+        REJECT_INVALID_EXPIRY => Ok(RejectReason::InvalidExpiry),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1077,6 +1081,7 @@ mod tests {
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
                     stp: SelfTradeProtection::CancelNewest,
+                    expiry_ns: 0,
                 },
             },
             Request::SubmitOrder {
@@ -1089,6 +1094,7 @@ mod tests {
                     time_in_force: TimeInForce::IOC,
                     quantity: Quantity(nz(5)),
                     stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
                 },
             },
             Request::SubmitOrder {
@@ -1103,6 +1109,7 @@ mod tests {
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(20)),
                     stp: SelfTradeProtection::CancelOldest,
+                    expiry_ns: 0,
                 },
             },
             Request::SubmitOrder {
@@ -1118,6 +1125,7 @@ mod tests {
                     time_in_force: TimeInForce::FOK,
                     quantity: Quantity(nz(15)),
                     stp: SelfTradeProtection::CancelBoth,
+                    expiry_ns: 0,
                 },
             },
             Request::CancelOrder {

@@ -381,6 +381,7 @@ impl App {
             time_in_force: tif,
             quantity: qty,
             stp: SelfTradeProtection::default(),
+            expiry_ns: 0,
         };
 
         let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
@@ -489,6 +490,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
                 RejectReason::ReplicaDisconnected => "replica disconnected",
+                RejectReason::InvalidExpiry => "invalid expiry",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

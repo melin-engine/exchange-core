@@ -226,6 +226,7 @@ pub(crate) struct RestingOrderSnapshot {
     pub(crate) account: AccountId,
     pub(crate) remaining: Quantity,
     pub(crate) time_in_force: TimeInForce,
+    pub(crate) expiry_ns: u64,
 }
 
 /// Serialized pending stop.
@@ -242,6 +243,8 @@ pub(crate) struct PendingStopSnapshot {
     pub(crate) quote_budget: Option<u64>,
     /// Self-trade prevention mode.
     pub(crate) stp: crate::types::SelfTradeProtection,
+    /// Expiry time in nanoseconds (GTD orders). Zero for non-GTD.
+    pub(crate) expiry_ns: u64,
 }
 
 // --- Encoding helpers ---
@@ -930,6 +933,7 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
                 account,
                 remaining: Quantity(remaining_val),
                 time_in_force,
+                expiry_ns: 0,
             });
             pos += 21;
         }
@@ -1043,6 +1047,7 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 limit_price,
                 quote_budget,
                 stp,
+                expiry_ns: 0,
             });
         }
         levels.push((Price(trigger_val), stops));
@@ -1179,6 +1184,7 @@ impl OrderBook {
                                 account: o.account(),
                                 remaining: o.remaining(),
                                 time_in_force: o.time_in_force(),
+                                expiry_ns: o.expiry_ns(),
                             })
                             .collect();
                         (price, orders)
@@ -1202,6 +1208,7 @@ impl OrderBook {
                             limit_price: s.limit_price(),
                             quote_budget: s.quote_budget(),
                             stp: s.stp(),
+                            expiry_ns: s.expiry_ns(),
                         })
                         .collect();
                     (trigger_price, snaps)
@@ -1236,6 +1243,7 @@ impl OrderBook {
                                 o.account,
                                 o.remaining,
                                 o.time_in_force,
+                                o.expiry_ns,
                             )
                         })
                         .collect();
@@ -1261,6 +1269,7 @@ impl OrderBook {
                             s.limit_price,
                             s.quote_budget,
                             s.stp,
+                            s.expiry_ns,
                         )
                     })
                     .collect();
@@ -1334,6 +1343,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 

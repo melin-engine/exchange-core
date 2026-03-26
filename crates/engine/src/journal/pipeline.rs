@@ -1429,6 +1429,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: Quantity(NonZeroU64::new(qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 

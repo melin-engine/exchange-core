@@ -1014,6 +1014,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -1026,6 +1027,7 @@ mod tests {
             time_in_force: TimeInForce::IOC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -1329,6 +1331,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp,
+            expiry_ns: 0,
         }
     }
 
@@ -1347,6 +1350,7 @@ mod tests {
             time_in_force: TimeInForce::IOC,
             quantity: qty(q),
             stp,
+            expiry_ns: 0,
         }
     }
 
@@ -2758,6 +2762,7 @@ mod tests {
                 time_in_force: TimeInForce::IOC,
                 quantity: qty(5),
                 stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3043,6 +3048,7 @@ mod tests {
                 time_in_force: TimeInForce::IOC,
                 quantity: qty(1000),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3197,6 +3203,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3726,6 +3733,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3752,6 +3760,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3796,6 +3805,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3822,6 +3832,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -3866,6 +3877,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -5250,6 +5262,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -5740,6 +5753,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(NonZeroU64::new(10).unwrap()),
                 stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -5759,6 +5773,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(NonZeroU64::new(10).unwrap()),
                 stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -5791,6 +5806,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(NonZeroU64::new(10).unwrap()),
                 stp: SelfTradeProtection::CancelOldest,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -5811,6 +5827,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(NonZeroU64::new(10).unwrap()),
                 stp: SelfTradeProtection::CancelOldest,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -5942,6 +5959,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(1),
                 stp: SelfTradeProtection::default(),
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -5970,6 +5988,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(1),
                 stp: SelfTradeProtection::default(),
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -6159,6 +6178,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(10),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         exchange.execute(Symbol(1), stop_a, &mut reports);
         reports.clear();
@@ -6173,6 +6193,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(5),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         exchange.execute(Symbol(1), stop_b, &mut reports);
         reports.clear();
@@ -6344,6 +6365,7 @@ mod tests {
                 time_in_force: TimeInForce::Day,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );
@@ -6362,6 +6384,7 @@ mod tests {
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(5),
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
             &mut reports,
         );

@@ -267,6 +267,7 @@ fn run_book_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -286,6 +287,7 @@ fn run_book_actions(
                     time_in_force: TimeInForce::IOC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -308,6 +310,7 @@ fn run_book_actions(
                     time_in_force: TimeInForce::GTC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -333,6 +336,7 @@ fn run_book_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -522,6 +526,7 @@ fn run_exchange_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -545,6 +550,7 @@ fn run_exchange_actions(
                     time_in_force: TimeInForce::IOC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -571,6 +577,7 @@ fn run_exchange_actions(
                     time_in_force: TimeInForce::GTC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -600,6 +607,7 @@ fn run_exchange_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -899,6 +907,7 @@ proptest! {
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             };
             book.execute(order, None, &mut reports);
         }
@@ -912,6 +921,7 @@ proptest! {
             time_in_force: TimeInForce::IOC,
             quantity: Quantity(NonZeroU64::new(market_qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         book.execute(market, None, &mut reports);
 
@@ -964,6 +974,7 @@ proptest! {
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             };
             book.execute(order, None, &mut reports);
         }
@@ -977,6 +988,7 @@ proptest! {
             time_in_force: TimeInForce::IOC,
             quantity: Quantity(NonZeroU64::new(market_qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         book.execute(market, None, &mut reports);
 
@@ -1077,6 +1089,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         let _ = mgr.try_reserve(&buy, &spec, 0);
 
@@ -1089,6 +1102,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         let _ = mgr.try_reserve(&sell, &spec, 0);
     }
@@ -1116,6 +1130,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         let sell = Order {
             id: OrderId(2),
@@ -1125,6 +1140,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
 
         let buy_res = mgr.try_reserve(&buy, &spec, 0);

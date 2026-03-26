@@ -911,6 +911,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
             time_in_force,
             quantity: Quantity(quantity),
             stp,
+            expiry_ns: 0,
         },
     ))
 }
@@ -952,6 +953,7 @@ mod tests {
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
                     stp: SelfTradeProtection::CancelNewest,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -964,6 +966,7 @@ mod tests {
                     time_in_force: TimeInForce::IOC,
                     quantity: Quantity(nz(5)),
                     stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -978,6 +981,7 @@ mod tests {
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(20)),
                     stp: SelfTradeProtection::CancelOldest,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -993,6 +997,7 @@ mod tests {
                     time_in_force: TimeInForce::FOK,
                     quantity: Quantity(nz(15)),
                     stp: SelfTradeProtection::CancelBoth,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::CancelOrder {
