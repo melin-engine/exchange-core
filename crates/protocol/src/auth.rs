@@ -13,31 +13,42 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 /// Permission level assigned to an authenticated connection.
 ///
-/// Uses a simple three-tier model: Admin > Trader > ReadOnly.
+/// Four-tier model: Admin > Trader > Custodian > ReadOnly.
 /// Checked on the reader thread (cold per-request check) with zero
 /// cost on the matching engine hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
-    /// Full access including future admin commands (circuit breakers,
-    /// instrument management, kill switch for other accounts).
+    /// Full access: trading, fund management, and admin operations
+    /// (circuit breakers, instrument management, risk limits, kill switch).
     Admin,
-    /// Submit/cancel orders, heartbeats — all current `Request` types.
+    /// Submit/cancel orders and heartbeats. Cannot perform admin ops
+    /// or fund management (deposit/withdraw).
     Trader,
+    /// Deposit and withdraw only. Cannot trade or perform admin ops.
+    /// Separates fund management from trading and exchange administration.
+    Custodian,
     /// Heartbeats only. Future: market data subscriptions.
     ReadOnly,
 }
 
 impl Permission {
     /// Whether this permission level allows trading operations
-    /// (submit order, cancel order, cancel all).
+    /// (submit order, cancel order, cancel all, cancel-replace).
     pub fn can_trade(self) -> bool {
         matches!(self, Permission::Admin | Permission::Trader)
     }
 
     /// Whether this permission level allows administrative operations
-    /// (add instrument, deposit, set risk limits).
+    /// (add instrument, set risk limits, circuit breakers, fee schedules,
+    /// end-of-day, query stats).
     pub fn is_admin(self) -> bool {
         matches!(self, Permission::Admin)
+    }
+
+    /// Whether this permission level allows fund management operations
+    /// (deposit, withdraw).
+    pub fn can_manage_funds(self) -> bool {
+        matches!(self, Permission::Admin | Permission::Custodian)
     }
 }
 
@@ -89,10 +100,11 @@ impl AuthorizedKeys {
             let permission = match perm_str {
                 "admin" => Permission::Admin,
                 "trader" => Permission::Trader,
+                "custodian" => Permission::Custodian,
                 "readonly" => Permission::ReadOnly,
                 other => {
                     return Err(format!(
-                        "line {}: unknown permission '{}' (expected admin/trader/readonly)",
+                        "line {}: unknown permission '{}' (expected admin/trader/custodian/readonly)",
                         line_num + 1,
                         other
                     ));
@@ -197,6 +209,7 @@ admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
     fn permission_can_trade() {
         assert!(Permission::Admin.can_trade());
         assert!(Permission::Trader.can_trade());
+        assert!(!Permission::Custodian.can_trade());
         assert!(!Permission::ReadOnly.can_trade());
     }
 
@@ -204,7 +217,24 @@ admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
     fn permission_is_admin() {
         assert!(Permission::Admin.is_admin());
         assert!(!Permission::Trader.is_admin());
+        assert!(!Permission::Custodian.is_admin());
         assert!(!Permission::ReadOnly.is_admin());
+    }
+
+    #[test]
+    fn permission_can_manage_funds() {
+        assert!(Permission::Admin.can_manage_funds());
+        assert!(!Permission::Trader.can_manage_funds());
+        assert!(Permission::Custodian.can_manage_funds());
+        assert!(!Permission::ReadOnly.can_manage_funds());
+    }
+
+    #[test]
+    fn custodian_key_parsed_from_file() {
+        let content = "custodian AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= treasury\n";
+        let keys = AuthorizedKeys::parse(content).unwrap();
+        let pub_key = [0u8; 32];
+        assert_eq!(keys.lookup(&pub_key), Some(Permission::Custodian));
     }
 
     #[test]

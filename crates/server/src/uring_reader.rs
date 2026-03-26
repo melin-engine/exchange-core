@@ -681,7 +681,8 @@ fn process_frames<R>(
             continue;
         }
 
-        // Enforce permissions.
+        // Enforce permissions: admin ops → Admin only,
+        // fund management → Admin or Custodian, trading → Admin or Trader.
         if request.requires_admin() && !conn.permission.is_admin() {
             debug!(
                 connection_id = conn.connection_id,
@@ -689,10 +690,20 @@ fn process_frames<R>(
             );
             continue;
         }
-        if !request.requires_admin() && !conn.permission.can_trade() {
+        if request.is_fund_management() && !conn.permission.can_manage_funds() {
             debug!(
                 connection_id = conn.connection_id,
-                "read-only connection attempted trade, dropping request"
+                "non-custodian attempted fund management, dropping request"
+            );
+            continue;
+        }
+        if !request.requires_admin()
+            && !request.is_fund_management()
+            && !conn.permission.can_trade()
+        {
+            debug!(
+                connection_id = conn.connection_id,
+                "connection lacks trading permission, dropping request"
             );
             continue;
         }

@@ -7,7 +7,7 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 1 | Manual promotion | High | Medium | ★★★☆☆ | "How do I failover?" is a deal-breaker question. Admin command to promote replica. |
 | 2 | Output event channel | High | Medium | ★★★☆☆ | Prerequisite for market data, audit trail, and replica analytics. Unlocks many downstream features. |
 | 3 | GTD TIF | Low | Very low | ★★★☆☆ | Easy add, nice checkbox. Less asked-for than Day. |
-| 4 | Custodian role | Medium | Low | ★★★☆☆ | Separation of duties matters for regulated buyers. Small auth change. |
+| 4 | Revoke Admin fund access | Medium | Low | ★★★☆☆ | Admin currently has full access including deposit/withdraw. Should be renamed to Operations and lose fund management — only Custodian should manage funds. Principle of least privilege. |
 | 5 | Per-account trading permissions | Medium | Medium | ★★★☆☆ | Multi-tenant deployments need account-level access control. |
 | 6 | Order throttling | Medium | Low | ★★★☆☆ | SEC-04 audit finding. Simple per-account counter on the hot path. |
 | 7 | Snapshot schedule | Medium | Low | ★★★☆☆ | Operators don't want to trigger snapshots manually. Timer + existing save logic. |

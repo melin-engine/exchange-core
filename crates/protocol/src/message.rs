@@ -104,17 +104,26 @@ pub enum Request {
 
 impl Request {
     /// Whether this request requires `Permission::Admin`.
+    /// Deposit and Withdraw are excluded — they require `can_manage_funds`
+    /// instead, which is satisfied by both Admin and Custodian.
     pub fn requires_admin(&self) -> bool {
         matches!(
             self,
             Request::AddInstrument { .. }
-                | Request::Deposit { .. }
-                | Request::Withdraw { .. }
                 | Request::SetRiskLimits { .. }
                 | Request::SetCircuitBreaker { .. }
                 | Request::SetFeeSchedule { .. }
                 | Request::EndOfDay
                 | Request::QueryStats
+        )
+    }
+
+    /// Whether this request is a fund management operation (deposit/withdraw).
+    /// Requires `Permission::Admin` or `Permission::Custodian`.
+    pub fn is_fund_management(&self) -> bool {
+        matches!(
+            self,
+            Request::Deposit { .. } | Request::Withdraw { .. }
         )
     }
 }
