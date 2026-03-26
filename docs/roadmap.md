@@ -38,3 +38,4 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Tiered fee schedules | Volume-based tiers and per-account overrides. Can be implemented outside Melin — a fee service looks up the account's tier and sets the rate via the existing per-instrument fee API. |
 | TLS | Most exchange deployments use VLAN instead. Only needed for compliance-driven buyers. |
 | Hybrid UDP multicast + TCP recovery for event channel | Current event channel is pure TCP. Multicast would reduce latency for co-located subscribers but adds complexity (gap detection, retransmit). Defer until a buyer needs sub-microsecond market data. |
+| Brand setup (domain, GitHub org, email) | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
