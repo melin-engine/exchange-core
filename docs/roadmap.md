@@ -14,11 +14,10 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 6 | Failover tests | High | Medium | ★★★☆☆ | Kill primary during load, promote replica, verify no data loss and clients can reconnect. Validates the manual promotion path under realistic conditions. |
 | 7 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
 | 8 | Tiered fee schedules | Medium | Medium | ★★☆☆☆ | Nice-to-have — most buyers customize fees anyway. |
-| 9 | Position/exposure limits | Medium | Medium | ★★☆☆☆ | Important for derivatives, less so for spot. |
-| 10 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
-| 11 | Failover detection + promotion | High | Very high | ★☆☆☆☆ | Leader election, split-brain — distributed systems hard mode. |
-| 12 | Network partition handling | High | Very high | ★☆☆☆☆ | Fencing, quorum. Same as above — extremely complex. |
-| 13 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
+| 9 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
+| 10 | Failover detection + promotion | High | Very high | ★☆☆☆☆ | Leader election, split-brain — distributed systems hard mode. |
+| 11 | Network partition handling | High | Very high | ★☆☆☆☆ | Fencing, quorum. Same as above — extremely complex. |
+| 12 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
 
 ## Deferred
 
@@ -35,4 +34,5 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Subscription management | Gateway concern — the engine broadcasts, the gateway filters per-subscriber. |
 | Iceberg orders | Niche — only matters for venues with institutional flow. |
 | Auction mechanisms | Regulated venues only. Massive complexity (state machine, indicative pricing, uncrossing). |
+| Position/exposure limits | Important for derivatives, less so for spot. Defer until a derivatives buyer needs it. |
 | TLS | Most exchange deployments use VLAN instead. Only needed for compliance-driven buyers. |
