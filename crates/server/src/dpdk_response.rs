@@ -91,7 +91,7 @@ pub fn run(
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
-    mut tx_out: spsc::Producer<TxFrame>,
+    mut tx_producers: Vec<spsc::Producer<TxFrame>>,
 ) {
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
@@ -153,7 +153,8 @@ pub fn run(
                             frame.len = heartbeat_len as u16;
                             frame.data[..heartbeat_len]
                                 .copy_from_slice(&heartbeat_frame[..heartbeat_len]);
-                            if tx_out.try_publish(frame).is_err() {
+                            let tid = (conn_id >> 56) as usize % tx_producers.len();
+                            if tx_producers[tid].try_publish(frame).is_err() {
                                 // SPSC full — DPDK poll thread fell behind.
                                 failed.push(conn_id);
                                 continue;
@@ -243,7 +244,8 @@ pub fn run(
             frame.connection_id = slot.connection_id;
             frame.len = written as u16;
             frame.data[..written].copy_from_slice(&encode_buf[..written]);
-            tx_out.publish(frame);
+            let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
+            tx_producers[tid].publish(frame);
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
                 state.last_send = batch_now;

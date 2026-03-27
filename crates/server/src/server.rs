@@ -1105,7 +1105,18 @@ pub fn run_dpdk(
     // Lock-free, fixed-size slots — no heap allocation per frame.
     // 4096 slots × ~140 bytes = ~560 KiB. Enough to buffer a burst
     // without backpressuring the response stage.
-    let (tx_out, tx_rx) = melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
+    // One SPSC channel per DPDK poll thread. The response stage routes
+    // frames to the correct thread based on thread_id encoded in
+    // connection_id bits 56..63.
+    let num_dpdk_threads = config.readers as usize;
+    let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
+    let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
+    for _ in 0..num_dpdk_threads {
+        let (tx_out, tx_rx) =
+            melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
+        tx_producers.push(tx_out);
+        tx_consumers.push(tx_rx);
+    }
 
     // Spawn pipeline threads (journal, matching — identical to epoll path).
     let cores = config.cores;
@@ -1146,7 +1157,7 @@ pub fn run_dpdk(
                 &s3,
                 heartbeat_interval,
                 active_connections_response,
-                tx_out,
+                tx_producers,
             );
         })
         .expect("failed to spawn response thread");
@@ -1301,13 +1312,13 @@ pub fn run_dpdk(
         transport,
         input_producer,
         control_tx,
-        tx_rx,
+        tx_consumers.remove(0),
         &shutdown,
         authorized_keys,
         config.connection_timeout(),
         config.max_connections,
         Arc::clone(&active_connections),
-        0, // thread_id — single thread for now, RSS will spawn N threads
+        0, // thread_id — single thread for now, Step 8 will spawn N threads
     );
 
     // Shutdown sequence.
