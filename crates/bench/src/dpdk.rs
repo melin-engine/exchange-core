@@ -606,12 +606,13 @@ fn dpdk_auth_all(
                 continue;
             }
 
-            let payload = conn.parse_buf[4..4 + frame_len].to_vec();
-            conn.parse_buf.drain(..4 + frame_len);
+            // Borrow payload directly from parse_buf — no allocation needed.
+            // Use a cursor approach: process the frame, then compact once.
+            let consumed = 4 + frame_len;
 
             match &phases[i] {
                 AuthPhase::WaitChallenge => {
-                    let response = codec::decode_response(&payload).expect("decode Challenge");
+                    let response = codec::decode_response(&conn.parse_buf[4..consumed]).expect("decode Challenge");
                     let nonce = match response {
                         ResponseKind::Challenge { nonce } => nonce,
                         other => panic!("client {i}: expected Challenge, got {other:?}"),
@@ -635,7 +636,7 @@ fn dpdk_auth_all(
                     phases[i] = AuthPhase::WaitServerReady;
                 }
                 AuthPhase::WaitServerReady => {
-                    let response = codec::decode_response(&payload).expect("decode ServerReady");
+                    let response = codec::decode_response(&conn.parse_buf[4..consumed]).expect("decode ServerReady");
                     assert!(
                         matches!(response, ResponseKind::ServerReady),
                         "client {i}: expected ServerReady, got {response:?}"
@@ -644,6 +645,9 @@ fn dpdk_auth_all(
                 }
                 AuthPhase::Done => unreachable!(),
             }
+
+            // Compact parse buffer after processing the frame.
+            conn.parse_buf.drain(..consumed);
         }
 
         if all_done {
