@@ -528,6 +528,7 @@ pub fn run_dpdk_roundtrip(
         &extra_lines,
         json_path,
         &series,
+        &[], // no health samples in DPDK mode
     );
 }
 

@@ -18,6 +18,7 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 - Write unit tests for all non-trivial code. Skip only when genuinely unreasonable (e.g., trivial glue code).
 - **Correctness is critical** — the matching engine is financial infrastructure. Correctness always comes first.
 - **Reasonably optimized from the start** — don't prematurely optimize, but make performance-conscious choices by default: minimize allocations, avoid locks on the hot path, favor cache-friendly data structures. Profile before micro-optimizing.
+- **Always `cargo check` before committing** — run `cargo check` with the correct feature flags for all affected crates before committing. For DPDK code, check with `--features dpdk --no-default-features` on both server and bench.
 - **No `.unwrap()` in production code** — use proper error handling. `.unwrap()` is fine in tests.
 - **No `#[ignore]` on tests** — if a test fails, fix the bug. Never suppress a failing test with `#[ignore]`.
 - **No silently ignored results** — do not use `let _ =` to discard `Result` values unless there is a clear reason (e.g., best-effort diagnostic writes). Handle errors explicitly.

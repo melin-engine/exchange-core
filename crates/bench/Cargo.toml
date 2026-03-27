@@ -9,7 +9,7 @@ no-fsync = ["melin-engine/no-fsync"]
 no-persist = ["melin-server/no-persist"]
 latency-trace = ["melin-server/latency-trace"]
 io-uring = ["melin-server/io-uring", "dep:io-uring"]
-dpdk = ["dep:melin-dpdk", "dep:smoltcp"]
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]
 pipeline-stats = ["melin-server/pipeline-stats"]
 plot = ["dep:plotters"]
 
