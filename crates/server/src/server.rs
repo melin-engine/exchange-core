@@ -1307,6 +1307,7 @@ pub fn run_dpdk(
         config.connection_timeout(),
         config.max_connections,
         Arc::clone(&active_connections),
+        0, // thread_id — single thread for now, RSS will spawn N threads
     );
 
     // Shutdown sequence.

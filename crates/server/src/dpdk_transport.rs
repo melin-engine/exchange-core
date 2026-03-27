@@ -107,6 +107,7 @@ pub fn run_dpdk_poll(
     connection_timeout: Option<Duration>,
     max_connections: u64,
     active_connections: Arc<std::sync::atomic::AtomicU64>,
+    thread_id: u8,
 ) {
     // Map from smoltcp SocketHandle → connection state.
     let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
@@ -154,7 +155,9 @@ pub fn run_dpdk_poll(
                 continue;
             }
 
-            let conn_id = ConnectionId(next_connection_id);
+            // Encode thread_id in bits 56..63 of connection_id for O(1)
+            // response routing. Bits 0..55 are the per-thread sequence.
+            let conn_id = ConnectionId((thread_id as u64) << 56 | next_connection_id);
             next_connection_id += 1;
 
             debug!(
