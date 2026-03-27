@@ -85,6 +85,9 @@ struct ConnectionState {
     /// Incremental frame parsing state: accumulates bytes until a
     /// complete length-prefixed frame is available.
     parse_buf: Vec<u8>,
+    /// Last time data was received from this connection. Used for
+    /// idle timeout (drops connections that stop sending).
+    last_activity: Instant,
 }
 
 /// Run the DPDK poll loop.
@@ -101,6 +104,7 @@ pub fn run_dpdk_poll(
     mut tx_rx: melin_disruptor::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
     authorized_keys: Arc<AuthorizedKeys>,
+    connection_timeout: Option<Duration>,
 ) {
     // Map from smoltcp SocketHandle → connection state.
     let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
@@ -170,6 +174,7 @@ pub fn run_dpdk_poll(
                     parse_buf: parse_buf_pool
                         .pop()
                         .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                    last_activity: Instant::now(),
                 },
             );
         }
@@ -248,6 +253,9 @@ pub fn run_dpdk_poll(
             // Read directly into parse_buf, skipping the intermediate
             // read_buf stack copy.
             let n = transport.recv_into_vec(conn.handle, &mut conn.parse_buf);
+            if n > 0 {
+                conn.last_activity = Instant::now();
+            }
             if n == 0 {
                 if !transport.is_active(conn.handle) {
                     debug!(
@@ -266,6 +274,28 @@ pub fn run_dpdk_poll(
                         removed.parse_buf.clear();
                         parse_buf_pool.push(removed.parse_buf);
                     }
+                }
+                continue;
+            }
+
+            // Check idle timeout for authenticated connections.
+            if let Some(timeout) = connection_timeout
+                && matches!(conn.auth, AuthState::Authenticated { .. })
+                && conn.last_activity.elapsed() > timeout
+            {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    addr = %conn.addr,
+                    "DPDK: idle timeout, dropping connection"
+                );
+                transport.close(conn.handle);
+                let _ = control_tx.send(ControlEvent::Disconnected {
+                    connection_id: conn.connection_id.0,
+                });
+                id_to_handle.remove(&conn.connection_id.0);
+                if let Some(mut removed) = connections.remove(&handle) {
+                    removed.parse_buf.clear();
+                    parse_buf_pool.push(removed.parse_buf);
                 }
                 continue;
             }

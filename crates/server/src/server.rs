@@ -1312,6 +1312,7 @@ pub fn run_dpdk(
         tx_rx,
         &shutdown,
         authorized_keys,
+        config.connection_timeout(),
     );
 
     // Shutdown sequence.
