@@ -138,7 +138,7 @@ pub fn run_dpdk_roundtrip(
     let offloads = combined_offloads.unwrap_or_default();
 
     let mac = ports[0].mac_addr();
-    let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads);
+    let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads, 0);
     if config.mtu != 1500 {
         device.set_mtu(config.mtu);
         eprintln!("  DPDK jumbo frames: MTU {}", config.mtu);

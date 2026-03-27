@@ -26,6 +26,9 @@ const DEFAULT_MTU: usize = 1500;
 /// Per-port RX state for multi-port polling.
 struct RxPort {
     port_id: u16,
+    /// NIC queue index for this port. With RSS, each poll thread reads
+    /// from a different queue on the same port.
+    queue_id: u16,
     /// Staging buffer for received mbufs.
     rx_buf: [*mut ffi::rte_mbuf; BURST_SIZE],
     rx_count: usize,
@@ -44,6 +47,9 @@ pub struct DpdkDevice {
     active_rx: usize,
     /// Port used for all TX (first port in the list).
     tx_port_id: u16,
+    /// TX queue index. With RSS, each poll thread writes to its own
+    /// TX queue to avoid contention.
+    tx_queue_id: u16,
     mempool: *mut ffi::rte_mempool,
     /// MTU (Maximum Transmission Unit). 1500 for standard Ethernet,
     /// 9000 for jumbo frames (6x fewer TCP segments).
@@ -90,10 +96,13 @@ impl DpdkDevice {
     /// `port_ids` lists all ports to poll for RX. The first port is also
     /// used for TX. For LACP bonds, pass both VF port IDs so traffic
     /// arriving on either bond member is received.
+    /// `queue_id` selects which RX/TX queue pair this device uses on
+    /// each port. With RSS, each poll thread gets a different queue_id.
     pub fn new(
         port_ids: &[u16],
         mempool: *mut ffi::rte_mempool,
         offloads: ChecksumOffloads,
+        queue_id: u16,
     ) -> Self {
         assert!(!port_ids.is_empty(), "at least one DPDK port required");
 
@@ -114,6 +123,7 @@ impl DpdkDevice {
             .iter()
             .map(|&port_id| RxPort {
                 port_id,
+                queue_id,
                 rx_buf: [std::ptr::null_mut(); BURST_SIZE],
                 rx_count: 0,
                 rx_cursor: 0,
@@ -124,6 +134,7 @@ impl DpdkDevice {
             rx_ports,
             active_rx: 0,
             tx_port_id: port_ids[0],
+            tx_queue_id: queue_id,
             mempool,
             mtu: DEFAULT_MTU,
             offloads,
@@ -148,7 +159,7 @@ impl DpdkDevice {
         let sent = unsafe {
             ffi::dpdk_eth_tx_burst(
                 self.tx_port_id,
-                0,
+                self.tx_queue_id,
                 self.tx_batch.as_mut_ptr(),
                 count as u16,
             )
@@ -185,7 +196,7 @@ impl DpdkDevice {
 
             // SAFETY: port is started, rx_buf is correctly sized.
             let count = unsafe {
-                ffi::dpdk_eth_rx_burst(port.port_id, 0, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
+                ffi::dpdk_eth_rx_burst(port.port_id, port.queue_id, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
             };
 
             if count > 0 {
@@ -223,7 +234,7 @@ impl DpdkDevice {
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
             let count = unsafe {
-                ffi::dpdk_eth_rx_burst(port.port_id, 0, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
+                ffi::dpdk_eth_rx_burst(port.port_id, port.queue_id, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
             };
 
             for i in 0..count as usize {
