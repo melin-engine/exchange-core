@@ -176,17 +176,17 @@ pub fn run_dpdk_poll(
 
         // 3. Drain TX frames from the response stage into smoltcp sockets.
         // Lock-free SPSC — no mutex contention on the hot path.
+        // Single HashMap lookup (id_to_handle) instead of two.
         while let Some((_seq, frame)) = tx_rx.try_consume() {
             if let Some(&handle) = id_to_handle.get(&frame.connection_id)
-                && let Some(conn) = connections.get(&handle)
-                && !transport.queue_send(conn.handle, frame.as_bytes())
+                && !transport.queue_send(handle, frame.as_bytes())
             {
                 // TX queue overflow — client fell behind. Drop connection.
                 debug!(
                     connection_id = frame.connection_id,
                     "DPDK: TX queue overflow, dropping connection"
                 );
-                transport.close(conn.handle);
+                transport.close(handle);
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: frame.connection_id,
                 });
