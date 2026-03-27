@@ -5,6 +5,9 @@ edition = "2024"
 
 [features]
 default = []
+# Enable when libdpdk is installed. Without this feature the crate
+# compiles as an empty shell — no bindgen, no C compilation, no linking.
+dpdk-sys = ["dep:libc", "dep:bindgen", "dep:pkg-config", "dep:cc"]
 
 [dependencies]
 # Userspace TCP/IP stack — replaces the kernel TCP stack when using DPDK.
@@ -18,17 +21,12 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "log",
 ] }
 tracing = "0.1"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [build-dependencies]
 # bindgen generates Rust FFI bindings from DPDK C headers at build time.
 # Requires DPDK to be installed (pkg-config --cflags --libs libdpdk).
-bindgen = "0.71"
-pkg-config = "0.3"
+bindgen = { version = "0.71", optional = true }
+pkg-config = { version = "0.3", optional = true }
 # cc compiles the C wrapper functions for DPDK inline functions.
-cc = "1"
-
-# Use fastcp fork of smoltcp with dispatch_burst(), batch ingress,
-# and cached hardware address lookup.
-[patch.crates-io]
-smoltcp = { git = "ssh://git@github.com/pierre-l/fastcp.git", branch = "feat/zero-copy-rx" }
+cc = { version = "1", optional = true }

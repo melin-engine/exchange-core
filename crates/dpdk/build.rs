@@ -9,6 +9,12 @@
 //! Requires DPDK >= 22.11 installed and discoverable via pkg-config.
 
 fn main() {
+    #[cfg(feature = "dpdk-sys")]
+    generate_bindings();
+}
+
+#[cfg(feature = "dpdk-sys")]
+fn generate_bindings() {
     // Locate DPDK via pkg-config.
     let dpdk = pkg_config::Config::new()
         .atleast_version("22.11")
@@ -29,7 +35,7 @@ fn main() {
 
     // Compile the C wrapper functions for inline DPDK functions.
     let mut cc = cc::Build::new();
-    cc.file("src/inline_wrappers.c");
+    cc.file("src/dpdk/inline_wrappers.c");
     for path in &dpdk.include_paths {
         cc.include(path);
     }
@@ -153,6 +159,7 @@ fn main() {
         .expect("failed to write dpdk_bindings.rs");
 }
 
+#[cfg(feature = "dpdk-sys")]
 /// Find the clang resource directory containing stddef.h.
 fn find_clang_resource_dir() -> Option<String> {
     if let Ok(output) = std::process::Command::new("clang")

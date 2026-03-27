@@ -12,7 +12,7 @@ no-fsync = ["melin-engine/no-fsync"]
 no-persist = ["melin-engine/no-persist"]
 latency-trace = ["melin-engine/latency-trace", "melin-protocol/latency-trace"]
 io-uring = ["melin-engine/io-uring", "dep:io-uring"]
-dpdk = ["dep:melin-dpdk"]
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
 pipeline-stats = ["melin-engine/pipeline-stats"]
 
 [lib]
