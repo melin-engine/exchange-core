@@ -553,33 +553,27 @@ impl<'a> phy::TxToken for DpdkTxToken<'a> {
 /// header+payload checksum on top and complements to produce the final value.
 ///
 /// `frame` is a complete Ethernet frame (14-byte Ethernet + IPv4 + TCP).
+/// Reads directly from the frame buffer — no intermediate copy.
+#[inline(always)]
 fn ipv4_pseudo_header_checksum(frame: &[u8]) -> u16 {
-    // Build the 12-byte pseudo-header in memory, then sum as native u16s
-    // (matching DPDK's rte_raw_cksum which uses memcpy into native u16).
+    // Sum the pseudo-header fields directly from the frame as native-endian
+    // u16 words (matching DPDK's rte_raw_cksum convention).
     //
-    //   [0..4]  src_ip  (from frame[26..30])
-    //   [4..8]  dst_ip  (from frame[30..34])
-    //   [8..10] zero + protocol (0x00, 0x06)
-    //   [10..12] TCP segment length (big-endian)
+    // Pseudo-header: src_ip(4) + dst_ip(4) + zero_proto(2) + tcp_len(2)
+    // = 6 native-endian u16 additions.
     let tcp_len = (frame.len() - 34) as u16;
-    let mut phdr = [0u8; 12];
-    phdr[0..4].copy_from_slice(&frame[26..30]); // src_ip
-    phdr[4..8].copy_from_slice(&frame[30..34]); // dst_ip
-    phdr[8] = 0;
-    phdr[9] = 6; // TCP protocol
-    phdr[10..12].copy_from_slice(&tcp_len.to_be_bytes());
 
-    // Sum as native-endian 16-bit words (same as DPDK's rte_raw_cksum).
-    let mut sum: u32 = 0;
-    for chunk in phdr.chunks_exact(2) {
-        sum += u16::from_ne_bytes([chunk[0], chunk[1]]) as u32;
-    }
+    // Read src_ip (frame[26..30]) and dst_ip (frame[30..34]) as 4 native u16s.
+    let sum: u32 = u16::from_ne_bytes([frame[26], frame[27]]) as u32
+        + u16::from_ne_bytes([frame[28], frame[29]]) as u32
+        + u16::from_ne_bytes([frame[30], frame[31]]) as u32
+        + u16::from_ne_bytes([frame[32], frame[33]]) as u32
+        + u16::from_ne_bytes([0, 6]) as u32 // zero + protocol (TCP=6)
+        + u16::from_ne_bytes(tcp_len.to_be_bytes()) as u32;
 
     // Fold 32-bit sum to 16-bit.
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-
-    sum as u16
+    let folded = (sum & 0xFFFF) + (sum >> 16);
+    ((folded & 0xFFFF) + (folded >> 16)) as u16
 }
 
 /// Batch of received frames from `DpdkDevice::collect_rx_batch()`.
