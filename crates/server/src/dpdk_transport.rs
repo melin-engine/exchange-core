@@ -106,6 +106,7 @@ pub fn run_dpdk_poll(
     authorized_keys: Arc<AuthorizedKeys>,
     connection_timeout: Option<Duration>,
     max_connections: u64,
+    active_connections: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Map from smoltcp SocketHandle → connection state.
     let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
@@ -253,6 +254,7 @@ pub fn run_dpdk_poll(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: conn.connection_id.0,
                 });
+                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&conn.connection_id.0);
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
@@ -303,6 +305,7 @@ pub fn run_dpdk_poll(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: conn.connection_id.0,
                 });
+                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&conn.connection_id.0);
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
@@ -312,6 +315,7 @@ pub fn run_dpdk_poll(
             }
 
             // Process frames based on auth state.
+            let was_waiting = matches!(conn.auth, AuthState::WaitingForResponse { .. });
             match &conn.auth {
                 AuthState::WaitingForResponse { .. } => {
                     // Try to extract the ChallengeResponse frame.
@@ -332,8 +336,14 @@ pub fn run_dpdk_poll(
                         &producer,
                         &control_tx,
                         &mut id_to_handle,
+                        &active_connections,
                     );
                 }
+            }
+
+            // Track auth → authenticated transition for the connection counter.
+            if was_waiting && matches!(conn.auth, AuthState::Authenticated { .. }) {
+                active_connections.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -512,6 +522,7 @@ fn process_trading_frames(
     producer: &ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
+    active_connections: &std::sync::atomic::AtomicU64,
 ) {
     let mut cursor = 0;
 
@@ -530,6 +541,7 @@ fn process_trading_frames(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: conn.connection_id.0,
                 });
+                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&conn.connection_id.0);
                 conn.parse_buf.clear();
                 return;

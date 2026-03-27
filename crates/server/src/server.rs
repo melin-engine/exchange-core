@@ -1314,6 +1314,7 @@ pub fn run_dpdk(
         authorized_keys,
         config.connection_timeout(),
         config.max_connections,
+        Arc::clone(&active_connections),
     );
 
     // Shutdown sequence.
