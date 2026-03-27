@@ -211,6 +211,11 @@ impl DpdkDevice {
         let mut mbufs = std::mem::take(&mut self.batch_mbufs);
         mbufs.clear();
 
+        // Clear per-batch dedup so MACs are re-learned across poll cycles.
+        // smoltcp's neighbor cache entries expire (~60s), so we must
+        // re-seed periodically — not just on first sight.
+        self.known_neighbors.clear();
+
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
             let count = unsafe {
