@@ -25,7 +25,6 @@
 # Environment variables:
 #   DPDK_EAL_ARGS       Server EAL arguments (default: "" = default PCI scan)
 #   DPDK_PORT           Server DPDK port ID (default: 0)
-#   DPDK_CORE           Server DPDK poll thread core (default: 7)
 #   HUGE_DIR            Hugepage mount point (default: /mnt/huge_2m)
 #   BENCH_DPDK_EAL_ARGS Bench EAL arguments (default: "" = default PCI scan)
 #   BENCH_DPDK_PORT     Bench DPDK port ID (default: 0)
@@ -83,7 +82,6 @@ fi
 # Allow env var overrides after config file.
 DPDK_IP="${DPDK_IP:-${SERVER_VLAN}}"
 DPDK_PORT="${DPDK_PORT:-0}"
-DPDK_CORE="${DPDK_CORE:-7}"
 DPDK_PREFIX="${DPDK_PREFIX:-24}"
 DPDK_EAL_ARGS="${DPDK_EAL_ARGS:-}"
 HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
@@ -115,7 +113,7 @@ echo "  Server: ${SERVER} (VLAN: ${SERVER_VLAN})"
 echo "  Bench:  ${BENCH}"
 echo "  DPDK IP: ${DPDK_IP}/${DPDK_PREFIX}"
 echo "  DPDK EAL: ${DPDK_EAL_ARGS:-<default PCI scan>}"
-echo "  DPDK port: ${DPDK_PORT}, core: ${DPDK_CORE}"
+echo "  DPDK port: ${DPDK_PORT}"
 echo "  Bench args: ${BENCH_EXTRA_ARGS}"
 echo "============================================================"
 echo ""
