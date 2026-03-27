@@ -222,10 +222,18 @@ pub fn run_dpdk_poll(
         }
 
         // 4. Read data from all connections and process.
+        // Mid-iteration poll every N connections to keep the NIC busy —
+        // flush TX responses and receive new data without waiting for
+        // the full connection iteration to complete.
+        const POLL_EVERY_N_CONNS: usize = 4;
+
         handle_buf.clear();
         handle_buf.extend(connections.keys().copied());
 
-        for &handle in &handle_buf {
+        for (conn_idx, &handle) in handle_buf.iter().enumerate() {
+            if conn_idx > 0 && conn_idx % POLL_EVERY_N_CONNS == 0 {
+                transport.poll();
+            }
             let conn = match connections.get_mut(&handle) {
                 Some(c) => c,
                 None => continue,
