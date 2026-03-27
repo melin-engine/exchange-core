@@ -102,6 +102,8 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 
 The TCP network stack is now the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. Further gains require reducing transport overhead: kernel bypass (AF_XDP, DPDK, or OpenOnload) would eliminate syscall overhead on the send/recv path. See [docs/performance.md](docs/performance.md) for the full analysis and optimization roadmap.
 
+Early DPDK SR-IOV testing (end-to-end kernel bypass on both client and server) on AMD EPYC 4564P servers with Intel 82599 10GbE NICs achieved **38 µs p90 round-trip latency** (single order, window 1) — a 47% reduction from kernel TCP on the same hardware. This is on budget server-class hardware, not purpose-built low-latency infrastructure.
+
 ## Features
 
 ### Order Types
