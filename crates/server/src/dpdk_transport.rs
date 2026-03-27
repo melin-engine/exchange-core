@@ -207,6 +207,7 @@ pub fn run_dpdk_poll(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: frame.connection_id,
                 });
+                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&frame.connection_id);
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
@@ -280,6 +281,7 @@ pub fn run_dpdk_poll(
                         let _ = control_tx.send(ControlEvent::Disconnected {
                             connection_id: conn.connection_id.0,
                         });
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                     transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
@@ -288,28 +290,26 @@ pub fn run_dpdk_poll(
                         parse_buf_pool.push(removed.parse_buf);
                     }
                 }
-                continue;
-            }
-
-            // Check idle timeout for authenticated connections.
-            if let Some(timeout) = connection_timeout
-                && matches!(conn.auth, AuthState::Authenticated { .. })
-                && conn.last_activity.elapsed() > timeout
-            {
-                debug!(
-                    connection_id = conn.connection_id.0,
-                    addr = %conn.addr,
-                    "DPDK: idle timeout, dropping connection"
-                );
-                transport.close(conn.handle);
-                let _ = control_tx.send(ControlEvent::Disconnected {
-                    connection_id: conn.connection_id.0,
-                });
-                active_connections.fetch_sub(1, Ordering::Relaxed);
-                id_to_handle.remove(&conn.connection_id.0);
-                if let Some(mut removed) = connections.remove(&handle) {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
+                // Check idle timeout when no data was received.
+                else if let Some(timeout) = connection_timeout
+                    && matches!(conn.auth, AuthState::Authenticated { .. })
+                    && conn.last_activity.elapsed() > timeout
+                {
+                    debug!(
+                        connection_id = conn.connection_id.0,
+                        addr = %conn.addr,
+                        "DPDK: idle timeout, dropping connection"
+                    );
+                    transport.close(conn.handle);
+                    let _ = control_tx.send(ControlEvent::Disconnected {
+                        connection_id: conn.connection_id.0,
+                    });
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                    id_to_handle.remove(&conn.connection_id.0);
+                    if let Some(mut removed) = connections.remove(&handle) {
+                        removed.parse_buf.clear();
+                        parse_buf_pool.push(removed.parse_buf);
+                    }
                 }
                 continue;
             }
