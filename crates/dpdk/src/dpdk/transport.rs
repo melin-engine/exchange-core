@@ -103,10 +103,13 @@ pub struct AcceptedConnection {
 /// The DPDK transport. Owns all DPDK and smoltcp state.
 ///
 /// All methods must be called from the DPDK poll thread.
+/// Fields are ordered so that DPDK resources are dropped before EAL
+/// cleanup: ports → mempool → EAL. Rust drops fields in declaration
+/// order, and `rte_mempool_free` requires EAL to still be alive.
 pub struct DpdkTransport {
-    _eal: Eal,
-    _mempool: Mempool,
     _ports: Vec<Port>,
+    _mempool: Mempool,
+    _eal: Eal,
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
