@@ -305,18 +305,24 @@ impl DpdkTransport {
             );
         }
 
-        // Seed neighbor cache from MACs learned in the previous cycle.
-        // Must happen before collect_rx_batch() so that the injected ARP
-        // replies are included in the batch.
+        // Batch ingress: poll all ports in one pass. MAC learning happens
+        // inside collect_rx_batch() for every IPv4 frame.
+        let mut batch = self.device.collect_rx_batch();
+
+        // Seed neighbor cache from MACs learned in THIS batch (not the
+        // previous one). This ensures smoltcp knows the client's MAC
+        // before processing the SYN that arrived in the same batch —
+        // without this, the SYN-ACK would stall waiting for ARP
+        // resolution that can never complete on SR-IOV VFs (broadcast
+        // ARP is dropped by the PF).
         for (mac, ip_bytes) in self.device.take_learned_neighbors() {
             let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
             self.seed_neighbor(ip, mac);
         }
+        // Drain any ARP frames injected by seed_neighbor() into the
+        // batch so they're processed before the SYN.
+        batch.append_injected(&mut self.device);
 
-        // Batch ingress: poll all ports in one pass and process frames
-        // via poll_ingress_batch(), bypassing the one-at-a-time
-        // Device::receive() trait dispatch.
-        let batch = self.device.collect_rx_batch();
         if !batch.is_empty() {
             // Stack-allocated slice array — no heap allocation.
             // Max = BURST_SIZE(32) × 2 ports + injected ARP frames.

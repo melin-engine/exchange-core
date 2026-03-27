@@ -594,6 +594,14 @@ impl RxBatch {
         self.mbufs.is_empty() && self.injected.is_empty()
     }
 
+    /// Drain any newly injected frames from the device into this batch.
+    /// Used to include ARP replies seeded after `collect_rx_batch()` but
+    /// before `poll_ingress_batch()`, so smoltcp learns the neighbor
+    /// before processing the SYN in the same batch.
+    pub fn append_injected(&mut self, device: &mut DpdkDevice) {
+        self.injected.append(&mut device.inject_queue);
+    }
+
     /// Write frame slices into a caller-provided `MaybeUninit` array.
     /// Returns the number of slices written. Injected frames first (ARP),
     /// then NIC frames. Zero heap allocation.
