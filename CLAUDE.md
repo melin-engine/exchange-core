@@ -49,17 +49,19 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 
 See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
 
-## DPDK Transport (`feat/dpdk-zerocopy-rx` branch)
+## DPDK Transport (`feat/dpdk-rss` branch, based on `feat/dpdk-zerocopy-rx`)
 
 **Feature flag**: `--features dpdk` (compile-time, replaces io-uring/epoll transport)
 
 DPDK kernel-bypass networking — bypasses the Linux kernel TCP stack entirely. Uses DPDK for NIC I/O (`rx_burst`/`tx_burst`) and a smoltcp fork ([fastcp](https://github.com/pierre-l/fastcp)) for userspace TCP. The engine pipeline is unaware of DPDK.
 
-**Crate**: `crates/dpdk/` — gated behind `dpdk-sys` feature. Compiles as an empty shell without libdpdk, lives in the workspace unconditionally. Source files in `src/dpdk/` submodule.
+**Architecture**: N parallel poll threads, each with its own NIC queue pair and smoltcp stack. RSS (Receive Side Scaling) distributes TCP flows across queues in hardware. No shared mutable state between threads. `--readers` controls the thread count (same CLI arg as kernel TCP reader threads); `--reader-cores` controls where they pin. Queue count auto-clamps to NIC maximum (TAP devices get 1).
+
+**Crate**: `crates/dpdk/` — gated behind `dpdk-sys` feature. Compiles as an empty shell without libdpdk, lives in the workspace unconditionally. Source files in `src/dpdk/` submodule. `DpdkShared` holds global resources (EAL, mempool, ports); `DpdkTransport` is per-thread (device, Interface, SocketSet).
 
 **Scripts**: `dpdk-server.sh` (auto-detect config, start server), `dpdk-setup-sriov.sh` (VF creation for ice + ixgbe), `dpdk-test.sh` (testpmd environment check), `dpdk-smoke-test.sh` (TAP), `dpdk-e2e-smoke-test.sh` (veth + af_packet, both sides DPDK).
 
-**Core layout**: 0=OS/IRQ, 1-3=pipeline, 4-5=readers, 6=repl-sender, 7=event-publisher, 8=DPDK poll, 9+=bench.
+**Core layout**: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=DPDK poll threads (reuses reader cores), 6=repl-sender, 7=event-publisher, 8+=bench.
 
 **Tested hardware**: Intel 82599/X520 (ixgbe) SR-IOV on EPYC 4564P, LACP bond, Cherry Servers. Intel E810 (ice) supported but untested on current servers (IOMMU issues on some rentals).
 
@@ -69,14 +71,11 @@ DPDK kernel-bypass networking — bypasses the Linux kernel TCP stack entirely. 
 |-----------|-----|-----|-----|----------|
 | Kernel TCP | 71 µs | 71 µs | 114 µs | EPYC 4564P, 82599 10GbE |
 | DPDK (server only) | 59 µs | 61 µs | 113 µs | same |
-| DPDK (e2e) | **38 µs** | **38 µs** | **102 µs** | same |
+| DPDK (e2e) | **37 µs** | **38 µs** | **101 µs** | same |
 
-**Throughput bottleneck**: single DPDK poll thread handles all NIC I/O, TCP processing, frame parsing, and disruptor publish. Peaks at ~2M orders/sec vs ~5M for kernel TCP (which parallelizes across 2 reader threads). See [docs/roadmap.md](docs/roadmap.md) for optimization plan (split RX/TX, RSS, batch publish).
+**Response routing**: thread_id is encoded in bits 56..63 of connection_id. The response stage extracts it with a shift to route TxFrames to the correct per-thread SPSC channel in O(1).
 
 **Known remaining gaps**:
-- No idle connection timeout in DPDK path
-- No `max_connections` enforcement
-- `active_connections` counter not wired
 - Needs merge with main (shadow exchange, snapshot schedule, updated PipelineCores)
 
 ## Dead Ends / Investigated & Rejected

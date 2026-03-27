@@ -21,17 +21,10 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 ## DPDK Transport Optimization
 
-Working DPDK kernel-bypass transport on `feat/dpdk-zerocopy-rx`. SR-IOV tested on ixgbe (82599) and ice (E810) with LACP bonds. Early results: **38 µs p90** single-order round-trip (e2e kernel bypass), 47% lower than kernel TCP on the same hardware.
-
-Current bottleneck: single DPDK poll thread handles all NIC I/O, TCP processing, frame parsing, and disruptor publish.
-
 | # | Optimization | Est. impact | Complexity | Description |
 |---|-------------|------------|------------|-------------|
-| 1 | Batch disruptor publish | 10-20% throughput | Low | Accumulate parsed frames and publish in a single batch instead of one `producer.publish()` per frame. Amortizes ring buffer overhead. |
-| 2 | Split RX/TX onto separate cores | ~2x throughput | Medium | RX core: `rx_burst` → `poll_ingress_batch` → frame parse → disruptor publish. TX core: SPSC drain → `queue_send` → `flush_tx_queues` → `iface.poll` egress. RX and TX are independent — splitting roughly doubles throughput. |
-| 3 | Reduce tracing overhead | 5-10% throughput | Low | Build with `max_level_info` or `max_level_warn` for production. Even gated `debug!` macros hit the tracing filter check on every call site. |
-| 4 | RSS (Receive Side Scaling) | ~Nx throughput | High | Multiple RX queues on the NIC, each polled by a separate thread. NIC hashes flows by (src/dst IP+port). Requires per-queue smoltcp instances or shared-nothing design. |
-| 5 | Bypass smoltcp on hot path | Significant latency | Very high | For connected+authenticated clients, parse TCP directly from raw Ethernet frames. Eliminates smoltcp's per-packet overhead (neighbor lookup, socket dispatch, congestion window, timer checks). Custom minimal TCP for steady-state data path only. |
+| 1 | Reduce tracing overhead | 5-10% throughput | Low | Build with `max_level_info` or `max_level_warn` for production. Even gated `debug!` macros hit the tracing filter check on every call site. |
+| 2 | Bypass smoltcp on hot path | Significant latency | Very high | For connected+authenticated clients, parse TCP directly from raw Ethernet frames. Eliminates smoltcp's per-packet overhead (neighbor lookup, socket dispatch, congestion window, timer checks). Custom minimal TCP for steady-state data path only. |
 
 ## Deferred
 
