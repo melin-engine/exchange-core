@@ -359,31 +359,10 @@ impl Device for DpdkDevice {
             (ptr, len)
         };
 
-        // Learn source MAC+IP from incoming IPv4 frames to seed smoltcp's
-        // neighbor cache. On SR-IOV VFs that drop broadcast ARP, this is the
-        // only way smoltcp can learn peer MACs. Costs ~5ns per packet (two
-        // cache-hot byte reads from the mbuf we're already touching).
-        if data_len >= 34 {
-            let data = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
-            // EtherType at offset 12: 0x0800 = IPv4
-            if data[12] == 0x08 && data[13] == 0x00 {
-                let mut src_mac = [0u8; 6];
-                src_mac.copy_from_slice(&data[6..12]);
-                let mut src_ip = [0u8; 4];
-                src_ip.copy_from_slice(&data[26..30]);
-                let now = std::time::Instant::now();
-                const RESEED_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_secs(30);
-                let needs_seed = self
-                    .known_neighbors
-                    .get(&src_ip)
-                    .is_none_or(|last| now.duration_since(*last) >= RESEED_INTERVAL);
-                if needs_seed {
-                    self.known_neighbors.insert(src_ip, now);
-                    self.learned_neighbors.push((src_mac, src_ip));
-                }
-            }
-        }
+        // MAC learning is handled in collect_rx_batch() which runs before
+        // poll_ingress_batch(). This Device::receive() path only fires for
+        // smoltcp-internal egress (e.g., ARP responses) — no need to learn
+        // MACs from our own outbound frames.
 
         // Pass the mbuf directly to the RxToken. The token holds the raw
         // pointer and frees it after smoltcp consumes the packet data.
