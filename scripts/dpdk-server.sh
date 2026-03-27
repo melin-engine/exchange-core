@@ -11,6 +11,7 @@
 # Examples:
 #   sudo ./scripts/dpdk-server.sh
 #   sudo ./scripts/dpdk-server.sh --max-journal-mib 512
+#   NO_PERSIST=1 sudo ./scripts/dpdk-server.sh    # skip journal fsync (benchmarking only)
 #   DPDK_IP=10.0.0.50 sudo ./scripts/dpdk-server.sh
 
 set -euo pipefail
@@ -138,7 +139,15 @@ rm -f "$JOURNAL"*
 export RUST_LOG="${RUST_LOG:-debug}"
 
 cd "$PROJECT_DIR"
-exec cargo run --release -p melin-server --features dpdk --no-default-features -- \
+
+# Build features: always dpdk, optionally no-persist for benchmarking.
+FEATURES="dpdk"
+if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+    FEATURES="dpdk,no-persist"
+    echo "  *** NO_PERSIST=1: journal fsync disabled (benchmarking only) ***"
+fi
+
+exec cargo run --release -p melin-server --features "$FEATURES" --no-default-features -- \
     --bind 0.0.0.0:9876 \
     --journal "$JOURNAL" \
     --authorized-keys "$AUTH_KEYS" \
