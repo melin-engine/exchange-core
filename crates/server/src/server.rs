@@ -186,13 +186,6 @@ pub struct ServerConfig {
     #[arg(long)]
     pub dpdk_vlan: Option<u16>,
 
-    /// CPU core for the DPDK poll thread. This thread handles all NIC I/O
-    /// and smoltcp TCP processing — it should be on an isolated core.
-    /// Default: 8 (after pipeline 1-3, readers 4-5, repl-sender 6,
-    /// event-publisher 7).
-    #[arg(long, default_value_t = 8)]
-    pub dpdk_core: usize,
-
     /// Address for the output event publisher. Subscribers connect here
     /// to receive a real-time stream of all execution events (market data,
     /// fills, cancellations). Ed25519 auth required (ReadOnly or above).
@@ -258,7 +251,6 @@ impl Default for ServerConfig {
             dpdk_gateway: None,
             dpdk_mtu: 1500,
             dpdk_vlan: None,
-            dpdk_core: 8,
             event_bind: None,
             health_bind: Some("127.0.0.1:9877".parse().expect("valid default addr")),
             promote_bind: None,
@@ -1301,7 +1293,7 @@ pub fn run_dpdk(
     // Pin the DPDK poll thread to its dedicated core. This thread
     // handles all NIC I/O and smoltcp TCP processing — must not share
     // a core with pipeline threads.
-    apply_affinity("dpdk-poll", config.dpdk_core);
+    apply_affinity("dpdk-poll-0", config.reader_cores);
 
     // Run the DPDK poll loop on this thread (the main thread).
     // This blocks until shutdown.
