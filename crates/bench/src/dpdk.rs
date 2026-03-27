@@ -126,7 +126,8 @@ pub fn run_dpdk_roundtrip(
     let mut combined_offloads: Option<melin_dpdk::port::ChecksumOffloads> = None;
     for &pid in &config.port_ids {
         let mut port =
-            Port::configure_with_vlan(pid, &mempool, config.vlan_id).expect("port config failed");
+            Port::configure_with_vlan(pid, &mempool, config.vlan_id, 1)
+                .expect("port config failed");
         port.start().expect("port start failed");
         combined_offloads = Some(match combined_offloads {
             None => port.offloads,

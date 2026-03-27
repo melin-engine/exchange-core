@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen_port: config.bind.port(),
             mtu: config.dpdk_mtu,
             vlan_id: config.dpdk_vlan,
+            num_queues: config.readers as u16,
         };
         melin_server::server::run_dpdk(config, dpdk_config, shutdown)
     }

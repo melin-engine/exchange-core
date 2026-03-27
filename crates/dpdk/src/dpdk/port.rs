@@ -45,27 +45,32 @@ impl ChecksumOffloads {
 /// Configured DPDK ethernet port, ready for `start()`.
 pub struct Port {
     port_id: u16,
+    /// Number of RX/TX queue pairs configured on this port.
+    pub num_queues: u16,
     started: bool,
     /// Hardware checksum offloads enabled on this port.
     pub offloads: ChecksumOffloads,
 }
 
 impl Port {
-    /// Configure a DPDK port with a single RX queue and a single TX queue.
+    /// Configure a DPDK port with the given number of RX/TX queue pairs.
     ///
     /// `port_id` is the DPDK port index (typically 0 for the first NIC
     /// bound to DPDK). `mempool` provides the mbuf pool for RX DMA.
     /// `vlan_id` enables hardware VLAN strip (RX) and insert (TX) for
     /// dedicated NIC mode where the kernel isn't handling VLAN tags.
+    /// When `num_queues > 1`, RSS (Receive Side Scaling) is enabled to
+    /// distribute TCP/IP flows across RX queues.
     pub fn configure(port_id: u16, mempool: &Mempool) -> Result<Self, PortError> {
-        Self::configure_with_vlan(port_id, mempool, None)
+        Self::configure_with_vlan(port_id, mempool, None, 1)
     }
 
-    /// Configure with optional VLAN hardware offload.
+    /// Configure with optional VLAN hardware offload and N queue pairs.
     pub fn configure_with_vlan(
         port_id: u16,
         mempool: &Mempool,
         vlan_id: Option<u16>,
+        num_queues: u16,
     ) -> Result<Self, PortError> {
         // Get port info for default RX/TX config.
         let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
@@ -107,6 +112,24 @@ impl Port {
         port_conf.rxmode.offloads = rx_offloads;
         port_conf.txmode.offloads = tx_offloads;
 
+        // Enable RSS when multiple RX queues are requested. The NIC
+        // hashes TCP/IP flows across queues so each poll thread handles
+        // a disjoint set of connections.
+        if num_queues > 1 {
+            let rss_hf = unsafe { ffi::dpdk_eth_rss_ip() | ffi::dpdk_eth_rss_tcp() };
+            // Only request hash types the NIC supports.
+            let supported_hf = dev_info.flow_type_rss_offloads;
+            port_conf.rx_adv_conf.rss_conf.rss_hf = rss_hf & supported_hf;
+            port_conf.rx_adv_conf.rss_conf.rss_key = std::ptr::null_mut(); // NIC default key
+            port_conf.rx_adv_conf.rss_conf.rss_key_len = 0;
+            tracing::info!(
+                port_id,
+                num_queues,
+                rss_hf = rss_hf & supported_hf,
+                "RSS enabled"
+            );
+        }
+
         let offloads = ChecksumOffloads {
             rx_ip: rx_offloads & (1u64 << 1) != 0, // RTE_ETH_RX_OFFLOAD_IPV4_CKSUM
             rx_tcp: rx_offloads & (1u64 << 3) != 0, // RTE_ETH_RX_OFFLOAD_TCP_CKSUM
@@ -114,8 +137,12 @@ impl Port {
             tx_tcp: tx_offloads & (1u64 << 3) != 0, // RTE_ETH_TX_OFFLOAD_TCP_CKSUM
         };
 
-        // Configure port with 1 RX queue + 1 TX queue.
-        let ret = unsafe { ffi::rte_eth_dev_configure(port_id, 1, 1, &port_conf) };
+        // Configure port with N RX queues + N TX queues (one pair per
+        // poll thread). Each thread reads from its RX queue and writes
+        // to its TX queue.
+        let ret = unsafe {
+            ffi::rte_eth_dev_configure(port_id, num_queues, num_queues, &port_conf)
+        };
         if ret != 0 {
             return Err(PortError::ConfigureFailed(ret));
         }
@@ -124,33 +151,37 @@ impl Port {
         // for optimal DMA locality.
         let socket_id = unsafe { ffi::rte_eth_dev_socket_id(port_id) };
 
-        // Setup RX queue 0.
-        let ret = unsafe {
-            ffi::rte_eth_rx_queue_setup(
-                port_id,
-                0, // queue_id
-                RX_DESC,
-                socket_id as libc::c_uint,
-                std::ptr::null(), // default RX config
-                mempool.as_raw(),
-            )
-        };
-        if ret != 0 {
-            return Err(PortError::RxQueueFailed(ret));
+        // Setup N RX queues.
+        for q in 0..num_queues {
+            let ret = unsafe {
+                ffi::rte_eth_rx_queue_setup(
+                    port_id,
+                    q,
+                    RX_DESC,
+                    socket_id as libc::c_uint,
+                    std::ptr::null(), // default RX config
+                    mempool.as_raw(),
+                )
+            };
+            if ret != 0 {
+                return Err(PortError::RxQueueFailed(ret));
+            }
         }
 
-        // Setup TX queue 0.
-        let ret = unsafe {
-            ffi::rte_eth_tx_queue_setup(
-                port_id,
-                0, // queue_id
-                TX_DESC,
-                socket_id as libc::c_uint,
-                std::ptr::null(), // default TX config
-            )
-        };
-        if ret != 0 {
-            return Err(PortError::TxQueueFailed(ret));
+        // Setup N TX queues.
+        for q in 0..num_queues {
+            let ret = unsafe {
+                ffi::rte_eth_tx_queue_setup(
+                    port_id,
+                    q,
+                    TX_DESC,
+                    socket_id as libc::c_uint,
+                    std::ptr::null(), // default TX config
+                )
+            };
+            if ret != 0 {
+                return Err(PortError::TxQueueFailed(ret));
+            }
         }
 
         // Enable promiscuous mode so we receive all packets (needed for
@@ -162,6 +193,7 @@ impl Port {
 
         tracing::info!(
             port_id,
+            num_queues,
             rx_desc = RX_DESC,
             tx_desc = TX_DESC,
             ?offloads,
@@ -170,6 +202,7 @@ impl Port {
 
         Ok(Port {
             port_id,
+            num_queues,
             started: false,
             offloads,
         })

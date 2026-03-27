@@ -77,6 +77,10 @@ pub struct DpdkConfig {
     /// the kernel isn't handling VLAN tags. None = no VLAN offload (SR-IOV
     /// mode where the PF handles VLAN tagging).
     pub vlan_id: Option<u16>,
+    /// Number of RX/TX queue pairs per port. Each queue pair is polled
+    /// by a separate thread. When > 1, RSS is enabled on the NIC to
+    /// distribute TCP/IP flows across queues. Default: 1.
+    pub num_queues: u16,
 }
 
 impl Default for DpdkConfig {
@@ -90,6 +94,7 @@ impl Default for DpdkConfig {
             listen_port: LISTEN_PORT,
             mtu: 1500,
             vlan_id: None,
+            num_queues: 1,
         }
     }
 }
@@ -204,7 +209,12 @@ impl DpdkTransport {
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port = Port::configure_with_vlan(pid, &mempool, config.vlan_id)?;
+            let mut port = Port::configure_with_vlan(
+                pid,
+                &mempool,
+                config.vlan_id,
+                config.num_queues,
+            )?;
             port.start()?;
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,
