@@ -23,11 +23,13 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$PROJECT_DIR/target/release/melin-server"
 
-if [[ ! -x "$BINARY" ]]; then
-    echo "error: $BINARY not found — build with: cargo build --release -p melin-server --features dpdk --no-default-features" >&2
-    exit 1
+# Ensure cargo is available under sudo.
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_HOME=$(eval echo "~$SUDO_USER")
+    export PATH="$REAL_HOME/.cargo/bin:$PATH"
+    export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
+    export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -124,7 +126,8 @@ echo "  Auth:     $AUTH_KEYS"
 echo "============================================================"
 echo ""
 
-exec "$BINARY" \
+cd "$PROJECT_DIR"
+exec cargo run --release -p melin-server --features dpdk --no-default-features -- \
     --bind 0.0.0.0:9876 \
     --journal "$JOURNAL" \
     --authorized-keys "$AUTH_KEYS" \
