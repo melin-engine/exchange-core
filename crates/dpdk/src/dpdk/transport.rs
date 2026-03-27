@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, State};
@@ -105,16 +106,38 @@ pub struct AcceptedConnection {
     pub peer: std::net::SocketAddr,
 }
 
-/// The DPDK transport. Owns all DPDK and smoltcp state.
+/// Shared DPDK resources created once and shared across all poll threads.
 ///
-/// All methods must be called from the DPDK poll thread.
 /// Fields are ordered so that DPDK resources are dropped before EAL
 /// cleanup: ports → mempool → EAL. Rust drops fields in declaration
 /// order, and `rte_mempool_free` requires EAL to still be alive.
-pub struct DpdkTransport {
+///
+/// Held via `Arc` — the last poll thread to exit drops these resources.
+pub struct DpdkShared {
     _ports: Vec<Port>,
     _mempool: Mempool,
     _eal: Eal,
+    /// Intersection of all ports' checksum offload capabilities.
+    pub offloads: ChecksumOffloads,
+    /// MAC address of the first port (used for all smoltcp interfaces).
+    pub mac: [u8; 6],
+    /// Raw mempool pointer for DpdkDevice creation. Thread-safe — DPDK
+    /// mempools use per-lcore caches for lock-free alloc/free.
+    pub mempool_raw: *mut crate::ffi::rte_mempool,
+}
+
+// Safety: DpdkShared fields are either DPDK thread-safe (mempool) or
+// never accessed after init (ports, eal). The mempool_raw pointer is
+// only used for mbuf alloc/free which DPDK guarantees is thread-safe.
+unsafe impl Send for DpdkShared {}
+unsafe impl Sync for DpdkShared {}
+
+/// Per-thread DPDK transport. Owns its own smoltcp Interface and
+/// SocketSet. Each poll thread gets one of these.
+///
+/// All methods must be called from the owning poll thread.
+pub struct DpdkTransport {
+    _shared: Arc<DpdkShared>,
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -177,9 +200,10 @@ impl TxQueue {
     }
 }
 
-impl DpdkTransport {
-    /// Initialize the DPDK transport.
-    pub fn init(config: &DpdkConfig) -> Result<Self, Box<dyn std::error::Error>> {
+impl DpdkShared {
+    /// Initialize shared DPDK resources: EAL, mempool, ports.
+    /// Call once before spawning poll threads.
+    pub fn init(config: &DpdkConfig) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
         let eal = Eal::init(&eal_args)?;
 
@@ -192,20 +216,16 @@ impl DpdkTransport {
             }
         }
 
-        // Increase mempool for extra ports — each port needs RX descriptors.
-        let num_mbufs: u32 = if config.port_ids.len() > 1 {
-            12288
-        } else {
-            8192
-        };
+        // Scale mempool for number of queues and ports.
+        let num_mbufs: u32 = 8192 * (config.port_ids.len() as u32).max(1)
+            * (config.num_queues as u32).max(1);
         let mempool = if config.mtu > 1500 {
             Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, 0)?
         } else {
             Mempool::create_with_size("pktmbuf_pool", num_mbufs, 0)?
         };
 
-        // Configure and start all ports. Use the intersection of offload
-        // capabilities (in practice, VFs on the same NIC have identical caps).
+        // Configure and start all ports with N queue pairs.
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
@@ -223,18 +243,42 @@ impl DpdkTransport {
             ports.push(port);
         }
         let offloads = combined_offloads.unwrap_or_default();
-
         let mac = ports[0].mac_addr();
-        let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads, 0);
+        let mempool_raw = mempool.as_raw();
+
+        Ok(Arc::new(DpdkShared {
+            _ports: ports,
+            _mempool: mempool,
+            _eal: eal,
+            offloads,
+            mac,
+            mempool_raw,
+        }))
+    }
+}
+
+impl DpdkTransport {
+    /// Create a per-thread transport from shared resources.
+    ///
+    /// Each poll thread calls this with a unique `queue_id` (0..N-1).
+    /// The transport gets its own DpdkDevice, smoltcp Interface, and
+    /// SocketSet — no shared mutable state between threads.
+    pub fn from_shared(
+        shared: &Arc<DpdkShared>,
+        config: &DpdkConfig,
+        queue_id: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut device =
+            DpdkDevice::new(&config.port_ids, shared.mempool_raw, shared.offloads, queue_id);
         if config.mtu != 1500 {
             device.set_mtu(config.mtu);
-            tracing::info!(mtu = config.mtu, "DPDK jumbo frames enabled");
+            tracing::info!(mtu = config.mtu, queue_id, "DPDK jumbo frames enabled");
         }
         if let Some(vlan_id) = config.vlan_id {
             device.set_vlan_id(vlan_id);
         }
 
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(shared.mac));
         let iface_config = Config::new(hw_addr);
         let now = Instant::from_millis(
             std::time::SystemTime::now()
@@ -286,14 +330,13 @@ impl DpdkTransport {
         tracing::info!(
             ip = %config.ip_addr,
             port = config.listen_port,
-            mac = ?mac,
+            mac = ?shared.mac,
+            queue_id,
             "DPDK transport initialized"
         );
 
         Ok(DpdkTransport {
-            _eal: eal,
-            _mempool: mempool,
-            _ports: ports,
+            _shared: Arc::clone(shared),
             device,
             iface,
             sockets,
@@ -306,6 +349,13 @@ impl DpdkTransport {
             pending_tx_bytes: 0,
             handle_buf: Vec::with_capacity(MAX_CONNECTIONS),
         })
+    }
+
+    /// Convenience: initialize shared resources + create a single-queue transport.
+    /// Equivalent to `DpdkShared::init(config)` + `DpdkTransport::from_shared(..., 0)`.
+    pub fn init(config: &DpdkConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let shared = DpdkShared::init(config)?;
+        Self::from_shared(&shared, config, 0)
     }
 
     /// Run one poll iteration.
@@ -522,7 +572,7 @@ impl DpdkTransport {
     /// Call this for any peer IP that smoltcp needs to reach (e.g., bench
     /// clients, gateways) when running on an SR-IOV VF.
     pub fn seed_neighbor(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        let our_mac = self._ports[0].mac_addr();
+        let our_mac = self._shared.mac;
         let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
 
         // Craft an ARP reply Ethernet frame:
