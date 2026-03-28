@@ -8,6 +8,7 @@
 #   4. Parameter sweeps (window, instruments)
 #   5. Peak throughput with synchronous replication (optional, needs replica)
 #   5b. Peak throughput with dual synchronous replication (optional, needs 2 replicas)
+#   6. DPDK kernel bypass benchmarks (fsync, single-order, replication)
 #
 # Usage:
 #   ./scripts/lan-bench-suite.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip] [replica2-public-ip] [replica2-vlan-ip]
@@ -35,6 +36,7 @@
 #   RUN_SWEEP_ACCOUNTS=0|1    Account count sweep (default: off)
 #   RUN_REPLICATION=0|1  Synchronous replication benchmark
 #   RUN_DUAL_REPLICATION=0|1  Dual synchronous replication benchmark (needs 2 replicas)
+#   RUN_DPDK=0|1         DPDK kernel bypass benchmarks (fsync, single-order, replication)
 #   RUN_PLOTS=0|1        Generate plots from results
 #   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
@@ -73,10 +75,12 @@ RUN_SWEEP_INSTRUMENTS="${RUN_SWEEP_INSTRUMENTS:-0}"
 RUN_SWEEP_ACCOUNTS="${RUN_SWEEP_ACCOUNTS:-0}"
 RUN_REPLICATION="${RUN_REPLICATION:-1}"
 RUN_DUAL_REPLICATION="${RUN_DUAL_REPLICATION:-1}"
+RUN_DPDK="${RUN_DPDK:-1}"
 RUN_PLOTS="${RUN_PLOTS:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LAN_BENCH="${SCRIPT_DIR}/lan-bench.sh"
+DPDK_LAN_BENCH="${SCRIPT_DIR}/dpdk-lan-bench.sh"
 
 SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SERVER="${SSH_USER}@${SERVER_PUB}"
@@ -631,7 +635,225 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Generate plots
+# 6. DPDK kernel bypass benchmarks
+# ---------------------------------------------------------------------------
+if [[ "$RUN_DPDK" == "1" ]]; then
+
+echo ""
+echo "============================================================"
+echo "  DPDK — Setting up SR-IOV on server and bench"
+echo "============================================================"
+echo ""
+
+DPDK_SETUP_HOSTS=("$SERVER" "$BENCH")
+if [[ -n "$REPLICA" && "$RUN_REPLICATION" == "1" ]]; then
+    DPDK_SETUP_HOSTS+=("$REPLICA")
+fi
+for HOST in "${DPDK_SETUP_HOSTS[@]}"; do
+    echo "  Setting up DPDK on ${HOST}..."
+    ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
+    echo ""
+done
+
+# Read DPDK config from server (written by dpdk-setup-sriov.sh).
+DPDK_CONF=$(ssh $SSH_OPTS "$SERVER" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
+if [[ -n "$DPDK_CONF" ]]; then
+    eval "$DPDK_CONF"
+    echo "  Server DPDK config: IP=${DPDK_IP}, port=${DPDK_PORT}"
+fi
+DPDK_IP="${DPDK_IP:-${SERVER_VLAN}}"
+
+# 6a. DPDK peak throughput — full durability (fsync)
+echo ""
+echo "============================================================"
+echo "  DPDK [1/3] Peak throughput — full durability"
+echo "  100M pairs, 16 clients, window 256"
+echo "============================================================"
+echo ""
+
+"${DPDK_LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
+    -- 100000000 --clients 16 --window 256
+
+cp /tmp/dpdk-bench-results.json "${RESULTS_DIR}/7-dpdk-fsync.json" 2>/dev/null || true
+
+# 6b. DPDK single-order latency — full durability, 1 client, no pipelining
+echo ""
+echo "============================================================"
+echo "  DPDK [2/3] Single-order latency — full durability"
+echo "  500K pairs, 1 client, window 1"
+echo "============================================================"
+echo ""
+
+"${DPDK_LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
+    -- 500000 --clients 1 --window 1
+
+cp /tmp/dpdk-bench-results.json "${RESULTS_DIR}/8-dpdk-single-order.json" 2>/dev/null || true
+
+# 6c. DPDK replication (optional — requires replica server)
+# NOTE: Replication currently uses kernel TCP (std::net), not DPDK/smoltcp.
+# The primary binds --replication-bind on the kernel VLAN IP so the replica
+# can connect. Client traffic goes through DPDK. Once DPDK replication lands,
+# this section should switch --replication-bind to the DPDK IP.
+if [[ -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" && "$RUN_REPLICATION" == "1" ]]; then
+    echo ""
+    echo "============================================================"
+    echo "  DPDK [3/3] Peak throughput — full durability + sync replication"
+    echo "  100M pairs, 16 clients, window 256"
+    echo "  (replication channel uses kernel TCP)"
+    echo "============================================================"
+    echo ""
+
+    # Pin IRQs to core 0 on the replica.
+    echo "  Pinning IRQs to core 0 on replica..."
+    ssh $SSH_OPTS "$REPLICA" 'pinned=0; failed=0
+for f in /proc/irq/*/smp_affinity; do
+    if echo 1 > "$f" 2>/dev/null; then
+        pinned=$((pinned + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
+echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+
+    # Clean journals on both primary and replica.
+    JOURNAL_PATH="/mnt/journal/bench.journal"
+    REPLICA_JOURNAL="/mnt/journal/replica.journal"
+    ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
+
+    # Build DPDK server binary (dpdk-lan-bench.sh builds it for fsync/single,
+    # but we need to start the server manually here for replication).
+    DPDK_PREFIX="${DPDK_PREFIX:-24}"
+    DPDK_PORT="${DPDK_PORT:-0}"
+    HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
+
+    EAL_FULL="--huge-dir=${HUGE_DIR}"
+
+    # Start DPDK primary with replication on the kernel VLAN IP.
+    echo "  Starting DPDK primary on ${SERVER} with --replication-bind..."
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --bind 0.0.0.0:9876 \
+            --journal ${JOURNAL_PATH} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+            --dpdk-eal-args='${EAL_FULL}' \
+            --dpdk-ip ${DPDK_IP} \
+            --dpdk-prefix-len ${DPDK_PREFIX} \
+            --dpdk-ports ${DPDK_PORT} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    # Wait for the replication listener.
+    echo "  Waiting for replication listener..."
+    for i in $(seq 1 30); do
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/melin-server.log 2>/dev/null"; then
+            echo "  Replication listener ready (took ${i}s)."
+            break
+        fi
+        if [[ $i -eq 30 ]]; then
+            echo "  ERROR: Replication listener did not start. Check /tmp/melin-server.log"
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
+        fi
+        sleep 1
+    done
+
+    # Start replica (kernel TCP — connects to primary's kernel VLAN IP).
+    echo "  Starting replica on ${REPLICA}..."
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
+            --journal ${REPLICA_JOURNAL} \
+        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+
+    # Wait for primary to seed and start accepting clients.
+    echo "  Waiting for primary to seed and start accepting clients..."
+    for i in $(seq 1 120); do
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/melin-server.log 2>/dev/null"; then
+            echo "  Primary is ready (took ${i}s)."
+            break
+        fi
+        if [[ $i -eq 120 ]]; then
+            echo "  ERROR: Primary did not become ready. Check /tmp/melin-server.log"
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
+        fi
+        sleep 1
+    done
+
+    # Read bench DPDK config.
+    BENCH_DPDK_CONF=$(ssh $SSH_OPTS "$BENCH" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
+    BENCH_DPDK_IP=""
+    BENCH_DPDK_PREFIX_VAL="${DPDK_PREFIX}"
+    if [[ -n "$BENCH_DPDK_CONF" ]]; then
+        BENCH_DPDK_IP=$(echo "$BENCH_DPDK_CONF" | grep "^DPDK_IP=" | cut -d= -f2)
+        BENCH_DPDK_PREFIX_VAL=$(echo "$BENCH_DPDK_CONF" | grep "^DPDK_PREFIX=" | cut -d= -f2)
+    fi
+    BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
+    BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
+    BENCH_DPDK_EAL_ARGS="${BENCH_DPDK_EAL_ARGS:-}"
+
+    BENCH_EAL_FULL="${BENCH_DPDK_EAL_ARGS}"
+    if [[ -n "$BENCH_EAL_FULL" ]]; then
+        BENCH_EAL_FULL="${BENCH_EAL_FULL} --huge-dir=${HUGE_DIR}"
+    else
+        BENCH_EAL_FULL="--huge-dir=${HUGE_DIR}"
+    fi
+
+    BENCH_DPDK_ARGS="--dpdk-eal-args='${BENCH_EAL_FULL}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+    if [[ -n "$BENCH_DPDK_IP" ]]; then
+        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX_VAL}"
+    fi
+
+    # Run the benchmark against the DPDK primary.
+    echo "  Running DPDK replication benchmark..."
+    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        ./target/release/melin-bench \
+            --addr ${DPDK_IP}:9876 \
+            --key bench.key \
+            --json /tmp/dpdk-bench-results.json \
+            ${BENCH_DPDK_ARGS} \
+            100000000 --clients 16 --window 256"
+
+    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/dpdk-bench-results.json" "${RESULTS_DIR}/9-dpdk-replication.json" 2>/dev/null || true
+
+    # Stop both servers.
+    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x melin-server 2>/dev/null; true"
+    sleep 2
+    echo "  Servers stopped."
+
+    # Verify journal consistency.
+    echo ""
+    echo "  Verifying DPDK replication journal consistency..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "$REPLICA_JOURNAL"
+    echo ""
+else
+    echo ""
+    echo "  (skipping DPDK replication benchmark — no replica server specified)"
+    echo ""
+fi
+
+# Reboot all machines to discard vfio-pci bindings and restore kernel NIC drivers.
+echo ""
+echo "============================================================"
+echo "  Rebooting all machines to clean up DPDK state"
+echo "============================================================"
+echo ""
+REBOOT_HOSTS=("$SERVER" "$BENCH")
+if [[ -n "$REPLICA" ]]; then
+    REBOOT_HOSTS+=("$REPLICA")
+fi
+for HOST in "${REBOOT_HOSTS[@]}"; do
+    echo "  Rebooting ${HOST}..."
+    ssh $SSH_OPTS "$HOST" "nohup bash -c 'sleep 1 && reboot' >/dev/null 2>&1 &" </dev/null || true
+done
+echo "  Reboot initiated on all machines."
+
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Generate plots
 # ---------------------------------------------------------------------------
 if [[ "$RUN_PLOTS" == "1" ]]; then
 echo ""
@@ -660,6 +882,12 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     if [[ -f "${RESULTS_DIR}/5-dual-replication.json" ]]; then
         CDF_FILES+=("${RESULTS_DIR}/5-dual-replication.json")
     fi
+    if [[ -f "${RESULTS_DIR}/7-dpdk-fsync.json" ]]; then
+        CDF_FILES+=("${RESULTS_DIR}/7-dpdk-fsync.json")
+    fi
+    if [[ -f "${RESULTS_DIR}/9-dpdk-replication.json" ]]; then
+        CDF_FILES+=("${RESULTS_DIR}/9-dpdk-replication.json")
+    fi
     "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" \
         "${CDF_FILES[@]}" 2>&1
 
@@ -673,7 +901,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     done
 
     # Latency stability over time — one plot per mode.
-    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication"; do
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication" "7-dpdk-fsync:dpdk-fsync" "9-dpdk-replication:dpdk-replication"; do
         f="${f_label%%:*}"
         label="${f_label##*:}"
         if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
@@ -684,7 +912,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     done
 
     # Server health metrics over time — one set of plots per mode.
-    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication"; do
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication" "7-dpdk-fsync:dpdk-fsync" "9-dpdk-replication:dpdk-replication"; do
         f="${f_label%%:*}"
         label="${f_label##*:}"
         if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
