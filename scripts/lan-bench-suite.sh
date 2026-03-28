@@ -690,18 +690,35 @@ echo ""
 cp /tmp/dpdk-bench-results.json "${RESULTS_DIR}/8-dpdk-single-order.json" 2>/dev/null || true
 
 # 6c. DPDK replication (optional — requires replica server)
-# NOTE: Replication currently uses kernel TCP (std::net), not DPDK/smoltcp.
-# The primary binds --replication-bind on the kernel VLAN IP so the replica
-# can connect. Client traffic goes through DPDK. Once DPDK replication lands,
-# this section should switch --replication-bind to the DPDK IP.
+# Full e2e DPDK: primary sender and replica receiver both use smoltcp.
+# Replication binds on the DPDK IP, not the kernel VLAN IP.
 if [[ -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" && "$RUN_REPLICATION" == "1" ]]; then
     echo ""
     echo "============================================================"
     echo "  DPDK [3/3] Peak throughput — full durability + sync replication"
     echo "  100M pairs, 16 clients, window 256"
-    echo "  (replication channel uses kernel TCP)"
+    echo "  (e2e DPDK: client + replication channels)"
     echo "============================================================"
     echo ""
+
+    # Read replica DPDK config (written by dpdk-setup-sriov.sh earlier).
+    REPLICA_DPDK_CONF=$(ssh $SSH_OPTS "$REPLICA" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
+    REPLICA_DPDK_IP=""
+    REPLICA_DPDK_PREFIX=""
+    REPLICA_DPDK_PORT="0"
+    if [[ -n "$REPLICA_DPDK_CONF" ]]; then
+        REPLICA_DPDK_IP=$(echo "$REPLICA_DPDK_CONF" | grep "^DPDK_IP=" | cut -d= -f2)
+        REPLICA_DPDK_PREFIX=$(echo "$REPLICA_DPDK_CONF" | grep "^DPDK_PREFIX=" | cut -d= -f2)
+        REPLICA_DPDK_PORT=$(echo "$REPLICA_DPDK_CONF" | grep "^DPDK_PORT=" | cut -d= -f2)
+        echo "  Replica DPDK config: IP=${REPLICA_DPDK_IP}, port=${REPLICA_DPDK_PORT}"
+    fi
+    REPLICA_DPDK_IP="${REPLICA_DPDK_IP:-${REPLICA_VLAN}}"
+    REPLICA_DPDK_PREFIX="${REPLICA_DPDK_PREFIX:-24}"
+
+    # Build DPDK server on replica.
+    echo "  Building DPDK server on replica..."
+    ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
 
     # Pin IRQs to core 0 on the replica.
     echo "  Pinning IRQs to core 0 on replica..."
@@ -721,15 +738,13 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
     ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
     ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
 
-    # Build DPDK server binary (dpdk-lan-bench.sh builds it for fsync/single,
-    # but we need to start the server manually here for replication).
     DPDK_PREFIX="${DPDK_PREFIX:-24}"
     DPDK_PORT="${DPDK_PORT:-0}"
     HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
 
     EAL_FULL="--huge-dir=${HUGE_DIR}"
 
-    # Start DPDK primary with replication on the kernel VLAN IP.
+    # Start DPDK primary with replication on the DPDK IP.
     echo "  Starting DPDK primary on ${SERVER} with --replication-bind..."
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
@@ -737,17 +752,17 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
-            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+            --replication-bind ${DPDK_IP}:${REPL_PORT} \
             --dpdk-eal-args='${EAL_FULL}' \
             --dpdk-ip ${DPDK_IP} \
             --dpdk-prefix-len ${DPDK_PREFIX} \
             --dpdk-ports ${DPDK_PORT} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    # Wait for the replication listener.
-    echo "  Waiting for replication listener..."
+    # Wait for the replication listener (smoltcp).
+    echo "  Waiting for DPDK replication listener..."
     for i in $(seq 1 30); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/melin-server.log 2>/dev/null"; then
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'DPDK replication sender started' /tmp/melin-server.log 2>/dev/null"; then
             echo "  Replication listener ready (took ${i}s)."
             break
         fi
@@ -758,13 +773,18 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
         sleep 1
     done
 
-    # Start replica (kernel TCP — connects to primary's kernel VLAN IP).
-    echo "  Starting replica on ${REPLICA}..."
+    # Start DPDK replica — connects to primary's DPDK IP via smoltcp.
+    REPLICA_EAL_FULL="--huge-dir=${HUGE_DIR}"
+    echo "  Starting DPDK replica on ${REPLICA}..."
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
-            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
+            --replica-of ${DPDK_IP}:${REPL_PORT} \
             --journal ${REPLICA_JOURNAL} \
+            --dpdk-eal-args='${REPLICA_EAL_FULL}' \
+            --dpdk-ip ${REPLICA_DPDK_IP} \
+            --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
+            --dpdk-ports ${REPLICA_DPDK_PORT} \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
     # Wait for primary to seed and start accepting clients.
