@@ -354,11 +354,15 @@ pub fn run_sender(
     struct ReplicaSlot {
         consumer: Option<ReplicationConsumer>,
         handle: Option<std::thread::JoinHandle<ReplicationConsumer>>,
+        /// True after this slot has had at least one connection. Ring
+        /// data is only drained on idle slots that have connected before
+        /// — a never-connected slot preserves seed data for its first replica.
+        has_connected: bool,
     }
 
     let mut slots = [
-        ReplicaSlot { consumer: Some(repl_consumer_1), handle: None },
-        ReplicaSlot { consumer: Some(repl_consumer_2), handle: None },
+        ReplicaSlot { consumer: Some(repl_consumer_1), handle: None, has_connected: false },
+        ReplicaSlot { consumer: Some(repl_consumer_2), handle: None, has_connected: false },
     ];
 
     loop {
@@ -415,6 +419,7 @@ pub fn run_sender(
                     // Signal that at least one replica is connected.
                     replica_ready.store(true, Ordering::Release);
                     replicas_connected.fetch_add(1, Ordering::Release);
+                    slots[slot_idx].has_connected = true;
 
                     // Take the consumer out of the slot for the handler thread.
                     // The slot's consumer becomes None while the thread owns it.
@@ -459,14 +464,14 @@ pub fn run_sender(
         }
 
         // Drain batches on idle consumers to prevent ring backpressure.
-        // Only drain after the first replica has connected (seed data
-        // must be preserved for the first connection).
-        if replica_ready.load(Ordering::Relaxed) {
-            for slot in &mut slots {
-                if slot.handle.is_none() {
-                    if let Some(ref mut consumer) = slot.consumer {
-                        drain_batches_while_waiting(consumer);
-                    }
+        // Only drain consumers that have had at least one connection —
+        // never-connected consumers preserve seed data for their first
+        // replica. With journal catch-up, a late-joining replica gets
+        // historical data from the primary's journal files instead.
+        for slot in &mut slots {
+            if slot.handle.is_none() && slot.has_connected {
+                if let Some(ref mut consumer) = slot.consumer {
+                    drain_batches_while_waiting(consumer);
                 }
             }
         }
@@ -715,21 +720,18 @@ fn handle_replica_connection(
     writer.flush()?;
     send_buf.clear();
 
-    // Catch up from journal files if the replica has existing state but
-    // is behind the primary's live stream. Fresh replicas (last_sequence=0)
-    // get everything from live ring streaming — no catch-up needed, and
-    // reading the journal file during seeding would race with the writer.
-    let catchup_end = if handshake.last_sequence > 0 {
-        catch_up_from_journal(
-            journal_path,
-            handshake.last_sequence,
-            &mut writer,
-            repl_consumer,
-            shutdown,
-        )?
-    } else {
-        0
-    };
+    // Catch up from journal files if the replica is behind the primary's
+    // current position. For a fresh replica (last_sequence=0), this streams
+    // the entire journal history. The scanner reads entries that exist at
+    // this moment and stops at partially-written tails — new entries
+    // arriving during catch-up are in the ring, handled by overlap drain.
+    let catchup_end = catch_up_from_journal(
+        journal_path,
+        handshake.last_sequence,
+        &mut writer,
+        repl_consumer,
+        shutdown,
+    )?;
 
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up.

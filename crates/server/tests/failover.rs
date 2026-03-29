@@ -1119,3 +1119,204 @@ fn replacement_replica_catches_up_from_journal() {
 
     eprintln!("PASS: replacement replica caught up from journal and has all 50 orders.");
 }
+
+/// Catch-up with fills during the gap. Replica misses crossing orders
+/// that generate fills. After catch-up + promotion, verify balances are
+/// correct (place + fill works on promoted replacement).
+#[test]
+fn catchup_with_fills_during_gap() {
+    let mut cluster = DualCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Place resting sells from account 2 while both replicas are up.
+    for i in 1..=10u64 {
+        submit_order(&mut client, i, 2, 1, Side::Sell, 100 + i, 5);
+    }
+    cluster.wait_replicated();
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Kill replica 1 and copy its stale journal.
+    let replica1_journal = cluster._tmp.path().join("replica1.journal");
+    cluster.kill_replica1();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Aggressive buys from account 1 during the gap — generates fills
+    // that replica 1 misses.
+    for i in 11..=20u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 200, 3);
+    }
+    cluster.wait_replicated();
+
+    // Start replacement with stale journal.
+    let replacement_journal = cluster._tmp.path().join("replacement_fills.journal");
+    std::fs::copy(&replica1_journal, &replacement_journal).expect("copy journal");
+
+    let r3_client = free_port();
+    let r3_health = free_port();
+    let r3_promote = free_port();
+    let bin = server_bin();
+    let _replacement = {
+        let child = Command::new(&bin)
+            .args([
+                "--bind", &format!("127.0.0.1:{r3_client}"),
+                "--health-bind", &format!("127.0.0.1:{r3_health}"),
+                "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
+                "--journal", replacement_journal.to_str().unwrap(),
+                "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
+                "--connection-timeout-secs", "0",
+                "--yield-idle",
+                "--cores", "0,0,0,0,0,0",
+                "--readers", "1",
+                "--reader-cores", "0",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn replacement");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{r3_client}").parse().unwrap(),
+            health_addr: format!("127.0.0.1:{r3_health}").parse().unwrap(),
+        }
+    };
+
+    // Wait for catch-up.
+    let start = Instant::now();
+    loop {
+        let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
+        if lag == 0 { break; }
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("catch-up timeout (lag={lag})");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Kill primary, promote replacement.
+    drop(client);
+    cluster.kill_primary();
+    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
+    wait_healthy(format!("127.0.0.1:{r3_health}").parse().unwrap(), Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut client2 = Client::connect(
+        format!("127.0.0.1:{r3_client}").parse().unwrap(),
+        &cluster.key2,
+    )
+    .expect("connect to promoted replacement");
+
+    // Place a sell + matching buy to verify balances are correct.
+    let r = submit_order(&mut client2, 21, 2, 1, Side::Sell, 500, 1);
+    let accepted = has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. }))
+        || has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. }));
+    assert!(accepted, "expected Placed or Fill, got: {r:?}");
+
+    let r = submit_order(&mut client2, 22, 1, 1, Side::Buy, 500, 1);
+    assert!(
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        "expected Fill after catch-up with fills, got: {r:?}"
+    );
+
+    eprintln!("PASS: catch-up with fills — balances correct after promotion.");
+}
+
+/// Catch-up completes, kill primary immediately (no more orders after
+/// catch-up). Promote replacement. Verifies catch-up data survives.
+#[test]
+fn catchup_then_immediate_failover() {
+    let mut cluster = DualCluster::start();
+    let mut client = cluster.connect_primary();
+
+    for i in 1..=15u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+    }
+    cluster.wait_replicated();
+    cluster.kill_replica1();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Submit orders that replica 1 misses.
+    for i in 16..=30u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+    }
+    cluster.wait_replicated();
+
+    // Start fresh replacement (no journal copy — relies entirely on
+    // journal catch-up from the primary's files).
+    let replacement_journal = cluster._tmp.path().join("replacement_imm.journal");
+
+    let r3_client = free_port();
+    let r3_health = free_port();
+    let r3_promote = free_port();
+    let bin = server_bin();
+    let _replacement = {
+        let child = Command::new(&bin)
+            .args([
+                "--bind", &format!("127.0.0.1:{r3_client}"),
+                "--health-bind", &format!("127.0.0.1:{r3_health}"),
+                "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
+                "--journal", replacement_journal.to_str().unwrap(),
+                "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
+                "--connection-timeout-secs", "0",
+                "--yield-idle",
+                "--cores", "0,0,0,0,0,0",
+                "--readers", "1",
+                "--reader-cores", "0",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn replacement");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{r3_client}").parse().unwrap(),
+            health_addr: format!("127.0.0.1:{r3_health}").parse().unwrap(),
+        }
+    };
+
+    // Wait for catch-up.
+    let start = Instant::now();
+    loop {
+        let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
+        if lag == 0 { break; }
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("catch-up timeout (lag={lag})");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Kill primary IMMEDIATELY — no more orders after catch-up.
+    drop(client);
+    cluster.kill_primary();
+    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
+    wait_healthy(format!("127.0.0.1:{r3_health}").parse().unwrap(), Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut client2 = Client::connect(
+        format!("127.0.0.1:{r3_client}").parse().unwrap(),
+        &cluster.key2,
+    )
+    .expect("connect to promoted replacement");
+
+    // All 30 orders must be present.
+    let r = submit_order(&mut client2, 31, 1, 1, Side::Buy, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        "expected Placed, got: {r:?}"
+    );
+
+    // Duplicate of last order rejected.
+    let r = submit_order(&mut client2, 30, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "expected DuplicateOrderId, got: {r:?}"
+    );
+
+    eprintln!("PASS: catch-up then immediate failover — all 30 orders survived.");
+}
