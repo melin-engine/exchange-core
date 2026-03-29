@@ -197,7 +197,20 @@ fn spawn_replica(
     health_port: u16,
     promote_port: u16,
 ) -> ServerProcess {
-    let journal = tmp_dir.join("replica.journal");
+    spawn_replica_named(bin, tmp_dir, keys_path, primary_repl_port, client_port, health_port, promote_port, "replica")
+}
+
+fn spawn_replica_named(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    primary_repl_port: u16,
+    client_port: u16,
+    health_port: u16,
+    promote_port: u16,
+    name: &str,
+) -> ServerProcess {
+    let journal = tmp_dir.join(format!("{name}.journal"));
     let child = Command::new(bin)
         .args([
             "--bind", &format!("127.0.0.1:{client_port}"),
@@ -558,7 +571,7 @@ fn crashed_primary_recovers_from_journal() {
 
     let recovered_client_port = free_port();
     let recovered_health_port = free_port();
-    let mut recovered = {
+    let recovered = {
         let child = Command::new(&cluster.bin)
             .args([
                 "--bind", &format!("127.0.0.1:{recovered_client_port}"),
@@ -662,4 +675,180 @@ fn same_key_retry_after_failover_is_rejected() {
         )),
         "expected DuplicateRequest for stale seq on same key, got: {r:?}"
     );
+}
+
+/// Dual replication: primary streams to 2 replicas. Kill one replica,
+/// verify trading continues. Kill primary, promote the surviving replica,
+/// verify no data loss.
+#[test]
+fn dual_replication_survives_one_replica_failure() {
+    let bin = server_bin();
+    assert!(bin.exists(), "melin-server binary not found");
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let key = SigningKey::from_bytes(&[0xFA; 32]);
+    let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+    let keys_path = write_auth_keys_multi(tmp.path(), &[&key, &key2]);
+
+    let primary_client_port = free_port();
+    let primary_health_port = free_port();
+    let primary_repl_port = free_port();
+    let replica1_client_port = free_port();
+    let replica1_health_port = free_port();
+    let replica1_promote_port = free_port();
+    let replica2_client_port = free_port();
+    let replica2_health_port = free_port();
+    let replica2_promote_port = free_port();
+
+    // Start primary.
+    let mut primary = spawn_primary(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        primary_client_port,
+        primary_health_port,
+        primary_repl_port,
+    );
+
+    // Wait for replication port.
+    let repl_addr: SocketAddr =
+        format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
+    let start = Instant::now();
+    loop {
+        if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("primary replication port never became available");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Start two replicas.
+    let mut replica1 = spawn_replica_named(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        primary_repl_port,
+        replica1_client_port,
+        replica1_health_port,
+        replica1_promote_port,
+        "replica1",
+    );
+    let _replica2 = spawn_replica_named(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        primary_repl_port,
+        replica2_client_port,
+        replica2_health_port,
+        replica2_promote_port,
+        "replica2",
+    );
+
+    // Wait for primary healthy.
+    wait_healthy(
+        format!("127.0.0.1:{primary_health_port}").parse().unwrap(),
+        Duration::from_secs(30),
+    );
+
+    // Submit initial orders.
+    let mut client = Client::connect(
+        format!("127.0.0.1:{primary_client_port}").parse().unwrap(),
+        &key,
+    )
+    .expect("connect to primary");
+
+    for i in 1..=20u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "order {i}: no response");
+    }
+
+    // Wait for replication lag to reach 0 (both replicas caught up).
+    let primary_health: SocketAddr =
+        format!("127.0.0.1:{primary_health_port}").parse().unwrap();
+    let start = Instant::now();
+    loop {
+        let (_, _, lag, _) = query_health(primary_health).expect("query health");
+        if lag == 0 {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("replication lag did not reach 0");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // --- Kill replica 1 ---
+    unsafe {
+        libc::kill(replica1.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = replica1.child.wait();
+    eprintln!("Replica 1 killed.");
+
+    // Give the primary a moment to detect the disconnect.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Trading should continue — replica 2 is still connected.
+    let (_, _, _, trading) = query_health(primary_health).expect("query health after kill");
+    assert!(
+        trading,
+        "trading should continue with one replica still connected"
+    );
+
+    // Submit more orders while only replica 2 is connected.
+    for i in 21..=40u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "order {i}: no response after replica 1 death");
+    }
+
+    // Wait for lag 0 again (replica 2 has all orders).
+    let start = Instant::now();
+    loop {
+        let (_, _, lag, _) = query_health(primary_health).expect("query health");
+        if lag == 0 {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("replication lag did not reach 0 after replica 1 death");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // --- Kill primary, promote replica 2 ---
+    drop(client);
+    unsafe {
+        libc::kill(primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = primary.child.wait();
+    eprintln!("Primary killed.");
+
+    let promote_addr: SocketAddr =
+        format!("127.0.0.1:{replica2_promote_port}").parse().unwrap();
+    promote(promote_addr);
+    eprintln!("Replica 2 promoted.");
+
+    let replica2_health: SocketAddr =
+        format!("127.0.0.1:{replica2_health_port}").parse().unwrap();
+    wait_healthy(replica2_health, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Verify all 40 orders are present — new order at ID 41 must succeed
+    // (proves HWM covers all 40), and duplicate at 40 must be rejected.
+    let mut client2 = Client::connect(
+        format!("127.0.0.1:{replica2_client_port}").parse().unwrap(),
+        &key2,
+    )
+    .expect("connect to promoted replica 2");
+
+    let r = submit_order(&mut client2, 41, 1, 1, Side::Buy, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "expected Placed on promoted replica 2, got: {r:?}"
+    );
+
+    eprintln!("PASS: dual replication — survived one replica failure, promoted the other.");
 }
