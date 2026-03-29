@@ -8,7 +8,7 @@ Melin is an exchange core: order matching, account management, risk controls, fe
 
 ## Why Melin
 
-**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding.
+**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding.
 
 **Durable** — every order is persisted (pwritev2 + RWF_DSYNC) and replicated before acknowledgement; crash recovery via journal replay with CRC32C integrity checks; BLAKE3 hash chain for tamper evidence.
 
