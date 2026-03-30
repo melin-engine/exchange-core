@@ -128,6 +128,14 @@ if [[ -f "$CARGO_PROFILE" ]]; then
     fi
 fi
 
+# Cargo's built-in libgit2 can't authenticate private git SSH deps.
+# Configure cargo to shell out to git which uses the SSH agent/key.
+CARGO_CONFIG="$USER_HOME/.cargo/config.toml"
+if ! grep -q "git-fetch-with-cli" "$CARGO_CONFIG" 2>/dev/null; then
+    run_as_user "mkdir -p $USER_HOME/.cargo && echo -e '[net]\ngit-fetch-with-cli = true' >> $CARGO_CONFIG"
+    echo "  Added git-fetch-with-cli to $CARGO_CONFIG"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -410,11 +418,11 @@ else
 fi
 
 echo "  Building default (TCP + io_uring)..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release" 2>&1 | tail -3
+run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release" 2>&1 | tail -3
 echo "  Default build: OK"
 
 echo "  Building with --features no-persist,pipeline-stats..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release -p melin-server --features no-persist,pipeline-stats" 2>&1 | tail -3
+run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release -p melin-server --features no-persist,pipeline-stats" 2>&1 | tail -3
 echo "  Bench build: OK"
 
 echo ""
