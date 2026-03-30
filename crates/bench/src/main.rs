@@ -714,7 +714,10 @@ fn run_pipeline_bench(
     // Coordination: inflight counter (AtomicU64) for window gating,
     // SPSC channel for timestamps (publisher → drainer).
     let inflight = Arc::new(AtomicU64::new(0));
-    let (ts_tx, ts_rx) = std::sync::mpsc::sync_channel::<Instant>(window);
+    // TSC ticks instead of Instant::now() — ~4ns vs ~15-25ns per timestamp,
+    // reducing measurement overhead from ~15% to ~1% of total CPU.
+    let ticks_per_ns = calibrate_tsc();
+    let (ts_tx, ts_rx) = std::sync::mpsc::sync_channel::<u64>(window);
 
     // Publisher thread: continuously feeds events into the disruptor.
     let inflight_pub = Arc::clone(&inflight);
@@ -730,7 +733,7 @@ fn run_pipeline_bench(
                     std::hint::spin_loop();
                 }
 
-                let ts = Instant::now();
+                let ts = rdtscp();
                 producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash: 0,
@@ -778,7 +781,7 @@ fn run_pipeline_bench(
         ) {
             let sent_at = ts_rx.recv().expect("timestamp channel");
             inflight.fetch_sub(1, Ordering::Release);
-            let latency_ns = sent_at.elapsed().as_nanos() as u64;
+            let latency_ns = tsc_to_ns(rdtscp() - sent_at, ticks_per_ns);
             if completed >= warmup {
                 if measured_start.is_none() {
                     measured_start = Some(Instant::now());
