@@ -152,6 +152,50 @@ EOF
     echo "  $name: $IP (ready)"
 done
 
+# ---------------------------------------------------------------------------
+# Install DPDK build deps and build the DPDK server binary.
+# ---------------------------------------------------------------------------
+# The server container gets libdpdk-dev + libclang-dev for the DPDK build,
+# plus iproute2 for TAP device routing. The bench suite detects TAP mode
+# via DPDK_MODE=tap in /etc/melin-dpdk.conf and skips SR-IOV setup.
+echo ""
+echo "Setting up DPDK (TAP mode) on server..."
+
+docker exec "$SERVER" bash -c "
+    apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3 && \
+    source /root/.cargo/env && \
+    cd $REPO_DIR && \
+    cargo build --release -p melin-server --features dpdk 2>&1 | tail -3
+"
+
+# Pick a DPDK IP that's on the Docker bridge subnet but not used by any
+# container. The bench suite routes traffic to this IP via the server.
+DPDK_TAP_IP="172.17.0.100"
+
+docker exec "$SERVER" bash -c "
+    cat > /etc/melin-dpdk.conf << EOF
+DPDK_MODE=tap
+DPDK_IP=${DPDK_TAP_IP}
+DPDK_PREFIX=16
+DPDK_PORT=0
+DPDK_EAL_ARGS=--no-huge --no-pci --vdev net_tap0 -m 256
+EOF
+"
+echo "  DPDK config written (TAP mode, IP=${DPDK_TAP_IP})"
+
+# Install iproute2 on all other containers (bench needs it for routing).
+IPROUTE_HOSTS=("$CLIENT")
+if [[ "$WITH_REPLICA" == "true" ]]; then IPROUTE_HOSTS+=("$REPLICA"); fi
+if [[ "$WITH_DUAL_REPLICA" == "true" ]]; then IPROUTE_HOSTS+=("$REPLICA2"); fi
+for name in "${IPROUTE_HOSTS[@]}"; do
+    docker exec "$name" bash -c "apt-get install -y --no-install-recommends iproute2 2>&1 | tail -1"
+done
+
+# Create journal directory on all containers.
+for name in "${CONTAINERS[@]}"; do
+    docker exec "$name" mkdir -p /tmp/journal
+done
+
 SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SERVER")
 CLIENT_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLIENT")
 

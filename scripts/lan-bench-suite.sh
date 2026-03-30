@@ -566,55 +566,96 @@ transport_stop_tcp_dual_repl() {
 # --- DPDK transports ---
 
 # Load DPDK config from /etc/melin-dpdk.conf on a host.
-# Populates DPDK_IP, DPDK_PREFIX, DPDK_PORT from the remote config.
+# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS.
 load_dpdk_config() {
     local host="$1" prefix="$2"
     local conf
     conf=$(ssh $SSH_OPTS "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
     if [[ -n "$conf" ]]; then
-        local ip port dpdk_prefix
+        local ip port dpdk_prefix mode eal_args
         ip=$(echo "$conf" | grep "^DPDK_IP=" | cut -d= -f2)
         port=$(echo "$conf" | grep "^DPDK_PORT=" | cut -d= -f2)
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2)
+        mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2)
+        eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2-)
         eval "${prefix}_DPDK_IP=${ip:-}"
         eval "${prefix}_DPDK_PORT=${port:-0}"
         eval "${prefix}_DPDK_PREFIX=${dpdk_prefix:-24}"
+        eval "${prefix}_DPDK_MODE=${mode:-sriov}"
+        eval "${prefix}_DPDK_EAL_ARGS='${eal_args:-}'"
     fi
 }
 
 DPDK_SRIOV_DONE=0
+# Set to "tap" when TAP mode detected — controls routing setup.
+DPDK_MODE="sriov"
 
 dpdk_sriov_setup() {
     if [[ "$DPDK_SRIOV_DONE" == "1" ]]; then return; fi
 
-    echo ""
-    echo "=== Setting up DPDK SR-IOV ==="
-    local hosts=("$SERVER" "$BENCH")
-    if [[ -n "$REPLICA" ]]; then
-        for item in "${MATRIX[@]}"; do
-            if [[ "${item%%:*}" == "dpdk-repl" ]]; then hosts+=("$REPLICA"); break; fi
-        done
-    fi
-    for HOST in "${hosts[@]}"; do
-        echo "  Setting up DPDK on ${HOST}..."
-        ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
-    done
-
     load_dpdk_config "$SERVER" "SERVER"
-    load_dpdk_config "$BENCH" "BENCH"
     SERVER_DPDK_IP="${SERVER_DPDK_IP:-${SERVER_VLAN}}"
     SERVER_DPDK_PORT="${SERVER_DPDK_PORT:-0}"
     SERVER_DPDK_PREFIX="${SERVER_DPDK_PREFIX:-24}"
+    DPDK_MODE="${SERVER_DPDK_MODE:-sriov}"
+
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        # TAP mode (Docker containers): skip SR-IOV, use TAP PMD.
+        # The EAL args and routing are handled at server start time.
+        echo ""
+        echo "=== DPDK TAP mode (no SR-IOV) ==="
+        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=tap"
+        echo ""
+    else
+        echo ""
+        echo "=== Setting up DPDK SR-IOV ==="
+        local hosts=("$SERVER" "$BENCH")
+        if [[ -n "$REPLICA" ]]; then
+            for item in "${MATRIX[@]}"; do
+                if [[ "${item%%:*}" == "dpdk-repl" ]]; then hosts+=("$REPLICA"); break; fi
+            done
+        fi
+        for HOST in "${hosts[@]}"; do
+            echo "  Setting up DPDK on ${HOST}..."
+            ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
+        done
+        load_dpdk_config "$BENCH" "BENCH"
+        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=sriov"
+        echo ""
+    fi
+
     BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
     BENCH_DPDK_PREFIX="${BENCH_DPDK_PREFIX:-24}"
-    echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}"
-    echo ""
-
     DPDK_SRIOV_DONE=1
 }
 
 HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
 BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
+
+# After starting a DPDK TAP server, set up kernel routing so external
+# clients can reach smoltcp through the TAP device.
+# TAP PMD creates a kernel interface (dtap0). The kernel forwards
+# packets to it, DPDK reads from the TAP fd, smoltcp processes TCP.
+setup_tap_routing() {
+    local host="$1" dpdk_ip="$2"
+    ssh $SSH_OPTS "$host" "
+        ip link set dtap0 up 2>/dev/null
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip route replace ${dpdk_ip}/32 dev dtap0
+        MAC=\$(ip link show dtap0 2>/dev/null | grep link/ether | awk '{print \$2}')
+        ip neigh replace ${dpdk_ip} lladdr \$MAC dev dtap0 nud permanent
+        echo \"  TAP routing: dtap0 up, route ${dpdk_ip} -> dtap0 (MAC=\$MAC)\"
+    "
+}
+
+# Add a route on a remote host so it can reach the DPDK TAP IP via
+# the server's kernel interface.
+add_tap_route() {
+    local host="$1" dpdk_ip="$2" via_ip="$3"
+    ssh $SSH_OPTS "$host" "
+        ip route replace ${dpdk_ip}/32 via ${via_ip} 2>/dev/null
+    "
+}
 
 transport_start_dpdk() {
     dpdk_sriov_setup
@@ -622,29 +663,45 @@ transport_start_dpdk() {
     pin_irqs "$SERVER" "server"
     pin_irqs "$BENCH" "bench"
 
+    # Build EAL args: TAP mode uses config from /etc/melin-dpdk.conf,
+    # SR-IOV mode uses hugepages.
+    local server_eal
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        server_eal="${SERVER_DPDK_EAL_ARGS}"
+    else
+        server_eal="--huge-dir=${HUGE_DIR}"
+    fi
+
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
-            --dpdk-eal-args='--huge-dir=${HUGE_DIR}' \
+            ${SERVER_EXTRA_ARGS:-} \
+            --dpdk-eal-args='${server_eal}' \
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    # DPDK server doesn't respond to kernel nc — wait via log.
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK server"
 
-    local bench_eal="--huge-dir=${HUGE_DIR}"
-    if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
-        bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
-    fi
-    # Export bench DPDK args for run_bench_dpdk.
-    BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
-    if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
-        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+    # TAP mode: set up kernel routing so the bench client can reach smoltcp.
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        setup_tap_routing "$SERVER" "${SERVER_DPDK_IP}"
+        add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
+        # In TAP mode, the bench client uses kernel TCP (no DPDK on client).
+        BENCH_DPDK_ARGS=""
+    else
+        local bench_eal="--huge-dir=${HUGE_DIR}"
+        if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
+            bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
+        fi
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+        fi
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
@@ -670,6 +727,15 @@ transport_start_dpdk_repl() {
     REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
     REPLICA_DPDK_PREFIX="${REPLICA_DPDK_PREFIX:-24}"
 
+    local server_eal replica_eal
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        server_eal="${SERVER_DPDK_EAL_ARGS}"
+        replica_eal="${REPLICA_DPDK_EAL_ARGS:-${SERVER_DPDK_EAL_ARGS}}"
+    else
+        server_eal="--huge-dir=${HUGE_DIR}"
+        replica_eal="--huge-dir=${HUGE_DIR}"
+    fi
+
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
@@ -677,7 +743,7 @@ transport_start_dpdk_repl() {
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} \
-            --dpdk-eal-args='--huge-dir=${HUGE_DIR}' \
+            --dpdk-eal-args='${server_eal}' \
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
@@ -692,7 +758,7 @@ transport_start_dpdk_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
-            --dpdk-eal-args='--huge-dir=${HUGE_DIR}' \
+            --dpdk-eal-args='${replica_eal}' \
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
@@ -700,13 +766,20 @@ transport_start_dpdk_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
 
-    local bench_eal="--huge-dir=${HUGE_DIR}"
-    if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
-        bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
-    fi
-    BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
-    if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
-        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+    # TAP mode: routing for bench client.
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        setup_tap_routing "$SERVER" "${SERVER_DPDK_IP}"
+        add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
+        BENCH_DPDK_ARGS=""
+    else
+        local bench_eal="--huge-dir=${HUGE_DIR}"
+        if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
+            bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
+        fi
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+        fi
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
@@ -1010,7 +1083,7 @@ done
 # ---------------------------------------------------------------------------
 # DPDK cleanup: reboot if any DPDK transport ran
 # ---------------------------------------------------------------------------
-if [[ "$DPDK_RAN" == "1" ]]; then
+if [[ "$DPDK_RAN" == "1" && "$DPDK_MODE" != "tap" ]]; then
     echo ""
     echo "============================================================"
     echo "  Rebooting all machines to clean up DPDK state"
