@@ -40,6 +40,13 @@
 #   TRANSPORTS=<list>   Comma-separated transports (default: tcp-dual-repl)
 #   WORKLOADS=<list>    Comma-separated workloads (default: throughput)
 #   RUN_PLOTS=0|1       Generate plots from results (default: 0)
+#   THROUGHPUT_ORDERS=N     Orders for throughput workload (default: 100000000)
+#   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 16)
+#   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 256)
+#   SINGLE_ORDERS=N        Orders for single-order workload (default: 500000)
+#   WARMUP_ORDERS=N        Warmup orders per client (default: bench default 100000)
+#   ORDERS_PER_SWEEP=N     Orders per sweep data point (default: 10000000)
+#   LOCAL_ORDERS=N         Orders for local workloads (default: 100000000)
 #   RESULTS_DIR=<path>  Reuse existing results directory
 #   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
 #   BENCH_COMMIT=<hash> Checkout a specific commit (mutually exclusive with BENCH_BRANCH)
@@ -91,7 +98,10 @@ RUN_PLOTS="${RUN_PLOTS:-0}"
 
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
+THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
+THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-256}"
 SINGLE_ORDERS="${SINGLE_ORDERS:-500000}"
+WARMUP_ORDERS="${WARMUP_ORDERS:-}"  # empty = bench default (100000)
 ORDERS_PER_SWEEP="${ORDERS_PER_SWEEP:-10000000}"
 LOCAL_ORDERS="${LOCAL_ORDERS:-100000000}"
 
@@ -403,6 +413,10 @@ stop_servers() {
 run_bench() {
     local server_addr="$1" health_addr="$2" orders="$3"
     shift 3
+    local warmup_arg=""
+    if [[ -n "${WARMUP_ORDERS}" ]]; then
+        warmup_arg="--warmup ${WARMUP_ORDERS}"
+    fi
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${server_addr} \
@@ -410,6 +424,7 @@ run_bench() {
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
+            ${warmup_arg} \
             ${orders} $*"
 }
 
@@ -714,9 +729,12 @@ workload_throughput() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Peak throughput — full durability"
-    echo "  ${THROUGHPUT_ORDERS} pairs, 16 clients, window 256"
+    echo "  ${THROUGHPUT_ORDERS} pairs, ${THROUGHPUT_CLIENTS} clients, window ${THROUGHPUT_WINDOW}"
     echo "============================================================"
     echo ""
+
+    local warmup_arg=""
+    if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
@@ -724,10 +742,10 @@ workload_throughput() {
                 --addr ${CURRENT_BIND} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
-                ${BENCH_DPDK_ARGS} \
-                ${THROUGHPUT_ORDERS} --clients 16 --window 256"
+                ${BENCH_DPDK_ARGS} ${warmup_arg} \
+                ${THROUGHPUT_ORDERS} --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients 16 --window 256
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     fi
     collect_result "${transport}-throughput"
 }
@@ -737,7 +755,7 @@ workload_no_persist() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Peak throughput — no persistence"
-    echo "  ${THROUGHPUT_ORDERS} pairs, 16 clients, window 256"
+    echo "  ${THROUGHPUT_ORDERS} pairs, ${THROUGHPUT_CLIENTS} clients, window ${THROUGHPUT_WINDOW}"
     echo "============================================================"
     echo ""
 
@@ -777,13 +795,16 @@ workload_single() {
     echo "============================================================"
     echo ""
 
+    local warmup_arg=""
+    if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
+
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
             ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
-                ${BENCH_DPDK_ARGS} \
+                ${BENCH_DPDK_ARGS} ${warmup_arg} \
                 ${SINGLE_ORDERS} --clients 1 --window 1"
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_ORDERS}" --clients 1 --window 1
