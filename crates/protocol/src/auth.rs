@@ -13,11 +13,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 /// Permission level assigned to an authenticated connection.
 ///
-/// Four specialized roles with no overlap — separation of duties:
+/// Five specialized roles with no overlap — separation of duties:
 ///   Operator: exchange configuration (instruments, risk, circuit breakers)
 ///   Trader: order submission and cancellation
 ///   Custodian: fund management (deposit/withdraw)
 ///   ReadOnly: observation only (heartbeats, future market data)
+///   Replication: journal streaming between primary and replica servers
 ///
 /// No single role has full access. An organization needing both trading
 /// and admin uses separate keys for each role.
@@ -38,6 +39,10 @@ pub enum Permission {
     Custodian,
     /// Heartbeats only. Future: market data subscriptions.
     ReadOnly,
+    /// Replication only. Authorizes a replica to connect and receive
+    /// journal streams. Cannot trade, manage funds, or configure the
+    /// exchange. Infrastructure role, not client-facing.
+    Replication,
 }
 
 impl Permission {
@@ -58,6 +63,12 @@ impl Permission {
     /// (deposit, withdraw).
     pub fn can_manage_funds(self) -> bool {
         matches!(self, Permission::Custodian)
+    }
+
+    /// Whether this permission level authorizes replication connections
+    /// (journal streaming between primary and replica).
+    pub fn is_replication(self) -> bool {
+        matches!(self, Permission::Replication)
     }
 }
 
@@ -111,9 +122,10 @@ impl AuthorizedKeys {
                 "trader" => Permission::Trader,
                 "custodian" => Permission::Custodian,
                 "readonly" => Permission::ReadOnly,
+                "replication" => Permission::Replication,
                 other => {
                     return Err(format!(
-                        "line {}: unknown permission '{}' (expected operator/trader/custodian/readonly)",
+                        "line {}: unknown permission '{}' (expected operator/trader/custodian/readonly/replication)",
                         line_num + 1,
                         other
                     ));
@@ -220,6 +232,7 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
         assert!(Permission::Trader.can_trade());
         assert!(!Permission::Custodian.can_trade());
         assert!(!Permission::ReadOnly.can_trade());
+        assert!(!Permission::Replication.can_trade());
     }
 
     #[test]
@@ -228,6 +241,7 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
         assert!(!Permission::Trader.is_operator());
         assert!(!Permission::Custodian.is_operator());
         assert!(!Permission::ReadOnly.is_operator());
+        assert!(!Permission::Replication.is_operator());
     }
 
     #[test]
@@ -236,6 +250,25 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
         assert!(!Permission::Trader.can_manage_funds());
         assert!(Permission::Custodian.can_manage_funds());
         assert!(!Permission::ReadOnly.can_manage_funds());
+        assert!(!Permission::Replication.can_manage_funds());
+    }
+
+    #[test]
+    fn permission_is_replication() {
+        assert!(!Permission::Operator.is_replication());
+        assert!(!Permission::Trader.is_replication());
+        assert!(!Permission::Custodian.is_replication());
+        assert!(!Permission::ReadOnly.is_replication());
+        assert!(Permission::Replication.is_replication());
+    }
+
+    #[test]
+    fn replication_key_parsed_from_file() {
+        let content =
+            "replication AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= replica-1\n";
+        let keys = AuthorizedKeys::parse(content).unwrap();
+        let pub_key = [0u8; 32];
+        assert_eq!(keys.lookup(&pub_key), Some(Permission::Replication));
     }
 
     #[test]

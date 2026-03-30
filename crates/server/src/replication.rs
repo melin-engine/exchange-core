@@ -9,6 +9,12 @@
 //!
 //! Length-prefixed frames, little-endian, over a dedicated TCP connection.
 //!
+//! ### Auth (before handshake)
+//! - **Challenge** (Primary → Replica): `[len:u32][0x03][nonce:[u8;32]]`
+//! - **ChallengeResponse** (Replica → Primary): `[len:u32][0x04][signature:[u8;64]][pubkey:[u8;32]]`
+//! - **AuthOk** (Primary → Replica): `[len:u32][0x05]`
+//! - **AuthFailed** (Primary → Replica): `[len:u32][0x06]`
+//!
 //! ### Replica → Primary
 //! - **Handshake**: `[len:u32][0x01][last_sequence:u64][chain_hash:[u8;32]]`
 //! - **Ack**: `[len:u32][0x02][acked_sequence:u64]`
@@ -44,6 +50,11 @@ use melin_engine::journal::replication::ReplicationConsumer;
 /// Message type tags.
 const MSG_HANDSHAKE: u8 = 0x01;
 const MSG_ACK: u8 = 0x02;
+// Auth messages (exchanged before the handshake).
+const MSG_CHALLENGE: u8 = 0x03;
+const MSG_CHALLENGE_RESPONSE: u8 = 0x04;
+const MSG_AUTH_OK: u8 = 0x05;
+const MSG_AUTH_FAILED: u8 = 0x06;
 const MSG_STREAM_START: u8 = 0x10;
 const MSG_NEED_SNAPSHOT: u8 = 0x11;
 const MSG_HASH_MISMATCH: u8 = 0x12;
@@ -118,6 +129,85 @@ fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_ACK);
     buf.extend_from_slice(&ack.acked_sequence.to_le_bytes());
+}
+
+/// Encode a Challenge message (primary → replica).
+fn encode_challenge(nonce: &[u8; 32], buf: &mut Vec<u8>) {
+    let payload_len: u32 = 1 + 32; // type + nonce
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_CHALLENGE);
+    buf.extend_from_slice(nonce);
+}
+
+/// Encode a ChallengeResponse message (replica → primary).
+fn encode_challenge_response(signature: &[u8; 64], pubkey: &[u8; 32], buf: &mut Vec<u8>) {
+    let payload_len: u32 = 1 + 64 + 32; // type + signature + pubkey
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_CHALLENGE_RESPONSE);
+    buf.extend_from_slice(signature);
+    buf.extend_from_slice(pubkey);
+}
+
+/// Encode an AuthOk message (primary → replica).
+fn encode_auth_ok(buf: &mut Vec<u8>) {
+    let payload_len: u32 = 1;
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_AUTH_OK);
+}
+
+/// Encode an AuthFailed message (primary → replica).
+fn encode_auth_failed(buf: &mut Vec<u8>) {
+    let payload_len: u32 = 1;
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_AUTH_FAILED);
+}
+
+/// Decode a Challenge payload → 32-byte nonce.
+fn decode_challenge(payload: &[u8]) -> io::Result<[u8; 32]> {
+    if payload.len() < 1 + 32 {
+        return Err(io::Error::other("challenge too short"));
+    }
+    if payload[0] != MSG_CHALLENGE {
+        return Err(io::Error::other(format!(
+            "expected Challenge (0x{:02x}), got 0x{:02x}",
+            MSG_CHALLENGE, payload[0]
+        )));
+    }
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&payload[1..33]);
+    Ok(nonce)
+}
+
+/// Decode a ChallengeResponse payload → (signature, pubkey).
+fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64], [u8; 32])> {
+    if payload.len() < 1 + 64 + 32 {
+        return Err(io::Error::other("challenge response too short"));
+    }
+    if payload[0] != MSG_CHALLENGE_RESPONSE {
+        return Err(io::Error::other(format!(
+            "expected ChallengeResponse (0x{:02x}), got 0x{:02x}",
+            MSG_CHALLENGE_RESPONSE, payload[0]
+        )));
+    }
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&payload[1..65]);
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&payload[65..97]);
+    Ok((signature, pubkey))
+}
+
+/// Decode an auth result payload → true if AuthOk, false if AuthFailed.
+fn decode_auth_result(payload: &[u8]) -> io::Result<bool> {
+    if payload.is_empty() {
+        return Err(io::Error::other("empty auth result"));
+    }
+    match payload[0] {
+        MSG_AUTH_OK => Ok(true),
+        MSG_AUTH_FAILED => Ok(false),
+        other => Err(io::Error::other(format!(
+            "expected AuthOk/AuthFailed, got 0x{other:02x}"
+        ))),
+    }
 }
 
 /// Encode a StreamStart message into a frame.
@@ -325,6 +415,7 @@ pub fn run_sender(
     replication_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
+    authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     replicas_connected: &AtomicU32,
@@ -431,6 +522,7 @@ pub fn run_sender(
                     let cursor = Arc::clone(&replication_cursor);
                     let genesis = genesis_entry.clone();
                     let jpath = journal_path.clone();
+                    let auth_keys = Arc::clone(&authorized_keys);
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let handle = std::thread::Builder::new()
                         .name(format!("repl-{slot_idx}"))
@@ -445,6 +537,7 @@ pub fn run_sender(
                                 cursor,
                                 genesis,
                                 jpath,
+                                auth_keys,
                                 shutdown_ref,
                                 batch_size,
                                 heartbeat_secs,
@@ -488,6 +581,7 @@ fn run_replica_slot(
     replication_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
+    authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
     shutdown: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -499,6 +593,7 @@ fn run_replica_slot(
         &replication_cursor,
         &genesis_entry,
         &journal_path,
+        &authorized_keys,
         shutdown,
         batch_size,
         heartbeat_secs,
@@ -667,13 +762,128 @@ fn catch_up_from_journal(
     Ok(end_sequence)
 }
 
-/// Handle a single replica connection: handshake, catch-up, streaming, ack processing.
+/// Authenticate a replica connection (primary side).
+///
+/// Sends a 32-byte nonce challenge, verifies the replica's Ed25519
+/// signature, and checks that the key has `Replication` permission.
+/// Must complete within the stream's existing read timeout.
+fn authenticate_replica(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    authorized_keys: &melin_protocol::auth::AuthorizedKeys,
+) -> io::Result<()> {
+    use ed25519_dalek::{Verifier, VerifyingKey};
+
+    // Generate random nonce.
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+
+    // Send Challenge.
+    let mut buf = Vec::with_capacity(64);
+    encode_challenge(&nonce, &mut buf);
+    writer.write_all(&buf)?;
+    writer.flush()?;
+
+    // Read ChallengeResponse.
+    let frame = read_frame(reader, MAX_CONTROL_FRAME)?;
+    let (signature_bytes, pubkey_bytes) = match decode_challenge_response(&frame) {
+        Ok(pair) => pair,
+        Err(e) => {
+            buf.clear();
+            encode_auth_failed(&mut buf);
+            let _ = writer.write_all(&buf);
+            return Err(io::Error::other(format!("bad challenge response: {e}")));
+        }
+    };
+
+    // Look up key and verify permission.
+    let permission = match authorized_keys.lookup(&pubkey_bytes) {
+        Some(perm) => perm,
+        None => {
+            buf.clear();
+            encode_auth_failed(&mut buf);
+            let _ = writer.write_all(&buf);
+            return Err(io::Error::other("unknown replication key"));
+        }
+    };
+    if !permission.is_replication() {
+        buf.clear();
+        encode_auth_failed(&mut buf);
+        let _ = writer.write_all(&buf);
+        return Err(io::Error::other(format!(
+            "key has {permission:?} permission, expected Replication"
+        )));
+    }
+
+    // Verify Ed25519 signature over the nonce.
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| {
+        buf.clear();
+        encode_auth_failed(&mut buf);
+        let _ = writer.write_all(&buf);
+        io::Error::other(format!("invalid public key: {e}"))
+    })?;
+    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+    verifying_key.verify(&nonce, &signature).map_err(|e| {
+        buf.clear();
+        encode_auth_failed(&mut buf);
+        let _ = writer.write_all(&buf);
+        io::Error::other(format!("signature verification failed: {e}"))
+    })?;
+
+    // Auth succeeded.
+    buf.clear();
+    encode_auth_ok(&mut buf);
+    writer.write_all(&buf)?;
+    writer.flush()?;
+
+    Ok(())
+}
+
+/// Authenticate with the primary (replica side).
+///
+/// Reads the nonce challenge, signs it with the replica's private key,
+/// sends the response, and waits for AuthOk/AuthFailed.
+fn authenticate_with_primary(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> io::Result<()> {
+    use ed25519_dalek::Signer;
+
+    // Read Challenge.
+    let frame = read_frame(reader, MAX_CONTROL_FRAME)?;
+    let nonce = decode_challenge(&frame)?;
+
+    // Sign the nonce.
+    let signature = signing_key.sign(&nonce);
+    let pubkey = signing_key.verifying_key();
+
+    // Send ChallengeResponse.
+    let mut buf = Vec::with_capacity(128);
+    encode_challenge_response(
+        &signature.to_bytes(),
+        pubkey.as_bytes(),
+        &mut buf,
+    );
+    writer.write_all(&buf)?;
+    writer.flush()?;
+
+    // Read auth result.
+    let result_frame = read_frame(reader, MAX_CONTROL_FRAME)?;
+    match decode_auth_result(&result_frame)? {
+        true => Ok(()),
+        false => Err(io::Error::other("primary rejected replication key")),
+    }
+}
+
 fn handle_replica_connection(
     stream: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
     replication_cursor: &Arc<AtomicU64>,
     genesis_entry: &[u8],
     journal_path: &std::path::Path,
+    authorized_keys: &melin_protocol::auth::AuthorizedKeys,
     shutdown: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -682,8 +892,12 @@ fn handle_replica_connection(
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
-    // Set a read timeout for the handshake.
+    // Set a read timeout for the handshake and auth.
     reader.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+
+    // Authenticate before any data exchange.
+    authenticate_replica(&mut reader, &mut writer, authorized_keys)?;
+    info!("replica authenticated");
 
     // Read handshake.
     let handshake_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -925,6 +1139,7 @@ pub type ReceiverResult = Result<
 pub fn run_receiver(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
+    signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
 ) -> ReceiverResult {
@@ -941,6 +1156,10 @@ pub fn run_receiver(
 
     let mut reader = stream.try_clone()?;
     let mut tcp_writer = stream;
+
+    // Authenticate with the primary before any data exchange.
+    authenticate_with_primary(&mut reader, &mut tcp_writer, signing_key)?;
+    info!("authenticated with primary");
 
     // Determine our current state from the local journal (if any).
     // For fresh starts, we defer journal creation until after the handshake
@@ -1108,7 +1327,6 @@ pub fn run_receiver(
             if !journal_accum.is_empty() {
                 journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
                 replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
-                events_since_snapshot += accum_entry_count;
                 journal_accum.clear();
             }
             return Ok(Some((exchange, journal_writer)));
@@ -1142,7 +1360,6 @@ pub fn run_receiver(
                         &mut exchange,
                         &mut reports,
                     )?;
-                    events_since_snapshot += accum_entry_count;
                     journal_accum.clear();
                 }
 
@@ -1544,6 +1761,177 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let result = read_frame(&mut cursor, 64);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn challenge_encode_decode_round_trip() {
+        let nonce = [0x42; 32];
+        let mut buf = Vec::new();
+        encode_challenge(&nonce, &mut buf);
+
+        let payload = &buf[4..];
+        let decoded = decode_challenge(payload).unwrap();
+        assert_eq!(decoded, nonce);
+    }
+
+    #[test]
+    fn challenge_response_encode_decode_round_trip() {
+        let sig = [0xAA; 64];
+        let pubkey = [0xBB; 32];
+        let mut buf = Vec::new();
+        encode_challenge_response(&sig, &pubkey, &mut buf);
+
+        let payload = &buf[4..];
+        let (decoded_sig, decoded_pubkey) = decode_challenge_response(payload).unwrap();
+        assert_eq!(decoded_sig, sig);
+        assert_eq!(decoded_pubkey, pubkey);
+    }
+
+    #[test]
+    fn auth_ok_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_auth_ok(&mut buf);
+
+        let payload = &buf[4..];
+        assert!(decode_auth_result(payload).unwrap());
+    }
+
+    #[test]
+    fn auth_failed_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_auth_failed(&mut buf);
+
+        let payload = &buf[4..];
+        assert!(!decode_auth_result(payload).unwrap());
+    }
+
+    #[test]
+    fn decode_challenge_rejects_wrong_tag() {
+        let mut payload = [0u8; 33];
+        payload[0] = MSG_AUTH_OK;
+        assert!(decode_challenge(&payload).is_err());
+    }
+
+    #[test]
+    fn decode_challenge_response_rejects_short_payload() {
+        let payload = [MSG_CHALLENGE_RESPONSE; 10]; // too short
+        assert!(decode_challenge_response(&payload).is_err());
+    }
+
+    #[test]
+    fn auth_round_trip_valid_key() {
+        use ed25519_dalek::SigningKey;
+        use std::os::unix::net::UnixStream;
+
+        let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+        let pub_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            repl_key.verifying_key().to_bytes(),
+        );
+        let keys_content = format!("replication {pub_b64} test-replica\n");
+        let authorized_keys =
+            melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+        primary_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        replica_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let repl_key_clone = SigningKey::from_bytes(&[0xFC; 32]);
+        let replica_handle = std::thread::spawn(move || {
+            let mut reader = replica_stream.try_clone().unwrap();
+            let mut writer = replica_stream;
+            authenticate_with_primary(&mut reader, &mut writer, &repl_key_clone)
+        });
+
+        let mut reader = primary_stream.try_clone().unwrap();
+        let mut writer = primary_stream;
+        authenticate_replica(&mut reader, &mut writer, &authorized_keys).unwrap();
+
+        replica_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn auth_rejects_unknown_key() {
+        use ed25519_dalek::SigningKey;
+        use std::os::unix::net::UnixStream;
+
+        // authorized_keys has one key, but the replica uses a different one.
+        let authorized_key = SigningKey::from_bytes(&[0xAA; 32]);
+        let rogue_key = SigningKey::from_bytes(&[0xBB; 32]);
+        let pub_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            authorized_key.verifying_key().to_bytes(),
+        );
+        let keys_content = format!("replication {pub_b64} authorized-replica\n");
+        let authorized_keys =
+            melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+        primary_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        replica_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let replica_handle = std::thread::spawn(move || {
+            let mut reader = replica_stream.try_clone().unwrap();
+            let mut writer = replica_stream;
+            authenticate_with_primary(&mut reader, &mut writer, &rogue_key)
+        });
+
+        let mut reader = primary_stream.try_clone().unwrap();
+        let mut writer = primary_stream;
+        let result = authenticate_replica(&mut reader, &mut writer, &authorized_keys);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown"));
+
+        // Replica should also get a rejection.
+        let replica_result = replica_handle.join().unwrap();
+        assert!(replica_result.is_err());
+    }
+
+    #[test]
+    fn auth_rejects_wrong_permission() {
+        use ed25519_dalek::SigningKey;
+        use std::os::unix::net::UnixStream;
+
+        // Key exists but has Trader permission, not Replication.
+        let key = SigningKey::from_bytes(&[0xCC; 32]);
+        let pub_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            key.verifying_key().to_bytes(),
+        );
+        let keys_content = format!("trader {pub_b64} wrong-role\n");
+        let authorized_keys =
+            melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+        primary_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        replica_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let replica_handle = std::thread::spawn(move || {
+            let mut reader = replica_stream.try_clone().unwrap();
+            let mut writer = replica_stream;
+            authenticate_with_primary(&mut reader, &mut writer, &key)
+        });
+
+        let mut reader = primary_stream.try_clone().unwrap();
+        let mut writer = primary_stream;
+        let result = authenticate_replica(&mut reader, &mut writer, &authorized_keys);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Replication"));
+
+        let replica_result = replica_handle.join().unwrap();
+        assert!(replica_result.is_err());
     }
 
     #[test]

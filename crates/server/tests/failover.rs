@@ -56,8 +56,9 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
-/// Write an authorized_keys file for multiple test keys.
-fn write_auth_keys_multi(dir: &Path, keys: &[&SigningKey]) -> PathBuf {
+/// Write an authorized_keys file for multiple test keys, plus a
+/// replication key. Returns (authorized_keys_path, replication_key_path).
+fn write_auth_keys_multi(dir: &Path, keys: &[&SigningKey], repl_key: &SigningKey) -> (PathBuf, PathBuf) {
     let path = dir.join("authorized_keys");
     let mut content = String::new();
     for (i, key) in keys.iter().enumerate() {
@@ -68,8 +69,18 @@ fn write_auth_keys_multi(dir: &Path, keys: &[&SigningKey]) -> PathBuf {
         // Use trader permission so orders can be submitted.
         content.push_str(&format!("trader {pub_key_b64} test-key-{i}\n"));
     }
+    // Add replication key.
+    let repl_pub_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        repl_key.verifying_key().to_bytes(),
+    );
+    content.push_str(&format!("replication {repl_pub_b64} replication\n"));
     std::fs::write(&path, content).expect("write authorized_keys");
-    path
+
+    // Write the replication private key seed to a file.
+    let repl_key_path = dir.join("replication.key");
+    std::fs::write(&repl_key_path, repl_key.to_bytes()).expect("write replication key");
+    (path, repl_key_path)
 }
 
 /// Poll the health endpoint until it responds or timeout.
@@ -193,18 +204,20 @@ fn spawn_replica(
     bin: &Path,
     tmp_dir: &Path,
     keys_path: &Path,
+    repl_key_path: &Path,
     primary_repl_port: u16,
     client_port: u16,
     health_port: u16,
     promote_port: u16,
 ) -> ServerProcess {
-    spawn_replica_named(bin, tmp_dir, keys_path, primary_repl_port, client_port, health_port, promote_port, "replica")
+    spawn_replica_named(bin, tmp_dir, keys_path, repl_key_path, primary_repl_port, client_port, health_port, promote_port, "replica")
 }
 
 fn spawn_replica_named(
     bin: &Path,
     tmp_dir: &Path,
     keys_path: &Path,
+    repl_key_path: &Path,
     primary_repl_port: u16,
     client_port: u16,
     health_port: u16,
@@ -217,6 +230,7 @@ fn spawn_replica_named(
             "--bind", &format!("127.0.0.1:{client_port}"),
             "--health-bind", &format!("127.0.0.1:{health_port}"),
             "--replica-of", &format!("127.0.0.1:{primary_repl_port}"),
+            "--replication-key", repl_key_path.to_str().expect("valid path"),
             "--promote-bind", &format!("127.0.0.1:{promote_port}"),
             "--journal", journal.to_str().expect("valid path"),
             "--authorized-keys", keys_path.to_str().expect("valid path"),
@@ -258,6 +272,8 @@ struct TestCluster {
     key2: SigningKey,
     bin: PathBuf,
     keys_path: PathBuf,
+    #[allow(dead_code)] // Available for replacement replica spawns.
+    repl_key_path: PathBuf,
     _tmp: tempfile::TempDir,
 }
 
@@ -273,7 +289,8 @@ impl TestCluster {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let key = SigningKey::from_bytes(&[0xFA; 32]);
         let key2 = SigningKey::from_bytes(&[0xFB; 32]);
-        let keys_path = write_auth_keys_multi(tmp.path(), &[&key, &key2]);
+        let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+        let (keys_path, repl_key_path) = write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
 
         let primary_client_port = free_port();
         let primary_health_port = free_port();
@@ -309,6 +326,7 @@ impl TestCluster {
             &bin,
             tmp.path(),
             &keys_path,
+            &repl_key_path,
             primary_repl_port,
             replica_client_port,
             replica_health_port,
@@ -325,6 +343,7 @@ impl TestCluster {
             key2,
             bin,
             keys_path,
+            repl_key_path,
             _tmp: tmp,
         }
     }
@@ -696,6 +715,7 @@ struct DualCluster {
     replica2_promote_port: u16,
     key: SigningKey,
     key2: SigningKey,
+    repl_key_path: PathBuf,
     _tmp: tempfile::TempDir,
 }
 
@@ -707,7 +727,8 @@ impl DualCluster {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let key = SigningKey::from_bytes(&[0xFA; 32]);
         let key2 = SigningKey::from_bytes(&[0xFB; 32]);
-        let keys_path = write_auth_keys_multi(tmp.path(), &[&key, &key2]);
+        let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+        let (keys_path, repl_key_path) = write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
 
         let primary_client_port = free_port();
         let primary_health_port = free_port();
@@ -739,11 +760,11 @@ impl DualCluster {
         }
 
         let replica1 = spawn_replica_named(
-            &bin, tmp.path(), &keys_path, primary_repl_port,
+            &bin, tmp.path(), &keys_path, &repl_key_path, primary_repl_port,
             r1_client, r1_health, r1_promote, "replica1",
         );
         let replica2 = spawn_replica_named(
-            &bin, tmp.path(), &keys_path, primary_repl_port,
+            &bin, tmp.path(), &keys_path, &repl_key_path, primary_repl_port,
             r2_client, r2_health, r2_promote, "replica2",
         );
 
@@ -754,7 +775,7 @@ impl DualCluster {
             replica1, replica2,
             replica1_promote_port: r1_promote,
             replica2_promote_port: r2_promote,
-            key, key2, _tmp: tmp,
+            key, key2, repl_key_path, _tmp: tmp,
         }
     }
 
@@ -1044,6 +1065,7 @@ fn replacement_replica_catches_up_from_journal() {
                 "--bind", &format!("127.0.0.1:{r3_client}"),
                 "--health-bind", &format!("127.0.0.1:{r3_health}"),
                 "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
                 "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
                 "--journal", replacement_journal.to_str().expect("valid path"),
                 "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().expect("valid path"),
@@ -1168,6 +1190,7 @@ fn catchup_with_fills_during_gap() {
                 "--bind", &format!("127.0.0.1:{r3_client}"),
                 "--health-bind", &format!("127.0.0.1:{r3_health}"),
                 "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
                 "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
                 "--journal", replacement_journal.to_str().unwrap(),
                 "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
@@ -1263,6 +1286,7 @@ fn catchup_then_immediate_failover() {
                 "--bind", &format!("127.0.0.1:{r3_client}"),
                 "--health-bind", &format!("127.0.0.1:{r3_health}"),
                 "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
                 "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
                 "--journal", replacement_journal.to_str().unwrap(),
                 "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
@@ -1363,6 +1387,7 @@ fn fresh_replica_full_catchup() {
                 "--bind", &format!("127.0.0.1:{r3_client}"),
                 "--health-bind", &format!("127.0.0.1:{r3_health}"),
                 "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
                 "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
                 "--journal", fresh_journal.to_str().unwrap(),
                 "--authorized-keys",

@@ -19,7 +19,7 @@
 //! while preserving persist-before-ack at the response boundary.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;

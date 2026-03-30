@@ -23,7 +23,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: melin-keygen <name> <permission>");
-        eprintln!("  permission: operator | trader | custodian | readonly");
+        eprintln!("  permission: operator | trader | custodian | readonly | replication");
         eprintln!();
         eprintln!("example:");
         eprintln!("  melin-keygen ops operator");
@@ -36,10 +36,10 @@ fn main() {
     let permission = &args[2];
 
     match permission.as_str() {
-        "operator" | "trader" | "custodian" | "readonly" => {}
+        "operator" | "trader" | "custodian" | "readonly" | "replication" => {}
         other => {
             eprintln!(
-                "error: invalid permission '{other}' (expected operator/trader/custodian/readonly)"
+                "error: invalid permission '{other}' (expected operator/trader/custodian/readonly/replication)"
             );
             std::process::exit(1);
         }

@@ -86,6 +86,7 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 
 A server started with `--replica-of <primary_addr>` runs in replica mode:
 
+- Authenticates with the primary via Ed25519 challenge-response (`--replication-key`).
 - Connects to the primary and sends a `Handshake`.
 - Receives `DataBatch` frames, decodes entries, verifies CRC per entry.
 - Writes raw bytes to a local journal via `write_raw_sync()` for durability.
@@ -102,6 +103,7 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 | `--replication-bind <addr>` | No | — | Address to listen for replica connections |
 | `--standalone` | No | `false` | Explicitly disable replication (dev/test) |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
+| `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 
 `--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
 

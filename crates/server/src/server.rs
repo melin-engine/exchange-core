@@ -122,6 +122,13 @@ pub struct ServerConfig {
     #[arg(long)]
     pub replica_of: Option<std::net::SocketAddr>,
 
+    /// Path to the Ed25519 private key for replication authentication.
+    /// Required in replica mode (`--replica-of`). The corresponding
+    /// public key must be listed in the primary's authorized_keys file
+    /// with permission `replication`.
+    #[arg(long)]
+    pub replication_key: Option<std::path::PathBuf>,
+
     /// Maximum number of replication ring batches to coalesce into a
     /// single TCP write+flush. Higher values reduce syscall overhead
     /// but increase per-write latency. Default: 32.
@@ -253,6 +260,7 @@ impl Default for ServerConfig {
             replication_bind: None,
             standalone: false,
             replica_of: None,
+            replication_key: None,
             replication_batch_size: 32,
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
@@ -385,6 +393,30 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
 
+        // Load replication signing key.
+        let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
+            std::io::Error::other("--replication-key is required in replica mode (--replica-of)")
+        })?;
+        let signing_key = {
+            let seed = std::fs::read(replication_key_path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "failed to read replication key {}: {e}",
+                    replication_key_path.display()
+                ))
+            })?;
+            if seed.len() != 32 {
+                return Err(format!(
+                    "replication key must be 32 bytes, got {} ({})",
+                    seed.len(),
+                    replication_key_path.display()
+                )
+                .into());
+            }
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&seed);
+            ed25519_dalek::SigningKey::from_bytes(&bytes)
+        };
+
         // Spawn promotion listener if configured.
         let promote_flag = Arc::new(AtomicBool::new(false));
         let _promote_handle = config.promote_bind.map(|addr| {
@@ -394,6 +426,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         match crate::replication::run_receiver(
             primary_addr,
             &config.journal,
+            &signing_key,
             &shutdown,
             &promote_flag,
         )? {
@@ -659,6 +692,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
         let journal_path = config.journal.clone();
+        let repl_auth_keys = Arc::clone(&authorized_keys);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -670,6 +704,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     repl_cursor,
                     genesis_entry,
                     journal_path,
+                    repl_auth_keys,
                     &s_repl,
                     &ready_flag,
                     &connected_counter,
@@ -1283,6 +1318,7 @@ pub fn run_dpdk(
         let heartbeat_secs = config.replication_heartbeat_secs;
         let busy_spin = !config.yield_idle;
         let journal_path = config.journal.clone();
+        let repl_auth_keys = Arc::clone(&authorized_keys);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1294,6 +1330,7 @@ pub fn run_dpdk(
                     repl_cursor,
                     genesis_entry,
                     journal_path,
+                    repl_auth_keys,
                     &s_repl,
                     &ready_flag,
                     &connected_counter,
