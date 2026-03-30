@@ -10,11 +10,11 @@ It doesn't handle gateway concerns such as market data fan-out, client session m
 
 Melin is:
 
-**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding. Hundres of test scenarios have been written to make sure Melin is correct.
+**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding. Hundreds of test scenarios were written to make sure Melin is correct.
 
 **Durable** — every order is persisted (pwritev2 + RWF_DSYNC) and replicated before acknowledgement; crash recovery via journal replay with CRC32C integrity checks; BLAKE3 hash chain for tamper evidence. Melin supports dual-replication to survive and recover from major outage scenarios.
 
-**Efficient** — single-threaded matching engine on a lock-free disruptor pipeline for maximum, with journal, matching and replication running in parallel. Melin can handle 8.1M orders/sec over LAN with local fsync, 5.8M/sec with synchronous replication, with a sub-100 µs p99.9 single-order latency.
+**Efficient** — single-threaded matching engine on a lock-free disruptor pipeline for the best compromise between maximum throughput and minimum latency, with journal, matching and replication running in parallel. Melin can handle 8.1M orders/sec over LAN with local fsync, 5.8M/sec with synchronous replication, with a sub-100 µs p99.9 single-order latency. All of this on regular datacenter-grade hardware.
 
 ## Architecture
 
@@ -62,7 +62,7 @@ Melin is:
    Subscribers ◄─TCP──────────────────────────┘
 ```
 
-- **[LMAX-style disruptor pipeline](docs/pipeline-architecture.md)** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
+- **[LMAX-style disruptor pipeline](docs/pipeline-architecture.md)** — dedicated OS threads for journal, matching, response, replication, event publishing, and scheduled snapshots on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 256 MiB chunks so sync only flushes data pages, not extent metadata
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
 - **Pre-allocated everything** — reservation slab (2M slots), order book indices, and balance maps are pre-sized and page-faulted at startup; jemalloc avoids glibc fragmentation
