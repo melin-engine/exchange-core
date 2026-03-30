@@ -720,18 +720,22 @@ fn handle_replica_connection(
     writer.flush()?;
     send_buf.clear();
 
-    // Catch up from journal files if the replica is behind the primary's
-    // current position. For a fresh replica (last_sequence=0), this streams
-    // the entire journal history. The scanner reads entries that exist at
-    // this moment and stops at partially-written tails — new entries
-    // arriving during catch-up are in the ring, handled by overlap drain.
-    let catchup_end = catch_up_from_journal(
-        journal_path,
-        handshake.last_sequence,
-        &mut writer,
-        repl_consumer,
-        shutdown,
-    )?;
+    // Catch up from journal files if the replica has existing state but
+    // is behind the primary's live stream. Fresh replicas (last_sequence=0)
+    // get everything from live ring streaming — catch-up would race with
+    // the journal writer during seeding. For fresh replica deployment,
+    // copy the primary's journal files to the replica first, then start.
+    let catchup_end = if handshake.last_sequence > 0 {
+        catch_up_from_journal(
+            journal_path,
+            handshake.last_sequence,
+            &mut writer,
+            repl_consumer,
+            shutdown,
+        )?
+    } else {
+        0
+    };
 
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up.

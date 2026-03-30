@@ -12,6 +12,7 @@
 //! Uses actual child processes (`melin-server` binary) and TCP so the test
 //! exercises the real replication and promotion code paths.
 
+use serial_test::serial;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -419,6 +420,7 @@ fn has_report(
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn kill_primary_promote_replica_no_data_loss() {
     let mut cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
@@ -451,6 +453,7 @@ fn kill_primary_promote_replica_no_data_loss() {
 /// balance conservation holds after promotion — no phantom fills or
 /// leaked reservations.
 #[test]
+#[serial]
 fn kill_during_active_fills() {
     let mut cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
@@ -494,6 +497,7 @@ fn kill_during_active_fills() {
 /// acked response was replicated — verify the promoted replica has at
 /// least the acked state.
 #[test]
+#[serial]
 fn kill_without_waiting_for_replication() {
     let mut cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
@@ -543,6 +547,7 @@ fn kill_without_waiting_for_replication() {
 /// same state (can place orders, rejects duplicates). This tests journal
 /// crash recovery on a server that was SIGKILLed.
 #[test]
+#[serial]
 fn crashed_primary_recovers_from_journal() {
     let mut cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
@@ -631,6 +636,7 @@ fn crashed_primary_recovers_from_journal() {
 /// (not re-execute it). This tests that the per-key dedup state survives
 /// replication and promotion.
 #[test]
+#[serial]
 fn same_key_retry_after_failover_is_rejected() {
     let mut cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
@@ -819,6 +825,7 @@ impl DualCluster {
 /// Kill one replica, verify trading continues. Kill primary, promote the
 /// surviving replica, verify no data loss.
 #[test]
+#[serial]
 fn dual_replication_survives_one_replica_failure() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -857,6 +864,7 @@ fn dual_replication_survives_one_replica_failure() {
 /// Kill BOTH replicas — trading must halt. Verify orders are rejected
 /// with ReplicaDisconnected.
 #[test]
+#[serial]
 fn dual_replication_halts_when_both_disconnect() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -893,6 +901,7 @@ fn dual_replication_halts_when_both_disconnect() {
 /// replica (the one that was alive the whole time). Symmetric test —
 /// proves either replica can be promoted.
 #[test]
+#[serial]
 fn dual_replication_promote_replica1_after_replica2_dies() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -929,6 +938,7 @@ fn dual_replication_promote_replica1_after_replica2_dies() {
 /// then failover. Verifies the promoted replica's exchange state is
 /// consistent (balances correct, can continue trading).
 #[test]
+#[serial]
 fn dual_replication_with_fills_then_failover() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -978,6 +988,7 @@ fn dual_replication_with_fills_then_failover() {
 /// streams the gap (orders the replacement missed) via journal catch-up.
 /// Kill primary, promote replacement, verify ALL orders are present.
 #[test]
+#[serial]
 fn replacement_replica_catches_up_from_journal() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -989,12 +1000,8 @@ fn replacement_replica_catches_up_from_journal() {
     }
     cluster.wait_replicated();
 
-    // Wait a bit extra to ensure both replicas have acked all events.
-    // The replication cursor tracks max(ack1, ack2) so lag=0 only
-    // guarantees the faster replica caught up, not both.
-    std::thread::sleep(Duration::from_secs(1));
-
-    // Kill replica 1 — its journal should have all events up to this point.
+    // SIGKILL replica 1. Its journal may have gaps from interrupted writes.
+    // Recovery tolerates this by truncating at the gap.
     let replica1_journal = cluster._tmp.path().join("replica1.journal");
     cluster.kill_replica1();
     std::thread::sleep(Duration::from_millis(500));
@@ -1124,6 +1131,7 @@ fn replacement_replica_catches_up_from_journal() {
 /// that generate fills. After catch-up + promotion, verify balances are
 /// correct (place + fill works on promoted replacement).
 #[test]
+#[serial]
 fn catchup_with_fills_during_gap() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -1133,12 +1141,14 @@ fn catchup_with_fills_during_gap() {
         submit_order(&mut client, i, 2, 1, Side::Sell, 100 + i, 5);
     }
     cluster.wait_replicated();
-    std::thread::sleep(Duration::from_secs(1));
 
-    // Kill replica 1 and copy its stale journal.
+    // SIGKILL replica 1 and copy its journal (may have gaps — recovery tolerates).
     let replica1_journal = cluster._tmp.path().join("replica1.journal");
     cluster.kill_replica1();
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(200));
+
+    let replacement_journal = cluster._tmp.path().join("replacement_fills.journal");
+    std::fs::copy(&replica1_journal, &replacement_journal).expect("copy journal");
 
     // Aggressive buys from account 1 during the gap — generates fills
     // that replica 1 misses.
@@ -1147,10 +1157,7 @@ fn catchup_with_fills_during_gap() {
     }
     cluster.wait_replicated();
 
-    // Start replacement with stale journal.
-    let replacement_journal = cluster._tmp.path().join("replacement_fills.journal");
-    std::fs::copy(&replica1_journal, &replacement_journal).expect("copy journal");
-
+    // Start replacement with the pre-kill journal snapshot.
     let r3_client = free_port();
     let r3_health = free_port();
     let r3_promote = free_port();
@@ -1223,6 +1230,7 @@ fn catchup_with_fills_during_gap() {
 /// Catch-up completes, kill primary immediately (no more orders after
 /// catch-up). Promote replacement. Verifies catch-up data survives.
 #[test]
+#[serial]
 fn catchup_then_immediate_failover() {
     let mut cluster = DualCluster::start();
     let mut client = cluster.connect_primary();
@@ -1231,18 +1239,19 @@ fn catchup_then_immediate_failover() {
         submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
     }
     cluster.wait_replicated();
+    // SIGKILL replica 1 and copy its journal (may have gaps — recovery tolerates).
+    let replica1_journal = cluster._tmp.path().join("replica1.journal");
     cluster.kill_replica1();
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(200));
+
+    let replacement_journal = cluster._tmp.path().join("replacement_imm.journal");
+    std::fs::copy(&replica1_journal, &replacement_journal).expect("copy journal");
 
     // Submit orders that replica 1 misses.
     for i in 16..=30u64 {
         submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
     }
     cluster.wait_replicated();
-
-    // Start fresh replacement (no journal copy — relies entirely on
-    // journal catch-up from the primary's files).
-    let replacement_journal = cluster._tmp.path().join("replacement_imm.journal");
 
     let r3_client = free_port();
     let r3_health = free_port();
