@@ -286,18 +286,26 @@ for HOST in "${BUILD_HOSTS[@]}"; do
 done
 
 # DPDK build on server (and replica if dpdk-repl).
+# In TAP mode, test-containers-start.sh already built the .dpdk binary.
+# In SR-IOV mode, cherry-setup.sh builds with --features dpdk as the main binary.
 if [[ "$NEED_DPDK" == "1" ]]; then
-    echo "  Building DPDK server..."
-    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
-    for item in "${MATRIX[@]}"; do
-        if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
-            echo "  Building DPDK server on replica..."
-            ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
-            break
-        fi
-    done
+    # Check if TAP mode .dpdk binary already exists (container setup).
+    HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-server.dpdk && echo yes || echo no")
+    if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
+        echo "  DPDK binary already built (melin-server.dpdk)."
+    else
+        echo "  Building DPDK server..."
+        ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+        for item in "${MATRIX[@]}"; do
+            if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
+                echo "  Building DPDK server on replica..."
+                ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                    cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+                break
+            fi
+        done
+    fi
 fi
 echo "  Builds complete."
 echo ""
@@ -601,7 +609,9 @@ dpdk_sriov_setup() {
 
     if [[ "$DPDK_MODE" == "tap" ]]; then
         # TAP mode (Docker containers): skip SR-IOV, use TAP PMD.
-        # The EAL args and routing are handled at server start time.
+        # The .dpdk binary is separate from the default binary so TCP
+        # transports aren't broken by the DPDK feature flag.
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server.dpdk"
         echo ""
         echo "=== DPDK TAP mode (no SR-IOV) ==="
         echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=tap"
@@ -620,6 +630,8 @@ dpdk_sriov_setup() {
             ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
         done
         load_dpdk_config "$BENCH" "BENCH"
+        # SR-IOV mode: DPDK build is the main binary (cherry-setup.sh builds with --features dpdk).
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
         echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=sriov"
         echo ""
     fi
@@ -672,9 +684,9 @@ transport_start_dpdk() {
         server_eal="--huge-dir=${HUGE_DIR}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -711,6 +723,8 @@ transport_start_dpdk() {
 
 transport_stop_dpdk() {
     stop_servers "$SERVER"
+    # TAP mode uses melin-server.dpdk — kill that too.
+    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
 }
 
 transport_start_dpdk_repl() {
@@ -736,9 +750,9 @@ transport_start_dpdk_repl() {
         replica_eal="--huge-dir=${HUGE_DIR}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -751,9 +765,9 @@ transport_start_dpdk_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -789,6 +803,9 @@ transport_start_dpdk_repl() {
 
 transport_stop_dpdk_repl() {
     stop_servers "$SERVER" "$REPLICA"
+    for host in "$SERVER" "$REPLICA"; do
+        ssh $SSH_OPTS "$host" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
+    done
     echo "  Verifying DPDK replication journal consistency..."
     "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
 }

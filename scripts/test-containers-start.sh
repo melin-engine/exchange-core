@@ -165,7 +165,11 @@ docker exec "$SERVER" bash -c "
     apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3 && \
     source /root/.cargo/env && \
     cd $REPO_DIR && \
-    cargo build --release -p melin-server --features dpdk 2>&1 | tail -3
+    cargo build --release -p melin-server --features dpdk 2>&1 | tail -3 && \
+    cp target/release/melin-server target/release/melin-server.dpdk && \
+    echo 'Rebuilding default (non-DPDK) server binary...' && \
+    cargo build --release -p melin-server 2>&1 | tail -3 && \
+    ls -la target/release/melin-server target/release/melin-server.dpdk
 "
 
 # Pick a DPDK IP that's on the Docker bridge subnet but not used by any
