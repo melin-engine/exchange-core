@@ -221,8 +221,8 @@ impl DpdkShared {
         }
 
         // Scale mempool for number of queues and ports.
-        let num_mbufs: u32 = 8192 * (config.port_ids.len() as u32).max(1)
-            * (config.num_queues as u32).max(1);
+        let num_mbufs: u32 =
+            8192 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
         let mempool = if config.mtu > 1500 {
             Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, 0)?
         } else {
@@ -233,12 +233,8 @@ impl DpdkShared {
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port = Port::configure_with_vlan(
-                pid,
-                &mempool,
-                config.vlan_id,
-                config.num_queues,
-            )?;
+            let mut port =
+                Port::configure_with_vlan(pid, &mempool, config.vlan_id, config.num_queues)?;
             port.start()?;
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,
@@ -277,8 +273,12 @@ impl DpdkTransport {
         config: &DpdkConfig,
         queue_id: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut device =
-            DpdkDevice::new(&config.port_ids, shared.mempool_raw, shared.offloads, queue_id);
+        let mut device = DpdkDevice::new(
+            &config.port_ids,
+            shared.mempool_raw,
+            shared.offloads,
+            queue_id,
+        );
         if config.mtu != 1500 {
             device.set_mtu(config.mtu);
             tracing::info!(mtu = config.mtu, queue_id, "DPDK jumbo frames enabled");
@@ -484,7 +484,10 @@ impl DpdkTransport {
         // Skip when idle: no RX data, no pending TX, and timers not due.
         // Piggyback timer checks on the timestamp refresh interval.
         let has_pending_tx = self.pending_tx_bytes > 0;
-        if rx_had_data || has_pending_tx || self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
+        if rx_had_data
+            || has_pending_tx
+            || self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL)
+        {
             self.flush_tx_queues();
             self.iface
                 .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);

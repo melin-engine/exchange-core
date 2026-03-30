@@ -394,20 +394,14 @@ impl AccountManager {
         // (e.g., fee schedule changed after order placement).
         let fee_credit = buyer_actual_deducted as i128 - seller_actual_proceeds as i128;
         if fee_credit > 0 {
-            let fee_bal = self
-                .balances
-                .entry((FEE_ACCOUNT, spec.quote))
-                .or_default();
+            let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
             fee_bal.available = fee_bal
                 .available
                 .saturating_add(u64::try_from(fee_credit).unwrap_or(u64::MAX));
         } else if fee_credit < 0 {
             // Net rebate: funded from fee account.
             let rebate = u64::try_from(-fee_credit).unwrap_or(u64::MAX);
-            let fee_bal = self
-                .balances
-                .entry((FEE_ACCOUNT, spec.quote))
-                .or_default();
+            let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
             fee_bal.available = fee_bal.available.saturating_sub(rebate);
         }
 

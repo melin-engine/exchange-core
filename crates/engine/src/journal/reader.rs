@@ -8,10 +8,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::codec::{self, FILE_HEADER_SIZE, ENTRY_HEADER_SIZE, CRC_SIZE};
+use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, FILE_HEADER_SIZE};
 use super::error::JournalError;
-use crate::le;
 use super::event::JournalEvent;
+use crate::le;
 
 /// Initial read buffer size. Grows if needed, but entries are typically <100 bytes.
 /// Uses a Vec (growable) rather than a fixed array because the reader may need
@@ -221,7 +221,9 @@ impl JournalReader {
                 if let Some(chain) = &mut self.hash_chain {
                     // Finalize: feed the checkpoint entry bytes + previous
                     // chain hash, then compare with the recorded hash.
-                    chain.batch_hasher.update(&self.buffer[self.pos..entry_bytes_end]);
+                    chain
+                        .batch_hasher
+                        .update(&self.buffer[self.pos..entry_bytes_end]);
                     chain.batch_hasher.update(&chain.current_hash);
                     let computed = *chain.batch_hasher.finalize().as_bytes();
 
@@ -251,7 +253,9 @@ impl JournalReader {
 
             // Normal event: feed bytes into incremental batch hasher.
             if let Some(chain) = &mut self.hash_chain {
-                chain.batch_hasher.update(&self.buffer[self.pos..entry_bytes_end]);
+                chain
+                    .batch_hasher
+                    .update(&self.buffer[self.pos..entry_bytes_end]);
                 chain.events_since_checkpoint += 1;
             }
         }

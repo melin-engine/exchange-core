@@ -120,7 +120,6 @@ impl RestingOrder {
     pub(crate) fn expiry_ns(&self) -> u64 {
         self.expiry_ns
     }
-
 }
 
 impl PendingStop {
@@ -193,7 +192,6 @@ impl PendingStop {
     pub(crate) fn expiry_ns(&self) -> u64 {
         self.expiry_ns
     }
-
 }
 
 impl BookSide {
@@ -696,9 +694,7 @@ impl OrderBook {
                 true
             }
             OrderType::Market => false,
-            OrderType::Limit { .. } => {
-                self.order_index.contains_key(&(order.account, order.id))
-            }
+            OrderType::Limit { .. } => self.order_index.contains_key(&(order.account, order.id)),
         }
     }
 

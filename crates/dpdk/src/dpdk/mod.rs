@@ -8,5 +8,5 @@ pub mod transport;
 pub use eal::{Eal, EalError};
 pub use mempool::{Mempool, MempoolError};
 pub use port::{Port, PortError};
-pub use transport::{AcceptedConnection, DpdkConfig, DpdkShared, DpdkTransport};
 pub use smoltcp::iface::SocketHandle;
+pub use transport::{AcceptedConnection, DpdkConfig, DpdkShared, DpdkTransport};

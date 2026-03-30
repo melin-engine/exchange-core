@@ -625,7 +625,6 @@ fn nonblocking_read(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
     ReadResult::Complete(filled)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

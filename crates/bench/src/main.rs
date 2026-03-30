@@ -683,7 +683,7 @@ fn run_pipeline_bench(
         false, // no replication
         max_journal_batch,
         melin_engine::journal::replication::REPLICATION_RING_CAPACITY,
-        true, // busy_spin — match production default (yield_idle=false)
+        true,  // busy_spin — match production default (yield_idle=false)
         false, // event_publisher
         false, // shadow
     );

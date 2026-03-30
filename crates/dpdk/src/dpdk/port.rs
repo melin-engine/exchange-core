@@ -154,9 +154,8 @@ impl Port {
         // Configure port with N RX queues + N TX queues (one pair per
         // poll thread). Each thread reads from its RX queue and writes
         // to its TX queue.
-        let ret = unsafe {
-            ffi::rte_eth_dev_configure(port_id, num_queues, num_queues, &port_conf)
-        };
+        let ret =
+            unsafe { ffi::rte_eth_dev_configure(port_id, num_queues, num_queues, &port_conf) };
         if ret != 0 {
             return Err(PortError::ConfigureFailed(ret));
         }

@@ -599,31 +599,27 @@ impl Exchange {
                     // Resolve taker slot. The fill's taker may be the original
                     // order (use `slot`) or a triggered stop (consumed_slots
                     // if fully filled/cancelled, or order_index if it rested).
-                    let taker_slot =
-                        if fill_taker_account == taker_account && taker_order_id == taker_id {
-                            slot
-                        } else {
-                            // Triggered stop's slot — check consumed first,
-                            // then order_index (stop-limit that partially
-                            // filled and rested).
-                            match consumed
-                                .iter()
-                                .find(|(a, id, _, _)| {
-                                    *a == fill_taker_account && *id == taker_order_id
-                                })
-                                .map(|(_, _, _, s)| *s)
-                                .or_else(|| {
-                                    inst.book
-                                        .peek_order_location(
-                                            fill_taker_account,
-                                            taker_order_id,
-                                        )
-                                        .map(|(_, _, s)| s)
-                                }) {
-                                Some(s) => s,
-                                None => continue,
-                            }
-                        };
+                    let taker_slot = if fill_taker_account == taker_account
+                        && taker_order_id == taker_id
+                    {
+                        slot
+                    } else {
+                        // Triggered stop's slot — check consumed first,
+                        // then order_index (stop-limit that partially
+                        // filled and rested).
+                        match consumed
+                            .iter()
+                            .find(|(a, id, _, _)| *a == fill_taker_account && *id == taker_order_id)
+                            .map(|(_, _, _, s)| *s)
+                            .or_else(|| {
+                                inst.book
+                                    .peek_order_location(fill_taker_account, taker_order_id)
+                                    .map(|(_, _, s)| s)
+                            }) {
+                            Some(s) => s,
+                            None => continue,
+                        }
+                    };
 
                     let (buyer_slot, seller_slot, buyer_fee, seller_fee) = match maker_side {
                         Side::Buy => (maker_slot, taker_slot, maker_fee, taker_fee),
@@ -955,7 +951,8 @@ impl Exchange {
         // 1. Order must exist as a resting limit order.
         // Use peek_order_location (O(1) index lookup) for validation —
         // the VecDeque scan for old_remaining is deferred to replace_order.
-        let Some((side, _old_price, slot)) = inst.book.peek_order_location(account, order_id) else {
+        let Some((side, _old_price, slot)) = inst.book.peek_order_location(account, order_id)
+        else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -7090,14 +7087,14 @@ mod tests {
         // Verify balance conservation.
         let bal_a_usd = exchange.accounts().balance(ACCT_A, USD);
         let bal_b_usd = exchange.accounts().balance(ACCT_B, USD);
-        let total_usd = bal_a_usd.available + bal_a_usd.reserved
-            + bal_b_usd.available + bal_b_usd.reserved;
+        let total_usd =
+            bal_a_usd.available + bal_a_usd.reserved + bal_b_usd.available + bal_b_usd.reserved;
         assert_eq!(total_usd, 100_000, "USD conservation violated");
 
         let bal_a_btc = exchange.accounts().balance(ACCT_A, BTC);
         let bal_b_btc = exchange.accounts().balance(ACCT_B, BTC);
-        let total_btc = bal_a_btc.available + bal_a_btc.reserved
-            + bal_b_btc.available + bal_b_btc.reserved;
+        let total_btc =
+            bal_a_btc.available + bal_a_btc.reserved + bal_b_btc.available + bal_b_btc.reserved;
         assert_eq!(total_btc, 100, "BTC conservation violated");
 
         // No reservations should remain (all orders consumed or cancelled).
@@ -7162,14 +7159,14 @@ mod tests {
         // Verify balance conservation.
         let bal_a_usd = exchange.accounts().balance(ACCT_A, USD);
         let bal_b_usd = exchange.accounts().balance(ACCT_B, USD);
-        let total_usd = bal_a_usd.available + bal_a_usd.reserved
-            + bal_b_usd.available + bal_b_usd.reserved;
+        let total_usd =
+            bal_a_usd.available + bal_a_usd.reserved + bal_b_usd.available + bal_b_usd.reserved;
         assert_eq!(total_usd, 100_000, "USD conservation violated");
 
         let bal_a_btc = exchange.accounts().balance(ACCT_A, BTC);
         let bal_b_btc = exchange.accounts().balance(ACCT_B, BTC);
-        let total_btc = bal_a_btc.available + bal_a_btc.reserved
-            + bal_b_btc.available + bal_b_btc.reserved;
+        let total_btc =
+            bal_a_btc.available + bal_a_btc.reserved + bal_b_btc.available + bal_b_btc.reserved;
         assert_eq!(total_btc, 100, "BTC conservation violated");
     }
 
@@ -7574,15 +7571,26 @@ mod tests {
         // cost = 100 * 10 = 1000
         // maker_fee = 1000 * 10 / 10_000 = 1
         // taker_fee = 1000 * 20 / 10_000 = 2
-        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. })).unwrap();
-        if let ExecutionReport::Fill { maker_fee, taker_fee, .. } = fill {
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = fill
+        {
             assert_eq!(*maker_fee, 1);
             assert_eq!(*taker_fee, 2);
         }
 
         // Fee account should have maker_fee + taker_fee = 3 USD.
         let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
-        assert_eq!(fee_bal.available, 3, "fee account should hold collected fees");
+        assert_eq!(
+            fee_bal.available, 3,
+            "fee account should hold collected fees"
+        );
 
         // System conservation: deposited 100_000 USD, no withdrawals.
         // system = ACCT_A(available+reserved) + ACCT_B(available) + FEE_ACCOUNT(available)
@@ -7592,7 +7600,10 @@ mod tests {
             + a_bal.reserved as u128
             + b_bal.available as u128
             + fee_bal.available as u128;
-        assert_eq!(total, 100_000, "USD conservation: total must equal deposited");
+        assert_eq!(
+            total, 100_000,
+            "USD conservation: total must equal deposited"
+        );
     }
 
     #[test]
@@ -7642,10 +7653,15 @@ mod tests {
         let a = exchange.accounts().balance(ACCT_A, USD);
         let b = exchange.accounts().balance(ACCT_B, USD);
         let fee = exchange.accounts().balance(FEE_ACCOUNT, USD);
-        let total = a.available as u128 + a.reserved as u128
-            + b.available as u128 + b.reserved as u128
+        let total = a.available as u128
+            + a.reserved as u128
+            + b.available as u128
+            + b.reserved as u128
             + fee.available as u128;
-        assert_eq!(total, 10_000, "USD must be conserved after fee schedule change");
+        assert_eq!(
+            total, 10_000,
+            "USD must be conserved after fee schedule change"
+        );
     }
 
     #[test]
@@ -7693,7 +7709,13 @@ mod tests {
         // (it's placed after the change), so this should be fine.
         // Let's test a scenario where the stop was placed BEFORE fees.
         // Reset: place stop with no fees, then change fees, then trigger.
-        exchange.set_fee_schedule(Symbol(1), FeeSchedule { maker_fee_bps: 0, taker_fee_bps: 0 });
+        exchange.set_fee_schedule(
+            Symbol(1),
+            FeeSchedule {
+                maker_fee_bps: 0,
+                taker_fee_bps: 0,
+            },
+        );
 
         // Place stop buy@50 (no fees, so reservation = cost without cushion).
         exchange.execute(
@@ -7702,7 +7724,9 @@ mod tests {
                 id: OrderId(2),
                 account: ACCT_B,
                 side: Side::Buy,
-                order_type: OrderType::Stop { trigger_price: price(50) },
+                order_type: OrderType::Stop {
+                    trigger_price: price(50),
+                },
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(1),
                 stp: SelfTradeProtection::Allow,
@@ -7738,8 +7762,10 @@ mod tests {
         let a = exchange.accounts().balance(ACCT_A, USD);
         let b = exchange.accounts().balance(ACCT_B, USD);
         let fee = exchange.accounts().balance(FEE_ACCOUNT, USD);
-        let total = a.available as u128 + a.reserved as u128
-            + b.available as u128 + b.reserved as u128
+        let total = a.available as u128
+            + a.reserved as u128
+            + b.available as u128
+            + b.reserved as u128
             + fee.available as u128;
         assert_eq!(total, 20_000, "USD must be conserved with stop+fee change");
     }
@@ -7782,16 +7808,22 @@ mod tests {
             &mut reports,
         );
         assert!(
-            reports.iter().any(|r| matches!(r, ExecutionReport::Rejected {
-                reason: RejectReason::PriceWouldCross, ..
-            })),
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::PriceWouldCross,
+                    ..
+                }
+            )),
             "cancel-replace crossing spread must be rejected"
         );
         // Original order should still be resting at 90.
         reports.clear();
         exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
         assert!(
-            reports.iter().any(|r| matches!(r, ExecutionReport::Cancelled { .. })),
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Cancelled { .. })),
             "original order should still be on book after rejected amend"
         );
     }
@@ -7823,7 +7855,10 @@ mod tests {
                 id: OrderId(2),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Limit { price: price(100), post_only: false },
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
                 time_in_force: TimeInForce::FOK,
                 quantity: qty(10),
                 stp: SelfTradeProtection::CancelNewest,
@@ -7834,11 +7869,15 @@ mod tests {
 
         // Should be rejected, not filled.
         assert!(
-            reports.iter().any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
             "FOK with only self-liquidity and STP must reject"
         );
         assert!(
-            !reports.iter().any(|r| matches!(r, ExecutionReport::Fill { .. })),
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Fill { .. })),
             "FOK must never partially fill"
         );
     }
@@ -7868,7 +7907,10 @@ mod tests {
                 id: OrderId(2),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Limit { price: price(100), post_only: false },
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
                 time_in_force: TimeInForce::FOK,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
@@ -7878,7 +7920,9 @@ mod tests {
         );
 
         assert!(
-            reports.iter().any(|r| matches!(r, ExecutionReport::Fill { .. })),
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Fill { .. })),
             "FOK with STP Allow should fill against own order"
         );
     }
@@ -7927,10 +7971,15 @@ mod tests {
         let a = exchange.accounts().balance(ACCT_A, USD);
         let b = exchange.accounts().balance(ACCT_B, USD);
         let fee = exchange.accounts().balance(FEE_ACCOUNT, USD);
-        let total = a.available as u128 + a.reserved as u128
-            + b.available as u128 + b.reserved as u128
+        let total = a.available as u128
+            + a.reserved as u128
+            + b.available as u128
+            + b.reserved as u128
             + fee.available as u128;
-        assert_eq!(total, 10_000_000, "USD must be conserved across all fills with odd rounding");
+        assert_eq!(
+            total, 10_000_000,
+            "USD must be conserved across all fills with odd rounding"
+        );
     }
 
     /// Stop trigger cascade: a fill triggers stop A, which fills and triggers stop B.
@@ -7964,7 +8013,9 @@ mod tests {
                 id: OrderId(1),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Stop { trigger_price: price(100) },
+                order_type: OrderType::Stop {
+                    trigger_price: price(100),
+                },
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(5),
                 stp: SelfTradeProtection::Allow,
@@ -7980,7 +8031,9 @@ mod tests {
                 id: OrderId(2),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Stop { trigger_price: price(105) },
+                order_type: OrderType::Stop {
+                    trigger_price: price(105),
+                },
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(3),
                 stp: SelfTradeProtection::Allow,
@@ -8012,10 +8065,7 @@ mod tests {
             .filter(|r| matches!(r, ExecutionReport::Triggered { .. }))
             .collect();
 
-        assert!(
-            !fills.is_empty(),
-            "should have at least one fill"
-        );
+        assert!(!fills.is_empty(), "should have at least one fill");
         assert!(
             triggers.len() <= 1,
             "stop@105 should not trigger (last_trade=100 < 105)"
@@ -8052,7 +8102,11 @@ mod tests {
             qty(5),
             &mut reports,
         );
-        assert!(reports.iter().any(|r| matches!(r, ExecutionReport::Replaced { .. })));
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Replaced { .. }))
+        );
         reports.clear();
 
         // Buy 15@100 — should fill 10 from order 1, then 5 from order 2.
@@ -8065,14 +8119,20 @@ mod tests {
         let fills: Vec<_> = reports
             .iter()
             .filter_map(|r| match r {
-                ExecutionReport::Fill { maker_order_id, quantity, .. } => {
-                    Some((maker_order_id.0, quantity.get()))
-                }
+                ExecutionReport::Fill {
+                    maker_order_id,
+                    quantity,
+                    ..
+                } => Some((maker_order_id.0, quantity.get())),
                 _ => None,
             })
             .collect();
 
-        assert_eq!(fills, vec![(1, 10), (2, 5)], "order 2 should fill after 1 (priority preserved)");
+        assert_eq!(
+            fills,
+            vec![(1, 10), (2, 5)],
+            "order 2 should fill after 1 (priority preserved)"
+        );
     }
 
     /// Cancel-replace loses priority on price change.
@@ -8096,9 +8156,23 @@ mod tests {
         reports.clear();
 
         // Amend order 2: change price to 99, then back to 100. Loses priority.
-        exchange.cancel_replace(Symbol(1), ACCT_A, OrderId(2), price(99), qty(10), &mut reports);
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(2),
+            price(99),
+            qty(10),
+            &mut reports,
+        );
         reports.clear();
-        exchange.cancel_replace(Symbol(1), ACCT_A, OrderId(2), price(100), qty(10), &mut reports);
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(2),
+            price(100),
+            qty(10),
+            &mut reports,
+        );
         reports.clear();
 
         // Buy 25@100 — should fill 1 (10), then 3 (10), then 2 (5).
@@ -8111,14 +8185,20 @@ mod tests {
         let fills: Vec<_> = reports
             .iter()
             .filter_map(|r| match r {
-                ExecutionReport::Fill { maker_order_id, quantity, .. } => {
-                    Some((maker_order_id.0, quantity.get()))
-                }
+                ExecutionReport::Fill {
+                    maker_order_id,
+                    quantity,
+                    ..
+                } => Some((maker_order_id.0, quantity.get())),
                 _ => None,
             })
             .collect();
 
-        assert_eq!(fills, vec![(1, 10), (3, 10), (2, 5)], "order 2 should fill last (priority lost on price change)");
+        assert_eq!(
+            fills,
+            vec![(1, 10), (3, 10), (2, 5)],
+            "order 2 should fill last (priority lost on price change)"
+        );
     }
 
     /// Snapshot round-trip preserves fee account balance.
@@ -8134,7 +8214,10 @@ mod tests {
 
         exchange.set_fee_schedule(
             Symbol(1),
-            FeeSchedule { maker_fee_bps: 10, taker_fee_bps: 20 },
+            FeeSchedule {
+                maker_fee_bps: 10,
+                taker_fee_bps: 20,
+            },
         );
 
         let mut reports = Vec::new();
@@ -8160,7 +8243,10 @@ mod tests {
         let (restored, _, _) = snapshot::load(&snap_path).unwrap();
 
         let fee_after = restored.accounts().balance(FEE_ACCOUNT, USD).available;
-        assert_eq!(fee_before, fee_after, "fee account must survive snapshot round-trip");
+        assert_eq!(
+            fee_before, fee_after,
+            "fee account must survive snapshot round-trip"
+        );
     }
 
     /// Market order on an empty book is rejected with NoLiquidity.
@@ -8187,9 +8273,13 @@ mod tests {
         );
 
         assert!(
-            reports.iter().any(|r| matches!(r, ExecutionReport::Rejected {
-                reason: RejectReason::NoLiquidity, ..
-            })),
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected {
+                    reason: RejectReason::NoLiquidity,
+                    ..
+                }
+            )),
             "market order on empty book must be rejected with NoLiquidity"
         );
     }

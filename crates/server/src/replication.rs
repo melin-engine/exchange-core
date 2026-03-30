@@ -2068,17 +2068,12 @@ pub fn run_sender_dpdk(
 
                                 // Send StreamStart.
                                 send_buf.clear();
-                                encode_stream_start(
-                                    h.last_sequence,
-                                    &genesis_entry,
-                                    &mut send_buf,
-                                );
+                                encode_stream_start(h.last_sequence, &genesis_entry, &mut send_buf);
                                 transport.queue_send(handle, &send_buf);
                                 send_buf.clear();
 
                                 // Reset cursor.
-                                replication_cursor
-                                    .store(h.last_sequence + 1, Ordering::Release);
+                                replication_cursor.store(h.last_sequence + 1, Ordering::Release);
 
                                 last_sequence = h.last_sequence;
                                 last_chain_hash = h.chain_hash;
@@ -3328,7 +3323,9 @@ mod tests {
                         received += data.len() as u64;
                         received_data.extend_from_slice(&data);
                     }
-                    PrimaryMessage::SnapshotEnd { crc32c: expected_crc } => {
+                    PrimaryMessage::SnapshotEnd {
+                        crc32c: expected_crc,
+                    } => {
                         if received != snap_len {
                             return format!("length mismatch: {snap_len} vs {received}");
                         }
@@ -3414,7 +3411,9 @@ mod tests {
                         received += data.len() as u64;
                         received_data.extend_from_slice(&data);
                     }
-                    PrimaryMessage::SnapshotEnd { crc32c: expected_crc } => {
+                    PrimaryMessage::SnapshotEnd {
+                        crc32c: expected_crc,
+                    } => {
                         assert_eq!(received, snap_len, "length should match");
                         let actual_crc = crc32c::crc32c(&received_data);
                         assert_eq!(actual_crc, expected_crc, "CRC should match");
@@ -3484,7 +3483,10 @@ mod tests {
 
         // Replicate the primary's validation logic.
         let snap_data = std::fs::read(&snap_path).unwrap();
-        assert!(snap_data.len() >= 48, "file should be big enough for header");
+        assert!(
+            snap_data.len() >= 48,
+            "file should be big enough for header"
+        );
 
         let magic = u32::from_le_bytes(snap_data[0..4].try_into().unwrap());
         assert_ne!(magic, 0x534E_4150);

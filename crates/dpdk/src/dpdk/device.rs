@@ -196,7 +196,12 @@ impl DpdkDevice {
 
             // SAFETY: port is started, rx_buf is correctly sized.
             let count = unsafe {
-                ffi::dpdk_eth_rx_burst(port.port_id, port.queue_id, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
+                ffi::dpdk_eth_rx_burst(
+                    port.port_id,
+                    port.queue_id,
+                    port.rx_buf.as_mut_ptr(),
+                    BURST_SIZE as u16,
+                )
             };
 
             if count > 0 {
@@ -234,7 +239,12 @@ impl DpdkDevice {
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
             let count = unsafe {
-                ffi::dpdk_eth_rx_burst(port.port_id, port.queue_id, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
+                ffi::dpdk_eth_rx_burst(
+                    port.port_id,
+                    port.queue_id,
+                    port.rx_buf.as_mut_ptr(),
+                    BURST_SIZE as u16,
+                )
             };
 
             for i in 0..count as usize {
@@ -260,7 +270,10 @@ impl DpdkDevice {
                         // neighbor cache expiry (~60s) but long enough to
                         // avoid injecting ARP replies on every packet.
                         const RESEED_SECS: u64 = 30;
-                        let entry = self.known_neighbors.iter_mut().find(|(ip, _)| *ip == src_ip);
+                        let entry = self
+                            .known_neighbors
+                            .iter_mut()
+                            .find(|(ip, _)| *ip == src_ip);
                         let needs_seed = match entry {
                             Some((_, last)) => {
                                 if now.duration_since(*last).as_secs() >= RESEED_SECS {

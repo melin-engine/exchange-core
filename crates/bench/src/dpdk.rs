@@ -126,9 +126,8 @@ pub fn run_dpdk_roundtrip(
     let mut ports = Vec::with_capacity(config.port_ids.len());
     let mut combined_offloads: Option<melin_dpdk::port::ChecksumOffloads> = None;
     for &pid in &config.port_ids {
-        let mut port =
-            Port::configure_with_vlan(pid, &mempool, config.vlan_id, 1)
-                .expect("port config failed");
+        let mut port = Port::configure_with_vlan(pid, &mempool, config.vlan_id, 1)
+            .expect("port config failed");
         port.start().expect("port start failed");
         combined_offloads = Some(match combined_offloads {
             None => port.offloads,
@@ -539,9 +538,7 @@ pub fn run_dpdk_roundtrip(
         &extra_lines,
         json_path,
         &series,
-        &health_poller
-            .map(|p| p.stop())
-            .unwrap_or_default(),
+        &health_poller.map(|p| p.stop()).unwrap_or_default(),
     );
 }
 
@@ -626,7 +623,8 @@ fn dpdk_auth_all(
 
             match &phases[i] {
                 AuthPhase::WaitChallenge => {
-                    let response = codec::decode_response(&conn.parse_buf[4..consumed]).expect("decode Challenge");
+                    let response = codec::decode_response(&conn.parse_buf[4..consumed])
+                        .expect("decode Challenge");
                     let nonce = match response {
                         ResponseKind::Challenge { nonce } => nonce,
                         other => panic!("client {i}: expected Challenge, got {other:?}"),
@@ -650,7 +648,8 @@ fn dpdk_auth_all(
                     phases[i] = AuthPhase::WaitServerReady;
                 }
                 AuthPhase::WaitServerReady => {
-                    let response = codec::decode_response(&conn.parse_buf[4..consumed]).expect("decode ServerReady");
+                    let response = codec::decode_response(&conn.parse_buf[4..consumed])
+                        .expect("decode ServerReady");
                     assert!(
                         matches!(response, ResponseKind::ServerReady),
                         "client {i}: expected ServerReady, got {response:?}"

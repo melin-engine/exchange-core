@@ -892,10 +892,7 @@ mod tests {
         // Buyer got 20 BTC from fill.
         assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 20);
         // Seller: 500 - 50 reserved + 20 filled = 450 available, 30 resting.
-        assert_eq!(
-            je.exchange().accounts().balance(ACCT_B, BTC).available,
-            450
-        );
+        assert_eq!(je.exchange().accounts().balance(ACCT_B, BTC).available, 450);
         assert_eq!(je.exchange().accounts().balance(ACCT_B, BTC).reserved, 30);
     }
 
@@ -1643,7 +1640,10 @@ mod tests {
         // Shrink the original to its valid data size. The pre-allocated file
         // is 256 MiB; copying that per iteration dominates runtime.
         {
-            let f = std::fs::OpenOptions::new().write(true).open(&original).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&original)
+                .unwrap();
             f.set_len(end).unwrap();
         }
 
@@ -1668,7 +1668,10 @@ mod tests {
             drop(je);
             let je2 = JournaledExchange::recover(&work).unwrap();
             // At least 2: the deposit we appended (seq 1) + next is 2.
-            assert!(je2.next_sequence() >= 2, "double-recovery seq too low at byte {trunc_at}");
+            assert!(
+                je2.next_sequence() >= 2,
+                "double-recovery seq too low at byte {trunc_at}"
+            );
         }
     }
 
@@ -1700,8 +1703,7 @@ mod tests {
         drop(engine);
 
         // Snapshot state (for comparison when all post-rotation events are lost).
-        let (snap_exchange, snap_seq, _snap_hash) =
-            super::snapshot::load(&snap_path).unwrap();
+        let (snap_exchange, snap_seq, _snap_hash) = super::snapshot::load(&snap_path).unwrap();
         let snap_bal_a_usd = snap_exchange.accounts().balance(ACCT_A, USD).available;
 
         let end = valid_data_end(&journal_path);
@@ -1730,8 +1732,7 @@ mod tests {
                 f.set_len(trunc_at).unwrap();
             }
 
-            let je =
-                JournaledExchange::recover_from_snapshot(&snap_path, &work_journal).unwrap();
+            let je = JournaledExchange::recover_from_snapshot(&snap_path, &work_journal).unwrap();
 
             // Sequence must be between snapshot seq and final seq (inclusive of snap+1
             // because the new journal's genesis consumes one seq with hash-chain).
@@ -1794,10 +1795,26 @@ mod tests {
 
         // Reference state: recover from the full journal.
         let reference = JournaledExchange::recover(&original).unwrap();
-        let ref_bal_a_usd = reference.exchange().accounts().balance(ACCT_A, USD).available;
-        let ref_bal_a_btc = reference.exchange().accounts().balance(ACCT_A, BTC).available;
-        let ref_bal_b_usd = reference.exchange().accounts().balance(ACCT_B, USD).available;
-        let ref_bal_b_btc = reference.exchange().accounts().balance(ACCT_B, BTC).available;
+        let ref_bal_a_usd = reference
+            .exchange()
+            .accounts()
+            .balance(ACCT_A, USD)
+            .available;
+        let ref_bal_a_btc = reference
+            .exchange()
+            .accounts()
+            .balance(ACCT_A, BTC)
+            .available;
+        let ref_bal_b_usd = reference
+            .exchange()
+            .accounts()
+            .balance(ACCT_B, USD)
+            .available;
+        let ref_bal_b_btc = reference
+            .exchange()
+            .accounts()
+            .balance(ACCT_B, BTC)
+            .available;
         let ref_seq = reference.next_sequence();
         drop(reference);
 
@@ -1805,7 +1822,10 @@ mod tests {
         // Shrink to valid data size to avoid copying 256 MiB per iteration.
         let original_end = valid_data_end(&original);
         {
-            let f = std::fs::OpenOptions::new().write(true).open(&original).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&original)
+                .unwrap();
             f.set_len(original_end).unwrap();
         }
 
@@ -1926,7 +1946,10 @@ mod tests {
 
         // Balances.
         // ACCT_A: 10M USD deposited, 95*200 = 19000 reserved for buy.
-        assert_eq!(ex.accounts().balance(ACCT_A, USD).available, 10_000_000 - 19_000);
+        assert_eq!(
+            ex.accounts().balance(ACCT_A, USD).available,
+            10_000_000 - 19_000
+        );
         assert_eq!(ex.accounts().balance(ACCT_A, USD).reserved, 19_000);
         assert_eq!(ex.accounts().balance(ACCT_B, BTC).available, 10_000 - 300);
         assert_eq!(ex.accounts().balance(ACCT_B, BTC).reserved, 300);
@@ -2046,8 +2069,7 @@ mod tests {
                 f.set_len(trunc_at).unwrap();
             }
 
-            let je =
-                JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
+            let je = JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
 
             // Sequence must not exceed the full reference.
             assert!(
@@ -2057,8 +2079,7 @@ mod tests {
 
             // Must be able to append after recovery.
             drop(je);
-            let mut je2 =
-                JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
+            let mut je2 = JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
             je2.deposit(ACCT_A, USD, 1).unwrap();
 
             trunc_at += 10;

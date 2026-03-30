@@ -1674,8 +1674,7 @@ fn snapshot_transfer_when_archives_purged() {
     let key = SigningKey::from_bytes(&[0xFA; 32]);
     let key2 = SigningKey::from_bytes(&[0xFB; 32]);
     let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
-    let (keys_path, repl_key_path) =
-        write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+    let (keys_path, repl_key_path) = write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
 
     let primary_client_port = free_port();
     let primary_health_port = free_port();
@@ -1718,12 +1717,8 @@ fn snapshot_transfer_when_archives_purged() {
             .expect("spawn primary");
         ServerProcess {
             child,
-            client_addr: format!("127.0.0.1:{primary_client_port}")
-                .parse()
-                .unwrap(),
-            health_addr: format!("127.0.0.1:{primary_health_port}")
-                .parse()
-                .unwrap(),
+            client_addr: format!("127.0.0.1:{primary_client_port}").parse().unwrap(),
+            health_addr: format!("127.0.0.1:{primary_health_port}").parse().unwrap(),
         }
     };
 
@@ -1742,7 +1737,10 @@ fn snapshot_transfer_when_archives_purged() {
     let start = Instant::now();
     while !snap_path.exists() {
         if start.elapsed() > Duration::from_secs(30) {
-            panic!("snapshot was not created within 30s at {}", snap_path.display());
+            panic!(
+                "snapshot was not created within 30s at {}",
+                snap_path.display()
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1808,12 +1806,8 @@ fn snapshot_transfer_when_archives_purged() {
             .expect("spawn primary2");
         ServerProcess {
             child,
-            client_addr: format!("127.0.0.1:{primary_client_port2}")
-                .parse()
-                .unwrap(),
-            health_addr: format!("127.0.0.1:{primary_health_port2}")
-                .parse()
-                .unwrap(),
+            client_addr: format!("127.0.0.1:{primary_client_port2}").parse().unwrap(),
+            health_addr: format!("127.0.0.1:{primary_health_port2}").parse().unwrap(),
         }
     };
 
