@@ -1433,7 +1433,7 @@ pub fn run_receiver(
 
             // Receive SnapshotBegin.
             let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-            let (snap_len, snap_sequence, _snap_chain_hash) =
+            let (snap_len, snap_sequence, snap_chain_hash) =
                 match decode_primary_message(&begin_frame)? {
                     PrimaryMessage::SnapshotBegin {
                         snapshot_len,
@@ -1494,9 +1494,16 @@ pub fn run_receiver(
                 }
             }
 
-            // Load the snapshot.
+            // Load the snapshot and verify chain hash matches what the
+            // primary advertised in SnapshotBegin.
             let (snap_exchange, snap_seq, snap_hash) =
                 melin_engine::journal::snapshot::load(&snapshot_path)?;
+            if snap_hash != snap_chain_hash {
+                return Err(format!(
+                    "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
+                     loaded snapshot has {snap_hash:02x?}"
+                ).into());
+            }
             exchange = Some(snap_exchange);
 
             // Create a fresh journal continuing from the snapshot point.
