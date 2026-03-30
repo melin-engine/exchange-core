@@ -60,14 +60,14 @@ Melin is an exchange core: order matching, account management, risk controls, fe
    Subscribers ◄─TCP──────────────────────────┘
 ```
 
-- **LMAX-style disruptor pipeline** ([docs/pipeline-architecture.md](docs/pipeline-architecture.md)) — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
+- **[LMAX-style disruptor pipeline](docs/pipeline-architecture.md)** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 256 MiB chunks so sync only flushes data pages, not extent metadata
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
 - **Pre-allocated everything** — reservation slab (2M slots), order book indices, and balance maps are pre-sized and page-faulted at startup; jemalloc avoids glibc fragmentation
 
 ## LAN Benchmarks
 
-All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [docs/operations.md](docs/operations.md) and [docs/benchmarking.md](docs/benchmarking.md).
+All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
 ### Peak throughput (16 clients, window 256)
 
@@ -99,7 +99,7 @@ The DPDK result is an early experimental measurement with end-to-end kernel bypa
 
 ### Bottleneck and next steps
 
-The TCP network stack is now the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. Further gains require reducing transport overhead: kernel bypass (AF_XDP, DPDK, or OpenOnload) would eliminate syscall overhead on the send/recv path. See [docs/performance.md](docs/performance.md) for the full analysis and optimization roadmap.
+The TCP network stack is now the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. Further gains require reducing transport overhead: kernel bypass (AF_XDP, DPDK, or OpenOnload) would eliminate syscall overhead on the send/recv path.
 
 ## Features
 
@@ -108,7 +108,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Time-in-force: GTC, IOC, FOK, Day, GTD (Good-Til-Date)
 - Post-Only (maker-only, reject if would take)
 
-### Matching Engine ([docs/matching-engine.md](docs/matching-engine.md))
+### [Matching Engine](docs/matching-engine.md)
 - Strict price-time priority (sorted Vec + binary search order book)
 - Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced, InstrumentStatusChanged
 - Multi-instrument exchange with shared account balances
@@ -116,11 +116,11 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Circuit breakers (price bands, trading halts — per-instrument `CircuitBreakerConfig`)
 - Instrument lifecycle management (disable/enable/remove — disable cancels all resting orders atomically, remove reclaims memory)
 
-### Fees ([docs/fee-model.md](docs/fee-model.md))
+### [Fees](docs/fee-model.md)
 - Maker/taker fee model (per-instrument `FeeSchedule` in basis points, configurable via admin API)
 - Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds, reported in `ExecutionReport::Fill`)
 
-### Risk & Accounting ([docs/risk-checks.md](docs/risk-checks.md))
+### [Risk & Accounting](docs/risk-checks.md)
 - Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
 - Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
 - Fat finger checks (max order size, max notional value — per-instrument configurable `RiskLimits`)
@@ -129,7 +129,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Price band checks (static lower/upper bounds, per-instrument — part of circuit breaker config)
 - Withdraw event (debit funds, auto-evict zero-balance entries)
 
-### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
+### [Event Sourcing & Durability](docs/journal.md)
 - Write-ahead journal with CRC32C checksums and BLAKE3 hash chain (tamper evidence, replica consistency)
 - Persist-before-ack: matching latency overlapped against journal writes, acknowledgement gated on confirmed durability
 - Batch journal I/O via LMAX disruptor ring buffer pipeline (`pwritev2` + `RWF_DSYNC`, pipelined io_uring async fsync with group commit)
@@ -139,13 +139,13 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Scheduled snapshots via shadow exchange — periodic snapshots on a dedicated thread without pausing the matching engine (`--snapshot-interval-secs`)
 - Crash injection tests at every byte offset, during snapshot rotation, and under realistic load
 
-### Replication & High Availability ([docs/replication.md](docs/replication.md))
+### [Replication & High Availability](docs/replication.md)
 - Synchronous journal replication — live WAL streaming to replica via lock-free ring buffer; replica fsyncs and acks before the primary sends responses to clients (zero acknowledged data loss)
-- Automatic trading halt on replica disconnect — new orders rejected with `ReplicaDisconnected`, resumes instantly on reconnect. See [docs/operations.md](docs/operations.md)
+- Automatic trading halt on replica disconnect — new orders rejected with `ReplicaDisconnected`, resumes instantly on reconnect ([operations](docs/operations.md))
 - Manual promotion — operator sends `PROMOTE` to the replica's trigger endpoint; in-process transition reuses the warm Exchange state with zero re-replay, sub-second switchover
 - Multi-process failover tests — SIGKILL primary under load, promote replica, verify no data loss and clients can reconnect
 
-### Networking ([docs/wire-protocol.md](docs/wire-protocol.md))
+### [Networking](docs/wire-protocol.md)
 - Custom binary wire protocol (length-prefixed framing)
 - TCP and Unix domain socket transports (kernel bypass via DPDK in progress)
 - Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
@@ -153,17 +153,17 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Backpressure handling (explicit `ServerBusy` reject when the input pipeline is full — client should back off and retry)
 - Output event channel — real-time broadcast of all execution events to authenticated TCP subscribers via `--event-bind`; per-frame monotonic sequence numbers for gap detection; slow subscriber disconnect
 
-### Authentication & Authorization ([docs/admin-guide.md](docs/admin-guide.md))
+### [Authentication & Authorization](docs/admin-guide.md)
 - Ed25519 challenge-response handshake
 - Four permission roles: Operator (exchange configuration), Trader (order submission/cancellation), Custodian (deposit/withdraw), ReadOnly (heartbeats)
 - Operator API (instrument management and lifecycle, circuit breakers, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
 - Per-key idempotency (sequence numbers with duplicate rejection — safe to retry on timeout without double-applying)
 
-### Operations ([docs/operations.md](docs/operations.md))
+### [Operations](docs/operations.md)
 - Structured logging (`tracing` crate, error-level for server malfunctions only)
 - Health/liveness TCP endpoint (`--health-bind`) with Prometheus `/metrics` endpoint (active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
 - Admin TUI dashboard (live connection count, events processed, throughput, journal sequence)
-- Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md)
+- Sparse account storage to reduce memory usage, see [account lifecycle](docs/account-lifecycle.md)
 
 ### Testing
 - Property-based tests (proptest): price-time priority, balance conservation, volume conservation, reservation consistency, no self-trades under STP, deterministic replay, overflow safety
