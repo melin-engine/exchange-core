@@ -242,7 +242,8 @@ impl AccountManager {
         }
         bal.available -= amount;
         // Clean up zero-balance entries so memory scales with active accounts.
-        if bal.is_zero() {
+        // Never evict FEE_ACCOUNT — it must always exist for fee crediting.
+        if bal.is_zero() && account != FEE_ACCOUNT {
             self.balances.remove(&(account, currency));
         }
         Ok(())
