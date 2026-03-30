@@ -14,57 +14,6 @@ Melin is:
 
 **Efficient** — single-threaded matching engine on a lock-free disruptor pipeline for the best compromise between maximum throughput and minimum latency, with journal, matching and replication running in parallel. Melin can handle 8.1M orders/sec over LAN with local fsync, 5.8M/sec with synchronous replication, with a sub-100 µs p99.9 single-order latency. All of this on regular datacenter-grade hardware.
 
-## Architecture
-
-```
-                           ┌────────────────────────────────────────────────────────────┐
-                           │                          PRIMARY                           │
-                           │                                                            │
-  Clients ─TCP────────────────────────► Accept Loop                                     │
-                           │                │                                           │
-                           │                ▼                                           │
-                           │            Epoll/io_uring Reader Pool                      │
-                           │            (edge-triggered, non-blocking)                  │
-                           │                │                                           │
-                           │                │  lock-free CAS                            │
-                           │                ▼                                           │
-                           │   ┌─────────────────────────────────┐                      │
-                           │   │     Input Disruptor (ring buf)  │                      │
-                           │   └──────────┬──────────────┬───────┘                      │
-                           │              │              │                              │
-                           │              ▼              ▼                              │
-  ┌──────────────────┐     │   ┌──────────────┐  ┌──────────────┐                       │
-  │     REPLICA      │     │   │   Journal    │  │   Matching   │  parallel consumers   │
-  │                  │     │   │   Thread     │  │   Thread     │                       │
-  │  replay + fsync  │◄────┼───│              │  │              │                       │
-  │                  │repl │   │ pwritev2     │  │ Exchange     │                       │
-  │  ack ─┐          │ring │   │ + RWF_DSYNC  │  │ .execute()   │                       │
-  └───────┼──────────┘     │   └──────┬───────┘  └──────┬───────┘                       │
-          │                │          │                 │                               │
-          │ repl cursor    │          │ journal cursor  │ Output Disruptor Ring         │
-          │                │          ▼                 ▼                               │
-          │                │   ┌──────────────────────────────┐                         │
-          └──────────────► │   │       Response Thread        │ consumer 0              │
-                           │   │  gates on min(journal cursor,│                         │
-                           │   │      repl cursor)            │                         │
-                           │   └──────────────┬───────────────┘                         │
-                           │                  │                                         │
-                           │   ┌──────────────┴───────────────┐                         │
-                           │   │    Event Publisher Thread     │ consumer 1 (optional)  │
-                           │   │    (--event-bind, auth'd TCP) │                        │
-                           │   └──────────────┬───────────────┘                         │
-                           │                  │                                         │
-                           └──────────────────┼─────────────────────────────────────────┘
-                                              │
-   Clients ◄─TCP──────────────────────────────┤
-   Subscribers ◄─TCP──────────────────────────┘
-```
-
-- **[LMAX-style disruptor pipeline](docs/pipeline-architecture.md)** — dedicated OS threads for journal, matching, response, replication, event publishing, and scheduled snapshots on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
-- **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 256 MiB chunks so sync only flushes data pages, not extent metadata
-- **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
-- **Pre-allocated everything** — reservation slab (2M slots), order book indices, and balance maps are pre-sized and page-faulted at startup; jemalloc avoids glibc fragmentation
-
 ## LAN Benchmarks
 
 All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
