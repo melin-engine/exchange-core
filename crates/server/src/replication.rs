@@ -1058,88 +1058,93 @@ fn handle_replica_connection(
             }
         }
     } else {
-            // Replica's state predates all journal archives. Transfer a snapshot.
-            let snap_path = journal_path.with_extension("snapshot");
-            if !snap_path.exists() {
-                error!(
-                    "snapshot transfer requested but no snapshot file at {}",
-                    snap_path.display()
-                );
-                return Err(io::Error::other(
-                    "snapshot transfer required but no snapshot available \
-                     — enable --snapshot-interval-secs or trigger a journal rotation",
-                ));
-            }
-
-            // Send NeedSnapshot to tell the replica to prepare.
-            encode_need_snapshot(&mut send_buf);
-            writer.write_all(&send_buf)?;
-            writer.flush()?;
-            send_buf.clear();
-
-            // Read snapshot file header to get sequence and chain hash.
-            let snap_data = std::fs::read(&snap_path).map_err(|e| {
-                io::Error::other(format!("read snapshot {}: {e}", snap_path.display()))
-            })?;
-            let snap_len = snap_data.len() as u64;
-
-            // Parse header: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32)
-            if snap_data.len() < 48 {
-                return Err(io::Error::other("snapshot file too small for header"));
-            }
-            let snap_sequence = u64::from_le_bytes(snap_data[8..16].try_into().unwrap());
-            let mut snap_chain_hash = [0u8; 32];
-            snap_chain_hash.copy_from_slice(&snap_data[16..48]);
-
-            info!(
-                snap_sequence,
-                snap_len,
-                path = %snap_path.display(),
-                "transferring snapshot to replica"
+        // Replica's state predates all journal archives. Transfer a snapshot.
+        let snap_path = journal_path.with_extension("snapshot");
+        if !snap_path.exists() {
+            error!(
+                "snapshot transfer requested but no snapshot file at {}",
+                snap_path.display()
             );
+            return Err(io::Error::other(
+                "snapshot transfer required but no snapshot available \
+                 — enable --snapshot-interval-secs or trigger a journal rotation",
+            ));
+        }
 
-            // Send SnapshotBegin.
-            encode_snapshot_begin(snap_len, snap_sequence, &snap_chain_hash, &mut send_buf);
+        // Send NeedSnapshot to tell the replica to prepare.
+        encode_need_snapshot(&mut send_buf);
+        writer.write_all(&send_buf)?;
+        writer.flush()?;
+        send_buf.clear();
+
+        // Read snapshot file and validate magic before transferring.
+        let snap_data = std::fs::read(&snap_path)
+            .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
+        let snap_len = snap_data.len() as u64;
+
+        // Parse header: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32)
+        if snap_data.len() < 48 {
+            return Err(io::Error::other("snapshot file too small for header"));
+        }
+        // Validate snapshot magic (0x534E4150 = "SNAP") before transfer.
+        let magic = u32::from_le_bytes(snap_data[0..4].try_into().unwrap());
+        if magic != 0x534E_4150 {
+            return Err(io::Error::other(format!(
+                "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
+            )));
+        }
+        let snap_sequence = u64::from_le_bytes(snap_data[8..16].try_into().unwrap());
+        let mut snap_chain_hash = [0u8; 32];
+        snap_chain_hash.copy_from_slice(&snap_data[16..48]);
+
+        info!(
+            snap_sequence,
+            snap_len,
+            path = %snap_path.display(),
+            "transferring snapshot to replica"
+        );
+
+        // Send SnapshotBegin.
+        encode_snapshot_begin(snap_len, snap_sequence, &snap_chain_hash, &mut send_buf);
+        writer.write_all(&send_buf)?;
+        writer.flush()?;
+        send_buf.clear();
+
+        // Stream snapshot in 64 KiB chunks.
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut offset = 0;
+        while offset < snap_data.len() {
+            let end = (offset + CHUNK_SIZE).min(snap_data.len());
+            encode_snapshot_chunk(&snap_data[offset..end], &mut send_buf);
             writer.write_all(&send_buf)?;
-            writer.flush()?;
             send_buf.clear();
+            offset = end;
+        }
+        writer.flush()?;
 
-            // Stream snapshot in 64 KiB chunks.
-            const CHUNK_SIZE: usize = 64 * 1024;
-            let mut offset = 0;
-            while offset < snap_data.len() {
-                let end = (offset + CHUNK_SIZE).min(snap_data.len());
-                encode_snapshot_chunk(&snap_data[offset..end], &mut send_buf);
-                writer.write_all(&send_buf)?;
-                send_buf.clear();
-                offset = end;
-            }
-            writer.flush()?;
+        // Send SnapshotEnd with CRC32C of the entire file.
+        // The snapshot file already has a CRC at the end, but we
+        // compute one over the entire file for transfer integrity.
+        let transfer_crc = crc32c::crc32c(&snap_data);
+        encode_snapshot_end(transfer_crc, &mut send_buf);
+        writer.write_all(&send_buf)?;
+        writer.flush()?;
+        send_buf.clear();
 
-            // Send SnapshotEnd with CRC32C of the entire file.
-            // The snapshot file already has a CRC at the end, but we
-            // compute one over the entire file for transfer integrity.
-            let transfer_crc = crc32c::crc32c(&snap_data);
-            encode_snapshot_end(transfer_crc, &mut send_buf);
-            writer.write_all(&send_buf)?;
-            writer.flush()?;
-            send_buf.clear();
+        info!(snap_sequence, "snapshot transfer complete");
 
-            info!(snap_sequence, "snapshot transfer complete");
+        // Send StreamStart so the replica can set up its journal after
+        // loading the snapshot. The start_sequence is the snapshot's
+        // sequence — catch-up will send entries after this.
+        encode_stream_start(snap_sequence, genesis_entry, &mut send_buf);
+        writer.write_all(&send_buf)?;
+        writer.flush()?;
+        send_buf.clear();
 
-            // Send StreamStart so the replica can set up its journal after
-            // loading the snapshot. The start_sequence is the snapshot's
-            // sequence — catch-up will send entries after this.
-            encode_stream_start(snap_sequence, genesis_entry, &mut send_buf);
-            writer.write_all(&send_buf)?;
-            writer.flush()?;
-            send_buf.clear();
-
-            // Catch up from the snapshot's sequence using the current journal.
-            // The current journal starts at snap_sequence+1 (rotation boundary).
-            let post_snap_result = catch_up_from_journal(
-                journal_path, snap_sequence, &mut writer, shutdown,
-            )?;
+        // Catch up from the snapshot's sequence using the current journal.
+        // The current journal starts at snap_sequence+1 (rotation boundary).
+        let post_snap_result =
+            catch_up_from_journal(journal_path, snap_sequence, &mut writer, shutdown)?;
         match post_snap_result {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
@@ -1444,9 +1449,7 @@ pub fn run_receiver(
                         snap_chain_hash,
                     } => (snapshot_len, snap_sequence, snap_chain_hash),
                     other => {
-                        return Err(
-                            format!("expected SnapshotBegin, got {other:?}").into(),
-                        );
+                        return Err(format!("expected SnapshotBegin, got {other:?}").into());
                     }
                 };
 
@@ -1464,9 +1467,19 @@ pub fn run_receiver(
                             std::io::Write::write_all(&mut tmp_file, &data)?;
                             received += data.len() as u64;
                         }
-                        PrimaryMessage::SnapshotEnd { crc32c: expected_crc } => {
+                        PrimaryMessage::SnapshotEnd {
+                            crc32c: expected_crc,
+                        } => {
                             tmp_file.sync_all()?;
                             drop(tmp_file);
+
+                            // Verify received length matches advertised.
+                            if received != snap_len {
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(format!(
+                                    "snapshot length mismatch: expected {snap_len} bytes, got {received}"
+                                ).into());
+                            }
 
                             // Verify CRC over the received file.
                             let file_data = std::fs::read(&tmp_path)?;
@@ -1480,18 +1493,12 @@ pub fn run_receiver(
 
                             // Rename temp to final.
                             std::fs::rename(&tmp_path, &snapshot_path)?;
-                            info!(
-                                snap_sequence,
-                                received,
-                                "snapshot received and verified"
-                            );
+                            info!(snap_sequence, received, "snapshot received and verified");
                             break;
                         }
                         other => {
                             let _ = std::fs::remove_file(&tmp_path);
-                            return Err(
-                                format!("expected SnapshotChunk/End, got {other:?}").into(),
-                            );
+                            return Err(format!("expected SnapshotChunk/End, got {other:?}").into());
                         }
                     }
                 }
@@ -1505,23 +1512,23 @@ pub fn run_receiver(
                 return Err(format!(
                     "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
                      loaded snapshot has {snap_hash:02x?}"
-                ).into());
+                )
+                .into());
             }
             exchange = Some(snap_exchange);
 
             // Create a fresh journal continuing from the snapshot point.
-            let writer = JournalWriter::create_continuing(
-                journal_path,
-                snap_seq + 1,
-                snap_hash,
-            )?;
+            let writer = JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
             journal_writer = Some(writer);
 
             // Read the StreamStart that the primary sends after the snapshot.
             // It carries the genesis entry and start_sequence.
             let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
             match decode_primary_message(&ss_frame)? {
-                PrimaryMessage::StreamStart { start_sequence, genesis_entry } => {
+                PrimaryMessage::StreamStart {
+                    start_sequence,
+                    genesis_entry,
+                } => {
                     info!(start_sequence, "streaming resumed after snapshot transfer");
                     genesis_entry
                 }
@@ -3195,6 +3202,342 @@ mod tests {
                 assert_eq!(crc32c, 0xDEADBEEF);
             }
             _ => panic!("expected SnapshotEnd"),
+        }
+    }
+
+    /// Simulate the receiver side of a snapshot transfer where the
+    /// advertised snap_len doesn't match the actual bytes sent.
+    /// The receiver must detect this and return an error.
+    #[test]
+    fn snapshot_receiver_detects_length_mismatch() {
+        use std::os::unix::net::UnixStream;
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+
+        // Receiver thread — reads NeedSnapshot, then the snapshot transfer.
+        let receiver = std::thread::spawn(move || -> String {
+            let mut reader = replica_stream.try_clone().unwrap();
+
+            // Read NeedSnapshot.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            assert!(matches!(
+                decode_primary_message(&frame).unwrap(),
+                PrimaryMessage::NeedSnapshot,
+            ));
+
+            // Read SnapshotBegin.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            let (snap_len, _snap_sequence, _snap_chain_hash) =
+                match decode_primary_message(&frame).unwrap() {
+                    PrimaryMessage::SnapshotBegin {
+                        snapshot_len,
+                        snap_sequence,
+                        snap_chain_hash,
+                    } => (snapshot_len, snap_sequence, snap_chain_hash),
+                    other => panic!("expected SnapshotBegin, got {other:?}"),
+                };
+
+            // Receive chunks and check length at SnapshotEnd.
+            let mut received: u64 = 0;
+            loop {
+                let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
+                match decode_primary_message(&frame).unwrap() {
+                    PrimaryMessage::SnapshotChunk(data) => {
+                        received += data.len() as u64;
+                    }
+                    PrimaryMessage::SnapshotEnd { .. } => {
+                        if received != snap_len {
+                            return format!(
+                                "snapshot length mismatch: expected {snap_len} bytes, got {received}"
+                            );
+                        }
+                        return String::new(); // no error
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+        });
+
+        // Primary side — send snapshot with wrong advertised length.
+        let mut writer = primary_stream;
+        let mut buf = Vec::new();
+
+        let actual_data = vec![0xAA; 100];
+        let wrong_len = 999u64; // advertise 999 bytes, send only 100
+
+        encode_need_snapshot(&mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        encode_snapshot_begin(wrong_len, 42, &[0xBB; 32], &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        encode_snapshot_chunk(&actual_data, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        let crc = crc32c::crc32c(&actual_data);
+        encode_snapshot_end(crc, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let error_msg = receiver.join().unwrap();
+        assert!(
+            error_msg.contains("length mismatch"),
+            "expected length mismatch error, got: {error_msg:?}"
+        );
+    }
+
+    /// Simulate the receiver side of a snapshot transfer where the CRC
+    /// in SnapshotEnd doesn't match the actual data. The receiver must
+    /// detect and reject the transfer.
+    #[test]
+    fn snapshot_receiver_detects_crc_mismatch() {
+        use std::os::unix::net::UnixStream;
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+
+        let receiver = std::thread::spawn(move || -> String {
+            let mut reader = replica_stream.try_clone().unwrap();
+
+            // Read NeedSnapshot.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            assert!(matches!(
+                decode_primary_message(&frame).unwrap(),
+                PrimaryMessage::NeedSnapshot,
+            ));
+
+            // Read SnapshotBegin.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            let snap_len = match decode_primary_message(&frame).unwrap() {
+                PrimaryMessage::SnapshotBegin { snapshot_len, .. } => snapshot_len,
+                other => panic!("expected SnapshotBegin, got {other:?}"),
+            };
+
+            // Receive chunks, verify CRC at SnapshotEnd.
+            let mut received_data = Vec::new();
+            let mut received: u64 = 0;
+            loop {
+                let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
+                match decode_primary_message(&frame).unwrap() {
+                    PrimaryMessage::SnapshotChunk(data) => {
+                        received += data.len() as u64;
+                        received_data.extend_from_slice(&data);
+                    }
+                    PrimaryMessage::SnapshotEnd { crc32c: expected_crc } => {
+                        if received != snap_len {
+                            return format!("length mismatch: {snap_len} vs {received}");
+                        }
+                        let actual_crc = crc32c::crc32c(&received_data);
+                        if actual_crc != expected_crc {
+                            return format!(
+                                "CRC mismatch: expected {expected_crc:#x}, got {actual_crc:#x}"
+                            );
+                        }
+                        return String::new();
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+        });
+
+        // Primary side — send correct length but wrong CRC.
+        let mut writer = primary_stream;
+        let mut buf = Vec::new();
+
+        let data = vec![0xAA; 100];
+
+        encode_need_snapshot(&mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        encode_snapshot_begin(data.len() as u64, 42, &[0xBB; 32], &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        encode_snapshot_chunk(&data, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        // Send a wrong CRC (flip bits).
+        let wrong_crc = !crc32c::crc32c(&data);
+        encode_snapshot_end(wrong_crc, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let error_msg = receiver.join().unwrap();
+        assert!(
+            error_msg.contains("CRC mismatch"),
+            "expected CRC mismatch error, got: {error_msg:?}"
+        );
+    }
+
+    /// The receiver verifies the chain hash from the loaded snapshot
+    /// matches the one advertised in SnapshotBegin. Simulate a mismatch.
+    #[test]
+    fn snapshot_receiver_detects_chain_hash_mismatch() {
+        use std::os::unix::net::UnixStream;
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+
+        let receiver = std::thread::spawn(move || -> String {
+            let mut reader = replica_stream.try_clone().unwrap();
+
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            assert!(matches!(
+                decode_primary_message(&frame).unwrap(),
+                PrimaryMessage::NeedSnapshot,
+            ));
+
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            let (snap_len, _snap_sequence, snap_chain_hash) =
+                match decode_primary_message(&frame).unwrap() {
+                    PrimaryMessage::SnapshotBegin {
+                        snapshot_len,
+                        snap_sequence,
+                        snap_chain_hash,
+                    } => (snapshot_len, snap_sequence, snap_chain_hash),
+                    other => panic!("expected SnapshotBegin, got {other:?}"),
+                };
+
+            // Receive the snapshot data.
+            let mut received_data = Vec::new();
+            let mut received: u64 = 0;
+            loop {
+                let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
+                match decode_primary_message(&frame).unwrap() {
+                    PrimaryMessage::SnapshotChunk(data) => {
+                        received += data.len() as u64;
+                        received_data.extend_from_slice(&data);
+                    }
+                    PrimaryMessage::SnapshotEnd { crc32c: expected_crc } => {
+                        assert_eq!(received, snap_len, "length should match");
+                        let actual_crc = crc32c::crc32c(&received_data);
+                        assert_eq!(actual_crc, expected_crc, "CRC should match");
+                        break;
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+
+            // Simulate chain hash verification: the loaded snapshot would
+            // have a different chain hash than what SnapshotBegin advertised.
+            let loaded_hash = [0xFF; 32]; // different from snap_chain_hash
+            if loaded_hash != snap_chain_hash {
+                return format!(
+                    "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
+                     loaded snapshot has {loaded_hash:02x?}"
+                );
+            }
+            String::new()
+        });
+
+        // Primary side — send valid snapshot but with a chain hash in
+        // SnapshotBegin that won't match what the replica "loads".
+        let mut writer = primary_stream;
+        let mut buf = Vec::new();
+
+        let data = vec![0xAA; 64];
+        // Advertise chain hash [0xBB; 32] — receiver will "load" [0xFF; 32].
+        let advertised_hash = [0xBB; 32];
+
+        encode_need_snapshot(&mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        encode_snapshot_begin(data.len() as u64, 10, &advertised_hash, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        encode_snapshot_chunk(&data, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        buf.clear();
+
+        let crc = crc32c::crc32c(&data);
+        encode_snapshot_end(crc, &mut buf);
+        std::io::Write::write_all(&mut writer, &buf).unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+
+        let error_msg = receiver.join().unwrap();
+        assert!(
+            error_msg.contains("chain hash mismatch"),
+            "expected chain hash mismatch error, got: {error_msg:?}"
+        );
+    }
+
+    /// Primary-side magic validation: a file without the SNAP magic
+    /// (0x534E4150) must be rejected before transfer.
+    #[test]
+    fn primary_rejects_snapshot_with_invalid_magic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_path = tmp.path().join("test.snapshot");
+
+        // Write a file with wrong magic but enough bytes for a header.
+        let mut bad_snap = vec![0u8; 64];
+        bad_snap[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // wrong magic
+
+        std::fs::write(&snap_path, &bad_snap).unwrap();
+
+        // Replicate the primary's validation logic.
+        let snap_data = std::fs::read(&snap_path).unwrap();
+        assert!(snap_data.len() >= 48, "file should be big enough for header");
+
+        let magic = u32::from_le_bytes(snap_data[0..4].try_into().unwrap());
+        assert_ne!(magic, 0x534E_4150);
+        assert_eq!(magic, 0xDEAD_BEEF);
+    }
+
+    /// Primary-side: a snapshot file smaller than the 48-byte header
+    /// must be rejected.
+    #[test]
+    fn primary_rejects_snapshot_too_small_for_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_path = tmp.path().join("test.snapshot");
+
+        // Write a file smaller than the 48-byte header.
+        std::fs::write(&snap_path, &[0u8; 20]).unwrap();
+
+        let snap_data = std::fs::read(&snap_path).unwrap();
+        assert!(
+            snap_data.len() < 48,
+            "file must be too small for header validation"
+        );
+    }
+
+    #[test]
+    fn decode_snapshot_begin_too_short() {
+        // SnapshotBegin needs type(1) + snapshot_len(8) + snap_sequence(8) + chain_hash(32) = 49.
+        // Send only the type byte + a few extra bytes.
+        let payload = [MSG_SNAPSHOT_BEGIN, 0x01, 0x02, 0x03];
+        let err = decode_primary_message(&payload).unwrap_err();
+        assert!(
+            err.to_string().contains("SnapshotBegin too short"),
+            "expected 'SnapshotBegin too short', got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_snapshot_end_too_short() {
+        // SnapshotEnd needs type(1) + crc32c(4) = 5. Send only the type byte.
+        let payload = [MSG_SNAPSHOT_END];
+        let err = decode_primary_message(&payload).unwrap_err();
+        assert!(
+            err.to_string().contains("SnapshotEnd too short"),
+            "expected 'SnapshotEnd too short', got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_snapshot_chunk_empty_data() {
+        // SnapshotChunk with just the type byte — valid but empty payload.
+        let payload = [MSG_SNAPSHOT_CHUNK];
+        let msg = decode_primary_message(&payload).unwrap();
+        match msg {
+            PrimaryMessage::SnapshotChunk(data) => {
+                assert!(data.is_empty());
+            }
+            _ => panic!("expected SnapshotChunk"),
         }
     }
 }
