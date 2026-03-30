@@ -5,9 +5,10 @@
 # containers with SSH access via your default SSH key.
 #
 # Usage:
-#   ./scripts/test-containers-start.sh                    # server + client
-#   ./scripts/test-containers-start.sh --replica          # server + client + 1 replica
-#   ./scripts/test-containers-start.sh --dual-replica     # server + client + 2 replicas
+#   ./scripts/test-containers-start.sh                              # server + client
+#   ./scripts/test-containers-start.sh --replica                    # server + client + 1 replica
+#   ./scripts/test-containers-start.sh --dual-replica               # server + client + 2 replicas
+#   ./scripts/test-containers-start.sh --dual-replica --branch foo  # checkout branch "foo" in all containers
 #
 # After starting:
 #   SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-server)
@@ -30,15 +31,18 @@ CLIENT="bench-client"
 REPLICA="bench-replica"
 REPLICA2="bench-replica2"
 IMAGE="ubuntu:24.04"
+REPO_DIR="/root/workspace/trading"
 
 # Parse flags.
 WITH_REPLICA=false
 WITH_DUAL_REPLICA=false
-for arg in "$@"; do
-    case "$arg" in
-        --replica) WITH_REPLICA=true ;;
-        --dual-replica) WITH_REPLICA=true; WITH_DUAL_REPLICA=true ;;
-        *) echo "unknown flag: $arg" >&2; exit 1 ;;
+BRANCH=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --replica) WITH_REPLICA=true; shift ;;
+        --dual-replica) WITH_REPLICA=true; WITH_DUAL_REPLICA=true; shift ;;
+        --branch) BRANCH="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
     esac
 done
 
@@ -131,11 +135,16 @@ EOF
 
     # Clone the repo and build.
     echo "  Cloning repo and building in $name (this takes a few minutes)..."
+    CHECKOUT_CMD=""
+    if [[ -n "$BRANCH" ]]; then
+        CHECKOUT_CMD="git fetch origin $BRANCH && git checkout $BRANCH &&"
+    fi
     docker exec "$name" bash -c "
         source /root/.cargo/env && \
         mkdir -p /root/workspace && \
-        git clone git@github.com:pierre-l/trading.git /root/workspace/trading && \
-        cd /root/workspace/trading && \
+        git clone git@github.com:pierre-l/trading.git $REPO_DIR && \
+        cd $REPO_DIR && \
+        $CHECKOUT_CMD
         cargo build --release
     " 2>&1 | tail -3
 
@@ -146,22 +155,88 @@ done
 SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SERVER")
 CLIENT_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLIENT")
 
+# ---------------------------------------------------------------------------
+# Generate keys and distribute to replicas.
+# ---------------------------------------------------------------------------
+if [[ "$WITH_REPLICA" == "true" ]]; then
+    echo ""
+    echo "Generating authentication keys..."
+    REPLICA_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$REPLICA")
+
+    # Generate trader key (for client connections) and replication key.
+    docker exec "$SERVER" bash -c "
+        cd /tmp && \
+        rm -f trader.key trader.pub repl.key repl.pub authorized_keys 2>/dev/null; \
+        $REPO_DIR/target/release/melin-keygen trader trader > /dev/null 2>&1 && \
+        $REPO_DIR/target/release/melin-keygen repl replication > /dev/null 2>&1 && \
+        echo \"trader \$(cat trader.pub | tr -d '\\n') trader\" > authorized_keys && \
+        echo \"replication \$(cat repl.pub | tr -d '\\n') repl\" >> authorized_keys
+    "
+
+    # Copy replication key to replica(s).
+    docker cp "$SERVER":/tmp/repl.key /tmp/repl.key
+    docker cp /tmp/repl.key "$REPLICA":/tmp/repl.key
+    echo "  Distributed replication key to $REPLICA"
+
+    if [[ "$WITH_DUAL_REPLICA" == "true" ]]; then
+        REPLICA2_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$REPLICA2")
+        docker cp /tmp/repl.key "$REPLICA2":/tmp/repl.key
+        echo "  Distributed replication key to $REPLICA2"
+    fi
+    rm -f /tmp/repl.key
+
+    echo "  authorized_keys:"
+    docker exec "$SERVER" cat /tmp/authorized_keys | sed 's/^/    /'
+fi
+
+# ---------------------------------------------------------------------------
+# Print ready-to-use commands.
+# ---------------------------------------------------------------------------
 echo ""
 echo "Containers ready. Run the benchmark with:"
 echo "  ./scripts/lan-bench.sh $SERVER_IP $CLIENT_IP $SERVER_IP"
 
 if [[ "$WITH_REPLICA" == "true" ]]; then
-    REPLICA_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$REPLICA")
     echo ""
     echo "Replication benchmark:"
     echo "  RUN_FSYNC=0 RUN_NOPERSIST=0 RUN_SINGLE=0 RUN_SWEEPS=0 RUN_PLOTS=0 \\"
     echo "    ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root $REPLICA_IP $REPLICA_IP"
-fi
 
-if [[ "$WITH_DUAL_REPLICA" == "true" ]]; then
-    REPLICA2_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$REPLICA2")
     echo ""
-    echo "Dual replication benchmark:"
-    echo "  RUN_FSYNC=0 RUN_NOPERSIST=0 RUN_SINGLE=0 RUN_SWEEPS=0 RUN_REPLICATION=0 RUN_PLOTS=0 \\"
-    echo "    ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root $REPLICA_IP $REPLICA_IP $REPLICA2_IP $REPLICA2_IP"
+    echo "Manual smoke test (copy-paste):"
+    echo ""
+    echo "  # Start primary"
+    echo "  docker exec -d $SERVER bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-server \\"
+    echo "      --journal /tmp/bench.journal --replication-bind 0.0.0.0:9877 --health-bind 0.0.0.0:9878 \\"
+    echo "      --bind 0.0.0.0:9876 --authorized-keys /tmp/authorized_keys --accounts 100 --instruments 5 \\"
+    echo "      >/tmp/server.log 2>&1'"
+    echo ""
+    echo "  # Start replica"
+    echo "  docker exec -d $REPLICA bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-server \\"
+    echo "      --replica-of $SERVER_IP:9877 --replication-key /tmp/repl.key --journal /tmp/replica.journal \\"
+    echo "      >/tmp/replica.log 2>&1'"
+
+    if [[ "$WITH_DUAL_REPLICA" == "true" ]]; then
+        echo ""
+        echo "  # Start replica2"
+        echo "  docker exec -d $REPLICA2 bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-server \\"
+        echo "      --replica-of $SERVER_IP:9877 --replication-key /tmp/repl.key --journal /tmp/replica2.journal \\"
+        echo "      >/tmp/replica2.log 2>&1'"
+
+        echo ""
+        echo "Dual replication benchmark:"
+        echo "  RUN_FSYNC=0 RUN_NOPERSIST=0 RUN_SINGLE=0 RUN_SWEEPS=0 RUN_REPLICATION=0 RUN_PLOTS=0 \\"
+        echo "    ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root $REPLICA_IP $REPLICA_IP $REPLICA2_IP $REPLICA2_IP"
+    fi
+
+    echo ""
+    echo "  # Check health"
+    echo "  docker exec $SERVER bash -c 'echo | nc -w1 127.0.0.1 9878'"
+    echo ""
+    echo "  # Check logs"
+    echo "  docker exec $SERVER tail -5 /tmp/server.log"
+    echo "  docker exec $REPLICA tail -5 /tmp/replica.log"
+    if [[ "$WITH_DUAL_REPLICA" == "true" ]]; then
+        echo "  docker exec $REPLICA2 tail -5 /tmp/replica2.log"
+    fi
 fi
