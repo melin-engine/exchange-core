@@ -1597,20 +1597,58 @@ pub fn run_receiver(
     let mut accum_entry_count: u64 = 0;
     let mut accum_end_sequence: u64;
 
-    // Periodic snapshot during catch-up. Saves the Exchange state so a
-    // crash during catch-up doesn't require replaying from genesis.
-    // Snapshot every 5M events (~400 MB of journal at ~80 bytes/entry).
-    const SNAPSHOT_INTERVAL: u64 = 5_000_000;
-    // snapshot_path already declared above (used for recovery too).
-    let mut events_since_snapshot: u64 = 0;
     // Reusable frame buffer — grows to high-water mark, avoids per-frame
     // heap allocation in the hot receive loop.
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    // Shadow exchange for background snapshots — same pattern as the
+    // primary's shadow stage. A cloned Exchange on a dedicated thread
+    // replays events from a disruptor ring and snapshots periodically,
+    // keeping snapshot I/O completely off the receive thread.
+    let shadow_exchange = exchange.clone_via_snapshot();
+    // 256-slot ring: enough buffering so the shadow thread doesn't
+    // backpressure the receive thread during snapshot serialization.
+    let mut shadow_builder = melin_disruptor::ring::DisruptorBuilder::<
+        melin_engine::journal::pipeline::InputSlot,
+    >::new(256);
+    shadow_builder = shadow_builder.add_consumer();
+    let (mut shadow_producer, mut shadow_consumers) = shadow_builder.build();
+    let shadow_consumer = shadow_consumers.pop().expect("shadow consumer");
+    let shadow_shutdown = Arc::new(AtomicBool::new(false));
+    let shadow_shutdown_flag = Arc::clone(&shadow_shutdown);
+    // Chain hash is always zero on the replica — write_raw_sync doesn't
+    // maintain chain state. Zero is safe: recovery rebuilds from journal.
+    let shadow_chain_hash = Arc::new(melin_disruptor::seqlock::SeqLock::new([0u8; 32]));
+    let shadow_snap_path = snapshot_path.clone();
+    let shadow_handle = std::thread::Builder::new()
+        .name("replica-shadow".into())
+        .spawn(move || {
+            crate::shadow::run(
+                shadow_consumer,
+                shadow_exchange,
+                shadow_snap_path,
+                std::time::Duration::from_secs(30),
+                shadow_chain_hash,
+                &shadow_shutdown_flag,
+                false, // yield, don't busy-spin — shadow is not latency-critical
+            );
+        })
+        .expect("spawn replica shadow thread");
+    let mut shadow_handle = Some(shadow_handle);
+
+    /// Stop the replica shadow thread and wait for it to finish.
+    fn stop_shadow(shutdown: &AtomicBool, handle: &mut Option<std::thread::JoinHandle<()>>) {
+        shutdown.store(true, Ordering::Relaxed);
+        if let Some(h) = handle.take() {
+            let _ = h.join();
+        }
+    }
 
     // Main receive loop.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
+            stop_shadow(&shadow_shutdown, &mut shadow_handle);
             return Ok(None);
         }
 
@@ -1648,9 +1686,10 @@ pub fn run_receiver(
             // Fsync any accumulated data.
             if !journal_accum.is_empty() {
                 journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
-                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
                 journal_accum.clear();
             }
+            stop_shadow(&shadow_shutdown, &mut shadow_handle);
             return Ok(Some((exchange, journal_writer)));
         }
 
@@ -1674,9 +1713,12 @@ pub fn run_receiver(
                 // Flush any accumulated but un-acked data before waiting.
                 if !journal_accum.is_empty() {
                     journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
-                    replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                    replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
                     journal_accum.clear();
                 }
+
+                // Shut down shadow thread — no more events to replay.
+                stop_shadow(&shadow_shutdown, &mut shadow_handle);
 
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
@@ -1767,34 +1809,15 @@ pub fn run_receiver(
                 // advances as soon as the ack arrives, unblocking the
                 // response stage. Replay is not on the critical path —
                 // on crash recovery, the replica replays from its journal.
-                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                replay_journal_bytes(
+                    &journal_accum,
+                    &mut exchange,
+                    &mut reports,
+                    Some(&mut shadow_producer),
+                )?;
 
-                events_since_snapshot += accum_entry_count;
                 journal_accum.clear();
                 accum_entry_count = 0;
-
-                // Periodic snapshot so a crash during catch-up doesn't
-                // require replaying from genesis. The snapshot captures
-                // the Exchange state at the current journal position.
-                if events_since_snapshot >= SNAPSHOT_INTERVAL {
-                    let seq = journal_writer.next_sequence().saturating_sub(1);
-                    // Chain hash is zero — write_raw_sync doesn't update the
-                    // writer's chain state (it writes pre-encoded bytes). Zero
-                    // is safe: on recovery, seed_chain_hash([0;32]) is a no-op
-                    // and the reader rebuilds the chain from journal entries.
-                    let chain_hash = [0u8; 32];
-                    if let Err(e) = melin_engine::journal::snapshot::save(
-                        &exchange,
-                        seq,
-                        chain_hash,
-                        &snapshot_path,
-                    ) {
-                        warn!(error = %e, "failed to save replica snapshot (non-fatal)");
-                    } else {
-                        info!(sequence = seq, "replica snapshot saved");
-                    }
-                    events_since_snapshot = 0;
-                }
             }
             PrimaryMessage::Heartbeat {
                 sequence,
@@ -1831,7 +1854,12 @@ fn replay_journal_bytes(
     journal_bytes: &[u8],
     exchange: &mut melin_engine::exchange::Exchange,
     reports: &mut Vec<melin_engine::types::ExecutionReport>,
+    mut shadow_producer: Option<
+        &mut melin_disruptor::ring::Producer<melin_engine::journal::pipeline::InputSlot>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use melin_engine::journal::pipeline::InputSlot;
+
     let mut offset = 0;
     while offset < journal_bytes.len() {
         let remaining = &journal_bytes[offset..];
@@ -1843,6 +1871,23 @@ fn replay_journal_bytes(
                 // Rebuild per-key HWM state on replica (same as primary replay).
                 exchange.check_request_seq(key_hash, request_seq);
                 replay_event(exchange, &event, reports);
+
+                // Feed the shadow exchange via the disruptor ring.
+                // try_publish avoids blocking the receive thread if the
+                // shadow falls behind — missed events are acceptable since
+                // the shadow's snapshot is best-effort (journal is the
+                // source of truth for recovery).
+                if let Some(ref mut producer) = shadow_producer {
+                    let _ = producer.try_publish(InputSlot {
+                        connection_id: 0,
+                        key_hash,
+                        request_seq,
+                        event,
+                        publish_ts: Default::default(),
+                        recv_ts: Default::default(),
+                    });
+                }
+
                 offset += consumed;
             }
             Err(e) => {
@@ -2418,7 +2463,7 @@ pub fn run_receiver_dpdk(
             }
             if !journal_accum.is_empty() {
                 journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
-                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
                 journal_accum.clear();
             }
             return Ok(Some((exchange, journal_writer)));
@@ -2489,7 +2534,7 @@ pub fn run_receiver_dpdk(
             transport.queue_send(handle, &send_buf);
 
             // Replay AFTER acking — not on the critical path.
-            replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+            replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
 
             journal_accum.clear();
             accum_entry_count = 0;
