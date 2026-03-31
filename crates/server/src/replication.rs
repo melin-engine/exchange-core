@@ -70,9 +70,10 @@ const MSG_HEARTBEAT: u8 = 0x30;
 /// Data batches can be much larger (up to 128 KiB of journal data).
 const MAX_CONTROL_FRAME: usize = 256;
 
-/// Maximum data batch frame size. Sized for MAX_JOURNAL_BATCH (1024) entries
-/// at ~80 bytes each = ~80 KiB, plus header overhead.
-const MAX_DATA_FRAME: usize = 256 * 1024;
+/// Maximum data batch frame size. Must be >= CHUNK_SIZE (512 KiB) in the
+/// replication ring, plus header overhead (45 bytes). Ring batches can use
+/// the full 512 KiB chunk, so the frame limit must accommodate that.
+const MAX_DATA_FRAME: usize = 768 * 1024;
 
 // --- Wire protocol encode/decode ---
 
@@ -1730,8 +1731,19 @@ pub fn run_receiver(
                     if !ready {
                         break;
                     }
-                    if read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME).is_err() {
-                        break;
+                    match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
+                        Ok(()) => {}
+                        Err(e)
+                            if e.kind() == io::ErrorKind::WouldBlock
+                                || e.kind() == io::ErrorKind::TimedOut =>
+                        {
+                            break;
+                        }
+                        Err(e) => {
+                            // Frame-too-large or other read errors leave the
+                            // TCP stream misaligned — propagate to disconnect.
+                            return Err(format!("coalescing read failed: {e}").into());
+                        }
                     }
                     match decode_primary_message(&frame_buf)? {
                         PrimaryMessage::DataBatch {
