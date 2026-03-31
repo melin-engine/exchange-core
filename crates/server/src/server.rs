@@ -417,10 +417,24 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             ed25519_dalek::SigningKey::from_bytes(&bytes)
         };
 
+        // Load authorized keys early — the promotion listener needs them
+        // for Ed25519 challenge-response auth (operator keys only).
+        let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+        info!(
+            keys = authorized_keys.len(),
+            path = %config.authorized_keys.display(),
+            "loaded authorized keys (replica mode, for promotion auth)"
+        );
+
         // Spawn promotion listener if configured.
         let promote_flag = Arc::new(AtomicBool::new(false));
         let _promote_handle = config.promote_bind.map(|addr| {
-            crate::promote::spawn(addr, Arc::clone(&promote_flag), Arc::clone(&shutdown))
+            crate::promote::spawn(
+                addr,
+                Arc::clone(&promote_flag),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )
         });
 
         match crate::replication::run_receiver(
@@ -435,14 +449,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 // Promotion! Transition to primary mode.
                 info!("replica promoted — transitioning to primary");
                 exchange.prefault();
-
-                // Load authorized keys (skipped during replica mode).
-                let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
-                info!(
-                    keys = authorized_keys.len(),
-                    path = %config.authorized_keys.display(),
-                    "loaded authorized keys"
-                );
 
                 return run_as_primary(
                     exchange,
@@ -1155,9 +1161,23 @@ pub fn run_dpdk(
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
 
+        // Load authorized keys early — the promotion listener needs them
+        // for Ed25519 challenge-response auth (operator keys only).
+        let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+        info!(
+            keys = authorized_keys.len(),
+            path = %config.authorized_keys.display(),
+            "loaded authorized keys (DPDK replica mode, for promotion auth)"
+        );
+
         let promote_flag = Arc::new(AtomicBool::new(false));
         let _promote_handle = config.promote_bind.map(|addr| {
-            crate::promote::spawn(addr, Arc::clone(&promote_flag), Arc::clone(&shutdown))
+            crate::promote::spawn(
+                addr,
+                Arc::clone(&promote_flag),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )
         });
 
         // Use queue 0 for the replication receiver's smoltcp connection.
@@ -1190,13 +1210,6 @@ pub fn run_dpdk(
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
                 exchange.prefault();
-
-                let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
-                info!(
-                    keys = authorized_keys.len(),
-                    path = %config.authorized_keys.display(),
-                    "loaded authorized keys"
-                );
 
                 // TODO: run_as_primary_dpdk — for now, fall back to
                 // kernel TCP primary after promotion.

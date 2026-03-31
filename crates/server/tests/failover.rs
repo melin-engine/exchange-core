@@ -53,11 +53,13 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
-/// Write an authorized_keys file for multiple test keys, plus a
-/// replication key. Returns (authorized_keys_path, replication_key_path).
+/// Write an authorized_keys file for multiple test keys, an operator key
+/// (for promotion auth), plus a replication key.
+/// Returns (authorized_keys_path, replication_key_path).
 fn write_auth_keys_multi(
     dir: &Path,
     keys: &[&SigningKey],
+    operator_key: &SigningKey,
     repl_key: &SigningKey,
 ) -> (PathBuf, PathBuf) {
     let path = dir.join("authorized_keys");
@@ -70,6 +72,12 @@ fn write_auth_keys_multi(
         // Use trader permission so orders can be submitted.
         content.push_str(&format!("trader {pub_key_b64} test-key-{i}\n"));
     }
+    // Add operator key (used for authenticated promotion).
+    let ops_pub_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        operator_key.verifying_key().to_bytes(),
+    );
+    content.push_str(&format!("operator {ops_pub_b64} ops\n"));
     // Add replication key.
     let repl_pub_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
@@ -119,13 +127,59 @@ fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::
     ))
 }
 
-/// Send PROMOTE to the promotion endpoint.
-fn promote(addr: SocketAddr) {
+/// Authenticate and send PROMOTE to the promotion endpoint.
+fn promote(addr: SocketAddr, operator_key: &SigningKey) {
+    use melin_protocol::codec;
+    use melin_protocol::message::{Request, ResponseKind};
+
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .expect("connect to promotion endpoint");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
+
+    // Step 1: Receive Challenge.
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read challenge len");
+    let frame_len = u32::from_le_bytes(len_buf) as usize;
+    let mut frame_buf = vec![0u8; frame_len];
+    stream
+        .read_exact(&mut frame_buf)
+        .expect("read challenge payload");
+    let nonce = match codec::decode_response(&frame_buf).expect("decode challenge") {
+        ResponseKind::Challenge { nonce } => nonce,
+        other => panic!("expected Challenge, got {other:?}"),
+    };
+
+    // Step 2: Sign nonce and send ChallengeResponse.
+    let signature = operator_key.sign(&nonce);
+    let request = Request::ChallengeResponse {
+        signature: signature.to_bytes(),
+        public_key: operator_key.verifying_key().to_bytes(),
+    };
+    let mut encode_buf = [0u8; 256];
+    let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");
+    stream
+        .write_all(&encode_buf[..written])
+        .expect("send ChallengeResponse");
+    stream.flush().expect("flush");
+
+    // Step 3: Read auth result.
+    stream
+        .read_exact(&mut len_buf)
+        .expect("read auth result len");
+    let result_len = u32::from_le_bytes(len_buf) as usize;
+    let mut result_buf = vec![0u8; result_len];
+    stream
+        .read_exact(&mut result_buf)
+        .expect("read auth result payload");
+    match codec::decode_response(&result_buf).expect("decode auth result") {
+        ResponseKind::ServerReady => {}
+        ResponseKind::AuthFailed => panic!("promotion auth failed"),
+        other => panic!("unexpected auth response: {other:?}"),
+    }
+
+    // Step 4: Send PROMOTE command.
     stream.write_all(b"PROMOTE\n").expect("send PROMOTE");
     let mut reader = BufReader::new(&stream);
     let mut response = String::new();
@@ -291,6 +345,7 @@ struct TestCluster {
     promote_port: u16,
     key: SigningKey,
     key2: SigningKey,
+    operator_key: SigningKey,
     bin: PathBuf,
     keys_path: PathBuf,
     #[allow(dead_code)] // Available for replacement replica spawns.
@@ -310,9 +365,10 @@ impl TestCluster {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let key = SigningKey::from_bytes(&[0xFA; 32]);
         let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+        let operator_key = SigningKey::from_bytes(&[0xFD; 32]);
         let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
         let (keys_path, repl_key_path) =
-            write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+            write_auth_keys_multi(tmp.path(), &[&key, &key2], &operator_key, &repl_key);
 
         let primary_client_port = free_port();
         let primary_health_port = free_port();
@@ -362,6 +418,7 @@ impl TestCluster {
             promote_port: replica_promote_port,
             key,
             key2,
+            operator_key,
             bin,
             keys_path,
             repl_key_path,
@@ -399,7 +456,7 @@ impl TestCluster {
         let _ = self.primary.child.wait();
 
         let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.promote_port).parse().unwrap();
-        promote(promote_addr);
+        promote(promote_addr, &self.operator_key);
 
         wait_healthy(self.replica.health_addr, Duration::from_secs(30));
 
@@ -733,7 +790,7 @@ fn same_key_retry_after_failover_is_rejected() {
         libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
     }
     let _ = cluster.primary.child.wait();
-    promote(promote_addr);
+    promote(promote_addr, &cluster.operator_key);
     wait_healthy(cluster.replica.health_addr, Duration::from_secs(30));
     std::thread::sleep(Duration::from_secs(1));
 
@@ -769,6 +826,7 @@ struct DualCluster {
     replica2_promote_port: u16,
     key: SigningKey,
     key2: SigningKey,
+    operator_key: SigningKey,
     repl_key_path: PathBuf,
     _tmp: tempfile::TempDir,
 }
@@ -781,9 +839,10 @@ impl DualCluster {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let key = SigningKey::from_bytes(&[0xFA; 32]);
         let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+        let operator_key = SigningKey::from_bytes(&[0xFD; 32]);
         let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
         let (keys_path, repl_key_path) =
-            write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+            write_auth_keys_multi(tmp.path(), &[&key, &key2], &operator_key, &repl_key);
 
         let primary_client_port = free_port();
         let primary_health_port = free_port();
@@ -851,6 +910,7 @@ impl DualCluster {
             replica2_promote_port: r2_promote,
             key,
             key2,
+            operator_key,
             repl_key_path,
             _tmp: tmp,
         }
@@ -900,7 +960,7 @@ impl DualCluster {
         let addr: SocketAddr = format!("127.0.0.1:{}", self.replica1_promote_port)
             .parse()
             .unwrap();
-        promote(addr);
+        promote(addr, &self.operator_key);
         wait_healthy(self.replica1.health_addr, Duration::from_secs(30));
         std::thread::sleep(Duration::from_secs(1));
         Client::connect(self.replica1.client_addr, &self.key2)
@@ -911,7 +971,7 @@ impl DualCluster {
         let addr: SocketAddr = format!("127.0.0.1:{}", self.replica2_promote_port)
             .parse()
             .unwrap();
-        promote(addr);
+        promote(addr, &self.operator_key);
         wait_healthy(self.replica2.health_addr, Duration::from_secs(30));
         std::thread::sleep(Duration::from_secs(1));
         Client::connect(self.replica2.client_addr, &self.key2)
@@ -1236,7 +1296,7 @@ fn replacement_replica_catches_up_from_journal() {
     cluster.kill_primary();
 
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
-    promote(promote_addr);
+    promote(promote_addr, &cluster.operator_key);
     let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
     wait_healthy(r3_health_addr, Duration::from_secs(30));
     std::thread::sleep(Duration::from_secs(1));
@@ -1366,7 +1426,7 @@ fn catchup_with_fills_during_gap() {
     // Kill primary, promote replacement.
     drop(client);
     cluster.kill_primary();
-    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
+    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap(), &cluster.operator_key);
     wait_healthy(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -1489,7 +1549,7 @@ fn catchup_then_immediate_failover() {
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
     cluster.kill_primary();
-    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
+    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap(), &cluster.operator_key);
     wait_healthy(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -1622,7 +1682,7 @@ fn fresh_replica_full_catchup() {
     // Kill primary, promote the fresh replacement.
     drop(client);
     cluster.kill_primary();
-    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
+    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap(), &cluster.operator_key);
     wait_healthy(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -1673,8 +1733,10 @@ fn snapshot_transfer_when_archives_purged() {
     // Deterministic keys (same pattern as TestCluster::start).
     let key = SigningKey::from_bytes(&[0xFA; 32]);
     let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+    let operator_key = SigningKey::from_bytes(&[0xFD; 32]);
     let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
-    let (keys_path, repl_key_path) = write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+    let (keys_path, repl_key_path) =
+        write_auth_keys_multi(tmp.path(), &[&key, &key2], &operator_key, &repl_key);
 
     let primary_client_port = free_port();
     let primary_health_port = free_port();
