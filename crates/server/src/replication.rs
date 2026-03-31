@@ -524,22 +524,16 @@ pub fn run_sender(
     struct ReplicaSlot {
         consumer: Option<ReplicationConsumer>,
         handle: Option<std::thread::JoinHandle<ReplicationConsumer>>,
-        /// True after this slot has had at least one connection. Ring
-        /// data is only drained on idle slots that have connected before
-        /// — a never-connected slot preserves seed data for its first replica.
-        has_connected: bool,
     }
 
     let mut slots = [
         ReplicaSlot {
             consumer: Some(repl_consumer_1),
             handle: None,
-            has_connected: false,
         },
         ReplicaSlot {
             consumer: Some(repl_consumer_2),
             handle: None,
-            has_connected: false,
         },
     ];
 
@@ -599,7 +593,6 @@ pub fn run_sender(
                     // Signal that at least one replica is connected.
                     replica_ready.store(true, Ordering::Release);
                     replicas_connected.fetch_add(1, Ordering::Release);
-                    slots[slot_idx].has_connected = true;
 
                     // Take the consumer out of the slot for the handler thread.
                     // The slot's consumer becomes None while the thread owns it.
@@ -645,13 +638,11 @@ pub fn run_sender(
         }
 
         // Drain batches on idle consumers to prevent ring backpressure.
-        // Only drain consumers that have had at least one connection —
-        // never-connected consumers preserve seed data for their first
-        // replica. With journal catch-up, a late-joining replica gets
-        // historical data from the primary's journal files instead.
+        // All idle consumers must be drained — otherwise an unconnected
+        // consumer blocks the ring and deadlocks the pipeline. Late-joining
+        // replicas catch up from journal files, so no data is lost.
         for slot in &mut slots {
             if slot.handle.is_none()
-                && slot.has_connected
                 && let Some(ref mut consumer) = slot.consumer
             {
                 drain_batches_while_waiting(consumer);
