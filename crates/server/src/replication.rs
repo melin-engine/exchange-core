@@ -1581,135 +1581,180 @@ pub fn run_receiver(
         journal_writer = Some(writer);
     }
 
-    let mut exchange = exchange.expect("exchange initialized");
-    let mut journal_writer = journal_writer.expect("journal_writer initialized");
+    let exchange = exchange.expect("exchange initialized");
+    let journal_writer = journal_writer.expect("journal_writer initialized");
 
-    // Pre-allocated report buffer, reused across events to avoid per-event
-    // heap allocation. Same pattern as MatchingStage.
-    let mut reports: Vec<melin_engine::types::ExecutionReport> = Vec::with_capacity(256);
+    // Build the replica pipeline — same stages as the primary (journal →
+    // matching → shadow), with the replication receiver feeding the disruptor
+    // instead of reader threads. The journal stage writes raw bytes from
+    // a side channel instead of encoding events.
+    let (
+        input_producer,
+        journal_stage,
+        matching_stage,
+        drain_consumer,
+        journal_cursor,
+        _matching_cursor,
+        raw_journal_tx,
+        shadow_consumer,
+        chain_hash_lock,
+    ) = melin_engine::journal::pipeline::build_replica_pipeline(
+        exchange,
+        journal_writer,
+        4096,  // max_journal_batch
+        false, // don't busy-spin on replica
+        true,  // enable shadow for snapshots
+    );
 
-    // Accumulation buffer for coalescing multiple DataBatch frames into
-    // one fsync. The replica reads all available frames from the TCP
-    // buffer, accumulates journal bytes, then does ONE pwritev2+RWF_DSYNC
-    // and ONE ack for the highest sequence. This reduces NVMe fsync
-    // overhead from one-per-batch to one-per-TCP-read-burst.
-    let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
-    let mut accum_entry_count: u64 = 0;
-    let mut accum_end_sequence: u64;
+    // RAII guard for pipeline threads — ensures all threads are joined on
+    // any exit path (including ? returns). The guard also signals shutdown
+    // and extracts the Exchange + JournalWriter from the stage return values.
+    let pipeline_shutdown = Arc::new(AtomicBool::new(false));
 
-    // Reusable frame buffer — grows to high-water mark, avoids per-frame
-    // heap allocation in the hot receive loop.
-    let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let ps = Arc::clone(&pipeline_shutdown);
+    let journal_handle = std::thread::Builder::new()
+        .name("journal".into())
+        .spawn(move || journal_stage.run(&ps))
+        .expect("spawn journal thread");
 
-    // Shadow exchange for background snapshots — same pattern as the
-    // primary's shadow stage. A cloned Exchange on a dedicated thread
-    // replays events from a disruptor ring and snapshots periodically,
-    // keeping snapshot I/O completely off the receive thread.
-    let shadow_exchange = exchange.clone_via_snapshot();
-    // 256-slot ring: enough buffering so the shadow thread doesn't
-    // backpressure the receive thread during snapshot serialization.
-    let mut shadow_builder = melin_disruptor::ring::DisruptorBuilder::<
-        melin_engine::journal::pipeline::InputSlot,
-    >::new(256);
-    shadow_builder = shadow_builder.add_consumer();
-    let (mut shadow_producer, mut shadow_consumers) = shadow_builder.build();
-    let shadow_consumer = shadow_consumers.pop().expect("shadow consumer");
-    let shadow_shutdown = Arc::new(AtomicBool::new(false));
-    let shadow_shutdown_flag = Arc::clone(&shadow_shutdown);
-    // Chain hash is always zero on the replica — write_raw_sync doesn't
-    // maintain chain state. Zero is safe: recovery rebuilds from journal.
-    let shadow_chain_hash = Arc::new(melin_disruptor::seqlock::SeqLock::new([0u8; 32]));
-    let shadow_snap_path = snapshot_path.clone();
-    let shadow_handle = std::thread::Builder::new()
-        .name("replica-shadow".into())
+    let ps = Arc::clone(&pipeline_shutdown);
+    let matching_handle = std::thread::Builder::new()
+        .name("matching".into())
+        .spawn(move || matching_stage.run(&ps))
+        .expect("spawn matching thread");
+
+    // Output drain thread — consumes and discards output slots so the
+    // matching stage doesn't block on an unconsumed output ring.
+    let ps = Arc::clone(&pipeline_shutdown);
+    let drain_handle = std::thread::Builder::new()
+        .name("drain".into())
         .spawn(move || {
-            crate::shadow::run(
-                shadow_consumer,
-                shadow_exchange,
-                shadow_snap_path,
-                std::time::Duration::from_secs(30),
-                shadow_chain_hash,
-                &shadow_shutdown_flag,
-                false, // yield, don't busy-spin — shadow is not latency-critical
-            );
-        })
-        .expect("spawn replica shadow thread");
-    /// RAII guard that stops the shadow thread on drop. Ensures the thread
-    /// is joined on all exit paths (including early `?` returns and errors)
-    /// so it's never leaked.
-    struct ShadowGuard {
-        shutdown: Arc<AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-    impl ShadowGuard {
-        fn stop(&mut self) {
-            self.shutdown.store(true, Ordering::Relaxed);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
+            let mut consumer = drain_consumer;
+            let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+            loop {
+                if ps.load(Ordering::Relaxed) {
+                    return;
+                }
+                let count = consumer.consume_batch(&mut batch, 256);
+                if count == 0 {
+                    std::thread::yield_now();
+                }
             }
-        }
-    }
-    impl Drop for ShadowGuard {
-        fn drop(&mut self) {
-            self.stop();
-        }
-    }
-    let mut shadow_guard = ShadowGuard {
-        shutdown: Arc::clone(&shadow_shutdown),
-        handle: Some(shadow_handle),
+        })
+        .expect("spawn drain thread");
+
+    // Shadow snapshot thread — reuses the primary's shadow::run().
+    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
+        let snap_path = snapshot_path.clone();
+        let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
+        let ps = Arc::clone(&pipeline_shutdown);
+        Some(
+            std::thread::Builder::new()
+                .name("replica-shadow".into())
+                .spawn(move || {
+                    crate::shadow::run(
+                        shadow_cons,
+                        // Shadow needs its own Exchange clone — it replays
+                        // events independently for periodic snapshots.
+                        // The matching stage owns the "real" Exchange.
+                        // We start with a fresh Exchange; the shadow will
+                        // replay all events from the disruptor to build state.
+                        melin_engine::exchange::Exchange::new(),
+                        snap_path,
+                        std::time::Duration::from_secs(30),
+                        chain_lock,
+                        &ps,
+                        false,
+                    );
+                })
+                .expect("spawn shadow thread"),
+        )
+    } else {
+        None
     };
+
+    /// Shut down the pipeline and extract Exchange + JournalWriter from
+    /// the stage threads. Returns None if a thread panicked.
+    fn shutdown_pipeline(
+        shutdown_flag: &AtomicBool,
+        journal_handle: std::thread::JoinHandle<melin_engine::journal::writer::JournalWriter>,
+        matching_handle: std::thread::JoinHandle<melin_engine::exchange::Exchange>,
+        drain_handle: std::thread::JoinHandle<()>,
+        shadow_handle: Option<std::thread::JoinHandle<()>>,
+    ) -> Option<(
+        melin_engine::exchange::Exchange,
+        melin_engine::journal::writer::JournalWriter,
+    )> {
+        shutdown_flag.store(true, Ordering::Relaxed);
+        let writer = journal_handle.join().ok()?;
+        let exchange = matching_handle.join().ok()?;
+        let _ = drain_handle.join();
+        if let Some(h) = shadow_handle {
+            let _ = h.join();
+        }
+        Some((exchange, writer))
+    }
+
+    // Reusable buffers for the receive loop.
+    let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
+    let mut accum_entry_count: u32 = 0;
+    let mut accum_end_sequence: u64 = 0;
+    let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
     // Main receive loop.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
-            shadow_guard.stop();
+            shutdown_pipeline(
+                &pipeline_shutdown,
+                journal_handle,
+                matching_handle,
+                drain_handle,
+                shadow_handle,
+            );
             return Ok(None);
         }
 
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered — stopping replication, transitioning to primary");
-            // Drain any remaining data already in the TCP buffer to
-            // maximize data freshness before promotion.
-            let mut rpollfd = libc::pollfd {
-                fd: reader.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            loop {
-                rpollfd.revents = 0;
-                let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
-                    && (rpollfd.revents & libc::POLLIN) != 0;
-                if !ready {
-                    break;
-                }
-                if read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME).is_err() {
-                    break;
-                }
-                match decode_primary_message(&frame_buf) {
-                    Ok(PrimaryMessage::DataBatch {
-                        entry_count,
-                        journal_bytes,
-                        ..
-                    }) => {
-                        journal_accum.extend_from_slice(&journal_bytes);
-                        accum_entry_count += entry_count as u64;
-                    }
-                    _ => break,
-                }
-            }
-            // Fsync any accumulated data.
+            // Drain remaining TCP data for maximum freshness.
+            drain_tcp_data_batches(
+                &mut reader,
+                &mut frame_buf,
+                &mut journal_accum,
+                &mut accum_entry_count,
+                &mut accum_end_sequence,
+            );
+            // Flush accumulated data through the pipeline.
             if !journal_accum.is_empty() {
-                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
-                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
+                publish_batch_to_pipeline(
+                    &journal_accum,
+                    accum_entry_count,
+                    accum_end_sequence,
+                    accum_chain_hash,
+                    &input_producer,
+                    &raw_journal_tx,
+                    &journal_cursor,
+                )?;
                 journal_accum.clear();
+                accum_entry_count = 0;
             }
-            shadow_guard.stop();
-            return Ok(Some((exchange, journal_writer)));
+            // Shut down pipeline and extract Exchange + JournalWriter.
+            drop(raw_journal_tx); // unblock journal stage if waiting on channel
+            return match shutdown_pipeline(
+                &pipeline_shutdown,
+                journal_handle,
+                matching_handle,
+                drain_handle,
+                shadow_handle,
+            ) {
+                Some((exchange, writer)) => Ok(Some((exchange, writer))),
+                None => Err("pipeline thread panicked during promotion".into()),
+            };
         }
 
-        // Read the first frame (blocking, with the 5s timeout for
-        // shutdown checking).
+        // Read the first frame (blocking, with 5s timeout for shutdown check).
         match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
             Ok(()) => {}
             Err(e)
@@ -1718,30 +1763,47 @@ pub fn run_receiver(
                 continue;
             }
             Err(e) => {
-                // Primary disconnected (crash, network failure, or graceful
-                // shutdown). Instead of exiting, wait for the operator to
-                // promote this replica. The replica's journal is durable and
-                // the Exchange state is consistent up to the last acked
-                // sequence.
                 warn!(error = %e, "primary disconnected — waiting for promotion");
-
-                // Flush any accumulated but un-acked data before waiting.
+                // Flush any accumulated data.
                 if !journal_accum.is_empty() {
-                    journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
-                    replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
+                    let _ = publish_batch_to_pipeline(
+                        &journal_accum,
+                        accum_entry_count,
+                        accum_end_sequence,
+                        accum_chain_hash,
+                        &input_producer,
+                        &raw_journal_tx,
+                        &journal_cursor,
+                    );
                     journal_accum.clear();
+                    accum_entry_count = 0;
                 }
-
-                // Shut down shadow thread — no more events to replay.
-                shadow_guard.stop();
-
+                // Wait for promotion or shutdown.
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
+                        drop(raw_journal_tx);
+                        shutdown_pipeline(
+                            &pipeline_shutdown,
+                            journal_handle,
+                            matching_handle,
+                            drain_handle,
+                            shadow_handle,
+                        );
                         return Ok(None);
                     }
                     if promote.load(Ordering::Acquire) {
                         info!("promotion triggered after primary disconnect");
-                        return Ok(Some((exchange, journal_writer)));
+                        drop(raw_journal_tx);
+                        return match shutdown_pipeline(
+                            &pipeline_shutdown,
+                            journal_handle,
+                            matching_handle,
+                            drain_handle,
+                            shadow_handle,
+                        ) {
+                            Some((exchange, writer)) => Ok(Some((exchange, writer))),
+                            None => Err("pipeline thread panicked during promotion".into()),
+                        };
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -1752,66 +1814,37 @@ pub fn run_receiver(
         match message {
             PrimaryMessage::DataBatch {
                 end_sequence,
-                chain_hash: _batch_chain_hash,
+                chain_hash: batch_chain_hash,
                 entry_count,
                 journal_bytes,
             } => {
-                // Accumulate raw bytes for coalesced fsync. Replay is
-                // deferred until after the ack — the ack only guarantees
-                // durability (bytes on disk), not state application.
-                // Entry count comes from the wire frame — no data scanning.
                 journal_accum.extend_from_slice(&journal_bytes);
-                accum_entry_count += entry_count as u64;
+                accum_entry_count += entry_count;
                 accum_end_sequence = end_sequence;
+                accum_chain_hash = batch_chain_hash;
 
-                // Drain additional frames already in the TCP buffer.
-                // Use poll(0) to check availability — avoids the ~2ms
-                // SO_RCVTIMEO jiffy floor on Linux.
-                let mut rpollfd = libc::pollfd {
-                    fd: reader.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    rpollfd.revents = 0;
-                    let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
-                        && (rpollfd.revents & libc::POLLIN) != 0;
-                    if !ready {
-                        break;
-                    }
-                    match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
-                        Ok(()) => {}
-                        Err(e)
-                            if e.kind() == io::ErrorKind::WouldBlock
-                                || e.kind() == io::ErrorKind::TimedOut =>
-                        {
-                            break;
-                        }
-                        Err(e) => {
-                            // Frame-too-large or other read errors leave the
-                            // TCP stream misaligned — propagate to disconnect.
-                            return Err(format!("coalescing read failed: {e}").into());
-                        }
-                    }
-                    match decode_primary_message(&frame_buf)? {
-                        PrimaryMessage::DataBatch {
-                            end_sequence,
-                            entry_count,
-                            journal_bytes,
-                            ..
-                        } => {
-                            journal_accum.extend_from_slice(&journal_bytes);
-                            accum_entry_count += entry_count as u64;
-                            accum_end_sequence = end_sequence;
-                        }
-                        _ => break,
-                    }
-                }
+                // Drain additional frames from TCP buffer.
+                drain_tcp_data_batches(
+                    &mut reader,
+                    &mut frame_buf,
+                    &mut journal_accum,
+                    &mut accum_entry_count,
+                    &mut accum_end_sequence,
+                );
 
-                // Fsync all accumulated batches.
-                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+                // Publish events to the disruptor and raw bytes to the
+                // journal stage. Wait for journal fsync, then ack.
+                publish_batch_to_pipeline(
+                    &journal_accum,
+                    accum_entry_count,
+                    accum_end_sequence,
+                    accum_chain_hash,
+                    &input_producer,
+                    &raw_journal_tx,
+                    &journal_cursor,
+                )?;
 
-                // Ack immediately — data is durable on disk.
+                // Ack — data is durable on disk (journal_cursor advanced).
                 let ack = Ack {
                     acked_sequence: accum_end_sequence,
                 };
@@ -1819,17 +1852,6 @@ pub fn run_receiver(
                 tcp_writer.write_all(&send_buf)?;
                 tcp_writer.flush()?;
                 send_buf.clear();
-
-                // Replay AFTER acking. The primary's replication cursor
-                // advances as soon as the ack arrives, unblocking the
-                // response stage. Replay is not on the critical path —
-                // on crash recovery, the replica replays from its journal.
-                replay_journal_bytes(
-                    &journal_accum,
-                    &mut exchange,
-                    &mut reports,
-                    Some(&mut shadow_producer),
-                )?;
 
                 journal_accum.clear();
                 accum_entry_count = 0;
@@ -1858,6 +1880,114 @@ pub fn run_receiver(
     }
 }
 
+/// Drain DataBatch frames from the TCP buffer using non-blocking poll(0).
+fn drain_tcp_data_batches(
+    reader: &mut TcpStream,
+    frame_buf: &mut Vec<u8>,
+    journal_accum: &mut Vec<u8>,
+    accum_entry_count: &mut u32,
+    accum_end_sequence: &mut u64,
+) {
+    let mut rpollfd = libc::pollfd {
+        fd: std::os::unix::io::AsRawFd::as_raw_fd(reader),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        rpollfd.revents = 0;
+        let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
+            && (rpollfd.revents & libc::POLLIN) != 0;
+        if !ready {
+            break;
+        }
+        match read_frame_into(reader, frame_buf, MAX_DATA_FRAME) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+        match decode_primary_message(frame_buf) {
+            Ok(PrimaryMessage::DataBatch {
+                end_sequence,
+                entry_count,
+                journal_bytes,
+                ..
+            }) => {
+                journal_accum.extend_from_slice(&journal_bytes);
+                *accum_entry_count += entry_count;
+                *accum_end_sequence = end_sequence;
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Decode accumulated journal bytes into events, publish each to the
+/// input disruptor, send the raw bytes to the journal stage, and wait
+/// for the journal cursor to advance (fsync complete).
+fn publish_batch_to_pipeline(
+    journal_bytes: &[u8],
+    entry_count: u32,
+    end_sequence: u64,
+    chain_hash: [u8; 32],
+    producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
+    raw_tx: &std::sync::mpsc::SyncSender<melin_engine::journal::pipeline::RawJournalBatch>,
+    journal_cursor: &melin_disruptor::padding::Sequence,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use melin_engine::journal::pipeline::{InputSlot, RawJournalBatch};
+
+    // Decode events and publish to the disruptor.
+    let mut offset = 0;
+    let mut last_published_seq = 0u64;
+    while offset < journal_bytes.len() {
+        let remaining = &journal_bytes[offset..];
+        match melin_engine::journal::codec::decode(
+            remaining,
+            melin_engine::journal::codec::FORMAT_VERSION,
+        ) {
+            Ok((consumed, _sequence, _timestamp_ns, key_hash, request_seq, event)) => {
+                last_published_seq = producer.publish(InputSlot {
+                    connection_id: 0,
+                    key_hash,
+                    request_seq,
+                    event,
+                    publish_ts: Default::default(),
+                    recv_ts: Default::default(),
+                });
+                offset += consumed;
+            }
+            Err(e) => {
+                return Err(
+                    format!("failed to decode journal entry at offset {offset}: {e}").into(),
+                );
+            }
+        }
+    }
+
+    // Send raw bytes to the journal stage for write_raw_sync.
+    // This blocks if the channel is full (backpressure from journal I/O).
+    raw_tx
+        .send(RawJournalBatch {
+            bytes: journal_bytes.to_vec(),
+            end_sequence,
+            chain_hash,
+            entry_count,
+        })
+        .map_err(|_| "journal stage channel disconnected")?;
+
+    // Wait for journal cursor to advance past our last published sequence.
+    // This means the journal stage has fsynced our data.
+    let target = last_published_seq + 1;
+    while journal_cursor.get().load(Ordering::Acquire) < target {
+        std::hint::spin_loop();
+    }
+
+    Ok(())
+}
+
 /// Replay journal events against the exchange (same as MatchingStage::process_event
 /// but without the output SPSC publishing — replicas don't serve clients).
 ///
@@ -1865,6 +1995,8 @@ pub fn run_receiver(
 /// per-event heap allocation.
 /// Decode and replay journal entries from raw bytes into the exchange.
 /// Called AFTER the ack is sent — not on the critical path.
+/// Used by the DPDK receiver path (TCP receiver uses the pipeline instead).
+#[allow(dead_code)]
 fn replay_journal_bytes(
     journal_bytes: &[u8],
     exchange: &mut melin_engine::exchange::Exchange,
@@ -1915,6 +2047,7 @@ fn replay_journal_bytes(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn replay_event(
     exchange: &mut melin_engine::exchange::Exchange,
     event: &melin_engine::journal::event::JournalEvent,
