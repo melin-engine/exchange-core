@@ -12,6 +12,7 @@
 //! Uses actual child processes (`melin-server` binary) and TCP so the test
 //! exercises the real replication and promotion code paths.
 
+use ed25519_dalek::Signer;
 use serial_test::serial;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -1426,7 +1427,10 @@ fn catchup_with_fills_during_gap() {
     // Kill primary, promote replacement.
     drop(client);
     cluster.kill_primary();
-    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap(), &cluster.operator_key);
+    promote(
+        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
+        &cluster.operator_key,
+    );
     wait_healthy(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -1549,7 +1553,10 @@ fn catchup_then_immediate_failover() {
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
     cluster.kill_primary();
-    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap(), &cluster.operator_key);
+    promote(
+        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
+        &cluster.operator_key,
+    );
     wait_healthy(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -1682,7 +1689,10 @@ fn fresh_replica_full_catchup() {
     // Kill primary, promote the fresh replacement.
     drop(client);
     cluster.kill_primary();
-    promote(format!("127.0.0.1:{r3_promote}").parse().unwrap(), &cluster.operator_key);
+    promote(
+        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
+        &cluster.operator_key,
+    );
     wait_healthy(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
