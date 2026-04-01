@@ -1584,6 +1584,11 @@ pub fn run_receiver(
     let exchange = exchange.expect("exchange initialized");
     let journal_writer = journal_writer.expect("journal_writer initialized");
 
+    // Clone exchange for the shadow stage BEFORE moving it into the pipeline.
+    // The shadow needs the fully-recovered state as its base — it only sees
+    // new events from the disruptor, not historical ones from the journal.
+    let shadow_exchange = exchange.clone_via_snapshot();
+
     // Build the replica pipeline — same stages as the primary (journal →
     // matching → shadow), with the replication receiver feeding the disruptor
     // instead of reader threads. The journal stage writes raw bytes from
@@ -1654,12 +1659,7 @@ pub fn run_receiver(
                 .spawn(move || {
                     crate::shadow::run(
                         shadow_cons,
-                        // Shadow needs its own Exchange clone — it replays
-                        // events independently for periodic snapshots.
-                        // The matching stage owns the "real" Exchange.
-                        // We start with a fresh Exchange; the shadow will
-                        // replay all events from the disruptor to build state.
-                        melin_engine::exchange::Exchange::new(),
+                        shadow_exchange,
                         snap_path,
                         std::time::Duration::from_secs(30),
                         chain_lock,
@@ -1703,6 +1703,7 @@ pub fn run_receiver(
                 &mut journal_accum,
                 &mut accum_entry_count,
                 &mut accum_end_sequence,
+                &mut accum_chain_hash,
             );
             // Flush accumulated data through the pipeline.
             if !journal_accum.is_empty() {
@@ -1804,6 +1805,7 @@ pub fn run_receiver(
                     &mut journal_accum,
                     &mut accum_entry_count,
                     &mut accum_end_sequence,
+                    &mut accum_chain_hash,
                 );
 
                 // Publish events to the disruptor and raw bytes to the
@@ -1884,6 +1886,7 @@ fn drain_tcp_data_batches(
     journal_accum: &mut Vec<u8>,
     accum_entry_count: &mut u32,
     accum_end_sequence: &mut u64,
+    accum_chain_hash: &mut [u8; 32],
 ) {
     let mut rpollfd = libc::pollfd {
         fd: std::os::unix::io::AsRawFd::as_raw_fd(reader),
@@ -1911,11 +1914,12 @@ fn drain_tcp_data_batches(
                 end_sequence,
                 entry_count,
                 journal_bytes,
-                ..
+                chain_hash,
             }) => {
                 journal_accum.extend_from_slice(&journal_bytes);
                 *accum_entry_count += entry_count;
                 *accum_end_sequence = end_sequence;
+                *accum_chain_hash = chain_hash;
             }
             _ => break,
         }
@@ -2409,6 +2413,9 @@ pub fn run_receiver_dpdk(
     let exchange = exchange.expect("exchange initialized");
     let journal_writer = journal_writer.expect("journal_writer initialized");
 
+    // Clone exchange for shadow stage before moving into pipeline.
+    let shadow_exchange = exchange.clone_via_snapshot();
+
     // Build the replica pipeline — same as the TCP receiver.
     let (
         input_producer,
@@ -2471,7 +2478,7 @@ pub fn run_receiver_dpdk(
                 .spawn(move || {
                     crate::shadow::run(
                         shadow_cons,
-                        melin_engine::exchange::Exchange::new(),
+                        shadow_exchange,
                         snap_path,
                         std::time::Duration::from_secs(30),
                         chain_lock,

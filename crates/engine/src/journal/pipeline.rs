@@ -2470,4 +2470,226 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
     }
+
+    /// Journal stage in replica mode: writes raw bytes from a channel and
+    /// advances the disruptor cursor only after the durable write.
+    #[test]
+    fn replica_journal_stage_writes_raw_bytes_and_advances_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("primary.journal");
+        let replica_path = dir.path().join("replica.journal");
+
+        // Write events to a primary journal to get raw bytes.
+        let events = vec![
+            JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(0),
+                amount: 500,
+            },
+            JournalEvent::Deposit {
+                account: AccountId(2),
+                currency: CurrencyId(0),
+                amount: 300,
+            },
+        ];
+
+        let raw_bytes;
+        let entry_count;
+        {
+            let mut writer = crate::journal::writer::JournalWriter::create(&primary_path).unwrap();
+            for event in &events {
+                writer.batch_append(event).unwrap();
+            }
+            raw_bytes = writer.pending_batch_bytes().to_vec();
+            entry_count = events.len() as u32;
+            writer.flush_batch_sync().unwrap();
+        }
+
+        // Set up replica pipeline components: disruptor + journal stage with
+        // raw_journal_rx.
+        let replica_writer = crate::journal::writer::JournalWriter::create(&replica_path).unwrap();
+
+        let (input_producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build_multi_producer();
+        let consumer = consumers.pop().unwrap();
+        let journal_cursor = consumer.progress_counter();
+
+        let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawJournalBatch>(4);
+
+        let mut stage = JournalStage::new(
+            replica_writer,
+            consumer,
+            Duration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        );
+        stage.set_raw_journal_receiver(raw_rx);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+        // Publish events to the disruptor (same as the replication receiver
+        // would do) so the journal stage can advance the cursor.
+        for event in &events {
+            input_producer.publish(InputSlot {
+                connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
+                event: event.clone(),
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        }
+
+        // Send raw bytes via the channel.
+        raw_tx
+            .send(RawJournalBatch {
+                bytes: raw_bytes,
+                end_sequence: FIRST_SEQ + entry_count as u64 - 1,
+                chain_hash: [0u8; 32],
+                entry_count,
+            })
+            .unwrap();
+
+        // Wait for the journal cursor to advance past our events.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while journal_cursor.get().load(Ordering::Acquire) < entry_count as u64 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for replica journal cursor"
+            );
+            std::hint::spin_loop();
+        }
+
+        // Shut down and verify the replica journal has the correct entries.
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = handle.join().unwrap();
+
+        #[cfg(not(feature = "no-persist"))]
+        {
+            let mut reader = crate::journal::JournalReader::open(&replica_path).unwrap();
+            let e1 = reader.next_entry().unwrap().unwrap();
+            assert!(matches!(e1.event, JournalEvent::Deposit { amount: 500, .. }));
+            let e2 = reader.next_entry().unwrap().unwrap();
+            assert!(matches!(e2.event, JournalEvent::Deposit { amount: 300, .. }));
+            assert!(reader.next_entry().unwrap().is_none());
+        }
+    }
+
+    /// `build_replica_pipeline` produces a working pipeline: events published
+    /// to the input disruptor are processed by the matching stage, and raw
+    /// bytes sent to the journal stage are written to disk.
+    #[test]
+    fn build_replica_pipeline_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("primary.journal");
+        let replica_path = dir.path().join("replica.journal");
+
+        // Prepare a primary journal to get raw bytes.
+        let deposit = JournalEvent::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(0),
+            amount: 1_000,
+        };
+        let raw_bytes;
+        {
+            let mut writer = crate::journal::writer::JournalWriter::create(&primary_path).unwrap();
+            writer.batch_append(&deposit).unwrap();
+            raw_bytes = writer.pending_batch_bytes().to_vec();
+            writer.flush_batch_sync().unwrap();
+        }
+
+        // Build the replica pipeline.
+        let exchange = Exchange::new();
+        let writer = crate::journal::writer::JournalWriter::create(&replica_path).unwrap();
+        let (
+            input_producer,
+            journal_stage,
+            matching_stage,
+            drain_consumer,
+            journal_cursor,
+            _matching_cursor,
+            raw_tx,
+            _shadow_consumer,
+            _chain_hash_lock,
+        ) = build_replica_pipeline(exchange, writer, MAX_JOURNAL_BATCH, false, false);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let s = Arc::clone(&shutdown);
+        let j_handle = std::thread::spawn(move || journal_stage.run(&s));
+
+        let s = Arc::clone(&shutdown);
+        let m_handle = std::thread::spawn(move || matching_stage.run(&s));
+
+        // Drain output so matching stage doesn't block.
+        let s = Arc::clone(&shutdown);
+        let d_handle = std::thread::spawn(move || {
+            let mut consumer = drain_consumer;
+            let mut batch = vec![OutputSlot::default(); 64];
+            loop {
+                if s.load(Ordering::Relaxed) {
+                    return;
+                }
+                let count = consumer.consume_batch(&mut batch, 64);
+                if count == 0 {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        // Publish event to disruptor and raw bytes to journal stage.
+        input_producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            event: deposit.clone(),
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+        raw_tx
+            .send(RawJournalBatch {
+                bytes: raw_bytes,
+                end_sequence: FIRST_SEQ,
+                chain_hash: [0u8; 32],
+                entry_count: 1,
+            })
+            .unwrap();
+
+        // Wait for journal cursor.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while journal_cursor.get().load(Ordering::Acquire) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for journal cursor"
+            );
+            std::hint::spin_loop();
+        }
+
+        // Shut down pipeline.
+        drop(raw_tx); // unblock journal stage
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = j_handle.join().unwrap();
+        let exchange = m_handle.join().unwrap();
+        let _ = d_handle.join();
+
+        // Verify matching stage applied the deposit.
+        assert!(
+            exchange.accounts().has_balances(AccountId(1)),
+            "matching stage should have applied the deposit"
+        );
+
+        // Verify journal has the entry.
+        #[cfg(not(feature = "no-persist"))]
+        {
+            let mut reader = crate::journal::JournalReader::open(&replica_path).unwrap();
+            let entry = reader.next_entry().unwrap().unwrap();
+            assert!(matches!(
+                entry.event,
+                JournalEvent::Deposit { amount: 1_000, .. }
+            ));
+        }
+    }
 }

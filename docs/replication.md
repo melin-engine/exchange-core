@@ -92,13 +92,34 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 
 - Authenticates with the primary via Ed25519 challenge-response (`--replication-key`).
 - Connects to the primary and sends a `Handshake`.
-- Receives `DataBatch` frames, decodes entries, verifies CRC per entry.
-- Writes raw bytes to a local journal via `write_raw_sync()` for durability.
-- Replays entries into a local `Exchange` for state.
-- Sends `Ack` frames after each durable write.
-- Saves periodic snapshots every 5M events during catch-up, so a crash doesn't require replaying from genesis.
+- Receives `DataBatch` frames, decodes entries, publishes them to a local disruptor pipeline.
+- Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of reader threads.
+- The journal stage writes pre-encoded bytes from the primary via `write_raw_sync()` (byte-identical journals) instead of re-encoding events from the disruptor.
+- The matching stage replays events into a local `Exchange` to maintain warm state for promotion.
+- Sends `Ack` frames after the journal stage confirms durable write (cursor advance).
+- The shadow stage runs on a dedicated thread with a cloned `Exchange`, saving periodic snapshots (30s interval) so a crash doesn't require replaying from genesis.
 - On restart, uses `recover_from_snapshot` if a snapshot exists alongside the journal.
 - Does **not** accept client connections (read-only state).
+
+### Replica pipeline topology
+
+```
+TCP Stream → Replication Receiver (decode + publish)
+                    ↓                     ↓
+              Input Disruptor        raw_journal_tx (bounded channel, cap 4)
+              ┌─────┼─────┐               ↓
+              │     │     │         Journal Stage (write_raw_sync)
+          Journal Matching Shadow
+          Stage   Stage   Stage
+              │     │     │
+           (cursor) │  (snapshots)
+              │     ↓
+              │  Output Disruptor → Drain (no clients on replica)
+              ↓
+         Ack to primary
+```
+
+The receiver thread publishes decoded events to the input disruptor and sends the raw journal bytes to the journal stage via a bounded `mpsc::SyncSender` (capacity 4). The journal stage writes the raw bytes with `write_raw_sync`, then consumes (and discards) the corresponding disruptor events to advance its cursor. The receiver spin-waits on the journal cursor to confirm durability before sending the ack.
 
 ## CLI Flags
 
