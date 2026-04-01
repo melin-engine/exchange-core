@@ -797,8 +797,10 @@ fn run_as_primary<L: BlockingTransportListener>(
     // consume from the disruptor) but before accepting client connections.
     //
     // When replication is enabled, wait for the first replica to connect
-    // before publishing. The replication ring is bounded (64 slots) and
-    // the sender drains it while waiting — seed data would be lost.
+    // before publishing. replica_ready is set by the replica handler
+    // thread after catch-up completes and it enters the live streaming
+    // loop — this ensures the ring consumer is actively draining before
+    // seeds start flowing.
     if enable_replication && needs_seeding {
         info!("waiting for replica to connect before seeding...");
         while !replica_ready.load(Ordering::Acquire) {

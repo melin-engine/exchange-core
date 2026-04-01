@@ -590,8 +590,6 @@ pub fn run_sender(
                         debug!(error = %e, "failed to set TCP_NODELAY on replica connection");
                     }
 
-                    // Signal that at least one replica is connected.
-                    replica_ready.store(true, Ordering::Release);
                     replicas_connected.fetch_add(1, Ordering::Release);
 
                     // Take the consumer out of the slot for the handler thread.
@@ -606,12 +604,15 @@ pub fn run_sender(
                     let jpath = journal_path.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
+                    let ready_flag = replica_ready as *const AtomicBool as usize;
                     let handle = std::thread::Builder::new()
                         .name(format!("repl-{slot_idx}"))
                         .spawn(move || {
-                            // Safety: shutdown outlives this thread (it's on the
-                            // parent's stack, which blocks on join during shutdown).
+                            // Safety: shutdown and replica_ready outlive this thread
+                            // (they're on the parent's stack, which blocks on join
+                            // during shutdown).
                             let shutdown_ref = unsafe { &*(shutdown_flag as *const AtomicBool) };
+                            let ready_ref = unsafe { &*(ready_flag as *const AtomicBool) };
                             run_replica_slot(
                                 stream,
                                 consumer,
@@ -620,6 +621,7 @@ pub fn run_sender(
                                 jpath,
                                 auth_keys,
                                 shutdown_ref,
+                                ready_ref,
                                 batch_size,
                                 heartbeat_secs,
                                 busy_spin,
@@ -664,6 +666,7 @@ fn run_replica_slot(
     journal_path: std::path::PathBuf,
     authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
     shutdown: &AtomicBool,
+    replica_ready: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -676,6 +679,7 @@ fn run_replica_slot(
         &journal_path,
         &authorized_keys,
         shutdown,
+        replica_ready,
         batch_size,
         heartbeat_secs,
         busy_spin,
@@ -998,6 +1002,7 @@ fn handle_replica_connection(
     journal_path: &std::path::Path,
     authorized_keys: &melin_protocol::auth::AuthorizedKeys,
     shutdown: &AtomicBool,
+    replica_ready: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -1202,6 +1207,13 @@ fn handle_replica_connection(
         Ordering::Release,
         Ordering::Relaxed,
     );
+
+    // Signal that this replica is ready to consume from the replication
+    // ring. The main thread waits on this before seeding test data.
+    // Must happen AFTER catch-up and overlap drain complete — otherwise
+    // seeding fills the replication ring faster than we can drain it,
+    // deadlocking the journal stage.
+    replica_ready.store(true, Ordering::Release);
 
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();
@@ -2080,7 +2092,6 @@ pub fn run_sender_dpdk(
                 let accepted = transport.take_accepted();
                 if let Some(conn) = accepted.into_iter().next() {
                     info!(peer = ?conn.peer, "replica connected via DPDK");
-                    replica_ready.store(true, Ordering::Release);
                     replica_connected.store(true, Ordering::Release);
                     recv_buf.clear();
                     state = State::Handshaking(conn.handle);
@@ -2088,9 +2099,7 @@ pub fn run_sender_dpdk(
                 }
 
                 // Drain batches to avoid blocking the replication ring.
-                if replica_ready.load(Ordering::Relaxed) {
-                    drain_batches_while_waiting(&mut repl_consumer);
-                }
+                drain_batches_while_waiting(&mut repl_consumer);
 
                 if busy_spin {
                     std::hint::spin_loop();
@@ -2127,6 +2136,9 @@ pub fn run_sender_dpdk(
                                 last_send = std::time::Instant::now();
 
                                 compact_recv_buf(&mut recv_buf, frame_end);
+                                // Signal readiness after cursor is engaged so
+                                // seeding doesn't fill the ring before we consume.
+                                replica_ready.store(true, Ordering::Release);
                                 state = State::Streaming(handle);
                             }
                             Ok(ReplicaMessage::Ack(_)) => {
