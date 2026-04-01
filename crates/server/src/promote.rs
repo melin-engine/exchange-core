@@ -190,6 +190,7 @@ fn handle_connection(
     authorized_keys: &AuthorizedKeys,
 ) -> bool {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     // Authenticate via Ed25519 challenge-response (operator only).
     if let Err(reason) = authenticate(&mut stream, authorized_keys) {
@@ -507,6 +508,52 @@ mod tests {
         stream.flush().unwrap();
 
         // Read auth result — must be AuthFailed.
+        stream.read_exact(&mut len_buf).unwrap();
+        let result_len = u32::from_le_bytes(len_buf) as usize;
+        let mut result_buf = vec![0u8; result_len];
+        stream.read_exact(&mut result_buf).unwrap();
+        let result = codec::decode_response(&result_buf).unwrap();
+        assert!(matches!(result, ResponseKind::AuthFailed));
+
+        assert!(!promote.load(Ordering::Acquire));
+
+        shutdown.store(true, Ordering::Release);
+    }
+
+    /// An oversized ChallengeResponse frame (> 256 bytes) must be rejected
+    /// without reading the payload, preventing memory abuse.
+    #[test]
+    fn oversized_frame_rejected() {
+        let (listener, addr) = ephemeral_listener();
+        drop(listener);
+
+        let (_key, auth_keys) = operator_keys();
+        let promote = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _handle = spawn(
+            addr,
+            Arc::clone(&promote),
+            Arc::clone(&shutdown),
+            auth_keys,
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        // Read and discard the Challenge.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let frame_len = u32::from_le_bytes(len_buf) as usize;
+        let mut frame_buf = vec![0u8; frame_len];
+        stream.read_exact(&mut frame_buf).unwrap();
+
+        // Send an oversized frame length (> 256).
+        let fake_len: u32 = 512;
+        stream.write_all(&fake_len.to_le_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // Server should send AuthFailed.
         stream.read_exact(&mut len_buf).unwrap();
         let result_len = u32::from_le_bytes(len_buf) as usize;
         let mut result_buf = vec![0u8; result_len];
