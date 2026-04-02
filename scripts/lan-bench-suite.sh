@@ -473,7 +473,7 @@ transport_start_tcp() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -500,7 +500,7 @@ transport_start_tcp_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -512,7 +512,7 @@ transport_start_tcp_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -543,7 +543,7 @@ transport_start_tcp_dual_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -555,7 +555,7 @@ transport_start_tcp_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -564,7 +564,7 @@ transport_start_tcp_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
@@ -699,7 +699,7 @@ transport_start_dpdk() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -765,7 +765,7 @@ transport_start_dpdk_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -780,7 +780,7 @@ transport_start_dpdk_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
