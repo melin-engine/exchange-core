@@ -398,6 +398,9 @@ for f in /proc/irq/*/smp_affinity; do
         failed=$((failed + 1))
     fi
 done
+# Restrict kernel writeback threads to core 0 to prevent them from
+# running on isolated pipeline cores during journal fsync.
+echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
 }
 
