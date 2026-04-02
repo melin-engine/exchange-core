@@ -1,6 +1,7 @@
 //! Background health poller that periodically scrapes the server's Prometheus
 //! `/metrics` endpoint and collects timestamped samples for post-run analysis.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,6 +36,10 @@ pub struct HealthSample {
     pub pipeline_healthy: bool,
     /// Whether the engine is accepting orders.
     pub trading_active: bool,
+    /// Additional metrics not in the fixed fields. Forward-compatible:
+    /// new Prometheus metrics are captured automatically without code
+    /// changes. Keys are metric names, values are parsed as f64.
+    pub extra: HashMap<String, f64>,
 }
 
 /// Background poller that scrapes the Prometheus `/metrics` endpoint at
@@ -104,8 +109,9 @@ fn scrape_metrics(addr: SocketAddr, start: Instant) -> Option<HealthSample> {
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .ok()?;
 
-    // Read the full response. The metrics payload is small (<1KB).
-    let mut buf = [0u8; 2048];
+    // Read the full response. The metrics payload is ~3 KiB with
+    // per-replica replication metrics.
+    let mut buf = [0u8; 4096];
     let mut total = 0;
     loop {
         match stream.read(&mut buf[total..]) {
@@ -143,6 +149,7 @@ fn parse_prometheus(text: &str, elapsed_secs: f64) -> Option<HealthSample> {
         input_queue_capacity: 0,
         pipeline_healthy: false,
         trading_active: false,
+        extra: HashMap::new(),
     };
 
     let mut found_any = false;
@@ -153,47 +160,48 @@ fn parse_prometheus(text: &str, elapsed_secs: f64) -> Option<HealthSample> {
             continue;
         }
 
-        // Prometheus text format: `metric_name value`
+        // Prometheus text format: `metric_name value` or
+        // `metric_name{label="value"} value`
         let (name, value_str) = match line.split_once(' ') {
             Some(pair) => pair,
             None => continue,
         };
 
         let value_str = value_str.trim();
+        found_any = true;
         match name {
             "melin_active_connections" => {
                 sample.active_connections = value_str.parse().unwrap_or(0);
-                found_any = true;
             }
             "melin_events_processed" => {
                 sample.events_processed = value_str.parse().unwrap_or(0);
-                found_any = true;
             }
             "melin_journal_sequence" => {
                 sample.journal_sequence = value_str.parse().unwrap_or(0);
-                found_any = true;
             }
             "melin_replication_lag" => {
                 sample.replication_lag = value_str.parse().unwrap_or(0);
-                found_any = true;
             }
             "melin_input_queue_depth" => {
                 sample.input_queue_depth = value_str.parse().unwrap_or(0);
-                found_any = true;
             }
             "melin_input_queue_capacity" => {
                 sample.input_queue_capacity = value_str.parse().unwrap_or(0);
-                found_any = true;
             }
             "melin_pipeline_healthy" => {
                 sample.pipeline_healthy = value_str == "1";
-                found_any = true;
             }
             "melin_trading_active" => {
                 sample.trading_active = value_str == "1";
-                found_any = true;
             }
-            _ => {} // Forward-compatible: ignore unknown metrics.
+            other => {
+                // Capture all other melin_ metrics (including labeled
+                // ones like `melin_replica_lag{slot="0"}`). Store the
+                // full metric name + labels as the key.
+                if let Ok(v) = value_str.parse::<f64>() {
+                    sample.extra.insert(other.to_string(), v);
+                }
+            }
         }
     }
 
@@ -245,7 +253,7 @@ melin_trading_active 1
     }
 
     #[test]
-    fn parse_unknown_metrics_ignored() {
+    fn parse_unknown_metrics_captured_in_extra() {
         let text = "\
 melin_active_connections 5
 melin_future_metric 999
@@ -254,7 +262,8 @@ melin_trading_active 0
         let sample = parse_prometheus(text, 0.0).expect("should parse");
         assert_eq!(sample.active_connections, 5);
         assert!(!sample.trading_active);
-        // Unknown metric should not cause failure.
+        // Unknown metrics are captured in the extra map.
+        assert_eq!(sample.extra.get("melin_future_metric"), Some(&999.0));
     }
 
     #[test]

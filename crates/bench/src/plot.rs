@@ -10,7 +10,7 @@
 //!   melin-plot saturation -o saturation.svg sweep/*.json
 //!   melin-plot pipeline -o pipeline.svg --stats pipeline-stats.log
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -80,6 +80,17 @@ struct HealthPoint {
     input_queue_capacity: u64,
     pipeline_healthy: bool,
     trading_active: bool,
+    /// Additional metrics captured by the forward-compatible poller.
+    /// Keys are Prometheus metric names (including labels), values are f64.
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+impl HealthPoint {
+    /// Get an extra metric by name, returning 0.0 if not present.
+    fn extra_f64(&self, key: &str) -> f64 {
+        self.extra.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0)
+    }
 }
 
 /// Pipeline stats parsed from tracing output.
@@ -984,6 +995,39 @@ fn cmd_health(args: &[String]) {
             &PathBuf::from(format!("{stem}-replication-lag.svg")),
         );
     }
+
+    // Per-replica metrics from the extra fields (forward-compatible).
+    // Keys use sanitized format: {slot="0"} → _slot_0
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-lag.svg")),
+        &["melin_replica_lag_slot_0", "melin_replica_lag_slot_1"],
+        &["slot 0", "slot 1"],
+        "Per-Replica Lag Over Time",
+        "Lag (events)",
+    );
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-ack-latency.svg")),
+        &[
+            "melin_replica_ack_latency_us_slot_0",
+            "melin_replica_ack_latency_us_slot_1",
+        ],
+        &["slot 0", "slot 1"],
+        "Replica Ack Latency Over Time",
+        "Latency (\u{00b5}s)",
+    );
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-bytes-sent.svg")),
+        &[
+            "melin_replica_bytes_sent_total_slot_0",
+            "melin_replica_bytes_sent_total_slot_1",
+        ],
+        &["slot 0", "slot 1"],
+        "Cumulative Bytes Sent Per Replica",
+        "Bytes",
+    );
 }
 
 /// Plot input queue depth over time — the primary saturation indicator.
@@ -1230,6 +1274,93 @@ fn plot_health_replication_lag(results: &[(HealthResult, String)], output: &Path
                 .legend(move |(x, y)| {
                     PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
                 });
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
+}
+
+/// Plot a per-replica metric from the extra fields. Generates one line per
+/// replica slot (0 and 1) per result file. Skipped if no samples have the
+/// metric.
+fn plot_health_extra_metric(
+    results: &[(HealthResult, String)],
+    output: &PathBuf,
+    metric_keys: &[&str],   // e.g. ["melin_replica_lag{slot=\"0\"}", ...]
+    series_labels: &[&str], // e.g. ["slot 0", "slot 1"]
+    title: &str,
+    y_label: &str,
+) {
+    // Check if any sample has this metric.
+    let has_data = results.iter().any(|(r, _)| {
+        r.health
+            .iter()
+            .any(|h| metric_keys.iter().any(|k| h.extra_f64(k) > 0.0))
+    });
+    if !has_data {
+        return;
+    }
+
+    let max_time = health_max_time(results) * 1.05;
+    let max_val = results
+        .iter()
+        .flat_map(|(r, _)| {
+            r.health
+                .iter()
+                .flat_map(|h| metric_keys.iter().map(|k| h.extra_f64(k)))
+        })
+        .fold(1.0f64, f64::max)
+        * 1.2;
+
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
+
+        let mut chart = ChartBuilder::on(&root)
+            .caption(title, ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(80)
+            .build_cartesian_2d(0.0..max_time, 0.0..max_val)
+            .unwrap();
+
+        chart
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc(y_label)
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| format_large_number(*v))
+            .draw()
+            .unwrap();
+
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
+
+            for (slot, key) in metric_keys.iter().enumerate() {
+                let color_idx = i * metric_keys.len() + slot;
+                let color = COLORS[color_idx % COLORS.len()];
+                let label = series_labels.get(slot).unwrap_or(&"");
+
+                let points: Vec<(f64, f64)> = result
+                    .health
+                    .iter()
+                    .map(|h| (h.elapsed_secs, h.extra_f64(key)))
+                    .collect();
+
+                chart
+                    .draw_series(LineSeries::new(points, color.stroke_width(2)))
+                    .unwrap()
+                    .label(format!("{mode} {label} ({tp})"))
+                    .legend(move |(x, y)| {
+                        PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                    });
+            }
         }
 
         chart

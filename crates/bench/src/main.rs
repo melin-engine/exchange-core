@@ -2362,15 +2362,15 @@ pub(crate) fn print_results(
             format!("[{}]", entries.join(","))
         };
 
-        // Serialize health samples.
+        // Serialize health samples (fixed fields + any extra metrics).
         let health_json = if health_samples.is_empty() {
             String::from("[]")
         } else {
             let entries: Vec<String> = health_samples
                 .iter()
                 .map(|s| {
-                    format!(
-                        "{{\"elapsed_secs\":{:.3},\"active_connections\":{},\"events_processed\":{},\"journal_sequence\":{},\"replication_lag\":{},\"input_queue_depth\":{},\"input_queue_capacity\":{},\"pipeline_healthy\":{},\"trading_active\":{}}}",
+                    let mut json = format!(
+                        "{{\"elapsed_secs\":{:.3},\"active_connections\":{},\"events_processed\":{},\"journal_sequence\":{},\"replication_lag\":{},\"input_queue_depth\":{},\"input_queue_capacity\":{},\"pipeline_healthy\":{},\"trading_active\":{}",
                         s.elapsed_secs,
                         s.active_connections,
                         s.events_processed,
@@ -2380,7 +2380,34 @@ pub(crate) fn print_results(
                         s.input_queue_capacity,
                         s.pipeline_healthy,
                         s.trading_active,
-                    )
+                    );
+                    // Append extra metrics (per-replica replication stats, etc.).
+                    // Sorted for deterministic output. Prometheus label syntax
+                    // like `metric{slot="0"}` is sanitized to `metric_slot_0`
+                    // for valid JSON keys.
+                    let mut keys: Vec<&String> = s.extra.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        let val = s.extra[key];
+                        // Sanitize Prometheus label syntax for JSON keys:
+                        // melin_replica_lag{slot="0"} → melin_replica_lag_slot_0
+                        let safe_key: String = key
+                            .chars()
+                            .filter_map(|c| match c {
+                                '{' | '=' => Some('_'),
+                                '}' | '"' => None,
+                                other => Some(other),
+                            })
+                            .collect();
+                        // Emit integers without decimal point for cleaner JSON.
+                        if val == val.trunc() && val.abs() < u64::MAX as f64 {
+                            json.push_str(&format!(",\"{safe_key}\":{}", val as i64));
+                        } else {
+                            json.push_str(&format!(",\"{safe_key}\":{val:.3}"));
+                        }
+                    }
+                    json.push('}');
+                    json
                 })
                 .collect();
             format!("[{}]", entries.join(","))
