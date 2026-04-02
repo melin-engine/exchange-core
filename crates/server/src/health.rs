@@ -46,6 +46,8 @@ struct HealthState {
     replication_cursor: Arc<AtomicU64>,
     pipeline_healthy: Arc<AtomicBool>,
     replicas_connected: Option<Arc<AtomicU32>>,
+    /// Per-replica replication metrics. None in standalone mode.
+    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
 }
 
 /// Spawn the health endpoint thread. Returns the join handle.
@@ -67,6 +69,7 @@ pub fn spawn(
     replication_cursor: Arc<AtomicU64>,
     pipeline_healthy: Arc<AtomicBool>,
     replicas_connected: Option<Arc<AtomicU32>>,
+    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr)?;
@@ -84,6 +87,7 @@ pub fn spawn(
         replication_cursor,
         pipeline_healthy,
         replicas_connected,
+        replication_metrics,
     };
 
     let handle = std::thread::Builder::new()
@@ -106,6 +110,21 @@ struct HealthSnapshot {
     replication_lag: u64,
     input_queue_depth: u64,
     trading: bool,
+    /// Number of replicas currently connected. 0 in standalone mode.
+    replicas_connected: u32,
+    /// Per-replica lag: journal_seq - acked_sequence (0 if no ack yet).
+    /// Fixed-size array for up to 2 replica slots.
+    per_replica_lag: [u64; 2],
+    /// Per-replica cumulative bytes sent.
+    per_replica_bytes_sent: [u64; 2],
+    /// Per-replica ack round-trip latency in microseconds.
+    per_replica_ack_latency_us: [u64; 2],
+    /// Per-replica catch-up state.
+    per_replica_catching_up: [bool; 2],
+    /// Per-replica last acked sequence number.
+    per_replica_acked_sequence: [u64; 2],
+    /// Total replica eviction count.
+    evictions_total: u64,
 }
 
 impl HealthSnapshot {
@@ -139,6 +158,54 @@ impl HealthSnapshot {
             .as_ref()
             .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
 
+        // Per-replica metrics from the replication sender (if enabled).
+        let replicas_connected_val = state
+            .replicas_connected
+            .as_ref()
+            .map_or(0, |c| c.load(Ordering::Relaxed));
+
+        let (
+            per_replica_acked_sequence,
+            per_replica_lag,
+            per_replica_bytes_sent,
+            per_replica_ack_latency_us,
+            per_replica_catching_up,
+            evictions_total,
+        ) = if let Some(ref rm) = state.replication_metrics {
+            let acked = [
+                rm.acked_sequence[0].load(Ordering::Relaxed),
+                rm.acked_sequence[1].load(Ordering::Relaxed),
+            ];
+            let lag = [
+                if acked[0] == 0 {
+                    0
+                } else {
+                    journal_seq.saturating_sub(acked[0])
+                },
+                if acked[1] == 0 {
+                    0
+                } else {
+                    journal_seq.saturating_sub(acked[1])
+                },
+            ];
+            let bytes = [
+                rm.bytes_sent[0].load(Ordering::Relaxed),
+                rm.bytes_sent[1].load(Ordering::Relaxed),
+            ];
+            let latency = [
+                rm.ack_latency_us[0].load(Ordering::Relaxed),
+                rm.ack_latency_us[1].load(Ordering::Relaxed),
+            ];
+            let catching = [
+                rm.catching_up[0].load(Ordering::Relaxed),
+                rm.catching_up[1].load(Ordering::Relaxed),
+            ];
+            let evictions = rm.evictions_total.load(Ordering::Relaxed);
+            (acked, lag, bytes, latency, catching, evictions)
+        } else {
+            ([0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
+        };
+
         Self {
             healthy,
             active_connections: conns,
@@ -147,6 +214,13 @@ impl HealthSnapshot {
             replication_lag,
             input_queue_depth,
             trading,
+            replicas_connected: replicas_connected_val,
+            per_replica_lag,
+            per_replica_bytes_sent,
+            per_replica_ack_latency_us,
+            per_replica_catching_up,
+            per_replica_acked_sequence,
+            evictions_total,
         }
     }
 
@@ -167,6 +241,16 @@ impl HealthSnapshot {
     fn write_prometheus(&self, buf: &mut [u8]) -> usize {
         let healthy_val: u8 = if self.healthy { 1 } else { 0 };
         let trading_val: u8 = if self.trading { 1 } else { 0 };
+        let catching_0: u8 = if self.per_replica_catching_up[0] {
+            1
+        } else {
+            0
+        };
+        let catching_1: u8 = if self.per_replica_catching_up[1] {
+            1
+        } else {
+            0
+        };
         let mut c = Cursor::new(buf);
         let _ = write!(
             c,
@@ -193,7 +277,33 @@ impl HealthSnapshot {
              melin_input_queue_capacity {}\n\
              # HELP melin_trading_active Whether the engine is accepting orders (1) or halted (0).\n\
              # TYPE melin_trading_active gauge\n\
-             melin_trading_active {}\n",
+             melin_trading_active {}\n\
+             # HELP melin_replicas_connected Number of replicas currently connected.\n\
+             # TYPE melin_replicas_connected gauge\n\
+             melin_replicas_connected {}\n\
+             # HELP melin_replica_acked_sequence Last sequence acked by each replica slot.\n\
+             # TYPE melin_replica_acked_sequence gauge\n\
+             melin_replica_acked_sequence{{slot=\"0\"}} {}\n\
+             melin_replica_acked_sequence{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_lag Per-replica replication lag (journal_seq - acked_sequence).\n\
+             # TYPE melin_replica_lag gauge\n\
+             melin_replica_lag{{slot=\"0\"}} {}\n\
+             melin_replica_lag{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_bytes_sent_total Cumulative bytes sent to each replica.\n\
+             # TYPE melin_replica_bytes_sent_total counter\n\
+             melin_replica_bytes_sent_total{{slot=\"0\"}} {}\n\
+             melin_replica_bytes_sent_total{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_ack_latency_us Ack round-trip latency per replica in microseconds.\n\
+             # TYPE melin_replica_ack_latency_us gauge\n\
+             melin_replica_ack_latency_us{{slot=\"0\"}} {}\n\
+             melin_replica_ack_latency_us{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_catching_up Whether each replica is catching up from journal (1) or live (0).\n\
+             # TYPE melin_replica_catching_up gauge\n\
+             melin_replica_catching_up{{slot=\"0\"}} {}\n\
+             melin_replica_catching_up{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_evictions_total Total replica evictions due to ring backpressure.\n\
+             # TYPE melin_replica_evictions_total counter\n\
+             melin_replica_evictions_total {}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -202,6 +312,18 @@ impl HealthSnapshot {
             self.input_queue_depth,
             INPUT_QUEUE_CAPACITY,
             trading_val,
+            self.replicas_connected,
+            self.per_replica_acked_sequence[0],
+            self.per_replica_acked_sequence[1],
+            self.per_replica_lag[0],
+            self.per_replica_lag[1],
+            self.per_replica_bytes_sent[0],
+            self.per_replica_bytes_sent[1],
+            self.per_replica_ack_latency_us[0],
+            self.per_replica_ack_latency_us[1],
+            catching_0,
+            catching_1,
+            self.evictions_total,
         );
         c.position() as usize
     }
@@ -322,10 +444,11 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
     let kind = detect_request(&mut stream);
 
     // Stack buffers — sized for worst case (all u64::MAX values).
-    // Body: Prometheus body is ~1 KiB with max-length u64 values.
+    // Body: Prometheus body is ~3 KiB with max-length u64 values
+    // (includes per-replica replication metrics).
     // Response: body + HTTP headers (~200 bytes).
-    let mut body_buf = [0u8; 1536];
-    let mut resp_buf = [0u8; 1792];
+    let mut body_buf = [0u8; 4096];
+    let mut resp_buf = [0u8; 4352];
 
     let resp_len = match kind {
         RequestKind::Metrics => {
@@ -419,6 +542,7 @@ mod tests {
             replication_cursor: repl,
             pipeline_healthy: Arc::clone(&healthy),
             replicas_connected,
+            replication_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -540,6 +664,7 @@ mod tests {
             Arc::clone(&repl),
             Arc::clone(&healthy),
             None,
+            None,
             Arc::clone(&shutdown),
         );
         // spawn binds to port 0 which is auto-assigned — we can't know the
@@ -565,6 +690,7 @@ mod tests {
             Box::new(MockCursor(AtomicU64::new(0))),
             Arc::new(AtomicU64::new(u64::MAX)),
             Arc::new(AtomicBool::new(true)),
+            None,
             None,
             Arc::new(AtomicBool::new(false)),
         );
@@ -737,6 +863,7 @@ mod tests {
             replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            replication_metrics: None,
         };
 
         let handle = std::thread::spawn(move || {
