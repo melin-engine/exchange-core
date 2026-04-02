@@ -57,11 +57,12 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,repl-sender,event-publisher,shadow
+    /// Pipeline core IDs: journal,matching,response,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
     /// repl-sender is used when replication is enabled, event-publisher when
     /// `--event-bind` is set, shadow when `--snapshot-interval-secs` > 0.
-    #[arg(long, default_value = "1,2,3,6,7,8", value_parser = parse_cores)]
+    /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
+    #[arg(long, default_value = "1,2,3,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Number of epoll reader threads.
     #[arg(long, default_value_t = 2)]
@@ -246,6 +247,8 @@ impl Default for ServerConfig {
                 repl_sender: 6,
                 event_publisher: 7,
                 shadow: 8,
+                repl_handler_0: 9,
+                repl_handler_1: 10,
             },
             readers: 2,
             reader_cores: 4,
@@ -329,14 +332,18 @@ pub struct PipelineCores {
     pub repl_sender: usize,
     pub event_publisher: usize,
     pub shadow: usize,
+    /// Core for replication handler thread 0. 0 = unpinned (OS scheduled).
+    pub repl_handler_0: usize,
+    /// Core for replication handler thread 1. 0 = unpinned (OS scheduled).
+    pub repl_handler_1: usize,
 }
 
-/// Parse "j,m,r,s,e,sh" into `PipelineCores` for pipeline core affinity.
+/// Parse "j,m,r,s,e,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 6 {
+    if parts.len() != 8 {
         return Err(format!(
-            "expected 6 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher,shadow), got {}",
+            "expected 8 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1), got {}",
             parts.len()
         ));
     }
@@ -351,6 +358,8 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         repl_sender: parse(parts[3])?,
         event_publisher: parse(parts[4])?,
         shadow: parse(parts[5])?,
+        repl_handler_0: parse(parts[6])?,
+        repl_handler_1: parse(parts[7])?,
     })
 }
 
@@ -743,6 +752,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         let repl_metrics = replication_metrics
             .clone()
             .expect("replication_metrics must be Some when replication is enabled");
+        let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -761,6 +771,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     evict_flags,
                     active_flags,
                     repl_metrics,
+                    handler_cores,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,

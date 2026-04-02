@@ -535,6 +535,7 @@ pub fn run_sender(
     evict_flags: [Arc<AtomicBool>; 2],
     active_flags: [Arc<AtomicBool>; 2],
     metrics: Arc<ReplicationMetrics>,
+    handler_cores: [usize; 2],
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -682,15 +683,29 @@ pub fn run_sender(
                     let slot_metrics = Arc::clone(&metrics);
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
+                    let handler_core = handler_cores[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
                     let handle = std::thread::Builder::new()
                         .name(format!("repl-{slot_idx}"))
                         .spawn(move || {
-                            // Clear inherited CPU affinity from the sender
-                            // thread (pinned to core 6). The handler does TCP
-                            // I/O and doesn't need a dedicated core.
-                            if let Err(e) = crate::affinity::clear_affinity() {
+                            // Pin to a dedicated core if configured (> 0),
+                            // otherwise clear inherited affinity from the
+                            // sender thread so the OS can schedule freely.
+                            if handler_core > 0 {
+                                match crate::affinity::pin_to_core(handler_core) {
+                                    Ok(c) => tracing::info!(
+                                        core = c,
+                                        slot = slot_idx,
+                                        "replication handler pinned to core"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        error = e,
+                                        slot = slot_idx,
+                                        "failed to pin handler"
+                                    ),
+                                }
+                            } else if let Err(e) = crate::affinity::clear_affinity() {
                                 tracing::warn!(error = e, "failed to clear handler affinity");
                             }
                             // Safety: shutdown and replica_ready outlive this thread
