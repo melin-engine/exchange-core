@@ -218,7 +218,7 @@ pub struct ServerConfig {
     /// stage replays journaled events on a cloned Exchange and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
     /// to disable shadow snapshots entirely.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 3000)]
     pub snapshot_interval_secs: u64,
 
     /// Path for shadow snapshots. Defaults to the journal path with a
@@ -279,7 +279,7 @@ impl Default for ServerConfig {
             event_bind: None,
             health_bind: Some("127.0.0.1:9878".parse().expect("valid default addr")),
             promote_bind: None,
-            snapshot_interval_secs: 30,
+            snapshot_interval_secs: 3000,
             snapshot_path: None,
         }
     }
