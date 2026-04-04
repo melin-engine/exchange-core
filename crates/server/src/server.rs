@@ -1496,71 +1496,95 @@ pub fn run_dpdk(
         } else {
             None
         };
-    // DPDK replication sender currently supports single-replica only.
-    // The second consumer from the dual-replica pipeline is unused here.
-    let replication_handle =
-        if let Some((repl_consumer_1, _repl_consumer_2)) = replication_consumers {
-            let repl_bind = config
-                .replication_bind
-                .expect("replication_bind must be set");
-            let repl_port = repl_bind.port();
+    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
+    {
+        let repl_bind = config
+            .replication_bind
+            .expect("replication_bind must be set");
+        let repl_port = repl_bind.port();
 
-            // Create a DpdkTransport for the replication sender with its own
-            // queue pair. Client transports use queues 0..num_client_queues-1;
-            // the replication sender gets the next one (num_client_queues).
-            let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
-                &shared,
-                &dpdk_config,
-                num_client_queues as u16,
-                repl_port,
-            )
-            .expect("failed to create DPDK transport for replication");
+        // Create a DpdkTransport for the replication sender with its own
+        // queue pair. Client transports use queues 0..num_client_queues-1;
+        // the replication sender gets the next one (num_client_queues).
+        let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
+            &shared,
+            &dpdk_config,
+            num_client_queues as u16,
+            repl_port,
+        )
+        .expect("failed to create DPDK transport for replication");
 
-            let s_repl = Arc::clone(&shutdown);
-            let repl_cursor = Arc::clone(&replication_cursor);
-            let ready_flag = Arc::clone(&replica_ready);
-            // DPDK sender uses AtomicBool (single-replica). The dual-replica
-            // AtomicU32 counter is used by the DPDK poll loop (passed separately).
-            let connected_flag = Arc::new(AtomicBool::new(false));
-            let connected_bridge = Arc::clone(&connected_flag);
-            let batch_size = config.replication_batch_size;
-            let heartbeat_secs = config.replication_heartbeat_secs;
-            let busy_spin = !config.yield_idle;
-            let repl_metrics = replication_metrics
-                .clone()
-                .expect("replication_metrics must be Some when replication is enabled");
-            let dpdk_active_flag = replication_ring_progress
-                .as_ref()
-                .map(|rp| Arc::clone(&rp.active_flags[0]))
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-            let repl_sender_handle = std::thread::Builder::new()
-                .name("repl-sender".into())
-                .spawn(move || {
-                    apply_affinity("repl-sender", cores.repl_sender);
-                    crate::replication::run_sender_dpdk(
-                        repl_transport,
-                        repl_consumer_1,
-                        repl_cursor,
-                        genesis_entry,
-                        &s_repl,
-                        &ready_flag,
-                        &connected_bridge,
-                        dpdk_active_flag,
-                        repl_metrics,
-                        batch_size,
-                        heartbeat_secs,
-                        busy_spin,
-                    );
-                })
-                .expect("failed to spawn replication sender thread");
-            info!(addr = %repl_bind, "DPDK replication sender started");
-            Some(repl_sender_handle)
-        } else {
-            if !config.standalone && config.replica_of.is_none() {
-                info!("running in standalone mode (no replication)");
-            }
-            None
-        };
+        let s_repl = Arc::clone(&shutdown);
+        let repl_cursor = Arc::clone(&replication_cursor);
+        let ready_flag = Arc::clone(&replica_ready);
+        let batch_size = config.replication_batch_size;
+        let heartbeat_secs = config.replication_heartbeat_secs;
+        let busy_spin = !config.yield_idle;
+        let repl_metrics = replication_metrics
+            .clone()
+            .expect("replication_metrics must be Some when replication is enabled");
+        let connected_counter = replicas_connected
+            .clone()
+            .expect("replicas_connected must be Some when replication is enabled");
+        let dpdk_active_flags: [Arc<AtomicBool>; 2] = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                [
+                    Arc::clone(&rp.active_flags[0]),
+                    Arc::clone(&rp.active_flags[1]),
+                ]
+            })
+            .unwrap_or_else(|| {
+                [
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ]
+            });
+        let dpdk_evict_flags: [Arc<AtomicBool>; 2] = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                [
+                    Arc::clone(&rp.evict_flags[0]),
+                    Arc::clone(&rp.evict_flags[1]),
+                ]
+            })
+            .unwrap_or_else(|| {
+                [
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ]
+            });
+        let journal_path = config.journal.clone();
+        let repl_sender_handle = std::thread::Builder::new()
+            .name("repl-sender".into())
+            .spawn(move || {
+                apply_affinity("repl-sender", cores.repl_sender);
+                crate::replication::run_sender_dpdk(
+                    repl_transport,
+                    [repl_consumer_1, repl_consumer_2],
+                    repl_cursor,
+                    genesis_entry,
+                    journal_path,
+                    &s_repl,
+                    &ready_flag,
+                    &connected_counter,
+                    dpdk_evict_flags,
+                    dpdk_active_flags,
+                    repl_metrics,
+                    batch_size,
+                    heartbeat_secs,
+                    busy_spin,
+                );
+            })
+            .expect("failed to spawn replication sender thread");
+        info!(addr = %repl_bind, "DPDK replication sender started (dual-replica)");
+        Some(repl_sender_handle)
+    } else {
+        if !config.standalone && config.replica_of.is_none() {
+            info!("running in standalone mode (no replication)");
+        }
+        None
+    };
 
     // Seed through the pipeline if needed.
     if enable_replication && needs_seeding {
