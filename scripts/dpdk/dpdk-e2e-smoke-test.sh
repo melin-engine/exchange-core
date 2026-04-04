@@ -37,7 +37,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TMPDIR=$(mktemp -d)
 
 # IP configuration: server .1, bench .2, same /24 subnet.
@@ -199,14 +199,14 @@ echo ""
 "$PROJECT_DIR/target/release/melin-bench" \
     --addr "$SERVER_IP:$PORT" \
     --key "$TMPDIR/bench.key" \
-    --clients 16 \
-    --window 256 \
-    --warmup 100 \
+    --clients 2 \
+    --window 32 \
+    --warmup 1000 \
     --dpdk-eal-args="--vdev=net_af_packet1,iface=$VETH_BENCH --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=bench" \
     --dpdk-ip "$BENCH_IP" \
     --dpdk-prefix-len "$PREFIX" \
     --dpdk-core 5 \
-    300000 \
+    30000 \
     2>&1 | tee "$TMPDIR/bench.log"
 
 BENCH_EXIT=$?

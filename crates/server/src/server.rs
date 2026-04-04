@@ -1435,7 +1435,6 @@ pub fn run_dpdk(
     // One SPSC channel per DPDK poll thread. The response stage routes
     // frames to the correct thread based on thread_id encoded in
     // connection_id bits 56..63.
-    let num_dpdk_threads = config.readers as usize;
     let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
     for _ in 0..num_dpdk_threads {
