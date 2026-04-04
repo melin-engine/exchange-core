@@ -16,7 +16,7 @@
 #   8. Verify orders were processed
 #
 # Usage:
-#   sudo ./scripts/dpdk-smoke-test.sh
+#   sudo ./scripts/dpdk/dpdk-smoke-test.sh
 #
 # Prerequisites:
 #   - DPDK >= 22.11 installed (dnf install dpdk-devel)

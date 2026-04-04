@@ -5,14 +5,14 @@
 # The bench client uses regular kernel TCP — no DPDK needed on the bench machine.
 #
 # Usage:
-#   ./scripts/dpdk-lan-bench.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [-- bench-args...]
+#   ./scripts/dpdk/dpdk-lan-bench.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [-- bench-args...]
 #
 # Examples:
 #   # Defaults (100M pairs, 16 clients, window 256):
-#   ./scripts/dpdk-lan-bench.sh 84.32.176.135 84.32.176.145 10.181.29.15
+#   ./scripts/dpdk/dpdk-lan-bench.sh 84.32.176.135 84.32.176.145 10.181.29.15
 #
 #   # Custom bench args:
-#   ./scripts/dpdk-lan-bench.sh 84.32.176.135 84.32.176.145 10.181.29.15 root \
+#   ./scripts/dpdk/dpdk-lan-bench.sh 84.32.176.135 84.32.176.145 10.181.29.15 root \
 #       -- 50000000 --clients 32 --window 128
 #
 # Prerequisites:

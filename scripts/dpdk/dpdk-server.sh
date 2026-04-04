@@ -6,13 +6,13 @@
 # Falls back to TAP mode if no SR-IOV config is found.
 #
 # Usage:
-#   sudo ./scripts/dpdk-server.sh [extra server args...]
+#   sudo ./scripts/dpdk/dpdk-server.sh [extra server args...]
 #
 # Examples:
-#   sudo ./scripts/dpdk-server.sh
-#   sudo ./scripts/dpdk-server.sh --max-journal-mib 512
-#   NO_PERSIST=1 sudo ./scripts/dpdk-server.sh    # skip journal fsync (benchmarking only)
-#   DPDK_IP=10.0.0.50 sudo ./scripts/dpdk-server.sh
+#   sudo ./scripts/dpdk/dpdk-server.sh
+#   sudo ./scripts/dpdk/dpdk-server.sh --max-journal-mib 512
+#   NO_PERSIST=1 sudo ./scripts/dpdk/dpdk-server.sh    # skip journal fsync (benchmarking only)
+#   DPDK_IP=10.0.0.50 sudo ./scripts/dpdk/dpdk-server.sh
 
 set -euo pipefail
 

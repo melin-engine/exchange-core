@@ -14,7 +14,7 @@
 #   7. Run benchmark
 #
 # Usage:
-#   sudo ./scripts/dpdk-e2e-smoke-test.sh
+#   sudo ./scripts/dpdk/dpdk-e2e-smoke-test.sh
 #
 # Prerequisites:
 #   - DPDK >= 22.11 installed (dnf install dpdk-devel)

@@ -8,10 +8,10 @@ Step-by-step procedure for testing the DPDK kernel-bypass transport.
 
 ```sh
 # Server-side DPDK only (kernel TCP bench client, TAP device):
-sudo ./scripts/dpdk-smoke-test.sh
+sudo ./scripts/dpdk/dpdk-smoke-test.sh
 
 # Both sides DPDK (veth pair + af_packet):
-sudo ./scripts/dpdk-e2e-smoke-test.sh
+sudo ./scripts/dpdk/dpdk-e2e-smoke-test.sh
 
 # Kernel TCP baseline (no DPDK, no root):
 ./scripts/smoke-test.sh
@@ -23,13 +23,13 @@ Use `dpdk-testpmd` to verify DPDK works independently of the application:
 
 ```sh
 # Quick port check:
-sudo ./scripts/dpdk-test.sh
+sudo ./scripts/dpdk/dpdk-test.sh
 
 # ICMP echo (test L2/L3 connectivity from bench machine):
-sudo ./scripts/dpdk-test.sh icmpecho
+sudo ./scripts/dpdk/dpdk-test.sh icmpecho
 
 # Interactive forward mode (check LACP both-port RX):
-sudo ./scripts/dpdk-test.sh forward
+sudo ./scripts/dpdk/dpdk-test.sh forward
 ```
 
 ## Remote Testing — Cherry Servers
@@ -52,14 +52,14 @@ SR-IOV VF creation, driver binding, hugepages, and MTU are all runtime state —
 ```sh
 ssh root@SERVER
 cd ~/workspace/melin
-sudo ./scripts/dpdk-setup-sriov.sh
+sudo ./scripts/dpdk/dpdk-setup-sriov.sh
 ```
 
 **On the bench machine** (if using DPDK bench client):
 ```sh
 ssh root@BENCH
 cd ~/workspace/melin
-sudo ./scripts/dpdk-setup-sriov.sh
+sudo ./scripts/dpdk/dpdk-setup-sriov.sh
 ```
 
 Verify with:
@@ -109,7 +109,7 @@ ssh root@SERVER "cd ~/workspace/melin && echo 'trader $(cat bench.pub) bench' > 
 ssh root@SERVER
 cd ~/workspace/melin
 rm -f /mnt/journal/bench.journal*
-sudo ./scripts/dpdk-server.sh
+sudo ./scripts/dpdk/dpdk-server.sh
 ```
 
 The script auto-detects DPDK IP from `/etc/melin-dpdk.conf`, uses both VF ports for LACP, and falls back to TAP mode if no SR-IOV is available.
@@ -167,7 +167,7 @@ cargo run --release --bin melin-bench --features dpdk --no-default-features -- \
 #### No packets received
 - Verify VFs are bound: `ls /sys/bus/pci/drivers/vfio-pci/ | grep 0000`
 - Check hugepages: `grep -i huge /proc/meminfo`
-- Use `sudo ./scripts/dpdk-test.sh` to verify DPDK environment independently
+- Use `sudo ./scripts/dpdk/dpdk-test.sh` to verify DPDK environment independently
 - Check server log with `RUST_LOG=debug` for per-packet logging
 
 #### Server crashes on startup

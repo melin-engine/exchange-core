@@ -11,7 +11,7 @@
 #   forward         — forward packets between ports (test LACP both-port RX)
 #
 # Usage:
-#   sudo ./scripts/dpdk-test.sh [info|icmpecho|forward]
+#   sudo ./scripts/dpdk/dpdk-test.sh [info|icmpecho|forward]
 #
 # Prerequisites:
 #   - dpdk-testpmd installed (dnf install dpdk-tools / apt install dpdk)
@@ -20,13 +20,13 @@
 #
 # Examples:
 #   # Verify ports are detected and link is up:
-#   sudo ./scripts/dpdk-test.sh
+#   sudo ./scripts/dpdk/dpdk-test.sh
 #
 #   # Test connectivity from the bench machine (ping <DPDK_IP>):
-#   sudo ./scripts/dpdk-test.sh icmpecho
+#   sudo ./scripts/dpdk/dpdk-test.sh icmpecho
 #
 #   # Test LACP — verify both bond members receive traffic:
-#   sudo ./scripts/dpdk-test.sh forward
+#   sudo ./scripts/dpdk/dpdk-test.sh forward
 
 set -euo pipefail
 

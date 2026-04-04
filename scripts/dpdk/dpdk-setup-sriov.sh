@@ -14,10 +14,10 @@
 #   - Root access
 #
 # Usage:
-#   ./scripts/dpdk-setup-sriov.sh [--vlan 1461] [--ip 10.189.210.100/24]
+#   ./scripts/dpdk/dpdk-setup-sriov.sh [--vlan 1461] [--ip 10.189.210.100/24]
 #
 # After running this script, start the server with:
-#   sudo ./scripts/dpdk-server.sh
+#   sudo ./scripts/dpdk/dpdk-server.sh
 
 set -euo pipefail
 
@@ -349,4 +349,4 @@ echo "  Bond: untouched (LACP active)"
 echo "  Hugepages: ${ACTUAL} x 2MB"
 echo ""
 echo "  Start the server with:"
-echo "    sudo ./scripts/dpdk-server.sh"
+echo "    sudo ./scripts/dpdk/dpdk-server.sh"

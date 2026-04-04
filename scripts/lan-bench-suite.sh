@@ -655,7 +655,7 @@ dpdk_sriov_setup() {
         fi
         for HOST in "${hosts[@]}"; do
             echo "  Setting up DPDK on ${HOST}..."
-            ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
+            ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk/dpdk-setup-sriov.sh" 2>&1 | tail -5
         done
         load_dpdk_config "$BENCH" "BENCH"
         # SR-IOV mode: DPDK build is the main binary (cherry-setup.sh builds with --features dpdk).
