@@ -13,6 +13,9 @@ sudo ./scripts/dpdk/dpdk-smoke-test.sh
 # Both sides DPDK (veth pair + af_packet):
 sudo ./scripts/dpdk/dpdk-e2e-smoke-test.sh
 
+# DPDK replication (primary + replica, veth pair + af_packet):
+sudo ./scripts/dpdk/dpdk-replication-smoke-test.sh
+
 # Kernel TCP baseline (no DPDK, no root):
 ./scripts/smoke-test.sh
 ```

@@ -1738,22 +1738,32 @@ pub fn run_dpdk(
         dpdk_handles.push(handle);
     }
 
-    // Queue 0 runs on the main thread.
-    apply_affinity("dpdk-poll-0", reader_cores);
-    let transport_0 = transports.remove(0);
-    let tx_rx_0 = tx_consumers.remove(0);
-    crate::dpdk_transport::run_dpdk_poll(
-        transport_0,
-        input_producer,
-        control_tx,
-        tx_rx_0,
-        &shutdown,
-        authorized_keys,
-        connection_timeout,
-        max_conns,
-        Arc::clone(&active_connections),
-        0,
-    );
+    if !transports.is_empty() {
+        // Queue 0 runs on the main thread.
+        apply_affinity("dpdk-poll-0", reader_cores);
+        let transport_0 = transports.remove(0);
+        let tx_rx_0 = tx_consumers.remove(0);
+        crate::dpdk_transport::run_dpdk_poll(
+            transport_0,
+            input_producer,
+            control_tx,
+            tx_rx_0,
+            &shutdown,
+            authorized_keys,
+            connection_timeout,
+            max_conns,
+            Arc::clone(&active_connections),
+            0,
+        );
+    } else {
+        // No client queues (e.g., single-queue NIC with replication taking
+        // the only queue). The main thread just waits for shutdown while
+        // the replication sender runs on its own thread.
+        info!("no client queues available — waiting for shutdown");
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 
     // Join DPDK poll threads before shutdown sequence.
     for h in dpdk_handles {
