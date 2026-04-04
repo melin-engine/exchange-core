@@ -34,8 +34,14 @@ fn generate_bindings() {
         .collect();
 
     // Compile the C wrapper functions for inline DPDK functions.
+    // Use the system clang explicitly — the Android NDK clang (if present
+    // in PATH) fails on DPDK's AVX intrinsic headers.
+    let system_clang = find_system_clang();
     let mut cc = cc::Build::new();
     cc.file("src/dpdk/inline_wrappers.c");
+    if let Some(ref clang) = system_clang {
+        cc.compiler(clang);
+    }
     for path in &dpdk.include_paths {
         cc.include(path);
     }
@@ -43,9 +49,16 @@ fn generate_bindings() {
     cc.flag_if_supported("-march=native");
     cc.compile("dpdk_wrappers");
 
-    // Find clang resource directory for system headers (stddef.h).
+    // Find the system clang's resource directory for system headers (stddef.h,
+    // AVX intrinsics). Passing --resource-dir forces bindgen's internal
+    // libclang to use the system clang's headers instead of whichever clang
+    // happens to be first in PATH (e.g., Android NDK clang, which has
+    // broken AVX headers).
     let clang_extra: Vec<String> = if let Some(resource_dir) = find_clang_resource_dir() {
-        vec![format!("-I{}/include", resource_dir)]
+        vec![
+            format!("-I{}/include", resource_dir),
+            format!("-resource-dir={}", resource_dir),
+        ]
     } else {
         Vec::new()
     };
@@ -166,10 +179,25 @@ fn generate_bindings() {
         .expect("failed to write dpdk_bindings.rs");
 }
 
+/// Find the system clang, preferring /usr/bin/clang over whatever is in PATH.
+/// This avoids the Android NDK clang which can't compile DPDK's AVX headers.
+#[cfg(feature = "dpdk-sys")]
+fn find_system_clang() -> Option<String> {
+    for path in ["/usr/bin/clang", "/usr/local/bin/clang"] {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(feature = "dpdk-sys")]
 /// Find the clang resource directory containing stddef.h.
 fn find_clang_resource_dir() -> Option<String> {
-    if let Ok(output) = std::process::Command::new("clang")
+    // Use system clang to find the resource directory, matching the
+    // compiler used for the wrapper compilation above.
+    let clang = find_system_clang().unwrap_or_else(|| "clang".to_string());
+    if let Ok(output) = std::process::Command::new(&clang)
         .arg("--print-resource-dir")
         .output()
         && output.status.success()

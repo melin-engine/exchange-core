@@ -55,5 +55,5 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 - **One-liner commands** — when giving the user shell commands to run, always format them as a single line that can be copy-pasted directly. Do not use backslash continuations or multi-line formatting.
 
 ## Local Build Notes
-- **DPDK feature check** — the Android NDK clang in PATH breaks the DPDK build (AVX header errors). Use `PATH=/usr/bin:/usr/local/bin:$PATH cargo check --features dpdk --no-default-features -p melin-server` to pick up the system clang (`/usr/bin/clang`, Ubuntu 18.1.3).
+- **DPDK feature check** — `cargo check --features dpdk --no-default-features -p melin-server`. The build script auto-detects the system clang (`/usr/bin/clang`) to avoid Android NDK clang AVX header issues.
 
