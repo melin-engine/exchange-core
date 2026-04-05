@@ -13,7 +13,7 @@
 #   4. irqbalance → stopped (prevents daemon from redistributing IRQs)
 #
 # Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response),
-# 4-5=reader threads (or DPDK poll threads), 6=repl-sender, 7=event-publisher, 8=shadow, 9+=bench threads.
+# 4-5=reader threads (or DPDK poll threads), 6=repl-sender, 7=event-publisher, 8=shadow, 9-10=repl-handlers, 11+=bench threads.
 # All pinned via sched_setaffinity.
 # All settings are saved and restored on exit (including Ctrl-C / errors).
 # Kernel dmesg is captured before/after to correlate spikes with kernel events.
@@ -116,7 +116,7 @@ else
 fi
 
 # 4. Pin all IRQs to core 0. This keeps hardware interrupts (NIC, NVMe,
-#    USB, etc.) off pipeline cores 1-8 and bench cores 9+. Core 0 is
+#    USB, etc.) off pipeline cores 1-10 and bench cores 11+. Core 0 is
 #    reserved for OS work and interrupt handling.
 #    smp_affinity is a hex bitmask — "1" = core 0 only.
 irq_pinned=0

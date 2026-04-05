@@ -430,13 +430,15 @@ The recommended core assignment for a production server:
 | 6 | Replication sender | `--cores ...,...,...,6,...` |
 | 7 | Event publisher | `--cores ...,...,...,...,7,...` |
 | 8 | Shadow exchange (scheduled snapshots) | `--cores ...,...,...,...,...,8` |
-| 9+ | Available for other work (benchmarks, monitoring) | -- |
+| 9 | Replication handler 0 | `--cores ...,...,...,...,...,...,9,...` |
+| 10 | Replication handler 1 | `--cores ...,...,...,...,...,...,...,10` |
+| 11+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`, `--readers`, `--reader-cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-- `--cores 1,2,3,6,7,8` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7, shadow exchange to core 8.
+- `--cores 1,2,3,6,7,8,9,10` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7, shadow exchange to core 8, repl-handler-0 to core 9, repl-handler-1 to core 10.
 - `--readers 2 --reader-cores 4` pins reader 0 to core 4, reader 1 to core 5.
 
 ### Kernel Boot Parameters (GRUB)
@@ -444,7 +446,7 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 For lowest latency, configure kernel boot parameters. Edit `/etc/default/grub` and append to `GRUB_CMDLINE_LINUX_DEFAULT`:
 
 ```
-isolcpus=nohz,domain,1-8 nohz_full=1-8 rcu_nocbs=1-8
+isolcpus=nohz,domain,1-10 nohz_full=1-10 rcu_nocbs=1-10
 ```
 
 Then apply:
@@ -456,16 +458,16 @@ sudo reboot
 
 What each parameter does:
 
-- **`isolcpus=nohz,domain,1-8`**: Removes cores 1-8 from the scheduler's load balancing and timer tick distribution. Only explicitly pinned threads run on these cores.
-- **`nohz_full=1-8`**: Stops the timer tick on cores 1-8 when only one task is running. Eliminates ~1-10us jitter every 4ms (HZ=250).
-- **`rcu_nocbs=1-8`**: Moves RCU callback processing off cores 1-8. Without this, RCU grace periods can still interrupt isolated cores.
+- **`isolcpus=nohz,domain,1-10`**: Removes cores 1-10 from the scheduler's load balancing and timer tick distribution. Only explicitly pinned threads run on these cores.
+- **`nohz_full=1-10`**: Stops the timer tick on cores 1-10 when only one task is running. Eliminates ~1-10us jitter every 4ms (HZ=250).
+- **`rcu_nocbs=1-10`**: Moves RCU callback processing off cores 1-10. Without this, RCU grace periods can still interrupt isolated cores.
 
 Verify after reboot:
 
 ```sh
-cat /sys/devices/system/cpu/isolated      # should print: 1-8
-cat /sys/devices/system/cpu/nohz_full     # should print: 1-8
-grep rcu_nocbs /proc/cmdline              # should show rcu_nocbs=1-8
+cat /sys/devices/system/cpu/isolated      # should print: 1-10
+cat /sys/devices/system/cpu/nohz_full     # should print: 1-10
+grep rcu_nocbs /proc/cmdline              # should show rcu_nocbs=1-10
 ```
 
 To revert:
