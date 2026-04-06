@@ -915,11 +915,23 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Close the FIX client socket.
-        unsafe { libc::close(self.fix_fd) };
-        // Close the Melin socket if open.
+        // `shutdown(SHUT_RDWR)` initiates TCP FIN immediately. `close`
+        // alone is not enough here because io_uring may still hold an
+        // internal reference to the socket via an armed multishot RECV
+        // — in that case `close` decrements the user refcount but the
+        // kernel keeps the socket alive (no FIN to the peer) until the
+        // multishot completes. `shutdown` sidesteps that by forcing
+        // the half-close at the protocol level so the client observes
+        // EOF promptly.
+        unsafe {
+            libc::shutdown(self.fix_fd, libc::SHUT_RDWR);
+            libc::close(self.fix_fd);
+        }
         if let Some(fd) = self.melin_fd {
-            unsafe { libc::close(fd) };
+            unsafe {
+                libc::shutdown(fd, libc::SHUT_RDWR);
+                libc::close(fd);
+            }
         }
     }
 }
