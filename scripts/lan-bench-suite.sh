@@ -613,7 +613,7 @@ load_dpdk_config() {
         port=$(echo "$conf" | grep "^DPDK_PORT=" | cut -d= -f2)
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2)
-        eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2-)
+        eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
         eval "${prefix}_DPDK_IP=${ip:-}"
         eval "${prefix}_DPDK_PORT=${port:-0}"
         eval "${prefix}_DPDK_PREFIX=${dpdk_prefix:-24}"
