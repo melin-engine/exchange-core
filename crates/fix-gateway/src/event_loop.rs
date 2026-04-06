@@ -863,6 +863,7 @@ impl Gateway {
 
 /// Actions the event loop should take after a session processes a message.
 #[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionAction {
     /// No I/O needed.
     None,
