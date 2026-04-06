@@ -152,10 +152,15 @@ echo ""
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
 BENCH_PARAMS="isolcpus=nohz,domain,1-10 nohz_full=1-10 rcu_nocbs=1-10 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
-# IOMMU for DPDK SR-IOV (vfio-pci). intel_iommu=on enables the IOMMU
-# (required for vfio-pci to manage VFs); iommu=pt sets passthrough mode
-# so DMA bypasses IOMMU translation for performance.
-IOMMU_PARAMS="intel_iommu=on iommu=pt"
+# IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
+# bypasses IOMMU translation for performance. intel_iommu=on is
+# Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
+# automatically when iommu=pt is set.
+if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+    IOMMU_PARAMS="iommu=pt"
+else
+    IOMMU_PARAMS="intel_iommu=on iommu=pt"
+fi
 
 if [[ -f "$GRUB_FILE" ]]; then
     NEEDS_UPDATE=0
@@ -166,7 +171,7 @@ if [[ -f "$GRUB_FILE" ]]; then
         NEEDS_UPDATE=1
     fi
 
-    if ! grep -q "intel_iommu=on" "$GRUB_FILE" 2>/dev/null; then
+    if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
         echo "  Adding IOMMU passthrough for DPDK: $IOMMU_PARAMS"
         NEEDS_UPDATE=1
     fi
@@ -178,7 +183,7 @@ if [[ -f "$GRUB_FILE" ]]; then
         if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
             ADD_PARAMS="$BENCH_PARAMS"
         fi
-        if ! grep -q "intel_iommu=on" "$GRUB_FILE" 2>/dev/null; then
+        if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
             ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
         fi
         sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
@@ -244,6 +249,40 @@ EOF
 echo "  Written $LIMITS_FILE (nofile=65536)"
 sysctl --system --quiet
 echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0)"
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 3d. Hugepages for DPDK
+# ---------------------------------------------------------------------------
+# DPDK uses 2 MiB hugepages for packet buffers and memory pools. Allocate
+# persistently via sysctl so they survive reboots. 1024 pages = 2 GiB.
+HUGEPAGES_SYSCTL="/etc/sysctl.d/99-melin-hugepages.conf"
+if [[ ! -f "$HUGEPAGES_SYSCTL" ]]; then
+    echo "=== Configuring hugepages for DPDK ==="
+    cat > "$HUGEPAGES_SYSCTL" << 'EOF'
+# DPDK hugepage allocation — 1024 x 2 MiB = 2 GiB.
+vm.nr_hugepages = 1024
+EOF
+    sysctl --system --quiet
+    echo "  Allocated $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) x 2 MiB hugepages"
+else
+    echo "=== Hugepages already configured ==="
+    echo "  $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) x 2 MiB hugepages"
+fi
+
+# ---------------------------------------------------------------------------
+# 3e. vfio-pci module (DPDK NIC binding)
+# ---------------------------------------------------------------------------
+# Ensure vfio-pci is loaded at boot for DPDK to bind NICs via IOMMU.
+if ! grep -q "vfio-pci" /etc/modules-load.d/*.conf 2>/dev/null; then
+    echo "=== Configuring vfio-pci module autoload ==="
+    echo "vfio-pci" > /etc/modules-load.d/vfio-pci.conf
+    modprobe vfio-pci 2>/dev/null || true
+    echo "  vfio-pci module configured for autoload"
+else
+    echo "=== vfio-pci already configured ==="
+fi
 
 echo ""
 
