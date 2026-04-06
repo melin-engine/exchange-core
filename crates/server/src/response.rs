@@ -301,13 +301,16 @@ pub fn run(
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
 
-                    cached_durable_pos = if quorum_durability {
+                    cached_durable_pos = if quorum_durability && repl_min != u64::MAX {
                         // Quorum: two durable copies via whichever path
-                        // completes first.
+                        // completes first. Only active when 2 replicas are
+                        // connected (repl_min < u64::MAX).
                         let repl_max = fastest_replica_cursor.load(Ordering::Acquire);
                         let fsync_plus_one = journal_pos.min(repl_max);
                         repl_min.max(fsync_plus_one)
                     } else {
+                        // Standalone or degraded (0-1 replicas): gate on
+                        // both journal fsync and replication.
                         journal_pos.min(repl_min)
                     };
 

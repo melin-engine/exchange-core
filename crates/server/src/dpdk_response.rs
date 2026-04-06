@@ -191,7 +191,7 @@ pub fn run(
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
-                    cached_durable_pos = if quorum_durability {
+                    cached_durable_pos = if quorum_durability && repl_min != u64::MAX {
                         let repl_max = fastest_replica_cursor.load(Ordering::Acquire);
                         repl_min.max(journal_pos.min(repl_max))
                     } else {
