@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signer, SigningKey};
 use tracing::{debug, error, info, warn};
 
-use melin_engine::types::{AccountId, OrderId};
+use melin_engine::types::{AccountId, OrderId, Side};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 
@@ -29,11 +29,22 @@ use crate::translate::{self, TranslateContext};
 // ---------------------------------------------------------------------------
 
 /// Per-order metadata needed to translate Melin execution reports back
-/// to FIX with correct symbol names and price/quantity scaling.
+/// to FIX with correct symbol names, price/quantity scaling, and side.
 struct OrderSymbolInfo {
     fix_symbol: String,
     tick_inverse: u64,
     lot_inverse: u64,
+    side: Side,
+}
+
+/// Tracks a pending cancel or cancel-replace request so we can emit
+/// the correct FIX message type on rejection (OrderCancelReject 35=9
+/// instead of ExecutionReport 35=8).
+struct PendingCancel {
+    /// ClOrdID of the cancel/replace request itself (not the original order).
+    cancel_clord_id: String,
+    /// True for cancel-replace (35=G), false for cancel (35=F).
+    is_replace: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +111,9 @@ pub struct Session {
     /// Maps Melin OrderId → symbol/scaling info for exec report translation.
     /// Populated when orders are submitted, consulted when exec reports arrive.
     order_symbols: HashMap<OrderId, OrderSymbolInfo>,
+    /// Tracks pending cancel/replace requests by original order ID.
+    /// Used to distinguish OrderCancelReject from ExecutionReport on rejection.
+    pending_cancels: HashMap<OrderId, PendingCancel>,
     account_id: AccountId,
     signing_key: Option<SigningKey>,
     /// Index into config.sessions for this FIX session.
@@ -152,6 +166,7 @@ impl Session {
 
             id_map: ClOrdIdMap::new(),
             order_symbols: HashMap::new(),
+            pending_cancels: HashMap::new(),
             account_id: AccountId(0),
             signing_key: None,
             session_config_idx: None,
@@ -524,24 +539,39 @@ impl Session {
 
         match request {
             Ok(req) => {
-                // Record order → symbol mapping so we can translate
-                // execution reports back with correct symbol/scaling.
+                // Record order → symbol/side mapping for exec report translation.
                 if let Some(fix_sym) = msg.get_str(tags::SYMBOL) {
                     if let Some(sym_cfg) = symbol_map.get(fix_sym) {
-                        let order_id = match &req {
-                            Request::SubmitOrder { order, .. } => Some(order.id),
-                            Request::CancelOrder { order_id, .. } => Some(*order_id),
-                            Request::CancelReplace { order_id, .. } => Some(*order_id),
-                            _ => None,
-                        };
-                        if let Some(oid) = order_id {
-                            self.order_symbols.entry(oid).or_insert_with(|| {
-                                OrderSymbolInfo {
-                                    fix_symbol: fix_sym.to_owned(),
-                                    tick_inverse: sym_cfg.tick_size_inverse,
-                                    lot_inverse: sym_cfg.lot_size_inverse,
+                        match &req {
+                            Request::SubmitOrder { order, .. } => {
+                                self.order_symbols.entry(order.id).or_insert_with(|| {
+                                    OrderSymbolInfo {
+                                        fix_symbol: fix_sym.to_owned(),
+                                        tick_inverse: sym_cfg.tick_size_inverse,
+                                        lot_inverse: sym_cfg.lot_size_inverse,
+                                        side: order.side,
+                                    }
+                                });
+                            }
+                            Request::CancelOrder { order_id, .. } => {
+                                // Track the cancel request's ClOrdID so we can
+                                // emit OrderCancelReject if the engine rejects it.
+                                if let Some(clord) = msg.get_str(tags::CL_ORD_ID) {
+                                    self.pending_cancels.insert(*order_id, PendingCancel {
+                                        cancel_clord_id: clord.to_owned(),
+                                        is_replace: false,
+                                    });
                                 }
-                            });
+                            }
+                            Request::CancelReplace { order_id, .. } => {
+                                if let Some(clord) = msg.get_str(tags::CL_ORD_ID) {
+                                    self.pending_cancels.insert(*order_id, PendingCancel {
+                                        cancel_clord_id: clord.to_owned(),
+                                        is_replace: true,
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -588,36 +618,115 @@ impl Session {
 
         match response {
             ResponseKind::Report(ref report) => {
-                // Look up symbol/scaling info from the order that
-                // produced this execution report.
-                let order_id = report_order_id(report);
-                let info = order_id.and_then(|id| self.order_symbols.get(&id));
-                let (symbol_str, tick_inv, lot_inv) = match info {
-                    Some(i) => (i.fix_symbol.as_str(), i.tick_inverse, i.lot_inverse),
-                    None => {
-                        debug!("exec report for unknown order, using defaults");
-                        ("UNKNOWN", 1, 1)
+                match report {
+                    ExecutionReport::Fill {
+                        maker_order_id,
+                        taker_order_id,
+                        price: fill_price,
+                        quantity,
+                        maker_fee,
+                        taker_fee,
+                        ..
+                    } => {
+                        // Emit separate fill reports for each side that
+                        // belongs to this session (identified by id_map).
+                        let mut sent = false;
+
+                        // Maker side.
+                        if self.id_map.get_clord_id(*maker_order_id).is_some() {
+                            let info = self.order_symbols.get(maker_order_id);
+                            let (sym, ti, li, side) = sym_info_or_default(info);
+                            let msg = translate::fill_report_for_order(
+                                *maker_order_id, side, *fill_price, *quantity,
+                                *maker_fee, &self.id_map, sym, ti, li,
+                                &config.target_comp_id, &self.sender_comp_id,
+                                self.fix_outbound_seq, self.exec_id,
+                            );
+                            self.queue_fix_raw(&msg);
+                            self.exec_id += 1;
+                            sent = true;
+                        }
+
+                        // Taker side.
+                        if self.id_map.get_clord_id(*taker_order_id).is_some() {
+                            let info = self.order_symbols.get(taker_order_id);
+                            let (sym, ti, li, side) = sym_info_or_default(info);
+                            let msg = translate::fill_report_for_order(
+                                *taker_order_id, side, *fill_price, *quantity,
+                                *taker_fee, &self.id_map, sym, ti, li,
+                                &config.target_comp_id, &self.sender_comp_id,
+                                self.fix_outbound_seq, self.exec_id,
+                            );
+                            self.queue_fix_raw(&msg);
+                            self.exec_id += 1;
+                            sent = true;
+                        }
+
+                        if sent { SessionAction::SendFix } else { SessionAction::None }
                     }
-                };
 
-                let fix_msg = translate::execution_report_to_fix(
-                    report,
-                    &self.id_map,
-                    symbol_str,
-                    tick_inv,
-                    lot_inv,
-                    &config.target_comp_id,
-                    &self.sender_comp_id,
-                    self.fix_outbound_seq,
-                    self.exec_id,
-                );
+                    ExecutionReport::Rejected {
+                        order_id, reason, ..
+                    } => {
+                        // Check if this was a rejected cancel/replace → OrderCancelReject.
+                        if let Some(pending) = self.pending_cancels.remove(order_id) {
+                            let orig_clord = self.id_map.get_clord_id(*order_id)
+                                .unwrap_or("UNKNOWN");
+                            let msg = translate::cancel_reject_to_fix(
+                                *order_id,
+                                &pending.cancel_clord_id,
+                                orig_clord,
+                                reason,
+                                pending.is_replace,
+                                &config.target_comp_id,
+                                &self.sender_comp_id,
+                                self.fix_outbound_seq,
+                            );
+                            self.queue_fix_raw(&msg);
+                            SessionAction::SendFix
+                        } else {
+                            // Regular order rejection.
+                            let info = self.order_symbols.get(order_id);
+                            let (sym, ti, li, side) = sym_info_or_default(info);
+                            let msg = translate::execution_report_to_fix(
+                                report, &self.id_map, sym, ti, li,
+                                Some(side),
+                                &config.target_comp_id, &self.sender_comp_id,
+                                self.fix_outbound_seq, self.exec_id,
+                            );
+                            self.queue_fix_raw(&msg);
+                            self.exec_id += 1;
+                            SessionAction::SendFix
+                        }
+                    }
 
-                if !fix_msg.is_empty() {
-                    self.queue_fix_raw(&fix_msg);
-                    self.exec_id += 1;
-                    SessionAction::SendFix
-                } else {
-                    SessionAction::None
+                    _ => {
+                        // Placed, Cancelled, Replaced, Triggered, InstrumentStatusChanged.
+                        let order_id = report_order_id(report);
+
+                        // Clean up pending cancel tracking on success.
+                        if let Some(oid) = order_id {
+                            self.pending_cancels.remove(&oid);
+                        }
+
+                        let info = order_id.and_then(|id| self.order_symbols.get(&id));
+                        let (sym, ti, li, side) = sym_info_or_default(info);
+
+                        let fix_msg = translate::execution_report_to_fix(
+                            report, &self.id_map, sym, ti, li,
+                            Some(side),
+                            &config.target_comp_id, &self.sender_comp_id,
+                            self.fix_outbound_seq, self.exec_id,
+                        );
+
+                        if !fix_msg.is_empty() {
+                            self.queue_fix_raw(&fix_msg);
+                            self.exec_id += 1;
+                            SessionAction::SendFix
+                        } else {
+                            SessionAction::None
+                        }
+                    }
                 }
             }
             ResponseKind::BatchEnd | ResponseKind::Heartbeat | ResponseKind::ServerReady => {
@@ -773,6 +882,14 @@ impl Drop for Session {
 // ---------------------------------------------------------------------------
 
 use melin_engine::types::ExecutionReport;
+
+/// Extract symbol info from an OrderSymbolInfo, or return defaults.
+fn sym_info_or_default(info: Option<&OrderSymbolInfo>) -> (&str, u64, u64, Side) {
+    match info {
+        Some(i) => (i.fix_symbol.as_str(), i.tick_inverse, i.lot_inverse, i.side),
+        None => ("UNKNOWN", 1, 1, Side::Buy),
+    }
+}
 
 /// Extract the primary order ID from an execution report for
 /// order→symbol lookups.

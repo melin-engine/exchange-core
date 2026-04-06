@@ -6,7 +6,7 @@
 use std::num::NonZeroU64;
 
 use melin_engine::types::{
-    AccountId, ExecutionReport, OrderType, Price, Quantity, RejectReason,
+    AccountId, ExecutionReport, OrderId, OrderType, Price, Quantity, RejectReason,
     SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 use melin_protocol::message::Request;
@@ -331,11 +331,13 @@ pub fn execution_report_to_fix(
     symbol_str: &str,
     tick_inverse: u64,
     lot_inverse: u64,
+    side_hint: Option<Side>,
     sender: &str,
     target: &str,
     seq: u64,
     exec_id: u64,
 ) -> Vec<u8> {
+    let hint_side = side_hint.map(fix_side).unwrap_or("1");
     match report {
         ExecutionReport::Placed {
             order_id,
@@ -370,9 +372,9 @@ pub fn execution_report_to_fix(
             taker_fee,
             ..
         } => {
-            // Emit for the taker side (the most recent aggressor).
-            // A proper implementation would emit separate reports for
-            // maker and taker; for v1 we emit for the taker.
+            // Fallback: emit for the taker. The session layer handles
+            // Fill reports directly via fill_report_for_order to emit
+            // separate reports for maker and taker with correct sides.
             let order_id = taker_order_id;
             let clord_id = id_map
                 .get_clord_id(*order_id)
@@ -386,13 +388,13 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::EXEC_TYPE, "F") // Trade
                 .str_tag(tags::ORD_STATUS, "2") // Filled (conservative)
                 .str_tag(tags::SYMBOL, symbol_str)
-                .str_tag(tags::SIDE, "1") // Placeholder — Fill doesn't carry side
+                .str_tag(tags::SIDE, hint_side)
                 .str_tag(tags::LAST_SHARES, &price::ticks_to_decimal(quantity.get(), lot_inverse))
                 .str_tag(tags::LAST_PX, &price::ticks_to_decimal(fill_price.get(), tick_inverse))
                 .str_tag(tags::LEAVES_QTY, "0")
                 .str_tag(tags::CUM_QTY, &price::ticks_to_decimal(quantity.get(), lot_inverse))
                 .str_tag(tags::AVG_PX, &price::ticks_to_decimal(fill_price.get(), tick_inverse))
-                .str_tag(tags::TEXT, &taker_fee.to_string()) // Fee in text for visibility
+                .str_tag(tags::TEXT, &taker_fee.to_string())
                 .build(sender, target, seq)
         }
         ExecutionReport::Cancelled {
@@ -411,7 +413,7 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::EXEC_TYPE, "4") // Canceled
                 .str_tag(tags::ORD_STATUS, "4") // Canceled
                 .str_tag(tags::SYMBOL, symbol_str)
-                .str_tag(tags::SIDE, "1") // Placeholder
+                .str_tag(tags::SIDE, hint_side)
                 .str_tag(tags::LEAVES_QTY, "0")
                 .str_tag(tags::CUM_QTY, "0")
                 .str_tag(tags::AVG_PX, "0")
@@ -433,7 +435,7 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::EXEC_TYPE, "8") // Rejected
                 .str_tag(tags::ORD_STATUS, "8") // Rejected
                 .str_tag(tags::SYMBOL, symbol_str)
-                .str_tag(tags::SIDE, "1") // Placeholder
+                .str_tag(tags::SIDE, hint_side)
                 .str_tag(tags::ORDER_QTY, "0")
                 .str_tag(tags::LEAVES_QTY, "0")
                 .str_tag(tags::CUM_QTY, "0")
@@ -482,7 +484,7 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::EXEC_TYPE, "L") // Triggered
                 .str_tag(tags::ORD_STATUS, "0") // New
                 .str_tag(tags::SYMBOL, symbol_str)
-                .str_tag(tags::SIDE, "1") // Placeholder
+                .str_tag(tags::SIDE, hint_side)
                 .str_tag(tags::STOP_PX, &price::ticks_to_decimal(trigger_price.get(), tick_inverse))
                 .str_tag(tags::LEAVES_QTY, "0")
                 .str_tag(tags::CUM_QTY, "0")
@@ -524,6 +526,75 @@ fn reject_reason_code(reason: &RejectReason) -> String {
         _ => 99, // Other
     };
     code.to_string()
+}
+
+/// Build a FIX ExecutionReport (35=8) for a single side of a fill.
+///
+/// Unlike the Fill arm of `execution_report_to_fix`, this emits a
+/// report for a specific `order_id` with the correct `side` and `fee`.
+/// The session calls this once per order that belongs to the current
+/// FIX session (maker, taker, or both).
+pub fn fill_report_for_order(
+    order_id: OrderId,
+    side: Side,
+    fill_price: Price,
+    fill_quantity: Quantity,
+    fee: i64,
+    id_map: &ClOrdIdMap,
+    symbol_str: &str,
+    tick_inverse: u64,
+    lot_inverse: u64,
+    sender: &str,
+    target: &str,
+    seq: u64,
+    exec_id: u64,
+) -> Vec<u8> {
+    let clord_id = id_map.get_clord_id(order_id).unwrap_or("UNKNOWN");
+    FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+        .str_tag(tags::ORDER_ID, &order_id.0.to_string())
+        .str_tag(tags::CL_ORD_ID, clord_id)
+        .str_tag(tags::EXEC_ID, &exec_id.to_string())
+        .str_tag(tags::EXEC_TRANS_TYPE, "0")
+        .str_tag(tags::EXEC_TYPE, "F") // Trade
+        .str_tag(tags::ORD_STATUS, "2") // Filled (conservative)
+        .str_tag(tags::SYMBOL, symbol_str)
+        .str_tag(tags::SIDE, fix_side(side))
+        .str_tag(tags::LAST_SHARES, &price::ticks_to_decimal(fill_quantity.get(), lot_inverse))
+        .str_tag(tags::LAST_PX, &price::ticks_to_decimal(fill_price.get(), tick_inverse))
+        .str_tag(tags::LEAVES_QTY, "0")
+        .str_tag(tags::CUM_QTY, &price::ticks_to_decimal(fill_quantity.get(), lot_inverse))
+        .str_tag(tags::AVG_PX, &price::ticks_to_decimal(fill_price.get(), tick_inverse))
+        .str_tag(tags::TEXT, &fee.to_string())
+        .build(sender, target, seq)
+}
+
+/// Build a FIX OrderCancelReject (35=9) for a failed cancel or
+/// cancel-replace request.
+pub fn cancel_reject_to_fix(
+    order_id: OrderId,
+    cancel_clord_id: &str,
+    orig_clord_id: &str,
+    reason: &RejectReason,
+    is_replace: bool,
+    sender: &str,
+    target: &str,
+    seq: u64,
+) -> Vec<u8> {
+    // CxlRejReason (102): 1=Unknown order, 3=Already pending, 99=Other.
+    let cxl_reason = match reason {
+        RejectReason::UnknownOrder => "1",
+        RejectReason::DuplicateRequest => "3",
+        _ => "99",
+    };
+    FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REJECT)
+        .str_tag(tags::ORDER_ID, &order_id.0.to_string())
+        .str_tag(tags::CL_ORD_ID, cancel_clord_id)
+        .str_tag(tags::ORIG_CL_ORD_ID, orig_clord_id)
+        .str_tag(tags::ORD_STATUS, "8") // Rejected
+        .str_tag(tags::CXL_REJ_RESPONSE_TO, if is_replace { "2" } else { "1" })
+        .str_tag(tags::CXL_REJ_REASON, cxl_reason)
+        .str_tag(tags::TEXT, &format!("{reason:?}"))
+        .build(sender, target, seq)
 }
 
 #[cfg(test)]
@@ -1093,7 +1164,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
@@ -1125,7 +1196,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
@@ -1149,7 +1220,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, Some(Side::Sell), "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
@@ -1157,6 +1228,7 @@ mod tests {
         assert_eq!(msg.get_str(tags::ORD_STATUS), Some("4"));
         assert_eq!(msg.get_str(tags::LEAVES_QTY), Some("0"));
         assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("CXL_ORD"));
+        assert_eq!(msg.get_str(tags::SIDE), Some("2")); // Sell via side_hint
     }
 
     #[test]
@@ -1171,7 +1243,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
@@ -1196,7 +1268,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
@@ -1218,7 +1290,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
@@ -1236,7 +1308,7 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 100, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         // InstrumentStatusChanged has no FIX equivalent — empty output.
@@ -1255,10 +1327,107 @@ mod tests {
         };
 
         let fix_bytes = execution_report_to_fix(
-            &report, &id_map, "BTC/USD", 1, 1, "MELIN", "FIRM", 1, 1,
+            &report, &id_map, "BTC/USD", 1, 1, None, "MELIN", "FIRM", 1, 1,
         );
 
         let msg = FixMessage::parse(&fix_bytes).unwrap();
         assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("UNKNOWN"));
+    }
+
+    #[test]
+    fn fill_report_for_specific_order() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("BUY_ORD");
+
+        let fix_bytes = fill_report_for_order(
+            OrderId(1),
+            Side::Buy,
+            Price(NonZeroU64::new(5_000_000).unwrap()),
+            Quantity(NonZeroU64::new(10).unwrap()),
+            -5, // Maker rebate
+            &id_map,
+            "BTC/USD",
+            100,
+            1,
+            "MELIN",
+            "FIRM",
+            1,
+            1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("BUY_ORD"));
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("F"));
+        assert_eq!(msg.get_str(tags::SIDE), Some("1")); // Buy — correct side
+        assert_eq!(msg.get_str(tags::LAST_PX), Some("50000.00"));
+        assert_eq!(msg.get_str(tags::LAST_SHARES), Some("10"));
+        assert_eq!(msg.get_str(tags::TEXT), Some("-5")); // Rebate
+    }
+
+    #[test]
+    fn fill_report_sell_side() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("SELL_ORD");
+
+        let fix_bytes = fill_report_for_order(
+            OrderId(1),
+            Side::Sell,
+            Price(NonZeroU64::new(100).unwrap()),
+            Quantity(NonZeroU64::new(1).unwrap()),
+            10,
+            &id_map,
+            "BTC/USD",
+            1,
+            1,
+            "MELIN",
+            "FIRM",
+            1,
+            1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.get_str(tags::SIDE), Some("2")); // Sell
+    }
+
+    #[test]
+    fn cancel_reject_for_cancel() {
+        let fix_bytes = cancel_reject_to_fix(
+            OrderId(42),
+            "CXL_REQ_1",
+            "ORIG_ORD_1",
+            &RejectReason::UnknownOrder,
+            false, // cancel, not replace
+            "MELIN",
+            "FIRM",
+            1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
+        assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("CXL_REQ_1"));
+        assert_eq!(msg.get_str(tags::ORIG_CL_ORD_ID), Some("ORIG_ORD_1"));
+        assert_eq!(msg.get_str(tags::ORD_STATUS), Some("8"));
+        assert_eq!(msg.get_str(tags::CXL_REJ_RESPONSE_TO), Some("1")); // Cancel
+        assert_eq!(msg.get_str(tags::CXL_REJ_REASON), Some("1")); // Unknown order
+    }
+
+    #[test]
+    fn cancel_reject_for_replace() {
+        let fix_bytes = cancel_reject_to_fix(
+            OrderId(42),
+            "REP_REQ_1",
+            "ORIG_ORD_1",
+            &RejectReason::DuplicateRequest,
+            true, // replace
+            "MELIN",
+            "FIRM",
+            1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
+        assert_eq!(msg.get_str(tags::CXL_REJ_RESPONSE_TO), Some("2")); // Replace
+        assert_eq!(msg.get_str(tags::CXL_REJ_REASON), Some("3")); // Already pending
     }
 }
