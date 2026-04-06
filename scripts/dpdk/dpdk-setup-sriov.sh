@@ -134,9 +134,13 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Check IOMMU is enabled.
-if ! dmesg | grep -qi "DMAR\|IOMMU"; then
-    echo "warning: IOMMU may not be enabled. Add 'intel_iommu=on iommu=pt' to kernel cmdline."
+# Check IOMMU is enabled. Intel uses DMAR, AMD uses AMD-Vi.
+if ! dmesg | grep -qi "DMAR\|AMD-Vi\|iommu"; then
+    if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        echo "warning: IOMMU may not be enabled. Add 'iommu=pt' to kernel cmdline and reboot."
+    else
+        echo "warning: IOMMU may not be enabled. Add 'intel_iommu=on iommu=pt' to kernel cmdline and reboot."
+    fi
 fi
 
 # Check SR-IOV support on the first PF.
