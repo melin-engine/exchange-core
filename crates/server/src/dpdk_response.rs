@@ -191,12 +191,12 @@ pub fn run(
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
-                    cached_durable_pos = if quorum_durability && repl_min != u64::MAX {
-                        let repl_max = fastest_replica_cursor.load(Ordering::Acquire);
-                        repl_min.max(journal_pos.min(repl_max))
-                    } else {
-                        journal_pos.min(repl_min)
-                    };
+                    cached_durable_pos = crate::response::durable_pos(
+                        journal_pos,
+                        repl_min,
+                        fastest_replica_cursor.load(Ordering::Acquire),
+                        quorum_durability,
+                    );
                     if cached_durable_pos >= needed {
                         break;
                     }

@@ -301,18 +301,12 @@ pub fn run(
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
 
-                    cached_durable_pos = if quorum_durability && repl_min != u64::MAX {
-                        // Quorum: two durable copies via whichever path
-                        // completes first. Only active when 2 replicas are
-                        // connected (repl_min < u64::MAX).
-                        let repl_max = fastest_replica_cursor.load(Ordering::Acquire);
-                        let fsync_plus_one = journal_pos.min(repl_max);
-                        repl_min.max(fsync_plus_one)
-                    } else {
-                        // Standalone or degraded (0-1 replicas): gate on
-                        // both journal fsync and replication.
-                        journal_pos.min(repl_min)
-                    };
+                    cached_durable_pos = durable_pos(
+                        journal_pos,
+                        repl_min,
+                        fastest_replica_cursor.load(Ordering::Acquire),
+                        quorum_durability,
+                    );
 
                     if cached_durable_pos >= needed {
                         break;
@@ -524,6 +518,36 @@ fn retry_send(
     }
 }
 
+/// Compute the durable position from journal and replication cursors.
+///
+/// Quorum mode (2 replicas connected — both cursors finite):
+///   `durable = max(repl_min, min(journal_pos, repl_max))`
+/// An event is durable when it exists on 2+ nodes.
+///
+/// Standalone / degraded (0-1 replicas — either cursor is `u64::MAX`):
+///   `durable = min(journal_pos, repl_min)`
+/// Falls back to journal + replication gating.
+#[inline(always)]
+pub(crate) fn durable_pos(
+    journal_pos: u64,
+    repl_min: u64,
+    repl_max: u64,
+    quorum_durability: bool,
+) -> u64 {
+    // Quorum requires both replica slots active (neither cursor is
+    // u64::MAX). With only 1 replica, repl_max = u64::MAX (the idle
+    // slot), and the formula would degrade to max(repl_min, journal)
+    // which can skip the replica ack — only 1-node durability.
+    if quorum_durability && repl_min != u64::MAX && repl_max != u64::MAX {
+        // Both replicas connected: two durable copies via whichever
+        // path completes first.
+        repl_min.max(journal_pos.min(repl_max))
+    } else {
+        // Standalone or degraded: gate on journal fsync + replication.
+        journal_pos.min(repl_min)
+    }
+}
+
 /// Print busy/idle utilization for a pipeline stage on shutdown.
 #[cfg(feature = "pipeline-stats")]
 fn print_utilization(stage: &str, busy: u64, idle: u64) {
@@ -541,4 +565,110 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
         total,
         "pipeline utilization",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::durable_pos;
+
+    // --- Standalone (no replicas) ---
+
+    #[test]
+    fn standalone_gates_on_journal() {
+        // repl_min = repl_max = u64::MAX → must return journal_pos,
+        // NOT u64::MAX. This was the bug: the quorum formula produced
+        // u64::MAX in standalone mode, bypassing all durability gating.
+        let journal = 500;
+        let pos = durable_pos(journal, u64::MAX, u64::MAX, true);
+        assert_eq!(pos, journal);
+    }
+
+    #[test]
+    fn standalone_non_quorum_gates_on_journal() {
+        let journal = 500;
+        let pos = durable_pos(journal, u64::MAX, u64::MAX, false);
+        assert_eq!(pos, journal);
+    }
+
+    // --- Quorum mode, 2 replicas connected ---
+
+    #[test]
+    fn quorum_both_replicas_ahead_of_journal() {
+        // Both replicas acked past journal → durable = repl_min.
+        // Journal hasn't fsynced yet but both replicas have the data.
+        let pos = durable_pos(50, 100, 120, true);
+        assert_eq!(pos, 100);
+    }
+
+    #[test]
+    fn quorum_journal_ahead_of_both_replicas() {
+        // Journal fsynced past both replicas → durable = repl_min.
+        // min(journal=500, repl_max=120) = 120, max(repl_min=100, 120) = 120.
+        let pos = durable_pos(500, 100, 120, true);
+        assert_eq!(pos, 120);
+    }
+
+    #[test]
+    fn quorum_journal_between_slow_and_fast_replica() {
+        // Fast replica at 200, slow at 50, journal at 150.
+        // min(journal=150, repl_max=200) = 150, max(repl_min=50, 150) = 150.
+        // Durable = 150: journal + fast replica both have it.
+        let pos = durable_pos(150, 50, 200, true);
+        assert_eq!(pos, 150);
+    }
+
+    #[test]
+    fn quorum_both_replicas_equal() {
+        // Both replicas at same position, journal ahead.
+        // min(500, 100) = 100, max(100, 100) = 100.
+        let pos = durable_pos(500, 100, 100, true);
+        assert_eq!(pos, 100);
+    }
+
+    // --- Non-quorum mode, replicas connected ---
+
+    #[test]
+    fn non_quorum_takes_min_of_journal_and_replication() {
+        // Non-quorum always returns min(journal, repl_min).
+        let pos = durable_pos(500, 100, 200, false);
+        assert_eq!(pos, 100);
+
+        let pos = durable_pos(50, 100, 200, false);
+        assert_eq!(pos, 50);
+    }
+
+    // --- Single replica (repl_min == repl_max, but not u64::MAX) ---
+
+    #[test]
+    fn single_replica_falls_back_to_non_quorum() {
+        // One replica at 100, other idle (u64::MAX). Quorum requires
+        // both slots active — with repl_max = u64::MAX, falls back to
+        // min(journal, repl_min) to gate on both journal and replica.
+        let pos = durable_pos(50, 100, u64::MAX, true);
+        assert_eq!(pos, 50);
+
+        // Replica ahead of journal: gates on journal.
+        let pos = durable_pos(50, 200, u64::MAX, true);
+        assert_eq!(pos, 50);
+
+        // Journal ahead of replica: gates on replica.
+        let pos = durable_pos(200, 100, u64::MAX, true);
+        assert_eq!(pos, 100);
+    }
+
+    // --- Edge: journal at 0 ---
+
+    #[test]
+    fn quorum_journal_at_zero() {
+        // Journal hasn't fsynced anything yet, replicas acked.
+        // min(0, 200) = 0, max(100, 0) = 100.
+        let pos = durable_pos(0, 100, 200, true);
+        assert_eq!(pos, 100);
+    }
+
+    #[test]
+    fn standalone_journal_at_zero() {
+        let pos = durable_pos(0, u64::MAX, u64::MAX, true);
+        assert_eq!(pos, 0);
+    }
 }

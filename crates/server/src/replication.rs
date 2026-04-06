@@ -555,6 +555,15 @@ pub fn run_sender(
         },
     ];
 
+    // Per-slot acked positions. Each handler thread writes its own slot and
+    // reads the other to compute the shared min/max cursors. Initialized to
+    // u64::MAX (idle — not gating). This mirrors the DPDK path's per-slot
+    // `acked_cursor` fields.
+    let slot_acked: [Arc<AtomicU64>; 2] = [
+        Arc::new(AtomicU64::new(u64::MAX)),
+        Arc::new(AtomicU64::new(u64::MAX)),
+    ];
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replication sender shutting down");
@@ -617,21 +626,18 @@ pub fn run_sender(
                         } else {
                             warn!(slot = i, "replica disconnected");
                         }
+                        // Reset this slot's acked position and recompute
+                        // shared cursors from the two per-slot values.
+                        slot_acked[i].store(u64::MAX, Ordering::Release);
+                        let other = slot_acked[1 - i].load(Ordering::Acquire);
+                        update_dual_replication_cursor(
+                            u64::MAX,
+                            other,
+                            &replication_cursor,
+                            &fastest_replica_cursor,
+                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            // Reset cursors so the response stage stops gating
-                            // on replica acks. Without this, the cursor stays
-                            // at the last acked sequence and the response stage
-                            // blocks indefinitely.
-                            replication_cursor.store(u64::MAX, Ordering::Release);
-                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
-                        } else {
-                            // One replica disconnected, the other is still
-                            // streaming. Reset fastest_replica_cursor to the
-                            // min cursor (safe lower bound) — the surviving
-                            // handler's next fetch_max will correct it upward.
-                            let min_pos = replication_cursor.load(Ordering::Acquire);
-                            fastest_replica_cursor.store(min_pos, Ordering::Release);
                         }
                     }
                     Err(_) => {
@@ -671,6 +677,8 @@ pub fn run_sender(
 
                     let cursor = Arc::clone(&replication_cursor);
                     let fastest_cursor = Arc::clone(&fastest_replica_cursor);
+                    let this_slot_acked = Arc::clone(&slot_acked[slot_idx]);
+                    let other_slot_acked = Arc::clone(&slot_acked[1 - slot_idx]);
                     let genesis = genesis_entry.clone();
                     let jpath = journal_path.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
@@ -712,6 +720,8 @@ pub fn run_sender(
                                 consumer,
                                 cursor,
                                 fastest_cursor,
+                                this_slot_acked,
+                                other_slot_acked,
                                 genesis,
                                 jpath,
                                 auth_keys,
@@ -754,6 +764,8 @@ fn run_replica_slot(
     mut consumer: ReplicationConsumer,
     replication_cursor: Arc<AtomicU64>,
     fastest_replica_cursor: Arc<AtomicU64>,
+    this_slot_acked: Arc<AtomicU64>,
+    other_slot_acked: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
     authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
@@ -772,6 +784,8 @@ fn run_replica_slot(
         &mut consumer,
         &replication_cursor,
         &fastest_replica_cursor,
+        &this_slot_acked,
+        &other_slot_acked,
         &genesis_entry,
         &journal_path,
         &authorized_keys,
@@ -1091,6 +1105,8 @@ fn handle_replica_connection(
     repl_consumer: &mut ReplicationConsumer,
     replication_cursor: &Arc<AtomicU64>,
     fastest_replica_cursor: &Arc<AtomicU64>,
+    this_slot_acked: &Arc<AtomicU64>,
+    other_slot_acked: &Arc<AtomicU64>,
     genesis_entry: &[u8],
     journal_path: &std::path::Path,
     authorized_keys: &melin_protocol::auth::AuthorizedKeys,
@@ -1280,17 +1296,16 @@ fn handle_replica_connection(
         }
     }
 
-    // Engage the replication cursor so the response stage gates on
-    // replica acks. Uses compare_exchange to only lower the cursor from
-    // u64::MAX (no replicas connected). If another replica is already
-    // connected (cursor < MAX), this is a no-op — their acks already
-    // maintain the cursor. Subsequent acks from this replica advance
-    // the cursor via fetch_max in process_acks.
-    let _ = replication_cursor.compare_exchange(
-        u64::MAX,
-        handshake.last_sequence + 1,
-        Ordering::Release,
-        Ordering::Relaxed,
+    // Engage both replication cursors. Set this slot's per-slot acked
+    // position and recompute the shared min/max cursors.
+    let initial_acked = handshake.last_sequence + 1;
+    this_slot_acked.store(initial_acked, Ordering::Release);
+    let other = other_slot_acked.load(Ordering::Acquire);
+    update_dual_replication_cursor(
+        initial_acked,
+        other,
+        replication_cursor,
+        fastest_replica_cursor,
     );
 
     // Catch-up complete — replica is entering the live streaming loop.
@@ -1318,6 +1333,8 @@ fn handle_replica_connection(
         repl_consumer,
         replication_cursor,
         fastest_replica_cursor,
+        this_slot_acked,
+        other_slot_acked,
         shutdown,
         evict_flag,
         metrics,
@@ -1344,6 +1361,8 @@ fn live_stream_uring(
     repl_consumer: &mut ReplicationConsumer,
     replication_cursor: &Arc<AtomicU64>,
     fastest_replica_cursor: &Arc<AtomicU64>,
+    this_slot_acked: &Arc<AtomicU64>,
+    other_slot_acked: &Arc<AtomicU64>,
     shutdown: &AtomicBool,
     evict_flag: &AtomicBool,
     metrics: &ReplicationMetrics,
@@ -1503,8 +1522,14 @@ fn live_stream_uring(
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                         if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
                             let new_val = ack.acked_sequence + 1;
-                            let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
-                            let _ = fastest_replica_cursor.fetch_max(new_val, Ordering::Release);
+                            this_slot_acked.store(new_val, Ordering::Release);
+                            let other = other_slot_acked.load(Ordering::Acquire);
+                            update_dual_replication_cursor(
+                                new_val,
+                                other,
+                                replication_cursor,
+                                fastest_replica_cursor,
+                            );
                             metrics.acked_sequence[slot_idx]
                                 .store(ack.acked_sequence, Ordering::Relaxed);
                             metrics.ack_latency_us[slot_idx]
@@ -2750,30 +2775,14 @@ fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
     }
 }
 
-/// DPDK variant of the replication sender. Uses a `DpdkTransport` (smoltcp)
-/// instead of kernel TCP. The replication sender thread gets its own DPDK
-/// queue pair for independent NIC access.
-///
-/// Supports dual replicas: each slot has its own `ReplicationConsumer` and
-/// independent state machine. Both are polled in a single-threaded loop
-/// (no per-replica threads — DPDK is single-threaded).
-///
-#[cfg(any(feature = "dpdk", test))]
-/// Compute and store the replication cursor for dual-replica DPDK mode.
-///
-/// The cursor is `min(this_slot_acked, other_slot_acked)`. Idle slots use
-/// `u64::MAX` so they don't block. Uses `store` (not `fetch_max`) because
-/// the cursor must be able to *decrease* when a second replica connects
-/// with a lower acked position.
-/// Update both replication cursors after an ack.
+/// Update both replication cursors after an ack or disconnect.
 ///
 /// - `cursor_min`: `min(slot0, slot1)` — both replicas have confirmed up to here.
 /// - `cursor_max`: `max(slot0, slot1)` — fastest replica has confirmed up to here.
 ///
-/// The response stage uses these for quorum durability:
-/// `durable = max(cursor_min, min(journal, cursor_max))`
-/// i.e., an event is durable if *either* both replicas acked *or* the
-/// journal fsynced and the fastest replica acked (two distinct durable copies).
+/// Used by both TCP (per-slot threads) and DPDK (single-threaded loop).
+/// Uses `store` (not `fetch_max`) because the cursor must be able to
+/// *decrease* when a second replica connects with a lower acked position.
 fn update_dual_replication_cursor(
     this_acked: u64,
     other_acked: u64,
@@ -2784,6 +2793,14 @@ fn update_dual_replication_cursor(
     cursor_max.store(this_acked.max(other_acked), Ordering::Release);
 }
 
+/// DPDK variant of the replication sender. Uses a `DpdkTransport` (smoltcp)
+/// instead of kernel TCP. The replication sender thread gets its own DPDK
+/// queue pair for independent NIC access.
+///
+/// Supports dual replicas: each slot has its own `ReplicationConsumer` and
+/// independent state machine. Both are polled in a single-threaded loop
+/// (no per-replica threads — DPDK is single-threaded).
+///
 /// The protocol is identical to `run_sender` — same wire format, same
 /// handshake, same streaming logic. Only the I/O primitives differ.
 #[cfg(feature = "dpdk")]
