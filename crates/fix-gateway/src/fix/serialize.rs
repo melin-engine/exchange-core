@@ -43,12 +43,6 @@ impl FixMessageBuilder {
         self.tag(tag, s.as_bytes())
     }
 
-    /// Add a field with an i64 value.
-    pub fn i64_tag(self, tag: u32, value: i64) -> Self {
-        let s = value.to_string();
-        self.tag(tag, s.as_bytes())
-    }
-
     /// Build the complete FIX message with header and trailer.
     ///
     /// Adds: BeginString (8), BodyLength (9), SenderCompID (49),
@@ -130,9 +124,7 @@ fn sending_time() -> String {
     // Days since epoch → year/month/day (simplified Gregorian).
     let (year, month, day) = days_to_ymd(days);
 
-    format!(
-        "{year:04}{month:02}{day:02}-{hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
-    )
+    format!("{year:04}{month:02}{day:02}-{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -157,8 +149,7 @@ mod tests {
 
     #[test]
     fn build_heartbeat() {
-        let msg = FixMessageBuilder::new(tags::MSG_HEARTBEAT)
-            .build("SENDER", "TARGET", 1);
+        let msg = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("SENDER", "TARGET", 1);
         // Should start with "8=FIX.4.2\x01"
         assert!(msg.starts_with(b"8=FIX.4.2\x01"));
         // Should end with "10=xxx\x01"

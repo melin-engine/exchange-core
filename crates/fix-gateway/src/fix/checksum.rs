@@ -35,10 +35,7 @@ mod tests {
         // Verify format is 3 digits
         assert_eq!(formatted.len(), 3);
         // Verify round-trip: parse back
-        let parsed: u8 = std::str::from_utf8(&formatted)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let parsed: u8 = std::str::from_utf8(&formatted).unwrap().parse().unwrap();
         assert_eq!(parsed, cs);
     }
 

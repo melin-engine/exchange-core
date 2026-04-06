@@ -1,6 +1,5 @@
 //! TOML configuration for the FIX gateway.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -86,9 +85,7 @@ impl GatewayConfig {
         let mut seen = std::collections::HashSet::new();
         for s in &self.sessions {
             if !seen.insert(&s.sender_comp_id) {
-                return Err(
-                    format!("duplicate sender_comp_id: {}", s.sender_comp_id).into()
-                );
+                return Err(format!("duplicate sender_comp_id: {}", s.sender_comp_id).into());
             }
         }
         // Check for duplicate FIX symbols.
@@ -99,24 +96,6 @@ impl GatewayConfig {
             }
         }
         Ok(())
-    }
-
-    /// Build a lookup map from SenderCompID → SessionConfig index.
-    pub fn session_map(&self) -> HashMap<&str, usize> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.sender_comp_id.as_str(), i))
-            .collect()
-    }
-
-    /// Build a lookup map from FIX symbol string → SymbolConfig index.
-    pub fn symbol_map(&self) -> HashMap<&str, usize> {
-        self.symbols
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.fix_symbol.as_str(), i))
-            .collect()
     }
 }
 
@@ -164,23 +143,6 @@ lot_size_inverse = 1
         assert_eq!(config.symbols[0].tick_size_inverse, 100);
         // Default lot_size_inverse.
         assert_eq!(config.symbols[0].lot_size_inverse, 1);
-    }
-
-    #[test]
-    fn session_map_lookup() {
-        let config: GatewayConfig = toml::from_str(SAMPLE_TOML).unwrap();
-        let map = config.session_map();
-        assert_eq!(map.get("FIRM_A"), Some(&0));
-        assert_eq!(map.get("FIRM_B"), Some(&1));
-        assert_eq!(map.get("UNKNOWN"), None);
-    }
-
-    #[test]
-    fn symbol_map_lookup() {
-        let config: GatewayConfig = toml::from_str(SAMPLE_TOML).unwrap();
-        let map = config.symbol_map();
-        assert_eq!(map.get("BTC/USD"), Some(&0));
-        assert_eq!(map.get("ETH/USD"), Some(&1));
     }
 
     #[test]

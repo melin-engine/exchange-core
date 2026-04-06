@@ -102,7 +102,10 @@ fn pin_to_core(core: usize) {
         libc::CPU_SET(core, &mut cpuset);
         let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
         if rc != 0 {
-            warn!(core, "failed to pin to core (sched_setaffinity returned {rc})");
+            warn!(
+                core,
+                "failed to pin to core (sched_setaffinity returned {rc})"
+            );
         }
     }
 }

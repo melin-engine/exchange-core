@@ -55,11 +55,17 @@ impl std::fmt::Display for ParseError {
             Self::MissingBodyLength => write!(f, "second field must be BodyLength (9)"),
             Self::InvalidBodyLength => write!(f, "invalid BodyLength value"),
             Self::BodyLengthMismatch { declared, actual } => {
-                write!(f, "BodyLength mismatch: declared {declared}, actual {actual}")
+                write!(
+                    f,
+                    "BodyLength mismatch: declared {declared}, actual {actual}"
+                )
             }
             Self::MissingCheckSum => write!(f, "last field must be CheckSum (10)"),
             Self::CheckSumMismatch { declared, computed } => {
-                write!(f, "CheckSum mismatch: declared {declared}, computed {computed}")
+                write!(
+                    f,
+                    "CheckSum mismatch: declared {declared}, computed {computed}"
+                )
             }
             Self::MissingMsgType => write!(f, "missing MsgType (35)"),
         }
@@ -115,8 +121,7 @@ impl<'a> FixMessage<'a> {
         if fields.len() < 2 || fields[1].tag != tags::BODY_LENGTH {
             return Err(ParseError::MissingBodyLength);
         }
-        let declared_len =
-            parse_usize(fields[1].value).ok_or(ParseError::InvalidBodyLength)?;
+        let declared_len = parse_usize(fields[1].value).ok_or(ParseError::InvalidBodyLength)?;
 
         // Validate CheckSum (last field).
         let last = fields.last().ok_or(ParseError::MissingCheckSum)?;
@@ -143,11 +148,10 @@ impl<'a> FixMessage<'a> {
 
         // Validate checksum: sum of all bytes from tag 8 up to (not
         // including) "10=".
-        let declared_checksum =
-            parse_u8(last.value).ok_or(ParseError::CheckSumMismatch {
-                declared: 0,
-                computed: 0,
-            })?;
+        let declared_checksum = parse_u8(last.value).ok_or(ParseError::CheckSumMismatch {
+            declared: 0,
+            computed: 0,
+        })?;
         let computed_checksum = checksum::compute(&data[..checksum_start]);
         if declared_checksum != computed_checksum {
             return Err(ParseError::CheckSumMismatch {
@@ -185,19 +189,9 @@ impl<'a> FixMessage<'a> {
         self.get_str(tags::SENDER_COMP_ID)
     }
 
-    /// Get the TargetCompID (tag 56) as a string.
-    pub fn target_comp_id(&self) -> Option<&'a str> {
-        self.get_str(tags::TARGET_COMP_ID)
-    }
-
     /// Get the MsgSeqNum (tag 34) as u64.
     pub fn msg_seq_num(&self) -> Option<u64> {
         self.get(tags::MSG_SEQ_NUM).and_then(parse_u64_slice)
-    }
-
-    /// Get all fields (for iteration).
-    pub fn fields(&self) -> &[Field<'a>] {
-        &self.fields
     }
 }
 
@@ -207,9 +201,7 @@ fn find_body_start(data: &[u8]) -> Option<usize> {
     // Find first SOH (after BeginString).
     let first_soh = data.iter().position(|&b| b == tags::SOH)?;
     // Find second SOH (after BodyLength).
-    let second_soh = data[first_soh + 1..]
-        .iter()
-        .position(|&b| b == tags::SOH)?;
+    let second_soh = data[first_soh + 1..].iter().position(|&b| b == tags::SOH)?;
     Some(first_soh + 1 + second_soh + 1)
 }
 
@@ -240,51 +232,6 @@ fn parse_u8(bytes: &[u8]) -> Option<u8> {
 
 fn parse_u64_slice(bytes: &[u8]) -> Option<u64> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-/// Read one complete FIX message from a buffered reader.
-///
-/// FIX messages don't have a fixed framing — we read until we find
-/// the CheckSum field (10=xxx|). Returns the raw bytes of the complete
-/// message, or None on EOF.
-pub fn read_message(reader: &mut impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-
-    // Read bytes one at a time looking for the complete message.
-    // This is simple but correct — FIX messages are small (~200 bytes)
-    // and the gateway handles tens of sessions, not millions.
-    //
-    // We detect message completion by looking for the pattern:
-    // "10=xxx\x01" at the end of the buffer (checksum is always last).
-    loop {
-        match reader.read(&mut byte) {
-            Ok(0) => {
-                return if buf.is_empty() { Ok(None) } else { Ok(Some(buf)) };
-            }
-            Ok(_) => {
-                buf.push(byte[0]);
-                // Check if we've received a complete checksum field.
-                // Pattern: SOH + "10=" + 3 digits + SOH at end of buffer.
-                if buf.len() >= 7 && buf[buf.len() - 1] == tags::SOH {
-                    // Look for "10=" near the end.
-                    let tail = &buf[buf.len().saturating_sub(8)..];
-                    if let Some(pos) = tail
-                        .windows(3)
-                        .position(|w| w == b"10=")
-                    {
-                        // Verify the "10=" is preceded by SOH.
-                        let abs_pos = buf.len().saturating_sub(8) + pos;
-                        if abs_pos == 0 || buf[abs_pos - 1] == tags::SOH {
-                            return Ok(Some(buf));
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 /// Try to extract one complete FIX message from the front of `buf`.
@@ -334,8 +281,7 @@ mod tests {
 
     /// Build a minimal valid FIX message for testing.
     fn sample_heartbeat() -> Vec<u8> {
-        FixMessageBuilder::new(tags::MSG_HEARTBEAT)
-            .build("SENDER", "TARGET", 1)
+        FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("SENDER", "TARGET", 1)
     }
 
     #[test]
@@ -344,7 +290,6 @@ mod tests {
         let msg = FixMessage::parse(&raw).unwrap();
         assert_eq!(msg.msg_type(), tags::MSG_HEARTBEAT);
         assert_eq!(msg.sender_comp_id(), Some("SENDER"));
-        assert_eq!(msg.target_comp_id(), Some("TARGET"));
         assert_eq!(msg.msg_seq_num(), Some(1));
     }
 
@@ -390,21 +335,6 @@ mod tests {
         assert_eq!(msg.get_str(tags::SIDE), Some("1"));
         assert_eq!(msg.get_str(tags::PRICE), Some("50000.00"));
         assert_eq!(msg.msg_seq_num(), Some(42));
-    }
-
-    #[test]
-    fn read_message_from_stream() {
-        let raw = sample_heartbeat();
-        let mut cursor = std::io::Cursor::new(&raw);
-        let result = read_message(&mut cursor).unwrap().unwrap();
-        assert_eq!(result, raw);
-    }
-
-    #[test]
-    fn read_message_eof() {
-        let mut cursor = std::io::Cursor::new(&[] as &[u8]);
-        let result = read_message(&mut cursor).unwrap();
-        assert!(result.is_none());
     }
 
     #[test]

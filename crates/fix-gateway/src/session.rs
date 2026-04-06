@@ -255,12 +255,12 @@ impl Session {
         );
 
         // Validate MsgSeqNum — Logon must be sequence 1.
-        if let Some(seq) = msg.msg_seq_num() {
-            if seq != 1 {
-                warn!(sender = sender_comp_id, seq, "Logon MsgSeqNum must be 1");
-                self.queue_fix_logout(config, "MsgSeqNum must be 1 on Logon");
-                return SessionAction::Close;
-            }
+        if let Some(seq) = msg.msg_seq_num()
+            && seq != 1
+        {
+            warn!(sender = sender_comp_id, seq, "Logon MsgSeqNum must be 1");
+            self.queue_fix_logout(config, "MsgSeqNum must be 1 on Logon");
+            return SessionAction::Close;
         }
 
         // Extract HeartBtInt (default 30s).
@@ -464,11 +464,7 @@ impl Session {
             }
             if seq > self.fix_inbound_seq {
                 // Gap — disconnect (v1: no gap fill).
-                warn!(
-                    expected = self.fix_inbound_seq,
-                    got = seq,
-                    "MsgSeqNum gap"
-                );
+                warn!(expected = self.fix_inbound_seq, got = seq, "MsgSeqNum gap");
                 self.queue_fix_logout(config, "MsgSeqNum too high, expected sequence reset");
                 return SessionAction::Close;
             }
@@ -540,39 +536,45 @@ impl Session {
         match request {
             Ok(req) => {
                 // Record order → symbol/side mapping for exec report translation.
-                if let Some(fix_sym) = msg.get_str(tags::SYMBOL) {
-                    if let Some(sym_cfg) = symbol_map.get(fix_sym) {
-                        match &req {
-                            Request::SubmitOrder { order, .. } => {
-                                self.order_symbols.entry(order.id).or_insert_with(|| {
-                                    OrderSymbolInfo {
-                                        fix_symbol: fix_sym.to_owned(),
-                                        tick_inverse: sym_cfg.tick_size_inverse,
-                                        lot_inverse: sym_cfg.lot_size_inverse,
-                                        side: order.side,
-                                    }
+                if let Some(fix_sym) = msg.get_str(tags::SYMBOL)
+                    && let Some(sym_cfg) = symbol_map.get(fix_sym)
+                {
+                    match &req {
+                        Request::SubmitOrder { order, .. } => {
+                            self.order_symbols
+                                .entry(order.id)
+                                .or_insert_with(|| OrderSymbolInfo {
+                                    fix_symbol: fix_sym.to_owned(),
+                                    tick_inverse: sym_cfg.tick_size_inverse,
+                                    lot_inverse: sym_cfg.lot_size_inverse,
+                                    side: order.side,
                                 });
-                            }
-                            Request::CancelOrder { order_id, .. } => {
-                                // Track the cancel request's ClOrdID so we can
-                                // emit OrderCancelReject if the engine rejects it.
-                                if let Some(clord) = msg.get_str(tags::CL_ORD_ID) {
-                                    self.pending_cancels.insert(*order_id, PendingCancel {
+                        }
+                        Request::CancelOrder { order_id, .. } => {
+                            // Track the cancel request's ClOrdID so we can
+                            // emit OrderCancelReject if the engine rejects it.
+                            if let Some(clord) = msg.get_str(tags::CL_ORD_ID) {
+                                self.pending_cancels.insert(
+                                    *order_id,
+                                    PendingCancel {
                                         cancel_clord_id: clord.to_owned(),
                                         is_replace: false,
-                                    });
-                                }
+                                    },
+                                );
                             }
-                            Request::CancelReplace { order_id, .. } => {
-                                if let Some(clord) = msg.get_str(tags::CL_ORD_ID) {
-                                    self.pending_cancels.insert(*order_id, PendingCancel {
+                        }
+                        Request::CancelReplace { order_id, .. } => {
+                            if let Some(clord) = msg.get_str(tags::CL_ORD_ID) {
+                                self.pending_cancels.insert(
+                                    *order_id,
+                                    PendingCancel {
                                         cancel_clord_id: clord.to_owned(),
                                         is_replace: true,
-                                    });
-                                }
+                                    },
+                                );
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
 
@@ -636,11 +638,23 @@ impl Session {
                         if self.id_map.get_clord_id(*maker_order_id).is_some() {
                             let info = self.order_symbols.get(maker_order_id);
                             let (sym, ti, li, side) = sym_info_or_default(info);
+                            let ctx = translate::FixCtx {
+                                id_map: &self.id_map,
+                                symbol_str: sym,
+                                tick_inverse: ti,
+                                lot_inverse: li,
+                                sender: &config.target_comp_id,
+                                target: &self.sender_comp_id,
+                            };
                             let msg = translate::fill_report_for_order(
-                                *maker_order_id, side, *fill_price, *quantity,
-                                *maker_fee, &self.id_map, sym, ti, li,
-                                &config.target_comp_id, &self.sender_comp_id,
-                                self.fix_outbound_seq, self.exec_id,
+                                *maker_order_id,
+                                side,
+                                *fill_price,
+                                *quantity,
+                                *maker_fee,
+                                &ctx,
+                                self.fix_outbound_seq,
+                                self.exec_id,
                             );
                             self.queue_fix_raw(&msg);
                             self.exec_id += 1;
@@ -651,18 +665,34 @@ impl Session {
                         if self.id_map.get_clord_id(*taker_order_id).is_some() {
                             let info = self.order_symbols.get(taker_order_id);
                             let (sym, ti, li, side) = sym_info_or_default(info);
+                            let ctx = translate::FixCtx {
+                                id_map: &self.id_map,
+                                symbol_str: sym,
+                                tick_inverse: ti,
+                                lot_inverse: li,
+                                sender: &config.target_comp_id,
+                                target: &self.sender_comp_id,
+                            };
                             let msg = translate::fill_report_for_order(
-                                *taker_order_id, side, *fill_price, *quantity,
-                                *taker_fee, &self.id_map, sym, ti, li,
-                                &config.target_comp_id, &self.sender_comp_id,
-                                self.fix_outbound_seq, self.exec_id,
+                                *taker_order_id,
+                                side,
+                                *fill_price,
+                                *quantity,
+                                *taker_fee,
+                                &ctx,
+                                self.fix_outbound_seq,
+                                self.exec_id,
                             );
                             self.queue_fix_raw(&msg);
                             self.exec_id += 1;
                             sent = true;
                         }
 
-                        if sent { SessionAction::SendFix } else { SessionAction::None }
+                        if sent {
+                            SessionAction::SendFix
+                        } else {
+                            SessionAction::None
+                        }
                     }
 
                     ExecutionReport::Rejected {
@@ -670,8 +700,8 @@ impl Session {
                     } => {
                         // Check if this was a rejected cancel/replace → OrderCancelReject.
                         if let Some(pending) = self.pending_cancels.remove(order_id) {
-                            let orig_clord = self.id_map.get_clord_id(*order_id)
-                                .unwrap_or("UNKNOWN");
+                            let orig_clord =
+                                self.id_map.get_clord_id(*order_id).unwrap_or("UNKNOWN");
                             let msg = translate::cancel_reject_to_fix(
                                 *order_id,
                                 &pending.cancel_clord_id,
@@ -688,11 +718,20 @@ impl Session {
                             // Regular order rejection.
                             let info = self.order_symbols.get(order_id);
                             let (sym, ti, li, side) = sym_info_or_default(info);
+                            let ctx = translate::FixCtx {
+                                id_map: &self.id_map,
+                                symbol_str: sym,
+                                tick_inverse: ti,
+                                lot_inverse: li,
+                                sender: &config.target_comp_id,
+                                target: &self.sender_comp_id,
+                            };
                             let msg = translate::execution_report_to_fix(
-                                report, &self.id_map, sym, ti, li,
+                                report,
+                                &ctx,
                                 Some(side),
-                                &config.target_comp_id, &self.sender_comp_id,
-                                self.fix_outbound_seq, self.exec_id,
+                                self.fix_outbound_seq,
+                                self.exec_id,
                             );
                             self.queue_fix_raw(&msg);
                             self.exec_id += 1;
@@ -711,12 +750,21 @@ impl Session {
 
                         let info = order_id.and_then(|id| self.order_symbols.get(&id));
                         let (sym, ti, li, side) = sym_info_or_default(info);
+                        let ctx = translate::FixCtx {
+                            id_map: &self.id_map,
+                            symbol_str: sym,
+                            tick_inverse: ti,
+                            lot_inverse: li,
+                            sender: &config.target_comp_id,
+                            target: &self.sender_comp_id,
+                        };
 
                         let fix_msg = translate::execution_report_to_fix(
-                            report, &self.id_map, sym, ti, li,
+                            report,
+                            &ctx,
                             Some(side),
-                            &config.target_comp_id, &self.sender_comp_id,
-                            self.fix_outbound_seq, self.exec_id,
+                            self.fix_outbound_seq,
+                            self.exec_id,
                         );
 
                         if !fix_msg.is_empty() {
@@ -827,12 +875,12 @@ impl Session {
         let since_sent = now.duration_since(self.last_fix_sent);
 
         // Step 3: TestRequest was sent and timed out → disconnect.
-        if let Some(sent_at) = self.test_request_sent_at {
-            if now.duration_since(sent_at) > hb {
-                warn!(sender = %self.sender_comp_id, "FIX heartbeat timeout (TestRequest unanswered)");
-                self.queue_fix_logout(config, "heartbeat timeout");
-                return SessionAction::Close;
-            }
+        if let Some(sent_at) = self.test_request_sent_at
+            && now.duration_since(sent_at) > hb
+        {
+            warn!(sender = %self.sender_comp_id, "FIX heartbeat timeout (TestRequest unanswered)");
+            self.queue_fix_logout(config, "heartbeat timeout");
+            return SessionAction::Close;
         }
 
         // Step 2: Haven't heard from client in HeartBtInt → send TestRequest.
@@ -852,12 +900,11 @@ impl Session {
 
         // Step 1: Haven't sent anything in HeartBtInt → send Heartbeat.
         if since_sent > hb {
-            let msg = FixMessageBuilder::new(tags::MSG_HEARTBEAT)
-                .build(
-                    &config.target_comp_id,
-                    &self.sender_comp_id,
-                    self.fix_outbound_seq,
-                );
+            let msg = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build(
+                &config.target_comp_id,
+                &self.sender_comp_id,
+                self.fix_outbound_seq,
+            );
             self.queue_fix_raw(&msg);
             return SessionAction::SendFix;
         }
@@ -900,9 +947,7 @@ fn report_order_id(report: &ExecutionReport) -> Option<OrderId> {
         | ExecutionReport::Rejected { order_id, .. }
         | ExecutionReport::Replaced { order_id, .. }
         | ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
-        ExecutionReport::Fill {
-            taker_order_id, ..
-        } => Some(*taker_order_id),
+        ExecutionReport::Fill { taker_order_id, .. } => Some(*taker_order_id),
         ExecutionReport::InstrumentStatusChanged { .. } => None,
     }
 }

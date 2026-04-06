@@ -52,11 +52,6 @@ impl ClOrdIdMap {
     pub fn get_clord_id(&self, order_id: OrderId) -> Option<&str> {
         self.to_clord_id.get(&order_id).map(|s| s.as_str())
     }
-
-    /// The next OrderId that will be assigned.
-    pub fn next_id(&self) -> u64 {
-        self.next_id
-    }
 }
 
 #[cfg(test)]
@@ -80,7 +75,9 @@ mod tests {
         let id1 = map.insert("ORD001");
         let id2 = map.insert("ORD001");
         assert_eq!(id1, id2);
-        assert_eq!(map.next_id(), 2); // Only one ID consumed.
+        // Only one ID consumed: a third distinct insert should yield 2.
+        let id3 = map.insert("ORD002");
+        assert_eq!(id3, OrderId(2));
     }
 
     #[test]

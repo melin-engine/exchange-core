@@ -15,10 +15,6 @@ pub const HEART_BT_INT: u32 = 108;
 pub const TEST_REQ_ID: u32 = 112;
 pub const ENCRYPT_METHOD: u32 = 98;
 pub const TEXT: u32 = 58;
-pub const REF_SEQ_NUM: u32 = 45;
-pub const REF_TAG_ID: u32 = 371;
-pub const REF_MSG_TYPE: u32 = 372;
-pub const SESSION_REJECT_REASON: u32 = 373;
 
 // --- Order entry tags ---
 pub const ACCOUNT: u32 = 1;
@@ -35,7 +31,6 @@ pub const STOP_PX: u32 = 99;
 pub const SIDE: u32 = 54;
 pub const SYMBOL: u32 = 55;
 pub const TIME_IN_FORCE: u32 = 59;
-pub const TRANSACT_TIME: u32 = 60;
 pub const ORDER_ID: u32 = 37;
 pub const LAST_SHARES: u32 = 32;
 pub const LAST_PX: u32 = 31;
@@ -46,13 +41,11 @@ pub const ORD_REJ_REASON: u32 = 103;
 pub const CXL_REJ_REASON: u32 = 102;
 pub const CXL_REJ_RESPONSE_TO: u32 = 434;
 pub const EXEC_INST: u32 = 18;
-pub const EXPIRE_TIME: u32 = 126;
 
 // --- MsgType values (Tag 35) ---
 pub const MSG_HEARTBEAT: &[u8] = b"0";
 pub const MSG_TEST_REQUEST: &[u8] = b"1";
 pub const MSG_REJECT: &[u8] = b"3";
-pub const MSG_SEQUENCE_RESET: &[u8] = b"4";
 pub const MSG_LOGOUT: &[u8] = b"5";
 pub const MSG_LOGON: &[u8] = b"A";
 pub const MSG_NEW_ORDER_SINGLE: &[u8] = b"D";

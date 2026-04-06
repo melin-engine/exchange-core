@@ -9,12 +9,12 @@
 
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::GatewayConfig;
 use crate::session::{Session, SessionState};
@@ -180,8 +180,7 @@ impl Gateway {
         let listener_fd = listener.into_raw_fd();
 
         // Register the provided buffer pool.
-        let mut buffer_pool =
-            vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
+        let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
         register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr());
 
         // Build lookup maps.
@@ -304,9 +303,13 @@ impl Gateway {
     // -----------------------------------------------------------------------
 
     fn push_accept(&mut self) {
-        let sqe = opcode::Accept::new(types::Fd(self.listener_fd), std::ptr::null_mut(), std::ptr::null_mut())
-            .build()
-            .user_data(OP_ACCEPT);
+        let sqe = opcode::Accept::new(
+            types::Fd(self.listener_fd),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .build()
+        .user_data(OP_ACCEPT);
 
         unsafe {
             self.ring
@@ -360,10 +363,7 @@ impl Gateway {
             .user_data(OP_FIX_RECV | idx as u64);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .expect("io_uring SQ full");
+            self.ring.submission().push(&sqe).expect("io_uring SQ full");
         }
         session.fix_multishot_active = true;
     }
@@ -431,12 +431,8 @@ impl Gateway {
             };
 
             // Dispatch based on session state.
-            let action = session.handle_fix_message(
-                &raw,
-                self.config,
-                &self.session_map,
-                &self.symbol_map,
-            );
+            let action =
+                session.handle_fix_message(&raw, self.config, &self.session_map, &self.symbol_map);
 
             match action {
                 SessionAction::None => {}
@@ -470,9 +466,7 @@ impl Gateway {
         let server_addr = self.config.server_addr;
 
         // Create a non-blocking TCP socket.
-        let fd = unsafe {
-            libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0)
-        };
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
         if fd < 0 {
             error!(error = fd, "socket() failed for Melin connection");
             self.to_remove.push(idx);
@@ -496,18 +490,15 @@ impl Gateway {
         }
 
         let session = self.sessions.get(idx).unwrap();
-        let addr_ptr = session.connect_addr.as_ref().unwrap()
-            as *const libc::sockaddr_in as *const libc::sockaddr;
+        let addr_ptr = session.connect_addr.as_ref().unwrap() as *const libc::sockaddr_in
+            as *const libc::sockaddr;
 
         let sqe = opcode::Connect::new(types::Fd(fd), addr_ptr, sockaddr_len)
             .build()
             .user_data(OP_CONNECT | idx as u64);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .expect("io_uring SQ full");
+            self.ring.submission().push(&sqe).expect("io_uring SQ full");
         }
     }
 
@@ -559,10 +550,7 @@ impl Gateway {
             .user_data(OP_MELIN_RECV | idx as u64);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .expect("io_uring SQ full");
+            self.ring.submission().push(&sqe).expect("io_uring SQ full");
         }
         session.melin_multishot_active = true;
     }
@@ -620,11 +608,7 @@ impl Gateway {
                 None => return,
             };
 
-            let action = session.try_process_melin_frame(
-                self.config,
-                &self.symbol_map,
-                now,
-            );
+            let action = session.try_process_melin_frame(self.config, &self.symbol_map, now);
 
             match action {
                 SessionAction::None => return, // No complete frame or nothing to do.
@@ -694,10 +678,7 @@ impl Gateway {
             .user_data(OP_SEND_FIX | idx as u64);
 
             unsafe {
-                self.ring
-                    .submission()
-                    .push(&sqe)
-                    .expect("io_uring SQ full");
+                self.ring.submission().push(&sqe).expect("io_uring SQ full");
             }
         }
 
@@ -730,10 +711,7 @@ impl Gateway {
             .user_data(OP_SEND_MELIN | idx as u64);
 
             unsafe {
-                self.ring
-                    .submission()
-                    .push(&sqe)
-                    .expect("io_uring SQ full");
+                self.ring.submission().push(&sqe).expect("io_uring SQ full");
             }
         }
     }
@@ -755,8 +733,7 @@ impl Gateway {
                 } else {
                     session.fix_inflight.drain(..sent);
                 }
-                let requeue = !session.fix_inflight.is_empty()
-                    || !session.fix_send_buf.is_empty();
+                let requeue = !session.fix_inflight.is_empty() || !session.fix_send_buf.is_empty();
                 // If this Closing session has no more data to send on
                 // either side, it can be removed.
                 let remove = !requeue
@@ -791,8 +768,8 @@ impl Gateway {
                 } else {
                     session.melin_inflight.drain(..sent);
                 }
-                let requeue = !session.melin_inflight.is_empty()
-                    || !session.melin_send_buf.is_empty();
+                let requeue =
+                    !session.melin_inflight.is_empty() || !session.melin_send_buf.is_empty();
                 let remove = !requeue
                     && matches!(session.state, SessionState::Closing)
                     && session.fix_inflight.is_empty();
@@ -814,9 +791,10 @@ impl Gateway {
     fn drain_removals(&mut self) {
         let pending: Vec<usize> = self.to_remove.drain(..).collect();
         for idx in pending {
-            let can_remove = self.sessions.get(idx).map_or(true, |s| {
-                s.fix_inflight.is_empty() && s.melin_inflight.is_empty()
-            });
+            let can_remove = self
+                .sessions
+                .get(idx)
+                .is_none_or(|s| s.fix_inflight.is_empty() && s.melin_inflight.is_empty());
             if can_remove {
                 if let Some(session) = self.sessions.remove(idx) {
                     debug!(sender = %session.sender_comp_id, "session removed");
@@ -825,10 +803,10 @@ impl Gateway {
                 // Sends still in flight — mark as Closing so the send
                 // completion handler will schedule removal once the
                 // kernel is done with the buffers.
-                if let Some(session) = self.sessions.get_mut(idx) {
-                    if !matches!(session.state, SessionState::Closing) {
-                        session.state = SessionState::Closing;
-                    }
+                if let Some(session) = self.sessions.get_mut(idx)
+                    && !matches!(session.state, SessionState::Closing)
+                {
+                    session.state = SessionState::Closing;
                 }
             }
         }
@@ -874,10 +852,7 @@ impl Gateway {
                 .user_data(PROVIDE_BUFS_TOKEN);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .expect("io_uring SQ full");
+            self.ring.submission().push(&sqe).expect("io_uring SQ full");
         }
     }
 }
@@ -908,10 +883,9 @@ pub enum SessionAction {
 // ---------------------------------------------------------------------------
 
 fn register_buffer_pool(ring: &mut IoUring, pool_ptr: *mut u8) {
-    let sqe =
-        opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, NUM_BUFFERS, BUF_GROUP_ID, 0)
-            .build()
-            .user_data(PROVIDE_BUFS_TOKEN);
+    let sqe = opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, NUM_BUFFERS, BUF_GROUP_ID, 0)
+        .build()
+        .user_data(PROVIDE_BUFS_TOKEN);
 
     unsafe {
         ring.submission()
@@ -945,9 +919,7 @@ fn set_tcp_nodelay(fd: RawFd) {
 fn get_peer_addr(fd: RawFd) -> String {
     let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
-    };
+    let rc = unsafe { libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
     if rc != 0 {
         return "unknown".to_string();
     }
