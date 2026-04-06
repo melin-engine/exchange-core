@@ -174,4 +174,113 @@ lot_size_inverse = 1
         assert_eq!(map.get("BTC/USD"), Some(&0));
         assert_eq!(map.get("ETH/USD"), Some(&1));
     }
+
+    #[test]
+    fn deserialize_missing_sessions_is_error() {
+        let toml = r#"
+server_addr = "127.0.0.1:9876"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+"#;
+        let result: Result<GatewayConfig, _> = toml::from_str(toml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("session"));
+    }
+
+    #[test]
+    fn deserialize_missing_symbols_is_error() {
+        let toml = r#"
+server_addr = "127.0.0.1:9876"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 1
+key_path = "keys/firm_a.key"
+"#;
+        let result: Result<GatewayConfig, _> = toml::from_str(toml);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("symbol"));
+    }
+
+    #[test]
+    fn validate_duplicate_sender_comp_id() {
+        let toml = r#"
+server_addr = "127.0.0.1:9876"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 1
+key_path = "keys/firm_a.key"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 2
+key_path = "keys/firm_b.key"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+"#;
+        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate sender_comp_id"));
+    }
+
+    #[test]
+    fn validate_duplicate_fix_symbol() {
+        let toml = r#"
+server_addr = "127.0.0.1:9876"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 1
+key_path = "keys/firm_a.key"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 2
+tick_size_inverse = 100
+"#;
+        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate fix_symbol"));
+    }
+
+    #[test]
+    fn lot_size_inverse_defaults_to_one() {
+        let toml = r#"
+server_addr = "127.0.0.1:9876"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 1
+key_path = "keys/firm_a.key"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+"#;
+        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.symbols[0].lot_size_inverse, 1);
+    }
 }

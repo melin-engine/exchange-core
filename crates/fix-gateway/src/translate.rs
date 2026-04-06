@@ -673,4 +673,592 @@ mod tests {
             _ => panic!("expected SubmitOrder"),
         }
     }
+
+    #[test]
+    fn translate_stop_order() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "STOP1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "2")
+            .str_tag(tags::ORD_TYPE, "3") // Stop
+            .str_tag(tags::STOP_PX, "48000.00")
+            .str_tag(tags::ORDER_QTY, "5")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match new_order_single(&msg, &mut ctx).unwrap() {
+            Request::SubmitOrder { order, .. } => match order.order_type {
+                OrderType::Stop { trigger_price } => {
+                    assert_eq!(trigger_price.get(), 4_800_000);
+                }
+                _ => panic!("expected Stop"),
+            },
+            _ => panic!("expected SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn translate_stop_limit_order() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "STOPLIM1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "4") // StopLimit
+            .str_tag(tags::STOP_PX, "49000.00")
+            .str_tag(tags::PRICE, "49500.00")
+            .str_tag(tags::ORDER_QTY, "3")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match new_order_single(&msg, &mut ctx).unwrap() {
+            Request::SubmitOrder { order, .. } => match order.order_type {
+                OrderType::StopLimit {
+                    trigger_price,
+                    limit_price,
+                } => {
+                    assert_eq!(trigger_price.get(), 4_900_000);
+                    assert_eq!(limit_price.get(), 4_950_000);
+                }
+                _ => panic!("expected StopLimit"),
+            },
+            _ => panic!("expected SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn translate_time_in_force_ioc() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "IOC1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "3") // IOC
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match new_order_single(&msg, &mut ctx).unwrap() {
+            Request::SubmitOrder { order, .. } => {
+                assert_eq!(order.time_in_force, TimeInForce::IOC);
+            }
+            _ => panic!("expected SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn translate_time_in_force_fok() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "FOK1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "4") // FOK
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match new_order_single(&msg, &mut ctx).unwrap() {
+            Request::SubmitOrder { order, .. } => {
+                assert_eq!(order.time_in_force, TimeInForce::FOK);
+            }
+            _ => panic!("expected SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn translate_invalid_time_in_force() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "BAD_TIF")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "9") // Invalid
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        assert!(matches!(
+            new_order_single(&msg, &mut ctx),
+            Err(TranslateError::InvalidValue { tag: 59, .. })
+        ));
+    }
+
+    #[test]
+    fn translate_invalid_side() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "BAD_SIDE")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "9")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        assert!(matches!(
+            new_order_single(&msg, &mut ctx),
+            Err(TranslateError::InvalidValue { tag: 54, .. })
+        ));
+    }
+
+    #[test]
+    fn translate_invalid_ord_type() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "BAD_OT")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "X")
+            .str_tag(tags::ORDER_QTY, "10")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        assert!(matches!(
+            new_order_single(&msg, &mut ctx),
+            Err(TranslateError::InvalidValue { tag: 40, .. })
+        ));
+    }
+
+    #[test]
+    fn translate_missing_clord_id() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        assert!(matches!(
+            new_order_single(&msg, &mut ctx),
+            Err(TranslateError::MissingTag(11))
+        ));
+    }
+
+    #[test]
+    fn translate_zero_quantity_rejected() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ZERO_QTY")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "0")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        assert!(matches!(
+            new_order_single(&msg, &mut ctx),
+            Err(TranslateError::ZeroQuantity)
+        ));
+    }
+
+    #[test]
+    fn translate_account_override() {
+        let raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ACCT_OVR")
+            .str_tag(tags::ACCOUNT, "42")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "1")
+            .build("FIRM", "MELIN", 1);
+
+        let msg = FixMessage::parse(&raw).unwrap();
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match new_order_single(&msg, &mut ctx).unwrap() {
+            Request::SubmitOrder { order, .. } => {
+                assert_eq!(order.account, AccountId(42));
+            }
+            _ => panic!("expected SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn translate_cancel_order() {
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+
+        // First, submit an order so it's registered in the id_map.
+        let submit_raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORIG001")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .build("FIRM", "MELIN", 1);
+        let submit_msg = FixMessage::parse(&submit_raw).unwrap();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+        new_order_single(&submit_msg, &mut ctx).unwrap();
+
+        // Now cancel it.
+        let cancel_raw = FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REQUEST)
+            .str_tag(tags::CL_ORD_ID, "CXL001")
+            .str_tag(tags::ORIG_CL_ORD_ID, "ORIG001")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .build("FIRM", "MELIN", 2);
+        let cancel_msg = FixMessage::parse(&cancel_raw).unwrap();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match cancel_order(&cancel_msg, &mut ctx).unwrap() {
+            Request::CancelOrder {
+                symbol,
+                account,
+                order_id,
+            } => {
+                assert_eq!(symbol, Symbol(1));
+                assert_eq!(account, AccountId(1));
+                assert_eq!(order_id, OrderId(1));
+            }
+            _ => panic!("expected CancelOrder"),
+        }
+    }
+
+    #[test]
+    fn translate_cancel_unknown_order() {
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+
+        let cancel_raw = FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REQUEST)
+            .str_tag(tags::CL_ORD_ID, "CXL002")
+            .str_tag(tags::ORIG_CL_ORD_ID, "NONEXISTENT")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .build("FIRM", "MELIN", 1);
+        let cancel_msg = FixMessage::parse(&cancel_raw).unwrap();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        assert!(matches!(
+            cancel_order(&cancel_msg, &mut ctx),
+            Err(TranslateError::InvalidValue { tag: 41, .. })
+        ));
+    }
+
+    #[test]
+    fn translate_cancel_replace_order() {
+        let symbols = sample_symbols();
+        let mut id_map = ClOrdIdMap::new();
+
+        // Submit original order.
+        let submit_raw = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORIG002")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .build("FIRM", "MELIN", 1);
+        let submit_msg = FixMessage::parse(&submit_raw).unwrap();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+        new_order_single(&submit_msg, &mut ctx).unwrap();
+
+        // Cancel-replace with new price and quantity.
+        let replace_raw = FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REPLACE)
+            .str_tag(tags::CL_ORD_ID, "REP001")
+            .str_tag(tags::ORIG_CL_ORD_ID, "ORIG002")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "51000.00")
+            .str_tag(tags::ORDER_QTY, "15")
+            .build("FIRM", "MELIN", 2);
+        let replace_msg = FixMessage::parse(&replace_raw).unwrap();
+        let mut ctx = TranslateContext {
+            account_id: AccountId(1),
+            symbols: &symbols,
+            id_map: &mut id_map,
+        };
+
+        match cancel_replace(&replace_msg, &mut ctx).unwrap() {
+            Request::CancelReplace {
+                symbol,
+                account,
+                order_id,
+                new_price,
+                new_quantity,
+            } => {
+                assert_eq!(symbol, Symbol(1));
+                assert_eq!(account, AccountId(1));
+                assert_eq!(order_id, OrderId(1));
+                assert_eq!(new_price.get(), 5_100_000); // 51000.00 * 100
+                assert_eq!(new_quantity.get(), 15);
+            }
+            _ => panic!("expected CancelReplace"),
+        }
+    }
+
+    #[test]
+    fn exec_report_placed() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("ORD_P1");
+
+        let report = ExecutionReport::Placed {
+            order_id: OrderId(1),
+            side: Side::Buy,
+            price: Price(NonZeroU64::new(5_000_000).unwrap()),
+            quantity: Quantity(NonZeroU64::new(10).unwrap()),
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("ORD_P1"));
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("0")); // New
+        assert_eq!(msg.get_str(tags::ORD_STATUS), Some("0")); // New
+        assert_eq!(msg.get_str(tags::SYMBOL), Some("BTC/USD"));
+        assert_eq!(msg.get_str(tags::SIDE), Some("1")); // Buy
+        assert_eq!(msg.get_str(tags::PRICE), Some("50000.00"));
+        assert_eq!(msg.get_str(tags::ORDER_QTY), Some("10"));
+    }
+
+    #[test]
+    fn exec_report_fill() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("MAKER1");
+        id_map.insert("TAKER1");
+
+        let report = ExecutionReport::Fill {
+            maker_order_id: OrderId(1),
+            taker_order_id: OrderId(2),
+            maker_account: AccountId(10),
+            taker_account: AccountId(20),
+            price: Price(NonZeroU64::new(5_000_000).unwrap()),
+            quantity: Quantity(NonZeroU64::new(5).unwrap()),
+            maker_fee: -10,
+            taker_fee: 25,
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("F")); // Trade
+        assert_eq!(msg.get_str(tags::LAST_PX), Some("50000.00"));
+        assert_eq!(msg.get_str(tags::LAST_SHARES), Some("5"));
+        // Taker fee in Text field.
+        assert_eq!(msg.get_str(tags::TEXT), Some("25"));
+    }
+
+    #[test]
+    fn exec_report_cancelled() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("CXL_ORD");
+
+        let report = ExecutionReport::Cancelled {
+            order_id: OrderId(1),
+            account: AccountId(1),
+            remaining_quantity: Quantity(NonZeroU64::new(5).unwrap()),
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("4")); // Canceled
+        assert_eq!(msg.get_str(tags::ORD_STATUS), Some("4"));
+        assert_eq!(msg.get_str(tags::LEAVES_QTY), Some("0"));
+        assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("CXL_ORD"));
+    }
+
+    #[test]
+    fn exec_report_rejected() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("REJ_ORD");
+
+        let report = ExecutionReport::Rejected {
+            order_id: OrderId(1),
+            account: AccountId(1),
+            reason: RejectReason::InsufficientBalance,
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("8")); // Rejected
+        assert_eq!(msg.get_str(tags::ORD_STATUS), Some("8"));
+        assert_eq!(msg.get_str(tags::ORD_REJ_REASON), Some("3")); // Insufficient buying power
+        assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("REJ_ORD"));
+    }
+
+    #[test]
+    fn exec_report_replaced() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("REP_ORD");
+
+        let report = ExecutionReport::Replaced {
+            order_id: OrderId(1),
+            side: Side::Sell,
+            old_price: Price(NonZeroU64::new(5_000_000).unwrap()),
+            new_price: Price(NonZeroU64::new(5_100_000).unwrap()),
+            old_remaining: Quantity(NonZeroU64::new(10).unwrap()),
+            new_remaining: Quantity(NonZeroU64::new(15).unwrap()),
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("5")); // Replace
+        assert_eq!(msg.get_str(tags::ORD_STATUS), Some("0")); // Still resting
+        assert_eq!(msg.get_str(tags::SIDE), Some("2")); // Sell
+        assert_eq!(msg.get_str(tags::PRICE), Some("51000.00"));
+        assert_eq!(msg.get_str(tags::LEAVES_QTY), Some("15"));
+    }
+
+    #[test]
+    fn exec_report_triggered() {
+        let mut id_map = ClOrdIdMap::new();
+        id_map.insert("TRIG_ORD");
+
+        let report = ExecutionReport::Triggered {
+            order_id: OrderId(1),
+            trigger_price: Price(NonZeroU64::new(4_800_000).unwrap()),
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("L")); // Triggered
+        assert_eq!(msg.get_str(tags::STOP_PX), Some("48000.00"));
+    }
+
+    #[test]
+    fn exec_report_instrument_status_empty() {
+        let id_map = ClOrdIdMap::new();
+
+        let report = ExecutionReport::InstrumentStatusChanged {
+            symbol: Symbol(1),
+            status: melin_engine::types::InstrumentStatus::Enabled,
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 100, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        // InstrumentStatusChanged has no FIX equivalent — empty output.
+        assert!(fix_bytes.is_empty());
+    }
+
+    #[test]
+    fn exec_report_unknown_clord_id_uses_unknown() {
+        let id_map = ClOrdIdMap::new(); // Empty map.
+
+        let report = ExecutionReport::Placed {
+            order_id: OrderId(999),
+            side: Side::Buy,
+            price: Price(NonZeroU64::new(100).unwrap()),
+            quantity: Quantity(NonZeroU64::new(1).unwrap()),
+        };
+
+        let fix_bytes = execution_report_to_fix(
+            &report, &id_map, "BTC/USD", 1, 1, "MELIN", "FIRM", 1, 1,
+        );
+
+        let msg = FixMessage::parse(&fix_bytes).unwrap();
+        assert_eq!(msg.get_str(tags::CL_ORD_ID), Some("UNKNOWN"));
+    }
 }
