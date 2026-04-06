@@ -74,6 +74,10 @@ impl GatewayConfig {
         if self.symbols.is_empty() {
             return Err("at least one [[symbol]] is required".into());
         }
+        // IPv6 Melin server addresses are not yet supported.
+        if self.server_addr.is_ipv6() {
+            return Err("server_addr must be IPv4 (IPv6 not yet supported)".into());
+        }
         // Check for duplicate SenderCompIDs.
         let mut seen = std::collections::HashSet::new();
         for s in &self.sessions {

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signer, SigningKey};
 use tracing::{debug, error, info, warn};
 
-use melin_engine::types::AccountId;
+use melin_engine::types::{AccountId, OrderId};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 
@@ -23,6 +23,18 @@ use crate::fix::serialize::FixMessageBuilder;
 use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
 use crate::translate::{self, TranslateContext};
+
+// ---------------------------------------------------------------------------
+// Order → symbol mapping for exec report translation
+// ---------------------------------------------------------------------------
+
+/// Per-order metadata needed to translate Melin execution reports back
+/// to FIX with correct symbol names and price/quantity scaling.
+struct OrderSymbolInfo {
+    fix_symbol: String,
+    tick_inverse: u64,
+    lot_inverse: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -53,6 +65,9 @@ pub struct Session {
     pub fix_fd: RawFd,
     pub fix_parse_buf: Vec<u8>,
     pub fix_send_buf: Vec<u8>,
+    /// Buffer currently being sent by io_uring — must not be mutated
+    /// until the corresponding SEND CQE arrives.
+    pub fix_inflight: Vec<u8>,
     /// Expected next inbound MsgSeqNum from the FIX client.
     fix_inbound_seq: u64,
     /// Next outbound MsgSeqNum to the FIX client.
@@ -60,12 +75,20 @@ pub struct Session {
     pub sender_comp_id: String,
     pub heartbeat_interval: Duration,
     pub last_fix_recv: Instant,
+    /// Last time we sent any FIX message (for outbound heartbeat timing).
+    pub last_fix_sent: Instant,
+    /// When we sent a TestRequest (tag 112) to probe a silent client.
+    /// If the client doesn't respond within HeartBtInt, we disconnect.
+    pub test_request_sent_at: Option<Instant>,
     pub fix_multishot_active: bool,
 
     // ── Melin server side ──
     pub melin_fd: Option<RawFd>,
     pub melin_parse_buf: Vec<u8>,
     pub melin_send_buf: Vec<u8>,
+    /// Buffer currently being sent by io_uring — must not be mutated
+    /// until the corresponding SEND CQE arrives.
+    pub melin_inflight: Vec<u8>,
     /// Melin request sequence number (per-key monotonic).
     melin_seq: u64,
     /// Reusable encode buffer for Melin requests.
@@ -74,6 +97,9 @@ pub struct Session {
 
     // ── Session-owned data ──
     id_map: ClOrdIdMap,
+    /// Maps Melin OrderId → symbol/scaling info for exec report translation.
+    /// Populated when orders are submitted, consulted when exec reports arrive.
+    order_symbols: HashMap<OrderId, OrderSymbolInfo>,
     account_id: AccountId,
     signing_key: Option<SigningKey>,
     /// Index into config.sessions for this FIX session.
@@ -98,21 +124,26 @@ impl Session {
             fix_fd,
             fix_parse_buf: Vec::with_capacity(512),
             fix_send_buf: Vec::with_capacity(512),
+            fix_inflight: Vec::with_capacity(512),
             fix_inbound_seq: 1,
             fix_outbound_seq: 1,
             sender_comp_id: String::new(),
             heartbeat_interval: Duration::from_secs(30),
             last_fix_recv: now,
+            last_fix_sent: now,
+            test_request_sent_at: None,
             fix_multishot_active: false,
 
             melin_fd: None,
             melin_parse_buf: Vec::with_capacity(256),
             melin_send_buf: Vec::with_capacity(256),
+            melin_inflight: Vec::with_capacity(256),
             melin_seq: 0,
             melin_encode_buf: [0u8; 136],
             melin_multishot_active: false,
 
             id_map: ClOrdIdMap::new(),
+            order_symbols: HashMap::new(),
             account_id: AccountId(0),
             signing_key: None,
             session_config_idx: None,
@@ -343,8 +374,7 @@ impl Session {
                         &self.sender_comp_id,
                         self.fix_outbound_seq,
                     );
-                self.fix_send_buf.extend_from_slice(&logon_response);
-                self.fix_outbound_seq += 1;
+                self.queue_fix_raw(&logon_response);
 
                 // Clean up auth state.
                 self.auth_nonce = None;
@@ -385,6 +415,10 @@ impl Session {
             }
         };
 
+        // Any valid message from the client proves it's alive —
+        // cancel any pending TestRequest probe.
+        self.test_request_sent_at = None;
+
         // Validate MsgSeqNum.
         if let Some(seq) = msg.msg_seq_num() {
             if seq < self.fix_inbound_seq {
@@ -416,8 +450,7 @@ impl Session {
                         &self.sender_comp_id,
                         self.fix_outbound_seq,
                     );
-                self.fix_send_buf.extend_from_slice(&hb);
-                self.fix_outbound_seq += 1;
+                self.queue_fix_raw(&hb);
                 SessionAction::SendFix
             }
             tags::MSG_LOGOUT => {
@@ -463,6 +496,28 @@ impl Session {
 
         match request {
             Ok(req) => {
+                // Record order → symbol mapping so we can translate
+                // execution reports back with correct symbol/scaling.
+                if let Some(fix_sym) = msg.get_str(tags::SYMBOL) {
+                    if let Some(sym_cfg) = symbol_map.get(fix_sym) {
+                        let order_id = match &req {
+                            Request::SubmitOrder { order, .. } => Some(order.id),
+                            Request::CancelOrder { order_id, .. } => Some(*order_id),
+                            Request::CancelReplace { order_id, .. } => Some(*order_id),
+                            _ => None,
+                        };
+                        if let Some(oid) = order_id {
+                            self.order_symbols.entry(oid).or_insert_with(|| {
+                                OrderSymbolInfo {
+                                    fix_symbol: fix_sym.to_owned(),
+                                    tick_inverse: sym_cfg.tick_size_inverse,
+                                    lot_inverse: sym_cfg.lot_size_inverse,
+                                }
+                            });
+                        }
+                    }
+                }
+
                 self.melin_seq += 1;
                 match codec::encode_request(&req, self.melin_seq, &mut self.melin_encode_buf) {
                     Ok(written) => {
@@ -505,18 +560,24 @@ impl Session {
 
         match response {
             ResponseKind::Report(ref report) => {
-                // TODO: track order→symbol mapping for proper symbol/tick
-                // resolution. For v1, use defaults.
-                let default_symbol = "UNKNOWN";
-                let default_tick = 1u64;
-                let default_lot = 1u64;
+                // Look up symbol/scaling info from the order that
+                // produced this execution report.
+                let order_id = report_order_id(report);
+                let info = order_id.and_then(|id| self.order_symbols.get(&id));
+                let (symbol_str, tick_inv, lot_inv) = match info {
+                    Some(i) => (i.fix_symbol.as_str(), i.tick_inverse, i.lot_inverse),
+                    None => {
+                        debug!("exec report for unknown order, using defaults");
+                        ("UNKNOWN", 1, 1)
+                    }
+                };
 
                 let fix_msg = translate::execution_report_to_fix(
                     report,
                     &self.id_map,
-                    default_symbol,
-                    default_tick,
-                    default_lot,
+                    symbol_str,
+                    tick_inv,
+                    lot_inv,
                     &config.target_comp_id,
                     &self.sender_comp_id,
                     self.fix_outbound_seq,
@@ -524,8 +585,7 @@ impl Session {
                 );
 
                 if !fix_msg.is_empty() {
-                    self.fix_send_buf.extend_from_slice(&fix_msg);
-                    self.fix_outbound_seq += 1;
+                    self.queue_fix_raw(&fix_msg);
                     self.exec_id += 1;
                     SessionAction::SendFix
                 } else {
@@ -560,8 +620,7 @@ impl Session {
         let msg = FixMessageBuilder::new(tags::MSG_LOGOUT)
             .str_tag(tags::TEXT, text)
             .build(&config.target_comp_id, target, self.fix_outbound_seq);
-        self.fix_send_buf.extend_from_slice(&msg);
-        self.fix_outbound_seq += 1;
+        self.queue_fix_raw(&msg);
         self.state = SessionState::Closing;
     }
 
@@ -573,8 +632,75 @@ impl Session {
                 &self.sender_comp_id,
                 self.fix_outbound_seq,
             );
-        self.fix_send_buf.extend_from_slice(&msg);
+        self.queue_fix_raw(&msg);
+    }
+
+    /// Append a serialized FIX message to the send buffer and bump
+    /// the outbound sequence counter + last-sent timestamp.
+    fn queue_fix_raw(&mut self, msg: &[u8]) {
+        self.fix_send_buf.extend_from_slice(msg);
         self.fix_outbound_seq += 1;
+        self.last_fix_sent = Instant::now();
+    }
+
+    // -----------------------------------------------------------------------
+    // Heartbeat management
+    // -----------------------------------------------------------------------
+
+    /// Check heartbeat timers and return an action if the event loop
+    /// needs to send or close.
+    ///
+    /// FIX heartbeat protocol:
+    /// 1. If we haven't sent anything in HeartBtInt, send a Heartbeat.
+    /// 2. If we haven't received anything in HeartBtInt, send a
+    ///    TestRequest to probe the client.
+    /// 3. If the TestRequest goes unanswered for HeartBtInt, disconnect.
+    pub fn check_heartbeat(&mut self, now: Instant, config: &GatewayConfig) -> SessionAction {
+        if !matches!(self.state, SessionState::Active) {
+            return SessionAction::None;
+        }
+
+        let hb = self.heartbeat_interval;
+        let since_recv = now.duration_since(self.last_fix_recv);
+        let since_sent = now.duration_since(self.last_fix_sent);
+
+        // Step 3: TestRequest was sent and timed out → disconnect.
+        if let Some(sent_at) = self.test_request_sent_at {
+            if now.duration_since(sent_at) > hb {
+                warn!(sender = %self.sender_comp_id, "FIX heartbeat timeout (TestRequest unanswered)");
+                self.queue_fix_logout(config, "heartbeat timeout");
+                return SessionAction::Close;
+            }
+        }
+
+        // Step 2: Haven't heard from client in HeartBtInt → send TestRequest.
+        if since_recv > hb && self.test_request_sent_at.is_none() {
+            let test_req_id = format!("TR{}", self.fix_outbound_seq);
+            let msg = FixMessageBuilder::new(tags::MSG_TEST_REQUEST)
+                .str_tag(tags::TEST_REQ_ID, &test_req_id)
+                .build(
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                );
+            self.queue_fix_raw(&msg);
+            self.test_request_sent_at = Some(now);
+            return SessionAction::SendFix;
+        }
+
+        // Step 1: Haven't sent anything in HeartBtInt → send Heartbeat.
+        if since_sent > hb {
+            let msg = FixMessageBuilder::new(tags::MSG_HEARTBEAT)
+                .build(
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                );
+            self.queue_fix_raw(&msg);
+            return SessionAction::SendFix;
+        }
+
+        SessionAction::None
     }
 }
 
@@ -592,6 +718,24 @@ impl Drop for Session {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+use melin_engine::types::ExecutionReport;
+
+/// Extract the primary order ID from an execution report for
+/// order→symbol lookups.
+fn report_order_id(report: &ExecutionReport) -> Option<OrderId> {
+    match report {
+        ExecutionReport::Placed { order_id, .. }
+        | ExecutionReport::Cancelled { order_id, .. }
+        | ExecutionReport::Rejected { order_id, .. }
+        | ExecutionReport::Replaced { order_id, .. }
+        | ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+        ExecutionReport::Fill {
+            taker_order_id, ..
+        } => Some(*taker_order_id),
+        ExecutionReport::InstrumentStatusChanged { .. } => None,
+    }
+}
 
 /// Load a 32-byte Ed25519 private key seed from a file.
 fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {

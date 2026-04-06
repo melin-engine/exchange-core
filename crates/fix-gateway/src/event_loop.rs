@@ -50,8 +50,9 @@ const HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const OP_ACCEPT: u64 = 0x00 << 56;
 const OP_FIX_RECV: u64 = 0x01 << 56;
 const OP_MELIN_RECV: u64 = 0x02 << 56;
-const OP_SEND: u64 = 0x03 << 56;
-const OP_CONNECT: u64 = 0x04 << 56;
+const OP_SEND_FIX: u64 = 0x03 << 56;
+const OP_SEND_MELIN: u64 = 0x04 << 56;
+const OP_CONNECT: u64 = 0x05 << 56;
 const OP_MASK: u64 = 0xFF << 56;
 const IDX_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
@@ -269,7 +270,8 @@ impl Gateway {
                     OP_MELIN_RECV => {
                         self.handle_melin_recv(slab_idx(token), result, flags, now);
                     }
-                    OP_SEND => self.handle_send_complete(slab_idx(token), result),
+                    OP_SEND_FIX => self.handle_fix_send_complete(slab_idx(token), result),
+                    OP_SEND_MELIN => self.handle_melin_send_complete(slab_idx(token), result),
                     OP_CONNECT => self.handle_melin_connected(slab_idx(token), result, now),
                     _ => {
                         debug!(token, "unknown op type in CQE");
@@ -277,19 +279,15 @@ impl Gateway {
                 }
             }
 
-            // Remove sessions marked for cleanup.
-            for idx in self.to_remove.drain(..) {
-                if let Some(session) = self.sessions.remove(idx) {
-                    debug!(
-                        sender = %session.sender_comp_id,
-                        "session removed"
-                    );
-                    // Fds are closed when the OwnedFd fields in Session drop.
-                }
-            }
-
-            // Flush pending outbound data.
+            // Flush pending outbound data before removing sessions,
+            // so closing sessions can send their final messages
+            // (e.g., FIX Logout).
             self.flush_dirty_sends();
+
+            // Remove sessions that are safe to remove (no in-flight
+            // SEND SQEs referencing session buffers). Sessions with
+            // pending sends are deferred until the send completes.
+            self.drain_removals();
 
             // Periodic heartbeat check.
             if now.duration_since(self.last_heartbeat_check) >= HEARTBEAT_CHECK_INTERVAL {
@@ -659,6 +657,13 @@ impl Gateway {
     // -----------------------------------------------------------------------
 
     fn flush_dirty_sends(&mut self) {
+        // Dedup: multiple messages processed in one CQE batch can push
+        // the same session index, causing redundant send SQEs.
+        self.dirty_fix.sort_unstable();
+        self.dirty_fix.dedup();
+        self.dirty_melin.sort_unstable();
+        self.dirty_melin.dedup();
+
         // Flush FIX outbound.
         let fix_dirty: Vec<usize> = self.dirty_fix.drain(..).collect();
         for idx in fix_dirty {
@@ -666,17 +671,28 @@ impl Gateway {
                 Some(s) => s,
                 None => continue,
             };
-            if session.fix_send_buf.is_empty() {
+
+            if !session.fix_inflight.is_empty() {
+                // Previous send partially completed — resubmit the
+                // remaining bytes. The buffer is stable (untouched
+                // since the partial CQE).
+            } else if !session.fix_send_buf.is_empty() {
+                // New data: swap send_buf into inflight so the buffer
+                // is stable while the kernel reads it. New messages
+                // that arrive while the send is in flight will append
+                // to send_buf (now empty) without disturbing inflight.
+                std::mem::swap(&mut session.fix_send_buf, &mut session.fix_inflight);
+            } else {
                 continue;
             }
 
             let sqe = opcode::Send::new(
                 types::Fd(session.fix_fd),
-                session.fix_send_buf.as_ptr(),
-                session.fix_send_buf.len() as u32,
+                session.fix_inflight.as_ptr(),
+                session.fix_inflight.len() as u32,
             )
             .build()
-            .user_data(OP_SEND | idx as u64);
+            .user_data(OP_SEND_FIX | idx as u64);
 
             unsafe {
                 self.ring
@@ -697,17 +713,22 @@ impl Gateway {
                 Some(fd) => fd,
                 None => continue,
             };
-            if session.melin_send_buf.is_empty() {
+
+            if !session.melin_inflight.is_empty() {
+                // Partial send remainder — resubmit.
+            } else if !session.melin_send_buf.is_empty() {
+                std::mem::swap(&mut session.melin_send_buf, &mut session.melin_inflight);
+            } else {
                 continue;
             }
 
             let sqe = opcode::Send::new(
                 types::Fd(melin_fd),
-                session.melin_send_buf.as_ptr(),
-                session.melin_send_buf.len() as u32,
+                session.melin_inflight.as_ptr(),
+                session.melin_inflight.len() as u32,
             )
             .build()
-            .user_data(OP_SEND | idx as u64);
+            .user_data(OP_SEND_MELIN | idx as u64);
 
             unsafe {
                 self.ring
@@ -718,35 +739,97 @@ impl Gateway {
         }
     }
 
-    fn handle_send_complete(&mut self, idx: usize, result: i32) {
+    fn handle_fix_send_complete(&mut self, idx: usize, result: i32) {
         if result < 0 {
-            let err = std::io::Error::from_raw_os_error(-result);
             if let Some(session) = self.sessions.get(idx) {
-                debug!(sender = %session.sender_comp_id, error = %err, "send error");
+                debug!(sender = %session.sender_comp_id, error = result, "FIX send error");
             }
             self.to_remove.push(idx);
             return;
         }
 
         let sent = result as usize;
-
-        // Drain sent bytes from both send buffers (only the non-empty one
-        // was submitted, but checking both is simpler and correct).
-        if let Some(session) = self.sessions.get_mut(idx) {
-            if !session.fix_send_buf.is_empty() {
-                if sent >= session.fix_send_buf.len() {
-                    session.fix_send_buf.clear();
+        let (needs_requeue, needs_remove) = match self.sessions.get_mut(idx) {
+            Some(session) => {
+                if sent >= session.fix_inflight.len() {
+                    session.fix_inflight.clear();
                 } else {
-                    session.fix_send_buf.drain(..sent);
-                    // Partial send — requeue.
-                    self.dirty_fix.push(idx);
+                    session.fix_inflight.drain(..sent);
                 }
-            } else if !session.melin_send_buf.is_empty() {
-                if sent >= session.melin_send_buf.len() {
-                    session.melin_send_buf.clear();
+                let requeue = !session.fix_inflight.is_empty()
+                    || !session.fix_send_buf.is_empty();
+                // If this Closing session has no more data to send on
+                // either side, it can be removed.
+                let remove = !requeue
+                    && matches!(session.state, SessionState::Closing)
+                    && session.melin_inflight.is_empty();
+                (requeue, remove)
+            }
+            None => (false, false),
+        };
+        if needs_requeue {
+            self.dirty_fix.push(idx);
+        }
+        if needs_remove {
+            self.to_remove.push(idx);
+        }
+    }
+
+    fn handle_melin_send_complete(&mut self, idx: usize, result: i32) {
+        if result < 0 {
+            if let Some(session) = self.sessions.get(idx) {
+                debug!(sender = %session.sender_comp_id, error = result, "Melin send error");
+            }
+            self.to_remove.push(idx);
+            return;
+        }
+
+        let sent = result as usize;
+        let (needs_requeue, needs_remove) = match self.sessions.get_mut(idx) {
+            Some(session) => {
+                if sent >= session.melin_inflight.len() {
+                    session.melin_inflight.clear();
                 } else {
-                    session.melin_send_buf.drain(..sent);
-                    self.dirty_melin.push(idx);
+                    session.melin_inflight.drain(..sent);
+                }
+                let requeue = !session.melin_inflight.is_empty()
+                    || !session.melin_send_buf.is_empty();
+                let remove = !requeue
+                    && matches!(session.state, SessionState::Closing)
+                    && session.fix_inflight.is_empty();
+                (requeue, remove)
+            }
+            None => (false, false),
+        };
+        if needs_requeue {
+            self.dirty_melin.push(idx);
+        }
+        if needs_remove {
+            self.to_remove.push(idx);
+        }
+    }
+
+    /// Remove sessions from the slab, deferring any that still have
+    /// io_uring SEND SQEs in flight (their inflight buffers are
+    /// non-empty and the kernel may still be reading from them).
+    fn drain_removals(&mut self) {
+        let pending: Vec<usize> = self.to_remove.drain(..).collect();
+        for idx in pending {
+            let can_remove = self.sessions.get(idx).map_or(true, |s| {
+                s.fix_inflight.is_empty() && s.melin_inflight.is_empty()
+            });
+            if can_remove {
+                if let Some(session) = self.sessions.remove(idx) {
+                    debug!(sender = %session.sender_comp_id, "session removed");
+                }
+            } else {
+                // Sends still in flight — mark as Closing so the send
+                // completion handler will schedule removal once the
+                // kernel is done with the buffers.
+                if let Some(session) = self.sessions.get_mut(idx) {
+                    if !matches!(session.state, SessionState::Closing) {
+                        session.state = SessionState::Closing;
+                    }
                 }
             }
         }
@@ -757,24 +840,26 @@ impl Gateway {
     // -----------------------------------------------------------------------
 
     fn check_heartbeats(&mut self, now: Instant) {
-        let mut to_disconnect: Vec<usize> = Vec::new();
+        // Collect actions first — can't borrow self.sessions and push
+        // to self.dirty_fix/to_remove at the same time.
+        let mut actions: Vec<(usize, SessionAction)> = Vec::new();
 
         for (idx, session) in self.sessions.iter_mut() {
-            if !matches!(session.state, SessionState::Active) {
-                continue;
-            }
-
-            let elapsed = now.duration_since(session.last_fix_recv);
-
-            if elapsed > session.heartbeat_interval * 2 {
-                // Client unresponsive — disconnect.
-                warn!(sender = %session.sender_comp_id, "FIX heartbeat timeout");
-                to_disconnect.push(idx);
+            let action = session.check_heartbeat(now, self.config);
+            if !matches!(action, SessionAction::None) {
+                actions.push((idx, action));
             }
         }
 
-        for idx in to_disconnect {
-            self.to_remove.push(idx);
+        for (idx, action) in actions {
+            match action {
+                SessionAction::SendFix => self.dirty_fix.push(idx),
+                SessionAction::Close => {
+                    self.dirty_fix.push(idx);
+                    self.to_remove.push(idx);
+                }
+                _ => {}
+            }
         }
     }
 
