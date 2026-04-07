@@ -5,7 +5,7 @@
 //! arrives, and the session responds with a `SessionAction` indicating
 //! what I/O the event loop should perform.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,12 @@ use crate::fix::serialize::FixMessageBuilder;
 use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
 use crate::translate::{self, TranslateContext};
+
+/// Maximum outbound messages retained per session for ResendRequest
+/// replay. At ~250 bytes/msg this caps the store at ~2.5 MB per
+/// session — enough to satisfy any realistic gap recovery while
+/// preventing unbounded growth from a peer that never reads.
+const MAX_OUTBOUND_STORE_MSGS: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Order → symbol mapping for exec report translation
@@ -120,10 +126,17 @@ pub struct Session {
     /// Stateless session model: a fresh TCP connection starts with
     /// an empty store and seq=1. There is no cross-session
     /// persistence — clients that need that must reconnect and
-    /// re-Logon. Vec (not VecDeque) because lookup is by linear
-    /// scan over a contiguous range and the store is appended to
-    /// in seq order.
-    outbound_store: Vec<(u64, Vec<u8>)>,
+    /// re-Logon.
+    ///
+    /// Bounded at `MAX_OUTBOUND_STORE_MSGS` entries to cap per-session
+    /// memory: a misbehaving (or hostile) client that never reads
+    /// would otherwise grow this without limit. When full, the oldest
+    /// entry is evicted on each new push. A subsequent ResendRequest
+    /// for an evicted seq is answered with a SequenceReset-GapFill
+    /// covering the missing range, which FIX 4.2 §4.7 explicitly
+    /// permits when stored messages are no longer available.
+    /// VecDeque so eviction at the front is O(1).
+    outbound_store: VecDeque<(u64, Vec<u8>)>,
 
     // ── Session-owned data ──
     id_map: ClOrdIdMap,
@@ -184,7 +197,7 @@ impl Session {
             melin_encode_buf: [0u8; 136],
             melin_multishot_active: false,
 
-            outbound_store: Vec::with_capacity(64),
+            outbound_store: VecDeque::with_capacity(64),
 
             id_map: ClOrdIdMap::new(),
             order_symbols: HashMap::new(),
@@ -939,6 +952,24 @@ impl Session {
         let mut admin_run_last: u64 = 0;
         let mut to_emit: Vec<Vec<u8>> = Vec::new();
 
+        // If the store has been evicted past `begin`, the messages in
+        // [begin, oldest_stored) are gone. FIX 4.2 §4.7 permits
+        // answering with a SequenceReset-GapFill that skips the
+        // missing range. Synthesize one before the normal replay.
+        if let Some((oldest, _)) = self.outbound_store.front()
+            && *oldest > begin
+        {
+            let gap_end = (*oldest).min(effective_end + 1);
+            if gap_end > begin {
+                to_emit.push(build_gap_fill(
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    begin,
+                    gap_end,
+                ));
+            }
+        }
+
         for (stored_seq, stored_bytes) in &self.outbound_store {
             if *stored_seq < begin {
                 continue;
@@ -1080,7 +1111,13 @@ impl Session {
     fn queue_fix_raw(&mut self, msg: &[u8]) {
         let stored_seq = self.fix_outbound_seq;
         self.fix_send_buf.extend_from_slice(msg);
-        self.outbound_store.push((stored_seq, msg.to_vec()));
+        if self.outbound_store.len() == MAX_OUTBOUND_STORE_MSGS {
+            // Drop the oldest entry to make room. A future
+            // ResendRequest for an evicted seq is answered with a
+            // SequenceReset-GapFill in handle_resend_request.
+            self.outbound_store.pop_front();
+        }
+        self.outbound_store.push_back((stored_seq, msg.to_vec()));
         self.fix_outbound_seq += 1;
         self.last_fix_sent = Instant::now();
     }
@@ -2329,8 +2366,7 @@ lot_size_inverse = 1
 
         // Each stored entry's seq matches its position and round-trips
         // through the parser cleanly.
-        let new_entries = &s.outbound_store[initial_store_len..];
-        for (offset, (seq, bytes)) in new_entries.iter().enumerate() {
+        for (offset, (seq, bytes)) in s.outbound_store.iter().skip(initial_store_len).enumerate() {
             assert_eq!(*seq, 2 + offset as u64);
             let parsed = FixMessage::parse(bytes).expect("stored msg parses");
             assert_eq!(parsed.msg_type(), tags::MSG_HEARTBEAT); // TestRequest reply
@@ -2631,6 +2667,53 @@ lot_size_inverse = 1
         s.handle_fix_message(&rr, &config, &smap, &sym);
 
         assert!(s.fix_send_buf.is_empty());
+    }
+
+    #[test]
+    fn outbound_store_evicts_oldest_when_full_and_resend_returns_gap_fill() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 1;
+        s.outbound_store.clear();
+
+        // Fill past the cap. Each push beyond the cap evicts the oldest.
+        let overshoot = 5usize;
+        for i in 0..(super::MAX_OUTBOUND_STORE_MSGS + overshoot) {
+            let hb =
+                FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 1 + i as u64);
+            s.queue_fix_raw(&hb);
+        }
+        assert_eq!(s.outbound_store.len(), super::MAX_OUTBOUND_STORE_MSGS);
+        let oldest = s.outbound_store.front().unwrap().0;
+        assert_eq!(
+            oldest,
+            1 + overshoot as u64,
+            "front advanced past evictions"
+        );
+        let _ = drain_send_buf(&mut s);
+
+        // ResendRequest beginning at seq 1 — fully inside the evicted
+        // range — must produce a single SequenceReset-GapFill collapsing
+        // both the lost prefix and the surviving admin run.
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 1)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", inbound);
+        s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        let out = drain_send_buf(&mut s);
+        // First message must be the synthesized GapFill for [1, oldest).
+        let first = FixMessage::parse(&out[0]).unwrap();
+        assert_eq!(first.msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(first.get_str(tags::GAP_FILL_FLAG), Some("Y"));
+        assert_eq!(first.msg_seq_num(), Some(1));
+        assert_eq!(
+            first.get_str(tags::NEW_SEQ_NO),
+            Some(oldest.to_string().as_str())
+        );
     }
 
     #[test]
