@@ -189,6 +189,11 @@ impl<'a> FixMessage<'a> {
         self.get_str(tags::SENDER_COMP_ID)
     }
 
+    /// Get the TargetCompID (tag 56) as a string.
+    pub fn target_comp_id(&self) -> Option<&'a str> {
+        self.get_str(tags::TARGET_COMP_ID)
+    }
+
     /// Get the MsgSeqNum (tag 34) as u64.
     pub fn msg_seq_num(&self) -> Option<u64> {
         self.get(tags::MSG_SEQ_NUM).and_then(parse_u64_slice)

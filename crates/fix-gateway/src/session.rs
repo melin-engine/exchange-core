@@ -228,6 +228,20 @@ impl Session {
             return SessionAction::Close;
         }
 
+        // FIX 4.2 §4.5: every message must carry a TargetCompID that
+        // matches the receiver's configured SenderCompID. A mismatch
+        // is a client-side misconfiguration — reply with Logout and
+        // disconnect rather than attempting recovery.
+        if msg.target_comp_id() != Some(config.target_comp_id.as_str()) {
+            warn!(
+                target = msg.target_comp_id().unwrap_or("?"),
+                expected = %config.target_comp_id,
+                "Logon TargetCompID mismatch"
+            );
+            self.queue_fix_logout(config, "invalid TargetCompID");
+            return SessionAction::Close;
+        }
+
         let sender_comp_id = match msg.sender_comp_id() {
             Some(s) => s,
             None => {
@@ -451,6 +465,19 @@ impl Session {
                 return SessionAction::SendFix;
             }
         };
+
+        // TargetCompID must match on every inbound message — not
+        // just Logon. A mid-session mismatch indicates the peer got
+        // reconfigured or we're seeing a replayed/misrouted packet.
+        if msg.target_comp_id() != Some(config.target_comp_id.as_str()) {
+            warn!(
+                sender = %self.sender_comp_id,
+                target = msg.target_comp_id().unwrap_or("?"),
+                "TargetCompID mismatch in active session"
+            );
+            self.queue_fix_logout(config, "invalid TargetCompID");
+            return SessionAction::Close;
+        }
 
         // Any valid message from the client proves it's alive —
         // cancel any pending TestRequest probe.
@@ -1201,6 +1228,42 @@ lot_size_inverse = 1
 
         assert_eq!(action, SessionAction::Close);
         assert!(matches!(s.state, SessionState::Closing));
+    }
+
+    #[test]
+    fn logon_wrong_target_comp_id_closes() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = new_session(Instant::now());
+
+        // TargetCompID "WRONG" does not match config.target_comp_id="MELIN".
+        let raw = logon_msg("FIRM_A", "WRONG", 1, 30);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(matches!(s.state, SessionState::Closing));
+        // Logout was queued.
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_LOGOUT);
+        assert_eq!(parsed.get_str(tags::TEXT), Some("invalid TargetCompID"));
+    }
+
+    #[test]
+    fn active_wrong_target_comp_id_closes() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Send a heartbeat with wrong TargetCompID.
+        let raw = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("FIRM_A", "WRONG", 2);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(matches!(s.state, SessionState::Closing));
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_LOGOUT);
     }
 
     #[test]
