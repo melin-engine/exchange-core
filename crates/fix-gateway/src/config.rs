@@ -12,6 +12,11 @@ pub struct GatewayConfig {
     pub server_addr: SocketAddr,
     /// Address to listen for FIX client connections.
     pub listen_addr: SocketAddr,
+    /// Optional address for the Prometheus `/metrics` endpoint.
+    /// When unset, metrics are still collected on the hot path but
+    /// no scrape endpoint is exposed.
+    #[serde(default)]
+    pub metrics_addr: Option<SocketAddr>,
     /// TargetCompID that this gateway presents to FIX clients.
     pub target_comp_id: String,
     /// FIX session definitions.

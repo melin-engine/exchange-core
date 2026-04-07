@@ -22,6 +22,7 @@ use crate::fix::parse::FixMessage;
 use crate::fix::serialize::FixMessageBuilder;
 use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
+use crate::metrics::GatewayMetrics;
 use crate::translate::{self, TranslateContext};
 
 /// Maximum outbound messages retained per session for ResendRequest
@@ -168,11 +169,14 @@ pub struct Session {
     // ── Connect state ──
     /// Stored sockaddr for the io_uring CONNECT SQE lifetime.
     pub connect_addr: Option<libc::sockaddr_in>,
+
+    /// Process-wide metrics surface. Shared across all sessions.
+    pub metrics: &'static GatewayMetrics,
 }
 
 impl Session {
     /// Create a new session for a just-accepted FIX client socket.
-    pub fn new(fix_fd: RawFd, now: Instant) -> Self {
+    pub fn new(fix_fd: RawFd, now: Instant, metrics: &'static GatewayMetrics) -> Self {
         Self {
             state: SessionState::AwaitingLogon,
             fix_fd,
@@ -213,6 +217,7 @@ impl Session {
 
             auth_nonce: None,
             connect_addr: None,
+            metrics,
         }
     }
 
@@ -229,6 +234,12 @@ impl Session {
         session_map: &HashMap<String, usize>,
         symbol_map: &HashMap<String, SymbolConfig>,
     ) -> SessionAction {
+        // One count per complete FIX frame handed to the session,
+        // regardless of parse outcome. parse_errors_total captures the
+        // subset that fails to parse below.
+        self.metrics
+            .messages_received_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.state {
             SessionState::AwaitingLogon => self.handle_logon(raw, config, session_map),
             SessionState::Active => self.handle_active_fix(raw, config, symbol_map),
@@ -253,6 +264,9 @@ impl Session {
         let msg = match FixMessage::parse(raw) {
             Ok(m) => m,
             Err(e) => {
+                self.metrics
+                    .parse_errors_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(error = %e, "malformed FIX Logon");
                 return SessionAction::Close;
             }
@@ -495,6 +509,9 @@ impl Session {
         let msg = match FixMessage::parse(raw) {
             Ok(m) => m,
             Err(e) => {
+                self.metrics
+                    .parse_errors_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(error = %e, "malformed FIX message");
                 self.queue_fix_reject(config, &e.to_string());
                 return SessionAction::SendFix;
@@ -585,6 +602,9 @@ impl Session {
                 SessionAction::Close
             }
             tags::MSG_RESEND_REQUEST => {
+                self.metrics
+                    .resend_requests_received_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let begin = msg.get_str(tags::BEGIN_SEQ_NO).and_then(|s| s.parse().ok());
                 let end = msg.get_str(tags::END_SEQ_NO).and_then(|s| s.parse().ok());
                 match (begin, end) {
@@ -605,6 +625,9 @@ impl Session {
                 if self.check_rate_limit() {
                     self.translate_and_send_order(msg_type, &msg, config, symbol_map)
                 } else {
+                    self.metrics
+                        .rate_limit_hits_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     warn!(sender = %self.sender_comp_id, "message rate limit exceeded");
                     self.queue_fix_reject(config, "message rate limit exceeded");
                     SessionAction::SendFix
@@ -1015,10 +1038,17 @@ impl Session {
 
         // Append all replays to the outbound buffer in one shot.
         // These do NOT go through queue_fix_raw — they reuse the
-        // original seq numbers and must not bump fix_outbound_seq.
+        // original seq numbers and must not bump fix_outbound_seq or
+        // re-store the replayed bytes. They DO count toward
+        // messages_sent_total, which tracks frames written to the
+        // wire (replay storms must show up on the operator dashboard).
+        let replay_count = to_emit.len() as u64;
         for bytes in to_emit {
             self.fix_send_buf.extend_from_slice(&bytes);
         }
+        self.metrics
+            .messages_sent_total
+            .fetch_add(replay_count, std::sync::atomic::Ordering::Relaxed);
         self.last_fix_sent = Instant::now();
     }
 
@@ -1077,6 +1107,9 @@ impl Session {
     /// "through infinity" per FIX 4.2 — the peer should resend
     /// everything from `begin` onward.
     fn queue_resend_request(&mut self, config: &GatewayConfig, begin: u64, end: u64) {
+        self.metrics
+            .resend_requests_sent_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
             .u64_tag(tags::BEGIN_SEQ_NO, begin)
             .u64_tag(tags::END_SEQ_NO, end)
@@ -1116,10 +1149,16 @@ impl Session {
             // ResendRequest for an evicted seq is answered with a
             // SequenceReset-GapFill in handle_resend_request.
             self.outbound_store.pop_front();
+            self.metrics
+                .store_evictions_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.outbound_store.push_back((stored_seq, msg.to_vec()));
         self.fix_outbound_seq += 1;
         self.last_fix_sent = Instant::now();
+        self.metrics
+            .messages_sent_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------------
@@ -1432,7 +1471,8 @@ lot_size_inverse = 1
     /// Build a fresh session in `AwaitingLogon`. `now` is fixed so
     /// heartbeat-timer tests can advance it deterministically.
     fn new_session(now: Instant) -> Session {
-        Session::new(fake_fd(), now)
+        let metrics = crate::metrics::GatewayMetrics::leak_default();
+        Session::new(fake_fd(), now, metrics)
     }
 
     /// Construct a session already in `Active` state, bypassing the
@@ -2292,6 +2332,148 @@ lot_size_inverse = 1
         assert_eq!(parsed.get_str(tags::EXEC_TYPE), Some("5")); // Replace
         assert_eq!(parsed.get_str(tags::PRICE), Some("51000.00"));
         assert_eq!(parsed.get_str(tags::LEAVES_QTY), Some("15"));
+    }
+
+    #[test]
+    fn metrics_counters_advance_through_session_hot_path() {
+        use std::sync::atomic::Ordering;
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        let m = s.metrics;
+
+        let received_before = m.messages_received_total.load(Ordering::Relaxed);
+        let sent_before = m.messages_sent_total.load(Ordering::Relaxed);
+        let parse_before = m.parse_errors_total.load(Ordering::Relaxed);
+        let rr_recv_before = m.resend_requests_received_total.load(Ordering::Relaxed);
+        let rr_sent_before = m.resend_requests_sent_total.load(Ordering::Relaxed);
+
+        // (1) A clean TestRequest: counts as one received and queues a Heartbeat reply.
+        let tr = FixMessageBuilder::new(tags::MSG_TEST_REQUEST)
+            .str_tag(tags::TEST_REQ_ID, "TID1")
+            .build("FIRM_A", "MELIN", s.fix_inbound_seq);
+        let act = s.handle_fix_message(&tr, &config, &smap, &sym);
+        assert_eq!(act, SessionAction::SendFix);
+
+        // (2) A malformed message: counts as received + parse error.
+        let _ = s.handle_fix_message(b"not even FIX", &config, &smap, &sym);
+
+        // (3) A peer ResendRequest: counts received + resend_requests_received.
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 1)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", s.fix_inbound_seq);
+        let _ = s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        // (4) Direct queue_resend_request: counts resend_requests_sent.
+        s.queue_resend_request(&config, 5, 10);
+
+        assert_eq!(
+            m.messages_received_total.load(Ordering::Relaxed) - received_before,
+            3,
+            "three handle_fix_message dispatches"
+        );
+        assert!(
+            m.messages_sent_total.load(Ordering::Relaxed) > sent_before,
+            "at least one outbound message was queued"
+        );
+        assert_eq!(
+            m.parse_errors_total.load(Ordering::Relaxed) - parse_before,
+            1
+        );
+        assert_eq!(
+            m.resend_requests_received_total.load(Ordering::Relaxed) - rr_recv_before,
+            1
+        );
+        assert_eq!(
+            m.resend_requests_sent_total.load(Ordering::Relaxed) - rr_sent_before,
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_store_evictions_increment_when_cap_reached() {
+        use std::sync::atomic::Ordering;
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 1;
+        s.outbound_store.clear();
+
+        let evictions_before = s.metrics.store_evictions_total.load(Ordering::Relaxed);
+        // Push exactly cap+3 messages; the last 3 must each evict one.
+        for i in 0..(super::MAX_OUTBOUND_STORE_MSGS + 3) {
+            let hb =
+                FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 1 + i as u64);
+            s.queue_fix_raw(&hb);
+        }
+        assert_eq!(
+            s.metrics.store_evictions_total.load(Ordering::Relaxed) - evictions_before,
+            3
+        );
+    }
+
+    #[test]
+    fn metrics_messages_sent_includes_resend_replays() {
+        use std::sync::atomic::Ordering;
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 2;
+        s.outbound_store.clear();
+
+        // Stage three heartbeats — they will collapse into a single
+        // SequenceReset-GapFill on replay, so the replay produces
+        // exactly one outbound frame.
+        for i in 0..3 {
+            let hb =
+                FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 2 + i as u64);
+            s.queue_fix_raw(&hb);
+        }
+        let _ = drain_send_buf(&mut s);
+        let sent_before = s.metrics.messages_sent_total.load(Ordering::Relaxed);
+
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 2)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", inbound);
+        let _ = s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        // The replay path bypasses queue_fix_raw but must still bump
+        // messages_sent_total — one frame for the GapFill.
+        assert_eq!(
+            s.metrics.messages_sent_total.load(Ordering::Relaxed) - sent_before,
+            1,
+            "replay-emitted GapFill must count as a sent message"
+        );
+    }
+
+    #[test]
+    fn metrics_rate_limit_hits_increment_when_window_full() {
+        use std::sync::atomic::Ordering;
+        let mut config = make_config("FIRM_A", "MELIN");
+        config.sessions[0].max_msgs_per_sec = 1;
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let t0 = Instant::now();
+        let mut s = active_session(&config, t0);
+        s.max_msgs_per_sec = 1;
+        s.rate_window_start = t0;
+
+        let before = s.metrics.rate_limit_hits_total.load(Ordering::Relaxed);
+        // First message: allowed.
+        let m1 = new_order_msg("FIRM_A", "MELIN", 2, "ORD1");
+        let _ = s.handle_fix_message(&m1, &config, &smap, &sym);
+        // Second message in same window: rate-limited.
+        let m2 = new_order_msg("FIRM_A", "MELIN", 3, "ORD2");
+        let _ = s.handle_fix_message(&m2, &config, &smap, &sym);
+
+        assert_eq!(
+            s.metrics.rate_limit_hits_total.load(Ordering::Relaxed) - before,
+            1
+        );
     }
 
     #[test]
