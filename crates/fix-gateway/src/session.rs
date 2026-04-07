@@ -2717,6 +2717,77 @@ lot_size_inverse = 1
     }
 
     #[test]
+    fn resend_straddling_eviction_emits_gap_fill_then_replays_live_messages() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 1;
+        s.outbound_store.clear();
+
+        // Fill the store to the cap with admin (heartbeats), then push
+        // two extra heartbeats to evict the oldest two, then one
+        // application ExecutionReport on the very end.
+        let cap = super::MAX_OUTBOUND_STORE_MSGS;
+        let overshoot = 2usize;
+        for i in 0..(cap + overshoot) {
+            let hb =
+                FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 1 + i as u64);
+            s.queue_fix_raw(&hb);
+        }
+        // Tail application message at seq cap + overshoot + 1.
+        let app_seq = (cap + overshoot + 1) as u64;
+        let er = FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .build("MELIN", "FIRM_A", app_seq);
+        s.queue_fix_raw(&er);
+
+        assert_eq!(s.outbound_store.len(), cap);
+        let oldest_live = s.outbound_store.front().unwrap().0;
+        // Loop pushed cap+overshoot, then the ER push evicted one more.
+        assert_eq!(oldest_live, 1 + overshoot as u64 + 1);
+        let _ = drain_send_buf(&mut s);
+
+        // ResendRequest [1 .. app_seq]: begin is in the evicted range,
+        // end is the live application message. Expected output:
+        //   1. GapFill spanning [1, oldest_live) — covers evicted seqs
+        //   2. GapFill collapsing the live admin run [oldest_live, app_seq)
+        //   3. Replay of the application ER at app_seq with PossDupFlag
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 1)
+            .u64_tag(tags::END_SEQ_NO, app_seq)
+            .build("FIRM_A", "MELIN", inbound);
+        s.handle_fix_message(&rr, &config, &smap, &sym);
+        let out = drain_send_buf(&mut s);
+        assert_eq!(out.len(), 3, "leading GapFill + admin GapFill + ER replay");
+
+        let first = FixMessage::parse(&out[0]).unwrap();
+        assert_eq!(first.msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(first.get_str(tags::GAP_FILL_FLAG), Some("Y"));
+        assert_eq!(first.msg_seq_num(), Some(1));
+        assert_eq!(
+            first.get_str(tags::NEW_SEQ_NO),
+            Some(oldest_live.to_string().as_str())
+        );
+
+        let second = FixMessage::parse(&out[1]).unwrap();
+        assert_eq!(second.msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(second.get_str(tags::GAP_FILL_FLAG), Some("Y"));
+        assert_eq!(second.msg_seq_num(), Some(oldest_live));
+        assert_eq!(
+            second.get_str(tags::NEW_SEQ_NO),
+            Some(app_seq.to_string().as_str())
+        );
+
+        let third = FixMessage::parse(&out[2]).unwrap();
+        assert_eq!(third.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(third.msg_seq_num(), Some(app_seq));
+        assert_eq!(third.get_str(tags::POSS_DUP_FLAG), Some("Y"));
+        assert_eq!(third.get_str(tags::CL_ORD_ID), Some("ORD1"));
+    }
+
+    #[test]
     fn handle_resend_request_replays_do_not_advance_outbound_seq() {
         let config = make_config("FIRM_A", "MELIN");
         let smap = session_map(&config);
