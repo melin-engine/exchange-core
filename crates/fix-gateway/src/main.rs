@@ -11,6 +11,7 @@ mod config;
 mod event_loop;
 mod fix;
 mod id_map;
+mod metrics;
 mod price;
 mod session;
 #[cfg(test)]
@@ -88,8 +89,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // program's lifetime, so this is safe.
     let config: &'static config::GatewayConfig = Box::leak(Box::new(config));
 
+    // Allocate the metrics surface and leak it as 'static — same
+    // pattern as the config: lives for the program's lifetime.
+    let metrics = metrics::GatewayMetrics::leak_default();
+
     // Create and run the single-threaded io_uring gateway.
-    let mut gateway = event_loop::Gateway::new(listener, config)?;
+    let mut gateway = event_loop::Gateway::new(listener, config, metrics)?;
     gateway.run(&shutdown)?;
 
     info!("FIX gateway shut down");

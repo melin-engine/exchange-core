@@ -149,6 +149,7 @@ impl Slab {
 pub struct Gateway {
     ring: IoUring,
     config: &'static GatewayConfig,
+    metrics: &'static crate::metrics::GatewayMetrics,
     listener_fd: RawFd,
     sessions: Slab,
     /// Contiguous buffer pool for io_uring provided buffers.
@@ -173,6 +174,7 @@ impl Gateway {
     pub fn new(
         listener: TcpListener,
         config: &'static GatewayConfig,
+        metrics: &'static crate::metrics::GatewayMetrics,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut ring = IoUring::new(RING_SIZE)?;
         // Take ownership of the fd so it stays open for the program's
@@ -201,6 +203,7 @@ impl Gateway {
         Ok(Self {
             ring,
             config,
+            metrics,
             listener_fd,
             sessions: Slab::new(),
             buffer_pool,
@@ -338,8 +341,12 @@ impl Gateway {
         info!(peer = %peer, fd, "FIX client connected");
 
         // Create a new session in AwaitingLogon state.
-        let session = Session::new(fd, now);
+        let session = Session::new(fd, now, self.metrics);
         let idx = self.sessions.insert(session);
+        self.metrics
+            .sessions_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.sessions_active.fetch_add(1, Ordering::Relaxed);
 
         // Submit multishot RECV on the FIX client socket.
         self.push_fix_recv_multi(idx);
@@ -810,6 +817,7 @@ impl Gateway {
             if can_remove {
                 if let Some(session) = self.sessions.remove(idx) {
                     debug!(sender = %session.sender_comp_id, "session removed");
+                    self.metrics.sessions_active.fetch_sub(1, Ordering::Relaxed);
                 }
             } else {
                 // Sends still in flight — mark as Closing so the send
@@ -1099,7 +1107,8 @@ lot_size_inverse = 1
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let join = std::thread::spawn(move || {
-            let mut gw = Gateway::new(listener, config).expect("gateway new");
+            let metrics = crate::metrics::GatewayMetrics::leak_default();
+            let mut gw = Gateway::new(listener, config, metrics).expect("gateway new");
             gw.run(&shutdown_clone).expect("gateway run");
         });
         GwHandle {
@@ -1197,11 +1206,12 @@ lot_size_inverse = 1
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = make_config("FIRM_A", "MELIN");
-        let mut gw = Gateway::new(listener, config).expect("gateway new");
+        let metrics = crate::metrics::GatewayMetrics::leak_default();
+        let mut gw = Gateway::new(listener, config, metrics).expect("gateway new");
 
         // Insert a fake session with non-empty inflight.
         let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
-        let mut session = Session::new(dummy_fd, Instant::now());
+        let mut session = Session::new(dummy_fd, Instant::now(), metrics);
         session.fix_inflight = b"PENDING SEND".to_vec();
         let idx = gw.sessions.insert(session);
 
@@ -1225,10 +1235,11 @@ lot_size_inverse = 1
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = make_config("FIRM_A", "MELIN");
-        let mut gw = Gateway::new(listener, config).expect("gateway new");
+        let metrics = crate::metrics::GatewayMetrics::leak_default();
+        let mut gw = Gateway::new(listener, config, metrics).expect("gateway new");
 
         let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
-        let mut session = Session::new(dummy_fd, Instant::now());
+        let mut session = Session::new(dummy_fd, Instant::now(), metrics);
         session.melin_inflight = b"PENDING SEND".to_vec();
         let idx = gw.sessions.insert(session);
 
