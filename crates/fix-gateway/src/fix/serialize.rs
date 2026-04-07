@@ -115,9 +115,12 @@ fn append_field(buf: &mut Vec<u8>, tag: u32, value: &[u8]) {
 /// Current UTC time in FIX format: YYYYMMDD-HH:MM:SS.sss
 fn sending_time() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // A pre-epoch system clock means the host is fundamentally
+    // misconfigured; emitting a bogus 1970 SendingTime would silently
+    // produce non-compliant FIX messages. Crash loudly instead.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+        .expect("system clock is before UNIX_EPOCH");
     let secs = now.as_secs();
     let millis = now.subsec_millis();
 
