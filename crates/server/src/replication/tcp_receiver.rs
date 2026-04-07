@@ -732,6 +732,32 @@ pub fn run_receiver(
             // replication throughput.
             warn!(error = %e, "failed to set TCP_NODELAY on replica receive socket");
         }
+        // Enable SO_BUSY_POLL: kernel busy-polls the NIC for incoming data
+        // for up to N µs after each blocking read instead of going to sleep.
+        // Removes softirq → wakeup handoff latency, which dominates
+        // replica recv jitter on high-IRQ-cost NICs (e.g. ixgbe). Costs CPU
+        // cycles in the receiver thread — acceptable since we already
+        // spin-wait there. 50 µs covers a typical LAN ack RTT.
+        {
+            use std::os::unix::io::AsRawFd;
+            let busy_poll: libc::c_int = 50;
+            let rc = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BUSY_POLL,
+                    &busy_poll as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                // Best-effort: requires CAP_NET_ADMIN and a NIC driver that
+                // supports it. Surface as warn so a misconfigured kernel is
+                // visible without halting replication.
+                let err = std::io::Error::last_os_error();
+                warn!(error = %err, "failed to set SO_BUSY_POLL on replica receive socket");
+            }
+        }
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
         let mut reader = stream.try_clone()?;
