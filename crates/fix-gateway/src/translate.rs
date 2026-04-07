@@ -18,6 +18,31 @@ use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
 use crate::price;
 
+/// Look up a ClOrdID for an OrderId, logging a warning on miss.
+///
+/// A miss means the gateway is emitting a FIX exec report for an
+/// OrderId it doesn't have in its id_map — usually a bug in routing
+/// or in id_map upkeep, occasionally a legitimate cross-session fill
+/// (maker side of a self-trade where the maker is on a different
+/// session). Either way it should not pass silently: callers used to
+/// substitute "UNKNOWN" with no audit trail, hiding both bugs and
+/// genuinely orphaned reports. We still emit "UNKNOWN" on the wire
+/// (dropping the report would be worse — clients reconcile by
+/// OrderID too) but log it as a warning so operators can grep for it.
+fn resolve_clord_id<'a>(id_map: &'a ClOrdIdMap, order_id: OrderId, context: &str) -> &'a str {
+    match id_map.get_clord_id(order_id) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                order_id = order_id.0,
+                context,
+                "no ClOrdID in id_map for order; emitting UNKNOWN"
+            );
+            "UNKNOWN"
+        }
+    }
+}
+
 /// Errors during FIX → Melin translation.
 #[derive(Debug)]
 pub enum TranslateError {
@@ -358,7 +383,7 @@ pub fn execution_report_to_fix(
             price,
             quantity,
         } => {
-            let clord_id = id_map.get_clord_id(*order_id).unwrap_or("UNKNOWN");
+            let clord_id = resolve_clord_id(id_map, *order_id, "Placed");
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
@@ -396,10 +421,20 @@ pub fn execution_report_to_fix(
             // Fill reports directly via fill_report_for_order to emit
             // separate reports for maker and taker with correct sides.
             let order_id = taker_order_id;
-            let clord_id = id_map
+            let clord_id = match id_map
                 .get_clord_id(*order_id)
                 .or_else(|| id_map.get_clord_id(*maker_order_id))
-                .unwrap_or("UNKNOWN");
+            {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(
+                        taker_order_id = order_id.0,
+                        maker_order_id = maker_order_id.0,
+                        "no ClOrdID in id_map for fill (taker or maker); emitting UNKNOWN"
+                    );
+                    "UNKNOWN"
+                }
+            };
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
@@ -434,7 +469,7 @@ pub fn execution_report_to_fix(
             remaining_quantity: _,
             ..
         } => {
-            let clord_id = id_map.get_clord_id(*order_id).unwrap_or("UNKNOWN");
+            let clord_id = resolve_clord_id(id_map, *order_id, "Cancelled");
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
@@ -452,7 +487,7 @@ pub fn execution_report_to_fix(
         ExecutionReport::Rejected {
             order_id, reason, ..
         } => {
-            let clord_id = id_map.get_clord_id(*order_id).unwrap_or("UNKNOWN");
+            let clord_id = resolve_clord_id(id_map, *order_id, "Rejected");
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
@@ -477,7 +512,7 @@ pub fn execution_report_to_fix(
             new_remaining,
             ..
         } => {
-            let clord_id = id_map.get_clord_id(*order_id).unwrap_or("UNKNOWN");
+            let clord_id = resolve_clord_id(id_map, *order_id, "Replaced");
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
@@ -503,7 +538,7 @@ pub fn execution_report_to_fix(
             order_id,
             trigger_price,
         } => {
-            let clord_id = id_map.get_clord_id(*order_id).unwrap_or("UNKNOWN");
+            let clord_id = resolve_clord_id(id_map, *order_id, "Triggered");
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
@@ -583,7 +618,7 @@ pub fn fill_report_for_order(
         sender,
         target,
     } = *ctx;
-    let clord_id = id_map.get_clord_id(order_id).unwrap_or("UNKNOWN");
+    let clord_id = resolve_clord_id(id_map, order_id, "fill_report");
     FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
         .str_tag(tags::ORDER_ID, &order_id.0.to_string())
         .str_tag(tags::CL_ORD_ID, clord_id)
