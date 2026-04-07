@@ -263,10 +263,20 @@ fn replica_stream_uring(
                 let _ = ring.submit();
                 let mut bp_cqes: [(u64, i32, u32); 16] = [(0, 0, 0); 16];
                 let mut bp_count = 0;
-                for cqe in ring.completion() {
-                    if bp_count < bp_cqes.len() {
-                        bp_cqes[bp_count] = (cqe.user_data(), cqe.result(), cqe.flags());
-                        bp_count += 1;
+                {
+                    // Drain only what fits in the local buffer; iterating
+                    // past the cap would consume cqes from the CQ and
+                    // silently drop their data — including the buffer id
+                    // for multishot recv, which would leak provided buffers.
+                    let mut cq = ring.completion();
+                    while bp_count < bp_cqes.len() {
+                        match cq.next() {
+                            Some(cqe) => {
+                                bp_cqes[bp_count] = (cqe.user_data(), cqe.result(), cqe.flags());
+                                bp_count += 1;
+                            }
+                            None => break,
+                        }
                     }
                 }
                 for &(bp_token, bp_result, bp_flags) in &bp_cqes[..bp_count] {
@@ -379,10 +389,20 @@ fn replica_stream_uring(
 
         let mut cqes: [(u64, i32, u32); 16] = [(0, 0, 0); 16];
         let mut cqe_count = 0;
-        for cqe in ring.completion() {
-            if cqe_count < cqes.len() {
-                cqes[cqe_count] = (cqe.user_data(), cqe.result(), cqe.flags());
-                cqe_count += 1;
+        {
+            // Drain only what fits in the local buffer; iterating past
+            // the cap would consume cqes from the CQ and silently drop
+            // their data — including the buffer id for multishot recv,
+            // which would leak provided buffers and corrupt parse_buf.
+            let mut cq = ring.completion();
+            while cqe_count < cqes.len() {
+                match cq.next() {
+                    Some(cqe) => {
+                        cqes[cqe_count] = (cqe.user_data(), cqe.result(), cqe.flags());
+                        cqe_count += 1;
+                    }
+                    None => break,
+                }
             }
         }
 
