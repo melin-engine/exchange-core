@@ -718,8 +718,16 @@ impl Gateway {
 
     fn handle_fix_send_complete(&mut self, idx: usize, result: i32) {
         if result < 0 {
-            if let Some(session) = self.sessions.get(idx) {
+            // Clear the inflight buffer before queueing removal.
+            // drain_removals refuses to remove sessions whose inflight
+            // buffers are non-empty (the kernel may still be reading
+            // them) — but on a SEND error the operation is *complete*,
+            // the kernel is no longer touching the bytes, so the buffer
+            // is safe to drop. Without this, every send error leaks
+            // the session permanently into the slab.
+            if let Some(session) = self.sessions.get_mut(idx) {
                 debug!(sender = %session.sender_comp_id, error = result, "FIX send error");
+                session.fix_inflight.clear();
             }
             self.to_remove.push(idx);
             return;
@@ -753,8 +761,12 @@ impl Gateway {
 
     fn handle_melin_send_complete(&mut self, idx: usize, result: i32) {
         if result < 0 {
-            if let Some(session) = self.sessions.get(idx) {
+            // See comment in handle_fix_send_complete: clear the
+            // inflight buffer so drain_removals can actually remove
+            // this session. Otherwise it leaks permanently.
+            if let Some(session) = self.sessions.get_mut(idx) {
                 debug!(sender = %session.sender_comp_id, error = result, "Melin send error");
+                session.melin_inflight.clear();
             }
             self.to_remove.push(idx);
             return;
@@ -1169,6 +1181,66 @@ lot_size_inverse = 1
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Direct unit tests for handler-internal invariants
+    // -----------------------------------------------------------------------
+
+    /// Construct a Gateway, plant `bytes` in `fix_inflight`, simulate a
+    /// SEND error CQE, and assert the buffer was cleared and the session
+    /// is queued for removal. Without the fix, drain_removals would
+    /// refuse to remove the session because inflight is non-empty.
+    #[test]
+    fn fix_send_error_clears_inflight_so_session_can_be_removed() {
+        use crate::session::Session;
+        use std::os::unix::io::IntoRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = make_config("FIRM_A", "MELIN");
+        let mut gw = Gateway::new(listener, config).expect("gateway new");
+
+        // Insert a fake session with non-empty inflight.
+        let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let mut session = Session::new(dummy_fd, Instant::now());
+        session.fix_inflight = b"PENDING SEND".to_vec();
+        let idx = gw.sessions.insert(session);
+
+        gw.handle_fix_send_complete(idx, -32); // EPIPE
+
+        let session = gw.sessions.get(idx).expect("session still in slab");
+        assert!(
+            session.fix_inflight.is_empty(),
+            "inflight must be cleared on send error"
+        );
+        assert!(
+            gw.to_remove.contains(&idx),
+            "session must be queued for removal"
+        );
+    }
+
+    #[test]
+    fn melin_send_error_clears_inflight_so_session_can_be_removed() {
+        use crate::session::Session;
+        use std::os::unix::io::IntoRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = make_config("FIRM_A", "MELIN");
+        let mut gw = Gateway::new(listener, config).expect("gateway new");
+
+        let dummy_fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+        let mut session = Session::new(dummy_fd, Instant::now());
+        session.melin_inflight = b"PENDING SEND".to_vec();
+        let idx = gw.sessions.insert(session);
+
+        gw.handle_melin_send_complete(idx, -104); // ECONNRESET
+
+        let session = gw.sessions.get(idx).expect("session still in slab");
+        assert!(
+            session.melin_inflight.is_empty(),
+            "melin inflight must be cleared on send error"
+        );
+        assert!(gw.to_remove.contains(&idx));
+    }
 
     #[test]
     fn unknown_sender_gets_logout_and_disconnects() {
