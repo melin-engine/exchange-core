@@ -36,7 +36,6 @@ enum FrameResult {
 }
 
 /// Try to extract one length-prefixed frame from a receive buffer.
-#[cfg(feature = "dpdk")]
 fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
     if buf.len() < 4 {
         return FrameResult::Incomplete;
@@ -52,7 +51,6 @@ fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
 }
 
 /// Compact a receive buffer by removing consumed bytes from the front.
-#[cfg(feature = "dpdk")]
 fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
     if consumed > 0 {
         buf.drain(..consumed);
@@ -69,7 +67,6 @@ fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
 ///
 /// The protocol is identical to `run_sender` — same wire format, same
 /// handshake, same streaming logic. Only the I/O primitives differ.
-#[cfg(feature = "dpdk")]
 pub fn run_sender_dpdk(
     mut transport: melin_dpdk::DpdkTransport,
     repl_consumers: [ReplicationConsumer; 2],
@@ -574,7 +571,6 @@ pub fn run_sender_dpdk(
 /// DPDK-adapted journal catch-up: reads journal files and sends DataBatch
 /// frames via the DPDK transport. Periodically polls the transport to flush
 /// TX and keep smoltcp's timers alive.
-#[cfg(feature = "dpdk")]
 fn catch_up_from_journal_dpdk(
     journal_path: &std::path::Path,
     last_sequence: u64,
@@ -679,7 +675,6 @@ fn catch_up_from_journal_dpdk(
 /// Transfer a snapshot to a replica via DPDK, then catch up from journals.
 /// Sends: NeedSnapshot → SnapshotBegin → SnapshotChunk* → SnapshotEnd →
 /// StreamStart → DataBatch* (catch-up).
-#[cfg(feature = "dpdk")]
 fn snapshot_transfer_dpdk(
     journal_path: &std::path::Path,
     genesis_entry: &[u8],
@@ -782,7 +777,6 @@ fn snapshot_transfer_dpdk(
 ///
 /// The protocol is identical to `run_receiver` — same wire format, same
 /// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
-#[cfg(feature = "dpdk")]
 pub fn run_receiver_dpdk(
     mut transport: melin_dpdk::DpdkTransport,
     primary_ip: std::net::Ipv4Addr,
@@ -1384,7 +1378,6 @@ pub fn run_receiver_dpdk(
 /// Receive a snapshot from the primary via DPDK transport.
 /// Expects: SnapshotBegin → SnapshotChunk* → SnapshotEnd.
 /// Returns the loaded Exchange, snapshot sequence, and chain hash.
-#[cfg(feature = "dpdk")]
 fn receive_snapshot_dpdk(
     handle: melin_dpdk::SocketHandle,
     transport: &mut melin_dpdk::DpdkTransport,
