@@ -11,9 +11,13 @@
 /// `inverse` is `1 / tick_size` — e.g., if tick_size is 0.01 then
 /// inverse is 100. Pure integer arithmetic: no floats.
 ///
-/// Returns `None` if the string is malformed, negative, or has more
-/// decimal places than the inverse supports.
+/// Returns `None` if the string is malformed, negative, has more
+/// decimal places than the inverse supports, `inverse` is zero, or
+/// the result would overflow `u64`.
 pub fn decimal_to_ticks(s: &str, inverse: u64) -> Option<u64> {
+    if inverse == 0 {
+        return None;
+    }
     let s = s.trim();
     if s.is_empty() || s.starts_with('-') {
         return None;
@@ -52,7 +56,7 @@ pub fn decimal_to_ticks(s: &str, inverse: u64) -> Option<u64> {
         return None;
     };
 
-    Some(int_val * inverse + frac_val)
+    int_val.checked_mul(inverse)?.checked_add(frac_val)
 }
 
 /// Convert Melin ticks back to a FIX decimal price string.
@@ -143,6 +147,17 @@ mod tests {
     #[test]
     fn no_integer_part() {
         assert_eq!(decimal_to_ticks(".50", 100), Some(50));
+    }
+
+    #[test]
+    fn overflow_rejected() {
+        // u64::MAX * 100 overflows.
+        assert_eq!(decimal_to_ticks("18446744073709551615", 100), None);
+    }
+
+    #[test]
+    fn zero_inverse_rejected() {
+        assert_eq!(decimal_to_ticks("1.00", 0), None);
     }
 
     #[test]

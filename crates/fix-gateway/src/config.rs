@@ -88,11 +88,24 @@ impl GatewayConfig {
                 return Err(format!("duplicate sender_comp_id: {}", s.sender_comp_id).into());
             }
         }
-        // Check for duplicate FIX symbols.
+        // Check for duplicate FIX symbols and validate scaling factors.
+        // Zero inverses would make decimal_to_ticks divide by zero (or
+        // its overflow-checked equivalent) and silently reject every
+        // price for the symbol.
         seen.clear();
         for s in &self.symbols {
             if !seen.insert(&s.fix_symbol) {
                 return Err(format!("duplicate fix_symbol: {}", s.fix_symbol).into());
+            }
+            if s.tick_size_inverse == 0 {
+                return Err(
+                    format!("tick_size_inverse must be > 0 for symbol {}", s.fix_symbol).into(),
+                );
+            }
+            if s.lot_size_inverse == 0 {
+                return Err(
+                    format!("lot_size_inverse must be > 0 for symbol {}", s.fix_symbol).into(),
+                );
             }
         }
         Ok(())
@@ -231,6 +244,28 @@ tick_size_inverse = 100
         let config: GatewayConfig = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate fix_symbol"));
+    }
+
+    #[test]
+    fn validate_zero_tick_size_inverse_rejected() {
+        let toml = r#"
+server_addr = "127.0.0.1:9876"
+listen_addr = "0.0.0.0:9100"
+target_comp_id = "MELIN"
+
+[[session]]
+sender_comp_id = "FIRM_A"
+account_id = 1
+key_path = "keys/firm_a.key"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 0
+"#;
+        let config: GatewayConfig = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("tick_size_inverse"));
     }
 
     #[test]
