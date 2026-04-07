@@ -81,10 +81,31 @@ fn replica_stream_uring(
 
     const TOKEN_RECV: u64 = 0;
     const TOKEN_SEND: u64 = 1;
+    const TOKEN_PROVIDE: u64 = 2;
+
+    // Multishot RECV buffer pool. The kernel selects a buffer per
+    // completion from this pool, eliminating per-recv resubmission and
+    // letting multiple cqes queue up while the receive thread is
+    // CPU-bound on decode. Decouples network arrival from parse.
+    //
+    // 16 buffers × MAX_DATA_FRAME each. The pool only needs to absorb
+    // bursts that arrive during a single parse pass; 16 frames is more
+    // than enough at any realistic batch rate.
+    const NUM_RECV_BUFFERS: u16 = 16;
+    const RECV_BUF_SIZE: usize = MAX_DATA_FRAME;
+    const RECV_BUF_GROUP_ID: u16 = 0;
+
+    // CQE flag bits (io_uring ABI; not exposed by io-uring crate constants).
+    const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+    const IORING_CQE_F_MORE: u32 = 1 << 1;
+    const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
     let tcp_fd = tcp_stream.as_raw_fd();
 
-    let mut ring: IoUring = match IoUring::builder().setup_single_issuer().build(8) {
+    // SQ depth must accommodate: 1 multishot RECV, 1 ack SEND, plus
+    // up to NUM_RECV_BUFFERS ProvideBuffers re-provisions per loop
+    // iteration in the worst case. 64 is comfortable headroom.
+    let mut ring: IoUring = match IoUring::builder().setup_single_issuer().build(64) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "io_uring init failed for replica receiver");
@@ -112,31 +133,53 @@ fn replica_stream_uring(
         let _ = ring.submitter().register_iowq_aff(&cpuset);
     }
 
-    // RECV buffer — sized to hold a full max DataBatch frame in a
-    // single recv. With a 64 KiB buffer the kernel had to fragment
-    // each ~165 KiB batch into 3 cqes, and parsing the first chunk
-    // blocked the next recv (single in-flight RECV). A buffer matching
-    // MAX_DATA_FRAME lets one recv drain whatever the kernel queued
-    // during the previous parse pass.
-    // Vec<u8> chosen for owned heap allocation with a cheap as_mut_ptr;
-    // Box<[u8; N]> would force a fixed compile-time size which we
-    // intentionally tie to MAX_DATA_FRAME at runtime.
-    let mut recv_buf = vec![0u8; MAX_DATA_FRAME];
+    // Provided buffer pool for multishot RECV. Vec<u8> backs the pool;
+    // the kernel reads/writes via raw pointers at fixed offsets, so the
+    // Vec must not move (no reallocation) for the lifetime of the loop.
+    let mut recv_pool: Vec<u8> = vec![0u8; NUM_RECV_BUFFERS as usize * RECV_BUF_SIZE];
+    let pool_ptr = recv_pool.as_mut_ptr();
+
+    // Register all buffers with io_uring as one group via ProvideBuffers.
+    {
+        let sqe = opcode::ProvideBuffers::new(
+            pool_ptr,
+            RECV_BUF_SIZE as i32,
+            NUM_RECV_BUFFERS,
+            RECV_BUF_GROUP_ID,
+            0,
+        )
+        .build()
+        .user_data(TOKEN_PROVIDE);
+        unsafe { ring.submission().push(&sqe).expect("SQ full") };
+        if let Err(e) = ring.submit_and_wait(1) {
+            error!(error = %e, "ProvideBuffers submit failed");
+            return SessionExit::Disconnected;
+        }
+        let cqe = match ring.completion().next() {
+            Some(c) => c,
+            None => {
+                error!("no cqe after ProvideBuffers");
+                return SessionExit::Disconnected;
+            }
+        };
+        if cqe.result() < 0 {
+            error!(rc = cqe.result(), "ProvideBuffers failed");
+            return SessionExit::Disconnected;
+        }
+    }
+
     let mut parse_buf: Vec<u8> = Vec::with_capacity(MAX_DATA_FRAME + 4);
     let mut ack_send_buf: Vec<u8> = Vec::with_capacity(64);
     let mut ack_send_offset: usize = 0;
     let mut ack_send_in_flight = false;
     let mut idle_spins: u32 = 0;
-
-    // Submit initial RECV.
-    let sqe = opcode::Recv::new(
-        types::Fixed(0),
-        recv_buf.as_mut_ptr(),
-        recv_buf.len() as u32,
-    )
-    .build()
-    .user_data(TOKEN_RECV);
+    // Submit initial multishot RECV. The kernel will produce CQEs
+    // continuously until EOF, error, or buffer pool exhaustion.
+    let sqe = opcode::RecvMulti::new(types::Fixed(0), RECV_BUF_GROUP_ID)
+        .build()
+        .user_data(TOKEN_RECV);
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
+    let mut multishot_active = true;
 
     loop {
         // --- Check flags ---
@@ -218,16 +261,23 @@ fn replica_stream_uring(
             // Collect CQEs into stack buffer to avoid CQ/SQ borrow conflict.
             while ack_send_in_flight {
                 let _ = ring.submit();
-                let mut bp_cqes: [(u64, i32); 4] = [(0, 0); 4];
+                let mut bp_cqes: [(u64, i32, u32); 16] = [(0, 0, 0); 16];
                 let mut bp_count = 0;
                 for cqe in ring.completion() {
                     if bp_count < bp_cqes.len() {
-                        bp_cqes[bp_count] = (cqe.user_data(), cqe.result());
+                        bp_cqes[bp_count] = (cqe.user_data(), cqe.result(), cqe.flags());
                         bp_count += 1;
                     }
                 }
-                for &(bp_token, bp_result) in &bp_cqes[..bp_count] {
+                for &(bp_token, bp_result, bp_flags) in &bp_cqes[..bp_count] {
                     match bp_token {
+                        TOKEN_PROVIDE => {
+                            if bp_result < 0 {
+                                debug!(
+                                    "ProvideBuffers re-provision failed during backpressure drain: {bp_result}"
+                                );
+                            }
+                        }
                         TOKEN_SEND => {
                             if bp_result < 0 {
                                 warn!("ack send error during backpressure drain");
@@ -253,24 +303,47 @@ fn replica_stream_uring(
                         TOKEN_RECV => {
                             // Stash RECV CQE data into parse_buf for later
                             // processing — don't handle frames here to keep
-                            // the backpressure drain simple.
-                            if bp_result > 0 {
-                                arm_tcp_quickack(tcp_fd);
-                                let n = bp_result as usize;
-                                parse_buf.extend_from_slice(&recv_buf[..n]);
-                                // Resubmit RECV.
-                                let sqe = opcode::Recv::new(
-                                    types::Fixed(0),
-                                    recv_buf.as_mut_ptr(),
-                                    recv_buf.len() as u32,
-                                )
-                                .build()
-                                .user_data(TOKEN_RECV);
-                                unsafe { ring.submission().push(&sqe).expect("SQ full") };
-                            } else {
+                            // the backpressure drain simple. Mirror the
+                            // multishot handling from the main loop.
+                            if (bp_flags & IORING_CQE_F_MORE) == 0 {
+                                multishot_active = false;
+                            }
+                            if bp_result < 0 {
+                                if bp_result == -libc::ENOBUFS {
+                                    debug!("recv multishot ENOBUFS during backpressure drain");
+                                    continue;
+                                }
                                 warn!("primary disconnected during backpressure drain");
                                 return SessionExit::Disconnected;
                             }
+                            if bp_result == 0 {
+                                warn!("primary disconnected during backpressure drain");
+                                return SessionExit::Disconnected;
+                            }
+                            if (bp_flags & IORING_CQE_F_BUFFER) == 0 {
+                                error!("recv cqe missing F_BUFFER flag in drain");
+                                return SessionExit::Disconnected;
+                            }
+                            arm_tcp_quickack(tcp_fd);
+                            let n = bp_result as usize;
+                            let buf_id = (bp_flags >> IORING_CQE_BUFFER_SHIFT) as usize;
+                            let buf_ptr = unsafe { pool_ptr.add(buf_id * RECV_BUF_SIZE) };
+                            // SAFETY: same invariant as the main loop —
+                            // kernel wrote `n` bytes into our owned pool
+                            // at this offset.
+                            let slice = unsafe { std::slice::from_raw_parts(buf_ptr, n) };
+                            parse_buf.extend_from_slice(slice);
+                            // Re-provide the buffer.
+                            let provide_sqe = opcode::ProvideBuffers::new(
+                                buf_ptr,
+                                RECV_BUF_SIZE as i32,
+                                1,
+                                RECV_BUF_GROUP_ID,
+                                buf_id as u16,
+                            )
+                            .build()
+                            .user_data(TOKEN_PROVIDE);
+                            unsafe { ring.submission().push(&provide_sqe).expect("SQ full") };
                         }
                         _ => {}
                     }
@@ -304,22 +377,43 @@ fn replica_stream_uring(
             return SessionExit::Disconnected;
         }
 
-        let mut cqes: [(u64, i32); 4] = [(0, 0); 4];
+        let mut cqes: [(u64, i32, u32); 16] = [(0, 0, 0); 16];
         let mut cqe_count = 0;
         for cqe in ring.completion() {
             if cqe_count < cqes.len() {
-                cqes[cqe_count] = (cqe.user_data(), cqe.result());
+                cqes[cqe_count] = (cqe.user_data(), cqe.result(), cqe.flags());
                 cqe_count += 1;
             }
         }
 
         let any_cqe = cqe_count > 0;
-        for &(token, result) in &cqes[..cqe_count] {
+        for &(token, result, flags) in &cqes[..cqe_count] {
             idle_spins = 0;
             match token {
                 TOKEN_RECV => {
-                    if result <= 0 {
+                    // Track multishot termination — when F_MORE is not
+                    // set the kernel will not produce more cqes for
+                    // this submission, so we must resubmit below.
+                    if (flags & IORING_CQE_F_MORE) == 0 {
+                        multishot_active = false;
+                    }
+                    if result < 0 {
+                        // ENOBUFS means the provided buffer pool was
+                        // exhausted; re-provisions are in flight, just
+                        // resubmit. Other errors are fatal.
+                        if result == -libc::ENOBUFS {
+                            debug!("recv multishot ENOBUFS — pool exhausted, will resubmit");
+                            continue;
+                        }
                         warn!("primary disconnected (recv returned {result})");
+                        return SessionExit::Disconnected;
+                    }
+                    if result == 0 {
+                        warn!("primary disconnected (recv returned 0)");
+                        return SessionExit::Disconnected;
+                    }
+                    if (flags & IORING_CQE_F_BUFFER) == 0 {
+                        error!("recv cqe missing F_BUFFER flag");
                         return SessionExit::Disconnected;
                     }
                     // Re-arm TCP_QUICKACK: Linux clears it after each
@@ -328,7 +422,25 @@ fn replica_stream_uring(
                     // delayed-ACK timer.
                     arm_tcp_quickack(tcp_fd);
                     let n = result as usize;
-                    parse_buf.extend_from_slice(&recv_buf[..n]);
+                    let buf_id = (flags >> IORING_CQE_BUFFER_SHIFT) as usize;
+                    let buf_ptr = unsafe { pool_ptr.add(buf_id * RECV_BUF_SIZE) };
+                    // SAFETY: kernel wrote `n` bytes (n = result) into
+                    // the buffer at offset `buf_id * RECV_BUF_SIZE`,
+                    // which is within `recv_pool`. We own the pool and
+                    // the buffer is not in flight until re-provided.
+                    let slice = unsafe { std::slice::from_raw_parts(buf_ptr, n) };
+                    parse_buf.extend_from_slice(slice);
+                    // Re-provide the consumed buffer to the pool.
+                    let provide_sqe = opcode::ProvideBuffers::new(
+                        buf_ptr,
+                        RECV_BUF_SIZE as i32,
+                        1,
+                        RECV_BUF_GROUP_ID,
+                        buf_id as u16,
+                    )
+                    .build()
+                    .user_data(TOKEN_PROVIDE);
+                    unsafe { ring.submission().push(&provide_sqe).expect("SQ full") };
 
                     // Extract complete frames from parse_buf.
                     let mut cursor = 0;
@@ -405,16 +517,14 @@ fn replica_stream_uring(
                             }
                         }
                     }
+                }
 
-                    // Resubmit RECV.
-                    let sqe = opcode::Recv::new(
-                        types::Fixed(0),
-                        recv_buf.as_mut_ptr(),
-                        recv_buf.len() as u32,
-                    )
-                    .build()
-                    .user_data(TOKEN_RECV);
-                    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                TOKEN_PROVIDE => {
+                    // Best-effort re-provision; failures only manifest
+                    // as ENOBUFS later, which we handle by resubmitting.
+                    if result < 0 {
+                        debug!("ProvideBuffers re-provision failed: {result}");
+                    }
                 }
 
                 TOKEN_SEND => {
@@ -443,6 +553,18 @@ fn replica_stream_uring(
 
                 _ => {}
             }
+        }
+
+        // --- Resubmit multishot if terminated ---
+        // Multishot can terminate on transient conditions (ENOBUFS,
+        // kernel buffer pool reset). Re-arm so the kernel keeps
+        // pushing cqes as data arrives.
+        if !multishot_active {
+            let sqe = opcode::RecvMulti::new(types::Fixed(0), RECV_BUF_GROUP_ID)
+                .build()
+                .user_data(TOKEN_RECV);
+            unsafe { ring.submission().push(&sqe).expect("SQ full") };
+            multishot_active = true;
         }
 
         // --- Idle wait ---
