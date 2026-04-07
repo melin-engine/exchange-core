@@ -1097,8 +1097,54 @@ lot_size_inverse = 1
         }
     }
 
+    /// A TCP client paired with a persistent accumulator buffer so
+    /// reads can frame multiple FIX messages without losing leftover
+    /// bytes between calls. Required for any test that expects more
+    /// than one message in sequence — without it, when the gateway
+    /// flushes several messages in one io_uring SEND the kernel can
+    /// deliver them in a single read and the second message's bytes
+    /// would be dropped on the floor.
+    struct FramedClient {
+        stream: TcpStream,
+        accum: Vec<u8>,
+    }
+    impl FramedClient {
+        fn connect(port: u16) -> Self {
+            let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            Self {
+                stream,
+                accum: Vec::with_capacity(512),
+            }
+        }
+        fn write_all(&mut self, bytes: &[u8]) {
+            self.stream.write_all(bytes).unwrap();
+        }
+        fn read_message(&mut self) -> Vec<u8> {
+            let mut tmp = [0u8; 256];
+            loop {
+                if let Some(msg) = crate::fix::parse::try_extract_message(&mut self.accum) {
+                    return msg;
+                }
+                match self.stream.read(&mut tmp) {
+                    Ok(0) => panic!(
+                        "unexpected EOF before complete FIX message (accum has {} bytes)",
+                        self.accum.len()
+                    ),
+                    Ok(n) => self.accum.extend_from_slice(&tmp[..n]),
+                    Err(e) => panic!("read error: {e}"),
+                }
+            }
+        }
+    }
+
     /// Read one complete FIX message from a TCP stream with a timeout.
-    /// Uses `try_extract_message` to frame.
+    /// One-shot variant for tests that expect exactly one inbound
+    /// message; do NOT use when more than one message may follow on
+    /// the same connection — leftover bytes after the first frame are
+    /// dropped. Use `FramedClient` instead in that case.
     fn read_fix_message(stream: &mut TcpStream) -> Vec<u8> {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1311,6 +1357,91 @@ lot_size_inverse = 1
         assert_eq!(er.get_str(tags::EXEC_TYPE), Some("0")); // New
         assert_eq!(er.get_str(tags::SYMBOL), Some("BTC/USD"));
         assert_eq!(er.get_str(tags::PRICE), Some("50000.00"));
+
+        drop(client);
+        gw.shutdown();
+        drop(stub);
+    }
+
+    #[test]
+    fn resend_request_replays_through_real_io_uring() {
+        use crate::test_stub::MelinStub;
+        use melin_engine::types::{ExecutionReport, Price, Quantity, Side};
+        use melin_protocol::message::{Request, ResponseKind};
+        use std::num::NonZeroU64;
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        // Use FramedClient — this test reads multiple messages from
+        // a single ResendRequest reply, so we need a persistent
+        // accumulator across reads.
+        let mut client = FramedClient::connect(gw.port);
+
+        // Logon (seq 1) → Logon ack lands as outbound seq 1.
+        client.write_all(&logon_bytes("FIRM_A", "MELIN", 1));
+        let raw = client.read_message();
+        assert_eq!(FixMessage::parse(&raw).unwrap().msg_type(), tags::MSG_LOGON);
+
+        // NewOrderSingle (seq 2) → SubmitOrder → Placed → ER as
+        // outbound seq 2.
+        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        client.write_all(&nos);
+        let (_, req) = stub.next_request(Duration::from_secs(3));
+        let order_id = match req {
+            Request::SubmitOrder { order, .. } => order.id,
+            other => panic!("expected SubmitOrder, got {other:?}"),
+        };
+        stub.send_response(ResponseKind::Report(ExecutionReport::Placed {
+            order_id,
+            side: Side::Buy,
+            price: Price(NonZeroU64::new(5_000_000).unwrap()),
+            quantity: Quantity(NonZeroU64::new(10).unwrap()),
+        }));
+        let raw = client.read_message();
+        assert_eq!(
+            FixMessage::parse(&raw).unwrap().msg_type(),
+            tags::MSG_EXECUTION_REPORT
+        );
+
+        // ResendRequest [1, 0] = "everything from seq 1". Store has:
+        //   seq 1 = Logon ack (admin) → collapses to GapFill
+        //   seq 2 = ER (application) → replays with PossDup=Y
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 1)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", 3);
+        client.write_all(&rr);
+
+        let frame1 = client.read_message();
+        let frame2 = client.read_message();
+
+        let m1 = FixMessage::parse(&frame1).unwrap();
+        assert_eq!(m1.msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(m1.get_str(tags::GAP_FILL_FLAG), Some("Y"));
+        assert_eq!(m1.get_str(tags::POSS_DUP_FLAG), Some("Y"));
+        assert_eq!(m1.msg_seq_num(), Some(1));
+        assert_eq!(m1.get_str(tags::NEW_SEQ_NO), Some("2"));
+
+        let m2 = FixMessage::parse(&frame2).unwrap();
+        assert_eq!(m2.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(m2.get_str(tags::POSS_DUP_FLAG), Some("Y"));
+        assert!(m2.get_str(tags::ORIG_SENDING_TIME).is_some());
+        assert_eq!(
+            m2.msg_seq_num(),
+            Some(2),
+            "replay must preserve original seq"
+        );
+        assert_eq!(m2.get_str(tags::CL_ORD_ID), Some("ORD1"));
 
         drop(client);
         gw.shutdown();

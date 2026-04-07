@@ -261,6 +261,16 @@ pub fn try_extract_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
         return None;
     }
 
+    // Defense in depth: a valid FIX 4.2 frame always starts with the
+    // `8=FIX.4.2\x01` prefix. If the buffer starts with anything else,
+    // we're either looking at a stream framing bug or actively
+    // misaligned data — refuse to extract garbage that just happens
+    // to contain a `\x0110=xxx\x01` pattern downstream.
+    const PREFIX: &[u8] = b"8=FIX.4.2\x01";
+    if !buf.starts_with(PREFIX) {
+        return None;
+    }
+
     // Scan for the checksum terminator: SOH + "10=" + 3 digits + SOH.
     // The checksum is always the last field, so the first occurrence of
     // this pattern marks the end of the first complete message.
