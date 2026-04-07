@@ -37,7 +37,7 @@
 //!
 //! See `docs/replication.md` for the full design document and limitation details.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -46,6 +46,7 @@ use tracing::{debug, error, info, warn};
 
 use melin_engine::journal::replication::ReplicationConsumer;
 
+mod auth;
 mod protocol;
 
 // Re-export the public wire-protocol types so the module's public API
@@ -54,10 +55,9 @@ mod protocol;
 // flag fields that are only read by external consumers / tests.
 pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
 
+use auth::{authenticate_replica, authenticate_with_primary};
 use protocol::{
-    MAX_CONTROL_FRAME, MAX_DATA_FRAME, decode_auth_result, decode_challenge,
-    decode_challenge_response, decode_primary_message, decode_replica_message, encode_ack,
-    encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response,
+    MAX_CONTROL_FRAME, MAX_DATA_FRAME, decode_primary_message, decode_replica_message, encode_ack,
     encode_data_batch, encode_handshake, encode_heartbeat, encode_need_snapshot,
     encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
     read_frame,
@@ -597,116 +597,6 @@ fn catch_up_from_journal(
     info!(end_sequence, batches_sent, "journal catch-up complete");
 
     Ok(CatchUpResult::Ok(end_sequence))
-}
-
-/// Authenticate a replica connection (primary side).
-///
-/// Sends a 32-byte nonce challenge, verifies the replica's Ed25519
-/// signature, and checks that the key has `Replication` permission.
-/// Must complete within the stream's existing read timeout.
-fn authenticate_replica(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
-    authorized_keys: &melin_protocol::auth::AuthorizedKeys,
-) -> io::Result<()> {
-    use ed25519_dalek::{Verifier, VerifyingKey};
-
-    // Generate random nonce.
-    let mut nonce = [0u8; 32];
-    getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
-
-    // Send Challenge.
-    let mut buf = Vec::with_capacity(64);
-    encode_challenge(&nonce, &mut buf);
-    writer.write_all(&buf)?;
-    writer.flush()?;
-
-    // Read ChallengeResponse.
-    let frame = read_frame(reader, MAX_CONTROL_FRAME)?;
-    let (signature_bytes, pubkey_bytes) = match decode_challenge_response(&frame) {
-        Ok(pair) => pair,
-        Err(e) => {
-            buf.clear();
-            encode_auth_failed(&mut buf);
-            let _ = writer.write_all(&buf);
-            return Err(io::Error::other(format!("bad challenge response: {e}")));
-        }
-    };
-
-    // Look up key and verify permission.
-    let permission = match authorized_keys.lookup(&pubkey_bytes) {
-        Some(perm) => perm,
-        None => {
-            buf.clear();
-            encode_auth_failed(&mut buf);
-            let _ = writer.write_all(&buf);
-            return Err(io::Error::other("unknown replication key"));
-        }
-    };
-    if !permission.is_replication() {
-        buf.clear();
-        encode_auth_failed(&mut buf);
-        let _ = writer.write_all(&buf);
-        return Err(io::Error::other(format!(
-            "key has {permission:?} permission, expected Replication"
-        )));
-    }
-
-    // Verify Ed25519 signature over the nonce.
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| {
-        buf.clear();
-        encode_auth_failed(&mut buf);
-        let _ = writer.write_all(&buf);
-        io::Error::other(format!("invalid public key: {e}"))
-    })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        buf.clear();
-        encode_auth_failed(&mut buf);
-        let _ = writer.write_all(&buf);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
-
-    // Auth succeeded.
-    buf.clear();
-    encode_auth_ok(&mut buf);
-    writer.write_all(&buf)?;
-    writer.flush()?;
-
-    Ok(())
-}
-
-/// Authenticate with the primary (replica side).
-///
-/// Reads the nonce challenge, signs it with the replica's private key,
-/// sends the response, and waits for AuthOk/AuthFailed.
-fn authenticate_with_primary(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> io::Result<()> {
-    use ed25519_dalek::Signer;
-
-    // Read Challenge.
-    let frame = read_frame(reader, MAX_CONTROL_FRAME)?;
-    let nonce = decode_challenge(&frame)?;
-
-    // Sign the nonce.
-    let signature = signing_key.sign(&nonce);
-    let pubkey = signing_key.verifying_key();
-
-    // Send ChallengeResponse.
-    let mut buf = Vec::with_capacity(128);
-    encode_challenge_response(&signature.to_bytes(), pubkey.as_bytes(), &mut buf);
-    writer.write_all(&buf)?;
-    writer.flush()?;
-
-    // Read auth result.
-    let result_frame = read_frame(reader, MAX_CONTROL_FRAME)?;
-    match decode_auth_result(&result_frame)? {
-        true => Ok(()),
-        false => Err(io::Error::other("primary rejected replication key")),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3877,7 +3767,9 @@ fn receive_snapshot_dpdk(
 mod tests {
     use super::protocol::{
         MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN, MSG_SNAPSHOT_CHUNK,
-        MSG_SNAPSHOT_END, encode_hash_mismatch,
+        MSG_SNAPSHOT_END, decode_auth_result, decode_challenge, decode_challenge_response,
+        encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response,
+        encode_hash_mismatch,
     };
     use super::*;
 
