@@ -45,6 +45,9 @@ pub struct MelinStub {
     requests: Receiver<(u64, Request)>,
     responses: Sender<ResponseKind>,
     shutdown: Arc<AtomicBool>,
+    /// Set by the stub thread when it observes EOF on the gateway
+    /// connection (i.e. the gateway closed its Melin socket).
+    disconnected: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     /// Errors observed by the stub thread — pulled in `drop` to fail
     /// the test if the stub crashed.
@@ -63,11 +66,19 @@ impl MelinStub {
         let (resp_tx, resp_rx) = channel::<ResponseKind>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_clone = disconnected.clone();
         let errors = Arc::new(Mutex::new(Vec::<String>::new()));
         let errors_clone = errors.clone();
 
         let join = std::thread::spawn(move || {
-            if let Err(e) = run_stub(listener, req_tx, resp_rx, shutdown_clone) {
+            if let Err(e) = run_stub(
+                listener,
+                req_tx,
+                resp_rx,
+                shutdown_clone,
+                disconnected_clone,
+            ) {
                 errors_clone.lock().unwrap().push(e);
             }
         });
@@ -77,9 +88,23 @@ impl MelinStub {
             requests: req_rx,
             responses: resp_tx,
             shutdown,
+            disconnected,
             join: Some(join),
             errors,
         }
+    }
+
+    /// Wait up to `timeout` for the stub to observe the gateway
+    /// closing its Melin socket. Returns true if EOF was seen.
+    pub fn wait_for_disconnect(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.disconnected.load(Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.disconnected.load(Ordering::Relaxed)
     }
 
     pub fn port(&self) -> u16 {
@@ -126,6 +151,7 @@ fn run_stub(
     requests: Sender<(u64, Request)>,
     responses: Receiver<ResponseKind>,
     shutdown: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // Only accept the first real inbound connection. If shutdown fires
     // before the gateway dials, we bail out cleanly via the dummy dial
@@ -179,13 +205,21 @@ fn run_stub(
         // Try to read. 50ms timeout means we wake often enough to
         // notice new queued responses and the shutdown flag.
         match stream.read(&mut tmp) {
-            Ok(0) => return Ok(()), // gateway closed
+            Ok(0) => {
+                // Gateway closed.
+                disconnected.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
             Ok(n) => accum.extend_from_slice(&tmp[..n]),
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                disconnected.store(true, Ordering::Relaxed);
+                return Ok(());
             }
             Err(e) => return Err(format!("read: {e}")),
         }

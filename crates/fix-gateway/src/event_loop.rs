@@ -1395,6 +1395,107 @@ lot_size_inverse = 1
     }
 
     #[test]
+    fn melin_server_disconnect_mid_session_closes_client() {
+        use crate::test_stub::MelinStub;
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let raw = read_fix_message(&mut client);
+        assert_eq!(FixMessage::parse(&raw).unwrap().msg_type(), tags::MSG_LOGON);
+
+        // Stub drops the connection mid-session. This is done by
+        // dropping the stub handle entirely — which joins the thread
+        // after flipping shutdown. The accepted stream is dropped too,
+        // sending FIN to the gateway.
+        drop(stub);
+
+        // The gateway's multishot RECV on the Melin fd should fire
+        // with result=0, trigger session cleanup, and FIN the client.
+        let mut tail = [0u8; 64];
+        let n = client.read(&mut tail).expect("final client read");
+        assert_eq!(n, 0, "client should see EOF after Melin disconnect");
+
+        drop(client);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn melin_connect_refused_disconnects_client_promptly() {
+        // No stub — point the gateway at a port nothing is listening
+        // on. The kernel should immediately refuse the connect.
+        //
+        // Pick a port by binding a throwaway listener, reading back
+        // the assigned port, then dropping the listener so that port
+        // is free again. Small race window but in practice reliable
+        // on loopback.
+        let port = {
+            let throwaway = TcpListener::bind("127.0.0.1:0").unwrap();
+            throwaway.local_addr().unwrap().port()
+        };
+        let config = make_config_with_port("FIRM_A", "MELIN", port);
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+
+        // The gateway's io_uring CONNECT to the bogus port returns
+        // -ECONNREFUSED and the session is torn down. The client
+        // should see EOF without ever receiving a Logon ack.
+        let mut tail = [0u8; 64];
+        let n = client.read(&mut tail).expect("client read");
+        assert_eq!(n, 0, "expected EOF after connect refused");
+
+        drop(client);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn client_disconnect_mid_session_closes_melin_connection() {
+        use crate::test_stub::MelinStub;
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let raw = read_fix_message(&mut client);
+        assert_eq!(FixMessage::parse(&raw).unwrap().msg_type(), tags::MSG_LOGON);
+
+        // Symmetric to the Melin-disconnect test: client closes,
+        // gateway should close its Melin socket. The stub's read
+        // loop observes EOF and sets `disconnected`.
+        drop(client);
+
+        assert!(
+            stub.wait_for_disconnect(Duration::from_secs(3)),
+            "gateway did not close Melin socket after client disconnect"
+        );
+
+        gw.shutdown();
+        drop(stub);
+    }
+
+    #[test]
     fn auth_failed_from_melin_closes_client_session() {
         // This variant of the stub answers the handshake with AuthFailed
         // instead of ServerReady. The gateway should Logout the client
