@@ -1200,13 +1200,18 @@ fn run_as_primary<L: BlockingTransportListener>(
             thread_panicked = true;
         }
     };
-    check_join("journal", journal_handle.join().map(|_| ()));
+    let journal_result = journal_handle.join();
+    let journal_failed = matches!(&journal_result, Ok(Err(_)));
+    if let Ok(Err(ref e)) = journal_result {
+        error!(thread = "journal", error = %e, "journal stage returned error");
+    }
+    check_join("journal", journal_result.map(|_| ()));
     check_join("matching", matching_handle.join().map(|_| ()));
     check_join("response", response_handle.join().map(|_| ()));
 
-    if thread_panicked {
-        error!("shutdown complete (with thread panic)");
-        return Err("pipeline thread panicked".into());
+    if thread_panicked || journal_failed {
+        error!("shutdown complete (with pipeline failure)");
+        return Err("pipeline failure".into());
     }
 
     // Join replication thread.
@@ -1798,13 +1803,18 @@ pub fn run_dpdk(
             thread_panicked = true;
         }
     };
-    check_join("journal", journal_handle.join().map(|_| ()));
+    let journal_result = journal_handle.join();
+    let journal_failed = matches!(&journal_result, Ok(Err(_)));
+    if let Ok(Err(ref e)) = journal_result {
+        error!(thread = "journal", error = %e, "journal stage returned error");
+    }
+    check_join("journal", journal_result.map(|_| ()));
     check_join("matching", matching_handle.join().map(|_| ()));
     check_join("response", response_handle.join().map(|_| ()));
 
-    if thread_panicked {
-        error!("shutdown complete (with thread panic)");
-        return Err("pipeline thread panicked".into());
+    if thread_panicked || journal_failed {
+        error!("shutdown complete (with pipeline failure)");
+        return Err("pipeline failure".into());
     }
 
     if let Some(repl_sender_handle) = replication_handle {

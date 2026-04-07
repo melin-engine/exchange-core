@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;
+use crate::journal::error::JournalError;
 use crate::journal::event::JournalEvent;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::journal::trace::{TraceTimestamp, trace_ts};
@@ -443,7 +444,10 @@ impl JournalStage {
     /// synchronous writes (io_uring overlapping is only useful with fsync).
     ///
     /// Returns the `JournalWriter` on shutdown for clean resource release.
-    pub fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+    pub fn run(
+        self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<JournalWriter, JournalError> {
         let use_uring = !cfg!(feature = "no-fsync") && !cfg!(feature = "no-persist");
 
         if self.raw_journal_rx.is_some() {
@@ -468,7 +472,10 @@ impl JournalStage {
     /// journal cursor is only advanced **after** the write is durable.
     /// The response stage checks this cursor before sending — this is
     /// the persist-before-ack boundary.
-    fn run_sync(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+    fn run_sync(
+        mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<JournalWriter, JournalError> {
         #[cfg(not(feature = "no-fsync"))]
         use std::time::Instant;
 
@@ -514,7 +521,7 @@ impl JournalStage {
                 }
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("journal", busy_count, idle_count);
-                return self.writer;
+                return Ok(self.writer);
             }
 
             // Read entries WITHOUT advancing the cursor.
@@ -559,14 +566,14 @@ impl JournalStage {
                         if matches!(slot.event, JournalEvent::QueryStats) {
                             continue;
                         }
-                        if let Err(e) = self.writer.batch_append_with_ts(
-                            &slot.event,
-                            ts,
-                            slot.key_hash,
-                            slot.request_seq,
-                        ) {
-                            panic!("fatal journal encode error: {e}");
-                        }
+                        self.writer
+                            .batch_append_with_ts(&slot.event, ts, slot.key_hash, slot.request_seq)
+                            .map_err(|e| {
+                                JournalError::Io(std::io::Error::other(format!(
+                                    "journal encode (run_sync, seq {}): {e}",
+                                    slot.request_seq
+                                )))
+                            })?;
                     }
                 }
                 pending += count;
@@ -617,13 +624,15 @@ impl JournalStage {
                             }
                         }
 
-                        if let Err(e) = self.writer.flush_batch_sync() {
-                            // Fatal: journal I/O failure means we can't
-                            // guarantee durability. Panic to prevent the
-                            // pipeline from spinning forever on a broken
-                            // disk (e.g., ENOSPC).
-                            panic!("fatal journal I/O error: {e}");
-                        }
+                        // Fatal: journal I/O failure means we can't
+                        // guarantee durability. Surface the error so the
+                        // pipeline shuts down rather than spinning forever
+                        // on a broken disk (e.g., ENOSPC).
+                        self.writer.flush_batch_sync().map_err(|e| {
+                            JournalError::Io(std::io::Error::other(format!(
+                                "journal flush_batch_sync: {e}"
+                            )))
+                        })?;
                     }
 
                     self.consumer.commit(pending);
@@ -649,11 +658,15 @@ impl JournalStage {
     /// receiver while consuming (and discarding) events from the disruptor
     /// to advance the cursor. The cursor advance happens AFTER `write_raw_sync`
     /// completes, preserving the persist-before-ack guarantee.
-    fn run_replica(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
-        let rx = self
-            .raw_journal_rx
-            .take()
-            .expect("run_replica called without raw_journal_rx");
+    fn run_replica(
+        mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<JournalWriter, JournalError> {
+        let rx = self.raw_journal_rx.take().ok_or_else(|| {
+            JournalError::Io(std::io::Error::other(
+                "run_replica called without raw_journal_rx",
+            ))
+        })?;
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let mut idle_spins: u32 = 0;
 
@@ -661,7 +674,7 @@ impl JournalStage {
             if shutdown.load(Ordering::Relaxed) {
                 // Drain remaining disruptor events before shutdown.
                 self.drain_remaining(&mut batch);
-                return self.writer;
+                return Ok(self.writer);
             }
 
             // Try to receive a raw journal batch from the replication
@@ -672,7 +685,12 @@ impl JournalStage {
                 // Write raw bytes to journal (durable write).
                 self.writer
                     .write_raw_sync(&raw_batch.bytes, raw_batch.entry_count as u64)
-                    .unwrap_or_else(|e| panic!("fatal replica journal I/O error: {e}"));
+                    .map_err(|e| {
+                        JournalError::Io(std::io::Error::other(format!(
+                            "replica journal write_raw_sync (end_seq {}): {e}",
+                            raw_batch.end_sequence
+                        )))
+                    })?;
 
                 self.publish_chain_hash();
 
@@ -718,13 +736,17 @@ impl JournalStage {
     /// The SPSC ring decouples the replication handler's TCP receive
     /// loop from the NVMe write latency: the handler can push up to
     /// 8 batches ahead while previous writes are in flight.
-    fn run_replica_uring(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+    fn run_replica_uring(
+        mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<JournalWriter, JournalError> {
         use io_uring::{IoUring, opcode, types};
 
-        let rx = self
-            .raw_journal_rx
-            .take()
-            .expect("run_replica_uring called without raw_journal_rx");
+        let rx = self.raw_journal_rx.take().ok_or_else(|| {
+            JournalError::Io(std::io::Error::other(
+                "run_replica_uring called without raw_journal_rx",
+            ))
+        })?;
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let mut idle_spins: u32 = 0;
 
@@ -732,20 +754,24 @@ impl JournalStage {
         let mut ring: IoUring = IoUring::builder()
             .setup_single_issuer()
             .build(8)
-            .expect("io_uring init failed");
+            .map_err(|e| JournalError::Io(std::io::Error::other(format!("io_uring init: {e}"))))?;
 
         let raw_fd = self.writer.fd();
-        ring.submitter()
-            .register_files(&[raw_fd])
-            .expect("io_uring register_files failed");
+        ring.submitter().register_files(&[raw_fd]).map_err(|e| {
+            JournalError::Io(std::io::Error::other(format!(
+                "io_uring register_files: {e}"
+            )))
+        })?;
 
         // Pin io-wq workers to core 0.
         {
             let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
             unsafe { libc::CPU_SET(0, &mut cpuset) };
-            ring.submitter()
-                .register_iowq_aff(&cpuset)
-                .expect("io_uring register_iowq_aff failed");
+            ring.submitter().register_iowq_aff(&cpuset).map_err(|e| {
+                JournalError::Io(std::io::Error::other(format!(
+                    "io_uring register_iowq_aff: {e}"
+                )))
+            })?;
         }
 
         // In-flight state: the async batch + entry count for disruptor
@@ -765,7 +791,7 @@ impl JournalStage {
                     self.writer.confirm_raw_async_write(inf.batch);
                 }
                 self.drain_remaining(&mut batch);
-                return self.writer;
+                return Ok(self.writer);
             }
 
             // --- Reap CQE (non-blocking) ---
@@ -774,16 +800,16 @@ impl JournalStage {
             {
                 let result = cqe.result();
                 if result < 0 {
-                    panic!(
-                        "fatal replica journal I/O error: io_uring write returned errno {}",
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "replica journal io_uring write returned errno {}",
                         -result
-                    );
+                    ))));
                 } else if (result as usize) != inf.batch.buf.len() {
-                    panic!(
-                        "fatal replica journal I/O error: short write ({} of {} bytes)",
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "replica journal short write ({} of {} bytes)",
                         result,
                         inf.batch.buf.len()
-                    );
+                    ))));
                 }
 
                 // Safe: the `if let Some(ref inf)` guard ensures
@@ -803,7 +829,12 @@ impl JournalStage {
                     let async_batch = self
                         .writer
                         .take_raw_for_async_write(raw_batch.bytes, raw_batch.entry_count as u64)
-                        .unwrap_or_else(|e| panic!("fatal replica journal I/O error: {e}"));
+                        .map_err(|e| {
+                            JournalError::Io(std::io::Error::other(format!(
+                                "replica journal take_raw_for_async_write (end_seq {}): {e}",
+                                raw_batch.end_sequence
+                            )))
+                        })?;
 
                     let sqe = opcode::Write::new(
                         types::Fixed(0),
@@ -969,7 +1000,10 @@ impl JournalStage {
     ///
     /// Cursor only advances after the CQE confirms durability — the
     /// persist-before-ack guarantee is preserved.
-    fn run_uring(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+    fn run_uring(
+        mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<JournalWriter, JournalError> {
         use io_uring::{IoUring, opcode, types};
         use std::time::Instant;
 
@@ -985,15 +1019,17 @@ impl JournalStage {
         let mut ring: IoUring = IoUring::builder()
             .setup_single_issuer()
             .build(4)
-            .expect("io_uring init failed");
+            .map_err(|e| JournalError::Io(std::io::Error::other(format!("io_uring init: {e}"))))?;
 
         // Register the journal fd so the kernel skips fget/fput (fd table
         // lookup + atomic refcount) on every SQE. Use types::Fixed(0) in
         // SQEs instead of types::Fd(raw_fd).
         let raw_fd = self.writer.fd();
-        ring.submitter()
-            .register_files(&[raw_fd])
-            .expect("io_uring register_files failed");
+        ring.submitter().register_files(&[raw_fd]).map_err(|e| {
+            JournalError::Io(std::io::Error::other(format!(
+                "io_uring register_files: {e}"
+            )))
+        })?;
 
         // Pin io-wq worker threads to core 0 (OS/IRQ core). Without this,
         // io-wq workers inherit the journal thread's CPU affinity (core 1)
@@ -1004,9 +1040,11 @@ impl JournalStage {
         {
             let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
             unsafe { libc::CPU_SET(0, &mut cpuset) };
-            ring.submitter()
-                .register_iowq_aff(&cpuset)
-                .expect("io_uring register_iowq_aff failed");
+            ring.submitter().register_iowq_aff(&cpuset).map_err(|e| {
+                JournalError::Io(std::io::Error::other(format!(
+                    "io_uring register_iowq_aff: {e}"
+                )))
+            })?;
         }
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -1046,7 +1084,7 @@ impl JournalStage {
                 self.drain_remaining(&mut batch);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("journal", busy_count, idle_count);
-                return self.writer;
+                return Ok(self.writer);
             }
 
             // --- Reap CQE from previous in-flight write (non-blocking) ---
@@ -1092,14 +1130,14 @@ impl JournalStage {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append_with_ts(
-                        &slot.event,
-                        ts,
-                        slot.key_hash,
-                        slot.request_seq,
-                    ) {
-                        panic!("fatal journal encode error: {e}");
-                    }
+                    self.writer
+                        .batch_append_with_ts(&slot.event, ts, slot.key_hash, slot.request_seq)
+                        .map_err(|e| {
+                            JournalError::Io(std::io::Error::other(format!(
+                                "journal encode (run_uring, seq {}): {e}",
+                                slot.request_seq
+                            )))
+                        })?;
                 }
                 pending += count;
                 if first_write_ts.is_none() {
@@ -1201,7 +1239,9 @@ impl JournalStage {
                             self.consumer.commit(pending);
                         }
                         Err(e) => {
-                            panic!("fatal journal I/O error: {e}");
+                            return Err(JournalError::Io(std::io::Error::other(format!(
+                                "journal take_batch_for_async_write: {e}"
+                            ))));
                         }
                     }
                     pending = 0;

@@ -870,7 +870,7 @@ pub fn run_receiver(
             SessionExit::Promote => {
                 return match pipeline_state {
                     Some((e, w)) => Ok(Some((e, w))),
-                    None => Err("pipeline thread panicked during promotion".into()),
+                    None => Err("pipeline failed during promotion".into()),
                 };
             }
 

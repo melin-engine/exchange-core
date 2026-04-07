@@ -239,7 +239,12 @@ pub(super) fn sleep_checking_flags(
 /// the stage threads. Returns None if a thread panicked.
 pub(super) fn shutdown_pipeline(
     shutdown_flag: &AtomicBool,
-    journal_handle: std::thread::JoinHandle<melin_engine::journal::writer::JournalWriter>,
+    journal_handle: std::thread::JoinHandle<
+        Result<
+            melin_engine::journal::writer::JournalWriter,
+            melin_engine::journal::error::JournalError,
+        >,
+    >,
     matching_handle: std::thread::JoinHandle<melin_engine::exchange::Exchange>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
@@ -248,7 +253,14 @@ pub(super) fn shutdown_pipeline(
     melin_engine::journal::writer::JournalWriter,
 )> {
     shutdown_flag.store(true, Ordering::Relaxed);
-    let writer = journal_handle.join().ok()?;
+    let writer = match journal_handle.join() {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "replica journal stage returned error on shutdown");
+            return None;
+        }
+        Err(_) => return None,
+    };
     let exchange = matching_handle.join().ok()?;
     let _ = drain_handle.join();
     if let Some(h) = shadow_handle {
