@@ -93,9 +93,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pattern as the config: lives for the program's lifetime.
     let metrics = metrics::GatewayMetrics::leak_default();
 
+    // Spawn the Prometheus /metrics endpoint if configured.
+    let metrics_join = if let Some(addr) = config.metrics_addr {
+        Some(metrics::spawn_metrics_endpoint(
+            addr,
+            metrics,
+            shutdown.clone(),
+        )?)
+    } else {
+        None
+    };
+
     // Create and run the single-threaded io_uring gateway.
     let mut gateway = event_loop::Gateway::new(listener, config, metrics)?;
     gateway.run(&shutdown)?;
+
+    if let Some(j) = metrics_join {
+        // The endpoint thread polls `shutdown` every 100 ms so this
+        // returns within ~100 ms of run() exit. A panic on this
+        // thread should be surfaced — it would otherwise leave the
+        // process running with a silently dead /metrics endpoint.
+        if let Err(payload) = j.join() {
+            tracing::error!(?payload, "metrics endpoint thread panicked");
+        }
+    }
 
     info!("FIX gateway shut down");
     Ok(())

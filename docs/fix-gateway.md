@@ -113,6 +113,30 @@ Execution reports from Melin are translated back into
 `ExecutionReport (35=8)` or `OrderCancelReject (35=9)` as appropriate
 and queued for the FIX client.
 
+## Metrics
+
+When `metrics_addr` is set in the config, the gateway exposes a
+Prometheus-compatible `/metrics` endpoint on that address. Counters
+are collected on the io_uring hot path with relaxed atomics (no lock
+contention) and read on demand by the scrape thread.
+
+Exposed series:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `fix_gateway_sessions_accepted_total` | counter | Cumulative client sessions accepted |
+| `fix_gateway_sessions_active` | gauge | Currently active sessions |
+| `fix_gateway_messages_received_total` | counter | Complete FIX frames received (including parse failures) |
+| `fix_gateway_messages_sent_total` | counter | FIX frames written to clients (including resend replays) |
+| `fix_gateway_parse_errors_total` | counter | Inbound frames that failed to parse |
+| `fix_gateway_resend_requests_sent_total` | counter | ResendRequests sent in response to inbound gaps |
+| `fix_gateway_resend_requests_received_total` | counter | ResendRequests received from peers |
+| `fix_gateway_store_evictions_total` | counter | Outbound store entries evicted at the per-session cap |
+| `fix_gateway_rate_limit_hits_total` | counter | Inbound messages dropped by per-session rate limit |
+
+If `metrics_addr` is omitted the counters are still maintained but
+no scrape endpoint is exposed.
+
 ## Configuration
 
 Sessions, symbols, and per-session limits are loaded from a TOML file
