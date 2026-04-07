@@ -92,6 +92,11 @@ pub struct Session {
     /// If the client doesn't respond within HeartBtInt, we disconnect.
     pub test_request_sent_at: Option<Instant>,
     pub fix_multishot_active: bool,
+    /// Highest inbound seq seen out of order, if a ResendRequest is
+    /// currently in flight to the peer. Suppresses duplicate
+    /// ResendRequest emission while the gap is being filled. Cleared
+    /// when fix_inbound_seq catches up past this value.
+    resend_high_water: Option<u64>,
 
     // ── Melin server side ──
     pub melin_fd: Option<RawFd>,
@@ -105,6 +110,20 @@ pub struct Session {
     /// Reusable encode buffer for Melin requests.
     melin_encode_buf: [u8; 136],
     pub melin_multishot_active: bool,
+
+    // ── Outbound message store (FIX 4.2 §4.6/4.7 ResendRequest) ──
+    /// Every outbound FIX message is retained here, keyed by the
+    /// MsgSeqNum it was sent with, for the lifetime of the session.
+    /// On a ResendRequest from the peer we replay these in order
+    /// (rebuilding admin message runs as SequenceReset-GapFill).
+    ///
+    /// Stateless session model: a fresh TCP connection starts with
+    /// an empty store and seq=1. There is no cross-session
+    /// persistence — clients that need that must reconnect and
+    /// re-Logon. Vec (not VecDeque) because lookup is by linear
+    /// scan over a contiguous range and the store is appended to
+    /// in seq order.
+    outbound_store: Vec<(u64, Vec<u8>)>,
 
     // ── Session-owned data ──
     id_map: ClOrdIdMap,
@@ -155,6 +174,7 @@ impl Session {
             last_fix_sent: now,
             test_request_sent_at: None,
             fix_multishot_active: false,
+            resend_high_water: None,
 
             melin_fd: None,
             melin_parse_buf: Vec::with_capacity(256),
@@ -163,6 +183,8 @@ impl Session {
             melin_seq: 0,
             melin_encode_buf: [0u8; 136],
             melin_multishot_active: false,
+
+            outbound_store: Vec::with_capacity(64),
 
             id_map: ClOrdIdMap::new(),
             order_symbols: HashMap::new(),
@@ -483,19 +505,42 @@ impl Session {
         // cancel any pending TestRequest probe.
         self.test_request_sent_at = None;
 
-        // Validate MsgSeqNum.
+        // Validate MsgSeqNum (FIX 4.2 §4.6 gap recovery).
+        //
+        // - seq < expected: stale duplicate (or replayed PossDup), ignore
+        // - seq > expected: gap. Send a ResendRequest covering
+        //   [expected, 0) — "0 = through infinity" — drop the current
+        //   message, and stash the high-water mark so we don't fire a
+        //   second ResendRequest while the first one is being filled
+        // - seq == expected: in order, advance and process
         if let Some(seq) = msg.msg_seq_num() {
             if seq < self.fix_inbound_seq {
-                // Duplicate — ignore.
                 return SessionAction::None;
             }
             if seq > self.fix_inbound_seq {
-                // Gap — disconnect (v1: no gap fill).
-                warn!(expected = self.fix_inbound_seq, got = seq, "MsgSeqNum gap");
-                self.queue_fix_logout(config, "MsgSeqNum too high, expected sequence reset");
-                return SessionAction::Close;
+                if self.resend_high_water.is_none() {
+                    warn!(
+                        expected = self.fix_inbound_seq,
+                        got = seq,
+                        "MsgSeqNum gap; sending ResendRequest"
+                    );
+                    let begin = self.fix_inbound_seq;
+                    self.queue_resend_request(config, begin, 0);
+                    self.resend_high_water = Some(seq);
+                    return SessionAction::SendFix;
+                }
+                // Already waiting for the gap to be filled — drop
+                // the out-of-order message; the peer's resend will
+                // re-deliver it.
+                return SessionAction::None;
             }
             self.fix_inbound_seq += 1;
+            // Gap closed?
+            if let Some(hw) = self.resend_high_water
+                && self.fix_inbound_seq > hw
+            {
+                self.resend_high_water = None;
+            }
         }
 
         let msg_type = msg.msg_type();
@@ -517,6 +562,21 @@ impl Session {
                 info!(sender = %self.sender_comp_id, "FIX Logout received");
                 self.queue_fix_logout(config, "Logout acknowledged");
                 SessionAction::Close
+            }
+            tags::MSG_RESEND_REQUEST => {
+                let begin = msg.get_str(tags::BEGIN_SEQ_NO).and_then(|s| s.parse().ok());
+                let end = msg.get_str(tags::END_SEQ_NO).and_then(|s| s.parse().ok());
+                match (begin, end) {
+                    (Some(b), Some(e)) => {
+                        self.handle_resend_request(config, b, e);
+                        SessionAction::SendFix
+                    }
+                    _ => {
+                        warn!(sender = %self.sender_comp_id, "ResendRequest missing BeginSeqNo/EndSeqNo");
+                        self.queue_fix_reject(config, "ResendRequest missing required tags");
+                        SessionAction::SendFix
+                    }
+                }
             }
             tags::MSG_NEW_ORDER_SINGLE
             | tags::MSG_ORDER_CANCEL_REQUEST
@@ -836,6 +896,108 @@ impl Session {
         self.state = SessionState::Closing;
     }
 
+    /// Replay messages from the outbound store in response to a peer
+    /// ResendRequest. FIX 4.2 §4.7:
+    ///
+    /// - Application messages are re-sent verbatim with the same
+    ///   MsgSeqNum but with PossDupFlag=Y and OrigSendingTime added.
+    /// - Runs of administrative messages (Heartbeat, TestRequest,
+    ///   Logon, Logout, ResendRequest, SequenceReset) are NEVER
+    ///   replayed; instead they are collapsed into a single
+    ///   SequenceReset-GapFill (35=4 GapFillFlag=Y) telling the peer
+    ///   "skip these, here's the next seq to expect."
+    ///
+    /// Replays bypass `queue_fix_raw` (and therefore the outbound
+    /// store and outbound seq counter): they are reissues of already-
+    /// stored messages, not new ones.
+    fn handle_resend_request(&mut self, config: &GatewayConfig, begin: u64, end_in: u64) {
+        // EndSeqNo=0 → "through infinity": replay everything we have
+        // from `begin` onward up to the most recently sent message.
+        let effective_end = if end_in == 0 {
+            self.fix_outbound_seq.saturating_sub(1)
+        } else {
+            end_in
+        };
+
+        info!(
+            sender = %self.sender_comp_id,
+            begin, end_in, effective_end,
+            "handling ResendRequest"
+        );
+
+        // Iterate the store in seq order, grouping consecutive admin
+        // messages into a single GapFill emission.
+        let mut admin_run_start: Option<u64> = None;
+        let mut admin_run_last: u64 = 0;
+        let mut to_emit: Vec<Vec<u8>> = Vec::new();
+
+        for (stored_seq, stored_bytes) in &self.outbound_store {
+            if *stored_seq < begin {
+                continue;
+            }
+            if *stored_seq > effective_end {
+                break;
+            }
+
+            let admin = stored_msg_is_admin(stored_bytes);
+
+            if admin {
+                if admin_run_start.is_none() {
+                    admin_run_start = Some(*stored_seq);
+                }
+                admin_run_last = *stored_seq;
+            } else {
+                // Flush any pending admin run as a GapFill before
+                // the application replay.
+                if let Some(start) = admin_run_start.take() {
+                    to_emit.push(build_gap_fill(
+                        &config.target_comp_id,
+                        &self.sender_comp_id,
+                        start,
+                        admin_run_last + 1,
+                    ));
+                }
+                to_emit.push(rebuild_with_poss_dup(
+                    stored_bytes,
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                ));
+            }
+        }
+        // Trailing admin run.
+        if let Some(start) = admin_run_start {
+            to_emit.push(build_gap_fill(
+                &config.target_comp_id,
+                &self.sender_comp_id,
+                start,
+                admin_run_last + 1,
+            ));
+        }
+
+        // Append all replays to the outbound buffer in one shot.
+        // These do NOT go through queue_fix_raw — they reuse the
+        // original seq numbers and must not bump fix_outbound_seq.
+        for bytes in to_emit {
+            self.fix_send_buf.extend_from_slice(&bytes);
+        }
+        self.last_fix_sent = Instant::now();
+    }
+
+    /// Build and queue a ResendRequest (35=2). `end` of 0 means
+    /// "through infinity" per FIX 4.2 — the peer should resend
+    /// everything from `begin` onward.
+    fn queue_resend_request(&mut self, config: &GatewayConfig, begin: u64, end: u64) {
+        let msg = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, begin)
+            .u64_tag(tags::END_SEQ_NO, end)
+            .build(
+                &config.target_comp_id,
+                &self.sender_comp_id,
+                self.fix_outbound_seq,
+            );
+        self.queue_fix_raw(&msg);
+    }
+
     fn queue_fix_reject(&mut self, config: &GatewayConfig, text: &str) {
         let msg = FixMessageBuilder::new(tags::MSG_REJECT)
             .str_tag(tags::TEXT, text)
@@ -848,9 +1010,18 @@ impl Session {
     }
 
     /// Append a serialized FIX message to the send buffer and bump
-    /// the outbound sequence counter + last-sent timestamp.
+    /// the outbound sequence counter + last-sent timestamp. Also
+    /// retain the message in the outbound store so a future
+    /// ResendRequest from the peer can replay it.
+    ///
+    /// At the call site `fix_outbound_seq` already equals the seq
+    /// number embedded in `msg` (it was passed to `build()` before
+    /// queueing), so we capture that as the store key before
+    /// bumping.
     fn queue_fix_raw(&mut self, msg: &[u8]) {
+        let stored_seq = self.fix_outbound_seq;
         self.fix_send_buf.extend_from_slice(msg);
+        self.outbound_store.push((stored_seq, msg.to_vec()));
         self.fix_outbound_seq += 1;
         self.last_fix_sent = Instant::now();
     }
@@ -989,6 +1160,75 @@ fn report_order_id(report: &ExecutionReport) -> Option<OrderId> {
         ExecutionReport::Fill { taker_order_id, .. } => Some(*taker_order_id),
         ExecutionReport::InstrumentStatusChanged { .. } => None,
     }
+}
+
+/// Whether a stored outbound message is an administrative message
+/// per FIX 4.2 §4.7. Admin messages are NEVER replayed on
+/// ResendRequest — they are collapsed into a SequenceReset-GapFill.
+fn stored_msg_is_admin(stored_bytes: &[u8]) -> bool {
+    let parsed = match FixMessage::parse(stored_bytes) {
+        Ok(m) => m,
+        // Unparseable stored bytes shouldn't happen — they came from
+        // our own builder. Treat as admin (gap-fill) to be safe.
+        Err(_) => return true,
+    };
+    matches!(
+        parsed.msg_type(),
+        tags::MSG_HEARTBEAT
+            | tags::MSG_TEST_REQUEST
+            | tags::MSG_RESEND_REQUEST
+            | tags::MSG_LOGON
+            | tags::MSG_LOGOUT
+            | tags::MSG_SEQUENCE_RESET
+            | tags::MSG_REJECT
+    )
+}
+
+/// Build a SequenceReset-GapFill (35=4 with GapFillFlag=Y) covering
+/// `[from_seq, new_seq)`. The MsgSeqNum of the GapFill is the first
+/// seq being skipped (`from_seq`), and `NewSeqNo` is the seq the peer
+/// should expect next.
+fn build_gap_fill(sender: &str, target: &str, from_seq: u64, new_seq: u64) -> Vec<u8> {
+    FixMessageBuilder::new(tags::MSG_SEQUENCE_RESET)
+        .str_tag(tags::POSS_DUP_FLAG, "Y")
+        .str_tag(tags::GAP_FILL_FLAG, "Y")
+        .u64_tag(tags::NEW_SEQ_NO, new_seq)
+        .build(sender, target, from_seq)
+}
+
+/// Rebuild a stored application message with PossDupFlag=Y and
+/// OrigSendingTime preserved. The MsgSeqNum is reused unchanged.
+///
+/// We parse the stored bytes back into fields and re-emit them via
+/// the builder so BodyLength and CheckSum get recomputed correctly.
+fn rebuild_with_poss_dup(stored_bytes: &[u8], sender: &str, target: &str) -> Vec<u8> {
+    let parsed = FixMessage::parse(stored_bytes)
+        .expect("stored outbound message must round-trip the parser");
+    let msg_type = parsed.msg_type();
+    let seq = parsed
+        .msg_seq_num()
+        .expect("stored outbound message must carry MsgSeqNum");
+    let orig_sending_time = parsed.get_str(tags::SENDING_TIME).unwrap_or("");
+
+    let mut builder = FixMessageBuilder::new(msg_type);
+    for field in parsed.fields_iter() {
+        // Skip header/trailer fields that build() will re-emit.
+        match field.tag {
+            tags::BEGIN_STRING
+            | tags::BODY_LENGTH
+            | tags::MSG_TYPE
+            | tags::SENDER_COMP_ID
+            | tags::TARGET_COMP_ID
+            | tags::MSG_SEQ_NUM
+            | tags::SENDING_TIME
+            | tags::CHECK_SUM => continue,
+            _ => {}
+        }
+        builder = builder.tag(field.tag, field.value);
+    }
+    builder = builder.str_tag(tags::POSS_DUP_FLAG, "Y");
+    builder = builder.str_tag(tags::ORIG_SENDING_TIME, orig_sending_time);
+    builder.build(sender, target, seq)
 }
 
 /// Load a 32-byte Ed25519 private key seed from a file.
@@ -1329,7 +1569,12 @@ lot_size_inverse = 1
     }
 
     #[test]
-    fn active_seq_gap_disconnects() {
+    fn active_seq_gap_triggers_resend_request_not_close() {
+        // Behavior change in the ResendRequest commit: a seq gap is
+        // recoverable per FIX 4.2 §4.6 — the gateway must request a
+        // resend instead of dropping the session. The dedicated
+        // resend tests below cover the full state transitions; this
+        // test pins the high-level contract.
         let config = make_config("FIRM_A", "MELIN");
         let smap = session_map(&config);
         let sym = symbol_map(&config);
@@ -1337,7 +1582,8 @@ lot_size_inverse = 1
 
         let raw = new_order_msg("FIRM_A", "MELIN", 99, "ORD1"); // Expected 2, got 99.
         let action = s.handle_fix_message(&raw, &config, &smap, &sym);
-        assert_eq!(action, SessionAction::Close);
+        assert_eq!(action, SessionAction::SendFix);
+        assert!(matches!(s.state, SessionState::Active));
     }
 
     #[test]
@@ -1991,6 +2237,388 @@ lot_size_inverse = 1
             "window should have rolled over"
         );
         assert_eq!(s.rate_msg_count, 1, "counter should have reset to 1");
+    }
+
+    #[test]
+    fn outbound_store_retains_every_queued_message() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        // active_session pre-bumped fix_outbound_seq to 2 to model
+        // the Logon ack already having gone out. Reset for clarity.
+        s.fix_outbound_seq = 2;
+        let initial_store_len = s.outbound_store.len();
+
+        // Queue three application messages via the normal path.
+        // (Each NewOrderSingle round-trip queues nothing on its own —
+        //  the Melin response would, but here we drive a TestRequest
+        //  reply, which is a clean way to queue an outbound message.)
+        for (i, id) in ["TR1", "TR2", "TR3"].iter().enumerate() {
+            let raw = FixMessageBuilder::new(tags::MSG_TEST_REQUEST)
+                .str_tag(tags::TEST_REQ_ID, id)
+                .build("FIRM_A", "MELIN", 2 + i as u64);
+            let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+            assert_eq!(action, SessionAction::SendFix);
+        }
+
+        assert_eq!(
+            s.outbound_store.len() - initial_store_len,
+            3,
+            "store should grow by exactly the number of queued messages"
+        );
+
+        // Each stored entry's seq matches its position and round-trips
+        // through the parser cleanly.
+        let new_entries = &s.outbound_store[initial_store_len..];
+        for (offset, (seq, bytes)) in new_entries.iter().enumerate() {
+            assert_eq!(*seq, 2 + offset as u64);
+            let parsed = FixMessage::parse(bytes).expect("stored msg parses");
+            assert_eq!(parsed.msg_type(), tags::MSG_HEARTBEAT); // TestRequest reply
+            assert_eq!(parsed.msg_seq_num(), Some(*seq));
+        }
+
+        // fix_outbound_seq has advanced past all stored messages.
+        assert_eq!(s.fix_outbound_seq, 2 + 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // ResendRequest / gap recovery
+    // -----------------------------------------------------------------------
+
+    /// Pull every complete FIX message currently in `fix_send_buf` by
+    /// the same framing logic the event loop would use. Useful for
+    /// asserting on multi-message replay output.
+    fn drain_send_buf(s: &mut Session) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = std::mem::take(&mut s.fix_send_buf);
+        while let Some(m) = crate::fix::parse::try_extract_message(&mut buf) {
+            out.push(m);
+        }
+        // Anything that didn't frame goes back.
+        s.fix_send_buf = buf;
+        out
+    }
+
+    #[test]
+    fn inbound_seq_gap_emits_resend_request_and_does_not_close() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        // Expect 2 next.
+        s.fix_inbound_seq = 2;
+
+        // Peer sends seq 5 (gap of 2,3,4).
+        let raw = new_order_msg("FIRM_A", "MELIN", 5, "ORD_FUTURE");
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::SendFix);
+        // The session must NOT be closing.
+        assert!(matches!(s.state, SessionState::Active));
+        assert_eq!(s.resend_high_water, Some(5));
+
+        let msgs = drain_send_buf(&mut s);
+        assert_eq!(msgs.len(), 1, "exactly one ResendRequest should be queued");
+        let rr = FixMessage::parse(&msgs[0]).unwrap();
+        assert_eq!(rr.msg_type(), tags::MSG_RESEND_REQUEST);
+        assert_eq!(rr.get_str(tags::BEGIN_SEQ_NO), Some("2"));
+        assert_eq!(rr.get_str(tags::END_SEQ_NO), Some("0"));
+    }
+
+    #[test]
+    fn duplicate_gap_does_not_fire_second_resend_request() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 2;
+
+        // First gap: triggers RR.
+        let m1 = new_order_msg("FIRM_A", "MELIN", 5, "ORD5");
+        s.handle_fix_message(&m1, &config, &smap, &sym);
+        let count_after_first = drain_send_buf(&mut s).len();
+        assert_eq!(count_after_first, 1);
+
+        // Second out-of-order message while RR still in flight: NO new RR.
+        let m2 = new_order_msg("FIRM_A", "MELIN", 7, "ORD7");
+        let action = s.handle_fix_message(&m2, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::None);
+        assert!(s.fix_send_buf.is_empty());
+        assert_eq!(s.resend_high_water, Some(5));
+    }
+
+    #[test]
+    fn gap_clears_after_inbound_seq_catches_up() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 2;
+
+        // Trigger RR for gap to seq 4.
+        let m_future = new_order_msg("FIRM_A", "MELIN", 4, "ORD4");
+        s.handle_fix_message(&m_future, &config, &smap, &sym);
+        let _ = drain_send_buf(&mut s);
+        assert_eq!(s.resend_high_water, Some(4));
+
+        // Peer resends 2, 3, 4 in order.
+        for (i, id) in ["ORD2", "ORD3", "ORD4"].iter().enumerate() {
+            let raw = new_order_msg("FIRM_A", "MELIN", 2 + i as u64, id);
+            s.handle_fix_message(&raw, &config, &smap, &sym);
+        }
+        assert_eq!(s.fix_inbound_seq, 5);
+        assert_eq!(s.resend_high_water, None, "gap should be cleared");
+    }
+
+    #[test]
+    fn handle_resend_request_replays_application_messages_with_poss_dup() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        // Reset outbound seq for predictable assertions.
+        s.fix_outbound_seq = 2;
+        s.outbound_store.clear();
+
+        // Inject 3 application execution reports into the store via
+        // the normal Melin path so they go through queue_fix_raw and
+        // get retained.
+        for i in 0..3 {
+            let order_id = s.id_map.insert(&format!("ORD{i}"));
+            s.order_symbols.insert(
+                order_id,
+                OrderSymbolInfo {
+                    fix_symbol: "BTC/USD".to_owned(),
+                    tick_inverse: 100,
+                    lot_inverse: 1,
+                    side: Side::Buy,
+                },
+            );
+            push_melin_response(
+                &mut s,
+                &ResponseKind::Report(ExecutionReport::Placed {
+                    order_id,
+                    side: Side::Buy,
+                    price: px(5_000_000),
+                    quantity: qty(10),
+                }),
+            );
+            s.try_process_melin_frame(&config, &sym, Instant::now());
+        }
+        assert_eq!(s.outbound_store.len(), 3);
+        let _ = drain_send_buf(&mut s); // Discard the original sends.
+
+        // Peer sends ResendRequest covering all of them.
+        // Inbound seq must be > expected since the test session was
+        // pre-bumped; just send the RR with the next inbound seq.
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 2)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", inbound);
+        let action = s.handle_fix_message(&rr, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::SendFix);
+
+        let replays = drain_send_buf(&mut s);
+        assert_eq!(replays.len(), 3, "all 3 stored ERs should replay");
+        for (i, raw) in replays.iter().enumerate() {
+            let parsed = FixMessage::parse(raw).unwrap();
+            assert_eq!(parsed.msg_type(), tags::MSG_EXECUTION_REPORT);
+            assert_eq!(parsed.get_str(tags::POSS_DUP_FLAG), Some("Y"));
+            assert!(parsed.get_str(tags::ORIG_SENDING_TIME).is_some());
+            // Original seq numbers preserved (2, 3, 4).
+            assert_eq!(parsed.msg_seq_num(), Some(2 + i as u64));
+        }
+    }
+
+    #[test]
+    fn handle_resend_request_collapses_admin_runs_into_gap_fill() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 2;
+        s.outbound_store.clear();
+
+        // Queue: heartbeat (admin), heartbeat (admin), heartbeat (admin).
+        // Three admin messages should collapse to one GapFill.
+        for i in 0..3 {
+            let raw =
+                FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 2 + i as u64);
+            s.queue_fix_raw(&raw);
+        }
+        let _ = drain_send_buf(&mut s);
+
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 2)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", inbound);
+        s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        let out = drain_send_buf(&mut s);
+        assert_eq!(out.len(), 1, "admin run collapses to a single GapFill");
+        let gf = FixMessage::parse(&out[0]).unwrap();
+        assert_eq!(gf.msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(gf.get_str(tags::GAP_FILL_FLAG), Some("Y"));
+        assert_eq!(gf.get_str(tags::POSS_DUP_FLAG), Some("Y"));
+        // GapFill MsgSeqNum = first skipped seq.
+        assert_eq!(gf.msg_seq_num(), Some(2));
+        // NewSeqNo = seq after the run.
+        assert_eq!(gf.get_str(tags::NEW_SEQ_NO), Some("5"));
+    }
+
+    #[test]
+    fn handle_resend_request_interleaves_application_and_gap_fills() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 2;
+        s.outbound_store.clear();
+
+        // Pattern: ER, HB, HB, ER, HB.  Expect: ER, GapFill(3..4), ER, GapFill(5..5).
+        // Seqs: ER=2, HB=3, HB=4, ER=5, HB=6.
+        let order_id = s.id_map.insert("ORD1");
+        s.order_symbols.insert(
+            order_id,
+            OrderSymbolInfo {
+                fix_symbol: "BTC/USD".to_owned(),
+                tick_inverse: 100,
+                lot_inverse: 1,
+                side: Side::Buy,
+            },
+        );
+        // ER seq 2.
+        push_melin_response(
+            &mut s,
+            &ResponseKind::Report(ExecutionReport::Placed {
+                order_id,
+                side: Side::Buy,
+                price: px(5_000_000),
+                quantity: qty(10),
+            }),
+        );
+        s.try_process_melin_frame(&config, &sym, Instant::now());
+        // HB seqs 3 and 4.
+        for seq in [3u64, 4] {
+            let hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", seq);
+            s.queue_fix_raw(&hb);
+        }
+        // ER seq 5.
+        push_melin_response(
+            &mut s,
+            &ResponseKind::Report(ExecutionReport::Placed {
+                order_id,
+                side: Side::Buy,
+                price: px(5_000_000),
+                quantity: qty(10),
+            }),
+        );
+        s.try_process_melin_frame(&config, &sym, Instant::now());
+        // HB seq 6.
+        let hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 6);
+        s.queue_fix_raw(&hb);
+
+        assert_eq!(s.outbound_store.len(), 5);
+        let _ = drain_send_buf(&mut s);
+
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 2)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", inbound);
+        s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        let out = drain_send_buf(&mut s);
+        assert_eq!(
+            out.len(),
+            4,
+            "ER, GapFill(3-4), ER, GapFill(6) = 4 messages"
+        );
+
+        let parsed: Vec<_> = out.iter().map(|m| FixMessage::parse(m).unwrap()).collect();
+        assert_eq!(parsed[0].msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(parsed[0].msg_seq_num(), Some(2));
+        assert_eq!(parsed[0].get_str(tags::POSS_DUP_FLAG), Some("Y"));
+
+        assert_eq!(parsed[1].msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(parsed[1].msg_seq_num(), Some(3));
+        assert_eq!(parsed[1].get_str(tags::NEW_SEQ_NO), Some("5"));
+
+        assert_eq!(parsed[2].msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(parsed[2].msg_seq_num(), Some(5));
+
+        assert_eq!(parsed[3].msg_type(), tags::MSG_SEQUENCE_RESET);
+        assert_eq!(parsed[3].msg_seq_num(), Some(6));
+        assert_eq!(parsed[3].get_str(tags::NEW_SEQ_NO), Some("7"));
+    }
+
+    #[test]
+    fn handle_resend_request_for_empty_range_emits_nothing() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Store is empty (test session with no recent sends).
+        s.outbound_store.clear();
+
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 1)
+            .u64_tag(tags::END_SEQ_NO, 100)
+            .build("FIRM_A", "MELIN", inbound);
+        s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        assert!(s.fix_send_buf.is_empty());
+    }
+
+    #[test]
+    fn handle_resend_request_replays_do_not_advance_outbound_seq() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_outbound_seq = 2;
+        s.outbound_store.clear();
+
+        let order_id = s.id_map.insert("ORD1");
+        s.order_symbols.insert(
+            order_id,
+            OrderSymbolInfo {
+                fix_symbol: "BTC/USD".to_owned(),
+                tick_inverse: 100,
+                lot_inverse: 1,
+                side: Side::Buy,
+            },
+        );
+        push_melin_response(
+            &mut s,
+            &ResponseKind::Report(ExecutionReport::Placed {
+                order_id,
+                side: Side::Buy,
+                price: px(5_000_000),
+                quantity: qty(10),
+            }),
+        );
+        s.try_process_melin_frame(&config, &sym, Instant::now());
+        let seq_after_send = s.fix_outbound_seq;
+        let store_len_after_send = s.outbound_store.len();
+        let _ = drain_send_buf(&mut s);
+
+        // Replay it.
+        let inbound = s.fix_inbound_seq;
+        let rr = FixMessageBuilder::new(tags::MSG_RESEND_REQUEST)
+            .u64_tag(tags::BEGIN_SEQ_NO, 2)
+            .u64_tag(tags::END_SEQ_NO, 0)
+            .build("FIRM_A", "MELIN", inbound);
+        s.handle_fix_message(&rr, &config, &smap, &sym);
+
+        // Outbound seq and store unchanged: replays don't allocate
+        // new seq numbers and don't re-store messages.
+        assert_eq!(s.fix_outbound_seq, seq_after_send);
+        assert_eq!(s.outbound_store.len(), store_len_after_send);
     }
 
     #[test]

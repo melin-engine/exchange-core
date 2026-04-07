@@ -198,6 +198,13 @@ impl<'a> FixMessage<'a> {
     pub fn msg_seq_num(&self) -> Option<u64> {
         self.get(tags::MSG_SEQ_NUM).and_then(parse_u64_slice)
     }
+
+    /// Iterate all parsed fields in order. Used by the resend path
+    /// to rebuild a stored message with PossDupFlag/OrigSendingTime
+    /// while preserving the original payload.
+    pub fn fields_iter(&self) -> impl Iterator<Item = &Field<'a>> {
+        self.fields.iter()
+    }
 }
 
 /// Find the byte offset where the body starts (after the BodyLength SOH).

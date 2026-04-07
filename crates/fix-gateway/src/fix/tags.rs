@@ -15,6 +15,12 @@ pub const HEART_BT_INT: u32 = 108;
 pub const TEST_REQ_ID: u32 = 112;
 pub const ENCRYPT_METHOD: u32 = 98;
 pub const TEXT: u32 = 58;
+pub const POSS_DUP_FLAG: u32 = 43;
+pub const ORIG_SENDING_TIME: u32 = 122;
+pub const BEGIN_SEQ_NO: u32 = 7;
+pub const END_SEQ_NO: u32 = 16;
+pub const NEW_SEQ_NO: u32 = 36;
+pub const GAP_FILL_FLAG: u32 = 123;
 
 // --- Order entry tags ---
 pub const ACCOUNT: u32 = 1;
@@ -45,7 +51,9 @@ pub const EXEC_INST: u32 = 18;
 // --- MsgType values (Tag 35) ---
 pub const MSG_HEARTBEAT: &[u8] = b"0";
 pub const MSG_TEST_REQUEST: &[u8] = b"1";
+pub const MSG_RESEND_REQUEST: &[u8] = b"2";
 pub const MSG_REJECT: &[u8] = b"3";
+pub const MSG_SEQUENCE_RESET: &[u8] = b"4";
 pub const MSG_LOGOUT: &[u8] = b"5";
 pub const MSG_LOGON: &[u8] = b"A";
 pub const MSG_NEW_ORDER_SINGLE: &[u8] = b"D";
