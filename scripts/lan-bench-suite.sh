@@ -44,6 +44,7 @@
 #   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 16)
 #   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 256)
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
+#   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #   SINGLE_ORDERS=N        Orders for single-order workload (default: 500000)
 #   WARMUP_ORDERS=N        Warmup orders per client (default: bench default 100000)
 #   ORDERS_PER_SWEEP=N     Orders per sweep data point (default: 10000000)
@@ -543,6 +544,10 @@ transport_start_tcp_repl() {
 
 transport_stop_tcp_repl() {
     stop_servers "$SERVER" "$REPLICA"
+    if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
+        echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
+        return
+    fi
     echo "  Verifying journal consistency..."
     "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
 }
@@ -598,6 +603,10 @@ transport_start_tcp_dual_repl() {
 
 transport_stop_tcp_dual_repl() {
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
+    if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
+        echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
+        return
+    fi
     echo "  Verifying journal consistency (replica1)..."
     "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
     echo "  Verifying journal consistency (replica2)..."
@@ -844,6 +853,10 @@ transport_stop_dpdk_repl() {
     for host in "$SERVER" "$REPLICA"; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
     done
+    if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
+        echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
+        return
+    fi
     echo "  Verifying DPDK replication journal consistency..."
     "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
 }
