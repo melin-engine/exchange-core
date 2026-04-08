@@ -2122,7 +2122,10 @@ fn set_read_timeout<F: std::os::unix::io::AsRawFd>(
 /// callers in Melin meet that condition: client reader threads spin on
 /// io_uring CQEs, the replication sender's ack-recv thread spins, and
 /// the bench client thread spins.
-fn set_busy_poll<F: std::os::unix::io::AsRawFd>(fd: &F, micros: i32) -> std::io::Result<()> {
+pub(crate) fn set_busy_poll<F: std::os::unix::io::AsRawFd>(
+    fd: &F,
+    micros: i32,
+) -> std::io::Result<()> {
     // SAFETY: fd is a live socket fd owned by the caller for the
     // duration of the call; the option pointer is to a stack-local i32
     // with the right size for SO_BUSY_POLL.
@@ -2146,7 +2149,7 @@ fn set_busy_poll<F: std::os::unix::io::AsRawFd>(fd: &F, micros: i32) -> std::io:
 /// already used on the replica receive socket; chosen to cover a
 /// typical LAN round-trip without burning excessive CPU on quiet
 /// connections.
-const BUSY_POLL_US: i32 = 50;
+pub(crate) const BUSY_POLL_US: i32 = 50;
 
 /// Set `SO_SNDTIMEO` on a socket. Prevents blocking writes from stalling
 /// the response thread when a client stops reading (SEC-01).

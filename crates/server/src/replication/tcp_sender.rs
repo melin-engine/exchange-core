@@ -200,6 +200,14 @@ pub fn run_sender(
                     if let Err(e) = stream.set_nodelay(true) {
                         debug!(error = %e, "failed to set TCP_NODELAY on replica connection");
                     }
+                    // SO_BUSY_POLL on the sender side: the per-replica thread
+                    // spins on `recv` for ack frames, so kernel busy-polling
+                    // removes the softirq->wakeup handoff from the ack path.
+                    if let Err(e) =
+                        crate::server::set_busy_poll(&stream, crate::server::BUSY_POLL_US)
+                    {
+                        debug!(error = %e, "failed to set SO_BUSY_POLL on replica connection");
+                    }
 
                     replicas_connected.fetch_add(1, Ordering::Release);
 
