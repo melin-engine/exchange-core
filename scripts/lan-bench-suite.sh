@@ -303,6 +303,16 @@ for HOST in "${BUILD_HOSTS[@]}"; do
         ${CLEAN_CMD} cargo build --release ${EXTRA_BUILD}" 2>&1 | tail -3
 done
 
+# Optional instrumented melin-server build on the primary only. Used to
+# enable diagnostic features (pipeline-stats, latency-trace) for one-off
+# investigations without polluting the default build on every host.
+# Example: SERVER_FEATURES=pipeline-stats ./scripts/lan-bench-suite.sh ...
+if [[ -n "${SERVER_FEATURES:-}" ]]; then
+    echo "  Rebuilding melin-server on primary with --features ${SERVER_FEATURES}..."
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        cargo build --release -p melin-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
+fi
+
 # DPDK build on server (and replica if dpdk-repl).
 # In TAP mode, test-containers-start.sh already built the .dpdk binary.
 # In SR-IOV mode, cherry-setup.sh builds with --features dpdk as the main binary.
