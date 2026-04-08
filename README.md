@@ -24,7 +24,14 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 
 ## LAN Benchmarks
 
-All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client) over LAN using four AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal, 10Gb/s NIC, 1 benchmark, 1 primary, 2 replicas). Commit [`46441eb`](../../commit/46441eb). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+All numbers are **full round-trip**:
+
+1. Client sends order
+2. Server durably persists (local journal + replicas, per configured durability mode)
+3. Matching engine executes
+4. Response arrives at client
+
+Measured over LAN using four AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal, 10Gb/s NIC, 1 benchmark, 1 primary, 2 replicas). Commit [`46441eb`](../../commit/46441eb). [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
 ### Peak throughput (16 clients, window 256)
 
