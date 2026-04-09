@@ -41,8 +41,8 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
 | `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow` (comma-separated). Core 0 should be reserved for OS/IRQ. |
-| `--readers` | `2` | Number of io_uring reader threads. Each multiplexes connections via io_uring multishot RECV. |
-| `--reader-cores` | `4` | First CPU core for reader threads. Reader thread `i` is pinned to core `reader_cores + i`. |
+| `--readers` | `2` | Number of io_uring reader threads (kernel TCP only). Each multiplexes connections via io_uring multishot RECV. Ignored in DPDK mode, which uses a single poll thread. |
+| `--reader-cores` | `4` | First CPU core for reader/poll threads. TCP: reader `i` → core `reader_cores + i`. DPDK: single poll thread on this core. |
 | `--max-journal-mib` | `256` | Maximum journal size in MiB before automatic rotation at startup. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -82,7 +82,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
 2. Initialize or recover the exchange (see [Recovery on Startup](#recovery-on-startup)).
 3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
 4. Build the disruptor pipeline (input ring + output ring).
-5. Spawn reader thread pool (io_uring-based, one thread per `--readers`).
+5. Spawn I/O threads: in TCP mode, a pool of io_uring reader threads (one per `--readers`); in DPDK mode, a single poll thread.
 6. Spawn 3-6 pipeline OS threads: journal, matching, response, optionally repl-sender, optionally event-publisher, optionally shadow exchange -- each pinned to its `--cores` value.
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
