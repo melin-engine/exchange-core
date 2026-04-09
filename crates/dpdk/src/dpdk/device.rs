@@ -74,9 +74,9 @@ pub struct DpdkDevice {
     /// a known peer. Cooldown must be shorter than smoltcp's neighbor cache
     /// expiry (~60s) to prevent stale entries.
     ///
-    /// O(1) lookup via extendible hashing — checked on every IPv4 packet
-    /// in collect_rx_batch, so lookup cost matters at high packet rates.
-    known_neighbors: astenn::HashMap<[u8; 4], std::time::Instant>,
+    /// O(1) lookup — checked on every IPv4 packet in collect_rx_batch,
+    /// so lookup cost matters at high packet rates.
+    known_neighbors: std::collections::HashMap<[u8; 4], std::time::Instant>,
     /// Reusable mbuf buffer for collect_rx_batch() to avoid per-poll allocation.
     batch_mbufs: Vec<*mut ffi::rte_mbuf>,
     /// Reusable injected-frames buffer for collect_rx_batch().
@@ -141,7 +141,7 @@ impl DpdkDevice {
             tx_vlan_id: 0,
             inject_queue: Vec::new(),
             learned_neighbors: Vec::new(),
-            known_neighbors: astenn::HashMap::new(),
+            known_neighbors: std::collections::HashMap::with_capacity(64),
             batch_mbufs: Vec::with_capacity(BURST_SIZE * port_ids.len()),
             batch_injected: Vec::new(),
             tx_batch: Vec::with_capacity(BURST_SIZE),

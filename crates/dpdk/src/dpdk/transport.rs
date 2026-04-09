@@ -4,7 +4,7 @@
 //! The transport owns the DPDK port and smoltcp interface. The server's
 //! DPDK poll thread calls `poll()` in a tight loop to drive all I/O.
 
-use astenn::HashMap;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -47,12 +47,17 @@ const LISTEN_PORT: u16 = 9876;
 /// and the queue exceeds this, the connection is dropped.
 const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
 
-/// smoltcp TCP socket buffer size per direction (RX and TX).
-/// 64 KiB matches MAX_TX_QUEUE_SIZE and provides enough TCP window
-/// for pipelined trading (256+ in-flight messages at ~100 bytes each).
-/// The previous 1 KiB caused smoltcp to advertise a tiny TCP window,
-/// forcing stop-and-wait at 1 KiB granularity.
-const SOCKET_BUF_SIZE: usize = 64 * 1024;
+/// smoltcp TCP RX buffer size. Determines the advertised receive window.
+/// 64 KiB provides enough window for pipelined trading (256+ in-flight
+/// messages at ~100 bytes each).
+const SOCKET_RX_BUF_SIZE: usize = 64 * 1024;
+
+/// smoltcp TCP TX buffer size. Controls how much response data queues
+/// per connection before dispatch_burst generates TCP segments. Smaller
+/// values reduce per-socket egress burst size, improving p99 latency
+/// with many connections (fewer segments serialized per egress pass).
+/// 16 KiB ≈ 11 segments at 1500 MTU vs 43 segments with 64 KiB.
+const SOCKET_TX_BUF_SIZE: usize = 16 * 1024;
 
 /// How often to refresh the smoltcp timestamp (in poll iterations).
 /// smoltcp only needs millisecond-precision timestamps for TCP timers
@@ -323,8 +328,8 @@ impl DpdkTransport {
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
         let listen_socket = {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             tune_socket(&mut socket);
             socket
@@ -385,8 +390,8 @@ impl DpdkTransport {
         remote_port: u16,
         local_port: u16,
     ) -> SocketHandle {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         tune_socket(&mut socket);
 
@@ -523,8 +528,8 @@ impl DpdkTransport {
             let accepted_handle = self.listen_handle;
 
             let new_listener = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
                 tune_socket(&mut socket);
                 socket
