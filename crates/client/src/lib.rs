@@ -400,6 +400,44 @@ mod tests {
         assert!(matches!(result, Err(ClientError::Protocol(_))));
     }
 
+    /// When the server pipeline is full, it sends ServerBusy.
+    /// The client should surface this as `ClientError::ServerBusy`.
+    #[test]
+    fn server_busy_returns_backpressure_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            mock_auth_handshake(&mut reader, &mut writer);
+
+            // Read the request.
+            let _frame = reader.read_frame().unwrap().unwrap();
+
+            // Respond with ServerBusy instead of a normal response batch.
+            let mut buf = [0u8; 128];
+            let written = codec::encode_response(&ResponseKind::ServerBusy, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        let result = client.send_request(&Request::CancelOrder {
+            symbol: Symbol(1),
+            account: melin_protocol::types::AccountId(1),
+            order_id: OrderId(42),
+        });
+
+        assert!(
+            matches!(result, Err(ClientError::ServerBusy)),
+            "expected ServerBusy error, got {result:?}"
+        );
+    }
+
     #[test]
     fn disconnect_before_batch_end_is_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
