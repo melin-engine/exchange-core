@@ -7170,6 +7170,354 @@ mod tests {
         assert_eq!(total_btc, 100, "BTC conservation violated");
     }
 
+    /// Stop-limit buy with IOC TIF: triggers, fills what's available,
+    /// cancels remainder (IOC semantics apply post-trigger).
+    #[test]
+    fn stop_limit_ioc_cancels_unfilled_remainder() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // ACCT_B: resting sell 3@500.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_B, Side::Sell, 500, 3, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A: stop-limit buy, trigger=500, limit=500, qty=10, IOC.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(500),
+                    limit_price: price(500),
+                },
+                time_in_force: TimeInForce::IOC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trade at 500 to trigger the stop.
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_B, Side::Sell, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_A, Side::Buy, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Triggered limit buy fills 3@500 (resting ask), IOC cancels remaining 7.
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        let cancels: Vec<_> = reports
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    ExecutionReport::Cancelled {
+                        order_id: OrderId(1),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Triggered {
+                    order_id: OrderId(1),
+                    ..
+                }
+            )),
+            "stop should trigger"
+        );
+        // The trigger fill (1@500) + the stop-limit fills (3@500).
+        assert!(
+            fills.len() >= 2,
+            "expected at least trigger fill + stop-limit fill, got {}",
+            fills.len()
+        );
+        assert_eq!(cancels.len(), 1, "IOC remainder should be cancelled");
+    }
+
+    /// Stop-limit with STP CancelNewest: the triggered limit order should
+    /// respect self-trade prevention just like a regular limit order.
+    #[test]
+    fn stop_limit_stp_cancel_newest() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.deposit(ACCT_B, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: resting sell @ 500.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Sell, 500, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        // ACCT_B: resting sell @ 500 (behind A in queue).
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_B, Side::Sell, 500, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A: stop-limit buy, trigger=500, limit=500, qty=5, CancelNewest.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(500),
+                    limit_price: price(500),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(5),
+                stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trigger via ACCT_B buy → trade at 500.
+        exchange.execute(
+            spec.symbol,
+            limit_order(3, ACCT_B, Side::Buy, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Triggered stop-limit buy hits ACCT_A's own sell → CancelNewest
+        // cancels the taker (the stop-limit). It should NOT self-trade.
+        let self_fills: Vec<_> = reports
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    ExecutionReport::Fill {
+                        taker_order_id: OrderId(2),
+                        maker_account: a,
+                        ..
+                    } if *a == ACCT_A
+                )
+            })
+            .collect();
+        assert!(
+            self_fills.is_empty(),
+            "STP should prevent self-trade on triggered stop-limit"
+        );
+    }
+
+    /// Stop-limit sell with wide gap between trigger and limit: the triggered
+    /// limit sell rests because its limit price is above the best bid.
+    #[test]
+    fn stop_limit_wide_trigger_limit_gap_rests() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.deposit(ACCT_B, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: resting buy @ 400.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 400, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_B: stop-limit sell, trigger=500, limit=450, qty=5.
+        // Wide gap: trigger at 500, but limit sell at 450 (above best bid 400).
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_B,
+                side: Side::Sell,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(500),
+                    limit_price: price(450),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(5),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trade at 500 to trigger: ACCT_A sells 1@500 to ACCT_B.
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_A, Side::Sell, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_B, Side::Buy, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Triggered limit sell at 450 can't match bid@400 (450 > 400) → rests.
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Triggered {
+                    order_id: OrderId(1),
+                    ..
+                }
+            )),
+            "stop should trigger"
+        );
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Placed {
+                    order_id: OrderId(1),
+                    side: Side::Sell,
+                    ..
+                }
+            )),
+            "triggered limit sell should rest (limit 450 > best bid 400)"
+        );
+
+        // Verify balance conservation.
+        let total_btc = exchange.accounts().balance(ACCT_A, BTC).available
+            + exchange.accounts().balance(ACCT_A, BTC).reserved
+            + exchange.accounts().balance(ACCT_B, BTC).available
+            + exchange.accounts().balance(ACCT_B, BTC).reserved;
+        assert_eq!(total_btc, 200, "BTC conservation violated");
+    }
+
+    /// Stop-limit buy fills across multiple price levels after triggering.
+    #[test]
+    fn stop_limit_fills_multiple_levels() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 1_000);
+        exchange.deposit(ACCT_B, USD, 1_000_000);
+
+        let mut reports = Vec::new();
+
+        // ACCT_B: asks at 500, 510, 520.
+        for (id, p) in [(1, 500), (2, 510), (3, 520)] {
+            exchange.execute(
+                spec.symbol,
+                limit_order(id, ACCT_B, Side::Sell, p, 5, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // ACCT_A: stop-limit buy, trigger=500, limit=520, qty=12.
+        // Should fill 5@500 + 5@510 + 2@520 after triggering.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(500),
+                    limit_price: price(520),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(12),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trigger: ACCT_B buys own ask at 500 (STP Allow).
+        exchange.execute(
+            spec.symbol,
+            limit_order(4, ACCT_B, Side::Buy, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // After trigger, the stop-limit becomes a limit buy at 520 with qty=12.
+        // It sweeps: remaining 4@500 + 5@510 + 3 left, but only 5@520 available
+        // at that level → fills 4@500 + 5@510 + partially 3@520.
+        let trigger_count = reports
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    ExecutionReport::Triggered {
+                        order_id: OrderId(1),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(trigger_count, 1, "stop should trigger exactly once");
+
+        let stop_limit_fills: Vec<_> = reports
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    ExecutionReport::Fill {
+                        taker_order_id: OrderId(1),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            stop_limit_fills.len() >= 2,
+            "stop-limit should fill across multiple levels, got {} fills",
+            stop_limit_fills.len()
+        );
+
+        // Verify balance conservation.
+        let total_usd = exchange.accounts().balance(ACCT_A, USD).available
+            + exchange.accounts().balance(ACCT_A, USD).reserved
+            + exchange.accounts().balance(ACCT_B, USD).available
+            + exchange.accounts().balance(ACCT_B, USD).reserved;
+        assert_eq!(total_usd, 2_000_000, "USD conservation violated");
+    }
+
     /// Snapshot round-trip: verifies that reservation slots survive
     /// save/restore and that post-restore operations work correctly.
     #[test]
