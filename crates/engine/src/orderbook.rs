@@ -2620,6 +2620,143 @@ mod tests {
         assert!(!book.is_empty());
     }
 
+    /// Stop buy triggers when trade price is ABOVE the trigger price
+    /// (not just at it). Trigger condition: trade_price >= trigger_price.
+    #[test]
+    fn stop_buy_triggers_above_trigger_price() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Resting asks at 100 and 110.
+        book.execute(
+            limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(2, Side::Sell, 110, 10, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        // Stop buy triggers at 95 — should fire when trade happens at 100.
+        book.execute(
+            stop_order(3, Side::Buy, 95, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trade at 100 (above trigger 95) → stop should trigger.
+        book.execute(
+            limit_order(4, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Triggered {
+                    order_id: OrderId(3),
+                    ..
+                }
+            )),
+            "stop buy should trigger when trade price (100) > trigger price (95)"
+        );
+    }
+
+    /// Stop sell triggers when trade price is BELOW the trigger price
+    /// (not just at it). Trigger condition: trade_price <= trigger_price.
+    #[test]
+    fn stop_sell_triggers_below_trigger_price() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Resting bids at 100 and 90.
+        book.execute(
+            limit_order(1, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(2, Side::Buy, 90, 10, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        // Stop sell triggers at 105 — should fire when trade happens at 100.
+        book.execute(
+            stop_order(3, Side::Sell, 105, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trade at 100 (below trigger 105) → stop should trigger.
+        book.execute(
+            limit_order(4, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Triggered {
+                    order_id: OrderId(3),
+                    ..
+                }
+            )),
+            "stop sell should trigger when trade price (100) < trigger price (105)"
+        );
+    }
+
+    /// Stop sell does NOT trigger when trade price is above trigger price.
+    #[test]
+    fn stop_sell_does_not_trigger_above_price() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Resting bid at 100 and stop sell at trigger 90.
+        book.execute(
+            limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            stop_order(2, Side::Sell, 90, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trade at 100 (above trigger 90) → stop sell should NOT trigger.
+        book.execute(
+            limit_order(3, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+
+        assert_eq!(reports.len(), 1, "only the limit fill, no trigger");
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Fill {
+                taker_order_id: OrderId(3),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn stop_limit_triggers_and_rests() {
         let mut book = OrderBook::new();
