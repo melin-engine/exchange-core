@@ -1016,4 +1016,40 @@ mod tests {
         assert_eq!(restored.balance(ACCT_B, BTC).available, 500);
         assert_eq!(restored.balance(ACCT_A, BTC), Balance::default());
     }
+
+    /// FEE_ACCOUNT entry persists in the balances map even when its balance
+    /// reaches zero. Regular accounts are evicted (removed from map) at zero,
+    /// but FEE_ACCOUNT keeps its entry so fee credits can use `entry()`.
+    #[test]
+    fn fee_account_not_evicted_at_zero_balance() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(FEE_ACCOUNT, USD, 100);
+
+        // Withdraw to zero — entry should remain in map.
+        mgr.withdraw(FEE_ACCOUNT, USD, 100).unwrap();
+        assert_eq!(mgr.balance(FEE_ACCOUNT, USD).available, 0);
+
+        // FEE_ACCOUNT's entry still exists: withdrawing 0 more should NOT
+        // return UnknownAccount (it would if the entry were evicted).
+        // A regular account at zero IS evicted and returns UnknownAccount.
+        mgr.deposit(ACCT_A, USD, 100);
+        mgr.withdraw(ACCT_A, USD, 100).unwrap();
+        let regular_result = mgr.withdraw(ACCT_A, USD, 1);
+        assert_eq!(
+            regular_result,
+            Err(RejectReason::UnknownAccount),
+            "regular account should be evicted at zero"
+        );
+
+        let fee_result = mgr.withdraw(FEE_ACCOUNT, USD, 1);
+        assert_eq!(
+            fee_result,
+            Err(RejectReason::InsufficientBalance),
+            "FEE_ACCOUNT should still exist (InsufficientBalance, not UnknownAccount)"
+        );
+
+        // FEE_ACCOUNT can receive new deposits/credits after hitting zero.
+        mgr.deposit(FEE_ACCOUNT, USD, 50);
+        assert_eq!(mgr.balance(FEE_ACCOUNT, USD).available, 50);
+    }
 }
