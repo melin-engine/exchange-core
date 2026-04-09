@@ -210,7 +210,9 @@ Core 0 is reserved for OS/IRQ handling.
 
 Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9 latency jitter from approximately 5-20 us per core migration to near zero.
 
-Reader threads are pinned to cores starting at `--reader-cores` (default 4). Reader thread `i` is pinned to core `reader_cores + i`.
+In **kernel TCP mode**, reader threads are pinned to cores starting at `--reader-cores` (default 4). Reader thread `i` is pinned to core `reader_cores + i`.
+
+In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is pinned to the `--reader-cores` core (default 4). The `--readers` flag is ignored.
 
 ### Why not async
 
@@ -241,8 +243,8 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow (comma-separated) |
-| `--readers` | `2` | Number of io_uring reader threads |
-| `--reader-cores` | `4` | First CPU core for reader thread pinning (reader i -> core reader_cores + i) |
+| `--readers` | `2` | Number of io_uring reader threads (kernel TCP only; ignored in DPDK mode) |
+| `--reader-cores` | `4` | First CPU core for reader/poll thread pinning. TCP: reader i -> core reader_cores + i. DPDK: single poll thread on this core. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

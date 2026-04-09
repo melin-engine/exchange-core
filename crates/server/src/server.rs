@@ -52,11 +52,13 @@ pub struct ServerConfig {
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
     #[arg(long, default_value = "1,2,3,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
-    /// Number of io_uring reader threads.
+    /// Number of io_uring reader threads (kernel TCP only). Ignored in
+    /// DPDK mode, which uses a single poll thread on core `reader-cores`.
     #[arg(long, default_value_t = 2)]
     pub readers: usize,
-    /// First CPU core for reader thread pinning. Reader thread i is
-    /// pinned to reader_cores + i.
+    /// First CPU core for reader/poll thread pinning. In TCP mode, reader
+    /// thread i is pinned to core reader_cores + i. In DPDK mode, the
+    /// single poll thread is pinned to this core.
     #[arg(long, default_value_t = 4)]
     pub reader_cores: usize,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
