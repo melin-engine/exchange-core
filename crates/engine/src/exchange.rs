@@ -8782,4 +8782,99 @@ mod tests {
         let result = exchange.withdraw(FEE_ACCOUNT, USD, 1);
         assert!(result.is_err(), "over-withdrawing fee account should fail");
     }
+
+    /// Different instruments can have different fee schedules, and fills
+    /// on each instrument apply the correct schedule.
+    #[test]
+    fn per_instrument_fee_isolation() {
+        use crate::account::FEE_ACCOUNT;
+
+        let mut exchange = Exchange::new();
+        let btc_spec = btc_usd_spec();
+        let eth_spec = eth_usd_spec();
+        exchange.add_instrument(btc_spec);
+        exchange.add_instrument(eth_spec);
+
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 1_000);
+        exchange.deposit(ACCT_B, ETH, 1_000);
+
+        // BTC/USD: 10 bps maker, 20 bps taker.
+        exchange.set_fee_schedule(
+            btc_spec.symbol,
+            FeeSchedule {
+                maker_fee_bps: 10,
+                taker_fee_bps: 20,
+            },
+        );
+        // ETH/USD: 50 bps maker, 100 bps taker.
+        exchange.set_fee_schedule(
+            eth_spec.symbol,
+            FeeSchedule {
+                maker_fee_bps: 50,
+                taker_fee_bps: 100,
+            },
+        );
+
+        let mut reports = Vec::new();
+
+        // BTC/USD fill: 10@1000, cost=10_000.
+        exchange.execute(
+            btc_spec.symbol,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            btc_spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let btc_fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        // BTC fees: maker=10_000*10/10_000=10, taker=10_000*20/10_000=20.
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = btc_fill
+        {
+            assert_eq!(*maker_fee, 10, "BTC maker fee");
+            assert_eq!(*taker_fee, 20, "BTC taker fee");
+        }
+        reports.clear();
+
+        // ETH/USD fill: 10@1000, cost=10_000.
+        exchange.execute(
+            eth_spec.symbol,
+            limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            eth_spec.symbol,
+            limit_order(2, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let eth_fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        // ETH fees: maker=10_000*50/10_000=50, taker=10_000*100/10_000=100.
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = eth_fill
+        {
+            assert_eq!(*maker_fee, 50, "ETH maker fee");
+            assert_eq!(*taker_fee, 100, "ETH taker fee");
+        }
+
+        // Total fees: BTC(10+20) + ETH(50+100) = 180.
+        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        assert_eq!(fee_bal.available, 180, "aggregated fee account");
+    }
 }
