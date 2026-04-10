@@ -325,6 +325,9 @@ if [[ "$NEED_DPDK" == "1" ]]; then
         echo "  Building DPDK server..."
         ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
             cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+        echo "  Building DPDK bench..."
+        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            cargo build --release -p melin-bench --features dpdk" 2>&1 | tail -3
         for item in "${MATRIX[@]}"; do
             if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
                 echo "  Building DPDK server on replica..."
