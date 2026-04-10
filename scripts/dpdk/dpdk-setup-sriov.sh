@@ -48,10 +48,11 @@ PF1_IFACE="${PF1_IFACE}"
 PF_DRIVER=$(ethtool -i "$PF0_IFACE" 2>/dev/null | awk '/^driver:/{print $2}')
 case "$PF_DRIVER" in
     ice)    NIC_NAME="E810"; VF_DRIVER="iavf" ;;
+    i40e)   NIC_NAME="X710/XL710"; VF_DRIVER="iavf" ;;
     ixgbe)  NIC_NAME="82599/X520"; VF_DRIVER="ixgbevf" ;;
     *)
         echo "error: unsupported PF driver '$PF_DRIVER' on $PF0_IFACE" >&2
-        echo "  Supported: ice (E810), ixgbe (82599/X520/X540)" >&2
+        echo "  Supported: ice (E810), i40e (X710/XL710), ixgbe (82599/X520/X540)" >&2
         exit 1
         ;;
 esac
