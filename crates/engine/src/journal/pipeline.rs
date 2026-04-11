@@ -376,7 +376,18 @@ impl RawBatchSender {
     /// The slot buffer is a `Vec<u8>` with `RAW_SLOT_INITIAL_CAPACITY`
     /// headroom; larger batches grow the Vec amortized without altering
     /// the ring protocol.
+    ///
+    /// # Panics
+    /// Panics if `bytes.len() > u32::MAX`. The wire format caps batches
+    /// at a few hundred KB so this is unreachable in practice, but the
+    /// explicit check prevents a silent truncation of `len` in the slot
+    /// metadata (which would translate to a short/empty journal write).
     pub fn send(&self, bytes: &[u8], end_sequence: u64, chain_hash: [u8; 32], entry_count: u32) {
+        assert!(
+            bytes.len() <= u32::MAX as usize,
+            "raw batch too large for u32 len field: {}",
+            bytes.len()
+        );
         loop {
             let head = self.ring.head.get().load(Ordering::Relaxed);
             let tail = self.ring.tail.get().load(Ordering::Acquire);
@@ -487,9 +498,19 @@ pub struct RawBatchReceiver {
 impl RawBatchReceiver {
     /// Try to receive a raw batch without blocking. Returns `None` if
     /// the ring is empty. The returned [`RawBatchSlot`] pins the slot
-    /// until dropped — callers must not call `try_recv` again before
-    /// dropping the previous slot, or the sender's backpressure will
-    /// starve waiting for a slot that is logically in-flight.
+    /// until dropped.
+    ///
+    /// # Single-outstanding contract
+    ///
+    /// Callers must drop the previous slot before calling `try_recv`
+    /// again. Violating this is **not** memory-unsafe — the sender's
+    /// backpressure keeps the slot pinned as long as any handle exists
+    /// — but it causes silent data loss: the second call returns the
+    /// *same* slot (both reads see the pre-drop `tail`), and dropping
+    /// both handles advances `tail` twice, skipping the next batch
+    /// entirely. The journal stage enforces the invariant structurally
+    /// via its `Option<InflightRaw>` state machine — there is only one
+    /// legitimate caller and it cannot violate the contract.
     pub fn try_recv(&self) -> Option<RawBatchSlot> {
         let tail = self.ring.tail.get().load(Ordering::Relaxed);
         let head = self.ring.head.get().load(Ordering::Acquire);
@@ -3450,6 +3471,32 @@ mod tests {
         assert_eq!(slot.bytes(), &[42]);
         drop(slot);
         assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn raw_batch_ring_slot_grows_past_initial_capacity() {
+        // The slot buffer starts at RAW_SLOT_INITIAL_CAPACITY (1 MiB) but
+        // is a `Vec<u8>` so it grows amortized on larger bursts. Send a
+        // batch that exceeds the initial capacity and verify the payload
+        // round-trips correctly.
+        let (tx, rx) = raw_batch_channel();
+        let big: Vec<u8> = (0..(RAW_SLOT_INITIAL_CAPACITY + 4096))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+        tx.send(&big, 99, [0xCC; 32], 1);
+        let slot = rx.try_recv().unwrap();
+        assert_eq!(slot.len(), big.len());
+        assert_eq!(slot.bytes(), big.as_slice());
+        assert_eq!(slot.end_sequence, 99);
+        assert_eq!(slot.chain_hash, [0xCC; 32]);
+
+        // After the slot is released, the sender can reuse it for a
+        // smaller batch. The Vec keeps its grown capacity; no realloc
+        // on the next send.
+        drop(slot);
+        tx.send(&[1, 2, 3], 100, [0; 32], 1);
+        let next = rx.try_recv().unwrap();
+        assert_eq!(next.bytes(), &[1, 2, 3]);
     }
 
     #[test]
