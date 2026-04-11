@@ -303,7 +303,7 @@ pub(super) fn submit_batch_to_pipeline(
     producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
     raw_tx: &melin_engine::journal::pipeline::RawBatchSender,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    use melin_engine::journal::pipeline::{InputSlot, RawJournalBatch};
+    use melin_engine::journal::pipeline::InputSlot;
 
     // Decode ALL entries from the raw bytes and publish to the disruptor,
     // including auto-emitted Checkpoint entries. Count the actual entries
@@ -339,15 +339,12 @@ pub(super) fn submit_batch_to_pipeline(
         }
     }
 
-    // Send raw bytes to the journal stage via the bounded SPSC ring.
-    // The ring has 8 slots — the receiver can pipeline up to 8 batches
+    // Send raw bytes to the journal stage via the pre-allocated SPSC
+    // ring. `send` copies into the next free slot buffer — no heap
+    // allocation, no intermediate `Vec::to_vec()` on the hot path. The
+    // ring has 8 slots, so the receiver can pipeline up to 8 batches
     // ahead of the journal stage's NVMe writes.
-    raw_tx.send(RawJournalBatch {
-        bytes: journal_bytes.to_vec(),
-        end_sequence,
-        chain_hash,
-        entry_count: decoded_count,
-    });
+    raw_tx.send(journal_bytes, end_sequence, chain_hash, decoded_count);
 
     // Return the disruptor target — the caller waits for this before
     // sending an ack.
