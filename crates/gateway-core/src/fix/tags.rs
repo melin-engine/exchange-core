@@ -47,6 +47,21 @@ pub const CXL_REJ_REASON: u32 = 102;
 pub const CXL_REJ_RESPONSE_TO: u32 = 434;
 pub const EXEC_INST: u32 = 18;
 
+// --- Order status / mass status tags ---
+pub const MASS_STATUS_REQ_ID: u32 = 584;
+pub const MASS_STATUS_REQ_TYPE: u32 = 585;
+pub const TOT_NUM_REPORTS: u32 = 911;
+pub const LAST_RPT_REQUESTED: u32 = 912;
+
+// --- Position tags ---
+pub const POS_REQ_ID: u32 = 710;
+pub const POS_REQ_TYPE: u32 = 724;
+pub const NO_POSITIONS: u32 = 702;
+pub const LONG_QTY: u32 = 704;
+pub const SHORT_QTY: u32 = 705;
+pub const POS_REQ_RESULT: u32 = 728;
+pub const TOTAL_NUM_POS_REPORTS: u32 = 727;
+
 // --- Market data tags (FIX 4.4) ---
 pub const MD_REQ_ID: u32 = 262;
 pub const SUBSCRIPTION_REQUEST_TYPE: u32 = 263;
@@ -84,6 +99,10 @@ pub const MSG_ORDER_CANCEL_REQUEST: &[u8] = b"F";
 pub const MSG_ORDER_CANCEL_REPLACE: &[u8] = b"G";
 pub const MSG_EXECUTION_REPORT: &[u8] = b"8";
 pub const MSG_ORDER_CANCEL_REJECT: &[u8] = b"9";
+pub const MSG_ORDER_STATUS_REQUEST: &[u8] = b"H";
+pub const MSG_ORDER_MASS_STATUS_REQUEST: &[u8] = b"AF";
+pub const MSG_REQUEST_FOR_POSITIONS: &[u8] = b"AN";
+pub const MSG_POSITION_REPORT: &[u8] = b"AP";
 pub const MSG_MARKET_DATA_REQUEST: &[u8] = b"V";
 pub const MSG_MD_SNAPSHOT: &[u8] = b"W";
 pub const MSG_MD_INCREMENTAL: &[u8] = b"X";

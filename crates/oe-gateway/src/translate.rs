@@ -678,6 +678,117 @@ pub fn cancel_reject_to_fix(
         .build(sender, target, seq)
 }
 
+// ---------------------------------------------------------------------------
+// Order status queries (H, AF)
+// ---------------------------------------------------------------------------
+
+// Allow dead_code: these types and functions are exercised by tests
+// and will be called from session.rs when dispatch is wired.
+#[allow(dead_code)]
+/// Live state of a single order, tracked per-session from ExecutionReports.
+#[derive(Debug, Clone)]
+pub struct OrderLiveState {
+    pub symbol_str: String,
+    pub side: &'static str,
+    pub price: String,
+    /// FIX OrdStatus(39): "0"=New, "1"=PartiallyFilled, "2"=Filled, "4"=Canceled, "8"=Rejected
+    pub ord_status: &'static str,
+    pub leaves_qty: String,
+    pub cum_qty: u64,
+    pub avg_px: u64,
+    pub order_qty: String,
+}
+
+/// Build an ExecutionReport (35=8) for an OrderStatusRequest (H) response.
+///
+/// ExecType=I (OrderStatus) — a non-event report purely answering a query.
+#[allow(dead_code)] // Used when session dispatch is wired.
+pub fn order_status_report(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    order_id: u64,
+    clord_id: &str,
+    exec_id: &str,
+    state: &OrderLiveState,
+) -> Vec<u8> {
+    FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+        .str_tag(tags::ORDER_ID, &order_id.to_string())
+        .str_tag(tags::CL_ORD_ID, clord_id)
+        .str_tag(tags::EXEC_ID, exec_id)
+        .str_tag(tags::EXEC_TYPE, "I") // OrderStatus
+        .str_tag(tags::ORD_STATUS, state.ord_status)
+        .str_tag(tags::SYMBOL, &state.symbol_str)
+        .str_tag(tags::SIDE, state.side)
+        .str_tag(tags::ORDER_QTY, &state.order_qty)
+        .str_tag(tags::PRICE, &state.price)
+        .str_tag(tags::LEAVES_QTY, &state.leaves_qty)
+        .str_tag(tags::CUM_QTY, &state.cum_qty.to_string())
+        .str_tag(tags::AVG_PX, &state.avg_px.to_string())
+        .build(sender, target, seq)
+}
+
+/// Build an ExecutionReport (35=8) as the terminating message for
+/// OrderMassStatusRequest (AF) when there are no matching orders.
+///
+/// `TotNumReports=0` signals "query complete, nothing found".
+#[allow(dead_code)] // Used when session dispatch is wired.
+pub fn order_mass_status_empty(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    mass_status_req_id: &str,
+    exec_id: &str,
+) -> Vec<u8> {
+    FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+        .str_tag(tags::MASS_STATUS_REQ_ID, mass_status_req_id)
+        .str_tag(tags::EXEC_ID, exec_id)
+        .str_tag(tags::EXEC_TYPE, "I") // OrderStatus
+        .str_tag(tags::ORD_STATUS, "0") // New (nominal)
+        .str_tag(tags::TOT_NUM_REPORTS, "0")
+        .str_tag(tags::LAST_RPT_REQUESTED, "Y")
+        .build(sender, target, seq)
+}
+
+// ---------------------------------------------------------------------------
+// Position queries (AN → AP)
+// ---------------------------------------------------------------------------
+
+/// One currency balance entry in a PositionReport.
+#[allow(dead_code)] // Used when session dispatch is wired.
+pub struct BalanceEntry {
+    pub currency: String,
+    pub free: u64,
+    pub reserved: u64,
+}
+
+/// Build a PositionReport (35=AP) for a RequestForPositions (AN) response.
+#[allow(dead_code)] // Used when session dispatch is wired.
+pub fn position_report_to_fix(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    pos_req_id: &str,
+    account: &str,
+    balances: &[BalanceEntry],
+) -> Vec<u8> {
+    let mut builder = FixMessageBuilder::new(tags::MSG_POSITION_REPORT)
+        .str_tag(tags::POS_REQ_ID, pos_req_id)
+        .str_tag(tags::POS_REQ_RESULT, "0") // Valid request
+        .str_tag(tags::ACCOUNT, account)
+        .str_tag(tags::TOTAL_NUM_POS_REPORTS, "1")
+        .str_tag(tags::NO_POSITIONS, &balances.len().to_string());
+
+    for bal in balances {
+        builder = builder
+            .str_tag(tags::CURRENCY, &bal.currency)
+            .str_tag(tags::LONG_QTY, &bal.free.to_string())
+            .str_tag(tags::SHORT_QTY, &bal.reserved.to_string());
+    }
+
+    builder.build(sender, target, seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,5 +1619,68 @@ mod tests {
         assert_eq!(msg.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
         assert_eq!(msg.get_str(tags::CXL_REJ_RESPONSE_TO), Some("2")); // Replace
         assert_eq!(msg.get_str(tags::CXL_REJ_REASON), Some("3")); // Already pending
+    }
+
+    #[test]
+    fn order_status_report_builds_valid_fix() {
+        let state = OrderLiveState {
+            symbol_str: "BTC/USD".to_string(),
+            side: "1", // Buy
+            price: "50000".to_string(),
+            ord_status: "0", // New
+            leaves_qty: "10".to_string(),
+            cum_qty: 0,
+            avg_px: 0,
+            order_qty: "10".to_string(),
+        };
+        let msg_bytes = order_status_report("MELIN", "FIRM", 1, 42, "CLO1", "E1", &state);
+        let msg = FixMessage::parse(&msg_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("I"));
+        assert_eq!(msg.get_str(tags::ORD_STATUS), Some("0"));
+        assert_eq!(msg.get_str(tags::ORDER_ID), Some("42"));
+        assert_eq!(msg.get_str(tags::SYMBOL), Some("BTC/USD"));
+        assert_eq!(msg.get_str(tags::LEAVES_QTY), Some("10"));
+    }
+
+    #[test]
+    fn order_mass_status_empty_builds_valid_fix() {
+        let msg_bytes = order_mass_status_empty("MELIN", "FIRM", 1, "MSR1", "E2");
+        let msg = FixMessage::parse(&msg_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(msg.get_str(tags::EXEC_TYPE), Some("I"));
+        assert_eq!(msg.get_str(tags::TOT_NUM_REPORTS), Some("0"));
+        assert_eq!(msg.get_str(tags::LAST_RPT_REQUESTED), Some("Y"));
+        assert_eq!(msg.get_str(tags::MASS_STATUS_REQ_ID), Some("MSR1"));
+    }
+
+    #[test]
+    fn position_report_builds_valid_fix() {
+        let balances = vec![
+            BalanceEntry {
+                currency: "BTC".to_string(),
+                free: 100,
+                reserved: 20,
+            },
+            BalanceEntry {
+                currency: "USD".to_string(),
+                free: 50000,
+                reserved: 10000,
+            },
+        ];
+        let msg_bytes = position_report_to_fix("MELIN", "FIRM", 1, "PR1", "ACCT1", &balances);
+        let msg = FixMessage::parse(&msg_bytes).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_POSITION_REPORT);
+        assert_eq!(msg.get_str(tags::POS_REQ_ID), Some("PR1"));
+        assert_eq!(msg.get_str(tags::ACCOUNT), Some("ACCT1"));
+        assert_eq!(msg.get_str(tags::NO_POSITIONS), Some("2"));
+
+        let currencies: Vec<_> = msg
+            .fields_iter()
+            .filter(|f| f.tag == tags::CURRENCY)
+            .collect();
+        assert_eq!(currencies.len(), 2);
+        assert_eq!(std::str::from_utf8(currencies[0].value).unwrap(), "BTC");
+        assert_eq!(std::str::from_utf8(currencies[1].value).unwrap(), "USD");
     }
 }
