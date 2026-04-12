@@ -1584,6 +1584,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-market-data"
+version = "0.1.0"
+dependencies = [
+ "melin-engine",
+ "proptest",
+ "tracing",
+]
+
+[[package]]
 name = "melin-oe-gateway"
 version = "0.1.0"
 dependencies = [
