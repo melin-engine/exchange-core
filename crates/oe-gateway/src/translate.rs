@@ -390,7 +390,6 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
                 .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TRANS_TYPE, "0") // New
                 .str_tag(tags::EXEC_TYPE, "0") // New
                 .str_tag(tags::ORD_STATUS, "0") // New
                 .str_tag(tags::SYMBOL, symbol_str)
@@ -441,7 +440,6 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
                 .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TRANS_TYPE, "0")
                 .str_tag(tags::EXEC_TYPE, "F") // Trade
                 .str_tag(tags::ORD_STATUS, "2") // Filled (conservative)
                 .str_tag(tags::SYMBOL, symbol_str)
@@ -476,7 +474,6 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
                 .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TRANS_TYPE, "0")
                 .str_tag(tags::EXEC_TYPE, "4") // Canceled
                 .str_tag(tags::ORD_STATUS, "4") // Canceled
                 .str_tag(tags::SYMBOL, symbol_str)
@@ -494,7 +491,6 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
                 .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TRANS_TYPE, "0")
                 .str_tag(tags::EXEC_TYPE, "8") // Rejected
                 .str_tag(tags::ORD_STATUS, "8") // Rejected
                 .str_tag(tags::SYMBOL, symbol_str)
@@ -519,7 +515,6 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
                 .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TRANS_TYPE, "0")
                 .str_tag(tags::EXEC_TYPE, "5") // Replace
                 .str_tag(tags::ORD_STATUS, "0") // New (still resting)
                 .str_tag(tags::SYMBOL, symbol_str)
@@ -547,7 +542,6 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
                 .str_tag(tags::CL_ORD_ID, clord_id)
                 .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TRANS_TYPE, "0")
                 .str_tag(tags::EXEC_TYPE, "L") // Triggered
                 .str_tag(tags::ORD_STATUS, "0") // New
                 .str_tag(tags::SYMBOL, symbol_str)
@@ -627,7 +621,6 @@ pub fn fill_report_for_order(
         .str_tag(tags::ORDER_ID, &order_id.0.to_string())
         .str_tag(tags::CL_ORD_ID, clord_id)
         .str_tag(tags::EXEC_ID, &exec_id.to_string())
-        .str_tag(tags::EXEC_TRANS_TYPE, "0")
         .str_tag(tags::EXEC_TYPE, "F") // Trade
         .str_tag(tags::ORD_STATUS, "2") // Filled (conservative)
         .str_tag(tags::SYMBOL, symbol_str)

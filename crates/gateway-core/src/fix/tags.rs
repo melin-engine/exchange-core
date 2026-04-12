@@ -27,7 +27,6 @@ pub const ACCOUNT: u32 = 1;
 pub const CL_ORD_ID: u32 = 11;
 pub const ORIG_CL_ORD_ID: u32 = 41;
 pub const EXEC_ID: u32 = 17;
-pub const EXEC_TRANS_TYPE: u32 = 20;
 pub const EXEC_TYPE: u32 = 150;
 pub const ORD_STATUS: u32 = 39;
 pub const ORD_TYPE: u32 = 40;

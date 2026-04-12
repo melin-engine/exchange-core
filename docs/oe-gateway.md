@@ -1,6 +1,6 @@
-# FIX Gateway
+# Order Entry Gateway
 
-The FIX gateway is the front door for clients that speak FIX 4.4. It
+The order entry gateway is the front door for clients that speak FIX 4.4. It
 terminates FIX sessions, translates orders into the internal Melin
 protocol, and translates execution reports back to FIX. One gateway
 process can serve many concurrent FIX clients on a single thread,
