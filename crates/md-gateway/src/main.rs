@@ -8,6 +8,7 @@
 //!   melin-md-gateway --config md-gateway.toml [--core N]
 
 mod config;
+pub mod event_loop;
 pub mod translate;
 
 fn main() {
