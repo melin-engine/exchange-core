@@ -1594,6 +1594,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-md-gateway"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "io-uring",
+ "libc",
+ "melin-engine",
+ "melin-gateway-core",
+ "melin-market-data",
+ "melin-protocol",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "melin-oe-gateway"
 version = "0.1.0"
 dependencies = [

@@ -47,6 +47,20 @@ pub const CXL_REJ_REASON: u32 = 102;
 pub const CXL_REJ_RESPONSE_TO: u32 = 434;
 pub const EXEC_INST: u32 = 18;
 
+// --- Market data tags (FIX 4.4) ---
+pub const MD_REQ_ID: u32 = 262;
+pub const SUBSCRIPTION_REQUEST_TYPE: u32 = 263;
+pub const MARKET_DEPTH: u32 = 264;
+pub const MD_UPDATE_TYPE: u32 = 265;
+pub const NO_MD_ENTRIES: u32 = 268;
+pub const MD_ENTRY_TYPE: u32 = 269;
+pub const MD_ENTRY_PX: u32 = 270;
+pub const MD_ENTRY_SIZE: u32 = 271;
+pub const MD_UPDATE_ACTION: u32 = 279;
+pub const NO_RELATED_SYM: u32 = 146;
+pub const NUMBER_OF_ORDERS: u32 = 346;
+pub const MD_REQ_REJ_REASON: u32 = 281;
+
 // --- MsgType values (Tag 35) ---
 pub const MSG_HEARTBEAT: &[u8] = b"0";
 pub const MSG_TEST_REQUEST: &[u8] = b"1";
@@ -60,6 +74,10 @@ pub const MSG_ORDER_CANCEL_REQUEST: &[u8] = b"F";
 pub const MSG_ORDER_CANCEL_REPLACE: &[u8] = b"G";
 pub const MSG_EXECUTION_REPORT: &[u8] = b"8";
 pub const MSG_ORDER_CANCEL_REJECT: &[u8] = b"9";
+pub const MSG_MARKET_DATA_REQUEST: &[u8] = b"V";
+pub const MSG_MD_SNAPSHOT: &[u8] = b"W";
+pub const MSG_MD_INCREMENTAL: &[u8] = b"X";
+pub const MSG_MD_REQUEST_REJECT: &[u8] = b"Y";
 
 pub const FIX_VERSION: &[u8] = b"FIX.4.4";
 
