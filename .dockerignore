@@ -1,0 +1,6 @@
+target
+.git
+*.journal
+*.snapshot
+docs
+scripts
