@@ -136,6 +136,7 @@ pub fn run(
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut frame_buf = [0u8; MAX_FRAME_BUF];
     let mut idle_spins: u32 = 0;
+    let mut last_broadcast = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Accept new connections (non-blocking).
@@ -148,6 +149,23 @@ pub fn run(
         let batch_start_seq = consumer.next_read();
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
         if count == 0 {
+            // Send a heartbeat to streaming subscribers every 10s of idle
+            // so their read timeouts don't fire on a quiet firehose.
+            if last_broadcast.elapsed() >= std::time::Duration::from_secs(10) {
+                frame_buf[..8].copy_from_slice(&last_seq.to_le_bytes());
+                if let Ok(n) = codec::encode_response(&ResponseKind::Heartbeat, &mut frame_buf[8..])
+                {
+                    let frame = &frame_buf[..8 + n];
+                    subscribers.retain_mut(|sub| {
+                        if !matches!(sub.state, SubscriberState::Streaming) {
+                            return true;
+                        }
+                        sub.stream.write_all(frame).is_ok()
+                    });
+                }
+                last_broadcast = std::time::Instant::now();
+            }
+
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
@@ -157,6 +175,7 @@ pub fn run(
             continue;
         }
         idle_spins = 0;
+        last_broadcast = std::time::Instant::now();
 
         // Process each event: update mirrors, then broadcast to streaming subscribers.
         for (idx, slot) in batch[..count].iter().enumerate() {
