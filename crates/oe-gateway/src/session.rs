@@ -1157,10 +1157,15 @@ impl Session {
     ) -> SessionAction {
         let mass_req_id = msg.get_str(tags::MASS_STATUS_REQ_ID).unwrap_or("0");
         let req_type = msg.get_str(tags::MASS_STATUS_REQ_TYPE).unwrap_or("1");
-        let symbol_filter = if req_type == "7" {
-            msg.get_str(tags::SYMBOL)
-        } else {
-            None
+        // FIX 4.4 MassStatusReqType: "1" = all orders, "7" = by symbol.
+        let symbol_filter = match req_type {
+            "1" => None,
+            "7" => msg.get_str(tags::SYMBOL),
+            _ => {
+                warn!(sender = %self.sender_comp_id, req_type, "invalid MassStatusReqType");
+                self.queue_fix_reject(config, "invalid MassStatusReqType");
+                return SessionAction::SendFix;
+            }
         };
 
         // Collect matching active orders (ord_status "0" New or "1" PartiallyFilled).
