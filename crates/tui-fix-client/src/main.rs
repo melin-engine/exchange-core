@@ -705,6 +705,41 @@ fn parse_snapshot(msg: &FixMessage<'_>) -> (Vec<BookLevel>, Vec<BookLevel>) {
 
 // --- OE session ---------------------------------------------------------------
 
+/// Local order state maintained from execution reports.
+struct LocalOrder {
+    order_id: String,
+    clord_id: String,
+    symbol: String,
+    side: &'static str,
+    qty: String,
+    price: String,
+    leaves_qty: String,
+}
+
+impl LocalOrder {
+    fn display(&self) -> String {
+        format!(
+            "{} {} {} {}@{} leaves={} ({})",
+            self.order_id,
+            self.symbol,
+            self.side,
+            self.qty,
+            self.price,
+            self.leaves_qty,
+            self.clord_id
+        )
+    }
+}
+
+/// Ordered map of active orders, keyed by OrderID.
+/// BTreeMap keeps the display order stable.
+type OrderTable = std::collections::BTreeMap<String, LocalOrder>;
+
+fn send_order_table(table: &OrderTable, tx: &Sender<UiMsg>) {
+    let lines: Vec<String> = table.values().map(|o| o.display()).collect();
+    let _ = tx.send(UiMsg::ActiveOrders(lines));
+}
+
 fn run_oe_session(
     addr: &str,
     sender: &str,
@@ -725,13 +760,69 @@ fn run_oe_session(
     };
     let _ = tx.send(UiMsg::OeStatus(true, String::new()));
     let _ = tx.send(UiMsg::Log("[OE] connected".into()));
+
+    // --- One-time sync: mass status + positions ---
+
+    let msr = FixMessageBuilder::new(tags::MSG_ORDER_MASS_STATUS_REQUEST)
+        .str_tag(tags::MASS_STATUS_REQ_ID, "INIT")
+        .str_tag(tags::MASS_STATUS_REQ_TYPE, "1");
+    if let Err(e) = c.send_builder(msr) {
+        send_err(&e);
+        return;
+    }
+    let pr = FixMessageBuilder::new(tags::MSG_REQUEST_FOR_POSITIONS)
+        .str_tag(tags::POS_REQ_ID, "INIT")
+        .str_tag(tags::POS_REQ_TYPE, "0")
+        .str_tag(tags::ACCOUNT, "1");
+    if let Err(e) = c.send_builder(pr) {
+        send_err(&e);
+        return;
+    }
+
     if let Err(e) = c.set_read_timeout(Some(Duration::from_millis(100))) {
         send_err(&e);
         return;
     }
 
-    let (mut last_q, mut msr_n, mut pr_n) = (Instant::now() - Duration::from_secs(10), 0u64, 0u64);
-    let mut pending_orders: Vec<String> = Vec::new();
+    // Drain the initial mass status + position responses.
+    let mut orders = OrderTable::new();
+    let mut init_done = false;
+    let init_deadline = Instant::now() + Duration::from_secs(5);
+    let mut got_positions = false;
+    while Instant::now() < init_deadline && !(init_done && got_positions) {
+        match c.try_recv() {
+            Ok(Some(msg)) => {
+                if msg.msg_type() == tags::MSG_EXECUTION_REPORT
+                    && msg.get_str(tags::MASS_STATUS_REQ_ID).is_some()
+                {
+                    if msg.get_str(tags::TOT_NUM_REPORTS) != Some("0")
+                        && let Some(o) = er_to_local_order(&msg)
+                    {
+                        orders.insert(o.order_id.clone(), o);
+                    }
+                    if msg.get_str(tags::LAST_RPT_REQUESTED) == Some("Y") {
+                        init_done = true;
+                    }
+                } else if msg.msg_type() == tags::MSG_POSITION_REPORT {
+                    let _ = tx.send(UiMsg::Balances(parse_positions(&msg)));
+                    got_positions = true;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                send_err(&e);
+                return;
+            }
+        }
+    }
+    send_order_table(&orders, tx);
+    let _ = tx.send(UiMsg::Log(format!(
+        "[OE] synced: {} active orders",
+        orders.len()
+    )));
+
+    // --- Main loop: send orders, process unsolicited ERs ---
+
     loop {
         // Process order commands from the UI.
         while let Ok(cmd) = order_rx.try_recv() {
@@ -752,14 +843,11 @@ fn run_oe_session(
                         .str_tag(tags::ORDER_QTY, &qty)
                         .str_tag(tags::TIME_IN_FORCE, "1") // GTC
                         .str_tag(tags::ACCOUNT, "1");
-                    let _ = tx.send(UiMsg::Log(format!(
-                        "[OE>] D 11={clord_id} 55={symbol} 54={side} 44={price} 38={qty} 40=2 59=1"
-                    )));
                     match c.send_builder(nos) {
                         Ok(()) => {
                             let side_str = if side == "1" { "BUY" } else { "SELL" };
-                            let _ = tx.send(UiMsg::OrderAck(format!(
-                                "Sent {clord_id}: {side_str} {qty}@{price} {symbol}"
+                            let _ = tx.send(UiMsg::Log(format!(
+                                "[OE] {clord_id}: {side_str} {qty}@{price} {symbol}"
                             )));
                         }
                         Err(e) => {
@@ -770,77 +858,12 @@ fn run_oe_session(
             }
         }
 
-        // Periodic queries.
-        if last_q.elapsed() >= Duration::from_secs(2) {
-            msr_n += 1;
-            let _ = tx.send(UiMsg::Log(format!("[OE>] AF 584=MSR{msr_n}")));
-            let msr = FixMessageBuilder::new(tags::MSG_ORDER_MASS_STATUS_REQUEST)
-                .str_tag(tags::MASS_STATUS_REQ_ID, &format!("MSR{msr_n}"))
-                .str_tag(tags::MASS_STATUS_REQ_TYPE, "1");
-            if let Err(e) = c.send_builder(msr) {
-                send_err(&e);
-                return;
-            }
-            pr_n += 1;
-            let _ = tx.send(UiMsg::Log(format!("[OE>] AN 710=PR{pr_n}")));
-            let pr = FixMessageBuilder::new(tags::MSG_REQUEST_FOR_POSITIONS)
-                .str_tag(tags::POS_REQ_ID, &format!("PR{pr_n}"))
-                .str_tag(tags::POS_REQ_TYPE, "0")
-                .str_tag(tags::ACCOUNT, "1");
-            if let Err(e) = c.send_builder(pr) {
-                send_err(&e);
-                return;
-            }
-            pending_orders.clear();
-            last_q = Instant::now();
-        }
-
         // Read responses.
         match c.try_recv() {
             Ok(Some(msg)) => {
-                // Log every received FIX message.
                 let mt = msg.msg_type();
-                let mt_str = std::str::from_utf8(mt).unwrap_or("?");
-                let _ = tx.send(UiMsg::Log(format!(
-                    "[OE<] 35={mt_str} 150={} 39={} 37={} 11={} 584={} 58={}",
-                    msg.get_str(tags::EXEC_TYPE).unwrap_or("-"),
-                    msg.get_str(tags::ORD_STATUS).unwrap_or("-"),
-                    msg.get_str(tags::ORDER_ID).unwrap_or("-"),
-                    msg.get_str(tags::CL_ORD_ID).unwrap_or("-"),
-                    msg.get_str(tags::MASS_STATUS_REQ_ID).unwrap_or("-"),
-                    msg.get_str(tags::TEXT).unwrap_or("-"),
-                )));
                 if mt == tags::MSG_EXECUTION_REPORT {
-                    if msg.get_str(tags::MASS_STATUS_REQ_ID).is_some() {
-                        // Mass status response — accumulate.
-                        if msg.get_str(tags::TOT_NUM_REPORTS) != Some("0") {
-                            pending_orders.extend(parse_mass_status(&msg));
-                        }
-                        if msg.get_str(tags::LAST_RPT_REQUESTED) == Some("Y") {
-                            let _ = tx.send(UiMsg::ActiveOrders(pending_orders.clone()));
-                            pending_orders.clear();
-                        }
-                    } else {
-                        // Regular execution report (order ack/reject/fill).
-                        let exec_type = msg.get_str(tags::EXEC_TYPE).unwrap_or("?");
-                        let ord_status = msg.get_str(tags::ORD_STATUS).unwrap_or("?");
-                        let clord = msg.get_str(tags::CL_ORD_ID).unwrap_or("?");
-                        let text = msg.get_str(tags::TEXT).unwrap_or("");
-                        let ack = match exec_type {
-                            "0" => format!("{clord}: PLACED (status={ord_status})"),
-                            "F" => {
-                                let px = msg.get_str(tags::LAST_PX).unwrap_or("?");
-                                let qty = msg.get_str(tags::LAST_SHARES).unwrap_or("?");
-                                format!("{clord}: FILL {qty}@{px}")
-                            }
-                            "4" => format!("{clord}: CANCELLED"),
-                            "8" => format!("{clord}: REJECTED ({text})"),
-                            _ => {
-                                format!("{clord}: ExecType={exec_type} status={ord_status} {text}")
-                            }
-                        };
-                        let _ = tx.send(UiMsg::OrderAck(ack));
-                    }
+                    handle_exec_report(&msg, &mut orders, tx);
                 } else if mt == tags::MSG_POSITION_REPORT {
                     let _ = tx.send(UiMsg::Balances(parse_positions(&msg)));
                 } else if mt == tags::MSG_ORDER_CANCEL_REJECT {
@@ -860,26 +883,74 @@ fn run_oe_session(
     }
 }
 
-fn parse_mass_status(msg: &FixMessage<'_>) -> Vec<String> {
-    if msg.get_str(tags::TOT_NUM_REPORTS) == Some("0") {
-        return vec![];
+/// Build a LocalOrder from an ER (mass-status or unsolicited Placed).
+fn er_to_local_order(msg: &FixMessage<'_>) -> Option<LocalOrder> {
+    let order_id = msg.get_str(tags::ORDER_ID)?;
+    Some(LocalOrder {
+        order_id: order_id.to_owned(),
+        clord_id: msg.get_str(tags::CL_ORD_ID).unwrap_or("-").to_owned(),
+        symbol: msg.get_str(tags::SYMBOL).unwrap_or("-").to_owned(),
+        side: match msg.get_str(tags::SIDE) {
+            Some("1") => "BUY",
+            Some("2") => "SELL",
+            _ => "?",
+        },
+        qty: msg.get_str(tags::ORDER_QTY).unwrap_or("-").to_owned(),
+        price: msg.get_str(tags::PRICE).unwrap_or("-").to_owned(),
+        leaves_qty: msg.get_str(tags::LEAVES_QTY).unwrap_or("-").to_owned(),
+    })
+}
+
+/// Process an unsolicited execution report, update the local order table.
+fn handle_exec_report(msg: &FixMessage<'_>, orders: &mut OrderTable, tx: &Sender<UiMsg>) {
+    let exec_type = msg.get_str(tags::EXEC_TYPE).unwrap_or("?");
+    let clord = msg.get_str(tags::CL_ORD_ID).unwrap_or("?");
+    let order_id = msg.get_str(tags::ORDER_ID).unwrap_or("?");
+
+    match exec_type {
+        "0" => {
+            // Placed — add to table.
+            if let Some(o) = er_to_local_order(msg) {
+                orders.insert(o.order_id.clone(), o);
+            }
+            let _ = tx.send(UiMsg::OrderAck(format!("{clord}: PLACED")));
+            send_order_table(orders, tx);
+        }
+        "F" => {
+            // Fill — update leaves_qty, remove if fully filled.
+            let px = msg.get_str(tags::LAST_PX).unwrap_or("?");
+            let qty = msg.get_str(tags::LAST_SHARES).unwrap_or("?");
+            let leaves = msg.get_str(tags::LEAVES_QTY).unwrap_or("0");
+            if let Some(o) = orders.get_mut(order_id) {
+                o.leaves_qty = leaves.to_owned();
+                if leaves == "0" {
+                    orders.remove(order_id);
+                }
+            }
+            let _ = tx.send(UiMsg::OrderAck(format!("{clord}: FILL {qty}@{px}")));
+            send_order_table(orders, tx);
+        }
+        "4" => {
+            // Cancelled — remove from table.
+            orders.remove(order_id);
+            let _ = tx.send(UiMsg::OrderAck(format!("{clord}: CANCELLED")));
+            send_order_table(orders, tx);
+        }
+        "8" => {
+            // Rejected — not on the book, just notify.
+            let text = msg.get_str(tags::TEXT).unwrap_or("");
+            let _ = tx.send(UiMsg::OrderAck(format!("{clord}: REJECTED ({text})")));
+        }
+        "I" => {
+            // Order status (from mass status) — ignore in main loop,
+            // these only matter during initial sync.
+        }
+        _ => {
+            let _ = tx.send(UiMsg::Log(format!(
+                "[OE] {clord}: ExecType={exec_type} (unhandled)"
+            )));
+        }
     }
-    let g = |t| msg.get_str(t).unwrap_or("-");
-    let side = match msg.get_str(tags::SIDE) {
-        Some("1") => "BUY",
-        Some("2") => "SELL",
-        _ => "?",
-    };
-    vec![format!(
-        "{} {} {} {}@{} leaves={} st={}",
-        g(tags::ORDER_ID),
-        g(tags::SYMBOL),
-        side,
-        g(tags::ORDER_QTY),
-        g(tags::PRICE),
-        g(tags::LEAVES_QTY),
-        g(tags::ORD_STATUS)
-    )]
 }
 
 fn parse_positions(msg: &FixMessage<'_>) -> Vec<String> {
