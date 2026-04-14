@@ -993,7 +993,10 @@ impl Session {
                 self.queue_fix_raw(&msg);
                 SessionAction::SendFix
             }
-            _ => SessionAction::None,
+            _ => {
+                warn!(?response, "unexpected Melin response type");
+                SessionAction::None
+            }
         }
     }
 
