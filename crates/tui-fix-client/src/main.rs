@@ -953,6 +953,7 @@ fn handle_exec_report(msg: &FixMessage<'_>, orders: &mut OrderTable, tx: &Sender
     }
 }
 
+/// Extract balance entries from a PositionReport (35=AP).
 fn parse_positions(msg: &FixMessage<'_>) -> Vec<String> {
     let fields: Vec<&Field<'_>> = msg.fields_iter().collect();
     let (mut out, mut i) = (Vec::new(), 0);
@@ -977,4 +978,243 @@ fn parse_positions(msg: &FixMessage<'_>) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a FIX message from a builder, parse it back.
+    fn build_and_parse(builder: FixMessageBuilder) -> Vec<u8> {
+        builder.build("SENDER", "TARGET", 1)
+    }
+
+    fn make_exec_report(exec_type: &str, order_id: &str, clord: &str) -> FixMessageBuilder {
+        FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+            .str_tag(tags::ORDER_ID, order_id)
+            .str_tag(tags::CL_ORD_ID, clord)
+            .str_tag(tags::EXEC_ID, "1")
+            .str_tag(tags::EXEC_TYPE, exec_type)
+            .str_tag(tags::ORD_STATUS, "0")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORDER_QTY, "100")
+            .str_tag(tags::PRICE, "50000")
+            .str_tag(tags::LEAVES_QTY, "100")
+            .str_tag(tags::CUM_QTY, "0")
+            .str_tag(tags::AVG_PX, "0")
+    }
+
+    // -- er_to_local_order tests --
+
+    #[test]
+    fn er_to_local_order_extracts_fields() {
+        let raw = build_and_parse(make_exec_report("0", "42", "abc"));
+        let msg = FixMessage::parse(&raw).unwrap();
+        let o = er_to_local_order(&msg).unwrap();
+        assert_eq!(o.order_id, "42");
+        assert_eq!(o.clord_id, "abc");
+        assert_eq!(o.symbol, "BTC/USD");
+        assert_eq!(o.side, "BUY");
+        assert_eq!(o.qty, "100");
+        assert_eq!(o.price, "50000");
+        assert_eq!(o.leaves_qty, "100");
+    }
+
+    #[test]
+    fn er_to_local_order_missing_order_id_returns_none() {
+        let raw = build_and_parse(
+            FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+                .str_tag(tags::CL_ORD_ID, "abc")
+                .str_tag(tags::EXEC_TYPE, "0"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        assert!(er_to_local_order(&msg).is_none());
+    }
+
+    // -- handle_exec_report tests --
+
+    #[test]
+    fn handle_placed_inserts_order() {
+        let (tx, rx) = mpsc::channel();
+        let mut orders = OrderTable::new();
+        let raw = build_and_parse(make_exec_report("0", "42", "abc"));
+        let msg = FixMessage::parse(&raw).unwrap();
+
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        assert!(orders.contains_key("42"));
+        assert_eq!(orders["42"].clord_id, "abc");
+        // Should have sent OrderAck and ActiveOrders messages.
+        let msgs: Vec<_> = rx.try_iter().collect();
+        assert!(msgs.len() >= 2);
+    }
+
+    #[test]
+    fn handle_fill_updates_leaves() {
+        let (tx, _rx) = mpsc::channel();
+        let mut orders = OrderTable::new();
+
+        // Place first.
+        let raw = build_and_parse(make_exec_report("0", "42", "abc"));
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        // Partial fill — build without the base LEAVES_QTY so the
+        // parser sees only the fill's value.
+        let raw = build_and_parse(
+            FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+                .str_tag(tags::ORDER_ID, "42")
+                .str_tag(tags::CL_ORD_ID, "abc")
+                .str_tag(tags::EXEC_ID, "2")
+                .str_tag(tags::EXEC_TYPE, "F")
+                .str_tag(tags::ORD_STATUS, "1")
+                .str_tag(tags::SYMBOL, "BTC/USD")
+                .str_tag(tags::SIDE, "1")
+                .str_tag(tags::ORDER_QTY, "100")
+                .str_tag(tags::PRICE, "50000")
+                .str_tag(tags::LAST_PX, "50000")
+                .str_tag(tags::LAST_SHARES, "30")
+                .str_tag(tags::LEAVES_QTY, "70")
+                .str_tag(tags::CUM_QTY, "30")
+                .str_tag(tags::AVG_PX, "50000"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        assert_eq!(orders["42"].leaves_qty, "70");
+    }
+
+    #[test]
+    fn handle_fill_removes_when_fully_filled() {
+        let (tx, _rx) = mpsc::channel();
+        let mut orders = OrderTable::new();
+
+        let raw = build_and_parse(make_exec_report("0", "42", "abc"));
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        let raw = build_and_parse(
+            FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+                .str_tag(tags::ORDER_ID, "42")
+                .str_tag(tags::CL_ORD_ID, "abc")
+                .str_tag(tags::EXEC_ID, "3")
+                .str_tag(tags::EXEC_TYPE, "F")
+                .str_tag(tags::ORD_STATUS, "2")
+                .str_tag(tags::SYMBOL, "BTC/USD")
+                .str_tag(tags::SIDE, "1")
+                .str_tag(tags::ORDER_QTY, "100")
+                .str_tag(tags::PRICE, "50000")
+                .str_tag(tags::LAST_PX, "50000")
+                .str_tag(tags::LAST_SHARES, "100")
+                .str_tag(tags::LEAVES_QTY, "0")
+                .str_tag(tags::CUM_QTY, "100")
+                .str_tag(tags::AVG_PX, "50000"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        assert!(!orders.contains_key("42"));
+    }
+
+    #[test]
+    fn handle_cancelled_removes_order() {
+        let (tx, _rx) = mpsc::channel();
+        let mut orders = OrderTable::new();
+
+        let raw = build_and_parse(make_exec_report("0", "42", "abc"));
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        let raw = build_and_parse(make_exec_report("4", "42", "abc"));
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn handle_rejected_does_not_insert() {
+        let (tx, _rx) = mpsc::channel();
+        let mut orders = OrderTable::new();
+
+        let raw = build_and_parse(
+            make_exec_report("8", "42", "abc").str_tag(tags::TEXT, "insufficient funds"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn handle_fill_for_unknown_order_is_graceful() {
+        let (tx, _rx) = mpsc::channel();
+        let mut orders = OrderTable::new();
+
+        // Fill for order not in table — should not panic.
+        let raw = build_and_parse(
+            FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+                .str_tag(tags::ORDER_ID, "999")
+                .str_tag(tags::CL_ORD_ID, "abc")
+                .str_tag(tags::EXEC_ID, "1")
+                .str_tag(tags::EXEC_TYPE, "F")
+                .str_tag(tags::ORD_STATUS, "2")
+                .str_tag(tags::SYMBOL, "BTC/USD")
+                .str_tag(tags::SIDE, "1")
+                .str_tag(tags::ORDER_QTY, "10")
+                .str_tag(tags::PRICE, "50000")
+                .str_tag(tags::LAST_PX, "50000")
+                .str_tag(tags::LAST_SHARES, "10")
+                .str_tag(tags::LEAVES_QTY, "0")
+                .str_tag(tags::CUM_QTY, "10")
+                .str_tag(tags::AVG_PX, "50000"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        handle_exec_report(&msg, &mut orders, &tx);
+
+        assert!(orders.is_empty());
+    }
+
+    // -- parse_snapshot tests --
+
+    #[test]
+    fn parse_snapshot_extracts_bids_and_asks() {
+        let raw = build_and_parse(
+            FixMessageBuilder::new(tags::MSG_MD_SNAPSHOT)
+                .str_tag(tags::SYMBOL, "BTC/USD")
+                // Bid entry.
+                .str_tag(tags::MD_ENTRY_TYPE, "0")
+                .str_tag(tags::MD_ENTRY_PX, "49000")
+                .str_tag(tags::MD_ENTRY_SIZE, "5")
+                .str_tag(tags::NUMBER_OF_ORDERS, "2")
+                // Ask entry.
+                .str_tag(tags::MD_ENTRY_TYPE, "1")
+                .str_tag(tags::MD_ENTRY_PX, "51000")
+                .str_tag(tags::MD_ENTRY_SIZE, "3")
+                .str_tag(tags::NUMBER_OF_ORDERS, "1"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        let (bids, asks) = parse_snapshot(&msg);
+
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].0, "49000");
+        assert_eq!(bids[0].1, "5");
+        assert_eq!(bids[0].2, "2");
+
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].0, "51000");
+        assert_eq!(asks[0].1, "3");
+    }
+
+    #[test]
+    fn parse_snapshot_empty_book() {
+        let raw = build_and_parse(
+            FixMessageBuilder::new(tags::MSG_MD_SNAPSHOT).str_tag(tags::SYMBOL, "BTC/USD"),
+        );
+        let msg = FixMessage::parse(&raw).unwrap();
+        let (bids, asks) = parse_snapshot(&msg);
+        assert!(bids.is_empty());
+        assert!(asks.is_empty());
+    }
 }
