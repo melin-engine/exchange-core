@@ -154,27 +154,30 @@ impl BookMirror {
                     if new_remaining == 0 {
                         self.debit_count(maker.side, maker.price);
                         self.index.remove(&maker_order_id);
-                    } else {
-                        if let Some(entry) = self.index.get_mut(&maker_order_id) {
-                            entry.remaining =
-                                Quantity(NonZeroU64::new(new_remaining).expect("checked > 0"));
-                        }
+                    } else if let Some(entry) = self.index.get_mut(&maker_order_id) {
+                        entry.remaining =
+                            Quantity(NonZeroU64::new(new_remaining).expect("checked > 0"));
                     }
+
+                    self.last_trade_price = Some(price);
+                    self.trades.push(Trade {
+                        maker_order_id,
+                        taker_order_id,
+                        price,
+                        quantity,
+                    });
+                    true
                 } else {
-                    tracing::debug!(
+                    // Unknown maker — cold-start gap or stale snapshot.
+                    // Don't record the trade: the book wasn't debited, so
+                    // adding a trade entry would create an inconsistency
+                    // between the trade ring and the order book.
+                    tracing::warn!(
                         order_id = maker_order_id.0,
                         "fill for unknown maker — cold-start gap or bug"
                     );
+                    false
                 }
-
-                self.last_trade_price = Some(price);
-                self.trades.push(Trade {
-                    maker_order_id,
-                    taker_order_id,
-                    price,
-                    quantity,
-                });
-                true
             }
 
             ExecutionReport::Cancelled {
@@ -455,9 +458,9 @@ mod tests {
     #[test]
     fn fill_unknown_maker_is_graceful() {
         let mut m = BookMirror::new(SYM);
-        // No panic — just a debug log.
-        assert!(m.apply(&fill(999, 100, 200, 5)));
-        assert_eq!(m.trades().len(), 1);
+        // No panic — warn log, no trade recorded (book wasn't debited).
+        assert!(!m.apply(&fill(999, 100, 200, 5)));
+        assert_eq!(m.trades().len(), 0);
     }
 
     // -- Cancel tests --
