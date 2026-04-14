@@ -788,14 +788,16 @@ fn run_as_primary<L: BlockingTransportListener>(
             crate::response::run(
                 output_consumer,
                 control_rx,
-                journal_cursor_response,
-                replication_cursor_response,
-                fastest_replica_cursor_response,
-                quorum_durability,
+                crate::response::ResponseConfig {
+                    journal_cursor: journal_cursor_response,
+                    replication_cursor: replication_cursor_response,
+                    fastest_replica_cursor: fastest_replica_cursor_response,
+                    quorum_durability,
+                    heartbeat_interval,
+                    busy_spin,
+                    utilization: response_utilization_thread,
+                },
                 &s3,
-                heartbeat_interval,
-                busy_spin,
-                response_utilization_thread,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;

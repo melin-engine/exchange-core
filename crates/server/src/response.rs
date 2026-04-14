@@ -49,6 +49,17 @@ const MAX_SEND_BUF: usize = 64 * 1024;
 
 pub use crate::server::ControlEvent;
 
+/// Configuration and shared state for the response stage.
+pub struct ResponseConfig {
+    pub journal_cursor: Arc<Sequence>,
+    pub replication_cursor: Arc<std::sync::atomic::AtomicU64>,
+    pub fastest_replica_cursor: Arc<std::sync::atomic::AtomicU64>,
+    pub quorum_durability: bool,
+    pub heartbeat_interval: Option<Duration>,
+    pub busy_spin: bool,
+    pub utilization: Arc<StageUtilization>,
+}
+
 /// Per-connection state for batched io_uring sends.
 struct ConnectionEntry {
     fd: RawFd,
@@ -74,19 +85,21 @@ struct ConnectionEntry {
 /// An event is durable when it exists on 2+ nodes: either both replicas
 /// acked, or the journal fsynced and the fastest replica acked.
 /// With `--no-quorum-durability`: `durable = min(journal, repl_min)`.
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
-    journal_cursor: Arc<Sequence>,
-    replication_cursor: Arc<std::sync::atomic::AtomicU64>,
-    fastest_replica_cursor: Arc<std::sync::atomic::AtomicU64>,
-    quorum_durability: bool,
+    config: ResponseConfig,
     shutdown: &AtomicBool,
-    heartbeat_interval: Option<Duration>,
-    busy_spin: bool,
-    utilization: Arc<StageUtilization>,
 ) {
+    let ResponseConfig {
+        journal_cursor,
+        replication_cursor,
+        fastest_replica_cursor,
+        quorum_durability,
+        heartbeat_interval,
+        busy_spin,
+        utilization,
+    } = config;
     let mut ring =
         IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
 
