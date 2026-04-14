@@ -4,6 +4,7 @@
 //! frames from the event publisher's TCP stream and seeds per-symbol
 //! `BookMirror` instances.
 
+use std::collections::HashSet;
 use std::io;
 use std::num::NonZeroU64;
 
@@ -32,6 +33,8 @@ pub struct SnapshotResult {
 /// by the standard 4-byte length-prefixed response.
 pub fn parse_snapshot(reader: &mut dyn io::Read) -> Result<SnapshotResult, SnapshotError> {
     let mut mirrors: Vec<(Symbol, BookMirror)> = Vec::new();
+    // Track symbols we've already finalized to reject duplicates.
+    let mut seen_symbols: HashSet<Symbol> = HashSet::new();
     let mut current_symbol: Option<Symbol> = None;
     let mut current_mirror: Option<BookMirror> = None;
     let mut level_count: u32 = 0;
@@ -44,8 +47,11 @@ pub fn parse_snapshot(reader: &mut dyn io::Read) -> Result<SnapshotResult, Snaps
                 symbol,
                 last_applied_seq: _,
             } => {
-                // Start of a new symbol's snapshot.
+                // Finalize previous symbol if any.
                 if let Some((mirror, sym)) = current_mirror.take().zip(current_symbol) {
+                    if !seen_symbols.insert(sym) {
+                        return Err(SnapshotError::DuplicateSymbol(sym));
+                    }
                     mirrors.push((sym, mirror));
                 }
                 current_symbol = Some(symbol);
@@ -88,6 +94,9 @@ pub fn parse_snapshot(reader: &mut dyn io::Read) -> Result<SnapshotResult, Snaps
             ResponseKind::SnapshotComplete { last_applied_seq } => {
                 // Finalize last symbol.
                 if let Some((mirror, sym)) = current_mirror.take().zip(current_symbol) {
+                    if !seen_symbols.insert(sym) {
+                        return Err(SnapshotError::DuplicateSymbol(sym));
+                    }
                     mirrors.push((sym, mirror));
                 }
                 return Ok(SnapshotResult {
@@ -166,6 +175,7 @@ pub enum SnapshotError {
     Io(io::Error),
     Protocol(melin_protocol::error::ProtocolError),
     FrameTooLarge(usize),
+    DuplicateSymbol(Symbol),
 }
 
 impl From<io::Error> for SnapshotError {
@@ -186,6 +196,7 @@ impl std::fmt::Display for SnapshotError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::FrameTooLarge(n) => write!(f, "frame too large: {n} bytes"),
+            Self::DuplicateSymbol(s) => write!(f, "duplicate symbol in snapshot: {:?}", s),
         }
     }
 }
