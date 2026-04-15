@@ -788,7 +788,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             crate::response::run(
                 output_consumer,
                 control_rx,
-                crate::response::ResponseConfig {
+                crate::response::Response {
                     journal_cursor: journal_cursor_response,
                     replication_cursor: replication_cursor_response,
                     fastest_replica_cursor: fastest_replica_cursor_response,

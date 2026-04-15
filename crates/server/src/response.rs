@@ -50,7 +50,7 @@ const MAX_SEND_BUF: usize = 64 * 1024;
 pub use crate::server::ControlEvent;
 
 /// Configuration and shared state for the response stage.
-pub struct ResponseConfig {
+pub struct Response {
     pub journal_cursor: Arc<Sequence>,
     pub replication_cursor: Arc<std::sync::atomic::AtomicU64>,
     pub fastest_replica_cursor: Arc<std::sync::atomic::AtomicU64>,
@@ -88,10 +88,10 @@ struct ConnectionEntry {
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
-    config: ResponseConfig,
+    config: Response,
     shutdown: &AtomicBool,
 ) {
-    let ResponseConfig {
+    let Response {
         journal_cursor,
         replication_cursor,
         fastest_replica_cursor,
