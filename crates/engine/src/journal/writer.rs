@@ -385,6 +385,10 @@ impl JournalWriter {
     /// Avoids the `clock_gettime` syscall per event when the caller can batch
     /// a single timestamp for the entire batch. Same semantics as `batch_append`
     /// but uses the provided timestamp instead of calling `wall_clock_nanos()`.
+    ///
+    /// Convenience wrapper: allocates a sequence number and encodes in one call.
+    /// For explicit control over sequencing (e.g., input replication), use
+    /// [`allocate_sequence`] + [`encode_event`] separately.
     pub fn batch_append_with_ts(
         &mut self,
         event: &JournalEvent,
@@ -392,7 +396,43 @@ impl JournalWriter {
         key_hash: u64,
         request_seq: u64,
     ) -> Result<u64, JournalError> {
+        let seq = self.allocate_sequence();
+        self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
+        Ok(seq)
+    }
+
+    /// Allocate the next journal sequence number.
+    ///
+    /// Returns the allocated sequence and advances the internal counter.
+    /// The returned sequence should be passed to [`encode_event`] for
+    /// encoding. This two-step pattern separates sequence assignment from
+    /// encoding, enabling the sequencing decision to be made (and
+    /// replicated) independently of journal persistence.
+    pub fn allocate_sequence(&mut self) -> u64 {
         let seq = self.next_sequence;
+        self.next_sequence += 1;
+        seq
+    }
+
+    /// Encode a single event into the batch buffer using a pre-assigned
+    /// sequence number.
+    ///
+    /// Does NOT allocate or advance the internal sequence counter — the
+    /// caller is responsible for obtaining the sequence via
+    /// [`allocate_sequence`] or an external sequencer. This separation
+    /// enables moving sequence assignment to an earlier pipeline stage
+    /// without changing the encoding logic.
+    ///
+    /// Also handles hash-chain bookkeeping and auto-emits checkpoint
+    /// entries when the checkpoint interval is reached.
+    pub fn encode_event(
+        &mut self,
+        seq: u64,
+        timestamp_ns: u64,
+        event: &JournalEvent,
+        key_hash: u64,
+        request_seq: u64,
+    ) -> Result<(), JournalError> {
         let written = codec::encode(
             seq,
             timestamp_ns,
@@ -412,7 +452,6 @@ impl JournalWriter {
         }
 
         self.batch_buf.extend_from_slice(&self.buffer[..written]);
-        self.next_sequence += 1;
 
         // Auto-emit a checkpoint if we've hit the interval.
         // Finalize the batch hasher to get the current hash (including all
@@ -430,7 +469,7 @@ impl JournalWriter {
             self.emit_checkpoint(checkpoint_hash, count)?;
         }
 
-        Ok(seq)
+        Ok(())
     }
 
     /// Emit a checkpoint entry into the batch buffer and reset the counter.

@@ -748,6 +748,11 @@ impl JournalStage {
                 // sequence numbers. If per-event wall-clock timestamps become
                 // a regulatory requirement (MiFID II, SEC CAT), revert to
                 // batch_append() which calls clock_gettime per event.
+                //
+                // Two-step sequencing: allocate_sequence() is called
+                // separately from encode_event() so that sequence assignment
+                // can later be moved to an earlier pipeline stage (input
+                // replication).
                 #[cfg(not(feature = "no-persist"))]
                 {
                     let ts = crate::journal::writer::wall_clock_nanos();
@@ -758,8 +763,9 @@ impl JournalStage {
                         ) {
                             continue;
                         }
+                        let seq = self.writer.allocate_sequence();
                         self.writer
-                            .batch_append_with_ts(&slot.event, ts, slot.key_hash, slot.request_seq)
+                            .encode_event(seq, ts, &slot.event, slot.key_hash, slot.request_seq)
                             .map_err(|e| {
                                 JournalError::Io(std::io::Error::other(format!(
                                     "journal encode (run_sync, seq {}): {e}",
@@ -1191,9 +1197,11 @@ impl JournalStage {
                     ) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append_with_ts(
-                        &slot.event,
+                    let seq = self.writer.allocate_sequence();
+                    if let Err(e) = self.writer.encode_event(
+                        seq,
                         ts,
+                        &slot.event,
                         slot.key_hash,
                         slot.request_seq,
                     ) {
@@ -1365,8 +1373,9 @@ impl JournalStage {
                     ) {
                         continue;
                     }
+                    let seq = self.writer.allocate_sequence();
                     self.writer
-                        .batch_append_with_ts(&slot.event, ts, slot.key_hash, slot.request_seq)
+                        .encode_event(seq, ts, &slot.event, slot.key_hash, slot.request_seq)
                         .map_err(|e| {
                             JournalError::Io(std::io::Error::other(format!(
                                 "journal encode (run_uring, seq {}): {e}",
