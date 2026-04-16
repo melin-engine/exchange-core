@@ -47,24 +47,15 @@ Every node now runs the full pipeline independently. Promotion means "start acce
 
 **Known limitation**: journal rotation on the primary inserts a `GenesisHash` entry that may cause the replica's checkpoint counter to drift. Without rotation, sequences are guaranteed to align.
 
-### Step 4: Add Divergence Detection
+### ~~Step 4: Add Divergence Detection~~ (DONE)
 
-**Goal**: Detect determinism bugs by comparing output across nodes.
+Implemented checkpoint-based divergence detection. When the replica's JournalStage encounters a Checkpoint event from the primary (`slot.sequence != 0`), it compares the primary's `chain_hash` against its own `writer.chain_hash()`. A mismatch returns a fatal error, shutting down the pipeline. Fires every `CHECKPOINT_INTERVAL` (100K) events — deterministic, exact, zero false positives.
 
-- After processing each batch, each node computes a hash over its output (e.g., BLAKE3 over the encoded journal bytes for that batch).
-- The primary includes its output hash in a new field on the replication heartbeat or a dedicated message.
-- Replicas compare their own output hash against the primary's. A mismatch means a determinism bug — log, alert, halt.
+No new wire protocol messages needed — the primary's checkpoint entries already carry the chain hash in their event payload. They flow through `submit_batch_to_pipeline` to the disruptor, where the JournalStage verifies but does not encode them (each node auto-emits its own checkpoints).
 
-This is the key benefit of input replication: independent verification that was impossible with output replication.
+### ~~Step 5: Update Catch-up and Snapshot Transfer~~ (NO-OP)
 
-### Step 5: Update Catch-up and Snapshot Transfer
-
-**Goal**: Adapt recovery protocols to work with the input log instead of the output journal.
-
-- Catch-up streams sequenced input commands from the primary's input log (not journal entries).
-- The primary must retain a durable input log (or be able to reconstruct inputs from its journal) for catch-up.
-- Snapshot transfer is unchanged — it bootstraps Exchange state regardless of how inputs arrive.
-- Fresh replicas receive a snapshot + live input stream, same as today.
+No code changes needed. The journal already contains only input commands (`JournalEvent` has no output events — see `event.rs:1-5`), so catch-up already streams the input log. `submit_batch_to_pipeline` handles catch-up DataBatch frames identically to live ones — decoding, publishing with pre-assigned sequences, and verifying checkpoints. Snapshot transfer sends Exchange state (not journal state) and works unchanged.
 
 ## What Stays the Same
 
