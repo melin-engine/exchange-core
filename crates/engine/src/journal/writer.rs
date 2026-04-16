@@ -448,7 +448,12 @@ impl JournalWriter {
         if let Some(chain) = &mut self.hash_chain {
             let entry_bytes_len = written - 4; // exclude 4-byte CRC
             chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
-            chain.events_since_checkpoint += 1;
+            // GenesisHash initializes the chain — don't count it toward
+            // the checkpoint interval. Matches create_with_genesis() which
+            // sets events_since_checkpoint = 0 after writing the genesis.
+            if !matches!(event, JournalEvent::GenesisHash { .. }) {
+                chain.events_since_checkpoint += 1;
+            }
         }
 
         self.batch_buf.extend_from_slice(&self.buffer[..written]);

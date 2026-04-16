@@ -108,6 +108,41 @@ fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
     }
 }
 
+/// Shared sequence counter for pre-disruptor sequencing.
+///
+/// Every input event receives a journal sequence number and wall-clock
+/// timestamp at publish time — before entering the disruptor. This makes
+/// the sequencing decision visible to all pipeline stages (journal,
+/// matching, replication) and ensures the sequence is fixed at the
+/// earliest possible point, matching the LMAX architecture.
+///
+/// `AtomicU64` with `Relaxed` ordering: there is only one reader thread
+/// (`reader.rs`), and seed events are published sequentially before the
+/// reader starts. The atomic is for API safety, not real contention.
+pub struct Sequencer {
+    /// Next sequence to allocate. Monotonically increasing.
+    next: AtomicU64,
+}
+
+impl Sequencer {
+    /// Create a sequencer starting at the given sequence number.
+    pub fn new(start: u64) -> Self {
+        Self {
+            next: AtomicU64::new(start),
+        }
+    }
+
+    /// Atomically claim the next sequence number.
+    pub fn next(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Current next sequence (for diagnostics / snapshot coordination).
+    pub fn peek(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+}
+
 /// Maximum events consumed per disruptor batch in the matching stage.
 /// Amortizes one atomic Release store over N events. Keep small to avoid
 /// burstiness that causes the response stage to wait on the journal cursor.
@@ -463,18 +498,17 @@ impl JournalStage {
                 // Batch-encode all events into the writer's internal buffer.
                 // Data stays in the buffer until the sync point — one
                 // pwritev2+RWF_DSYNC replaces multiple pwrites + fdatasync.
-                // QueryStats is not journaled (no state change).
-                // Checkpoint events from the replication stream are skipped —
-                // each node auto-emits its own checkpoints independently.
+                // QueryStats/QueryPosition are not journaled (no state change).
+                // Checkpoint events are not encoded (each node auto-emits
+                // its own), but their chain hash is verified for divergence
+                // detection when received from a primary.
                 //
-                // Sequence/timestamp assignment: if the slot carries a
-                // pre-assigned sequence (non-zero, from replication), use it
-                // and keep the writer's counter in sync. Otherwise allocate
-                // locally (primary mode). One clock_gettime per batch in
-                // primary mode; replicas use the primary's timestamp.
+                // Every journalable event carries a pre-assigned sequence
+                // and timestamp from the Sequencer (primary) or the primary's
+                // replication stream (replica). The writer's internal counter
+                // is kept in sync via set_next_sequence for checkpoint auto-emit.
                 #[cfg(not(feature = "no-persist"))]
                 {
-                    let batch_ts = crate::journal::writer::wall_clock_nanos();
                     for slot in &batch[..count] {
                         if matches!(
                             slot.event,
@@ -482,10 +516,6 @@ impl JournalStage {
                         ) {
                             continue;
                         }
-                        // Checkpoint events from the primary are not
-                        // encoded (each node auto-emits its own), but
-                        // their chain hash is verified for divergence
-                        // detection.
                         if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
                             #[cfg(feature = "hash-chain")]
                             if slot.sequence != 0 {
@@ -493,14 +523,19 @@ impl JournalStage {
                             }
                             continue;
                         }
-                        let (seq, ts) = if slot.sequence != 0 {
-                            self.writer.set_next_sequence(slot.sequence + 1);
-                            (slot.sequence, slot.timestamp_ns)
-                        } else {
-                            (self.writer.allocate_sequence(), batch_ts)
-                        };
+                        debug_assert!(
+                            slot.sequence != 0,
+                            "journalable event must have a pre-assigned sequence"
+                        );
+                        self.writer.set_next_sequence(slot.sequence + 1);
                         self.writer
-                            .encode_event(seq, ts, &slot.event, slot.key_hash, slot.request_seq)
+                            .encode_event(
+                                slot.sequence,
+                                slot.timestamp_ns,
+                                &slot.event,
+                                slot.key_hash,
+                                slot.request_seq,
+                            )
                             .map_err(|e| {
                                 JournalError::Io(std::io::Error::other(format!(
                                     "journal encode (run_sync, seq {}): {e}",
@@ -680,7 +715,6 @@ impl JournalStage {
             }
             #[cfg(not(feature = "no-persist"))]
             {
-                let batch_ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
@@ -698,15 +732,14 @@ impl JournalStage {
                         }
                         continue;
                     }
-                    let (seq, ts) = if slot.sequence != 0 {
-                        self.writer.set_next_sequence(slot.sequence + 1);
-                        (slot.sequence, slot.timestamp_ns)
-                    } else {
-                        (self.writer.allocate_sequence(), batch_ts)
-                    };
+                    debug_assert!(
+                        slot.sequence != 0,
+                        "journalable event must have a pre-assigned sequence"
+                    );
+                    self.writer.set_next_sequence(slot.sequence + 1);
                     if let Err(e) = self.writer.encode_event(
-                        seq,
-                        ts,
+                        slot.sequence,
+                        slot.timestamp_ns,
                         &slot.event,
                         slot.key_hash,
                         slot.request_seq,
@@ -871,7 +904,6 @@ impl JournalStage {
                 idle_spins = 0;
                 busy_count += 1;
 
-                let batch_ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
@@ -886,14 +918,19 @@ impl JournalStage {
                         }
                         continue;
                     }
-                    let (seq, ts) = if slot.sequence != 0 {
-                        self.writer.set_next_sequence(slot.sequence + 1);
-                        (slot.sequence, slot.timestamp_ns)
-                    } else {
-                        (self.writer.allocate_sequence(), batch_ts)
-                    };
+                    debug_assert!(
+                        slot.sequence != 0,
+                        "journalable event must have a pre-assigned sequence"
+                    );
+                    self.writer.set_next_sequence(slot.sequence + 1);
                     self.writer
-                        .encode_event(seq, ts, &slot.event, slot.key_hash, slot.request_seq)
+                        .encode_event(
+                            slot.sequence,
+                            slot.timestamp_ns,
+                            &slot.event,
+                            slot.key_hash,
+                            slot.request_seq,
+                        )
                         .map_err(|e| {
                             JournalError::Io(std::io::Error::other(format!(
                                 "journal encode (run_uring, seq {}): {e}",
@@ -1577,6 +1614,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// Assembled pipeline stages and handles returned by [`build_pipeline_with_replication`].
 pub struct Pipeline {
     pub input_producer: ring::MultiProducer<InputSlot>,
+    pub sequencer: Arc<Sequencer>,
     pub journal_stage: JournalStage,
     pub matching_stage: MatchingStage,
     pub output_consumers: Vec<ring::Consumer<OutputSlot>>,
@@ -1699,6 +1737,11 @@ pub fn build_pipeline_with_replication(
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
+    // Sequencer: shared counter for pre-disruptor sequence assignment.
+    // Initialized from the writer's next_sequence so it continues from
+    // the last persisted entry (recovery) or genesis (fresh start).
+    let sequencer = Arc::new(Sequencer::new(writer.next_sequence()));
+
     let mut journal_stage = JournalStage::new(
         writer,
         journal_consumer,
@@ -1794,6 +1837,7 @@ pub fn build_pipeline_with_replication(
 
     Pipeline {
         input_producer,
+        sequencer,
         journal_stage,
         matching_stage,
         output_consumers,
@@ -1966,8 +2010,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
-            sequence: 0,
-            timestamp_ns: 0,
+            sequence: FIRST_SEQ,
+            timestamp_ns: 1_000_000_000,
             event: JournalEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
@@ -1982,8 +2026,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
-            sequence: 0,
-            timestamp_ns: 0,
+            sequence: FIRST_SEQ + 1,
+            timestamp_ns: 1_000_000_001,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
@@ -2281,6 +2325,7 @@ mod tests {
             false,
         );
         let input_producer = out.input_producer;
+        let sequencer = out.sequencer;
         let journal_stage = out.journal_stage;
         let matching_stage = out.matching_stage;
         let journal_cursor = out.journal_cursor;
@@ -2298,8 +2343,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
-            sequence: 0,
-            timestamp_ns: 0,
+            sequence: sequencer.next(),
+            timestamp_ns: 1_000_000_000,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -2394,6 +2439,7 @@ mod tests {
         let journal_stage = out.journal_stage;
         let matching_stage = out.matching_stage;
         let input_producer = out.input_producer;
+        let sequencer = out.sequencer;
         let journal_cursor = out.journal_cursor;
         let replication_cursor = out.replication_cursor;
 
@@ -2409,8 +2455,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
-            sequence: 0,
-            timestamp_ns: 0,
+            sequence: sequencer.next(),
+            timestamp_ns: 1_000_000_000,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
