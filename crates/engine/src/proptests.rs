@@ -963,6 +963,95 @@ proptest! {
     }
 }
 
+/// Strategy biased toward fee-schedule-change-then-fill scenarios.
+///
+/// The general `arb_exchange_actions` strategy only has a 1-in-16 chance
+/// of generating a SetFeeSchedule, and the bug requires a specific sequence
+/// (order placement → fee change → fill). This strategy guarantees at least
+/// one fee change sandwiched between orders, making conservation violations
+/// from stale fee cushions much more likely to surface.
+fn arb_fee_change_then_fill_actions() -> impl Strategy<Value = Vec<ExchangeAction>> {
+    (
+        // Phase 1: deposits + initial orders (placed under old fee schedule).
+        proptest::collection::vec(arb_exchange_action(), 3..=30),
+        // Fee schedule change.
+        (0i16..=100, 0i16..=100),
+        // Phase 2: more actions (fills happen under new fee schedule).
+        proptest::collection::vec(arb_exchange_action(), 3..=30),
+    )
+        .prop_map(|(mut phase1, (maker_bps, taker_bps), phase2)| {
+            phase1.push(ExchangeAction::SetFeeSchedule {
+                maker_fee_bps: maker_bps,
+                taker_fee_bps: taker_bps,
+            });
+            phase1.extend(phase2);
+            phase1
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Targeted variant of `balance_conservation` that biases toward the
+    /// fee-schedule-change-then-fill pattern. This is the scenario where
+    /// stale fee cushions on existing orders can cause silent value loss.
+    #[test]
+    fn balance_conservation_fee_change(actions in arb_fee_change_then_fill_actions()) {
+        let (exchange, _, _, withdrawn) = run_exchange_actions(&actions);
+
+        let mut total_deposited_btc: u128 = 0;
+        let mut total_deposited_usd: u128 = 0;
+
+        for action in &actions {
+            if let ExchangeAction::Deposit { currency, amount, .. } = action {
+                if *currency == BTC {
+                    total_deposited_btc += *amount as u128;
+                } else {
+                    total_deposited_usd += *amount as u128;
+                }
+            }
+        }
+
+        let total_withdrawn_btc = *withdrawn.get(&BTC).unwrap_or(&0);
+        let total_withdrawn_usd = *withdrawn.get(&USD).unwrap_or(&0);
+
+        use crate::account::FEE_ACCOUNT;
+
+        let accounts = exchange.accounts();
+        let all_accounts = [ACCT_A, ACCT_B, FEE_ACCOUNT];
+        let system_btc: u128 = all_accounts
+            .iter()
+            .map(|a| {
+                let b = accounts.balance(*a, BTC);
+                b.available as u128 + b.reserved as u128
+            })
+            .sum();
+        let system_usd: u128 = all_accounts
+            .iter()
+            .map(|a| {
+                let b = accounts.balance(*a, USD);
+                b.available as u128 + b.reserved as u128
+            })
+            .sum();
+
+        let net_btc = total_deposited_btc.saturating_sub(total_withdrawn_btc);
+        let net_usd = total_deposited_usd.saturating_sub(total_withdrawn_usd);
+
+        if total_deposited_btc <= u64::MAX as u128 && total_deposited_usd <= u64::MAX as u128 {
+            prop_assert_eq!(
+                system_btc, net_btc,
+                "BTC conservation violated after fee change: system={} != net={}",
+                system_btc, net_btc
+            );
+            prop_assert_eq!(
+                system_usd, net_usd,
+                "USD conservation violated after fee change: system={} != net={}",
+                system_usd, net_usd
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // 4. Price-Time Priority
 // ===========================================================================

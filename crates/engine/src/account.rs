@@ -346,6 +346,14 @@ impl AccountManager {
             let total_deduct_i128 = cost_u64 as i128 + buyer_fee as i128;
             let total_deduct =
                 u64::try_from(total_deduct_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
+            debug_assert!(
+                total_deduct <= res.remaining,
+                "fill deduction {total_deduct} exceeds reservation {remaining} \
+                 (cost={cost_u64}, buyer_fee={buyer_fee}): fee cushion insufficient — \
+                 likely a fee schedule change after order placement or a \
+                 market buy budget that didn't account for fees",
+                remaining = res.remaining,
+            );
             // Track actual deduction (may be less than requested due to saturation).
             let old_remaining = res.remaining;
             res.remaining = res.remaining.saturating_sub(total_deduct);
