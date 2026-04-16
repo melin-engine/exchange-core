@@ -2088,13 +2088,14 @@ mod tests {
         let shutdown2 = Arc::clone(&shutdown);
 
         // Publish events with pre-assigned sequences (simulating replica mode).
-        // Use sequence numbers starting at 100 to make it obvious they're
-        // not locally allocated (which would start at FIRST_SEQ = 2).
+        // Start at sequence 2: when the hash-chain feature is enabled,
+        // JournalWriter::create writes a GenesisHash at sequence 1, so the
+        // next expected sequence is 2. The reader enforces strict continuity.
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
-            sequence: 100,
+            sequence: 2,
             timestamp_ns: 1_700_000_000_000_000_000, // fixed timestamp
             event: JournalEvent::AddInstrument {
                 spec: InstrumentSpec {
@@ -2110,7 +2111,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
-            sequence: 101,
+            sequence: 3,
             timestamp_ns: 1_700_000_000_000_000_001,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
@@ -2132,13 +2133,17 @@ mod tests {
         #[cfg(not(feature = "no-persist"))]
         {
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+
+            // The reader auto-skips GenesisHash and Checkpoint entries
+            // (transparent to callers), so the first visible entry is
+            // AddInstrument at sequence 2.
             let entry1 = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry1.sequence, 100);
+            assert_eq!(entry1.sequence, 2);
             assert_eq!(entry1.timestamp_ns, 1_700_000_000_000_000_000);
             assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
 
             let entry2 = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry2.sequence, 101);
+            assert_eq!(entry2.sequence, 3);
             assert_eq!(entry2.timestamp_ns, 1_700_000_000_000_000_001);
             assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
 

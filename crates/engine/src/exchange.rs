@@ -544,12 +544,24 @@ impl Exchange {
             }
         };
 
-        // For buy-side market/stop-market orders, pass the reserved amount as
-        // a cost budget so the matching engine stops before exceeding it.
-        // Limit and stop-limit buys don't need this — their cost is bounded
-        // by price × quantity which matches the reservation exactly.
+        // For buy-side market/stop-market orders, pass a cost budget so the
+        // matching engine stops before exceeding what the reservation can
+        // cover (cost + fees). Limit and stop-limit buys don't need this —
+        // their cost is bounded by price × quantity and the reservation
+        // already includes the fee cushion.
+        //
+        // When fees are active, the budget must leave room for the fee:
+        //   cost + floor(cost × fee_bps / 10_000) ≤ reserved
+        // ⟹ cost ≤ floor(reserved × 10_000 / (10_000 + fee_bps))
         let quote_budget = match (order.side, order.order_type) {
-            (Side::Buy, OrderType::Market) | (Side::Buy, OrderType::Stop { .. }) => Some(reserved),
+            (Side::Buy, OrderType::Market) | (Side::Buy, OrderType::Stop { .. }) => {
+                if max_fee_bps > 0 {
+                    let effective = reserved as u128 * 10_000 / (10_000 + max_fee_bps as u128);
+                    Some(effective as u64)
+                } else {
+                    Some(reserved)
+                }
+            }
             _ => None,
         };
 

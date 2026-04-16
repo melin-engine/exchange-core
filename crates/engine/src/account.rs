@@ -356,7 +356,12 @@ impl AccountManager {
                 .balances
                 .entry((buyer_account, spec.quote))
                 .or_default();
-            quote_bal.reserved = quote_bal.reserved.saturating_sub(total_deduct);
+            // Use actual deducted amount (not total_deduct) so the aggregate
+            // reserved balance stays consistent with individual slot totals.
+            // When the fee schedule changed after placement, total_deduct may
+            // exceed this slot's remaining, and the excess would eat into
+            // other slots' share of the aggregate.
+            quote_bal.reserved = quote_bal.reserved.saturating_sub(buyer_actual_deducted);
 
             let base_bal = self.balances.entry((buyer_account, spec.base)).or_default();
             base_bal.available = base_bal.available.saturating_add(qty);
