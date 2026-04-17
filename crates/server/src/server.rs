@@ -409,13 +409,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Replica mode: connect to primary, receive journal stream, replay.
     // Must run before init_engine — the replica's journal is created from
     // the primary's genesis during the replication handshake.
-    //
-    // TODO: this is a minimal receiver that writes to journal only. For
-    // production, the replica should build the full pipeline (Exchange,
-    // matching stage, accept loop in dormant state) so it can:
-    //   - Be promoted to primary (switch input from replication to clients)
-    //   - Serve read-only queries (L2 book snapshots, trade feed)
-    //   - Verify state via BLAKE3 hash chain
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
 
