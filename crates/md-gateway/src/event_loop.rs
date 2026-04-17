@@ -10,7 +10,7 @@
 //! order-entry gateway).
 
 use std::net::TcpListener;
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -155,7 +155,8 @@ enum SessionState {
 /// A single FIX client session on the market data gateway.
 struct MdSession {
     state: SessionState,
-    fix_fd: RawFd,
+    // `OwnedFd` closes the socket on drop — no manual `libc::close`.
+    fix_fd: OwnedFd,
     /// Accumulates partial FIX data from multishot recv until a
     /// complete message can be extracted.
     fix_parse_buf: Vec<u8>,
@@ -177,16 +178,8 @@ struct MdSession {
     heartbeat_interval: Duration,
 }
 
-impl Drop for MdSession {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fix_fd);
-        }
-    }
-}
-
 impl MdSession {
-    fn new(fix_fd: RawFd) -> Self {
+    fn new(fix_fd: OwnedFd) -> Self {
         Self {
             state: SessionState::AwaitingLogon,
             fix_fd,
@@ -559,11 +552,11 @@ pub enum SessionAction {
 // ---------------------------------------------------------------------------
 
 pub struct MdGateway {
-    // Note: listener_fd is closed on Drop (see below). Session fds are
-    // closed by MdSession's Drop impl when they are removed from the slab.
     ring: IoUring,
     config: &'static GatewayConfig,
-    listener_fd: RawFd,
+    // `OwnedFd` closes the listener on drop. Session fds are closed
+    // the same way when `MdSession` is dropped out of the slab.
+    listener_fd: OwnedFd,
     sessions: Slab,
     /// Shared book mirror state from the MarketDataCore thread.
     md_state: Arc<RwLock<MdState>>,
@@ -580,14 +573,6 @@ pub struct MdGateway {
     timeout_ts: types::Timespec,
 }
 
-impl Drop for MdGateway {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.listener_fd);
-        }
-    }
-}
-
 impl MdGateway {
     /// Create the gateway and register the listener + buffer pool with
     /// io_uring.
@@ -597,9 +582,9 @@ impl MdGateway {
         md_state: Arc<RwLock<MdState>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut ring = IoUring::new(RING_SIZE)?;
-        // Take ownership of the fd so it stays open for the program's
-        // lifetime without leaking the TcpListener wrapper.
-        let listener_fd = listener.into_raw_fd();
+        // `TcpListener` owns the fd; converting to `OwnedFd` keeps
+        // ownership without leaking the wrapper.
+        let listener_fd: OwnedFd = listener.into();
 
         // Register the provided buffer pool.
         let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
@@ -701,7 +686,7 @@ impl MdGateway {
 
     fn push_accept(&mut self) {
         let sqe = opcode::Accept::new(
-            types::Fd(self.listener_fd),
+            types::Fd(self.listener_fd.as_raw_fd()),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -733,7 +718,11 @@ impl MdGateway {
         let peer = get_peer_addr(fd);
         info!(peer = %peer, fd, "FIX client connected");
 
-        let session = MdSession::new(fd);
+        // SAFETY: `fd` was just returned by accept(2); no other owner
+        // exists until we wrap it here, and the kernel guarantees the
+        // descriptor is fresh and unique.
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let session = MdSession::new(owned_fd);
         let idx = self.sessions.insert(session);
 
         // Submit multishot RECV on the FIX client socket.
@@ -770,7 +759,7 @@ impl MdGateway {
             return;
         }
 
-        let sqe = opcode::RecvMulti::new(types::Fd(session.fix_fd), BUF_GROUP_ID)
+        let sqe = opcode::RecvMulti::new(types::Fd(session.fix_fd.as_raw_fd()), BUF_GROUP_ID)
             .build()
             .user_data(OP_FIX_RECV | idx as u64);
 
@@ -887,7 +876,7 @@ impl MdGateway {
             }
 
             let sqe = opcode::Send::new(
-                types::Fd(session.fix_fd),
+                types::Fd(session.fix_fd.as_raw_fd()),
                 session.fix_inflight.as_ptr(),
                 session.fix_inflight.len() as u32,
             )
