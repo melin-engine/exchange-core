@@ -195,6 +195,21 @@ impl JournaledExchange {
         Ok(())
     }
 
+    /// Advance the engine clock to `now_ns`, draining any due scheduled
+    /// tasks. Journals the tick first so replay reproduces the same firing
+    /// boundary. In production the tick is published by the dedicated tick
+    /// thread onto the pipeline ring; this entry point exists for tests and
+    /// for callers that drive a JournaledExchange directly.
+    pub fn tick(
+        &mut self,
+        now_ns: u64,
+        reports: &mut Vec<ExecutionReport>,
+    ) -> Result<(), JournalError> {
+        self.writer.append(&JournalEvent::Tick { now_ns })?;
+        self.exchange.drain_due_scheduled_tasks(now_ns, reports);
+        Ok(())
+    }
+
     /// Recover from an existing journal file by replaying all events.
     ///
     /// Truncates any trailing garbage from a partial write (crash recovery),
@@ -506,6 +521,9 @@ fn replay_event(
         JournalEvent::RemoveInstrument { symbol } => {
             exchange.remove_instrument(symbol, reports);
         }
+        JournalEvent::Tick { now_ns } => {
+            exchange.drain_due_scheduled_tasks(now_ns, reports);
+        }
         JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
             // Read-only queries are never journaled, so they should never
             // appear during replay. No-op if they somehow do.
@@ -702,6 +720,52 @@ mod tests {
         }
 
         assert_eq!(original_reports, replay_reports);
+    }
+
+    #[test]
+    fn ticks_journal_and_drain_due_tasks_on_replay() {
+        use crate::scheduler::{ScheduledTask, ScheduledTaskKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ticks.journal");
+
+        // Write two ticks at distinct deadlines into the journal.
+        let mut reports = Vec::new();
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.tick(5_000, &mut reports).unwrap();
+            je.tick(6_000, &mut reports).unwrap();
+        }
+
+        // Build an exchange with two pending tasks: one due during replay,
+        // one still in the future. Replay must drain only the due one.
+        let mut exchange = Exchange::new();
+        exchange.push_scheduled_task(ScheduledTask {
+            fire_ns: 5_500,
+            kind: ScheduledTaskKind::Reserved,
+        });
+        exchange.push_scheduled_task(ScheduledTask {
+            fire_ns: 7_000,
+            kind: ScheduledTaskKind::Reserved,
+        });
+
+        let mut reader = super::super::reader::JournalReader::open(&path).unwrap();
+        let mut replay_reports = Vec::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            replay_event(
+                &mut exchange,
+                &entry.event,
+                entry.key_hash,
+                entry.request_seq,
+                &mut replay_reports,
+            );
+        }
+
+        // After replaying ticks at 5_000 and 6_000, the 5_500 task should
+        // have fired (drained) on the second tick; the 7_000 task remains.
+        let snap = exchange.snapshot_state();
+        assert_eq!(snap.scheduled_tasks.len(), 1);
+        assert_eq!(snap.scheduled_tasks[0].fire_ns, 7_000);
     }
 
     #[test]

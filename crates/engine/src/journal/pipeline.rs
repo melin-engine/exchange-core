@@ -1573,6 +1573,9 @@ impl MatchingStage {
             JournalEvent::RemoveInstrument { symbol } => {
                 self.exchange.remove_instrument(symbol, reports);
             }
+            JournalEvent::Tick { now_ns } => {
+                self.exchange.drain_due_scheduled_tasks(now_ns, reports);
+            }
             JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.

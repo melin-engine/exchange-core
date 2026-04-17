@@ -104,6 +104,12 @@ pub enum JournalEvent {
         chain_hash: [u8; 32],
         events_since_checkpoint: u64,
     },
+    /// Internal clock tick. Published by the tick generator thread and
+    /// journaled like any other input event. Carries the wall-clock time
+    /// that the engine's scheduler uses to fire due tasks (GTD expiry,
+    /// volatility halts, session transitions). Replay feeds the recorded
+    /// `now_ns` back to the engine, preserving determinism.
+    Tick { now_ns: u64 },
 }
 
 // Compile-time guard: GenesisHash/Checkpoint must not inflate the enum.

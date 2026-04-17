@@ -10,6 +10,7 @@
 
 use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
+use crate::scheduler::{ScheduledTask, ScheduledTaskHeap};
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
     InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason,
@@ -96,6 +97,11 @@ pub struct Exchange {
     /// the client's Ed25519 public key. Never evicted — key count is
     /// small (~100 max for any exchange).
     key_hwm: HashMap<u64, u64>,
+    /// Min-heap of pending time-driven tasks (GTD expiry, halt evaluation,
+    /// session transitions). Drained at the head of every event the matching
+    /// stage processes — see `drain_due_scheduled_tasks`. Empty until a
+    /// feature pushes a task; the substrate alone never schedules anything.
+    scheduled_tasks: ScheduledTaskHeap,
     /// When true, new order books are created with generous pre-allocation
     /// to avoid HashMap resize spikes on the hot path.
     presized: bool,
@@ -109,6 +115,7 @@ impl Exchange {
             max_order_id: HashMap4::default(),
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
+            scheduled_tasks: ScheduledTaskHeap::new(),
             presized: false,
         }
     }
@@ -125,6 +132,7 @@ impl Exchange {
             max_order_id: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             key_hwm: HashMap::default(),
+            scheduled_tasks: ScheduledTaskHeap::new(),
             presized: true,
         }
     }
@@ -135,6 +143,7 @@ impl Exchange {
         accounts: AccountManager,
         max_order_id: HashMap4<AccountId, u64>,
         key_hwm: HashMap<u64, u64>,
+        scheduled_tasks: ScheduledTaskHeap,
     ) -> Self {
         // Derive order_counts from order_index across all instruments.
         let mut order_counts: HashMap4<AccountId, u32> = HashMap4::default();
@@ -154,7 +163,31 @@ impl Exchange {
             max_order_id,
             order_counts,
             key_hwm,
+            scheduled_tasks,
             presized: false,
+        }
+    }
+
+    /// Snapshot the pending scheduled tasks for serialization.
+    pub(crate) fn snapshot_scheduled_tasks(&self) -> Vec<ScheduledTask> {
+        self.scheduled_tasks.snapshot()
+    }
+
+    /// Push a task onto the scheduler heap. Test-only for now — feature code
+    /// will gain dedicated entry points (e.g. `schedule_gtd_expiry`) as
+    /// scheduled-task kinds are introduced.
+    #[cfg(test)]
+    pub(crate) fn push_scheduled_task(&mut self, task: ScheduledTask) {
+        self.scheduled_tasks.push(task);
+    }
+
+    /// Drain every scheduled task whose `fire_ns <= now_ns`. Called at the
+    /// head of every event the matching stage processes, so time-driven work
+    /// runs in lockstep with the journal. With no concrete task kinds yet,
+    /// this only pops — future stages dispatch on `task.kind` to emit reports.
+    pub fn drain_due_scheduled_tasks(&mut self, now_ns: u64, _reports: &mut Vec<ExecutionReport>) {
+        while let Some(_task) = self.scheduled_tasks.pop_due(now_ns) {
+            // No kinds with side effects yet — substrate-only stage.
         }
     }
 

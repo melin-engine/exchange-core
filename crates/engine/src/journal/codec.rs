@@ -8,7 +8,7 @@
 //! | Field          | Type | Bytes | Purpose                                |
 //! |----------------|------|-------|----------------------------------------|
 //! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
-//! | format_version | u16  | 2     | Current version = 9                    |
+//! | format_version | u16  | 2     | Current version = 10                   |
 //! | reserved       | u16  | 2     | Padding for alignment, zeroed          |
 //!
 //! ## Entry layout (little-endian, repeats after file header)
@@ -51,7 +51,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v6 → v7: added Withdraw event for sparse account lifecycle.
 /// v7 → v8: added per-entry key_hash(8) + request_seq(8) for admin idempotency.
 /// v8 → v9: added ExpireOrders event + conditional expiry_ns in order encoding (GTD only).
-pub const FORMAT_VERSION: u16 = 9;
+/// v9 → v10: added Tick event for the internal scheduler clock.
+pub const FORMAT_VERSION: u16 = 10;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -84,6 +85,7 @@ const TAG_EXPIRE_ORDERS: u8 = 15;
 const TAG_DISABLE_INSTRUMENT: u8 = 16;
 const TAG_ENABLE_INSTRUMENT: u8 = 17;
 const TAG_REMOVE_INSTRUMENT: u8 = 18;
+const TAG_TICK: u8 = 19;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -110,11 +112,9 @@ pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
         return Err(JournalError::InvalidFile);
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
-    // Accept v5 (pre-hash-chain), v7 (pre-idempotency), v8 (pre-GTD), and v9 (current).
-    // v5 journals are readable — the reader simply won't have hash chain
-    // verification. v7 journals lack key_hash/request_seq fields.
-    // v8 journals lack conditional expiry_ns in order encoding.
-    if version != FORMAT_VERSION && version != 8 && version != 7 && version != 5 {
+    // Pre-production: only the current version is accepted. Older formats
+    // can be revived later as the on-disk format stabilises.
+    if version != FORMAT_VERSION {
         return Err(JournalError::UnsupportedVersion { version });
     }
     Ok(version)
@@ -291,6 +291,11 @@ pub fn encode(
             pos += 4;
             TAG_REMOVE_INSTRUMENT
         }
+        JournalEvent::Tick { now_ns } => {
+            le::put_u64(&mut buf[pos..], *now_ns);
+            pos += 8;
+            TAG_TICK
+        }
         JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
             // Read-only queries are never journaled — the journal stage
             // filters them out before calling batch_append. This arm
@@ -384,12 +389,12 @@ pub fn encode(
 /// Decode a journal entry from `buf`.
 ///
 /// Returns `(bytes_consumed, sequence, timestamp_ns, key_hash, request_seq, event)`.
-/// `version` determines the layout: v8+ entries have key_hash(8) + request_seq(8)
-/// after the header; older versions return (0, 0) for those fields.
+/// The `version` parameter is reserved for future per-version layout branches;
+/// the current codec accepts only [`FORMAT_VERSION`].
 /// Returns `Err(TruncatedEntry)` if the buffer doesn't contain a complete entry.
 pub fn decode(
     buf: &[u8],
-    version: u16,
+    _version: u16,
 ) -> Result<(usize, u64, u64, u64, u64, JournalEvent), JournalError> {
     // Need at least the fixed header to read length.
     if buf.len() < ENTRY_HEADER_SIZE + 1 + CRC_SIZE {
@@ -426,21 +431,16 @@ pub fn decode(
         });
     }
 
-    // Decode key_hash and request_seq (v8+). Older versions lack these
-    // fields — default to 0 (exempt from idempotency checking).
-    let (key_hash, request_seq, event_tag_offset) = if version >= 8 {
-        if payload_len < 17 {
-            return Err(JournalError::CorruptEntry {
-                sequence,
-                reason: "v8 entry too short for key_hash + request_seq + tag",
-            });
-        }
-        let kh = le::get_u64(&buf[ENTRY_HEADER_SIZE..]);
-        let rs = le::get_u64(&buf[ENTRY_HEADER_SIZE + 8..]);
-        (kh, rs, ENTRY_HEADER_SIZE + 16)
-    } else {
-        (0u64, 0u64, ENTRY_HEADER_SIZE)
-    };
+    // Decode key_hash and request_seq (mandatory in the current format).
+    if payload_len < 17 {
+        return Err(JournalError::CorruptEntry {
+            sequence,
+            reason: "entry too short for key_hash + request_seq + tag",
+        });
+    }
+    let key_hash = le::get_u64(&buf[ENTRY_HEADER_SIZE..]);
+    let request_seq = le::get_u64(&buf[ENTRY_HEADER_SIZE + 8..]);
+    let event_tag_offset = ENTRY_HEADER_SIZE + 16;
 
     // Decode event.
     let event_tag = buf[event_tag_offset];
@@ -822,6 +822,17 @@ pub fn decode(
                 symbol: Symbol(le::get_u32(&payload[0..])),
             }
         }
+        TAG_TICK => {
+            if payload.len() < 8 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "Tick payload too short",
+                });
+            }
+            JournalEvent::Tick {
+                now_ns: le::get_u64(&payload[0..]),
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -1180,6 +1191,9 @@ mod tests {
             JournalEvent::DisableInstrument { symbol: Symbol(1) },
             JournalEvent::EnableInstrument { symbol: Symbol(1) },
             JournalEvent::RemoveInstrument { symbol: Symbol(1) },
+            JournalEvent::Tick {
+                now_ns: 1_700_000_000_500_000_000,
+            },
         ]
     }
 
@@ -1319,47 +1333,6 @@ mod tests {
         assert_eq!(seq, 1);
         assert_eq!(kh, key_hash);
         assert_eq!(rs, request_seq);
-        assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn v7_decode_returns_zero_key_hash_and_seq() {
-        // Simulate a v7 entry (no key_hash/request_seq) by encoding with the
-        // old layout. Since we can't use the old encoder, manually build a v7
-        // entry: header(20) + event_tag(1) + payload + crc(4).
-        let event = JournalEvent::CancelAll {
-            account: AccountId(5),
-        };
-        // Encode as v8 first, then manually construct a v7 entry.
-        let mut buf_v8 = [0u8; 256];
-        let _ = encode(10, 200, 0xAA, 0xBB, &event, &mut buf_v8).unwrap();
-
-        // Build a v7 entry manually: header(20) + tag(1) + account(4) + crc(4)
-        let mut buf_v7 = [0u8; 256];
-        let payload_len: u16 = 1 + 4; // tag(1) + account(4)
-        let mut h = 0;
-        le::put_u16(&mut buf_v7[h..], ENTRY_MAGIC);
-        h += 2;
-        le::put_u16(&mut buf_v7[h..], payload_len);
-        h += 2;
-        le::put_u64(&mut buf_v7[h..], 10); // sequence
-        h += 8;
-        le::put_u64(&mut buf_v7[h..], 200); // timestamp
-        h += 8;
-        assert_eq!(h, ENTRY_HEADER_SIZE);
-        buf_v7[h] = 6; // TAG_CANCEL_ALL
-        h += 1;
-        le::put_u32(&mut buf_v7[h..], 5); // account
-        let data_end = ENTRY_HEADER_SIZE + payload_len as usize;
-        let crc = crc32c::crc32c(&buf_v7[..data_end]);
-        le::put_u32(&mut buf_v7[data_end..], crc);
-        let total = data_end + CRC_SIZE;
-
-        let (consumed, seq, _ts, kh, rs, decoded) = decode(&buf_v7[..total], 7).unwrap();
-        assert_eq!(consumed, total);
-        assert_eq!(seq, 10);
-        assert_eq!(kh, 0); // v7: no key_hash
-        assert_eq!(rs, 0); // v7: no request_seq
         assert_eq!(decoded, event);
     }
 

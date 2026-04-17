@@ -8,15 +8,15 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v11)
+//! ## File format (v13)
 //!
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 11               |
+//! | format_version | u16     | 2     | Current version = 13               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
-//! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state (v6+)      |
+//! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state            |
 //! | data           | ...     | var   | Serialized Exchange state          |
 //! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
@@ -29,6 +29,7 @@ use std::path::Path;
 use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
+use crate::scheduler::{self, ScheduledTask, ScheduledTaskHeap};
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, OrderId, Price,
     Quantity, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
@@ -57,7 +58,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v8 → v9: added per-key request sequence HWMs for admin idempotency.
 /// v10 → v11: added expiry_ns to resting orders and pending stops (GTD support).
 /// v11 → v12: added per-instrument disabled flag for instrument lifecycle management.
-const SNAP_VERSION: u16 = 12;
+/// v12 → v13: added scheduled_tasks heap for the engine-internal scheduler.
+const SNAP_VERSION: u16 = 13;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -146,12 +148,13 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
 
-    // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
-    let (header_size, has_chain_hash) = match version {
-        5 => (16usize, false),
-        6..=12 => (SNAP_HEADER_SIZE, true),
-        _ => return Err(JournalError::UnsupportedVersion { version }),
-    };
+    // Pre-production: only the current version is accepted. Older snapshot
+    // formats are intentionally not loadable while the on-disk layout is
+    // still in flux.
+    if version != SNAP_VERSION {
+        return Err(JournalError::UnsupportedVersion { version });
+    }
+    let header_size = SNAP_HEADER_SIZE;
 
     if buf.len() < header_size + 4 {
         return Err(JournalError::TruncatedEntry);
@@ -178,13 +181,11 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
     ]);
 
-    // Read chain_hash (v6+) or default to zeros (v5).
-    let chain_hash = if has_chain_hash {
+    // Chain hash always present in supported versions.
+    let chain_hash = {
         let mut h = [0u8; 32];
         h.copy_from_slice(&buf[16..48]);
         h
-    } else {
-        [0u8; 32]
     };
 
     // Decode exchange state.
@@ -217,6 +218,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) key_hwm: Vec<(u64, u64)>,
     /// Set of disabled instrument symbols (v12+).
     pub(crate) disabled_instruments: Vec<Symbol>,
+    /// Pending scheduler tasks, sorted by `fire_ns` ascending (v13+).
+    pub(crate) scheduled_tasks: Vec<ScheduledTask>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -371,6 +374,13 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     le::push_u32(buf, state.disabled_instruments.len() as u32);
     for symbol in &state.disabled_instruments {
         le::push_u32(buf, symbol.0);
+    }
+
+    // Scheduled tasks (v13+). Each entry: fire_ns(8) + kind_tag(1).
+    le::push_u32(buf, state.scheduled_tasks.len() as u32);
+    for task in &state.scheduled_tasks {
+        le::push_u64(buf, task.fire_ns);
+        buf.push(scheduler::encode_kind(task.kind));
     }
 }
 
@@ -785,6 +795,21 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Scheduled tasks (v13+). Each entry: fire_ns(8) + kind_tag(1) = 9 bytes.
+    check(pos, 4)?;
+    let n_tasks = le::get_u32(&buf[pos..]) as usize;
+    pos += 4;
+    validate_count(buf.len() - pos, n_tasks, 9)?;
+    let mut scheduled_tasks = Vec::with_capacity(n_tasks);
+    for _ in 0..n_tasks {
+        check(pos, 9)?;
+        let fire_ns = le::get_u64(&buf[pos..]);
+        let kind = scheduler::decode_kind(buf[pos + 8])
+            .ok_or(corrupt("invalid scheduled task kind tag"))?;
+        scheduled_tasks.push(ScheduledTask { fire_ns, kind });
+        pos += 9;
+    }
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -799,6 +824,7 @@ fn decode_exchange_state(
             fee_schedules,
             key_hwm,
             disabled_instruments,
+            scheduled_tasks,
         },
     ))
 }
@@ -1144,6 +1170,7 @@ impl Exchange {
         let fee_schedules = self.snapshot_fee_schedules();
         let key_hwm = self.snapshot_key_hwm();
         let disabled_instruments = self.snapshot_disabled_instruments();
+        let scheduled_tasks = self.snapshot_scheduled_tasks();
 
         ExchangeSnapshot {
             instruments,
@@ -1157,6 +1184,7 @@ impl Exchange {
             fee_schedules,
             key_hwm,
             disabled_instruments,
+            scheduled_tasks,
         }
     }
 
@@ -1231,7 +1259,15 @@ impl Exchange {
             key_hwm.insert(key_hash, hwm);
         }
 
-        Self::from_parts(instruments, accounts, max_order_id, key_hwm)
+        let scheduled_tasks = ScheduledTaskHeap::restore(state.scheduled_tasks);
+
+        Self::from_parts(
+            instruments,
+            accounts,
+            max_order_id,
+            key_hwm,
+            scheduled_tasks,
+        )
     }
 
     /// Create a deep copy of this Exchange by round-tripping through the
@@ -1391,6 +1427,7 @@ mod tests {
 
     use super::*;
     use crate::exchange::Exchange;
+    use crate::scheduler::ScheduledTaskKind;
     use crate::types::*;
 
     const ACCT_A: AccountId = AccountId(1);
@@ -1697,6 +1734,48 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trips_scheduler_heap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sched.snapshot");
+
+        let mut exchange = Exchange::new();
+        // Push tasks out of fire-order to exercise the deterministic sort
+        // on encode and the heap restore on decode.
+        for fire_ns in [3_000, 1_000, 2_000, 5_000, 4_000] {
+            exchange.push_scheduled_task(ScheduledTask {
+                fire_ns,
+                kind: ScheduledTaskKind::Reserved,
+            });
+        }
+
+        save(&exchange, 99, [0u8; 32], &path).unwrap();
+
+        let (mut restored, _, _) = load(&path).unwrap();
+
+        // Drain in fire_ns order — restored heap must hold all tasks.
+        let mut popped = Vec::new();
+        let mut reports = Vec::new();
+        // Drain everything in one shot via the engine entry point used in
+        // production; this also exercises drain_due_scheduled_tasks.
+        restored.drain_due_scheduled_tasks(u64::MAX, &mut reports);
+        // After drain the heap is empty; verify by re-snapshotting.
+        let after = restored.snapshot_state();
+        assert!(
+            after.scheduled_tasks.is_empty(),
+            "heap should be empty after drain"
+        );
+
+        // Independently inspect the on-disk ordering by re-reading the
+        // snapshot bytes via load and inspecting the snapshot vector.
+        let (fresh, _, _) = load(&path).unwrap();
+        let snap = fresh.snapshot_state();
+        for task in &snap.scheduled_tasks {
+            popped.push(task.fire_ns);
+        }
+        assert_eq!(popped, vec![1_000, 2_000, 3_000, 4_000, 5_000]);
+    }
+
+    #[test]
     fn save_rotates_previous_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotate.snapshot");
@@ -1757,46 +1836,5 @@ mod tests {
         let (_, seq, loaded_hash) = load(&path).unwrap();
         assert_eq!(seq, 10);
         assert_eq!(loaded_hash, [0u8; 32]);
-    }
-
-    #[test]
-    fn v5_snapshot_loads_with_zero_chain_hash() {
-        use std::io::Write;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v5.snapshot");
-
-        // Build a v5 snapshot manually: header(16) + empty exchange data + CRC.
-        // Use a real v6 snapshot as base, then rewrite header to v5 format.
-        let exchange = Exchange::new();
-        let v6_path = dir.path().join("v6_tmp.snapshot");
-        save(&exchange, 5, [0xBB; 32], &v6_path).unwrap();
-
-        // Read the v6 snapshot, extract exchange data, rebuild as v5.
-        let v6_data = std::fs::read(&v6_path).unwrap();
-        // v6 header is 48 bytes, data starts after that, CRC is last 4 bytes.
-        let exchange_data = &v6_data[48..v6_data.len() - 4];
-
-        let mut buf = Vec::new();
-        // v5 header: magic(4) + version(2) + reserved(2) + sequence(8) = 16 bytes.
-        buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&5u16.to_le_bytes()); // v5
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&5u64.to_le_bytes());
-        buf.extend_from_slice(exchange_data);
-        let crc = crc32c::crc32c(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
-
-        let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(&buf).unwrap();
-        drop(file);
-
-        // Load should succeed and return zero chain_hash for v5.
-        let (_, seq, chain_hash) = load(&path).unwrap();
-        assert_eq!(seq, 5);
-        assert_eq!(
-            chain_hash, [0u8; 32],
-            "v5 snapshot should return zero chain hash"
-        );
     }
 }

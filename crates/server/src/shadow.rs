@@ -207,6 +207,9 @@ fn dispatch_event(
         JournalEvent::RemoveInstrument { symbol } => {
             exchange.remove_instrument(symbol, reports);
         }
+        JournalEvent::Tick { now_ns } => {
+            exchange.drain_due_scheduled_tasks(now_ns, reports);
+        }
         JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
             // Read-only — no state change.
         }
@@ -535,6 +538,9 @@ mod tests {
                 }
                 JournalEvent::RemoveInstrument { symbol } => {
                     primary.remove_instrument(symbol, &mut primary_reports);
+                }
+                JournalEvent::Tick { now_ns } => {
+                    primary.drain_due_scheduled_tasks(now_ns, &mut primary_reports);
                 }
                 JournalEvent::QueryStats
                 | JournalEvent::QueryPosition { .. }

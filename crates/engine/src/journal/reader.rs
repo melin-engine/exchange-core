@@ -947,65 +947,6 @@ mod tests {
 
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn v5_journal_has_no_hash_chain() {
-        use std::os::unix::fs::FileExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v5.journal");
-
-        // Create a v5 journal manually: write v5 header + one raw entry.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-
-        // v5 file header: JOUR magic + version 5 + reserved.
-        let mut header = [0u8; 8];
-        header[0..4].copy_from_slice(&0x4A4F_5552u32.to_le_bytes());
-        header[4..6].copy_from_slice(&5u16.to_le_bytes());
-        file.write_all_at(&header, 0).unwrap();
-
-        // Write a Deposit entry at sequence 1 in v5 format (no key_hash/
-        // request_seq fields). v5 layout: header(20) + tag(1) + payload + CRC(4).
-        // Deposit payload: account(4) + currency(4) + amount(8) = 16 bytes.
-        let event = JournalEvent::Deposit {
-            account: AccountId(1),
-            currency: CurrencyId(0),
-            amount: 100,
-        };
-        let mut buf = [0u8; 64];
-        let payload_len: u16 = 17; // tag(1) + account(4) + currency(4) + amount(8)
-        buf[0..2].copy_from_slice(&0x4A45u16.to_le_bytes()); // ENTRY_MAGIC
-        buf[2..4].copy_from_slice(&payload_len.to_le_bytes());
-        buf[4..12].copy_from_slice(&1u64.to_le_bytes()); // sequence
-        buf[12..20].copy_from_slice(&1000u64.to_le_bytes()); // timestamp_ns
-        buf[20] = 2; // TAG_DEPOSIT
-        buf[21..25].copy_from_slice(&1u32.to_le_bytes()); // account
-        buf[25..29].copy_from_slice(&0u32.to_le_bytes()); // currency
-        buf[29..37].copy_from_slice(&100u64.to_le_bytes()); // amount
-        let data_end = 20 + payload_len as usize; // 37
-        let crc = crc32c::crc32c(&buf[..data_end]);
-        buf[data_end..data_end + 4].copy_from_slice(&crc.to_le_bytes());
-        let written = data_end + 4; // 41
-        file.write_all_at(&buf[..written], 8).unwrap();
-        drop(file);
-
-        // Read back: should work, chain_hash should be None.
-        let mut reader = JournalReader::open(&path).unwrap();
-        let entry = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry.sequence, 1);
-        assert_eq!(entry.event, event);
-        assert!(reader.next_entry().unwrap().is_none());
-        assert!(
-            reader.chain_hash().is_none(),
-            "v5 journal should have no hash chain"
-        );
-    }
-
-    #[cfg(feature = "hash-chain")]
-    #[test]
     fn checkpoint_event_count_mismatch_detected() {
         use crate::journal::writer::CHECKPOINT_INTERVAL;
 

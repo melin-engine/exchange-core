@@ -5,6 +5,7 @@ pub mod exchange;
 pub mod journal;
 pub mod le;
 pub mod orderbook;
+pub mod scheduler;
 pub mod types;
 
 #[cfg(test)]
