@@ -568,7 +568,9 @@ struct PipelineHandles {
     event_publisher: Option<std::thread::JoinHandle<()>>,
     shadow: Option<std::thread::JoinHandle<()>>,
     health: Option<std::thread::JoinHandle<()>>,
-    tick: Option<std::thread::JoinHandle<()>>,
+    // No standalone tick thread on either transport: io_uring emits ticks
+    // from inside the reader (via IORING_OP_TIMEOUT) and DPDK emits them
+    // from inside the poll thread (via a wall-clock check between bursts).
 }
 
 /// Drain the pipeline and join every worker thread, surfacing panics
@@ -621,9 +623,6 @@ fn shutdown_pipeline_stages(
     }
     if let Some(h) = handles.health {
         check_join("health", h.join());
-    }
-    if let Some(h) = handles.tick {
-        check_join("tick", h.join());
     }
 
     if thread_panicked || journal_failed {
@@ -1353,9 +1352,6 @@ fn run_as_primary<L: BlockingTransportListener>(
             event_publisher: event_publisher_handle,
             shadow: shadow_handle,
             health: health_handle,
-            // io_uring path: ticks are emitted from inside the reader thread,
-            // so there is no separate tick handle to join here.
-            tick: None,
         },
         Vec::new(),
         &pipeline_healthy,
@@ -1573,23 +1569,11 @@ pub fn run_dpdk(
         None
     };
 
-    // Spawn the tick generator thread, if enabled. Same role as in the TCP
-    // path: drives the engine's internal scheduler from a single journaled
-    // time source. Clones the input producer + sequencer so the DPDK poll
-    // thread below still owns its copy.
-    let tick_handle = if let Some(cadence) = config.tick_interval() {
-        let producer = input_producer.clone();
-        let sequencer = Arc::clone(&sequencer);
-        let s_tick = Arc::clone(&shutdown);
-        Some(
-            std::thread::Builder::new()
-                .name("tick".into())
-                .spawn(move || crate::tick::run(producer, sequencer, cadence, &s_tick))
-                .map_err(|e| format!("spawn tick thread: {e}"))?,
-        )
-    } else {
-        None
-    };
+    // The DPDK poll thread also generates the engine's scheduler ticks via
+    // a wall-clock comparison between NIC bursts (see `run_dpdk_poll`). The
+    // input ring is therefore single-producer in steady state alongside the
+    // one-shot seed loop — same property as the io_uring transport.
+    let tick_cadence = config.tick_interval();
 
     // Fastest-replica cursor (see TCP path for explanation).
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
@@ -1958,6 +1942,7 @@ pub fn run_dpdk(
                     &shutdown_i,
                     keys_i,
                     connection_timeout,
+                    tick_cadence,
                     max_conns,
                     active_i,
                     i as u8,
@@ -1981,6 +1966,7 @@ pub fn run_dpdk(
             &shutdown,
             authorized_keys,
             connection_timeout,
+            tick_cadence,
             max_conns,
             Arc::clone(&active_connections),
             0,
@@ -2014,7 +2000,6 @@ pub fn run_dpdk(
             event_publisher: None,
             shadow: shadow_handle,
             health: health_handle,
-            tick: tick_handle,
         },
         dpdk_extras,
         &pipeline_healthy,

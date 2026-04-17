@@ -107,6 +107,7 @@ pub fn run_dpdk_poll(
     shutdown: &AtomicBool,
     authorized_keys: Arc<AuthorizedKeys>,
     connection_timeout: Option<Duration>,
+    tick_cadence: Option<Duration>,
     max_connections: u64,
     active_connections: Arc<std::sync::atomic::AtomicU64>,
     thread_id: u8,
@@ -138,9 +139,52 @@ pub fn run_dpdk_poll(
     // session, not cryptographic key derivation.
     let mut rng = rand::rng();
 
+    // Tick generator state. The DPDK poll thread is a tight busy-spin
+    // loop, so unlike the io_uring reader it does not need a timeout
+    // primitive — a wall-clock comparison between bursts is enough.
+    // `tick_check_interval` amortises `Instant::now()` over many poll
+    // iterations: at typical ~5M iterations/sec, checking every 4096
+    // iterations stays well within microseconds of the deadline while
+    // making the per-iteration overhead unmeasurable.
+    let tick_enabled = tick_cadence.is_some();
+    let cadence = tick_cadence.unwrap_or(Duration::ZERO);
+    let mut next_tick_deadline = Instant::now() + cadence;
+    let mut last_tick_ns: u64 = 0;
+    let mut tick_check_counter: u32 = 0;
+    const TICK_CHECK_INTERVAL: u32 = 4096;
+    if tick_enabled {
+        tracing::info!(
+            cadence_ms = cadence.as_millis() as u64,
+            thread_id,
+            "tick generator integrated into DPDK poll thread"
+        );
+    }
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Tick generator: compare wall clock to deadline once every
+        // TICK_CHECK_INTERVAL poll iterations, emit if due.
+        if tick_enabled {
+            tick_check_counter = tick_check_counter.wrapping_add(1);
+            if tick_check_counter >= TICK_CHECK_INTERVAL {
+                tick_check_counter = 0;
+                let now = Instant::now();
+                if now >= next_tick_deadline {
+                    let raw_now_ns = wall_clock_nanos();
+                    let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
+                    last_tick_ns = now_ns;
+                    crate::tick::publish_tick(&producer, &sequencer, now_ns);
+                    let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
+                    next_tick_deadline = if elapsed > cadence {
+                        Instant::now() + cadence
+                    } else {
+                        next_tick_deadline + cadence
+                    };
+                }
+            }
         }
 
         // 1. Poll NIC + smoltcp.

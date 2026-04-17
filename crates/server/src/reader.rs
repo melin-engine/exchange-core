@@ -378,9 +378,9 @@ fn reader_loop<R: AsRawFd>(
             let now = Instant::now();
             if now >= next_tick_deadline {
                 let raw_now_ns = wall_clock_nanos();
-                let now_ns = clamp_monotonic_tick(raw_now_ns, last_tick_ns);
+                let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                 last_tick_ns = now_ns;
-                publish_tick(&producer, sequencer, now_ns);
+                crate::tick::publish_tick(&producer, sequencer, now_ns);
                 // Catch up rather than burst-emit if we fell badly behind.
                 let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                 next_tick_deadline = if elapsed > cadence {
@@ -713,49 +713,6 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
             .push(&sqe)
             .expect("io_uring SQ full — increase RING_SIZE");
     }
-}
-
-// ---------------------------------------------------------------------------
-// Tick generation
-// ---------------------------------------------------------------------------
-
-/// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.
-///
-/// `wall_clock_nanos()` (i.e. `SystemTime::now()`) can step backwards under
-/// NTP corrections. Since the engine's scheduler keys due-task firings on
-/// `now_ns >= fire_ns`, a backwards step followed by a forward step could
-/// re-fire tasks that were already drained on replay. Clamping the
-/// per-tick `now_ns` to `max(prev + 1, raw_now_ns)` keeps replay byte-
-/// identical with live behaviour.
-fn clamp_monotonic_tick(raw_now_ns: u64, last_now_ns: u64) -> u64 {
-    if last_now_ns == 0 {
-        // Bump 0 → 1 so a pre-epoch system clock still produces a non-zero
-        // tick (zero is the "no tick yet" sentinel elsewhere in the engine).
-        raw_now_ns.max(1)
-    } else if raw_now_ns > last_now_ns {
-        raw_now_ns
-    } else {
-        last_now_ns + 1
-    }
-}
-
-/// Publish a `JournalEvent::Tick { now_ns }` onto the input ring. Same
-/// publish path as a client request but with a synthetic InputSlot — no
-/// connection, no auth key. If the ring is full the tick is dropped; the
-/// next successful tick still carries the latest wall-clock time, so a
-/// missed tick only delays scheduler firings by one cadence at worst.
-fn publish_tick(producer: &ring::MultiProducer<InputSlot>, sequencer: &Sequencer, now_ns: u64) {
-    let seq = sequencer.next();
-    let _ = producer.try_publish(InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        request_seq: 0,
-        sequence: seq,
-        timestamp_ns: now_ns,
-        event: JournalEvent::Tick { now_ns },
-        publish_ts: trace_ts(),
-        recv_ts: trace_ts(),
-    });
 }
 
 // ---------------------------------------------------------------------------
