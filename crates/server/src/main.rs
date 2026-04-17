@@ -11,6 +11,35 @@ use clap::Parser;
 use melin_protocol::tcp::BlockingTcpListener;
 use melin_server::server::ServerConfig;
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(true)
+        .with_thread_names(true)
+        .init();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    install_shutdown_handler(&shutdown);
+
+    let config = ServerConfig::parse();
+
+    #[cfg(feature = "dpdk")]
+    {
+        let dpdk_config = dpdk_config_from(&config);
+        melin_server::server::run_dpdk(config, dpdk_config, shutdown)
+    }
+
+    #[cfg(not(feature = "dpdk"))]
+    {
+        let listener = BlockingTcpListener::bind(config.bind)?;
+        melin_server::server::run_with_shutdown(listener, config, shutdown)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
+
 /// Pointer to the shared shutdown flag, set once before signals can fire.
 /// `AtomicUsize` stores the raw pointer as an integer — signal-safe.
 static SHUTDOWN_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -30,19 +59,12 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(true)
-        .with_thread_names(true)
-        .init();
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    // Store the pointer for the signal handler before installing handlers.
-    // The Arc keeps the AtomicBool alive for the program's lifetime.
-    SHUTDOWN_PTR.store(Arc::as_ptr(&shutdown) as usize, Ordering::Relaxed);
-
+/// Install SIGINT/SIGTERM handlers that flip `shutdown` on first signal
+/// and force-exit on the second. The caller must keep the `Arc` alive
+/// for the program's lifetime — we publish its pointer to a signal-safe
+/// static so the handler can reach the flag.
+fn install_shutdown_handler(shutdown: &Arc<AtomicBool>) {
+    SHUTDOWN_PTR.store(Arc::as_ptr(shutdown) as usize, Ordering::Relaxed);
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -53,42 +75,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             signal_handler as *const () as libc::sighandler_t,
         );
     }
+}
 
-    let config = ServerConfig::parse();
+// ---------------------------------------------------------------------------
+// DPDK config
+// ---------------------------------------------------------------------------
 
-    #[cfg(feature = "dpdk")]
-    {
-        let dpdk_config = melin_dpdk::DpdkConfig {
-            eal_args: config
-                .dpdk_eal_args
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-            port_ids: config.dpdk_ports.clone(),
-            ip_addr: config.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
-            prefix_len: config.dpdk_prefix_len,
-            gateway: config
-                .dpdk_gateway
-                .as_deref()
-                .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
-            listen_port: config.bind.port(),
-            mtu: config.dpdk_mtu,
-            vlan_id: config.dpdk_vlan,
-            // Single I/O queue for trading connections (LMAX model: one
-            // poll thread owns all client sockets). Extra queue pair only
-            // for the replication sender when replication is enabled.
-            num_queues: if config.replication_bind.is_some() || config.replica_of.is_some() {
-                2
-            } else {
-                1
-            },
-        };
-        melin_server::server::run_dpdk(config, dpdk_config, shutdown)
+#[cfg(feature = "dpdk")]
+fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
+    melin_dpdk::DpdkConfig {
+        eal_args: cfg
+            .dpdk_eal_args
+            .split_whitespace()
+            .map(String::from)
+            .collect(),
+        port_ids: cfg.dpdk_ports.clone(),
+        ip_addr: cfg.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
+        prefix_len: cfg.dpdk_prefix_len,
+        gateway: cfg
+            .dpdk_gateway
+            .as_deref()
+            .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
+        listen_port: cfg.bind.port(),
+        mtu: cfg.dpdk_mtu,
+        vlan_id: cfg.dpdk_vlan,
+        num_queues: dpdk_num_queues(cfg),
     }
+}
 
-    #[cfg(not(feature = "dpdk"))]
-    {
-        let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server::server::run_with_shutdown(listener, config, shutdown)
+/// Single I/O queue for trading connections (LMAX model: one poll thread
+/// owns all client sockets). Extra queue pair only for the replication
+/// sender when replication is enabled.
+#[cfg(feature = "dpdk")]
+fn dpdk_num_queues(cfg: &ServerConfig) -> u16 {
+    if cfg.replication_bind.is_some() || cfg.replica_of.is_some() {
+        2
+    } else {
+        1
     }
 }
