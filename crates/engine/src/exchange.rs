@@ -9433,6 +9433,64 @@ mod tests {
     }
 
     #[test]
+    fn fee_increase_cancels_underfunded_stop_limit_buy() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        // Deposit just enough to cover the stop-limit's cost with no fees.
+        exchange.deposit(ACCT_A, USD, 1_500);
+
+        let mut reports = Vec::new();
+
+        // Place buy stop-limit: trigger=200, limit=150, qty=10.
+        // Reservation = 150 * 10 = 1_500 (no fees) — consumes all available.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(200),
+                    limit_price: price(150),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_500);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
+        reports.clear();
+
+        // Increase fees to 100bps. New required = 1_515 > 1_500 and
+        // available = 0, so the top-up fails and the stop must be cancelled.
+        exchange.set_fee_schedule(
+            btc,
+            FeeSchedule {
+                maker_fee_bps: 100,
+                taker_fee_bps: 0,
+            },
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        // Reservation fully released.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 1_500);
+        // Order count dropped to zero — withdrawal allowed.
+        exchange.withdraw(ACCT_A, USD, 1_500).unwrap();
+    }
+
+    #[test]
     fn fee_change_adjusts_stop_market_buy_budget() {
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
