@@ -183,7 +183,7 @@ fn dispatch_event(
             exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
         }
         JournalEvent::SetFeeSchedule { symbol, schedule } => {
-            exchange.set_fee_schedule(symbol, schedule);
+            exchange.set_fee_schedule(symbol, schedule, reports);
         }
         JournalEvent::ProvisionAccount { account, amount } => {
             exchange.provision_account(account, amount);
@@ -514,7 +514,7 @@ mod tests {
                     );
                 }
                 JournalEvent::SetFeeSchedule { symbol, schedule } => {
-                    primary.set_fee_schedule(symbol, schedule);
+                    primary.set_fee_schedule(symbol, schedule, &mut primary_reports);
                 }
                 JournalEvent::ProvisionAccount { account, amount } => {
                     primary.provision_account(account, amount);

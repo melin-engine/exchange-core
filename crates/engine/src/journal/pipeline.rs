@@ -1547,7 +1547,7 @@ impl MatchingStage {
                 );
             }
             JournalEvent::SetFeeSchedule { symbol, schedule } => {
-                self.exchange.set_fee_schedule(symbol, schedule);
+                self.exchange.set_fee_schedule(symbol, schedule, reports);
             }
             JournalEvent::ProvisionAccount { account, amount } => {
                 self.exchange.provision_account(account, amount);

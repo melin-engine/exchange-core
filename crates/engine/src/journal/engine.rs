@@ -116,14 +116,16 @@ impl JournaledExchange {
     }
 
     /// Set the fee schedule for an instrument. Journals before executing.
+    /// May cancel orders whose accounts can't afford the new fee cushion.
     pub fn set_fee_schedule(
         &mut self,
         symbol: Symbol,
         schedule: FeeSchedule,
+        reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
         self.writer
             .append(&JournalEvent::SetFeeSchedule { symbol, schedule })?;
-        self.exchange.set_fee_schedule(symbol, schedule);
+        self.exchange.set_fee_schedule(symbol, schedule, reports);
         Ok(())
     }
 
@@ -480,7 +482,7 @@ fn replay_event(
             exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
         }
         JournalEvent::SetFeeSchedule { symbol, schedule } => {
-            exchange.set_fee_schedule(symbol, schedule);
+            exchange.set_fee_schedule(symbol, schedule, reports);
         }
         JournalEvent::ProvisionAccount { account, amount } => {
             exchange.provision_account(account, amount);
@@ -2321,6 +2323,8 @@ mod tests {
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 100).unwrap();
 
+            let mut reports = Vec::new();
+
             // Set fees BEFORE the fill.
             je.set_fee_schedule(
                 Symbol(1),
@@ -2328,10 +2332,9 @@ mod tests {
                     maker_fee_bps: 10,
                     taker_fee_bps: 20,
                 },
+                &mut reports,
             )
             .unwrap();
-
-            let mut reports = Vec::new();
             // Maker sell.
             je.execute(
                 Symbol(1),

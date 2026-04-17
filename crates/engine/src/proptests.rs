@@ -732,7 +732,9 @@ fn run_exchange_actions(actions: &[ExchangeAction]) -> ExchangeActionResult {
                         maker_fee_bps: *maker_fee_bps,
                         taker_fee_bps: *taker_fee_bps,
                     },
+                    &mut reports,
                 );
+                reports.clear();
             }
             ExchangeAction::ExpireOrders { timestamp_ns } => {
                 action_order_ids.push(None);

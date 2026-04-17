@@ -120,6 +120,10 @@ impl RestingOrder {
     pub(crate) fn expiry_ns(&self) -> u64 {
         self.expiry_ns
     }
+
+    pub(crate) fn reservation(&self) -> ReservationSlot {
+        self.reservation
+    }
 }
 
 impl PendingStop {
@@ -191,6 +195,10 @@ impl PendingStop {
 
     pub(crate) fn expiry_ns(&self) -> u64 {
         self.expiry_ns
+    }
+
+    pub(crate) fn reservation(&self) -> ReservationSlot {
+        self.reservation
     }
 }
 
@@ -1498,6 +1506,32 @@ impl OrderBook {
         for (account, id) in to_cancel {
             if let Some((side, slot)) = self.cancel(account, id, reports) {
                 self.consumed_slots.push((account, id, side, slot));
+            }
+        }
+    }
+
+    /// Recalculate `quote_budget` on all pending buy-side stop-market orders
+    /// after a fee schedule change. The reservation amount stays the same
+    /// (entire available balance was already locked), but the budget must
+    /// shrink/grow to leave room for the new fee rate.
+    pub(crate) fn adjust_stop_buy_budgets(
+        &mut self,
+        new_max_fee_bps: u16,
+        remaining_fn: impl Fn(ReservationSlot) -> u64,
+    ) {
+        for stops in self.stop_buys.values_mut() {
+            for stop in stops.iter_mut() {
+                // Only stop-market buys have a quote_budget.
+                // Stop-limit buys have quote_budget == None.
+                if let Some(ref mut budget) = stop.quote_budget {
+                    let reserved = remaining_fn(stop.reservation);
+                    if new_max_fee_bps > 0 {
+                        *budget =
+                            (reserved as u128 * 10_000 / (10_000 + new_max_fee_bps as u128)) as u64;
+                    } else {
+                        *budget = reserved;
+                    }
+                }
             }
         }
     }
