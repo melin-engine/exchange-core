@@ -240,6 +240,15 @@ pub struct ServerConfig {
     /// `.snapshot` extension (same as the startup snapshot path).
     #[arg(long)]
     pub snapshot_path: Option<PathBuf>,
+
+    /// Cadence in milliseconds for the engine-internal scheduler tick.
+    /// A dedicated thread publishes a `JournalEvent::Tick { now_ns }` at
+    /// this interval so time-driven tasks (GTD expiry, volatility halts,
+    /// session transitions) fire in deterministic, journaled lockstep.
+    /// Set to 0 to disable the tick thread (useful for benchmarks that
+    /// don't exercise time-driven features).
+    #[arg(long, default_value_t = 10)]
+    pub tick_interval_ms: u64,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -298,6 +307,7 @@ impl Default for ServerConfig {
             promote_bind: None,
             snapshot_interval_secs: 3000,
             snapshot_path: None,
+            tick_interval_ms: 10,
         }
     }
 }
@@ -332,6 +342,16 @@ impl ServerConfig {
         self.snapshot_path
             .clone()
             .unwrap_or_else(|| self.journal.with_extension("snapshot"))
+    }
+
+    /// Tick generator cadence as a `Duration`. Returns `None` when the tick
+    /// thread is disabled (`--tick-interval-ms 0`).
+    pub fn tick_interval(&self) -> Option<std::time::Duration> {
+        if self.tick_interval_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(self.tick_interval_ms))
+        }
     }
 }
 
@@ -544,6 +564,7 @@ struct PipelineHandles {
     event_publisher: Option<std::thread::JoinHandle<()>>,
     shadow: Option<std::thread::JoinHandle<()>>,
     health: Option<std::thread::JoinHandle<()>>,
+    tick: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Drain the pipeline and join every worker thread, surfacing panics
@@ -596,6 +617,9 @@ fn shutdown_pipeline_stages(
     }
     if let Some(h) = handles.health {
         check_join("health", h.join());
+    }
+    if let Some(h) = handles.tick {
+        check_join("tick", h.join());
     }
 
     if thread_panicked || journal_failed {
@@ -726,6 +750,24 @@ fn run_as_primary<L: BlockingTransportListener>(
     // processed by the matching engine via the normal pipeline.
     let seed_producer = if needs_seeding {
         Some(input_producer.clone())
+    } else {
+        None
+    };
+
+    // Spawn the tick generator thread, if enabled. Publishes JournalEvent::Tick
+    // at the configured cadence so the engine's scheduler advances time
+    // independently of client traffic. Clones the input producer and sequencer
+    // so the reader pool below can still take ownership of the originals.
+    let tick_handle = if let Some(cadence) = config.tick_interval() {
+        let producer = input_producer.clone();
+        let sequencer = Arc::clone(&sequencer);
+        let s_tick = Arc::clone(&shutdown);
+        Some(
+            std::thread::Builder::new()
+                .name("tick".into())
+                .spawn(move || crate::tick::run(producer, sequencer, cadence, &s_tick))
+                .map_err(|e| format!("spawn tick thread: {e}"))?,
+        )
     } else {
         None
     };
@@ -1320,6 +1362,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             event_publisher: event_publisher_handle,
             shadow: shadow_handle,
             health: health_handle,
+            tick: tick_handle,
         },
         Vec::new(),
         &pipeline_healthy,
@@ -1533,6 +1576,24 @@ pub fn run_dpdk(
     // Clone producer for seeding before moving it to the DPDK thread.
     let seed_producer = if needs_seeding {
         Some(input_producer.clone())
+    } else {
+        None
+    };
+
+    // Spawn the tick generator thread, if enabled. Same role as in the TCP
+    // path: drives the engine's internal scheduler from a single journaled
+    // time source. Clones the input producer + sequencer so the DPDK poll
+    // thread below still owns its copy.
+    let tick_handle = if let Some(cadence) = config.tick_interval() {
+        let producer = input_producer.clone();
+        let sequencer = Arc::clone(&sequencer);
+        let s_tick = Arc::clone(&shutdown);
+        Some(
+            std::thread::Builder::new()
+                .name("tick".into())
+                .spawn(move || crate::tick::run(producer, sequencer, cadence, &s_tick))
+                .map_err(|e| format!("spawn tick thread: {e}"))?,
+        )
     } else {
         None
     };
@@ -1960,6 +2021,7 @@ pub fn run_dpdk(
             event_publisher: None,
             shadow: shadow_handle,
             health: health_handle,
+            tick: tick_handle,
         },
         dpdk_extras,
         &pipeline_healthy,

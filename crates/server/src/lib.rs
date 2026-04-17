@@ -10,6 +10,7 @@ pub mod request;
 mod response;
 pub mod server;
 pub mod shadow;
+pub mod tick;
 
 #[cfg(feature = "dpdk")]
 pub mod dpdk_response;
