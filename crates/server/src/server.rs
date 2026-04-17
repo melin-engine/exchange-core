@@ -758,30 +758,18 @@ fn run_as_primary<L: BlockingTransportListener>(
         None
     };
 
-    // Spawn the tick generator thread, if enabled. Publishes JournalEvent::Tick
-    // at the configured cadence so the engine's scheduler advances time
-    // independently of client traffic. Clones the input producer and sequencer
-    // so the reader thread below can still take ownership of the originals.
-    let tick_handle = if let Some(cadence) = config.tick_interval() {
-        let producer = input_producer.clone();
-        let sequencer = Arc::clone(&sequencer);
-        let s_tick = Arc::clone(&shutdown);
-        Some(
-            std::thread::Builder::new()
-                .name("tick".into())
-                .spawn(move || crate::tick::run(producer, sequencer, cadence, &s_tick))
-                .map_err(|e| format!("spawn tick thread: {e}"))?,
-        )
-    } else {
-        None
-    };
-
+    // The reader thread also generates the engine's scheduler ticks via
+    // an io_uring `IORING_OP_TIMEOUT` armed at the configured cadence. This
+    // keeps the input ring single-producer (alongside the one-shot seed
+    // loop), eliminating the multi-producer ordering race that would exist
+    // if tick lived on its own thread. See `reader::spawn_reader`.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = crate::reader::spawn_reader(
         input_producer,
         control_tx.clone(),
         config.reader_cores,
         connection_timeout,
+        config.tick_interval(),
         Arc::clone(&reader_shutdown),
         Arc::clone(&sequencer),
     );
@@ -1365,7 +1353,9 @@ fn run_as_primary<L: BlockingTransportListener>(
             event_publisher: event_publisher_handle,
             shadow: shadow_handle,
             health: health_handle,
-            tick: tick_handle,
+            // io_uring path: ticks are emitted from inside the reader thread,
+            // so there is no separate tick handle to join here.
+            tick: None,
         },
         Vec::new(),
         &pipeline_healthy,

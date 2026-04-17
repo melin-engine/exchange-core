@@ -63,6 +63,13 @@ const EVENTFD_TOKEN: u64 = u64::MAX;
 /// re-provisions — we log errors but don't act on success.
 const PROVIDE_BUFS_TOKEN: u64 = u64::MAX - 1;
 
+/// User data sentinel for the tick timeout SQE. The reader arms a single
+/// `IORING_OP_TIMEOUT` per cadence so `submit_and_wait` returns at the tick
+/// deadline even when no client traffic is flowing. The CQE itself carries
+/// no information; the loop body checks `Instant::now()` against the next
+/// deadline and emits the actual `JournalEvent::Tick`.
+const TICK_TIMEOUT_TOKEN: u64 = u64::MAX - 2;
+
 /// CQE flag: buffer ID is valid in upper 16 bits of flags.
 const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 
@@ -144,11 +151,22 @@ impl<R> UringReaderHandle<R> {
 /// matching stage is the throughput limit, so adding more reader threads
 /// would not raise throughput — it would only re-introduce the
 /// multi-producer ordering race in `Sequencer::next`/`MultiProducer::try_publish`.
+///
+/// `tick_cadence: Some(d)` makes the reader the engine's tick generator: it
+/// arms an `IORING_OP_TIMEOUT` so `submit_and_wait` returns at the tick
+/// deadline even when no client traffic is flowing, then publishes a
+/// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
+/// client requests. With this, the input ring is single-producer for
+/// io_uring transports, eliminating the multi-producer ordering race
+/// between the reader and a separate tick thread. Pass `None` to disable
+/// the tick (useful for benchmarks that don't exercise time-driven
+/// features).
 pub fn spawn_reader<R: AsRawFd + Send + 'static>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
     connection_timeout: Option<Duration>,
+    tick_cadence: Option<Duration>,
     shutdown: Arc<AtomicBool>,
     sequencer: Arc<Sequencer>,
 ) -> UringReaderHandle<R> {
@@ -167,7 +185,16 @@ pub fn spawn_reader<R: AsRawFd + Send + 'static>(
                 Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
                 Err(e) => tracing::warn!(thread = "uring-reader", core = core, error = %e, "failed to pin"),
             }
-            reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout, &shutdown_clone, &sequencer);
+            reader_loop(
+                rx,
+                wakeup_fd,
+                producer,
+                &control_tx,
+                connection_timeout,
+                tick_cadence,
+                &shutdown_clone,
+                &sequencer,
+            );
         })
         .expect("failed to spawn uring reader thread");
 
@@ -259,12 +286,16 @@ impl<R> ConnectionSlab<R> {
 // ---------------------------------------------------------------------------
 
 /// Main io_uring reader loop. Runs until channel disconnection.
+///
+/// When `tick_cadence` is `Some`, the loop also generates the engine's
+/// scheduler ticks — see [`spawn_reader`] for the rationale.
 fn reader_loop<R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
     wakeup_fd: RawFd,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
+    tick_cadence: Option<Duration>,
     shutdown: &AtomicBool,
     sequencer: &Sequencer,
 ) {
@@ -318,9 +349,67 @@ fn reader_loop<R: AsRawFd>(
     // heap allocation inside the hot loop.
     let mut stale: Vec<(usize, u64, RawFd)> = Vec::new();
 
+    // Tick generator state. `next_tick_deadline` is the monotonic instant the
+    // next `JournalEvent::Tick` should fire. `last_tick_ns` enforces strict
+    // monotonicity on the wall-clock timestamps published in those events
+    // (NTP can step the wall clock backwards). `tick_armed` tracks whether
+    // an `IORING_OP_TIMEOUT` SQE is currently pending; we keep at most one.
+    let tick_enabled = tick_cadence.is_some();
+    let cadence = tick_cadence.unwrap_or(Duration::ZERO);
+    let mut next_tick_deadline = Instant::now() + cadence;
+    let mut last_tick_ns: u64 = 0;
+    let mut tick_armed = false;
+    if tick_enabled {
+        tracing::info!(
+            cadence_ms = cadence.as_millis() as u64,
+            "tick generator integrated into reader thread"
+        );
+    }
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Tick generator: emit any due tick before sleeping again. Done before
+        // the timeout-arm so that a freshly-emitted tick re-arms a timeout for
+        // the *new* deadline.
+        if tick_enabled {
+            let now = Instant::now();
+            if now >= next_tick_deadline {
+                let raw_now_ns = wall_clock_nanos();
+                let now_ns = clamp_monotonic_tick(raw_now_ns, last_tick_ns);
+                last_tick_ns = now_ns;
+                publish_tick(&producer, sequencer, now_ns);
+                // Catch up rather than burst-emit if we fell badly behind.
+                let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
+                next_tick_deadline = if elapsed > cadence {
+                    Instant::now() + cadence
+                } else {
+                    next_tick_deadline + cadence
+                };
+                // The previous timeout (if any) is now stale; let it fire and
+                // be ignored, then arm a new one below.
+                tick_armed = false;
+            }
+
+            if !tick_armed {
+                let remaining = next_tick_deadline.saturating_duration_since(Instant::now());
+                let ts = types::Timespec::new()
+                    .sec(remaining.as_secs())
+                    .nsec(remaining.subsec_nanos());
+                let sqe = opcode::Timeout::new(&ts)
+                    .build()
+                    .user_data(TICK_TIMEOUT_TOKEN);
+                unsafe {
+                    ring.submission()
+                        .push(&sqe)
+                        .expect("io_uring SQ full while arming tick timeout");
+                }
+                // The Timespec is read by the kernel on submit_and_wait below;
+                // it must outlive that call, which it does (this scope).
+                tick_armed = true;
+            }
         }
 
         // Submit any pending SQEs and block until at least 1 CQE is ready.
@@ -345,6 +434,16 @@ fn reader_loop<R: AsRawFd>(
         let batch_now = Instant::now();
 
         for &(token, result, flags) in &cqes {
+            // ── Tick timeout ──
+            // The CQE is just a wakeup signal — the actual tick emission
+            // happens at the top of the next loop iteration via the
+            // deadline check, so the time the tick is stamped with reflects
+            // wall_clock_nanos at fire time, not at submit time.
+            if token == TICK_TIMEOUT_TOKEN {
+                tick_armed = false;
+                continue;
+            }
+
             // ── ProvideBuffers completion ──
             if token == PROVIDE_BUFS_TOKEN {
                 if result < 0 {
@@ -614,6 +713,49 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
             .push(&sqe)
             .expect("io_uring SQ full — increase RING_SIZE");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tick generation
+// ---------------------------------------------------------------------------
+
+/// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.
+///
+/// `wall_clock_nanos()` (i.e. `SystemTime::now()`) can step backwards under
+/// NTP corrections. Since the engine's scheduler keys due-task firings on
+/// `now_ns >= fire_ns`, a backwards step followed by a forward step could
+/// re-fire tasks that were already drained on replay. Clamping the
+/// per-tick `now_ns` to `max(prev + 1, raw_now_ns)` keeps replay byte-
+/// identical with live behaviour.
+fn clamp_monotonic_tick(raw_now_ns: u64, last_now_ns: u64) -> u64 {
+    if last_now_ns == 0 {
+        // Bump 0 → 1 so a pre-epoch system clock still produces a non-zero
+        // tick (zero is the "no tick yet" sentinel elsewhere in the engine).
+        raw_now_ns.max(1)
+    } else if raw_now_ns > last_now_ns {
+        raw_now_ns
+    } else {
+        last_now_ns + 1
+    }
+}
+
+/// Publish a `JournalEvent::Tick { now_ns }` onto the input ring. Same
+/// publish path as a client request but with a synthetic InputSlot — no
+/// connection, no auth key. If the ring is full the tick is dropped; the
+/// next successful tick still carries the latest wall-clock time, so a
+/// missed tick only delays scheduler firings by one cadence at worst.
+fn publish_tick(producer: &ring::MultiProducer<InputSlot>, sequencer: &Sequencer, now_ns: u64) {
+    let seq = sequencer.next();
+    let _ = producer.try_publish(InputSlot {
+        connection_id: 0,
+        key_hash: 0,
+        request_seq: 0,
+        sequence: seq,
+        timestamp_ns: now_ns,
+        event: JournalEvent::Tick { now_ns },
+        publish_ts: trace_ts(),
+        recv_ts: trace_ts(),
+    });
 }
 
 // ---------------------------------------------------------------------------

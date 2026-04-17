@@ -7,13 +7,12 @@ This document describes the LMAX-style disruptor pipeline that forms the core of
 The server uses a 3-stage pipeline plus a single reader thread, modeled after the LMAX Disruptor architecture:
 
 ```
-  Reader     -----+
-  (1 io_uring     |    +-------------------+
-   thread)        +--->| Input Disruptor   |--+--> Journal Stage
-                  |    | (1M-slot ring,    |  |
-  Tick Generator -+--->|  lock-free CAS)   |  +--> Matching Stage
-  (1 thread,      |    +-------------------+  |         |
-   wall clock)    |                           |         | Output Disruptor
+  Reader     -----+    +-------------------+
+  (1 io_uring     +--->| Input Disruptor   |--+--> Journal Stage
+   thread, also   |    | (1M-slot ring)    |  |
+   emits Ticks    |    +-------------------+  +--> Matching Stage
+   via io_uring   |                           |         |
+   timeout)       |                           |         | Output Disruptor
                   |                           |         | (multi-consumer)
   Seeding --------+                           |         v
   (startup only)                              |  +--> Response Stage --> Clients
@@ -24,8 +23,8 @@ The server uses a 3-stage pipeline plus a single reader thread, modeled after th
                                                      (optional, gated on journal)
 ```
 
-1. **Reader** -- a single io_uring thread multiplexes every TCP client connection via multishot RECV and publishes decoded requests into the input disruptor. The matching stage is the throughput limit, so adding reader threads would only re-introduce the multi-producer ordering race on the input ring without raising throughput.
-2. **Tick generator** -- dedicated thread that publishes `JournalEvent::Tick { now_ns }` at a fixed cadence (**default 250 ms**). The matching stage advances its scheduler clock from `slot.timestamp_ns` on every event, so under load each order/cancel implicitly fires due tasks at microsecond precision. Tick is the safety net that keeps time moving forward during quiet periods (no client traffic) — it is no longer the only thing that drives the scheduler.
+1. **Reader** -- a single io_uring thread multiplexes every TCP client connection via multishot RECV and publishes decoded requests into the input disruptor. The same thread arms an `IORING_OP_TIMEOUT` at the configured tick cadence (**default 250 ms**) and publishes a `JournalEvent::Tick { now_ns }` whenever that deadline passes. With this, the input ring is single-producer for io_uring transports — no multi-producer ordering race between the reader and a separate tick thread.
+2. **Tick semantics** -- the matching stage advances its scheduler clock from `slot.timestamp_ns` on every event, so under load each order/cancel implicitly fires due tasks at microsecond precision. The 250 ms tick is the safety net that keeps time moving forward during quiet periods (no client traffic). DPDK transports still use a separate tick thread (see `crates/server/src/tick.rs`) because there is no io_uring loop to embed it into.
 3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwritev2` + `RWF_DSYNC` (FUA). Advances its cursor only after the durable write completes.
 4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
@@ -43,19 +42,21 @@ The simplified diagram above shows the primary-side request path. The picture be
 |                           PRIMARY                              |
 +===============================================================+
 
- CLIENT TCP        WALL CLOCK        SEED LOOP
- (N conns)                           (startup only)
-      |                 |                |
-      v                 v                v
- +----------+      +----------+     +----------+
- | READER   |      |   TICK   |     |   SEED   |
- | POOL     |      |   GEN    |     | (one-    |
- | (R thr.) |      | (1 thr.) |     |   shot)  |
- +----+-----+      +----+-----+     +----+-----+
-      |                 |                |
-      | client requests |  Tick{now_ns}  |  AddInstrument /
-      |                 |  cadence 10ms  |  ProvisionAccount
-      v                 v                v
+ CLIENT TCP   +   WALL CLOCK            SEED LOOP
+ (N conns)    |   (io_uring timeout)    (startup only)
+      |       |        ^                     |
+      v       |        | TIMEOUT_TOKEN       |
+ +----------------+    | CQE                 |
+ |    READER      |----+                     |
+ | (1 io_uring    |  arms tick timeout       |
+ |  thread; also  |  per cadence; emits      |
+ |  publishes     |  Tick{now_ns} when       |
+ |  Ticks)        |  the deadline passes     |
+ +-------+--------+                          |
+         |                                   |
+         | client requests + Tick{now_ns}    |  AddInstrument /
+         |                                   |  ProvisionAccount
+         v                                   v
  +---------------------------------------------+
  |  INPUT RING -- disruptor, 1M InputSlot      |
  +---+-------------+----------------+----------+
@@ -147,8 +148,8 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 | Thread / stage              | Ingress                                 | Egress                                                |
 |----------------------------|-----------------------------------------|-------------------------------------------------------|
-| Reader (primary)           | Client TCP sockets (io_uring / DPDK)    | `InputSlot` into input ring                           |
-| Tick generator (primary)   | Wall clock (monotonic-clamped)          | `JournalEvent::Tick` into input ring                  |
+| Reader (primary, io_uring) | Client TCP sockets + io_uring TIMEOUT (wall-clock-cadenced, monotonic-clamped) | Client requests AND `JournalEvent::Tick` into the same input ring |
+| Tick generator (primary, DPDK only) | Wall clock (monotonic-clamped)  | `JournalEvent::Tick` into input ring (DPDK has no io_uring loop to embed it into) |
 | Seed loop (primary, boot)  | Config (`--accounts`, `--instruments`)  | `AddInstrument` / `ProvisionAccount` into input ring  |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
 | Matching stage             | Input ring                              | Execution reports into output ring                    |
@@ -177,7 +178,7 @@ The matching stage maintains a per-instance `last_drain_ns` watermark. At the he
 Two latent issues live in the producer-side sequence allocation and are worth documenting pending a rework:
 
 1. **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer (reader, seeding, tick).
-2. **Sequence / ring-slot ordering race under multi-producer contention.** `sequencer.next()` and the disruptor's slot-claim CAS are independent atomics. Two producers (today: the reader thread and the tick thread) can interleave such that producer A claims sequence `N`, producer B claims sequence `N+1`, B acquires ring slot `k`, A acquires ring slot `k+1`. The journal stage then writes the entries in ring-cursor order (i.e. with sequences `N+1, N, …`), producing a non-monotonic journal that also aborts recovery. With only the reader and tick as producers (~one tick every 250 ms vs. millions of orders) this is extraordinarily rare, but it remains theoretically possible.
+2. **Sequence / ring-slot ordering race under multi-producer contention.** `sequencer.next()` and the disruptor's slot-claim CAS are independent atomics. Two concurrent producers can interleave such that producer A claims sequence `N`, producer B claims sequence `N+1`, B acquires ring slot `k`, A acquires ring slot `k+1`. The journal stage then writes the entries in ring-cursor order (i.e. with sequences `N+1, N, …`), producing a non-monotonic journal that also aborts recovery. With io_uring transports the reader thread is the sole hot-path producer (it now emits ticks too — see "Reader" above), so this race is *eliminated* in steady state. The seed loop publishes once at startup before clients connect; theoretically it could race with the very first ticks, but the seed loop uses blocking `publish` on a quiet ring. With DPDK transports the tick thread is still separate, so the race remains as before.
 
 The architecturally clean fix is to move sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
 
@@ -350,7 +351,7 @@ The server spawns 3-6 dedicated OS threads for the pipeline plus one reader thre
 | Journal | 1 | Durable write-ahead log | No |
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
-| Reader | 4 | io_uring-based connection multiplexing | No |
+| Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
 | Repl Sender | 6 | Stream journal batches to replicas | Yes (`--replication-bind`) |
 | Event Publisher | 7 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
 | Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-secs`) |
