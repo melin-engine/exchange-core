@@ -516,7 +516,12 @@ impl JournalStage {
                         ) {
                             continue;
                         }
-                        if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
+                        if let JournalEvent::Checkpoint {
+                            #[cfg(feature = "hash-chain")]
+                            chain_hash,
+                            ..
+                        } = &slot.event
+                        {
                             #[cfg(feature = "hash-chain")]
                             if slot.sequence != 0 {
                                 self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
@@ -722,7 +727,12 @@ impl JournalStage {
                     ) {
                         continue;
                     }
-                    if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
+                    if let JournalEvent::Checkpoint {
+                        #[cfg(feature = "hash-chain")]
+                        chain_hash,
+                        ..
+                    } = &slot.event
+                    {
                         #[cfg(feature = "hash-chain")]
                         if slot.sequence != 0
                             && let Err(e) =
@@ -911,7 +921,12 @@ impl JournalStage {
                     ) {
                         continue;
                     }
-                    if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
+                    if let JournalEvent::Checkpoint {
+                        #[cfg(feature = "hash-chain")]
+                        chain_hash,
+                        ..
+                    } = &slot.event
+                    {
                         #[cfg(feature = "hash-chain")]
                         if slot.sequence != 0 {
                             self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
