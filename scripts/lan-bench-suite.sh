@@ -53,6 +53,9 @@
 #   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
 #   BENCH_COMMIT=<hash> Checkout a specific commit (mutually exclusive with BENCH_BRANCH)
 #   CLEAN_BUILD=1       Run cargo clean before building (forces full recompile)
+#   RUSTFLAGS=<flags>   Forwarded to every remote `cargo build` via ssh.
+#                       Useful to enable debug assertions in release
+#                       builds: RUSTFLAGS="-C debug-assertions=y"
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -300,6 +303,7 @@ fi
 for HOST in "${BUILD_HOSTS[@]}"; do
     echo "  Building on ${HOST}..."
     ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
+        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         ${CLEAN_CMD} cargo build --release ${EXTRA_BUILD}" 2>&1 | tail -3
 done
 
@@ -310,6 +314,7 @@ done
 if [[ -n "${SERVER_FEATURES:-}" ]]; then
     echo "  Rebuilding melin-server on primary with --features ${SERVER_FEATURES}..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         cargo build --release -p melin-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
 fi
 
@@ -324,14 +329,17 @@ if [[ "$NEED_DPDK" == "1" ]]; then
     else
         echo "  Building DPDK server..."
         ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
             cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
         echo "  Building DPDK bench..."
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
             cargo build --release -p melin-bench --features dpdk" 2>&1 | tail -3
         for item in "${MATRIX[@]}"; do
             if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
                 echo "  Building DPDK server on replica..."
                 ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                    export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
                     cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
                 break
             fi
@@ -964,6 +972,7 @@ workload_no_persist() {
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
         cp target/release/melin-server target/release/melin-server.persist && \
         source ~/.cargo/env && \
+        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         cargo build --release --features no-persist 2>&1 | tail -1 && \
         cp target/release/melin-server target/release/melin-server.nopersist && \
         cp target/release/melin-server.nopersist target/release/melin-server"

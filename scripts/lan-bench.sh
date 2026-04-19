@@ -25,6 +25,14 @@
 # Server always gets: --bind, --journal, --authorized-keys.
 # Bench always gets: --addr, --key, --json.
 #
+# Environment variables:
+#   CARGO_BUILD_FLAGS=<flags>   Passed to `cargo build` on both hosts
+#                               (default: --release).
+#   RUSTFLAGS=<flags>           Forwarded to every remote `cargo build`
+#                               via ssh. For example, enable debug
+#                               assertions in release builds with
+#                               RUSTFLAGS="-C debug-assertions=y".
+#
 # Prerequisites:
 #   - SSH access to both machines (as root by default, or as [user])
 #   - Both machines have been set up via cherry-deploy.sh (or cherry-setup.sh)
@@ -117,7 +125,7 @@ build_remote() {
     elif [[ -n "${BENCH_COMMIT:-}" ]]; then
         git_cmd="git fetch origin && git checkout ${BENCH_COMMIT}"
     fi
-    ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && ${git_cmd} && source ~/.cargo/env && cargo build ${CARGO_BUILD_FLAGS}" 2>&1 | tail -3
+    ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && ${git_cmd} && source ~/.cargo/env && RUSTFLAGS=\"${RUSTFLAGS:-}\" cargo build ${CARGO_BUILD_FLAGS}" 2>&1 | tail -3
     echo "  ${label} build: OK"
     echo ""
 }
