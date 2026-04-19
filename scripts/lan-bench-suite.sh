@@ -557,7 +557,7 @@ transport_start_tcp_repl() {
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
@@ -606,7 +606,7 @@ transport_start_tcp_dual_repl() {
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
@@ -616,7 +616,7 @@ transport_start_tcp_dual_repl() {
             --journal ${replica2_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
@@ -880,7 +880,7 @@ transport_start_dpdk_repl() {
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
 
