@@ -7,7 +7,7 @@
 #   1. Cargo.lock is staged when modified (prevents dep drift)
 #   2. cargo fmt (formatting)
 #   3. cargo clippy on all targets with warnings as errors
-#   4. cargo test
+#   4. cargo nextest run, falling back to cargo test if nextest is missing
 
 set -e
 
@@ -29,8 +29,14 @@ if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
     exit 1
 fi
 
-# 4. Tests.
-if ! cargo test 2>/dev/null; then
-    echo "error: tests failed. Fix them and try again."
+# 4. Tests. Uses cargo-nextest (~2x faster than cargo test); falls back to
+# cargo test if nextest is not installed.
+if command -v cargo-nextest >/dev/null 2>&1; then
+    if ! cargo nextest run 2>/dev/null; then
+        echo "error: tests failed. Fix them and try again."
+        exit 1
+    fi
+elif ! cargo test 2>/dev/null; then
+    echo "error: tests failed. Fix them and try again. (Install cargo-nextest for ~2x faster runs.)"
     exit 1
 fi

@@ -31,12 +31,9 @@ use melin_protocol::types::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Find the melin-server binary. Resolved at compile time via `env!` so the
-/// path is baked into the test binary — this works under any runner (cargo
-/// test, cargo nextest, or direct invocation), not just cargo test which
-/// happens to also set this variable at runtime. Using `std::env::var` here
-/// would silently fall back to a stale release binary whose protocol may not
-/// match the current test, producing `Protocol(Truncated)` failures.
+/// Path to the `melin-server` binary, resolved at compile time. `env!` works
+/// under any runner; `std::env::var` only works under `cargo test`, where it
+/// would otherwise silently pick up a stale release binary.
 fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_melin-server"))
 }
