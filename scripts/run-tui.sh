@@ -76,4 +76,5 @@ cargo run -p melin-tui-fix-client -- \
     --md-addr localhost:9001 \
     --sender TRADER \
     --oe-target MELIN-OE \
-    --md-target MELIN-MD
+    --md-target MELIN-MD \
+    --bot

@@ -16,23 +16,40 @@ DATA_DIR="${DATA_DIR:-/data}"
 mkdir -p "$DATA_DIR"
 cd "$DATA_DIR"
 
-# --- Generate Ed25519 key pair if not present ---
+# --- Generate Ed25519 key pairs if not present ---
+# Two keys: one for the human trader (TRADER session, account 1) and one
+# for the optional order-flow bot (BOT session, accounts ≥2). Distinct
+# keys are required so the bot's per-key request-seq namespace on the
+# engine doesn't collide with the human's.
 
 if [ ! -f "$DATA_DIR/trader.key" ]; then
-    echo "Generating Ed25519 key pair..."
+    echo "Generating trader Ed25519 key..."
     melin-keygen trader operator
-    # keygen also writes trader.pub with base64 pubkey
-    PUBKEY=$(cat trader.pub | tr -d '\n')
-    echo "trader $PUBKEY trader" > authorized_keys
-    # Also write a .pub.b64 for the md-gateway core (not yet signing)
-    echo "$PUBKEY" > trader.pub.b64
-    echo "  trader.key + authorized_keys created"
+    echo "  trader.key created"
 fi
 
-# --- Write oe-gateway config if not present ---
+if [ ! -f "$DATA_DIR/bot.key" ]; then
+    echo "Generating bot Ed25519 key..."
+    melin-keygen bot operator
+    echo "  bot.key created"
+fi
 
-if [ ! -f "$DATA_DIR/oe-gateway.toml" ]; then
-    cat > "$DATA_DIR/oe-gateway.toml" <<TOML
+# Always rewrite authorized_keys so both keys are trusted even if one was
+# already on disk from a previous image version.
+TRADER_PUB=$(tr -d '\n' < trader.pub)
+BOT_PUB=$(tr -d '\n' < bot.pub)
+cat > authorized_keys <<EOF
+trader $TRADER_PUB trader
+trader $BOT_PUB bot
+EOF
+echo "$TRADER_PUB" > trader.pub.b64
+echo "  authorized_keys updated (trader + bot)"
+
+# --- Write oe-gateway config (always overwritten) ---
+# Regenerated every start so schema/session changes from the image apply
+# without the user having to wipe $DATA_DIR.
+
+cat > "$DATA_DIR/oe-gateway.toml" <<TOML
 server_addr = "127.0.0.1:9876"
 listen_addr = "0.0.0.0:9000"
 target_comp_id = "MELIN-OE"
@@ -41,6 +58,11 @@ target_comp_id = "MELIN-OE"
 sender_comp_id = "TRADER"
 account_id = 1
 key_path = "$DATA_DIR/trader.key"
+
+[[session]]
+sender_comp_id = "BOT"
+account_id = 2
+key_path = "$DATA_DIR/bot.key"
 
 [[symbol]]
 fix_symbol = "BTC/USD"
@@ -54,8 +76,7 @@ melin_symbol = 1
 tick_size_inverse = 100
 lot_size_inverse = 1
 TOML
-    echo "  oe-gateway.toml created"
-fi
+echo "  oe-gateway.toml written (TRADER + BOT sessions)"
 
 # --- Write md-gateway config if not present ---
 
