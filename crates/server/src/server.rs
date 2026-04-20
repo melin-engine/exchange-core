@@ -1161,6 +1161,27 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Spawn health/liveness endpoint before the accept loop so it's
     // reachable as soon as the server is ready to accept connections.
     let health_handle = if let Some(health_addr) = config.health_bind {
+        // Clone the replication ring cursors so the health snapshot can
+        // report per-slot ring depth (producer_cursor - consumer.processed).
+        // Both cursor types are `Arc`-backed, so cloning is cheap.
+        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                (
+                    Some([
+                        Arc::clone(&rp.producer_cursors[0]),
+                        Arc::clone(&rp.producer_cursors[1]),
+                    ]),
+                    Some([
+                        Arc::clone(&rp.consumer_cursors[0]),
+                        Arc::clone(&rp.consumer_cursors[1]),
+                    ]),
+                )
+            })
+            .unwrap_or((None, None));
+        let fastest_repl_cursor_health = replication_metrics
+            .as_ref()
+            .map(|_| Arc::clone(&fastest_replica_cursor));
         Some(crate::health::spawn(
             health_addr,
             crate::health::HealthState {
@@ -1173,6 +1194,9 @@ fn run_as_primary<L: BlockingTransportListener>(
                 pipeline_healthy: Arc::clone(&pipeline_healthy),
                 replicas_connected: replicas_connected.clone(),
                 replication_metrics: replication_metrics.clone(),
+                replication_ring_producer_cursors: repl_ring_producers,
+                replication_ring_consumer_cursors: repl_ring_consumers,
+                fastest_replica_cursor: fastest_repl_cursor_health,
                 journal_utilization: Arc::clone(&journal_utilization),
                 matching_utilization: Arc::clone(&matching_utilization),
                 response_utilization: Arc::clone(&response_utilization),
@@ -1905,6 +1929,24 @@ pub fn run_dpdk(
 
     // Spawn health/liveness endpoint (same as TCP path).
     let health_handle = if let Some(health_addr) = config.health_bind {
+        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                (
+                    Some([
+                        Arc::clone(&rp.producer_cursors[0]),
+                        Arc::clone(&rp.producer_cursors[1]),
+                    ]),
+                    Some([
+                        Arc::clone(&rp.consumer_cursors[0]),
+                        Arc::clone(&rp.consumer_cursors[1]),
+                    ]),
+                )
+            })
+            .unwrap_or((None, None));
+        let fastest_repl_cursor_health = replication_metrics
+            .as_ref()
+            .map(|_| Arc::clone(&fastest_replica_cursor));
         Some(crate::health::spawn(
             health_addr,
             crate::health::HealthState {
@@ -1917,6 +1959,9 @@ pub fn run_dpdk(
                 pipeline_healthy: Arc::clone(&pipeline_healthy),
                 replicas_connected: replicas_connected.clone(),
                 replication_metrics: replication_metrics.clone(),
+                replication_ring_producer_cursors: repl_ring_producers,
+                replication_ring_consumer_cursors: repl_ring_consumers,
+                fastest_replica_cursor: fastest_repl_cursor_health,
                 journal_utilization: Arc::clone(&journal_utilization),
                 matching_utilization: Arc::clone(&matching_utilization),
                 response_utilization: Arc::clone(&response_utilization),

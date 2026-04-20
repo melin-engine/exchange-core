@@ -1660,8 +1660,11 @@ pub struct ReplicaPipeline {
 /// waiting for replica TCP acks (no network round-trip). Deadlock-free
 /// because the ring backpressures (spins) instead of dropping batches.
 pub struct ReplicationRingProgress {
-    /// Producer cursors (one per independent ring).
-    pub producer_cursors: Vec<Box<dyn ring::QueueCursor>>,
+    /// Producer cursors (one per independent ring). `Arc<dyn QueueCursor>`
+    /// so multiple readers (seed-drain gate, health snapshot) can share the
+    /// same handle; `cursor_reader` only clones the inner `Arc<Shared>` so
+    /// sharing has no hot-path cost.
+    pub producer_cursors: Vec<Arc<dyn ring::QueueCursor>>,
     /// Consumer progress counters (one per independent ring, paired
     /// with the corresponding producer cursor by index).
     pub consumer_cursors: Vec<Arc<Sequence>>,
@@ -1771,7 +1774,10 @@ pub fn build_pipeline_with_replication(
         ];
 
         let ring_progress = ReplicationRingProgress {
-            producer_cursors: vec![producer_0.cursor_reader(), producer_1.cursor_reader()],
+            producer_cursors: vec![
+                Arc::from(producer_0.cursor_reader()),
+                Arc::from(producer_1.cursor_reader()),
+            ],
             consumer_cursors: vec![
                 consumers_0[0].progress_counter(),
                 consumers_1[0].progress_counter(),

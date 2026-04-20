@@ -1029,6 +1029,33 @@ fn cmd_health(args: &[String]) {
         "Bytes",
     );
 
+    // Per-slot replication ring depth — direct view of stranded batches
+    // between the journal publisher and the sender thread. Spikes here
+    // mark backpressure episodes that lead to eviction.
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replication-ring-depth.svg")),
+        &[
+            "melin_replication_ring_depth_slot_0",
+            "melin_replication_ring_depth_slot_1",
+        ],
+        &["slot 0", "slot 1"],
+        "Replication Ring Depth Over Time",
+        "Depth (batches)",
+    );
+
+    // Fastest-replica cursor — the `max(slot_acked)` value used by the
+    // response stage's gating. Useful to see divergence from the slow
+    // replica's `slot_acked` during eviction / reconnect episodes.
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-fastest-replica-cursor.svg")),
+        &["melin_fastest_replica_cursor"],
+        &["fastest"],
+        "Fastest-Replica Cursor Over Time",
+        "Sequence",
+    );
+
     // Response gate bottleneck: journal vs replication gate-wait events.
     plot_health_extra_metric(
         &all_results,
@@ -1690,6 +1717,25 @@ fn cmd_all(args: &[String]) {
                 &PathBuf::from(format!("{stem}-replication-lag.svg")),
             );
         }
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-replication-ring-depth.svg")),
+            &[
+                "melin_replication_ring_depth_slot_0",
+                "melin_replication_ring_depth_slot_1",
+            ],
+            &["slot 0", "slot 1"],
+            "Replication Ring Depth Over Time",
+            "Depth (batches)",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-fastest-replica-cursor.svg")),
+            &["melin_fastest_replica_cursor"],
+            &["fastest"],
+            "Fastest-Replica Cursor Over Time",
+            "Sequence",
+        );
         plot_health_utilization(
             &health_results,
             &PathBuf::from(format!("{stem}-utilization.svg")),

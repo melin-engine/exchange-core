@@ -49,6 +49,16 @@ pub struct HealthState {
     pub replicas_connected: Option<Arc<AtomicU32>>,
     /// Per-replica replication metrics. None in standalone mode.
     pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    /// Per-slot replication-ring producer cursors. Paired index-wise with
+    /// `replication_ring_consumer_cursors` to compute per-slot ring depth
+    /// (producer - consumer). `None` in standalone mode.
+    pub replication_ring_producer_cursors: Option<[Arc<dyn QueueCursor>; 2]>,
+    /// Per-slot replication-ring consumer progress counters. See above.
+    pub replication_ring_consumer_cursors: Option<[Arc<Sequence>; 2]>,
+    /// The "fastest replica" cursor — `max(slot_acked[0], slot_acked[1])`,
+    /// maintained by the replication sender. Stored as `u64::MAX` when no
+    /// replica has engaged yet. `None` in standalone mode.
+    pub fastest_replica_cursor: Option<Arc<AtomicU64>>,
     /// Per-stage busy/idle utilization counters.
     pub journal_utilization: Arc<StageUtilization>,
     pub matching_utilization: Arc<StageUtilization>,
@@ -107,6 +117,12 @@ struct HealthSnapshot {
     per_replica_catching_up: [bool; 2],
     /// Per-replica last acked sequence number.
     per_replica_acked_sequence: [u64; 2],
+    /// Per-slot replication-ring depth: producer_cursor - consumer.processed.
+    /// 0 in standalone mode or when ring cursors aren't available.
+    per_replica_ring_depth: [u64; 2],
+    /// Fastest-replica cursor (max of slot_acked values). 0 when no replica
+    /// has engaged — the sentinel `u64::MAX` is mapped to 0 for plotting.
+    fastest_replica_cursor: u64,
     /// Total replica eviction count.
     evictions_total: u64,
     /// Per-stage busy/idle iteration counters for utilization monitoring.
@@ -202,6 +218,35 @@ impl HealthSnapshot {
             ([0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
         };
 
+        // Per-slot replication ring depth: producer_cursor - consumer.processed.
+        // Zero when cursors aren't wired (standalone mode). `saturating_sub`
+        // tolerates the benign race where the consumer side is read a hair
+        // after the producer — never produces underflow.
+        let per_replica_ring_depth = match (
+            state.replication_ring_producer_cursors.as_ref(),
+            state.replication_ring_consumer_cursors.as_ref(),
+        ) {
+            (Some(prods), Some(cons)) => [
+                prods[0]
+                    .load()
+                    .saturating_sub(cons[0].get().load(Ordering::Relaxed)),
+                prods[1]
+                    .load()
+                    .saturating_sub(cons[1].get().load(Ordering::Relaxed)),
+            ],
+            _ => [0, 0],
+        };
+
+        // Fastest-replica cursor. Mapped from the `u64::MAX` sentinel
+        // (no replica engaged yet / all disconnected) to 0 so the
+        // plotted series stays on-scale.
+        let fastest_replica_cursor = state
+            .fastest_replica_cursor
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed))
+            .map(|v| if v == u64::MAX { 0 } else { v })
+            .unwrap_or(0);
+
         Self {
             healthy,
             active_connections: conns,
@@ -216,6 +261,8 @@ impl HealthSnapshot {
             per_replica_ack_latency_us,
             per_replica_catching_up,
             per_replica_acked_sequence,
+            per_replica_ring_depth,
+            fastest_replica_cursor,
             evictions_total,
             journal_busy: state.journal_utilization.busy.load(Ordering::Relaxed),
             journal_idle: state.journal_utilization.idle.load(Ordering::Relaxed),
@@ -314,6 +361,13 @@ impl HealthSnapshot {
              # HELP melin_replica_evictions_total Total replica evictions due to ring backpressure.\n\
              # TYPE melin_replica_evictions_total counter\n\
              melin_replica_evictions_total {}\n\
+             # HELP melin_replication_ring_depth Per-slot replication-ring depth (producer_cursor - consumer.processed).\n\
+             # TYPE melin_replication_ring_depth gauge\n\
+             melin_replication_ring_depth{{slot=\"0\"}} {}\n\
+             melin_replication_ring_depth{{slot=\"1\"}} {}\n\
+             # HELP melin_fastest_replica_cursor Highest acked sequence across replica slots (0 when none engaged).\n\
+             # TYPE melin_fastest_replica_cursor gauge\n\
+             melin_fastest_replica_cursor {}\n\
              # HELP melin_stage_busy_total Cumulative busy iterations per pipeline stage (journal/response: batches, matching: events).\n\
              # TYPE melin_stage_busy_total counter\n\
              melin_stage_busy_total{{stage=\"journal\"}} {}\n\
@@ -348,6 +402,9 @@ impl HealthSnapshot {
             catching_0,
             catching_1,
             self.evictions_total,
+            self.per_replica_ring_depth[0],
+            self.per_replica_ring_depth[1],
+            self.fastest_replica_cursor,
             self.journal_busy,
             self.matching_busy,
             self.response_busy,
@@ -476,8 +533,9 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
     let kind = detect_request(&mut stream);
 
     // Stack buffers — sized for worst case (all u64::MAX values).
-    // Body: Prometheus body is ~3 KiB with max-length u64 values
-    // (includes per-replica replication metrics).
+    // Body: Prometheus body is ~3.5 KiB with max-length u64 values
+    // (includes per-replica replication metrics, ring depth, and the
+    // fastest-replica cursor).
     // Response: body + HTTP headers (~200 bytes).
     let mut body_buf = [0u8; 5120];
     let mut resp_buf = [0u8; 5376];
@@ -575,6 +633,9 @@ mod tests {
             pipeline_healthy: Arc::clone(&healthy),
             replicas_connected,
             replication_metrics: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -701,6 +762,9 @@ mod tests {
                 pipeline_healthy: Arc::clone(&healthy),
                 replicas_connected: None,
                 replication_metrics: None,
+                replication_ring_producer_cursors: None,
+                replication_ring_consumer_cursors: None,
+                fastest_replica_cursor: None,
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
@@ -733,6 +797,9 @@ mod tests {
                 pipeline_healthy: Arc::new(AtomicBool::new(true)),
                 replicas_connected: None,
                 replication_metrics: None,
+                replication_ring_producer_cursors: None,
+                replication_ring_consumer_cursors: None,
+                fastest_replica_cursor: None,
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
@@ -909,6 +976,9 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
@@ -962,6 +1032,9 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
             journal_utilization: journal_util,
             matching_utilization: matching_util,
             response_utilization: response_util,
@@ -987,6 +1060,106 @@ mod tests {
         assert!(
             response.contains("melin_stage_busy_total{stage=\"response\"} 0\n"),
             "response busy not found in: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn replication_ring_depth_and_fastest_cursor_in_metrics() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        // Slot 0: producer at 5000, consumer at 4950 → depth 50 (backpressured).
+        // Slot 1: producer = consumer at 5000 → depth 0 (caught up).
+        let prod_0: Arc<dyn QueueCursor> = Arc::new(MockCursor(AtomicU64::new(5000)));
+        let prod_1: Arc<dyn QueueCursor> = Arc::new(MockCursor(AtomicU64::new(5000)));
+        let cons_0 = Arc::new(Sequence::new(AtomicU64::new(4950)));
+        let cons_1 = Arc::new(Sequence::new(AtomicU64::new(5000)));
+        let fastest = Arc::new(AtomicU64::new(4990));
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(5000))),
+            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(5000))),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(5000))),
+            replication_cursor: Arc::new(AtomicU64::new(4990)),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: None,
+            replication_metrics: None,
+            replication_ring_producer_cursors: Some([prod_0, prod_1]),
+            replication_ring_consumer_cursors: Some([cons_0, cons_1]),
+            fastest_replica_cursor: Some(fastest),
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_replication_ring_depth{slot=\"0\"} 50\n"),
+            "slot 0 depth not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_replication_ring_depth{slot=\"1\"} 0\n"),
+            "slot 1 depth not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_fastest_replica_cursor 4990\n"),
+            "fastest cursor not found in: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fastest_replica_cursor_sentinel_mapped_to_zero() {
+        // u64::MAX is the "no replica engaged" sentinel — it must render as 0
+        // so it doesn't dominate the plotted y-axis or skew aggregates.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: None,
+            replication_metrics: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: Some(Arc::new(AtomicU64::new(u64::MAX))),
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_fastest_replica_cursor 0\n"),
+            "expected sentinel mapped to 0, got: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);
