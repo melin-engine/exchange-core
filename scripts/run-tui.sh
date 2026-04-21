@@ -2,10 +2,12 @@
 # Start the melin Docker container, run the TUI, then stop the container on exit.
 #
 # Usage:
-#   ./scripts/run-tui.sh [--rebuild]
+#   ./scripts/run-tui.sh [--rebuild] [--no-bot]
 #
 # Options:
 #   --rebuild   Rebuild the Docker image before starting (implies --ssh default)
+#   --no-bot    Run the TUI without the synthetic order-flow bot.
+#               Default is to pass --bot so the book has visible flow.
 
 set -euo pipefail
 
@@ -18,9 +20,16 @@ TUI_LOG="$REPO_DIR/tui.log"
 
 # Parse args
 REBUILD=0
+BOT=1
 for arg in "$@"; do
     case "$arg" in
         --rebuild) REBUILD=1 ;;
+        --no-bot) BOT=0 ;;
+        *)
+            echo "error: unknown arg: $arg" >&2
+            echo "usage: $0 [--rebuild] [--no-bot]" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -71,10 +80,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cargo run -p melin-tui-fix-client -- \
-    --oe-addr localhost:9000 \
-    --md-addr localhost:9001 \
-    --sender TRADER \
-    --oe-target MELIN-OE \
-    --md-target MELIN-MD \
-    --bot
+TUI_ARGS=(
+    --oe-addr localhost:9000
+    --md-addr localhost:9001
+    --sender TRADER
+    --oe-target MELIN-OE
+    --md-target MELIN-MD
+)
+if [ "$BOT" -eq 1 ]; then
+    TUI_ARGS+=(--bot)
+fi
+
+cargo run -p melin-tui-fix-client -- "${TUI_ARGS[@]}"
