@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod account;
+pub mod application_impl;
 pub mod exchange;
 pub mod journal;
 pub mod le;
 pub mod orderbook;
 pub mod scheduler;
+pub mod trading_event;
 pub mod types;
 
 #[cfg(test)]

@@ -1506,6 +1506,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-app"
+version = "0.1.0"
+
+[[package]]
 name = "melin-bench"
 version = "0.3.0"
 dependencies = [
@@ -1568,6 +1572,7 @@ dependencies = [
  "hdrhistogram",
  "io-uring",
  "libc",
+ "melin-app",
  "melin-disruptor",
  "proptest",
  "rustc-hash",
