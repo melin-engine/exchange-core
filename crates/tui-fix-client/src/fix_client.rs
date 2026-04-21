@@ -20,6 +20,11 @@ pub struct FixClient {
     outbound_seq: u64,
     /// Accumulates partial reads until a complete FIX message arrives.
     parse_buf: Vec<u8>,
+    /// Backing buffer for the most recently returned message. Owned by
+    /// the client and re-used across `recv`/`try_recv` calls so that the
+    /// returned `FixMessage<'_>` can borrow without leaking. Reusing the
+    /// allocation also avoids a per-message malloc on the bot's hot path.
+    recv_buf: Vec<u8>,
 }
 
 impl FixClient {
@@ -48,6 +53,7 @@ impl FixClient {
             target_comp_id: target_comp_id.to_string(),
             outbound_seq: 1,
             parse_buf: Vec::with_capacity(4096),
+            recv_buf: Vec::with_capacity(512),
         };
 
         // Send Logon.
@@ -85,22 +91,17 @@ impl FixClient {
     /// Read one complete FIX message from the connection.
     ///
     /// Blocks until a complete message is available or the read times out.
-    pub fn recv(&mut self) -> Result<FixMessage<'static>, Box<dyn std::error::Error>> {
+    /// The returned `FixMessage` borrows from an internal buffer owned by
+    /// the client; it is invalidated by the next call to `recv`/`try_recv`.
+    pub fn recv(&mut self) -> Result<FixMessage<'_>, Box<dyn std::error::Error>> {
         let mut tmp = [0u8; 4096];
         loop {
-            // Try to extract a complete message from the buffer.
             if let Some(raw) = parse::try_extract_message(&mut self.parse_buf) {
-                // Leak the raw bytes so FixMessage can borrow with 'static lifetime.
-                // FixMessage<'a> borrows from the input slice — there's no owned variant.
-                // ~200 bytes per message; a long-lived TUI should periodically
-                // reconnect to bound the leak. Fixing this properly requires an
-                // owned FixMessage type in gateway-core.
-                let leaked: &'static [u8] = Box::leak(raw.into_boxed_slice());
-                let msg = FixMessage::parse(leaked)?;
+                self.recv_buf = raw;
+                let msg = FixMessage::parse(&self.recv_buf)?;
                 return Ok(msg);
             }
 
-            // Read more data.
             let n = self.stream.read(&mut tmp)?;
             if n == 0 {
                 return Err("connection closed".into());
@@ -119,8 +120,10 @@ impl FixClient {
     /// Try to read a FIX message without blocking.
     ///
     /// Requires a short read timeout to have been set via `set_read_timeout`.
-    /// Returns `Ok(None)` if no complete message is available yet.
-    pub fn try_recv(&mut self) -> Result<Option<FixMessage<'static>>, Box<dyn std::error::Error>> {
+    /// Returns `Ok(None)` if no complete message is available yet. The
+    /// returned `FixMessage` borrows from an internal buffer owned by the
+    /// client; it is invalidated by the next call to `recv`/`try_recv`.
+    pub fn try_recv(&mut self) -> Result<Option<FixMessage<'_>>, Box<dyn std::error::Error>> {
         let mut tmp = [0u8; 4096];
         match self.stream.read(&mut tmp) {
             Ok(0) => return Err("connection closed".into()),
@@ -132,8 +135,8 @@ impl FixClient {
         }
 
         if let Some(raw) = parse::try_extract_message(&mut self.parse_buf) {
-            let leaked: &'static [u8] = Box::leak(raw.into_boxed_slice());
-            let msg = FixMessage::parse(leaked)?;
+            self.recv_buf = raw;
+            let msg = FixMessage::parse(&self.recv_buf)?;
             Ok(Some(msg))
         } else {
             Ok(None)
