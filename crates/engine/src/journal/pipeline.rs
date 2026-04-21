@@ -27,6 +27,7 @@ use crate::journal::JournalEvent;
 use crate::journal::JournalWriter;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::types::{AccountId, CurrencyId, ExecutionReport, OrderId, RejectReason, Symbol};
+use melin_app::{Application, ApplyCtx};
 use melin_journal::JournalError;
 use melin_journal::trace::{TraceTimestamp, trace_ts};
 
@@ -1517,127 +1518,54 @@ impl MatchingStage {
         }
     }
 
-    /// Execute a single event against the exchange.
+    /// Dispatch a single event through the [`Application`] trait.
+    ///
+    /// The 17-arm trading match that used to live here now collapses
+    /// into a single `Application::apply` call — the trait impl on
+    /// `Exchange` (see `application_impl.rs`) owns the per-variant
+    /// dispatch, freeing the pipeline from knowing anything about
+    /// trading semantics. `#[inline]` on `Exchange::apply` + fat LTO
+    /// keep the hot path zero-cost.
     fn process_event(&mut self, slot: &InputSlot, reports: &mut Vec<ExecutionReport>) {
         // Hybrid scheduler clock: every event with a non-zero, monotonic
-        // timestamp drives the scheduler forward. Under load this fires due
-        // tasks at every-event resolution (microseconds) without waiting for
-        // the next Tick. The non-monotonic guard tolerates the rare
-        // multi-producer ordering race in which a slot arrives with an
-        // earlier timestamp than its predecessor.
+        // timestamp drives the scheduler forward. Under load this fires
+        // due tasks at every-event resolution (microseconds) without
+        // waiting for the next Tick. The non-monotonic guard tolerates
+        // the rare multi-producer ordering race in which a slot arrives
+        // with an earlier timestamp than its predecessor.
         if slot.timestamp_ns > self.last_drain_ns {
             self.last_drain_ns = slot.timestamp_ns;
-            self.exchange
-                .drain_due_scheduled_tasks(slot.timestamp_ns, reports);
+            <Exchange as Application>::tick(&mut self.exchange, slot.timestamp_ns, reports);
         }
 
         match slot.event {
-            JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument { spec }) => {
-                self.exchange.add_instrument(spec);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
-                account,
-                currency,
-                amount,
-            }) => {
-                self.exchange.deposit(account, currency, amount);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
-                symbol,
-                order,
-            }) => {
-                self.exchange.execute(symbol, order, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
-                symbol,
-                account,
-                order_id,
-            }) => {
-                self.exchange.cancel(symbol, account, order_id, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::SetRiskLimits {
-                symbol,
-                limits,
-            }) => {
-                self.exchange.set_risk_limits(symbol, limits);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::CancelAll { account }) => {
-                self.exchange.cancel_all(account, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::EndOfDay) => {
-                self.exchange.end_of_day(reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::SetCircuitBreaker {
-                symbol,
-                config,
-            }) => {
-                self.exchange.set_circuit_breaker(symbol, config);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
-                symbol,
-                account,
-                order_id,
-                new_price,
-                new_quantity,
-            }) => {
-                self.exchange.cancel_replace(
-                    symbol,
-                    account,
-                    order_id,
-                    new_price,
-                    new_quantity,
-                    reports,
-                );
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::SetFeeSchedule {
-                symbol,
-                schedule,
-            }) => {
-                self.exchange.set_fee_schedule(symbol, schedule, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::ProvisionAccount {
-                account,
-                amount,
-            }) => {
-                self.exchange.provision_account(account, amount);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::Withdraw {
-                account,
-                currency,
-                amount,
-            }) => {
-                // Replay path: rejections (insufficient balance, resting
-                // orders, unknown account) are deterministic — they
-                // reproduce the original live outcome and were already
-                // surfaced to the client at the time. Discarding here is
-                // intentional and safe.
-                let _ = self.exchange.withdraw(account, currency, amount);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::DisableInstrument { symbol }) => {
-                self.exchange.disable_instrument(symbol, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::EnableInstrument { symbol }) => {
-                self.exchange.enable_instrument(symbol, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::RemoveInstrument { symbol }) => {
-                self.exchange.remove_instrument(symbol, reports);
+            JournalEvent::App(event) => {
+                // Transport-owned context the app can read during apply
+                // (lets queries surface StatsHeader-equivalent data
+                // without the transport pattern-matching app variants).
+                // `Relaxed` loads are fine — these counters are
+                // diagnostic, not synchronising the hot path.
+                let ctx = ApplyCtx {
+                    now_ns: slot.timestamp_ns,
+                    journal_sequence: self.journal_cursor.get().load(Ordering::Relaxed),
+                    active_connections: self.active_connections.load(Ordering::Relaxed),
+                    events_processed: self.events_processed.load(Ordering::Relaxed),
+                };
+                <Exchange as Application>::apply(&mut self.exchange, event, &ctx, reports);
             }
             JournalEvent::Tick { now_ns } => {
-                // Defensive: the head-of-event drain has already advanced the
-                // clock to `slot.timestamp_ns`, which equals `now_ns` for
-                // tick-generator-published slots — so this call is typically
-                // a no-op. We keep it for paths where slot.timestamp_ns is 0
-                // (tests, manually constructed Ticks), so the tick still
-                // drives time forward as documented on `JournalEvent::Tick`.
-                self.exchange.drain_due_scheduled_tasks(now_ns, reports);
-            }
-            JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-            | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. }) => {
-                // Handled inline in the run loop before process_event is called.
-                // This arm exists only for exhaustiveness.
+                // Defensive: the head-of-event drain has already advanced
+                // the clock to `slot.timestamp_ns`, which equals `now_ns`
+                // for tick-generator-published slots — so this call is
+                // typically a no-op. Kept for paths where
+                // `slot.timestamp_ns` is 0 (tests, manually constructed
+                // Ticks) so time still advances as documented on
+                // `JournalEvent::Tick`.
+                <Exchange as Application>::tick(&mut self.exchange, now_ns, reports);
             }
             JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
-                // Hash chain metadata — no exchange state change.
+                // Hash chain metadata — journal internal, never reaches
+                // the application.
             }
         }
     }
