@@ -4,6 +4,7 @@
 //!   melin-tui-fix-client --oe-addr 127.0.0.1:9000 --md-addr 127.0.0.1:9001 \
 //!     --sender CLIENT --oe-target MELIN-OE --md-target MELIN-MD
 
+mod bot;
 pub mod fix_client;
 
 use std::io;
@@ -1044,45 +1045,10 @@ fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
     }
     let _ = tx.send(UiMsg::Log("[BOT] connected".into()));
 
-    // rate(t) = MID + AMP · sin(2π · t / PERIOD)
-    // 30 s period makes the cycle visible in a short demo session.
-    // Peak 75 ord/s is well below engine capacity on localhost, so the
-    // bot never creates back-pressure in the gateway.
-    const PERIOD_SECS: f64 = 30.0;
-    const RATE_MID: f64 = 40.0;
-    const RATE_AMP: f64 = 35.0;
-
-    // Account pool: 2..=32. Fixed-size array (not Vec) since the pool is
-    // known at compile time — avoids a heap allocation per thread start.
-    // Accounts start at 2 to leave account 1 for the interactive trader,
-    // so the user's balances/active-orders panels aren't polluted.
-    const BOT_ACCOUNTS: [u32; 31] = {
-        let mut a = [0u32; 31];
-        let mut i = 0;
-        while i < 31 {
-            a[i] = (i as u32) + 2;
-            i += 1;
-        }
-        a
-    };
-    // Matches the FIX symbols configured in the OE gateway.
-    const BOT_SYMBOLS: [&str; 2] = ["BTC/USD", "ETH/USD"];
-    // FIX decimal mid-price; the gateway maps this to engine ticks via
-    // tick_size_inverse (100 in the default config → 10,000 ticks).
-    const MID_PRICE: f64 = 100.0;
-    // One FIX price tick is 1/tick_size_inverse = 0.01 at the default
-    // config. Offsets are drawn uniformly in [1, 50] ticks.
-    const MAX_OFFSET_TICKS: u64 = 50;
-
-    // xorshift64: ~1 ns/sample, single-u64 state, non-cryptographic —
-    // adequate for bot order-parameter jitter.
+    // rate(t) = MID + AMP · sin(2π · t / PERIOD). Peak 75 ord/s is well
+    // below engine capacity on localhost, so the bot never creates
+    // back-pressure in the gateway. See `bot::bot_rate` for the curve.
     let mut rng_state: u64 = 0xC0FF_EE00_DEAD_BEEF;
-    fn xs64(s: &mut u64) -> u64 {
-        *s ^= *s << 13;
-        *s ^= *s >> 7;
-        *s ^= *s << 17;
-        *s
-    }
 
     let start = Instant::now();
     // u64 ClOrdID suffix. The gateway assigns fresh Melin OrderIds from
@@ -1094,41 +1060,15 @@ fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
 
     loop {
         let t = start.elapsed().as_secs_f64();
-        let rate = (RATE_MID + RATE_AMP * (std::f64::consts::TAU * t / PERIOD_SECS).sin()).max(1.0);
+        let rate = bot::bot_rate(t);
         // Per-order sleep (not per-batch) so the sine wave is traced
         // smoothly rather than as a staircase.
         let sleep_dur = Duration::from_secs_f64(1.0 / rate);
 
-        let account_id = BOT_ACCOUNTS[(xs64(&mut rng_state) as usize) % BOT_ACCOUNTS.len()];
-        let sym = BOT_SYMBOLS[(xs64(&mut rng_state) as usize) % BOT_SYMBOLS.len()];
-        // "1" = BUY, "2" = SELL in FIX 4.4.
-        let side_code = if xs64(&mut rng_state) & 1 == 0 {
-            "1"
-        } else {
-            "2"
-        };
-        let offset_ticks = (xs64(&mut rng_state) % MAX_OFFSET_TICKS) + 1;
-        let price = if side_code == "1" {
-            // Buys sit below mid; saturating_sub on floats isn't a thing,
-            // but MID_PRICE - 0.50 is always positive here.
-            MID_PRICE - (offset_ticks as f64) / 100.0
-        } else {
-            MID_PRICE + (offset_ticks as f64) / 100.0
-        };
-        let qty = (xs64(&mut rng_state) % 50) + 1;
-
+        let order = bot::next_bot_order(&mut rng_state);
         let clord = format!("BOT{next_clord_id}");
         next_clord_id += 1;
-
-        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
-            .str_tag(tags::CL_ORD_ID, &clord)
-            .str_tag(tags::SYMBOL, sym)
-            .str_tag(tags::SIDE, side_code)
-            .str_tag(tags::ORD_TYPE, "2") // Limit
-            .str_tag(tags::PRICE, &format!("{price:.2}"))
-            .str_tag(tags::ORDER_QTY, &format!("{qty}"))
-            .str_tag(tags::TIME_IN_FORCE, "1") // GTC
-            .str_tag(tags::ACCOUNT, &format!("{account_id}"));
+        let nos = bot::build_bot_nos(&clord, &order);
 
         if let Err(e) = c.send_builder(nos) {
             log_err(&e);
