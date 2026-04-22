@@ -1015,7 +1015,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         use melin_engine::journal::JournalEvent;
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::journal::wall_clock_nanos;
-        use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
 
@@ -1029,7 +1029,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::App(
-                    melin_engine::trading_event::TradingEvent::AddInstrument {
+                    melin_trading::trading_event::TradingEvent::AddInstrument {
                         spec: InstrumentSpec {
                             symbol: Symbol(i),
                             base: CurrencyId(i * 2),
@@ -1054,7 +1054,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::App(
-                    melin_engine::trading_event::TradingEvent::ProvisionAccount {
+                    melin_trading::trading_event::TradingEvent::ProvisionAccount {
                         account: AccountId(acct),
                         amount: u64::MAX / 4,
                     },
@@ -1845,7 +1845,7 @@ pub fn run_dpdk(
         use melin_engine::journal::JournalEvent;
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::journal::wall_clock_nanos;
-        use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
@@ -1857,7 +1857,7 @@ pub fn run_dpdk(
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::App(
-                    melin_engine::trading_event::TradingEvent::AddInstrument {
+                    melin_trading::trading_event::TradingEvent::AddInstrument {
                         spec: InstrumentSpec {
                             symbol: Symbol(i),
                             base: CurrencyId(i * 2),
@@ -1879,7 +1879,7 @@ pub fn run_dpdk(
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::App(
-                    melin_engine::trading_event::TradingEvent::ProvisionAccount {
+                    melin_trading::trading_event::TradingEvent::ProvisionAccount {
                         account: AccountId(acct),
                         amount: u64::MAX / 4,
                     },

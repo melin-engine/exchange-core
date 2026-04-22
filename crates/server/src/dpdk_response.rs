@@ -22,7 +22,7 @@ use melin_disruptor::spsc;
 
 use melin_engine::journal::pipeline::StageUtilization;
 use melin_engine::journal::{OutputPayload, OutputSlot};
-use melin_engine::types::ExecutionReport;
+use melin_trading::types::ExecutionReport;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;

@@ -26,6 +26,7 @@ path = "src/main.rs"
 
 [dependencies]
 melin-engine = { path = "../engine" }
+melin-trading = { path = "../trading" }
 melin-disruptor = { path = "../disruptor" }
 melin-market-data = { path = "../market-data" }
 melin-protocol = { path = "../protocol" }

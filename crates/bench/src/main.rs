@@ -50,7 +50,6 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-use melin_engine::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
 #[cfg(not(feature = "dpdk"))]
@@ -59,6 +58,7 @@ use melin_protocol::message::ResponseKind;
 use melin_protocol::transport::BlockingTransportListener;
 #[cfg(not(feature = "dpdk"))]
 use melin_server::server::ServerConfig;
+use melin_trading::types::*;
 
 /// Number of completed orders between latency time-series samples.
 /// Each sample captures interval p99/p99.9 (reset after each sample),
@@ -728,7 +728,7 @@ fn run_pipeline_bench(
                     sequence: 0,
                     timestamp_ns: wall_clock_nanos(),
                     event: JournalEvent::App(
-                        melin_engine::trading_event::TradingEvent::SubmitOrder {
+                        melin_trading::trading_event::TradingEvent::SubmitOrder {
                             symbol: Symbol(1),
                             order: Order {
                                 id: order_id,

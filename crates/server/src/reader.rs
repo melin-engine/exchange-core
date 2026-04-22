@@ -826,9 +826,9 @@ fn process_frames<R>(
         // not journaled and skip even the timestamp.
         let ts = if matches!(
             event,
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
                 | JournalEvent::App(
-                    melin_engine::trading_event::TradingEvent::QueryPosition { .. }
+                    melin_trading::trading_event::TradingEvent::QueryPosition { .. }
                 )
         ) {
             0

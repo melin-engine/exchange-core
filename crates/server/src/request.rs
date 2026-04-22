@@ -46,7 +46,7 @@ pub fn check_permission(request: &Request, permission: Permission) -> Result<(),
 pub fn to_event(request: &Request) -> JournalEvent {
     match *request {
         Request::SubmitOrder { symbol, order } => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol,
                 order,
             })
@@ -55,22 +55,22 @@ pub fn to_event(request: &Request) -> JournalEvent {
             symbol,
             account,
             order_id,
-        } => JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelOrder {
+        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelOrder {
             symbol,
             account,
             order_id,
         }),
         Request::CancelAll { account } => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelAll { account })
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelAll { account })
         }
         Request::AddInstrument { spec } => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument { spec })
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument { spec })
         }
         Request::Deposit {
             account,
             currency,
             amount,
-        } => JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
+        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
             account,
             currency,
             amount,
@@ -79,19 +79,19 @@ pub fn to_event(request: &Request) -> JournalEvent {
             account,
             currency,
             amount,
-        } => JournalEvent::App(melin_engine::trading_event::TradingEvent::Withdraw {
+        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::Withdraw {
             account,
             currency,
             amount,
         }),
         Request::SetRiskLimits { symbol, limits } => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::SetRiskLimits {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SetRiskLimits {
                 symbol,
                 limits,
             })
         }
         Request::SetCircuitBreaker { symbol, config } => JournalEvent::App(
-            melin_engine::trading_event::TradingEvent::SetCircuitBreaker { symbol, config },
+            melin_trading::trading_event::TradingEvent::SetCircuitBreaker { symbol, config },
         ),
         Request::CancelReplace {
             symbol,
@@ -99,7 +99,7 @@ pub fn to_event(request: &Request) -> JournalEvent {
             order_id,
             new_price,
             new_quantity,
-        } => JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelReplace {
+        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelReplace {
             symbol,
             account,
             order_id,
@@ -107,26 +107,28 @@ pub fn to_event(request: &Request) -> JournalEvent {
             new_quantity,
         }),
         Request::SetFeeSchedule { symbol, schedule } => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::SetFeeSchedule {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SetFeeSchedule {
                 symbol,
                 schedule,
             })
         }
         Request::QueryStats => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
         }
         Request::QueryPosition { account } => {
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryPosition { account })
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryPosition { account })
         }
-        Request::EndOfDay => JournalEvent::App(melin_engine::trading_event::TradingEvent::EndOfDay),
+        Request::EndOfDay => {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::EndOfDay)
+        }
         Request::DisableInstrument { symbol } => JournalEvent::App(
-            melin_engine::trading_event::TradingEvent::DisableInstrument { symbol },
+            melin_trading::trading_event::TradingEvent::DisableInstrument { symbol },
         ),
         Request::EnableInstrument { symbol } => JournalEvent::App(
-            melin_engine::trading_event::TradingEvent::EnableInstrument { symbol },
+            melin_trading::trading_event::TradingEvent::EnableInstrument { symbol },
         ),
         Request::RemoveInstrument { symbol } => JournalEvent::App(
-            melin_engine::trading_event::TradingEvent::RemoveInstrument { symbol },
+            melin_trading::trading_event::TradingEvent::RemoveInstrument { symbol },
         ),
         Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. } => {
             unreachable!("heartbeats, auth, and subscribe must be filtered before to_event")
@@ -139,7 +141,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use melin_engine::types::*;
+    use melin_trading::types::*;
 
     #[test]
     fn filter_heartbeat() {

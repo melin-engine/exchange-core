@@ -655,9 +655,9 @@ fn process_trading_frames(
                     // disruptor cursor order — see `InputSlot::sequence`.
                     let ts = if matches!(
                         event,
-                        JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+                        JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
                             | JournalEvent::App(
-                                melin_engine::trading_event::TradingEvent::QueryPosition { .. }
+                                melin_trading::trading_event::TradingEvent::QueryPosition { .. }
                             )
                     ) {
                         0
@@ -737,7 +737,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use melin_engine::journal::JournalEvent;
-    use melin_engine::types::*;
+    use melin_trading::types::*;
 
     // --- try_extract_frame tests ---
 
@@ -842,7 +842,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder { symbol, .. }) if symbol == Symbol(1))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder { symbol, .. }) if symbol == Symbol(1))
         );
     }
 
@@ -855,7 +855,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelOrder { symbol, account, order_id })
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelOrder { symbol, account, order_id })
                 if symbol == Symbol(2) && account == AccountId(5) && order_id == OrderId(42))
         );
     }
@@ -867,7 +867,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelAll { account }) if account == AccountId(7))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelAll { account }) if account == AccountId(7))
         );
     }
 
@@ -880,7 +880,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit { account, currency, amount })
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit { account, currency, amount })
                 if account == AccountId(1) && currency == CurrencyId(2) && amount == 1000)
         );
     }
@@ -895,7 +895,7 @@ mod tests {
         let req = Request::AddInstrument { spec };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument { spec: s }) if s.symbol == Symbol(10))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument { spec: s }) if s.symbol == Symbol(10))
         );
     }
 
@@ -910,7 +910,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelReplace { order_id, .. }) if order_id == OrderId(5))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelReplace { order_id, .. }) if order_id == OrderId(5))
         );
     }
 
@@ -922,7 +922,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SetRiskLimits { symbol, .. }) if symbol == Symbol(1))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::SetRiskLimits { symbol, .. }) if symbol == Symbol(1))
         );
     }
 
@@ -934,7 +934,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SetCircuitBreaker { symbol, .. }) if symbol == Symbol(1))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::SetCircuitBreaker { symbol, .. }) if symbol == Symbol(1))
         );
     }
 
@@ -946,7 +946,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SetFeeSchedule { symbol, .. }) if symbol == Symbol(3))
+            matches!(event, JournalEvent::App(melin_trading::trading_event::TradingEvent::SetFeeSchedule { symbol, .. }) if symbol == Symbol(3))
         );
     }
 
@@ -956,7 +956,7 @@ mod tests {
         let event = shared_request::to_event(&req);
         assert!(matches!(
             event,
-            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
         ));
     }
 

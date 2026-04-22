@@ -4,11 +4,17 @@ pub mod account;
 pub mod application_impl;
 pub mod exchange;
 pub mod journal;
-pub mod le;
 pub mod orderbook;
 pub mod scheduler;
-pub mod trading_event;
 pub mod types;
+
+/// Re-exports of the shared trading wire types and codec. Extracted into
+/// `melin-trading` so the no-op transport binary can speak the same
+/// protocol without linking the matching engine; engine-internal code
+/// (and downstream consumers still on the old import paths) continue to
+/// reach them here.
+pub use melin_trading::le;
+pub use melin_trading::trading_event;
 
 #[cfg(test)]
 mod fuzz_tests;

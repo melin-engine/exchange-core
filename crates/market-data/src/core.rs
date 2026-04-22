@@ -13,9 +13,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use melin_engine::types::{ExecutionReport, Symbol};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
+use melin_trading::types::{ExecutionReport, Symbol};
 
 use crate::mirror::BookMirror;
 
