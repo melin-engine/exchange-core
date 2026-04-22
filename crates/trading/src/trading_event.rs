@@ -438,6 +438,7 @@ impl AppEvent for TradingEvent {
         }
     }
 
+    #[inline]
     fn is_query(&self) -> bool {
         matches!(
             self,
