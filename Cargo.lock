@@ -1639,6 +1639,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-noop"
+version = "0.1.0"
+dependencies = [
+ "melin-app",
+ "melin-disruptor",
+ "melin-journal",
+ "melin-trading",
+ "melin-transport-core",
+ "tempfile",
+]
+
+[[package]]
 name = "melin-oe-gateway"
 version = "0.3.0"
 dependencies = [
