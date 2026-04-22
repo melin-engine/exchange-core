@@ -1193,6 +1193,18 @@ impl<A: Application> MatchingStage<A> {
             }
             idle_spins = 0;
 
+            // Build ApplyCtx once per batch — the counters are advisory
+            // (stats queries, health endpoint) so batch-stale values are
+            // fine. `now_ns` is overwritten per-event from the slot
+            // timestamp inside `process_event`. Three Relaxed loads per
+            // batch instead of per event.
+            let mut ctx = ApplyCtx {
+                now_ns: 0,
+                journal_sequence: self.journal_cursor.get().load(Ordering::Relaxed),
+                active_connections: self.active_connections.load(Ordering::Relaxed),
+                events_processed: local_events,
+            };
+
             for (i, slot) in batch[..count].iter().enumerate() {
                 let input_seq = batch_start + i as u64;
                 busy_count += 1;
@@ -1210,12 +1222,7 @@ impl<A: Application> MatchingStage<A> {
                 #[cfg(feature = "latency-trace")]
                 let exec_start = trace_ts();
 
-                // Flush thread-local counters so `ApplyCtx` hands the
-                // app current values — the app reads these when
-                // synthesising query responses (stats snapshots, etc.).
-                // Cheap Relaxed store per event (~1 ns).
-                self.events_processed.store(local_events, Ordering::Relaxed);
-
+                ctx.events_processed = local_events;
                 local_events += 1;
 
                 // Halt check first: reject before advancing any HWMs so
@@ -1243,7 +1250,7 @@ impl<A: Application> MatchingStage<A> {
                         reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                     }
                 } else {
-                    query_report = self.process_event(slot, &mut reports);
+                    query_report = self.process_event(slot, &ctx, &mut reports);
                 }
 
                 #[cfg(feature = "latency-trace")]
@@ -1303,6 +1310,14 @@ impl<A: Application> MatchingStage<A> {
     /// processing each and publishing responses. Ensures every journaled
     /// event gets a matching response sent to the client.
     fn drain_remaining(&mut self, reports: &mut Vec<A::Report>) {
+        // Shutdown path — not performance-critical. Build a single ctx
+        // with zeroed counters (no health endpoint cares at this point).
+        let ctx = ApplyCtx {
+            now_ns: 0,
+            journal_sequence: 0,
+            active_connections: 0,
+            events_processed: 0,
+        };
         loop {
             let entry = self.consumer.try_consume();
             let Some((input_seq, slot)) = entry else {
@@ -1328,7 +1343,7 @@ impl<A: Application> MatchingStage<A> {
             } else {
                 // Queries are already skipped above, so process_event
                 // will not return a query response here.
-                let query_report = self.process_event(&slot, reports);
+                let query_report = self.process_event(&slot, &ctx, reports);
                 debug_assert!(query_report.is_none(), "drain_remaining skips queries");
             }
 
@@ -1365,6 +1380,7 @@ impl<A: Application> MatchingStage<A> {
     fn process_event(
         &mut self,
         slot: &InputSlot<A::Event>,
+        ctx: &ApplyCtx,
         reports: &mut Vec<A::Report>,
     ) -> Option<A::QueryResponse> {
         // Hybrid scheduler clock: every event with a non-zero, monotonic
@@ -1380,16 +1396,12 @@ impl<A: Application> MatchingStage<A> {
 
         match slot.event {
             melin_journal::JournalEvent::App(event) => {
-                // Transport-owned context the app can read during apply
-                // (lets queries surface StatsHeader-equivalent data
-                // without the transport pattern-matching app variants).
-                // `Relaxed` loads are fine — these counters are
-                // diagnostic, not synchronising the hot path.
+                // `now_ns` is the only per-event field — stamp it from
+                // the slot. The remaining ctx fields were loaded once per
+                // batch by the caller.
                 let ctx = ApplyCtx {
                     now_ns: slot.timestamp_ns,
-                    journal_sequence: self.journal_cursor.get().load(Ordering::Relaxed),
-                    active_connections: self.active_connections.load(Ordering::Relaxed),
-                    events_processed: self.events_processed.load(Ordering::Relaxed),
+                    ..*ctx
                 };
                 return self.app.apply(event, &ctx, reports);
             }
