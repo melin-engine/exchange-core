@@ -49,7 +49,9 @@
 #   WARMUP_ORDERS=N        Warmup orders per client (default: bench default 100000)
 #   ORDERS_PER_SWEEP=N     Orders per sweep data point (default: 10000000)
 #   LOCAL_ORDERS=N         Orders for local workloads (default: 100000000)
-#   RESULTS_DIR=<path>  Reuse existing results directory
+#   RESULTS_DIR=<path>  Reuse existing results directory (default:
+#                       <repo>/bench-results/lan-bench-suite-<timestamp>,
+#                       git-ignored).
 #   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
 #   BENCH_COMMIT=<hash> Checkout a specific commit (mutually exclusive with BENCH_BRANCH)
 #   CLEAN_BUILD=1       Run cargo clean before building (forces full recompile)
@@ -109,6 +111,7 @@ REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
 REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="~/workspace/melin"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
@@ -144,7 +147,11 @@ WARMUP_ORDERS="${WARMUP_ORDERS:-}"  # empty = bench default (100000)
 ORDERS_PER_SWEEP="${ORDERS_PER_SWEEP:-10000000}"
 LOCAL_ORDERS="${LOCAL_ORDERS:-100000000}"
 
-RESULTS_DIR="${RESULTS_DIR:-/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)}"
+# Default results dir lives under the repo (git-ignored via
+# `/bench-results/`) instead of /tmp so past runs survive reboots and
+# are easy to find for side-by-side comparison. Override via
+# `RESULTS_DIR=<path>` to write elsewhere.
+RESULTS_DIR="${RESULTS_DIR:-${LOCAL_REPO}/bench-results/lan-bench-suite-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${RESULTS_DIR}"
 
 # Track whether DPDK was used (need reboot at end).
@@ -1346,7 +1353,6 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
     echo ""
 
     if command -v cargo &>/dev/null && [[ -f "${SCRIPT_DIR}/../crates/bench/src/plot.rs" ]]; then
-        LOCAL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
         # Plots land alongside the run's JSON files first so each results
         # directory is self-contained — two runs kept in /tmp can be
         # compared visually without the in-tree copies overwriting each
