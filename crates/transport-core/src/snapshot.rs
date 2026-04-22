@@ -96,6 +96,18 @@ pub fn save<A: Application>(
     chain_hash: [u8; 32],
     path: &Path,
 ) -> Result<(), SnapshotError> {
+    save_with_limit::<A>(app, journal_sequence, chain_hash, path, MAX_SNAPSHOT_SIZE)
+}
+
+/// Internal form of [`save`] taking an explicit size cap. Factored out so
+/// tests can exercise the cap without allocating a 256 MiB payload.
+fn save_with_limit<A: Application>(
+    app: &A,
+    journal_sequence: u64,
+    chain_hash: [u8; 32],
+    path: &Path,
+    max_size: u64,
+) -> Result<(), SnapshotError> {
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     // Transport header.
     buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
@@ -108,6 +120,13 @@ pub fn save<A: Application>(
     // CRC over everything written so far.
     let crc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
+
+    // Refuse to write a file the matching `load` would reject. Without
+    // this guard a runaway `Application::snapshot` produces a file that
+    // every subsequent recovery fails on.
+    if buf.len() as u64 > max_size {
+        return Err(SnapshotError::TooLarge(buf.len() as u64));
+    }
 
     // Atomic rename via `.tmp`.
     let mut tmp_path = path.to_path_buf();
@@ -127,6 +146,23 @@ pub fn save<A: Application>(
         file.sync_all()?;
     }
     std::fs::rename(&tmp_path, path)?;
+
+    // POSIX semantics: the rename is atomic wrt concurrent readers but
+    // not durable until the parent directory's metadata is fsynced. A
+    // crash between `rename` returning and the dir metadata hitting
+    // disk can lose the rename on ext4/xfs — the file reverts to its
+    // pre-rename state (or, rarely, the directory ends up with both
+    // `.tmp` and the final path, or neither). `File::sync_all` on the
+    // opened directory issues `fsync(2)` which forces the dir
+    // metadata out.
+    let parent = match path.parent() {
+        // Empty parent ("snap" with no separator) denotes CWD; use "." so
+        // the open succeeds rather than failing with ENOENT.
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    File::open(&parent)?.sync_all()?;
+
     Ok(())
 }
 
@@ -357,6 +393,34 @@ mod tests {
             Err(SnapshotError::Truncated) => {}
             other => panic!("expected Truncated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn save_rejects_oversize_payload() {
+        // `load` caps at MAX_SNAPSHOT_SIZE; `save` must symmetrically
+        // refuse to write a file that the matching `load` would reject.
+        // A small limit lets us trip the guard without allocating the
+        // real 256 MiB cap.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let app = populated_app();
+
+        match save_with_limit::<TestApp>(&app, 0, [0u8; 32], &path, /* max_size */ 16) {
+            Err(SnapshotError::TooLarge(_)) => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+
+        // Rejection happens before any file write — no `.tmp` or final
+        // file should be left behind.
+        assert!(
+            !path.exists(),
+            "save_with_limit must not leave the target file on size-check failure"
+        );
+        let tmp = path.with_extension("tmp");
+        assert!(
+            !tmp.exists(),
+            "save_with_limit must not leave a .tmp on size-check failure"
+        );
     }
 
     #[test]
