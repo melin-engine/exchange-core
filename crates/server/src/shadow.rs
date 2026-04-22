@@ -183,7 +183,9 @@ fn dispatch_event(
                 active_connections: 0,
                 events_processed: 0,
             };
-            app.apply(e, &ctx, reports);
+            // Query response discarded — shadow is a secondary observer,
+            // it does not produce client-facing output.
+            let _ = app.apply(e, &ctx, reports);
         }
         RawJournalEvent::Tick { now_ns } => {
             // Defensive: the head-of-event drain typically already advanced

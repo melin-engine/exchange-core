@@ -28,8 +28,10 @@ pub type JournalWriter = melin_journal::JournalWriter<crate::trading_event::Trad
 /// `melin-transport-core`). Server/bench callers use these so they
 /// never have to spell `<Exchange>` or `<TradingEvent>` explicitly.
 pub type InputSlot = pipeline::InputSlot<crate::trading_event::TradingEvent>;
-pub type OutputSlot = pipeline::OutputSlot<crate::types::ExecutionReport>;
-pub type OutputPayload = pipeline::OutputPayload<crate::types::ExecutionReport>;
+pub type OutputSlot =
+    pipeline::OutputSlot<crate::types::ExecutionReport, crate::types::QueryResponse>;
+pub type OutputPayload =
+    pipeline::OutputPayload<crate::types::ExecutionReport, crate::types::QueryResponse>;
 pub type Pipeline = pipeline::Pipeline<crate::exchange::Exchange>;
 pub type ReplicaPipeline = pipeline::ReplicaPipeline<crate::exchange::Exchange>;
 pub type MatchingStage = pipeline::MatchingStage<crate::exchange::Exchange>;

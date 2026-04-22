@@ -24,7 +24,7 @@ use melin_disruptor::ring;
 use crate::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
 use melin_journal::trace;
-use melin_trading::types::ExecutionReport;
+use melin_trading::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
 
 use melin_protocol::codec;
@@ -338,12 +338,11 @@ pub fn run(
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
 
-            // Query responses (`ExecutionReport::Stats`/`::Position`)
-            // are internal variants the app emits from `apply`; the
-            // response stage translates them back to the public wire
+            // Query responses arrive as `OutputPayload::QueryResponse`;
+            // the response stage translates them to the public wire
             // variants so client-visible framing stays unchanged.
             let kind = match slot.payload {
-                OutputPayload::Report(ExecutionReport::Stats {
+                OutputPayload::QueryResponse(QueryResponse::Stats {
                     active_connections,
                     events_processed,
                     journal_sequence,
@@ -352,7 +351,7 @@ pub fn run(
                     events_processed,
                     journal_sequence,
                 },
-                OutputPayload::Report(ExecutionReport::Position {
+                OutputPayload::QueryResponse(QueryResponse::Position {
                     account,
                     balances,
                     count,

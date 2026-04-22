@@ -1,8 +1,8 @@
 //! Application-agnostic transport core for the Melin durable pipeline.
 //!
 //! Owns the disruptor wiring (journal stage + matching stage + response-stage
-//! output ring), the `InputSlot<E>` / `OutputSlot<R>` ring slot types, the
-//! `OutputPayload<R>` envelope, and the `Pipeline<A>` / `ReplicaPipeline<A>`
+//! output ring), the `InputSlot<E>` / `OutputSlot<R, Q>` ring slot types, the
+//! `OutputPayload<R, Q>` envelope, and the `Pipeline<A>` / `ReplicaPipeline<A>`
 //! builders. Everything here is generic over an `A: Application` — the
 //! matching engine (`melin-engine`) is one such application, the no-op
 //! demonstration (`melin-noop`) is another.

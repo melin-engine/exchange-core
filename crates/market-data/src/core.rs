@@ -207,7 +207,6 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
         | ExecutionReport::Rejected { symbol, .. }
         | ExecutionReport::Replaced { symbol, .. }
         | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
-        ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => Symbol(0),
     }
 }
 

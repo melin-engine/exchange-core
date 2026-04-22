@@ -535,10 +535,6 @@ fn format_report(report: &ExecutionReport) -> String {
             };
             format!("INSTRUMENT {} → {}", symbol.0, status_str)
         }
-        // Server-internal variants never reach the TUI over the wire —
-        // the response stage translates them to `StatsHeader` /
-        // `PositionSnapshot` response messages first.
-        ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => String::new(),
     }
 }
 

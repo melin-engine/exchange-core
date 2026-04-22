@@ -240,15 +240,15 @@ pub struct Order {
     pub expiry_ns: u64,
 }
 
-/// Events emitted by the matching engine.
+/// Events emitted by the matching engine's hot path (order placement,
+/// fills, cancels, etc.).
 ///
-/// `Position` is considerably larger than the other variants (it carries
-/// a fixed 16-slot balance array), but `ExecutionReport` must be `Copy`
-/// for zero-allocation ring transport — boxing would add hot-path heap
-/// indirection. `Position` is produced only on rare `QueryPosition`
-/// events, so the per-slot memory overhead is acceptable.
+/// Kept small so the per-event scratch `Vec<ExecutionReport>` stays
+/// cache-friendly. Query responses (`Stats`, `Position`) live in
+/// [`QueryResponse`] and bypass the scratch vec entirely — they are
+/// returned directly from `Application::apply` and written to the
+/// output ring as `OutputPayload::QueryResponse`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
 pub enum ExecutionReport {
     /// Order was placed on the book (resting).
     Placed {
@@ -312,11 +312,22 @@ pub enum ExecutionReport {
         symbol: Symbol,
         status: InstrumentStatus,
     },
+}
+
+/// 1:1 query responses returned directly from `Application::apply`,
+/// bypassing the fan-out scratch vec. Routed through
+/// `OutputPayload::QueryResponse` so the response stage can translate
+/// them to the public wire format.
+///
+/// Kept separate from `ExecutionReport` to avoid inflating that enum's
+/// size with the large `Position` balance array (392 B vs ~64 B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum QueryResponse {
     /// Transport stats snapshot emitted in response to a `QueryStats`
-    /// event. Internal report — never journaled, never sent on the wire
-    /// as an `ExecutionReport`. The response stage translates this to
-    /// `ResponseKind::StatsHeader` for the client, preserving the public
-    /// wire format.
+    /// event. Internal — never journaled, never sent on the wire
+    /// directly. The response stage translates this to
+    /// `ResponseKind::StatsHeader` for the client.
     Stats {
         active_connections: u64,
         events_processed: u64,

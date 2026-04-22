@@ -177,7 +177,7 @@ impl<E: AppEvent> Default for InputSlot<E> {
 /// for a specific connection, plus the input sequence it originated from
 /// so the response stage can gate on journal completion.
 #[derive(Debug, Clone, Copy)]
-pub struct OutputSlot<R: Copy> {
+pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Which client connection receives this response.
     pub connection_id: u64,
     /// Input disruptor sequence this output originated from.
@@ -185,7 +185,7 @@ pub struct OutputSlot<R: Copy> {
     /// has advanced past this value (i.e., the event is durable).
     pub input_seq: u64,
     /// The response payload.
-    pub payload: OutputPayload<R>,
+    pub payload: OutputPayload<R, Q>,
     /// Timestamp when the matching stage finished processing this event.
     /// `()` (zero-sized) when `latency-trace` is disabled.
     pub match_complete_ts: TraceTimestamp,
@@ -197,28 +197,31 @@ pub struct OutputSlot<R: Copy> {
 
 /// Payload within an output slot.
 ///
-/// Generic over the application's report type `R`. Must remain `Copy`
-/// for zero-allocation ring buffer transport. Large-report variants
-/// (e.g. the trading engine's balance snapshot) dominate the enum size
-/// when they exist; boxing would add heap indirection on the hot path,
-/// and such large reports are rare enough that the per-slot overhead is
-/// acceptable.
+/// Generic over the application's report type `R` and query response
+/// type `Q`. Must remain `Copy` for zero-allocation ring buffer
+/// transport. Large query-response variants (e.g. the trading engine's
+/// balance snapshot) dominate the enum size; they are rare enough that
+/// the per-slot overhead is acceptable while the hot-path scratch
+/// `Vec<R>` stays small.
 ///
-/// Prior versions carried app-specific query variants directly; those
-/// now live inside the app's `Report` type and the response stage
-/// translates them back to public wire variants where needed.
+/// `Report(R)` carries fan-out reports (fills, acks, cancels) that
+/// flow through the matching stage's scratch vec. `QueryResponse(Q)`
+/// carries 1:1 query responses returned directly from
+/// `Application::apply`, bypassing the scratch vec entirely.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
-pub enum OutputPayload<R: Copy> {
+pub enum OutputPayload<R: Copy, Q: Copy> {
     /// An application report from matching.
     Report(R),
+    /// A 1:1 query response returned directly from `Application::apply`.
+    QueryResponse(Q),
     /// Signals the end of reports for one request.
     BatchEnd,
     /// Internal error during matching.
     EngineError,
 }
 
-impl<R: Copy> Default for OutputSlot<R> {
+impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
     fn default() -> Self {
         Self {
             connection_id: 0,
@@ -1053,7 +1056,7 @@ impl<E: AppEvent> JournalStage<E> {
 pub struct MatchingStage<A: Application> {
     app: A,
     consumer: ring::Consumer<InputSlot<A::Event>>,
-    output: ring::Producer<OutputSlot<A::Report>>,
+    output: ring::Producer<OutputSlot<A::Report, A::QueryResponse>>,
     /// Monotonically increasing count of events processed. Relaxed ordering
     /// is sufficient — this is a diagnostic counter, not a synchronization
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
@@ -1087,7 +1090,7 @@ impl<A: Application> MatchingStage<A> {
     pub fn new(
         app: A,
         consumer: ring::Consumer<InputSlot<A::Event>>,
-        output: ring::Producer<OutputSlot<A::Report>>,
+        output: ring::Producer<OutputSlot<A::Report, A::QueryResponse>>,
         events_processed: Arc<AtomicU64>,
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
@@ -1202,6 +1205,7 @@ impl<A: Application> MatchingStage<A> {
                 }
 
                 reports.clear();
+                let mut query_report: Option<A::QueryResponse> = None;
 
                 #[cfg(feature = "latency-trace")]
                 let exec_start = trace_ts();
@@ -1239,7 +1243,7 @@ impl<A: Application> MatchingStage<A> {
                         reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                     }
                 } else {
-                    self.process_event(slot, &mut reports);
+                    query_report = self.process_event(slot, &mut reports);
                 }
 
                 #[cfg(feature = "latency-trace")]
@@ -1255,11 +1259,24 @@ impl<A: Application> MatchingStage<A> {
                 // Publish execution reports to the output SPSC.
                 // All output slots for this request carry the same input_seq
                 // so the response stage can gate on journal completion.
+                // Fan-out reports (fills, acks) come from the scratch vec;
+                // query responses (stats, position) are returned directly
+                // by `process_event` and published here without ever
+                // entering the vec — keeping the per-element size small.
                 for report in &reports {
                     self.output.publish(OutputSlot {
                         connection_id: slot.connection_id,
                         input_seq,
                         payload: OutputPayload::Report(*report),
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    });
+                }
+                if let Some(qr) = query_report {
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::QueryResponse(qr),
                         match_complete_ts,
                         recv_ts: slot.recv_ts,
                     });
@@ -1309,7 +1326,10 @@ impl<A: Application> MatchingStage<A> {
                     reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                 }
             } else {
-                self.process_event(&slot, reports);
+                // Queries are already skipped above, so process_event
+                // will not return a query response here.
+                let query_report = self.process_event(&slot, reports);
+                debug_assert!(query_report.is_none(), "drain_remaining skips queries");
             }
 
             #[allow(clippy::let_unit_value)]
@@ -1342,7 +1362,11 @@ impl<A: Application> MatchingStage<A> {
     /// dispatch, freeing the pipeline from knowing anything about
     /// trading semantics. `#[inline]` on `Exchange::apply` + fat LTO
     /// keep the hot path zero-cost.
-    fn process_event(&mut self, slot: &InputSlot<A::Event>, reports: &mut Vec<A::Report>) {
+    fn process_event(
+        &mut self,
+        slot: &InputSlot<A::Event>,
+        reports: &mut Vec<A::Report>,
+    ) -> Option<A::QueryResponse> {
         // Hybrid scheduler clock: every event with a non-zero, monotonic
         // timestamp drives the scheduler forward. Under load this fires
         // due tasks at every-event resolution (microseconds) without
@@ -1367,7 +1391,7 @@ impl<A: Application> MatchingStage<A> {
                     active_connections: self.active_connections.load(Ordering::Relaxed),
                     events_processed: self.events_processed.load(Ordering::Relaxed),
                 };
-                self.app.apply(event, &ctx, reports);
+                return self.app.apply(event, &ctx, reports);
             }
             melin_journal::JournalEvent::Tick { now_ns } => {
                 // Defensive: the head-of-event drain has already advanced
@@ -1385,6 +1409,7 @@ impl<A: Application> MatchingStage<A> {
                 // the application.
             }
         }
+        None
     }
 }
 
@@ -1420,7 +1445,7 @@ pub struct Pipeline<A: Application> {
     pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
-    pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report>>>,
+    pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
     pub journal_cursor: Arc<Sequence>,
     pub matching_cursor: Arc<Sequence>,
     pub events_processed: Arc<AtomicU64>,
@@ -1438,7 +1463,7 @@ pub struct ReplicaPipeline<A: Application> {
     pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
-    pub drain_consumer: ring::Consumer<OutputSlot<A::Report>>,
+    pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     pub journal_cursor: Arc<Sequence>,
     pub matching_cursor: Arc<Sequence>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
@@ -1545,7 +1570,10 @@ where
     // Single producer, N consumers (1 = response only, 2 = response + event publisher).
     // Uses the same ring::Producer/Consumer API as the input disruptor.
     let mut output_builder =
-        ring::DisruptorBuilder::<OutputSlot<A::Report>>::new(OUTPUT_RING_CAPACITY).add_consumer(); // consumer 0: response stage
+        ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
+            OUTPUT_RING_CAPACITY,
+        )
+        .add_consumer(); // consumer 0: response stage
     if enable_event_publisher {
         output_builder = output_builder.add_consumer(); // consumer 1: event publisher
     }
@@ -1714,8 +1742,10 @@ where
     let matching_cursor = matching_consumer.progress_counter();
 
     // Output disruptor: single drain consumer (no response stage on replica).
-    let output_builder =
-        ring::DisruptorBuilder::<OutputSlot<A::Report>>::new(OUTPUT_RING_CAPACITY).add_consumer();
+    let output_builder = ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
+        OUTPUT_RING_CAPACITY,
+    )
+    .add_consumer();
     let (output_producer, mut output_consumers) = output_builder.build();
     let drain_consumer = output_consumers.pop().expect("drain consumer");
 

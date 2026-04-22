@@ -80,6 +80,7 @@ fn pipeline_with_noop_app_runs_events_to_output() {
             match slot.payload {
                 OutputPayload::Report(_) => reports_seen += 1,
                 OutputPayload::BatchEnd => batch_ends += 1,
+                OutputPayload::QueryResponse(_) => {}
                 OutputPayload::EngineError => panic!("unexpected engine error"),
             }
         } else {

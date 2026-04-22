@@ -250,8 +250,6 @@ impl BookMirror {
                     InstrumentStatus::Enabled => false,
                 }
             }
-            // Query responses — the book mirror doesn't track them.
-            ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => false,
         }
     }
 

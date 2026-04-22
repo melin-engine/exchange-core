@@ -22,7 +22,7 @@ use std::io::{self, Read, Write};
 use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{
-    AccountId, ExecutionReport, OrderId, RejectReason as EngineRejectReason, Symbol,
+    AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
 };
 
 /// A stateless application that accepts any `TradingEvent` and emits a
@@ -52,6 +52,7 @@ impl NoopApp {
 impl Application for NoopApp {
     type Event = TradingEvent;
     type Report = ExecutionReport;
+    type QueryResponse = QueryResponse;
 
     const APP_VERSION: u16 = 1;
 
@@ -60,9 +61,15 @@ impl Application for NoopApp {
     /// rejection reason — deliberately innocuous; real matching would
     /// pick a reason based on state, noop doesn't have state.
     #[inline]
-    fn apply(&mut self, event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
+    fn apply(
+        &mut self,
+        event: Self::Event,
+        _ctx: &ApplyCtx,
+        out: &mut Vec<Self::Report>,
+    ) -> Option<Self::QueryResponse> {
         self.events_applied = self.events_applied.wrapping_add(1);
         out.push(rejected_from_event(&event, EngineRejectReason::NoLiquidity));
+        None
     }
 
     /// Ticks advance the transport clock but noop has no scheduled tasks.

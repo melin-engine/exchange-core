@@ -21,7 +21,7 @@ use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
 use crate::{OutputPayload, OutputSlot};
-use melin_trading::types::ExecutionReport;
+use melin_trading::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
 
 use melin_protocol::codec;
@@ -229,12 +229,8 @@ pub fn run(
 
         // Encode and queue responses.
         for slot in &batch[..count] {
-            // `ExecutionReport::Stats` / `::Position` are internal
-            // variants the app emits from `apply`; translated here to
-            // the public wire responses so client-visible framing is
-            // identical to the pre-split server.
             let kind = match slot.payload {
-                OutputPayload::Report(ExecutionReport::Stats {
+                OutputPayload::QueryResponse(QueryResponse::Stats {
                     active_connections,
                     events_processed,
                     journal_sequence,
@@ -243,7 +239,7 @@ pub fn run(
                     events_processed,
                     journal_sequence,
                 },
-                OutputPayload::Report(ExecutionReport::Position {
+                OutputPayload::QueryResponse(QueryResponse::Position {
                     account,
                     balances,
                     count,

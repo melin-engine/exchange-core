@@ -151,13 +151,33 @@ pub trait Application: Sized {
     /// buffer allocation-free.
     type Report: Copy;
 
+    /// 1:1 query responses returned directly from [`apply`](Self::apply),
+    /// bypassing the fan-out scratch `Vec`. Routed through
+    /// `OutputPayload::QueryResponse` on the output ring.
+    ///
+    /// Separated from `Report` so that large query payloads (e.g. a
+    /// balance snapshot) don't inflate the per-element size of the
+    /// scratch vec on the hot path.
+    type QueryResponse: Copy;
+
     /// Apply a single event to the application state. Must be
     /// deterministic given `(self, event, ctx)`: replay depends on it.
     ///
     /// The implementation is free to read any field of `ctx`; the
     /// transport guarantees those fields reflect its live state at
     /// dispatch time.
-    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>);
+    ///
+    /// Fan-out reports (fills, acks, cancels) go into `out`. Query
+    /// responses that are always 1:1 with the input event (e.g.
+    /// position snapshots, stats) should be returned directly — the
+    /// transport writes them to the output ring without touching the
+    /// scratch vec, keeping the per-element size of `out` small.
+    fn apply(
+        &mut self,
+        event: Self::Event,
+        ctx: &ApplyCtx,
+        out: &mut Vec<Self::Report>,
+    ) -> Option<Self::QueryResponse>;
 
     /// Advance the application's wall-clock without applying a business
     /// event. The transport calls [`tick`](Application::tick) once per

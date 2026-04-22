@@ -299,7 +299,9 @@ fn replay_entry<A: Application>(
                 active_connections: 0,
                 events_processed: 0,
             };
-            app.apply(*e, &ctx, reports);
+            // Query response discarded during replay — these already
+            // went to the client when the event was first accepted.
+            let _ = app.apply(*e, &ctx, reports);
         }
         JournalEvent::Tick { now_ns } => {
             app.tick(*now_ns, reports);

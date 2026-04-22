@@ -1632,9 +1632,7 @@ fn report_order_id(report: &ExecutionReport) -> Option<OrderId> {
         | ExecutionReport::Replaced { order_id, .. }
         | ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
         ExecutionReport::Fill { taker_order_id, .. } => Some(*taker_order_id),
-        ExecutionReport::InstrumentStatusChanged { .. }
-        | ExecutionReport::Stats { .. }
-        | ExecutionReport::Position { .. } => None,
+        ExecutionReport::InstrumentStatusChanged { .. } => None,
     }
 }
 

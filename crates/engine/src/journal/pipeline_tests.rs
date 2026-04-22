@@ -1245,7 +1245,7 @@ mod tests {
         for _ in 0..1_000_000 {
             if let Some((_, slot)) = output.try_consume() {
                 match slot.payload {
-                    OutputPayload::Report(ExecutionReport::Stats { .. }) => got_stats = true,
+                    OutputPayload::QueryResponse(QueryResponse::Stats { .. }) => got_stats = true,
                     OutputPayload::BatchEnd => {
                         got_batch_end = true;
                         break;

@@ -19,12 +19,13 @@ use crate::journal::snapshot as engine_snapshot;
 use crate::le;
 use crate::trading_event::TradingEvent;
 use crate::types::{
-    AccountId, ExecutionReport, OrderId, RejectReason as EngineRejectReason, Symbol,
+    AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
 };
 
 impl Application for Exchange {
     type Event = TradingEvent;
     type Report = ExecutionReport;
+    type QueryResponse = QueryResponse;
 
     /// Schema version for the snapshot payload. Tracks the underlying
     /// `snapshot` module's `SNAP_VERSION` — any change there forces a
@@ -36,24 +37,48 @@ impl Application for Exchange {
     /// concrete `Exchange` method: the inner methods (`execute`, `cancel`,
     /// …) own the real work and keep their own inlining attrs.
     #[inline]
-    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
+    fn apply(
+        &mut self,
+        event: Self::Event,
+        ctx: &ApplyCtx,
+        out: &mut Vec<Self::Report>,
+    ) -> Option<Self::QueryResponse> {
         match event {
-            TradingEvent::AddInstrument { spec } => self.add_instrument(spec),
+            TradingEvent::AddInstrument { spec } => {
+                self.add_instrument(spec);
+                None
+            }
             TradingEvent::Deposit {
                 account,
                 currency,
                 amount,
-            } => self.deposit(account, currency, amount),
-            TradingEvent::SubmitOrder { symbol, order } => self.execute(symbol, order, out),
+            } => {
+                self.deposit(account, currency, amount);
+                None
+            }
+            TradingEvent::SubmitOrder { symbol, order } => {
+                self.execute(symbol, order, out);
+                None
+            }
             TradingEvent::CancelOrder {
                 symbol,
                 account,
                 order_id,
-            } => self.cancel(symbol, account, order_id, out),
-            TradingEvent::SetRiskLimits { symbol, limits } => self.set_risk_limits(symbol, limits),
-            TradingEvent::CancelAll { account } => self.cancel_all(account, out),
+            } => {
+                self.cancel(symbol, account, order_id, out);
+                None
+            }
+            TradingEvent::SetRiskLimits { symbol, limits } => {
+                self.set_risk_limits(symbol, limits);
+                None
+            }
+            TradingEvent::CancelAll { account } => {
+                self.cancel_all(account, out);
+                None
+            }
             TradingEvent::SetCircuitBreaker { symbol, config } => {
-                self.set_circuit_breaker(symbol, config)
+                self.set_circuit_breaker(symbol, config);
+                None
             }
             TradingEvent::CancelReplace {
                 symbol,
@@ -61,12 +86,17 @@ impl Application for Exchange {
                 order_id,
                 new_price,
                 new_quantity,
-            } => self.cancel_replace(symbol, account, order_id, new_price, new_quantity, out),
+            } => {
+                self.cancel_replace(symbol, account, order_id, new_price, new_quantity, out);
+                None
+            }
             TradingEvent::SetFeeSchedule { symbol, schedule } => {
-                self.set_fee_schedule(symbol, schedule, out)
+                self.set_fee_schedule(symbol, schedule, out);
+                None
             }
             TradingEvent::ProvisionAccount { account, amount } => {
-                self.provision_account(account, amount)
+                self.provision_account(account, amount);
+                None
             }
             TradingEvent::Withdraw {
                 account,
@@ -79,28 +109,41 @@ impl Application for Exchange {
                 // outcome recorded for the client; discarding here matches
                 // current pipeline behaviour (see pipeline.rs withdraw arm).
                 let _ = self.withdraw(account, currency, amount);
+                None
             }
-            TradingEvent::EndOfDay => self.end_of_day(out),
-            TradingEvent::DisableInstrument { symbol } => self.disable_instrument(symbol, out),
-            TradingEvent::EnableInstrument { symbol } => self.enable_instrument(symbol, out),
-            TradingEvent::RemoveInstrument { symbol } => self.remove_instrument(symbol, out),
+            TradingEvent::EndOfDay => {
+                self.end_of_day(out);
+                None
+            }
+            TradingEvent::DisableInstrument { symbol } => {
+                self.disable_instrument(symbol, out);
+                None
+            }
+            TradingEvent::EnableInstrument { symbol } => {
+                self.enable_instrument(symbol, out);
+                None
+            }
+            TradingEvent::RemoveInstrument { symbol } => {
+                self.remove_instrument(symbol, out);
+                None
+            }
             TradingEvent::QueryStats => {
                 // Read-only query: the transport owns the counters, so
                 // the app synthesises the report directly from the
                 // `ApplyCtx` it was handed. No `Exchange` state touched.
-                out.push(ExecutionReport::Stats {
+                Some(QueryResponse::Stats {
                     active_connections: ctx.active_connections,
                     events_processed: ctx.events_processed,
                     journal_sequence: ctx.journal_sequence,
-                });
+                })
             }
             TradingEvent::QueryPosition { account } => {
                 let (balances, count) = self.accounts().balances_for(account);
-                out.push(ExecutionReport::Position {
+                Some(QueryResponse::Position {
                     account,
                     balances,
                     count,
-                });
+                })
             }
         }
     }
