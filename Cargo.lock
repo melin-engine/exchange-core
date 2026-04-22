@@ -1728,6 +1728,7 @@ dependencies = [
  "melin-app",
  "melin-disruptor",
  "melin-journal",
+ "tempfile",
  "tracing",
 ]
 

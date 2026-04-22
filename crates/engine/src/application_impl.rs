@@ -22,6 +22,20 @@ use crate::types::{
     AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
 };
 
+// Hot-path size budget. Disruptor slots are copied by value on every
+// publish/consume — growing these silently would tax cache footprint
+// across the whole pipeline. A prior review caught `ExecutionReport`
+// ballooning from 64 B → 392 B via an inlined `Position` variant; these
+// assertions would have failed at compile time and tripped CI.
+// Numbers match the layout on x86_64 Linux; bump deliberately if a
+// genuine field addition requires it.
+const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 104);
+const _: () = assert!(
+    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 408
+);
+const _: () = assert!(size_of::<melin_journal::JournalEvent<TradingEvent>>() == 64);
+const _: () = assert!(size_of::<ExecutionReport>() == 64);
+
 impl Application for Exchange {
     type Event = TradingEvent;
     type Report = ExecutionReport;

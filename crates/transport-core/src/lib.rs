@@ -19,4 +19,7 @@ pub mod journaled_app;
 pub mod pipeline;
 pub mod snapshot;
 
+#[cfg(test)]
+mod test_support;
+
 pub use journaled_app::{JournaledApp, JournaledAppError};

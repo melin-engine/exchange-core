@@ -30,3 +30,6 @@ tracing = { workspace = true }
 melin-app = { path = "../app" }
 melin-disruptor = { path = "../disruptor" }
 melin-journal = { path = "../journal" }
+
+[dev-dependencies]
+tempfile = "3"

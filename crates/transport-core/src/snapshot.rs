@@ -203,3 +203,180 @@ pub fn load<A: Application>(path: &Path) -> Result<(A, u64, [u8; 32]), SnapshotE
 
     Ok((app, sequence, chain_hash))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestApp;
+    use std::fs::OpenOptions;
+
+    /// Build a syntactically-valid snapshot byte vector with caller-chosen
+    /// header fields and trailing app payload. Used by negative-path tests
+    /// so each test can vary exactly one field while the CRC stays correct
+    /// (i.e. the failure must come from the semantic check, not the CRC).
+    fn craft_snapshot(
+        magic: u32,
+        transport_version: u16,
+        app_version: u16,
+        sequence: u64,
+        chain_hash: [u8; 32],
+        app_payload: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(HEADER_SIZE + app_payload.len() + CRC_SIZE);
+        buf.extend_from_slice(&magic.to_le_bytes());
+        buf.extend_from_slice(&transport_version.to_le_bytes());
+        buf.extend_from_slice(&app_version.to_le_bytes());
+        buf.extend_from_slice(&sequence.to_le_bytes());
+        buf.extend_from_slice(&chain_hash);
+        buf.extend_from_slice(app_payload);
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    fn populated_app() -> TestApp {
+        let mut a = TestApp::new();
+        a.total = 12_345;
+        a.ticks = 7;
+        a.key_hwm.insert(0xAA, 1);
+        a.key_hwm.insert(0xBB, 42);
+        a
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let app = populated_app();
+        let chain = [0xCDu8; 32];
+        save::<TestApp>(&app, 999, chain, &path).unwrap();
+
+        let (restored, seq, ch) = load::<TestApp>(&path).unwrap();
+        assert_eq!(seq, 999);
+        assert_eq!(ch, chain);
+        assert_eq!(restored, app);
+    }
+
+    #[test]
+    fn bad_magic_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let bytes = craft_snapshot(
+            0xDEAD_BEEF,
+            TRANSPORT_VERSION,
+            TestApp::APP_VERSION,
+            0,
+            [0u8; 32],
+            &[0u8; 20], // arbitrary payload, matches restore requirements minus dedup map
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::BadMagic) => {}
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_transport_version_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        let bytes = craft_snapshot(
+            SNAP_MAGIC,
+            999,
+            TestApp::APP_VERSION,
+            0,
+            [0u8; 32],
+            &[0u8; 20],
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::UnsupportedTransportVersion(999)) => {}
+            other => panic!("expected UnsupportedTransportVersion(999), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_app_version_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        // Use a valid TestApp payload (so restore would otherwise succeed)
+        // and set the header's app_version to a different value.
+        let mut payload = Vec::new();
+        populated_app().snapshot(&mut payload).unwrap();
+        let bytes = craft_snapshot(
+            SNAP_MAGIC,
+            TRANSPORT_VERSION,
+            TestApp::APP_VERSION + 1,
+            0,
+            [0u8; 32],
+            &payload,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::UnsupportedAppVersion(v)) if v == TestApp::APP_VERSION + 1 => {}
+            other => panic!("expected UnsupportedAppVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checksum_mismatch_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        save::<TestApp>(&populated_app(), 0, [0u8; 32], &path).unwrap();
+        // Flip one bit inside the payload region (after the header, before
+        // the trailing CRC). The mutated byte recomputes to a different
+        // CRC than the one written at save time.
+        let bytes = std::fs::read(&path).unwrap();
+        let mut mutated = bytes.clone();
+        let idx = HEADER_SIZE + 1;
+        mutated[idx] ^= 0xFF;
+        std::fs::write(&path, &mutated).unwrap();
+
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::ChecksumMismatch { .. }) => {}
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        // Anything shorter than HEADER_SIZE + CRC_SIZE trips the truncation
+        // guard before CRC/magic are consulted.
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&[0u8; HEADER_SIZE + CRC_SIZE - 1]).unwrap();
+        drop(f);
+
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_large_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap");
+        // Sparse file one byte larger than the cap — set_len avoids
+        // actually writing 256 MiB to disk.
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(MAX_SNAPSHOT_SIZE + 1).unwrap();
+        drop(f);
+
+        match load::<TestApp>(&path) {
+            Err(SnapshotError::TooLarge(size)) if size == MAX_SNAPSHOT_SIZE + 1 => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+}
