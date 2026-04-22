@@ -7,11 +7,12 @@
 //! matching engine (`melin-engine`) is one such application, the no-op
 //! demonstration (`melin-noop`) is another.
 //!
-//! Snapshot framing and the `JournaledExchange`-style synchronous
-//! wrappers still live with the concrete application (in `melin-engine`)
-//! because they're entangled with Exchange internals; this crate stays
-//! focused on the hot-path disruptor + journal fan-out that any
-//! application plugs into.
+//! Also owns the application-generic snapshot framing (`snapshot::{save,
+//! load}`) and the `JournaledApp<A>` lifecycle wrapper (create / recover /
+//! recover_from_snapshot / rotate) that composes a journal writer with an
+//! application state machine. The application supplies only the payload
+//! bytes via `Application::{snapshot, restore}`; the framing (magic,
+//! versions, sequence, chain hash, CRC) lives here.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
