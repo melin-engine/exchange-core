@@ -1577,6 +1577,7 @@ dependencies = [
  "melin-disruptor",
  "melin-journal",
  "melin-trading",
+ "melin-transport-core",
  "proptest",
  "rustc-hash",
  "tempfile",
@@ -1699,6 +1700,18 @@ name = "melin-trading"
 version = "0.1.0"
 dependencies = [
  "melin-app",
+]
+
+[[package]]
+name = "melin-transport-core"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "melin-app",
+ "melin-disruptor",
+ "melin-journal",
+ "tracing",
 ]
 
 [[package]]
