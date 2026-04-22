@@ -15,8 +15,8 @@ use tracing::{error, info};
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
 use melin_engine::exchange::Exchange;
+use melin_engine::journal::InputSlot;
 use melin_engine::journal::JournalEvent;
-use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::snapshot;
 use melin_engine::types::ExecutionReport;
 

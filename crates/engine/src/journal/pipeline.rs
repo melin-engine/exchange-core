@@ -22,12 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::exchange::Exchange;
-use crate::journal::JournalEvent;
-use crate::journal::JournalWriter;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
-use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason, Symbol};
-use melin_app::{Application, ApplyCtx};
+use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::JournalError;
 use melin_journal::trace::{TraceTimestamp, trace_ts};
 
@@ -119,12 +115,12 @@ const MAX_MATCHING_BATCH: usize = 16;
 
 /// Slot in the input disruptor ring buffer.
 ///
-/// Carries a connection ID alongside the event so the response stage knows
-/// where to route execution reports. `Copy` for zero-cost ring buffer ops.
-/// ~88 bytes: connection_id(8) + key_hash(8) + request_seq(8) + sequence(8)
-/// + timestamp_ns(8) + JournalEvent(~60) + padding.
+/// Carries a connection ID alongside the event so the response stage
+/// knows where to route execution reports. `Copy` for zero-cost ring
+/// buffer ops. Generic over `E: AppEvent` — the concrete engine crate
+/// aliases this to `InputSlot<TradingEvent>`.
 #[derive(Debug, Clone, Copy)]
-pub struct InputSlot {
+pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
     /// FxHash of the client's Ed25519 public key. Used with `request_seq`
@@ -139,15 +135,14 @@ pub struct InputSlot {
     /// across an external counter. On replicas the replication receiver
     /// stamps the primary's sequence here before publishing, and the
     /// journal stage uses that value verbatim. Also zero for non-journaled
-    /// events (QueryStats, QueryPosition) which are skipped by the
-    /// JournalStage.
+    /// events (queries) which the journal stage skips.
     pub sequence: u64,
     /// Wall-clock timestamp (nanoseconds since epoch), assigned at
     /// publish time alongside the sequence. Zero only for non-journaled
-    /// events (QueryStats, QueryPosition).
+    /// events (queries).
     pub timestamp_ns: u64,
     /// The journaled event (order submit, cancel, etc.).
-    pub event: JournalEvent,
+    pub event: melin_journal::JournalEvent<E>,
     /// Timestamp when the publisher wrote this slot to the disruptor.
     /// `()` (zero-sized) when `latency-trace` is disabled.
     pub publish_ts: TraceTimestamp,
@@ -157,22 +152,19 @@ pub struct InputSlot {
     pub recv_ts: TraceTimestamp,
 }
 
-impl Default for InputSlot {
+impl<E: AppEvent> Default for InputSlot<E> {
     fn default() -> Self {
-        // Default uses a zero-cost Deposit event as placeholder.
-        // Ring buffer slots are always overwritten before being read,
-        // so the default value is never observed.
+        // Default uses a transport-intrinsic `Tick` as placeholder — it
+        // works for any `E` without requiring `E: Default`. Ring buffer
+        // slots are always overwritten before being read, so the default
+        // value is never observed in steady state.
         Self {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
-                account: crate::types::AccountId(0),
-                currency: crate::types::CurrencyId(0),
-                amount: 0,
-            }),
+            event: melin_journal::JournalEvent::Tick { now_ns: 0 },
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         }
@@ -185,7 +177,7 @@ impl Default for InputSlot {
 /// for a specific connection, plus the input sequence it originated from
 /// so the response stage can gate on journal completion.
 #[derive(Debug, Clone, Copy)]
-pub struct OutputSlot {
+pub struct OutputSlot<R: Copy> {
     /// Which client connection receives this response.
     pub connection_id: u64,
     /// Input disruptor sequence this output originated from.
@@ -193,7 +185,7 @@ pub struct OutputSlot {
     /// has advanced past this value (i.e., the event is durable).
     pub input_seq: u64,
     /// The response payload.
-    pub payload: OutputPayload,
+    pub payload: OutputPayload<R>,
     /// Timestamp when the matching stage finished processing this event.
     /// `()` (zero-sized) when `latency-trace` is disabled.
     pub match_complete_ts: TraceTimestamp,
@@ -205,29 +197,28 @@ pub struct OutputSlot {
 
 /// Payload within an output slot.
 ///
-/// `ExecutionReport::Position` (≈320 bytes) dominates the enum size, but
-/// `OutputPayload` must be `Copy` for zero-allocation ring buffer
-/// transport. Boxing would add heap indirection on the hot path; position
-/// queries are infrequent (operator/trader initiated), so the per-slot
-/// overhead is acceptable.
+/// Generic over the application's report type `R`. Must remain `Copy`
+/// for zero-allocation ring buffer transport. Large-report variants
+/// (e.g. the trading engine's balance snapshot) dominate the enum size
+/// when they exist; boxing would add heap indirection on the hot path,
+/// and such large reports are rare enough that the per-slot overhead is
+/// acceptable.
 ///
-/// Prior versions of this enum carried `StatsHeader` and `PositionSnapshot`
-/// variants directly. After the transport/app split those live inside
-/// [`ExecutionReport`] (the app emits them via `Application::apply`) and
-/// the response stage translates them back to the public wire variants
-/// `ResponseKind::StatsHeader` / `ResponseKind::PositionSnapshot`.
+/// Prior versions carried app-specific query variants directly; those
+/// now live inside the app's `Report` type and the response stage
+/// translates them back to public wire variants where needed.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
-pub enum OutputPayload {
-    /// An execution report from matching.
-    Report(ExecutionReport),
+pub enum OutputPayload<R: Copy> {
+    /// An application report from matching.
+    Report(R),
     /// Signals the end of reports for one request.
     BatchEnd,
     /// Internal error during matching.
     EngineError,
 }
 
-impl Default for OutputSlot {
+impl<R: Copy> Default for OutputSlot<R> {
     fn default() -> Self {
         Self {
             connection_id: 0,
@@ -250,9 +241,9 @@ impl Default for OutputSlot {
 /// each encoded batch to the replication sender thread via a bounded
 /// channel. The bytes are identical to what was written to disk — same
 /// sequences, timestamps, CRC checksums, and checkpoint entries.
-pub struct JournalStage {
-    writer: JournalWriter,
-    consumer: ring::Consumer<InputSlot>,
+pub struct JournalStage<E: AppEvent> {
+    writer: melin_journal::JournalWriter<E>,
+    consumer: ring::Consumer<InputSlot<E>>,
     /// Group commit coalescing window. The journal stage waits up to this
     /// duration after the first unsynced write before issuing the durable
     /// write, allowing more events to accumulate in the batch. At high
@@ -306,7 +297,7 @@ impl Default for ReplicationState {
     }
 }
 
-impl JournalStage {
+impl<E: AppEvent> JournalStage<E> {
     /// Create a new journal stage.
     ///
     /// `group_commit_delay`: coalescing window for sync batching. The
@@ -314,8 +305,8 @@ impl JournalStage {
     /// issuing the durable write. Zero means sync immediately after each
     /// batch read.
     pub fn new(
-        writer: JournalWriter,
-        consumer: ring::Consumer<InputSlot>,
+        writer: melin_journal::JournalWriter<E>,
+        consumer: ring::Consumer<InputSlot<E>>,
         group_commit_delay: Duration,
         max_batch: usize,
         busy_spin: bool,
@@ -370,7 +361,7 @@ impl JournalStage {
     pub fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<JournalWriter, JournalError> {
+    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
         let use_uring = !cfg!(feature = "no-persist");
 
         if use_uring {
@@ -389,7 +380,7 @@ impl JournalStage {
     fn run_sync(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<JournalWriter, JournalError> {
+    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -476,16 +467,10 @@ impl JournalStage {
                 #[cfg(not(feature = "no-persist"))]
                 {
                     for slot in &batch[..count] {
-                        if matches!(
-                            slot.event,
-                            JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-                                | JournalEvent::App(
-                                    crate::trading_event::TradingEvent::QueryPosition { .. }
-                                )
-                        ) {
+                        if slot.event.is_query() {
                             continue;
                         }
-                        if let JournalEvent::Checkpoint {
+                        if let melin_journal::JournalEvent::Checkpoint {
                             #[cfg(feature = "hash-chain")]
                             chain_hash,
                             ..
@@ -674,7 +659,7 @@ impl JournalStage {
     }
 
     /// Drain any remaining entries from the ring buffer on shutdown.
-    fn drain_remaining(&mut self, batch: &mut [InputSlot]) {
+    fn drain_remaining(&mut self, batch: &mut [InputSlot<E>]) {
         loop {
             let count = self.consumer.read_batch(batch, MAX_JOURNAL_BATCH);
             if count == 0 {
@@ -683,16 +668,10 @@ impl JournalStage {
             #[cfg(not(feature = "no-persist"))]
             {
                 for slot in &batch[..count] {
-                    if matches!(
-                        slot.event,
-                        JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-                            | JournalEvent::App(
-                                crate::trading_event::TradingEvent::QueryPosition { .. }
-                            )
-                    ) {
+                    if slot.event.is_query() {
                         continue;
                     }
-                    if let JournalEvent::Checkpoint {
+                    if let melin_journal::JournalEvent::Checkpoint {
                         #[cfg(feature = "hash-chain")]
                         chain_hash,
                         ..
@@ -757,7 +736,7 @@ impl JournalStage {
     fn run_uring(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<JournalWriter, JournalError> {
+    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
         use io_uring::{IoUring, opcode, types};
         use std::time::Instant;
 
@@ -878,16 +857,10 @@ impl JournalStage {
                 busy_count += 1;
 
                 for slot in &batch[..count] {
-                    if matches!(
-                        slot.event,
-                        JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-                            | JournalEvent::App(
-                                crate::trading_event::TradingEvent::QueryPosition { .. }
-                            )
-                    ) {
+                    if slot.event.is_query() {
                         continue;
                     }
-                    if let JournalEvent::Checkpoint {
+                    if let melin_journal::JournalEvent::Checkpoint {
                         #[cfg(feature = "hash-chain")]
                         chain_hash,
                         ..
@@ -1077,10 +1050,10 @@ impl JournalStage {
 ///
 /// Runs on a dedicated OS thread. Does NOT wait for journal sync —
 /// the persist-before-ack check happens in the response stage.
-pub struct MatchingStage {
-    exchange: Exchange,
-    consumer: ring::Consumer<InputSlot>,
-    output: ring::Producer<OutputSlot>,
+pub struct MatchingStage<A: Application> {
+    app: A,
+    consumer: ring::Consumer<InputSlot<A::Event>>,
+    output: ring::Producer<OutputSlot<A::Report>>,
     /// Monotonically increasing count of events processed. Relaxed ordering
     /// is sufficient — this is a diagnostic counter, not a synchronization
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
@@ -1109,12 +1082,12 @@ pub struct MatchingStage {
     last_drain_ns: u64,
 }
 
-impl MatchingStage {
+impl<A: Application> MatchingStage<A> {
     /// Create a new matching stage.
     pub fn new(
-        exchange: Exchange,
-        consumer: ring::Consumer<InputSlot>,
-        output: ring::Producer<OutputSlot>,
+        app: A,
+        consumer: ring::Consumer<InputSlot<A::Event>>,
+        output: ring::Producer<OutputSlot<A::Report>>,
         events_processed: Arc<AtomicU64>,
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
@@ -1122,7 +1095,7 @@ impl MatchingStage {
         busy_spin: bool,
     ) -> Self {
         Self {
-            exchange,
+            app,
             consumer,
             output,
             events_processed,
@@ -1148,74 +1121,6 @@ impl MatchingStage {
             .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
     }
 
-    /// Extract the order ID from the event for reject reports, or OrderId(0) if N/A.
-    fn extract_order_id(event: &JournalEvent) -> OrderId {
-        match event {
-            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
-                order, ..
-            }) => order.id,
-            JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
-                order_id, ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
-                order_id,
-                ..
-            }) => *order_id,
-            _ => OrderId(0),
-        }
-    }
-
-    /// Extract the account ID from the event for reject reports, or AccountId(0) if N/A.
-    fn extract_account_id(event: &JournalEvent) -> AccountId {
-        match event {
-            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
-                order, ..
-            }) => order.account,
-            JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
-                account, ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::CancelAll { account })
-            | JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
-                account,
-                ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::Deposit { account, .. })
-            | JournalEvent::App(crate::trading_event::TradingEvent::Withdraw { account, .. })
-            | JournalEvent::App(crate::trading_event::TradingEvent::ProvisionAccount {
-                account,
-                ..
-            }) => *account,
-            _ => AccountId(0),
-        }
-    }
-
-    /// Extract the symbol from the event for reject reports, or Symbol(0) if N/A.
-    fn extract_symbol(event: &JournalEvent) -> Symbol {
-        match event {
-            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
-                symbol, ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
-                symbol, ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
-                symbol, ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::SetRiskLimits {
-                symbol, ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::SetCircuitBreaker {
-                symbol,
-                ..
-            })
-            | JournalEvent::App(crate::trading_event::TradingEvent::SetFeeSchedule {
-                symbol,
-                ..
-            }) => *symbol,
-            _ => Symbol(0),
-        }
-    }
-
     /// Run the matching stage loop. Blocks until shutdown.
     ///
     /// Uses small-batch consumption from the disruptor to amortize the
@@ -1223,13 +1128,13 @@ impl MatchingStage {
     /// per event. Events are still processed sequentially — only the
     /// disruptor I/O is batched.
     ///
-    /// Returns the `Exchange` on shutdown for potential snapshot saving.
-    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> Exchange {
+    /// Returns the application on shutdown for potential snapshot saving.
+    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> A {
         // Pre-allocated report buffer, reused across commands.
         // Pre-allocate with generous capacity. A market order sweeping many
         // price levels can produce one Fill per level + Placed/Cancelled. 256
         // avoids mid-hot-path reallocation for all but extreme scenarios.
-        let mut reports: Vec<ExecutionReport> = Vec::with_capacity(256);
+        let mut reports: Vec<A::Report> = Vec::with_capacity(256);
         // Spin count for adaptive wait: spin first (fast wakeup), then yield
         // to the OS scheduler (prevents the kernel from aggressively preempting
         // this thread during busy periods). 1000 spins ≈ 1µs at ~1ns/spin,
@@ -1237,10 +1142,11 @@ impl MatchingStage {
         let mut idle_spins: u32 = 0;
         // Thread-local events counter — plain u64 increment (~0.3ns) instead
         // of atomic fetch_add (~5-8ns). Flushed to the shared Arc<AtomicU64>
-        // once per batch, on QueryStats, and on shutdown.
+        // once per batch and on shutdown.
         let mut local_events: u64 = 0;
 
-        let mut batch = [InputSlot::default(); MAX_MATCHING_BATCH];
+        let mut batch: [InputSlot<A::Event>; MAX_MATCHING_BATCH] =
+            [InputSlot::default(); MAX_MATCHING_BATCH];
 
         let mut busy_count: u64 = 0;
         let mut idle_count: u64 = 0;
@@ -1268,7 +1174,7 @@ impl MatchingStage {
                 }
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
-                return self.exchange;
+                return self.app;
             }
 
             let batch_start = self.consumer.next_read();
@@ -1316,27 +1222,22 @@ impl MatchingStage {
                 // actually useful for operators monitoring the outage).
                 let is_query = slot.event.is_query();
                 if !is_query && self.is_halted() {
-                    reports.push(ExecutionReport::Rejected {
-                        order_id: Self::extract_order_id(&slot.event),
-                        symbol: Self::extract_symbol(&slot.event),
-                        account: Self::extract_account_id(&slot.event),
-                        reason: RejectReason::ReplicaDisconnected,
-                    });
-                } else if !is_query
-                    && !self
-                        .exchange
-                        .check_request_seq(slot.key_hash, slot.request_seq)
+                    // Only app events produce client-facing rejections;
+                    // transport variants (Tick, GenesisHash, Checkpoint)
+                    // have no client to reject to, so they silently
+                    // skip during halt.
+                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
+                        reports.push(A::build_reject(e, RejectReason::ReplicaDisconnected));
+                    }
+                } else if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq)
                 {
-                    // Duplicate request — produce Rejected response.
-                    // Use OrderId(0) and AccountId(0) as placeholders
-                    // since we don't parse the specific order/account
-                    // from the slot.
-                    reports.push(ExecutionReport::Rejected {
-                        order_id: OrderId(0),
-                        symbol: Symbol(0),
-                        account: AccountId(0),
-                        reason: RejectReason::DuplicateRequest,
-                    });
+                    // Duplicate request — produce a Rejected report for
+                    // the app event; transport variants don't go through
+                    // dedup (they use `key_hash == 0` which the app
+                    // exempts).
+                    if let melin_journal::JournalEvent::App(ref e) = slot.event {
+                        reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
+                    }
                 } else {
                     self.process_event(slot, &mut reports);
                 }
@@ -1384,41 +1285,29 @@ impl MatchingStage {
     /// Drain any remaining entries from the ring buffer on shutdown,
     /// processing each and publishing responses. Ensures every journaled
     /// event gets a matching response sent to the client.
-    fn drain_remaining(&mut self, reports: &mut Vec<ExecutionReport>) {
+    fn drain_remaining(&mut self, reports: &mut Vec<A::Report>) {
         loop {
             let entry = self.consumer.try_consume();
             let Some((input_seq, slot)) = entry else {
                 break;
             };
-            // Read-only queries are meaningless during shutdown — skip to avoid
-            // emitting a bare BatchEnd without a preceding response.
-            if matches!(
-                slot.event,
-                JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-                    | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. })
-            ) {
+            // Read-only queries are meaningless during shutdown — skip
+            // to avoid emitting a bare BatchEnd without a preceding
+            // response.
+            if slot.event.is_query() {
                 continue;
             }
             reports.clear();
 
             // Halt check first, then dedup (same order as the main run loop).
             if self.is_halted() {
-                reports.push(ExecutionReport::Rejected {
-                    order_id: Self::extract_order_id(&slot.event),
-                    symbol: Self::extract_symbol(&slot.event),
-                    account: Self::extract_account_id(&slot.event),
-                    reason: RejectReason::ReplicaDisconnected,
-                });
-            } else if !self
-                .exchange
-                .check_request_seq(slot.key_hash, slot.request_seq)
-            {
-                reports.push(ExecutionReport::Rejected {
-                    order_id: OrderId(0),
-                    symbol: Symbol(0),
-                    account: AccountId(0),
-                    reason: RejectReason::DuplicateRequest,
-                });
+                if let melin_journal::JournalEvent::App(ref e) = slot.event {
+                    reports.push(A::build_reject(e, RejectReason::ReplicaDisconnected));
+                }
+            } else if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
+                if let melin_journal::JournalEvent::App(ref e) = slot.event {
+                    reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
+                }
             } else {
                 self.process_event(&slot, reports);
             }
@@ -1453,7 +1342,7 @@ impl MatchingStage {
     /// dispatch, freeing the pipeline from knowing anything about
     /// trading semantics. `#[inline]` on `Exchange::apply` + fat LTO
     /// keep the hot path zero-cost.
-    fn process_event(&mut self, slot: &InputSlot, reports: &mut Vec<ExecutionReport>) {
+    fn process_event(&mut self, slot: &InputSlot<A::Event>, reports: &mut Vec<A::Report>) {
         // Hybrid scheduler clock: every event with a non-zero, monotonic
         // timestamp drives the scheduler forward. Under load this fires
         // due tasks at every-event resolution (microseconds) without
@@ -1462,11 +1351,11 @@ impl MatchingStage {
         // with an earlier timestamp than its predecessor.
         if slot.timestamp_ns > self.last_drain_ns {
             self.last_drain_ns = slot.timestamp_ns;
-            <Exchange as Application>::tick(&mut self.exchange, slot.timestamp_ns, reports);
+            self.app.tick(slot.timestamp_ns, reports);
         }
 
         match slot.event {
-            JournalEvent::App(event) => {
+            melin_journal::JournalEvent::App(event) => {
                 // Transport-owned context the app can read during apply
                 // (lets queries surface StatsHeader-equivalent data
                 // without the transport pattern-matching app variants).
@@ -1478,9 +1367,9 @@ impl MatchingStage {
                     active_connections: self.active_connections.load(Ordering::Relaxed),
                     events_processed: self.events_processed.load(Ordering::Relaxed),
                 };
-                <Exchange as Application>::apply(&mut self.exchange, event, &ctx, reports);
+                self.app.apply(event, &ctx, reports);
             }
-            JournalEvent::Tick { now_ns } => {
+            melin_journal::JournalEvent::Tick { now_ns } => {
                 // Defensive: the head-of-event drain has already advanced
                 // the clock to `slot.timestamp_ns`, which equals `now_ns`
                 // for tick-generator-published slots — so this call is
@@ -1488,9 +1377,10 @@ impl MatchingStage {
                 // `slot.timestamp_ns` is 0 (tests, manually constructed
                 // Ticks) so time still advances as documented on
                 // `JournalEvent::Tick`.
-                <Exchange as Application>::tick(&mut self.exchange, now_ns, reports);
+                self.app.tick(now_ns, reports);
             }
-            JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
+            melin_journal::JournalEvent::GenesisHash { .. }
+            | melin_journal::JournalEvent::Checkpoint { .. } => {
                 // Hash chain metadata — journal internal, never reaches
                 // the application.
             }
@@ -1526,11 +1416,11 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// (and replication cursor when active) instead.
 ///
 /// Assembled pipeline stages and handles returned by [`build_pipeline_with_replication`].
-pub struct Pipeline {
-    pub input_producer: ring::MultiProducer<InputSlot>,
-    pub journal_stage: JournalStage,
-    pub matching_stage: MatchingStage,
-    pub output_consumers: Vec<ring::Consumer<OutputSlot>>,
+pub struct Pipeline<A: Application> {
+    pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
+    pub journal_stage: JournalStage<A::Event>,
+    pub matching_stage: MatchingStage<A>,
+    pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report>>>,
     pub journal_cursor: Arc<Sequence>,
     pub matching_cursor: Arc<Sequence>,
     pub events_processed: Arc<AtomicU64>,
@@ -1538,20 +1428,20 @@ pub struct Pipeline {
     pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
     pub replication_cursor: Arc<AtomicU64>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
-    pub shadow_consumer: Option<ring::Consumer<InputSlot>>,
+    pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
 }
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
-pub struct ReplicaPipeline {
-    pub input_producer: ring::MultiProducer<InputSlot>,
-    pub journal_stage: JournalStage,
-    pub matching_stage: MatchingStage,
-    pub drain_consumer: ring::Consumer<OutputSlot>,
+pub struct ReplicaPipeline<A: Application> {
+    pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
+    pub journal_stage: JournalStage<A::Event>,
+    pub matching_stage: MatchingStage<A>,
+    pub drain_consumer: ring::Consumer<OutputSlot<A::Report>>,
     pub journal_cursor: Arc<Sequence>,
     pub matching_cursor: Arc<Sequence>,
-    pub shadow_consumer: Option<ring::Consumer<InputSlot>>,
+    pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
 }
 
@@ -1593,9 +1483,9 @@ pub struct ReplicationRingProgress {
 
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
 #[allow(clippy::too_many_arguments)]
-pub fn build_pipeline_with_replication(
-    exchange: Exchange,
-    writer: JournalWriter,
+pub fn build_pipeline_with_replication<A>(
+    app: A,
+    writer: melin_journal::JournalWriter<A::Event>,
     group_commit_delay: Duration,
     active_connections: Arc<AtomicU64>,
     enable_replication: bool,
@@ -1604,7 +1494,12 @@ pub fn build_pipeline_with_replication(
     busy_spin: bool,
     enable_event_publisher: bool,
     enable_shadow: bool,
-) -> Pipeline {
+) -> Pipeline<A>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + 'static,
+    A::Report: Send + 'static,
+{
     // Input disruptor. Steady-state producer is a single thread (the
     // ingress thread on primaries, which also emits ticks; the
     // replication receiver on replicas). The seed loop publishes via a
@@ -1615,7 +1510,7 @@ pub fn build_pipeline_with_replication(
     // and to leave room for future multi-queue ingress. When shadow
     // snapshots are enabled, a third consumer is chained after journal
     // (consumer 0) — it only sees events that have been durably fsynced.
-    let mut builder = ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
+    let mut builder = ring::DisruptorBuilder::<InputSlot<A::Event>>::new(INPUT_RING_CAPACITY)
         .add_consumer() // consumer 0: journal, gated on producer
         .add_consumer(); // consumer 1: matching, gated on producer (parallel)
     if enable_shadow {
@@ -1650,7 +1545,7 @@ pub fn build_pipeline_with_replication(
     // Single producer, N consumers (1 = response only, 2 = response + event publisher).
     // Uses the same ring::Producer/Consumer API as the input disruptor.
     let mut output_builder =
-        ring::DisruptorBuilder::<OutputSlot>::new(OUTPUT_RING_CAPACITY).add_consumer(); // consumer 0: response stage
+        ring::DisruptorBuilder::<OutputSlot<A::Report>>::new(OUTPUT_RING_CAPACITY).add_consumer(); // consumer 0: response stage
     if enable_event_publisher {
         output_builder = output_builder.add_consumer(); // consumer 1: event publisher
     }
@@ -1735,8 +1630,8 @@ pub fn build_pipeline_with_replication(
         None
     };
 
-    let matching_stage = MatchingStage::new(
-        exchange,
+    let matching_stage = MatchingStage::<A>::new(
+        app,
         matching_consumer,
         output_producer,
         Arc::clone(&events_processed),
@@ -1785,16 +1680,21 @@ pub fn build_pipeline_with_replication(
 /// events) but not byte-identical (each node stamps its own wall-clock
 /// on the batch when `slot.sequence == 0`, and checkpoint timing may
 /// vary after journal rotation).
-pub fn build_replica_pipeline(
-    exchange: Exchange,
-    writer: JournalWriter,
+pub fn build_replica_pipeline<A>(
+    app: A,
+    writer: melin_journal::JournalWriter<A::Event>,
     max_journal_batch: usize,
     busy_spin: bool,
     enable_shadow: bool,
-) -> ReplicaPipeline {
+) -> ReplicaPipeline<A>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + 'static,
+    A::Report: Send + 'static,
+{
     // Input disruptor: same topology as primary (journal + matching in parallel,
     // optional shadow gated on journal).
-    let mut builder = ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
+    let mut builder = ring::DisruptorBuilder::<InputSlot<A::Event>>::new(INPUT_RING_CAPACITY)
         .add_consumer() // consumer 0: journal
         .add_consumer(); // consumer 1: matching (parallel)
     if enable_shadow {
@@ -1815,7 +1715,7 @@ pub fn build_replica_pipeline(
 
     // Output disruptor: single drain consumer (no response stage on replica).
     let output_builder =
-        ring::DisruptorBuilder::<OutputSlot>::new(OUTPUT_RING_CAPACITY).add_consumer();
+        ring::DisruptorBuilder::<OutputSlot<A::Report>>::new(OUTPUT_RING_CAPACITY).add_consumer();
     let (output_producer, mut output_consumers) = output_builder.build();
     let drain_consumer = output_consumers.pop().expect("drain consumer");
 
@@ -1843,8 +1743,8 @@ pub fn build_replica_pipeline(
     // Matching stage: same as primary but with no replicas_connected check
     // (None = standalone mode, never halts on replica disconnect).
     let active_connections = Arc::new(AtomicU64::new(0));
-    let matching_stage = MatchingStage::new(
-        exchange,
+    let matching_stage = MatchingStage::<A>::new(
+        app,
         matching_consumer,
         output_producer,
         Arc::clone(&events_processed),
@@ -1868,8 +1768,16 @@ pub fn build_replica_pipeline(
 
 #[cfg(test)]
 mod tests {
+    // `super::*` brings in the generic `InputSlot<E>`, `OutputSlot<R>`,
+    // `OutputPayload<R>`, and `melin_app::RejectReason`. We override
+    // each with the trading-bound alias / trading enum the tests
+    // actually operate on — these live in `crate::journal` and
+    // `crate::types` respectively.
     use super::*;
+    use crate::exchange::Exchange;
     use crate::journal::replication::REPLICATION_RING_CAPACITY;
+    use crate::journal::{InputSlot, JournalEvent, JournalWriter, OutputPayload, OutputSlot};
+    use crate::types::RejectReason;
     use crate::types::*;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

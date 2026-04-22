@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_disruptor::ring;
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
+use melin_engine::journal::{OutputPayload, OutputSlot};
 use melin_engine::types::{ExecutionReport, Symbol};
 use melin_market_data::mirror::BookMirror;
 use melin_protocol::auth::AuthorizedKeys;
@@ -554,7 +554,7 @@ fn send_auth_failed(writer: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_engine::journal::pipeline::OutputSlot;
+    use melin_engine::journal::OutputSlot;
     use melin_engine::types::*;
 
     /// Helper to create a Streaming subscriber for tests that bypass

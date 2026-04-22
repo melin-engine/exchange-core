@@ -1062,7 +1062,7 @@ pub fn run_receiver_dpdk(
             .name("drain".into())
             .spawn(move || {
                 let mut consumer = drain_consumer;
-                let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+                let mut batch = vec![melin_engine::journal::OutputSlot::default(); 256];
                 loop {
                     if ps.load(Ordering::Relaxed) {
                         return;

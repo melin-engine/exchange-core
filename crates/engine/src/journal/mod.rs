@@ -22,6 +22,17 @@ pub type JournalEntry = melin_journal::JournalEntry<crate::trading_event::Tradin
 pub type JournalReader = melin_journal::JournalReader<crate::trading_event::TradingEvent>;
 pub type JournalWriter = melin_journal::JournalWriter<crate::trading_event::TradingEvent>;
 
+/// Trading-bound aliases for the generic pipeline types. Server/bench
+/// callers use these so they never have to spell `<Exchange>` or
+/// `<TradingEvent>` explicitly.
+pub type InputSlot = pipeline::InputSlot<crate::trading_event::TradingEvent>;
+pub type OutputSlot = pipeline::OutputSlot<crate::types::ExecutionReport>;
+pub type OutputPayload = pipeline::OutputPayload<crate::types::ExecutionReport>;
+pub type Pipeline = pipeline::Pipeline<crate::exchange::Exchange>;
+pub type ReplicaPipeline = pipeline::ReplicaPipeline<crate::exchange::Exchange>;
+pub type MatchingStage = pipeline::MatchingStage<crate::exchange::Exchange>;
+pub type JournalStage = pipeline::JournalStage<crate::trading_event::TradingEvent>;
+
 pub use melin_journal::{
     AsyncWriteBatch, CHECKPOINT_INTERVAL, JournalError, RawJournalScanner, codec, replication,
     trace, wall_clock_nanos,

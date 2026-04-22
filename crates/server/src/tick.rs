@@ -22,8 +22,8 @@
 //! periods rather than the sole source of clock progress.
 
 use melin_disruptor::ring;
+use melin_engine::journal::InputSlot;
 use melin_engine::journal::JournalEvent;
-use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 
 /// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.

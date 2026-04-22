@@ -21,9 +21,10 @@ use tracing::{debug, error};
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use melin_engine::journal::pipeline::StageUtilization;
 #[cfg(feature = "latency-trace")]
 use melin_engine::journal::trace;
+use melin_engine::journal::{OutputPayload, OutputSlot};
 use melin_engine::types::ExecutionReport;
 
 use melin_protocol::codec;

@@ -25,7 +25,8 @@ use melin_engine::exchange::Exchange;
 use melin_engine::journal::JournalError;
 use melin_engine::journal::JournalWriter;
 use melin_engine::journal::JournaledExchange;
-use melin_engine::journal::pipeline::{Pipeline, build_pipeline_with_replication};
+use melin_engine::journal::Pipeline;
+use melin_engine::journal::pipeline::build_pipeline_with_replication;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -1010,8 +1011,8 @@ fn run_as_primary<L: BlockingTransportListener>(
         }
     }
     if let Some(producer) = seed_producer {
+        use melin_engine::journal::InputSlot;
         use melin_engine::journal::JournalEvent;
-        use melin_engine::journal::pipeline::InputSlot;
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::journal::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
@@ -1840,8 +1841,8 @@ pub fn run_dpdk(
         }
     }
     if let Some(producer) = seed_producer {
+        use melin_engine::journal::InputSlot;
         use melin_engine::journal::JournalEvent;
-        use melin_engine::journal::pipeline::InputSlot;
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::journal::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};

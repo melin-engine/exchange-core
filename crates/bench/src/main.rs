@@ -629,9 +629,10 @@ fn run_pipeline_bench(
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
 ) {
+    use melin_engine::journal::InputSlot;
     use melin_engine::journal::JournalEvent;
     use melin_engine::journal::JournalWriter;
-    use melin_engine::journal::pipeline::{InputSlot, build_pipeline_with_replication};
+    use melin_engine::journal::pipeline::build_pipeline_with_replication;
     use melin_engine::journal::trace::trace_ts;
     use melin_engine::journal::wall_clock_nanos;
 
@@ -765,10 +766,7 @@ fn run_pipeline_bench(
             std::hint::spin_loop();
             continue;
         };
-        if matches!(
-            slot.payload,
-            melin_engine::journal::pipeline::OutputPayload::BatchEnd
-        ) {
+        if matches!(slot.payload, melin_engine::journal::OutputPayload::BatchEnd) {
             let (_, sent_at) = loop {
                 if let Some(v) = ts_rx.try_consume() {
                     break v;

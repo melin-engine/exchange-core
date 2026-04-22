@@ -77,9 +77,7 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 fn replica_stream_uring(
     tcp_stream: &TcpStream,
-    input_producer: &melin_disruptor::ring::MultiProducer<
-        melin_engine::journal::pipeline::InputSlot,
-    >,
+    input_producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::InputSlot>,
     journal_cursor: &melin_disruptor::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
@@ -1070,7 +1068,7 @@ pub fn run_receiver(
             .spawn(move || {
                 pin_replica_thread("drain", drain_core);
                 let mut consumer = drain_consumer;
-                let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+                let mut batch = vec![melin_engine::journal::OutputSlot::default(); 256];
                 loop {
                     if ps.load(Ordering::Relaxed) {
                         return;
