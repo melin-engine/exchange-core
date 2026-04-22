@@ -160,7 +160,13 @@ echo ""
 #     is reserved for explicitly-pinned Melin pipeline threads. This avoids
 #     hardcoding a range that straddles CCD boundaries on parts with fewer
 #     cores per CCD than expected.
-#   nmi_watchdog=0: disable NMI watchdog (eliminates periodic NMI interrupts)
+#   nowatchdog: disable both the NMI (hard-lockup) and soft-lockup watchdogs.
+#     The soft-lockup watchdog fires an hrtimer every `watchdog_thresh / 5`
+#     seconds (2s at the default thresh=10) on every CPU in `watchdog_cpumask`.
+#     Even when the cpumask excludes isolated cores, core 0's watchdog
+#     cadence ripples into client-observed tail latency on the persist
+#     path — measured as periodic ~600µs-1.2ms spikes every 2s / 10s in
+#     single-order tests. Disabling both removes that entire cadence.
 #   transparent_hugepage=never: disable THP (khugepaged compaction causes 1-4ms stalls)
 #   cpufreq.default_governor=performance: lock max CPU frequency (no scaling transitions)
 #   processor.max_cstate=1: prevent deep C-states (C2+ wakeup costs 10-100µs)
@@ -180,7 +186,7 @@ LAST_ISOLATED=$((PHYSICAL_CORES - 1))
 ISOLATED_RANGE="1-${LAST_ISOLATED}"
 echo "  detected $PHYSICAL_CORES physical cores → isolating ${ISOLATED_RANGE}"
 
-BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
 # IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
 # bypasses IOMMU translation for performance. intel_iommu=on is
 # Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
@@ -290,6 +296,11 @@ vm.swappiness = 0
 # Disable automatic NUMA page migration. The balancing scanner wakes up
 # periodically and can stall cores. Single-socket servers don't benefit.
 kernel.numa_balancing = 0
+# Disable the lockup detectors (hard + soft). Matches `nowatchdog` on the
+# kernel cmdline; applied here too so the setting takes effect on hosts
+# that can't reboot right now. The soft-lockup watchdog's 2s hrtimer on
+# core 0 ripples into persist-path tail latency.
+kernel.watchdog = 0
 EOF
 # Raise the system-wide max file descriptor limit. The default (1024) is
 # too low for client-sweep benchmarks: 512 clients × 2 fds (stream +
@@ -304,7 +315,7 @@ root hard nofile 65536
 EOF
 echo "  Written $LIMITS_FILE (nofile=65536)"
 sysctl --system --quiet
-echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0)"
+echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0, kernel.watchdog=0)"
 
 echo ""
 
