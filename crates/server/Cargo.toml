@@ -14,11 +14,14 @@ release-tracing = ["tracing/max_level_info"]
 ## `melin-engine::Exchange`) or `noop` (the transport-only benchmark
 ## app, via `melin-noop::NoopApp`). Exactly one must be enabled;
 ## `cargo build --features noop --no-default-features` drops
-## `melin-engine` from the dependency tree entirely. `melin-market-data`
-## is trading-only (book mirrors for the event publisher), so it piggy-
+## `melin-engine` from the dependency tree entirely. `noop` pulls in
+## `hash-chain` (required for replication) and `release-tracing` so
+## the noop binary behaves identically to the default trading build
+## in all transport-level functionality. `melin-market-data` is
+## trading-only (book mirrors for the event publisher), so it piggy-
 ## backs on the `trading` feature.
 trading = ["dep:melin-engine", "dep:melin-market-data"]
-noop = ["dep:melin-noop"]
+noop = ["dep:melin-noop", "hash-chain", "release-tracing"]
 no-persist = ["melin-engine?/no-persist", "melin-transport-core/no-persist"]
 latency-trace = [
     "melin-engine?/latency-trace",
