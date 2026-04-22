@@ -281,8 +281,15 @@ fn replay_entry<A: Application>(
     last_drain_ns: &mut u64,
     reports: &mut Vec<A::Report>,
 ) {
-    // Rebuild per-key HWM state so live dedup continues correctly post-recovery.
-    let _ = app.check_request_seq(key_hash, request_seq);
+    // Rebuild per-key HWM and capture whether this was a new request.
+    // The journal stage writes events before the matching stage dedups,
+    // so the journal can contain duplicates the primary rejected without
+    // calling `apply`. Replay must skip `apply` on those entries or
+    // state will diverge from the live primary (e.g. a retried deposit
+    // applied twice). For transport events (`Tick`, `GenesisHash`,
+    // `Checkpoint`) `key_hash == 0`, which `check_request_seq` exempts
+    // — `is_new` is always true there.
+    let is_new = app.check_request_seq(key_hash, request_seq);
 
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
@@ -291,6 +298,12 @@ fn replay_entry<A: Application>(
 
     match event {
         JournalEvent::App(e) => {
+            if !is_new {
+                // Primary produced a dedup rejection here; replay discards
+                // it because the client already received that reject at
+                // live time.
+                return;
+            }
             // Reports produced during replay are discarded — they already
             // went to the client at the time the event was accepted.
             let ctx = ApplyCtx {
@@ -338,10 +351,14 @@ mod tests {
     use melin_journal::JournalEvent;
 
     /// Write events with auto-allocated sequences and fsync them to disk.
-    /// Each event is keyed on `(key_hash = 1, request_seq = idx + 1)` so
-    /// replay rebuilds the per-key HWM and so duplicate-replay tests have
-    /// real dedup state to observe.
-    fn append_events(ja: JournaledApp<TestApp>, events: &[TestEvent]) -> JournaledApp<TestApp> {
+    /// Each event is keyed on `(key_hash = 1, request_seq = first_seq + idx)`
+    /// so tests that append in multiple phases can offset `first_seq` to
+    /// avoid dedup collisions across calls.
+    fn append_events(
+        ja: JournaledApp<TestApp>,
+        events: &[TestEvent],
+        first_seq: u64,
+    ) -> JournaledApp<TestApp> {
         let (app, mut writer) = ja.into_parts();
         for (i, e) in events.iter().enumerate() {
             let seq = writer.allocate_sequence();
@@ -351,7 +368,7 @@ mod tests {
                     /* timestamp_ns */ 1_000 * (i as u64 + 1),
                     &JournalEvent::App(*e),
                     /* key_hash */ 1,
-                    /* request_seq */ i as u64 + 1,
+                    /* request_seq */ first_seq + i as u64,
                 )
                 .unwrap();
         }
@@ -359,8 +376,11 @@ mod tests {
         JournaledApp::from_parts(app, writer)
     }
 
-    /// Compute the TestApp state that results from applying `events` in order.
-    fn expected_state(events: &[TestEvent]) -> TestApp {
+    /// Compute the TestApp state that results from applying `events` in
+    /// order, using the same `(key_hash, request_seq)` scheme as
+    /// `append_events`. Mirrors `replay_entry`'s dedup gate (post-#7) so
+    /// the expected state matches what replay produces.
+    fn expected_state(events: &[TestEvent], first_seq: u64) -> TestApp {
         let mut app = TestApp::new();
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
@@ -370,13 +390,12 @@ mod tests {
             events_processed: 0,
         };
         for (i, e) in events.iter().enumerate() {
-            // replay_entry calls check_request_seq + tick + apply for app
-            // events. Mirror that here so the expected app matches what
-            // recovery produces.
-            let _ = app.check_request_seq(1, i as u64 + 1);
+            let is_new = app.check_request_seq(1, first_seq + i as u64);
             let ts = 1_000 * (i as u64 + 1);
             app.tick(ts, &mut reports);
-            let _ = app.apply(*e, &ctx, &mut reports);
+            if is_new {
+                let _ = app.apply(*e, &ctx, &mut reports);
+            }
         }
         app
     }
@@ -406,11 +425,11 @@ mod tests {
 
         let events = [TestEvent::Add(3), TestEvent::Add(7), TestEvent::Add(100)];
         let ja = JournaledApp::create(TestApp::new(), &path).unwrap();
-        let ja = append_events(ja, &events);
+        let ja = append_events(ja, &events, 1);
         drop(ja);
 
         let recovered = JournaledApp::recover(TestApp::new(), &path).unwrap();
-        assert_eq!(*recovered.app(), expected_state(&events));
+        assert_eq!(*recovered.app(), expected_state(&events, 1));
     }
 
     #[test]
@@ -421,12 +440,12 @@ mod tests {
 
         let events = [TestEvent::Add(10), TestEvent::Add(20)];
         let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
-        drop(append_events(ja, &events)); // journal write, writer drops
+        drop(append_events(ja, &events, 1)); // journal write, writer drops
         let ja = JournaledApp::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         let (restored, seq, _chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        assert_eq!(restored, expected_state(&events));
+        assert_eq!(restored, expected_state(&events, 1));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
         // Under `hash-chain`, the genesis entry consumes an extra seq.
@@ -443,18 +462,16 @@ mod tests {
         let pre = [TestEvent::Add(1), TestEvent::Add(2)];
         let post = [TestEvent::Add(40), TestEvent::Add(50)];
 
-        // Phase 1: create + pre events + snapshot.
+        // Phase 1: create + pre events (request_seqs 1..=2) + snapshot.
         let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre);
-        // Reopen via recover so the writer is positioned for append and the
-        // app state is whatever recover rebuilds (which is what the in-
-        // memory instance should reflect anyway).
+        let ja = append_events(ja, &pre, 1);
         drop(ja);
         let ja = JournaledApp::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        // Phase 2: append post events to the same journal file (no rotation).
-        let ja = append_events(ja, &post);
+        // Phase 2: append post events (request_seqs 3..=4 — disjoint from
+        // pre, so they pass dedup) to the same journal file; no rotation.
+        let ja = append_events(ja, &post, pre.len() as u64 + 1);
         drop(ja);
 
         // Phase 3: recover_from_snapshot should load the snapshot (state
@@ -463,20 +480,49 @@ mod tests {
         let recovered =
             JournaledApp::<TestApp>::recover_from_snapshot(&snap_path, &journal_path).unwrap();
 
-        // Expected: all events applied once, in order. Note that the
-        // append_events helper keys events on request_seq = i+1 across
-        // each call; that keeps the pre/post sets from colliding on
-        // dedup because they have disjoint indices (0..pre.len()) vs
-        // (0..post.len()) only within each call — so replay via
-        // recover_from_snapshot will see request_seq 1,2 from the
-        // snapshot (already applied) and 1,2 from post. Since the
-        // snapshot-side HWM already recorded 1,2 for key 1, the post
-        // events get the same seqs and appear as duplicates to
-        // check_request_seq — but replay_entry discards the return and
-        // applies regardless (review item #7 tracks this), so the final
-        // counter still reflects all four adds.
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
-        assert_eq!(recovered.app().total, expected_state(&all).total);
+        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+    }
+
+    #[test]
+    fn replay_skips_duplicate_app_events() {
+        // The journal stage writes before the matching stage dedups, so
+        // the journal can legitimately contain two entries sharing a
+        // `(key_hash, request_seq)`. Only the first reaches `apply` on
+        // the live primary; replay must mirror that or recovered state
+        // will double-apply the duplicate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.bin");
+
+        let ja = JournaledApp::create(TestApp::new(), &path).unwrap();
+        let (_app, mut writer) = ja.into_parts();
+
+        let dup = JournalEvent::App(TestEvent::Add(100));
+        for _ in 0..2 {
+            let seq = writer.allocate_sequence();
+            writer
+                .encode_event(
+                    seq, 1_000, &dup, /* key_hash */ 5, /* request_seq */ 10,
+                )
+                .unwrap();
+        }
+        writer.flush_batch_sync().unwrap();
+        drop(writer);
+
+        let recovered = JournaledApp::recover(TestApp::new(), &path).unwrap();
+        // First Add(100) applied; second is a duplicate and must be
+        // skipped — total stays at 100, not 200.
+        assert_eq!(recovered.app().total, 100);
+        // HWM for key 5 should record seq 10 exactly once; a second
+        // check_request_seq at seq 10 must still be rejected as a
+        // duplicate after recovery.
+        let mut app = TestApp {
+            total: recovered.app().total,
+            ticks: recovered.app().ticks,
+            key_hwm: recovered.app().key_hwm.clone(),
+        };
+        assert!(!app.check_request_seq(5, 10));
+        assert!(app.check_request_seq(5, 11));
     }
 
     #[test]
@@ -487,7 +533,7 @@ mod tests {
 
         let events = [TestEvent::Add(11), TestEvent::Add(22)];
         let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
-        let mut ja = append_events(ja, &events);
+        let mut ja = append_events(ja, &events, 1);
         let pre_rotate_next_seq = ja.next_sequence();
         let pre_rotate_state = TestApp {
             total: ja.app().total,
