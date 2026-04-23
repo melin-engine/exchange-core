@@ -706,7 +706,7 @@ fn run_pipeline_bench(
     // Publisher thread: continuously feeds events into the disruptor.
     // `sequence: 0` — the journal stage allocates sequences in disruptor
     // cursor order at encode time.
-    let producer = out.input_producer;
+    let mut producer = out.input_producer;
     let inflight_pub = Arc::clone(&inflight);
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())

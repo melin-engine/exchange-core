@@ -77,7 +77,7 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 fn replica_stream_uring(
     tcp_stream: &TcpStream,
-    input_producer: &melin_disruptor::ring::MultiProducer<crate::InputSlot>,
+    input_producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,
     journal_cursor: &melin_disruptor::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
@@ -1027,7 +1027,7 @@ pub fn run_receiver(
             false, // don't busy-spin on replica
             enable_shadow,
         );
-        let input_producer = pipeline.input_producer;
+        let mut input_producer = pipeline.input_producer;
         let journal_stage = pipeline.journal_stage;
         let matching_stage = pipeline.matching_stage;
         let drain_consumer = pipeline.drain_consumer;
@@ -1116,7 +1116,7 @@ pub fn run_receiver(
 
         let exit_reason: SessionExit = replica_stream_uring(
             &tcp_writer,
-            &input_producer,
+            &mut input_producer,
             &journal_cursor,
             &mut pending_acks,
             &mut received_data,
@@ -1131,7 +1131,7 @@ pub fn run_receiver(
 
         // Flush any accumulated data not yet submitted.
         if !journal_accum.is_empty() {
-            if let Ok(target) = submit_batch_to_pipeline(&journal_accum, &input_producer) {
+            if let Ok(target) = submit_batch_to_pipeline(&journal_accum, &mut input_producer) {
                 pending_acks.push(target, accum_end_sequence);
             }
             journal_accum.clear();

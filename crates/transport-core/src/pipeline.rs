@@ -1454,7 +1454,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 ///
 /// Assembled pipeline stages and handles returned by [`build_pipeline_with_replication`].
 pub struct Pipeline<A: Application> {
-    pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
+    pub input_producer: ring::Producer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
@@ -1472,7 +1472,7 @@ pub struct Pipeline<A: Application> {
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
 pub struct ReplicaPipeline<A: Application> {
-    pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
+    pub input_producer: ring::Producer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
@@ -1553,7 +1553,7 @@ where
     if enable_shadow {
         builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
     }
-    let (input_producer, mut consumers) = builder.build_multi_producer();
+    let (input_producer, mut consumers) = builder.build();
 
     // Type-erased cursor reader for queue depth monitoring.
     // Extracted before the producer is cloned to producer threads.
@@ -1740,7 +1740,7 @@ where
     if enable_shadow {
         builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
     }
-    let (input_producer, mut consumers) = builder.build_multi_producer();
+    let (input_producer, mut consumers) = builder.build();
 
     let shadow_consumer = if enable_shadow {
         Some(consumers.pop().expect("shadow consumer"))

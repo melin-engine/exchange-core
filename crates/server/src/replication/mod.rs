@@ -353,7 +353,7 @@ pub(super) fn shutdown_pipeline(
 /// independently encoded journal has diverged from the primary's.
 pub(super) fn submit_batch_to_pipeline(
     journal_bytes: &[u8],
-    producer: &melin_disruptor::ring::MultiProducer<crate::InputSlot>,
+    producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     use crate::InputSlot;
 
