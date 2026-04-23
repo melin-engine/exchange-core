@@ -147,6 +147,13 @@ pub fn run_dpdk_poll(
     // Occupied-slot count for the max_connections gate. Cheaper than
     // scanning `connections` on every accept.
     let mut connection_count: usize = 0;
+    // Exclusive upper bound of the `connections` range that has ever
+    // been used. Lets the per-poll loop scan just the active range
+    // instead of all MAX_CONNECTIONS slots — skipping ~1000 None slots
+    // per poll was a chunk of `run_dpdk_poll` self-time. smoltcp reuses
+    // closed slab indices before extending, so this grows to the steady-
+    // state watermark and stays there.
+    let mut conn_range_end: usize = 0;
 
     // Batch buffer for disruptor publish — accumulate decoded events from
     // all connections, then publish in a tight loop. Reduces interleaving
@@ -258,7 +265,11 @@ pub fn run_dpdk_poll(
                     .expect("challenge encodes");
             transport.queue_send(accepted.handle, &challenge_buf[..written]);
 
-            connections[accepted.handle.index()] = Some(ConnectionState {
+            let accepted_idx = accepted.handle.index();
+            if accepted_idx + 1 > conn_range_end {
+                conn_range_end = accepted_idx + 1;
+            }
+            connections[accepted_idx] = Some(ConnectionState {
                 connection_id: conn_id,
                 addr: accepted.peer,
                 handle: accepted.handle,
@@ -323,9 +334,11 @@ pub fn run_dpdk_poll(
         // mid-iteration `transport.poll()` cadence.
         let mut active_idx: usize = 0;
         // Indexed loop, not iter_mut: remove paths do `connections[idx].take()`
-        // which conflicts with an outer iterator borrow.
+        // which conflicts with an outer iterator borrow. Bounded by
+        // `conn_range_end` (not `connections.len()`) so idle polls don't
+        // scan MAX_CONNECTIONS empty slots.
         #[allow(clippy::needless_range_loop)]
-        for idx in 0..connections.len() {
+        for idx in 0..conn_range_end {
             if connections[idx].is_none() {
                 continue;
             }
