@@ -170,6 +170,13 @@ pub fn run_dpdk_poll(
     let mut last_tick_ns: u64 = 0;
     let mut tick_check_counter: u32 = 0;
     const TICK_CHECK_INTERVAL: u32 = 4096;
+
+    // Auth / idle-timeout checks call `Instant::now()` via `elapsed()`,
+    // which showed up as ~13% of the poll core in perf. The timeouts are
+    // ~seconds, so firing the check once per ~1M polls (~100ms at 10M
+    // polls/sec) is still orders of magnitude tighter than the deadline.
+    let mut slow_check_counter: u32 = 0;
+    const SLOW_CHECK_INTERVAL: u32 = 1024 * 1024;
     if tick_enabled {
         tracing::info!(
             cadence_ms = cadence.as_millis() as u64,
@@ -305,6 +312,9 @@ pub fn run_dpdk_poll(
         // profile on idle polls with no traffic.
         let mut batch_wall_ns: Option<u64> = None;
 
+        slow_check_counter = slow_check_counter.wrapping_add(1);
+        let do_slow_checks = slow_check_counter.is_multiple_of(SLOW_CHECK_INTERVAL);
+
         for (conn_idx, &handle) in handle_buf.iter().enumerate() {
             if conn_idx > 0 && conn_idx % POLL_EVERY_N_CONNS == 0 {
                 transport.poll();
@@ -314,8 +324,10 @@ pub fn run_dpdk_poll(
                 None => continue,
             };
 
-            // Check auth timeout for pending connections.
-            if let AuthState::WaitingForResponse { accepted_at, .. } = &conn.auth
+            // Check auth timeout for pending connections. Throttled to
+            // avoid a per-poll `Instant::now()` via `elapsed()`.
+            if do_slow_checks
+                && let AuthState::WaitingForResponse { accepted_at, .. } = &conn.auth
                 && accepted_at.elapsed() > AUTH_TIMEOUT
             {
                 debug!(
@@ -376,8 +388,10 @@ pub fn run_dpdk_poll(
                         parse_buf_pool.push(removed.parse_buf);
                     }
                 }
-                // Check idle timeout when no data was received.
-                else if let Some(timeout) = connection_timeout
+                // Check idle timeout when no data was received. Throttled
+                // to avoid a per-poll `Instant::now()` via `elapsed()`.
+                else if do_slow_checks
+                    && let Some(timeout) = connection_timeout
                     && matches!(conn.auth, AuthState::Authenticated { .. })
                     && conn.last_activity.elapsed() > timeout
                 {
