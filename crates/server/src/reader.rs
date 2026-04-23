@@ -159,7 +159,7 @@ impl<R> UringReaderHandle<R> {
 /// client requests. Pass `None` to disable the tick (useful for benchmarks
 /// that don't exercise time-driven features).
 pub fn spawn_reader<R: AsRawFd + Send + 'static>(
-    producer: ring::MultiProducer<InputSlot>,
+    producer: ring::Producer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
     connection_timeout: Option<Duration>,
@@ -287,7 +287,7 @@ impl<R> ConnectionSlab<R> {
 fn reader_loop<R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
     wakeup_fd: RawFd,
-    producer: ring::MultiProducer<InputSlot>,
+    mut producer: ring::Producer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
@@ -397,7 +397,7 @@ fn reader_loop<R: AsRawFd>(
                 let raw_now_ns = wall_clock_nanos();
                 let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                 last_tick_ns = now_ns;
-                crate::tick::publish_tick(&producer, now_ns);
+                crate::tick::publish_tick(&mut producer, now_ns);
                 // Catch up rather than burst-emit if we fell badly behind.
                 let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                 next_tick_deadline = if elapsed > cadence {
@@ -572,7 +572,7 @@ fn reader_loop<R: AsRawFd>(
                 // Extract and publish complete frames.
                 let drop_conn = process_frames(
                     entry,
-                    &producer,
+                    &mut producer,
                     &server_busy_frame,
                     batch_wall_ns,
                     #[cfg(feature = "latency-trace")]
@@ -757,7 +757,7 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 /// `true` if the connection should be dropped.
 fn process_frames<R>(
     conn: &mut ConnectionEntry<R>,
-    producer: &ring::MultiProducer<InputSlot>,
+    producer: &mut ring::Producer<InputSlot>,
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
     #[cfg(feature = "latency-trace")] publish_hist: &mut melin_journal::trace::StageHistogram,

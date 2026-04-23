@@ -51,7 +51,7 @@ pub(crate) fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
 /// On a full ring the publish drops; the next successful tick still
 /// carries the latest wall-clock time, so a missed tick only delays
 /// scheduler firings by one cadence at worst.
-pub(crate) fn publish_tick(producer: &ring::MultiProducer<InputSlot>, now_ns: u64) {
+pub(crate) fn publish_tick(producer: &mut ring::Producer<InputSlot>, now_ns: u64) {
     // try_publish drop is intentional: on a full ring we'd rather skip a
     // tick than block the ingress thread (see fn doc).
     let _ = producer.try_publish(InputSlot {

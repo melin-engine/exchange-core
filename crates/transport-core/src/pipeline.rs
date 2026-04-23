@@ -1454,7 +1454,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 ///
 /// Assembled pipeline stages and handles returned by [`build_pipeline_with_replication`].
 pub struct Pipeline<A: Application> {
-    pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
+    pub input_producer: ring::Producer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
@@ -1472,7 +1472,7 @@ pub struct Pipeline<A: Application> {
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
 pub struct ReplicaPipeline<A: Application> {
-    pub input_producer: ring::MultiProducer<InputSlot<A::Event>>,
+    pub input_producer: ring::Producer<InputSlot<A::Event>>,
     pub journal_stage: JournalStage<A::Event>,
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
@@ -1537,23 +1537,20 @@ where
     A::Event: Send + 'static,
     A::Report: Send + 'static,
 {
-    // Input disruptor. Steady-state producer is a single thread (the
-    // ingress thread on primaries, which also emits ticks; the
-    // replication receiver on replicas). The seed loop publishes via a
-    // short-lived clone at startup and is fully drained before the
-    // ingress thread is spawned, so the ring is single-producer at every
-    // moment of normal operation. `MultiProducer` is kept so seed and
-    // ingress can hold independent clones across that startup handoff,
-    // and to leave room for future multi-queue ingress. When shadow
-    // snapshots are enabled, a third consumer is chained after journal
-    // (consumer 0) — it only sees events that have been durably fsynced.
+    // Input disruptor. Single producer: the ingress thread on primaries
+    // (which also emits ticks) or the replication receiver on replicas.
+    // The seed loop reuses the same producer before handing it off to
+    // the ingress thread, so the ring is single-producer at every moment
+    // of operation. When shadow snapshots are enabled, a third consumer
+    // is chained after journal (consumer 0) — it only sees events that
+    // have been durably fsynced.
     let mut builder = ring::DisruptorBuilder::<InputSlot<A::Event>>::new(INPUT_RING_CAPACITY)
         .add_consumer() // consumer 0: journal, gated on producer
         .add_consumer(); // consumer 1: matching, gated on producer (parallel)
     if enable_shadow {
         builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
     }
-    let (input_producer, mut consumers) = builder.build_multi_producer();
+    let (input_producer, mut consumers) = builder.build();
 
     // Type-erased cursor reader for queue depth monitoring.
     // Extracted before the producer is cloned to producer threads.
@@ -1740,7 +1737,7 @@ where
     if enable_shadow {
         builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
     }
-    let (input_producer, mut consumers) = builder.build_multi_producer();
+    let (input_producer, mut consumers) = builder.build();
 
     let shadow_consumer = if enable_shadow {
         Some(consumers.pop().expect("shadow consumer"))

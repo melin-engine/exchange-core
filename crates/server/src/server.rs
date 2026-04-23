@@ -749,21 +749,12 @@ fn run_as_primary<L: BlockingTransportListener>(
     let connection_timeout = config.connection_timeout();
     let heartbeat_interval = config.heartbeat_interval();
 
-    // Clone the input producer for seeding. Seed events flow through the
-    // disruptor like regular events so they're journaled, replicated, and
-    // processed by the matching engine via the normal pipeline.
-    let seed_producer = if needs_seeding {
-        Some(input_producer.clone())
-    } else {
-        None
-    };
-
-    // The reader thread is spawned LATER, after the seed loop has finished
-    // draining through the pipeline. Until then `input_producer` is held by
-    // this scope and only the seed loop publishes to the input ring. This
-    // serial-startup ordering eliminates the multi-producer ring-cursor
-    // ordering race that would otherwise exist between the seed loop and
-    // the reader's tick emission.
+    // Seed events flow through the disruptor like regular events so they're
+    // journaled, replicated, and processed by the matching engine via the
+    // normal pipeline. The input ring is single-producer: main publishes
+    // seeds through `input_producer`, then moves it into the reader thread
+    // which becomes the sole steady-state producer. No cloning required.
+    let mut input_producer = input_producer;
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
@@ -994,7 +985,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
-    if let Some(producer) = seed_producer {
+    if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_journal::trace::trace_ts;
@@ -1006,7 +997,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
         for i in 0..config.instruments {
-            producer.publish(InputSlot {
+            input_producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
@@ -1031,7 +1022,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         let account_start = std::time::Instant::now();
         let mut last_published_seq = 0u64;
         for acct in 1..=config.accounts {
-            last_published_seq = producer.publish(InputSlot {
+            last_published_seq = input_producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
@@ -1589,12 +1580,10 @@ pub fn run_dpdk(
 
     let heartbeat_interval = config.heartbeat_interval();
 
-    // Clone producer for seeding before moving it to the DPDK thread.
-    let seed_producer = if needs_seeding {
-        Some(input_producer.clone())
-    } else {
-        None
-    };
+    // Seed events flow through the disruptor like regular events. The input
+    // ring is single-producer: main publishes seeds, then moves the
+    // producer into the DPDK poll thread. No cloning required.
+    let mut input_producer = input_producer;
 
     // The DPDK poll thread also generates the engine's scheduler ticks via
     // a wall-clock comparison between NIC bursts (see `run_dpdk_poll`). The
@@ -1825,7 +1814,7 @@ pub fn run_dpdk(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
-    if let Some(producer) = seed_producer {
+    if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_journal::trace::trace_ts;
@@ -1835,7 +1824,7 @@ pub fn run_dpdk(
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
         for i in 0..config.instruments {
-            producer.publish(InputSlot {
+            input_producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
@@ -1857,7 +1846,7 @@ pub fn run_dpdk(
 
         let mut last_published_seq = 0u64;
         for acct in 1..=config.accounts {
-            last_published_seq = producer.publish(InputSlot {
+            last_published_seq = input_producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
@@ -1973,81 +1962,38 @@ pub fn run_dpdk(
         "DPDK transport listening"
     );
 
-    // Spawn N-1 DPDK poll threads (queues 1..N). Queue 0 runs on the
-    // main thread below. Each thread gets its own transport, SPSC
-    // consumer, and a clone of the MultiProducer.
     let connection_timeout = config.connection_timeout();
     let max_conns = config.max_connections;
     let reader_cores = config.reader_cores;
-    let mut dpdk_handles = Vec::with_capacity(num_dpdk_threads.saturating_sub(1));
 
-    for i in (1..num_dpdk_threads).rev() {
-        let transport_i = transports.pop().expect("transport for thread");
-        let tx_rx_i = tx_consumers.pop().expect("SPSC consumer for thread");
-        let producer_i = input_producer.clone();
-        let control_i = control_tx.clone();
-        let shutdown_i = Arc::clone(&shutdown);
-        let active_i = Arc::clone(&active_connections);
-        let keys_i = Arc::clone(&authorized_keys);
+    // Exactly one client poll queue (LMAX: single reader → single matcher).
+    // Additional DPDK queues, if any, are dedicated to the replication sender
+    // on its own thread and don't touch the input ring.
+    assert_eq!(
+        transports.len(),
+        1,
+        "expected exactly one client DPDK transport"
+    );
+    let transport_0 = transports.pop().expect("one client transport");
+    let tx_rx_0 = tx_consumers.remove(0);
+    apply_affinity("dpdk-poll-0", reader_cores);
+    crate::dpdk_transport::run_dpdk_poll(
+        transport_0,
+        input_producer,
+        control_tx,
+        tx_rx_0,
+        &shutdown,
+        authorized_keys,
+        connection_timeout,
+        tick_cadence,
+        max_conns,
+        Arc::clone(&active_connections),
+        0,
+    );
 
-        let handle = std::thread::Builder::new()
-            .name(format!("dpdk-poll-{i}"))
-            .spawn(move || {
-                apply_affinity(&format!("dpdk-poll-{i}"), reader_cores + i);
-                crate::dpdk_transport::run_dpdk_poll(
-                    transport_i,
-                    producer_i,
-                    control_i,
-                    tx_rx_i,
-                    &shutdown_i,
-                    keys_i,
-                    connection_timeout,
-                    tick_cadence,
-                    max_conns,
-                    active_i,
-                    i as u8,
-                );
-            })
-            .map_err(|e| format!("spawn DPDK poll thread: {e}"))?;
-        dpdk_handles.push(handle);
-    }
-
-    if !transports.is_empty() {
-        // Queue 0 runs on the main thread.
-        apply_affinity("dpdk-poll-0", reader_cores);
-        let transport_0 = transports.remove(0);
-        let tx_rx_0 = tx_consumers.remove(0);
-        crate::dpdk_transport::run_dpdk_poll(
-            transport_0,
-            input_producer,
-            control_tx,
-            tx_rx_0,
-            &shutdown,
-            authorized_keys,
-            connection_timeout,
-            tick_cadence,
-            max_conns,
-            Arc::clone(&active_connections),
-            0,
-        );
-    } else {
-        // No client queues (e.g., single-queue NIC with replication taking
-        // the only queue). The main thread just waits for shutdown while
-        // the replication sender runs on its own thread.
-        info!("no client queues available — waiting for shutdown");
-        while !shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-
-    // Join DPDK poll threads before draining the pipeline — they're the
-    // ingress producers, so they must stop pushing before journal/matching
-    // can drain.
-    let dpdk_extras: Vec<(String, std::thread::Result<()>)> = dpdk_handles
-        .into_iter()
-        .enumerate()
-        .map(|(i, h)| (format!("dpdk-poll-{i}"), h.join()))
-        .collect();
+    // The client poll runs on the main thread, so no extra DPDK threads
+    // to join here — replication sender (if enabled) is joined below.
+    let dpdk_extras: Vec<(String, std::thread::Result<()>)> = Vec::new();
 
     shutdown_pipeline_stages(
         PipelineHandles {

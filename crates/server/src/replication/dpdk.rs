@@ -1038,7 +1038,7 @@ pub fn run_receiver_dpdk(
             false,
             enable_shadow,
         );
-        let input_producer = pipeline.input_producer;
+        let mut input_producer = pipeline.input_producer;
         let journal_stage = pipeline.journal_stage;
         let matching_stage = pipeline.matching_stage;
         let drain_consumer = pipeline.drain_consumer;
@@ -1171,7 +1171,9 @@ pub fn run_receiver_dpdk(
                     compact_recv_buf(&mut recv_buf, consumed);
                 }
                 if !journal_accum.is_empty() {
-                    if let Ok(target) = submit_batch_to_pipeline(&journal_accum, &input_producer) {
+                    if let Ok(target) =
+                        submit_batch_to_pipeline(&journal_accum, &mut input_producer)
+                    {
                         pending_acks.push(target, accum_end_sequence);
                     }
                     journal_accum.clear();
@@ -1290,7 +1292,7 @@ pub fn run_receiver_dpdk(
 
             // Submit to pipeline and record pending ack.
             if got_data {
-                let target = submit_batch_to_pipeline(&journal_accum, &input_producer)?;
+                let target = submit_batch_to_pipeline(&journal_accum, &mut input_producer)?;
 
                 pending_acks.push(target, accum_end_sequence);
                 journal_accum.clear();

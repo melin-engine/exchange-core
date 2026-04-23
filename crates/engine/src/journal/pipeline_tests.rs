@@ -329,7 +329,7 @@ mod tests {
 
         let (mut repl_c0, mut repl_c1) =
             primary.replication_consumers.expect("replication enabled");
-        let replica_input = replica.input_producer.clone();
+        let mut replica_input = replica.input_producer;
 
         let primary_shutdown = Arc::new(AtomicBool::new(false));
         let replica_shutdown = Arc::new(AtomicBool::new(false));
@@ -791,7 +791,7 @@ mod tests {
             false,
             false,
         );
-        let input_producer = out.input_producer;
+        let mut input_producer = out.input_producer;
         let journal_stage = out.journal_stage;
         let matching_stage = out.matching_stage;
         let journal_cursor = out.journal_cursor;
@@ -909,7 +909,7 @@ mod tests {
 
         let journal_stage = out.journal_stage;
         let matching_stage = out.matching_stage;
-        let input_producer = out.input_producer;
+        let mut input_producer = out.input_producer;
         let journal_cursor = out.journal_cursor;
         let replication_cursor = out.replication_cursor;
 

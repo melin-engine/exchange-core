@@ -51,7 +51,7 @@ fn pipeline_with_noop_app_runs_events_to_output() {
     // Publish three deposit events. Noop ignores them beyond counting
     // and emitting a Rejected(NoLiquidity) per event.
     const N: u64 = 3;
-    let producer = pipeline.input_producer.clone();
+    let mut producer = pipeline.input_producer;
     for i in 0..N {
         producer.publish(InputSlot {
             connection_id: 1,

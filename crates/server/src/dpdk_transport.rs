@@ -121,7 +121,7 @@ struct ConnectionState {
 #[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_poll(
     mut transport: DpdkTransport,
-    producer: ring::MultiProducer<InputSlot>,
+    mut producer: ring::Producer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
     mut tx_rx: melin_disruptor::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
@@ -216,7 +216,7 @@ pub fn run_dpdk_poll(
                     let raw_now_ns = wall_clock_nanos();
                     let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                     last_tick_ns = now_ns;
-                    crate::tick::publish_tick(&producer, now_ns);
+                    crate::tick::publish_tick(&mut producer, now_ns);
                     let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                     next_tick_deadline = if elapsed > cadence {
                         Instant::now() + cadence
