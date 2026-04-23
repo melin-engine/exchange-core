@@ -73,7 +73,6 @@
 #                       trading. The LOCAL workloads `engine-only` and
 #                       `pipeline-only` are trading-only (they run a real
 #                       Exchange in-process) and are skipped under NOOP=1.
-#                       DPDK transports aren't wired for NOOP yet.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -228,13 +227,6 @@ for workload in "${WORKLOAD_LIST[@]}"; do
 
     for transport in "${TRANSPORT_LIST[@]}"; do
         transport="$(echo "$transport" | xargs)"
-
-        # NOOP gate: DPDK server binaries aren't built with the noop feature
-        # today, so just skip those combos cleanly.
-        if [[ "${NOOP:-0}" == "1" && "$transport" == dpdk* ]]; then
-            echo "  SKIP ${transport}:${workload} — NOOP=1 has no DPDK variant yet"
-            continue
-        fi
 
         # Check infrastructure.
         case "$transport" in
@@ -400,8 +392,21 @@ fi
 
 # DPDK build on server (and replica if dpdk-repl).
 # In TAP mode, test-containers-start.sh already built the .dpdk binary.
-# In SR-IOV mode, cherry-setup.sh builds with --features dpdk as the main binary.
+# In SR-IOV mode we rebuild melin-server here with the dpdk feature plus
+# the app selector (trading by default, noop under NOOP=1). `--features
+# dpdk` alone fails to compile — the server requires exactly one of
+# `trading` or `noop`.
 if [[ "$NEED_DPDK" == "1" ]]; then
+    # Feature set for the DPDK server build. Mirrors MAIN_BUILD above.
+    if [[ "${NOOP:-0}" == "1" ]]; then
+        DPDK_SERVER_FEATURES="dpdk,noop"
+    else
+        DPDK_SERVER_FEATURES="dpdk,trading,hash-chain,release-tracing"
+    fi
+    if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+        DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},no-persist"
+    fi
+
     # Check if TAP mode .dpdk binary already exists (container setup).
     HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-server.dpdk && echo yes || echo no")
     if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
@@ -409,12 +414,12 @@ if [[ "$NEED_DPDK" == "1" ]]; then
     else
         # Each DPDK build is independent — run them concurrently and
         # fail the suite if any one returns non-zero.
-        echo "  Building DPDK server, bench, (and replica if dpdk-repl) in parallel..."
+        echo "  Building DPDK server (--features ${DPDK_SERVER_FEATURES}), bench, (and replica if dpdk-repl) in parallel..."
         dpdk_pids=()
         (
             ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
                 export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 \
+                cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                 | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
         ) &
         dpdk_pids+=($!)
@@ -430,7 +435,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
                 (
                     ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
                         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 \
+                        cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                         | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
                 ) &
                 dpdk_pids+=($!)
