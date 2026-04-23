@@ -73,6 +73,12 @@
 #                       trading. The LOCAL workloads `engine-only` and
 #                       `pipeline-only` are trading-only (they run a real
 #                       Exchange in-process) and are skipped under NOOP=1.
+#   PERF_DPDK=1         Capture `perf record` on the server's DPDK poll core
+#                       during the first DPDK workload of the run. Report +
+#                       raw perf.data are copied to ${RESULTS_DIR}. Defaults:
+#                       core 4, settle 15s after server start, record 30s.
+#                       Override with PERF_DPDK_CORE, PERF_DPDK_SETTLE,
+#                       PERF_DPDK_SECS.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -875,6 +881,57 @@ add_tap_route() {
     "
 }
 
+# Start a background perf record on the server's DPDK poll core. Returns
+# immediately; data lands at /root/melin-perf-${label}.{data,report.txt}
+# on the server after ${settle}+${secs} seconds. perf_capture_stop() waits
+# for it, fetches both files to RESULTS_DIR, and clears the pending flag.
+# Safe to call whether PERF_DPDK is set or not.
+perf_capture_start() {
+    [[ "${PERF_DPDK:-0}" != "1" ]] && return
+    local label="$1"
+    local core="${PERF_DPDK_CORE:-4}"
+    local secs="${PERF_DPDK_SECS:-30}"
+    local settle="${PERF_DPDK_SETTLE:-15}"
+    PERF_ACTIVE_LABEL="${label}"
+    PERF_DATA_PATH="/root/melin-perf-${label}.data"
+    PERF_REPORT_PATH="/root/melin-perf-${label}.report.txt"
+
+    echo "  perf: core=${core} settle=${settle}s record=${secs}s label=${label}"
+    ssh $SSH_OPTS "$SERVER" "rm -f ${PERF_DATA_PATH} ${PERF_REPORT_PATH} /tmp/melin-perf.log; \
+        nohup bash -c 'sleep ${settle} && \
+            perf record -C ${core} -g -F 997 -o ${PERF_DATA_PATH} -- sleep ${secs} 2>>/tmp/melin-perf.log && \
+            perf report -i ${PERF_DATA_PATH} --stdio --no-children -F overhead,sample,symbol 2>/dev/null \
+                | head -200 > ${PERF_REPORT_PATH}; \
+            touch ${PERF_REPORT_PATH}.done' \
+        >/tmp/melin-perf.log 2>&1 </dev/null &" </dev/null
+}
+
+perf_capture_stop() {
+    [[ "${PERF_DPDK:-0}" != "1" ]] && return
+    [[ -z "${PERF_ACTIVE_LABEL:-}" ]] && return
+
+    echo "  perf: waiting for capture to finish..."
+    local max_wait=120 waited=0
+    while (( waited < max_wait )); do
+        if ssh $SSH_OPTS "$SERVER" "test -f ${PERF_REPORT_PATH}.done" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    if (( waited >= max_wait )); then
+        echo "  perf: report not produced within ${max_wait}s — skipping fetch"
+        ssh $SSH_OPTS "$SERVER" "cat /tmp/melin-perf.log 2>/dev/null | tail -20" || true
+        PERF_ACTIVE_LABEL=""
+        return
+    fi
+
+    echo "  perf: fetching data + report to ${RESULTS_DIR}"
+    scp $SSH_OPTS "$SERVER:${PERF_DATA_PATH}" "${RESULTS_DIR}/perf-${PERF_ACTIVE_LABEL}.data" 2>/dev/null || true
+    scp $SSH_OPTS "$SERVER:${PERF_REPORT_PATH}" "${RESULTS_DIR}/perf-${PERF_ACTIVE_LABEL}.report.txt" 2>/dev/null || true
+    PERF_ACTIVE_LABEL=""
+}
+
 transport_start_dpdk() {
     dpdk_sriov_setup
     clean_journal "$SERVER" "$JOURNAL_PATH"
@@ -935,9 +992,12 @@ transport_start_dpdk() {
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
     CURRENT_HEALTH=""  # No health endpoint with DPDK (smoltcp).
     DPDK_RAN=1
+
+    perf_capture_start "dpdk"
 }
 
 transport_stop_dpdk() {
+    perf_capture_stop
     stop_servers "$SERVER"
     # TAP mode uses melin-server.dpdk — kill that too.
     ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
