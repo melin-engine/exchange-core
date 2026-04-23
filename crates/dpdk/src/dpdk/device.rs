@@ -76,7 +76,7 @@ pub struct DpdkDevice {
     ///
     /// O(1) lookup — checked on every IPv4 packet in collect_rx_batch,
     /// so lookup cost matters at high packet rates.
-    known_neighbors: std::collections::HashMap<[u8; 4], std::time::Instant>,
+    known_neighbors: rustc_hash::FxHashMap<[u8; 4], std::time::Instant>,
     /// Reusable mbuf buffer for collect_rx_batch() to avoid per-poll allocation.
     batch_mbufs: Vec<*mut ffi::rte_mbuf>,
     /// Reusable injected-frames buffer for collect_rx_batch().
@@ -141,7 +141,10 @@ impl DpdkDevice {
             tx_vlan_id: 0,
             inject_queue: Vec::new(),
             learned_neighbors: Vec::new(),
-            known_neighbors: std::collections::HashMap::with_capacity(64),
+            known_neighbors: rustc_hash::FxHashMap::with_capacity_and_hasher(
+                64,
+                Default::default(),
+            ),
             batch_mbufs: Vec::with_capacity(BURST_SIZE * port_ids.len()),
             batch_injected: Vec::new(),
             tx_batch: Vec::with_capacity(BURST_SIZE),
@@ -231,7 +234,10 @@ impl DpdkDevice {
         let mut mbufs = std::mem::take(&mut self.batch_mbufs);
         mbufs.clear();
 
-        let now = std::time::Instant::now();
+        // Clock read for MAC-learning throttle, deferred until we actually
+        // see an IPv4 frame. Idle polls (no RX) skip the read entirely —
+        // `clock_gettime` otherwise dominates the poll core under low load.
+        let mut now: Option<std::time::Instant> = None;
 
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
@@ -267,6 +273,7 @@ impl DpdkDevice {
                         // neighbor cache expiry (~60s) but long enough to
                         // avoid injecting ARP replies on every packet.
                         const RESEED_SECS: u64 = 30;
+                        let now = *now.get_or_insert_with(std::time::Instant::now);
                         let needs_seed = match self.known_neighbors.get_mut(&src_ip) {
                             Some(last) => {
                                 if now.duration_since(*last).as_secs() >= RESEED_SECS {

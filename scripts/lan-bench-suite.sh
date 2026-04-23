@@ -73,7 +73,13 @@
 #                       trading. The LOCAL workloads `engine-only` and
 #                       `pipeline-only` are trading-only (they run a real
 #                       Exchange in-process) and are skipped under NOOP=1.
-#                       DPDK transports aren't wired for NOOP yet.
+#   PERF=1              Capture `perf record` on the server's ingress core
+#                       (io_uring reader for kernel TCP, DPDK poll thread
+#                       for DPDK — both default to core 4 via reader_cores)
+#                       during the first workload of the run. Report + raw
+#                       perf.data are copied to ${RESULTS_DIR}. Defaults:
+#                       core 4, settle 15s after server start, record 30s.
+#                       Override with PERF_CORE, PERF_SETTLE, PERF_SECS.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -228,13 +234,6 @@ for workload in "${WORKLOAD_LIST[@]}"; do
 
     for transport in "${TRANSPORT_LIST[@]}"; do
         transport="$(echo "$transport" | xargs)"
-
-        # NOOP gate: DPDK server binaries aren't built with the noop feature
-        # today, so just skip those combos cleanly.
-        if [[ "${NOOP:-0}" == "1" && "$transport" == dpdk* ]]; then
-            echo "  SKIP ${transport}:${workload} — NOOP=1 has no DPDK variant yet"
-            continue
-        fi
 
         # Check infrastructure.
         case "$transport" in
@@ -400,8 +399,21 @@ fi
 
 # DPDK build on server (and replica if dpdk-repl).
 # In TAP mode, test-containers-start.sh already built the .dpdk binary.
-# In SR-IOV mode, cherry-setup.sh builds with --features dpdk as the main binary.
+# In SR-IOV mode we rebuild melin-server here with the dpdk feature plus
+# the app selector (trading by default, noop under NOOP=1). `--features
+# dpdk` alone fails to compile — the server requires exactly one of
+# `trading` or `noop`.
 if [[ "$NEED_DPDK" == "1" ]]; then
+    # Feature set for the DPDK server build. Mirrors MAIN_BUILD above.
+    if [[ "${NOOP:-0}" == "1" ]]; then
+        DPDK_SERVER_FEATURES="dpdk,noop"
+    else
+        DPDK_SERVER_FEATURES="dpdk,trading,hash-chain,release-tracing"
+    fi
+    if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+        DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},no-persist"
+    fi
+
     # Check if TAP mode .dpdk binary already exists (container setup).
     HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-server.dpdk && echo yes || echo no")
     if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
@@ -409,12 +421,12 @@ if [[ "$NEED_DPDK" == "1" ]]; then
     else
         # Each DPDK build is independent — run them concurrently and
         # fail the suite if any one returns non-zero.
-        echo "  Building DPDK server, bench, (and replica if dpdk-repl) in parallel..."
+        echo "  Building DPDK server (--features ${DPDK_SERVER_FEATURES}), bench, (and replica if dpdk-repl) in parallel..."
         dpdk_pids=()
         (
             ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
                 export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 \
+                cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                 | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
         ) &
         dpdk_pids+=($!)
@@ -430,7 +442,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
                 (
                     ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
                         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 \
+                        cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                         | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
                 ) &
                 dpdk_pids+=($!)
@@ -636,9 +648,12 @@ transport_start_tcp() {
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Server"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+
+    perf_capture_start "tcp"
 }
 
 transport_stop_tcp() {
+    perf_capture_stop
     stop_servers "$SERVER"
 }
 
@@ -676,9 +691,12 @@ transport_start_tcp_repl() {
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+
+    perf_capture_start "tcp-repl"
 }
 
 transport_stop_tcp_repl() {
+    perf_capture_stop
     stop_servers "$SERVER" "$REPLICA"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
@@ -735,9 +753,12 @@ transport_start_tcp_dual_repl() {
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+
+    perf_capture_start "tcp-dual-repl"
 }
 
 transport_stop_tcp_dual_repl() {
+    perf_capture_stop
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
@@ -870,6 +891,58 @@ add_tap_route() {
     "
 }
 
+# Start a background perf record on the server's ingress core (DPDK poll
+# thread or io_uring reader — both default to core 4 via `reader_cores`).
+# Returns immediately; data lands at /root/melin-perf-${label}.{data,
+# report.txt} on the server after ${settle}+${secs} seconds.
+# perf_capture_stop() waits for it, fetches both files to RESULTS_DIR,
+# and clears the pending flag. Safe to call whether PERF is set or not.
+perf_capture_start() {
+    [[ "${PERF:-0}" != "1" ]] && return
+    local label="$1"
+    local core="${PERF_CORE:-4}"
+    local secs="${PERF_SECS:-30}"
+    local settle="${PERF_SETTLE:-15}"
+    PERF_ACTIVE_LABEL="${label}"
+    PERF_DATA_PATH="/root/melin-perf-${label}.data"
+    PERF_REPORT_PATH="/root/melin-perf-${label}.report.txt"
+
+    echo "  perf: core=${core} settle=${settle}s record=${secs}s label=${label}"
+    ssh $SSH_OPTS "$SERVER" "rm -f ${PERF_DATA_PATH} ${PERF_REPORT_PATH} /tmp/melin-perf.log; \
+        nohup bash -c 'sleep ${settle} && \
+            perf record -C ${core} -g -F 997 -o ${PERF_DATA_PATH} -- sleep ${secs} 2>>/tmp/melin-perf.log && \
+            perf report -i ${PERF_DATA_PATH} --stdio --no-children -F overhead,sample,symbol 2>/dev/null \
+                | head -200 > ${PERF_REPORT_PATH}; \
+            touch ${PERF_REPORT_PATH}.done' \
+        >/tmp/melin-perf.log 2>&1 </dev/null &" </dev/null
+}
+
+perf_capture_stop() {
+    [[ "${PERF:-0}" != "1" ]] && return
+    [[ -z "${PERF_ACTIVE_LABEL:-}" ]] && return
+
+    echo "  perf: waiting for capture to finish..."
+    local max_wait=120 waited=0
+    while (( waited < max_wait )); do
+        if ssh $SSH_OPTS "$SERVER" "test -f ${PERF_REPORT_PATH}.done" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    if (( waited >= max_wait )); then
+        echo "  perf: report not produced within ${max_wait}s — skipping fetch"
+        ssh $SSH_OPTS "$SERVER" "cat /tmp/melin-perf.log 2>/dev/null | tail -20" || true
+        PERF_ACTIVE_LABEL=""
+        return
+    fi
+
+    echo "  perf: fetching data + report to ${RESULTS_DIR}"
+    scp $SSH_OPTS "$SERVER:${PERF_DATA_PATH}" "${RESULTS_DIR}/perf-${PERF_ACTIVE_LABEL}.data" 2>/dev/null || true
+    scp $SSH_OPTS "$SERVER:${PERF_REPORT_PATH}" "${RESULTS_DIR}/perf-${PERF_ACTIVE_LABEL}.report.txt" 2>/dev/null || true
+    PERF_ACTIVE_LABEL=""
+}
+
 transport_start_dpdk() {
     dpdk_sriov_setup
     clean_journal "$SERVER" "$JOURNAL_PATH"
@@ -930,9 +1003,12 @@ transport_start_dpdk() {
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
     CURRENT_HEALTH=""  # No health endpoint with DPDK (smoltcp).
     DPDK_RAN=1
+
+    perf_capture_start "dpdk"
 }
 
 transport_stop_dpdk() {
+    perf_capture_stop
     stop_servers "$SERVER"
     # TAP mode uses melin-server.dpdk — kill that too.
     ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
@@ -1017,9 +1093,12 @@ transport_start_dpdk_repl() {
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
     CURRENT_HEALTH=""
     DPDK_RAN=1
+
+    perf_capture_start "dpdk-repl"
 }
 
 transport_stop_dpdk_repl() {
+    perf_capture_stop
     stop_servers "$SERVER" "$REPLICA"
     for host in "$SERVER" "$REPLICA"; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"

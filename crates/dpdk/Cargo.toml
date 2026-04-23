@@ -23,6 +23,8 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 tracing = "0.1"
 libc = { version = "0.2", optional = true }
+# FxHash: low-cost hasher for integer-keyed maps on the hot path.
+rustc-hash = "2"
 
 [build-dependencies]
 # bindgen generates Rust FFI bindings from DPDK C headers at build time.

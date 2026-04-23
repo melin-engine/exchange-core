@@ -1557,6 +1557,7 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+ "rustc-hash",
  "smoltcp",
  "tracing",
 ]
@@ -2753,7 +2754,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smoltcp"
 version = "0.13.0"
-source = "git+ssh://git@github.com/pierre-l/fastcp.git#5eb63c49153b365ef899887c212a27a6dc44fb2b"
+source = "git+ssh://git@github.com/pierre-l/fastcp.git#b626bdef158a27bcb8ee4bb44eb9d2e47d610778"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",

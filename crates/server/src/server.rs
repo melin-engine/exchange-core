@@ -1466,7 +1466,7 @@ pub fn run_dpdk(
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
-                exchange.prefault();
+                <App as melin_app::Application>::prefault(&mut exchange);
 
                 // TODO: run_as_primary_dpdk — for now, fall back to
                 // kernel TCP primary after promotion.
@@ -1517,7 +1517,7 @@ pub fn run_dpdk(
 
     // Initialize or recover the exchange.
     let (mut exchange, writer, needs_seeding) = init_engine(&config)?;
-    exchange.prefault();
+    <App as melin_app::Application>::prefault(&mut exchange);
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
