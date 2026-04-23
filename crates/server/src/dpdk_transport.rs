@@ -31,12 +31,13 @@
 //! Core 3:   Response stage    (encodes to SPSC queues instead of kernel sockets)
 //! ```
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap;
 
 use crate::InputSlot;
 use crate::JournalEvent;
@@ -131,24 +132,26 @@ pub fn run_dpdk_poll(
     active_connections: Arc<std::sync::atomic::AtomicU64>,
     thread_id: u8,
 ) {
-    // Map from smoltcp SocketHandle → connection state.
-    let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
-    // Reverse map: connection_id → socket handle (for TX routing).
-    let mut id_to_handle: HashMap<u64, SocketHandle> = HashMap::with_capacity(256);
+    // Per-connection state indexed by `SocketHandle::index()`. Dense
+    // `Vec<Option<_>>` beats a HashMap on the DPDK hot path: the HashMap
+    // hashing + probe cost was the top remaining hotspot after the
+    // clock-read cleanup. MAX_CONNECTIONS matches the SocketSet capacity,
+    // so handle indices are always in-bounds.
+    let mut connections: Vec<Option<ConnectionState>> =
+        (0..melin_dpdk::MAX_CONNECTIONS).map(|_| None).collect();
+    // Reverse lookup from response-stage connection_id to SocketHandle.
+    // FxHash instead of SipHash — u64 keys, no HashDoS surface internally.
+    let mut id_to_handle: FxHashMap<u64, SocketHandle> =
+        FxHashMap::with_capacity_and_hasher(256, Default::default());
     let mut next_connection_id: u64 = 1;
+    // Occupied-slot count for the max_connections gate. Cheaper than
+    // scanning `connections` on every accept.
+    let mut connection_count: usize = 0;
 
     // Batch buffer for disruptor publish — accumulate decoded events from
     // all connections, then publish in a tight loop. Reduces interleaving
     // between smoltcp/parsing and ring buffer operations.
     let mut publish_batch: Vec<InputSlot> = Vec::with_capacity(256);
-
-    // Reusable handle buffer. Rebuilt from `connections.keys()` only when
-    // the connection set changes; steady-state polls just iterate the
-    // cached copy. Iterating a 256-capacity HashMap's keys per poll (via
-    // SIMD group scan) showed up as a chunk of run_dpdk_poll self-time
-    // once the clock reads were out of the way.
-    let mut handle_buf: Vec<SocketHandle> = Vec::with_capacity(256);
-    let mut handle_buf_dirty = true;
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
     // by recycling buffers from disconnected connections.
@@ -223,7 +226,7 @@ pub fn run_dpdk_poll(
         // 2. Accept new connections and start auth handshake.
         for accepted in transport.take_accepted() {
             // Enforce max_connections limit.
-            if max_connections > 0 && connections.len() as u64 >= max_connections {
+            if max_connections > 0 && connection_count as u64 >= max_connections {
                 warn!(
                     peer = %accepted.peer,
                     "DPDK: connection rejected: max_connections reached"
@@ -255,26 +258,23 @@ pub fn run_dpdk_poll(
                     .expect("challenge encodes");
             transport.queue_send(accepted.handle, &challenge_buf[..written]);
 
-            connections.insert(
-                accepted.handle,
-                ConnectionState {
-                    connection_id: conn_id,
-                    addr: accepted.peer,
-                    handle: accepted.handle,
-                    auth: AuthState::WaitingForResponse {
-                        nonce,
-                        accepted_at: Instant::now(),
-                    },
-                    key_hash: 0,
-                    // Reuse a pre-allocated buffer from the pool, or allocate
-                    // if the pool is exhausted (more connections than pre-allocated).
-                    parse_buf: parse_buf_pool
-                        .pop()
-                        .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
-                    last_activity: Instant::now(),
+            connections[accepted.handle.index()] = Some(ConnectionState {
+                connection_id: conn_id,
+                addr: accepted.peer,
+                handle: accepted.handle,
+                auth: AuthState::WaitingForResponse {
+                    nonce,
+                    accepted_at: Instant::now(),
                 },
-            );
-            handle_buf_dirty = true;
+                key_hash: 0,
+                // Reuse a pre-allocated buffer from the pool, or allocate
+                // if the pool is exhausted (more connections than pre-allocated).
+                parse_buf: parse_buf_pool
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
+                last_activity: Instant::now(),
+            });
+            connection_count += 1;
         }
 
         // 3. Drain TX frames from the response stage into smoltcp sockets.
@@ -294,10 +294,10 @@ pub fn run_dpdk_poll(
                     connection_id: frame.connection_id,
                 });
                 id_to_handle.remove(&frame.connection_id);
-                if let Some(mut removed) = connections.remove(&handle) {
+                if let Some(mut removed) = connections[handle.index()].take() {
                     removed.parse_buf.clear();
                     parse_buf_pool.push(removed.parse_buf);
-                    handle_buf_dirty = true;
+                    connection_count -= 1;
                 }
             }
         }
@@ -307,16 +307,6 @@ pub fn run_dpdk_poll(
         // flush TX responses and receive new data without waiting for
         // the full connection iteration to complete.
         const POLL_EVERY_N_CONNS: usize = 4;
-
-        // Rebuild only when the connection set changed. Stale entries
-        // are harmless — the per-connection `connections.get_mut` lookup
-        // short-circuits with `continue` if the handle is gone, so we
-        // just pay for an extra hash lookup until the next real change.
-        if handle_buf_dirty {
-            handle_buf.clear();
-            handle_buf.extend(connections.keys().copied());
-            handle_buf_dirty = false;
-        }
 
         // One wall-clock read per outer poll iteration, reused for
         // every request stamped in this pass. Sub-microsecond precision
@@ -329,14 +319,27 @@ pub fn run_dpdk_poll(
         slow_check_counter = slow_check_counter.wrapping_add(1);
         let do_slow_checks = slow_check_counter.is_multiple_of(SLOW_CHECK_INTERVAL);
 
-        for (conn_idx, &handle) in handle_buf.iter().enumerate() {
-            if conn_idx > 0 && conn_idx % POLL_EVERY_N_CONNS == 0 {
+        // Counts occupied slots we actually process, to drive the
+        // mid-iteration `transport.poll()` cadence.
+        let mut active_idx: usize = 0;
+        // Indexed loop, not iter_mut: remove paths do `connections[idx].take()`
+        // which conflicts with an outer iterator borrow.
+        #[allow(clippy::needless_range_loop)]
+        for idx in 0..connections.len() {
+            if connections[idx].is_none() {
+                continue;
+            }
+            if active_idx > 0 && active_idx.is_multiple_of(POLL_EVERY_N_CONNS) {
                 transport.poll();
             }
-            let conn = match connections.get_mut(&handle) {
+            active_idx += 1;
+            let conn = match connections[idx].as_mut() {
                 Some(c) => c,
                 None => continue,
             };
+            // SocketHandle is Copy; capture before any &mut conn borrows
+            // so process_auth_frame can take it after the conn borrow.
+            let conn_handle = conn.handle;
 
             // Check auth timeout for pending connections. Throttled to
             // avoid a per-poll `Instant::now()` via `elapsed()`.
@@ -350,10 +353,10 @@ pub fn run_dpdk_poll(
                     "DPDK: auth timeout, dropping connection"
                 );
                 transport.close(conn.handle);
-                if let Some(mut removed) = connections.remove(&handle) {
+                if let Some(mut removed) = connections[idx].take() {
                     removed.parse_buf.clear();
                     parse_buf_pool.push(removed.parse_buf);
-                    handle_buf_dirty = true;
+                    connection_count -= 1;
                 }
                 continue;
             }
@@ -371,10 +374,10 @@ pub fn run_dpdk_poll(
                     connection_id: conn.connection_id.0,
                 });
                 id_to_handle.remove(&conn.connection_id.0);
-                if let Some(mut removed) = connections.remove(&handle) {
+                if let Some(mut removed) = connections[idx].take() {
                     removed.parse_buf.clear();
                     parse_buf_pool.push(removed.parse_buf);
-                    handle_buf_dirty = true;
+                    connection_count -= 1;
                 }
                 continue;
             }
@@ -399,10 +402,10 @@ pub fn run_dpdk_poll(
                     }
                     transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections.remove(&handle) {
+                    if let Some(mut removed) = connections[idx].take() {
                         removed.parse_buf.clear();
                         parse_buf_pool.push(removed.parse_buf);
-                        handle_buf_dirty = true;
+                        connection_count -= 1;
                     }
                 }
                 // Check idle timeout when no data was received. Throttled
@@ -422,10 +425,10 @@ pub fn run_dpdk_poll(
                         connection_id: conn.connection_id.0,
                     });
                     id_to_handle.remove(&conn.connection_id.0);
-                    if let Some(mut removed) = connections.remove(&handle) {
+                    if let Some(mut removed) = connections[idx].take() {
                         removed.parse_buf.clear();
                         parse_buf_pool.push(removed.parse_buf);
-                        handle_buf_dirty = true;
+                        connection_count -= 1;
                     }
                 }
                 continue;
@@ -442,7 +445,7 @@ pub fn run_dpdk_poll(
                         &authorized_keys,
                         &control_tx,
                         &mut id_to_handle,
-                        handle,
+                        conn_handle,
                     );
                 }
                 AuthState::Authenticated { .. } => {
@@ -480,7 +483,7 @@ fn process_auth_frame(
     transport: &mut DpdkTransport,
     authorized_keys: &AuthorizedKeys,
     control_tx: &mpsc::Sender<ControlEvent>,
-    id_to_handle: &mut HashMap<u64, SocketHandle>,
+    id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     handle: SocketHandle,
 ) {
     // Need at least 4 bytes for the length prefix.
@@ -651,7 +654,7 @@ fn process_trading_frames(
     transport: &mut DpdkTransport,
     batch: &mut Vec<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
-    id_to_handle: &mut HashMap<u64, SocketHandle>,
+    id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
 ) {
     let mut cursor = 0;

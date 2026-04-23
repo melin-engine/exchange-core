@@ -4,7 +4,6 @@
 //! The transport owns the DPDK port and smoltcp interface. The server's
 //! DPDK poll thread calls `poll()` in a tight loop to drive all I/O.
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -39,8 +38,9 @@ fn tune_socket(socket: &mut tcp::Socket<'_>) {
     socket.set_initial_congestion_window(64 * 1024);
 }
 
-/// Maximum concurrent TCP connections.
-const MAX_CONNECTIONS: usize = 1024;
+/// Maximum concurrent TCP connections. Exposed so callers can pre-size
+/// per-connection state vectors that parallel the smoltcp socket set.
+pub const MAX_CONNECTIONS: usize = 1024;
 
 /// TCP listen port for trading connections.
 const LISTEN_PORT: u16 = 9876;
@@ -186,9 +186,12 @@ pub struct DpdkTransport {
     listen_handle: SocketHandle,
     listen_port: u16,
     accepted: Vec<AcceptedConnection>,
-    /// Per-connection TX buffers keyed by SocketHandle. Uses a cursor
-    /// to avoid O(n) drain on partial sends.
-    tx_queues: HashMap<SocketHandle, TxQueue>,
+    /// Per-connection TX buffers, indexed by `SocketHandle::index()`.
+    /// Dense `Vec<Option<_>>` instead of a HashMap — HashMap hashing
+    /// showed up prominently on the DPDK poll core under throughput.
+    /// `None` = slot free (no socket or no pending TX). Uses a cursor
+    /// inside TxQueue to avoid O(n) drain on partial sends.
+    tx_queues: Vec<Option<TxQueue>>,
     /// Cached smoltcp timestamp. Refreshed periodically, not every poll.
     cached_timestamp: Instant,
     /// Poll iteration counter for timestamp refresh.
@@ -388,7 +391,10 @@ impl DpdkTransport {
             listen_handle,
             listen_port: config.listen_port,
             accepted: Vec::new(),
-            tx_queues: HashMap::new(),
+            // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
+            // always in-bounds. Each empty slot is a single discriminant
+            // tag — no heap allocation per slot.
+            tx_queues: (0..MAX_CONNECTIONS).map(|_| None).collect(),
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
@@ -597,19 +603,32 @@ impl DpdkTransport {
     }
 
     fn flush_tx_queues(&mut self) {
-        // Split borrow: iterate tx_queues while mutating sockets.
-        for (&handle, queue) in self.tx_queues.iter_mut() {
+        // Iterate occupied sockets (smoltcp's iter_mut skips empties) and
+        // look up each socket's TX slot by handle index. Avoids a
+        // HashMap lookup on the hot path.
+        let Self {
+            tx_queues,
+            sockets,
+            pending_tx_bytes,
+            ..
+        } = self;
+        for (handle, socket) in sockets.iter_mut() {
+            let Some(queue) = tx_queues.get_mut(handle.index()).and_then(|s| s.as_mut()) else {
+                continue;
+            };
             if queue.queued_bytes() == 0 {
                 continue;
             }
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+            // Only TCP sockets are ever added to the set; the enum has a
+            // single variant enabled by feature flags.
+            let smoltcp::socket::Socket::Tcp(socket) = socket;
             if !socket.can_send() {
                 continue;
             }
             let sent = socket.send_slice(queue.pending()).unwrap_or(0);
             if sent > 0 {
                 queue.advance(sent);
-                self.pending_tx_bytes -= sent;
+                *pending_tx_bytes -= sent;
             }
         }
     }
@@ -650,7 +669,11 @@ impl DpdkTransport {
     /// Queue data to be sent on a connection. Returns false if the
     /// connection's TX queue exceeds the size limit (client fell behind).
     pub fn queue_send(&mut self, handle: SocketHandle, data: &[u8]) -> bool {
-        let queue = self.tx_queues.entry(handle).or_insert_with(TxQueue::new);
+        // Slot is always in-bounds: tx_queues is pre-sized to
+        // MAX_CONNECTIONS and smoltcp never hands out a handle beyond
+        // its socket capacity (also MAX_CONNECTIONS).
+        let slot = &mut self.tx_queues[handle.index()];
+        let queue = slot.get_or_insert_with(TxQueue::new);
         if queue.queued_bytes() + data.len() > MAX_TX_QUEUE_SIZE {
             return false;
         }
@@ -672,7 +695,7 @@ impl DpdkTransport {
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
         socket.abort();
         self.sockets.remove(handle);
-        if let Some(q) = self.tx_queues.remove(&handle) {
+        if let Some(q) = self.tx_queues[handle.index()].take() {
             self.pending_tx_bytes -= q.queued_bytes();
         }
     }
