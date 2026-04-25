@@ -306,11 +306,15 @@ fn replay_entry<A: Application>(
             }
             // Reports produced during replay are discarded — they already
             // went to the client at the time the event was accepted.
+            // `key_hash` is the dedup identity threaded through this
+            // event so self-introspecting queries see the correct
+            // per-key state under replay.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
                 journal_sequence: 0,
                 active_connections: 0,
                 events_processed: 0,
+                key_hash,
             };
             // Query response discarded during replay — these already
             // went to the client when the event was first accepted.
@@ -388,6 +392,7 @@ mod tests {
             journal_sequence: 0,
             active_connections: 0,
             events_processed: 0,
+            key_hash: 1,
         };
         for (i, e) in events.iter().enumerate() {
             let is_new = app.check_request_seq(1, first_seq + i as u64);

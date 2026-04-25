@@ -171,6 +171,7 @@ mod tests {
             journal_sequence: 0,
             active_connections: 0,
             events_processed: 0,
+            key_hash: 0,
         }
     }
 

@@ -81,6 +81,14 @@ pub struct ApplyCtx {
     /// Monotonic count of events the matching stage has applied since
     /// this process started (includes the event currently being applied).
     pub events_processed: u64,
+    /// FxHash of the public key that authenticated the connection
+    /// submitting this event. `0` for transport-internal events
+    /// (`Tick`, `GenesisHash`, `Checkpoint`) which carry no client
+    /// identity. Used by self-introspecting queries (e.g. "what is my
+    /// current request_seq HWM?") to look up per-key state without
+    /// embedding identity in the event payload — the transport already
+    /// knows it from the connection registration.
+    pub key_hash: u64,
 }
 
 /// An application event that can be round-tripped through the journal.

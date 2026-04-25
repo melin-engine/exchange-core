@@ -1195,14 +1195,16 @@ impl<A: Application> MatchingStage<A> {
 
             // Build ApplyCtx once per batch — the counters are advisory
             // (stats queries, health endpoint) so batch-stale values are
-            // fine. `now_ns` is overwritten per-event from the slot
-            // timestamp inside `process_event`. Three Relaxed loads per
-            // batch instead of per event.
+            // fine. `now_ns` and `key_hash` are overwritten per-event
+            // below (the latter from the slot's authenticated identity
+            // so self-introspecting queries can read it from `ctx`).
+            // Three Relaxed loads per batch instead of per event.
             let mut ctx = ApplyCtx {
                 now_ns: 0,
                 journal_sequence: self.journal_cursor.get().load(Ordering::Relaxed),
                 active_connections: self.active_connections.load(Ordering::Relaxed),
                 events_processed: local_events,
+                key_hash: 0,
             };
 
             for (i, slot) in batch[..count].iter().enumerate() {
@@ -1223,6 +1225,7 @@ impl<A: Application> MatchingStage<A> {
                 let exec_start = trace_ts();
 
                 ctx.events_processed = local_events;
+                ctx.key_hash = slot.key_hash;
                 local_events += 1;
 
                 // Halt check first: reject before advancing any HWMs so
@@ -1317,6 +1320,7 @@ impl<A: Application> MatchingStage<A> {
             journal_sequence: 0,
             active_connections: 0,
             events_processed: 0,
+            key_hash: 0,
         };
         loop {
             let entry = self.consumer.try_consume();

@@ -194,12 +194,15 @@ fn dispatch_event(
             // answer (and journal sequence number) is produced by the
             // matching stage. `ApplyCtx` is supplied with the fields the
             // shadow can cheaply compute; `journal_sequence` / connection
-            // counts are live-pipeline-only.
+            // counts are live-pipeline-only. `key_hash` is threaded so
+            // that any self-introspecting query the app supports stays
+            // consistent between live and shadow paths.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
                 journal_sequence: 0,
                 active_connections: 0,
                 events_processed: 0,
+                key_hash,
             };
             // Query response discarded — shadow is a secondary observer,
             // it does not produce client-facing output.
