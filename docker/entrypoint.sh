@@ -128,9 +128,13 @@ melin-server \
     &
 SERVER_PID=$!
 
-# Wait for the server to accept connections.
+# Wait for the server to accept connections on BOTH ports:
+#   9876 — RPC (oe-gateway client)
+#   9877 — event publisher (md-gateway subscriber)
+# Otherwise md-gateway races the server's event-publisher bind and logs a
+# spurious "MarketDataCore disconnected, reconnecting in 1s" warning.
 for i in $(seq 1 50); do
-    if nc -z 127.0.0.1 9876 2>/dev/null; then
+    if nc -z 127.0.0.1 9876 2>/dev/null && nc -z 127.0.0.1 9877 2>/dev/null; then
         echo "  melin-server ready"
         break
     fi
