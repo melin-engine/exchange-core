@@ -185,6 +185,23 @@ fn run_stub(
     }
     write_response(&mut stream, &ResponseKind::ServerReady)?;
 
+    // Production-side, the gateway issues `QueryRequestSeq` immediately
+    // after `ServerReady` to learn the engine's per-key request_seq HWM
+    // before unblocking the FIX session (otherwise a fresh client
+    // process re-uses seqs the engine has already accepted and every
+    // order is rejected as `DuplicateRequest`). The stub mirrors that
+    // contract: read the query, return `hwm = 0` (the stub holds no
+    // engine-side state) followed by `BatchEnd` per the query batch
+    // shape, then enter the regular request loop. Tests don't see this
+    // exchange — it stays inside the stub.
+    let (_seq, req) = read_request_blocking(&mut stream, &shutdown)?;
+    match req {
+        Request::QueryRequestSeq => {}
+        other => return Err(format!("expected QueryRequestSeq, got {other:?}")),
+    }
+    write_response(&mut stream, &ResponseKind::RequestSeqHwm { hwm: 0 })?;
+    write_response(&mut stream, &ResponseKind::BatchEnd)?;
+
     // --- Request/response loop ---
     let mut accum: Vec<u8> = Vec::with_capacity(256);
     let mut tmp = [0u8; 256];

@@ -70,6 +70,14 @@ pub enum SessionState {
     AwaitingChallenge,
     /// ChallengeResponse sent, waiting for ServerReady/AuthFailed.
     AwaitingAuthResult,
+    /// Authenticated; the gateway issued `QueryRequestSeq` to learn the
+    /// engine's per-key request_seq HWM and is waiting for the
+    /// `RequestSeqHwm` response. Until that arrives we don't reply to
+    /// the FIX client's Logon — sending the Logon ack is what tells the
+    /// client it can start submitting orders, and we must seed
+    /// `melin_seq` past the engine's HWM first or every order would be
+    /// rejected as `DuplicateRequest` after a session restart.
+    SyncingRequestSeq,
     /// Fully active — bidirectional FIX ↔ Melin forwarding.
     Active,
     /// Logout initiated, pending cleanup.
@@ -403,6 +411,7 @@ impl Session {
         match self.state {
             SessionState::AwaitingChallenge => self.handle_challenge(&payload, config),
             SessionState::AwaitingAuthResult => self.handle_auth_result(&payload, config),
+            SessionState::SyncingRequestSeq => self.handle_request_seq_sync(&payload, config),
             SessionState::Active => self.handle_active_melin(&payload, config, symbol_map),
             _ => {
                 debug!(state = ?self.state, "Melin frame in unexpected state");
@@ -478,7 +487,78 @@ impl Session {
                     "Melin authentication succeeded"
                 );
 
-                // Send FIX Logon response to the client.
+                // Defer the FIX Logon ack until we've learned the
+                // engine's request_seq HWM for this key — see
+                // SessionState::SyncingRequestSeq for the rationale.
+                // Queue QueryRequestSeq immediately; the engine treats
+                // queries as dedup-exempt so the seq we send it with
+                // doesn't matter (it gets reset from the response).
+                self.melin_seq += 1;
+                let written = match codec::encode_request(
+                    &Request::QueryRequestSeq,
+                    self.melin_seq,
+                    &mut self.melin_encode_buf,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(error = %e, "failed to encode QueryRequestSeq");
+                        self.queue_fix_logout(config, "internal error");
+                        return SessionAction::Close;
+                    }
+                };
+                self.melin_send_buf
+                    .extend_from_slice(&self.melin_encode_buf[..written]);
+
+                // Clean up auth state now — the signing key isn't needed
+                // again and clearing it early shrinks the window during
+                // which it sits in memory after use.
+                self.auth_nonce = None;
+                self.signing_key = None;
+
+                self.state = SessionState::SyncingRequestSeq;
+                SessionAction::SendMelin
+            }
+            ResponseKind::AuthFailed => {
+                warn!(sender = %self.sender_comp_id, "Melin authentication failed");
+                self.queue_fix_logout(config, "authentication failed");
+                SessionAction::Close
+            }
+            other => {
+                error!(response = ?other, "unexpected Melin auth response");
+                self.queue_fix_logout(config, "internal error");
+                SessionAction::Close
+            }
+        }
+    }
+
+    /// Handle the `RequestSeqHwm` response that follows our
+    /// `QueryRequestSeq`. Seeds `melin_seq` to the engine's HWM so the
+    /// next outbound request increments past whatever the engine has
+    /// already accepted under any prior session lifetime, then sends
+    /// the FIX Logon ack and unblocks the session into `Active`. The
+    /// `BatchEnd` that arrives after `RequestSeqHwm` is processed by
+    /// `handle_active_melin` (which no-ops it) once we've transitioned.
+    fn handle_request_seq_sync(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
+        let response = match codec::decode_response(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "failed to decode RequestSeqHwm response");
+                self.queue_fix_logout(config, "internal error");
+                return SessionAction::Close;
+            }
+        };
+
+        match response {
+            ResponseKind::RequestSeqHwm { hwm } => {
+                debug!(
+                    sender = %self.sender_comp_id,
+                    hwm,
+                    "synchronised melin_seq from engine HWM"
+                );
+                self.melin_seq = hwm;
+
+                // Now that the seq is correct, ack the FIX Logon and
+                // open the session for real traffic.
                 let logon_response = FixMessageBuilder::new(tags::MSG_LOGON)
                     .str_tag(tags::ENCRYPT_METHOD, "0")
                     .u64_tag(tags::HEART_BT_INT, self.heartbeat_interval.as_secs())
@@ -489,20 +569,21 @@ impl Session {
                     );
                 self.queue_fix_raw(&logon_response);
 
-                // Clean up auth state.
-                self.auth_nonce = None;
-                self.signing_key = None;
-
                 self.state = SessionState::Active;
                 SessionAction::SendFix
             }
-            ResponseKind::AuthFailed => {
-                warn!(sender = %self.sender_comp_id, "Melin authentication failed");
-                self.queue_fix_logout(config, "authentication failed");
-                SessionAction::Close
+            ResponseKind::BatchEnd | ResponseKind::Heartbeat => {
+                // BatchEnd shouldn't arrive before RequestSeqHwm — engine
+                // emits the query response first — but be defensive: a
+                // stray BatchEnd (or keepalive Heartbeat) doesn't break
+                // anything, just stay parked until the real response.
+                SessionAction::None
             }
             other => {
-                error!(response = ?other, "unexpected Melin auth response");
+                error!(
+                    response = ?other,
+                    "unexpected response while syncing request_seq"
+                );
                 self.queue_fix_logout(config, "internal error");
                 SessionAction::Close
             }
@@ -1932,6 +2013,89 @@ lot_size_inverse = 1
 
         assert_eq!(action, SessionAction::Close);
         assert!(matches!(s.state, SessionState::Closing));
+    }
+
+    /// Encode a response with the codec and strip the 4-byte length
+    /// prefix to match what the dispatcher hands to the auth handlers
+    /// (it consumes the prefix when framing).
+    fn encode_response_payload(resp: &ResponseKind) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = codec::encode_response(resp, &mut buf).unwrap();
+        buf[4..n].to_vec()
+    }
+
+    #[test]
+    fn server_ready_queues_query_request_seq_and_holds_fix_logon() {
+        // Fresh session in AwaitingAuthResult, as if ChallengeResponse
+        // had just been sent.
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::AwaitingAuthResult;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.heartbeat_interval = Duration::from_secs(30);
+        s.signing_key = Some(SigningKey::from_bytes(&[0u8; 32]));
+        s.auth_nonce = Some([0u8; 32]);
+
+        let payload = encode_response_payload(&ResponseKind::ServerReady);
+        let action = s.handle_auth_result(&payload, &config);
+
+        assert_eq!(action, SessionAction::SendMelin);
+        assert!(matches!(s.state, SessionState::SyncingRequestSeq));
+        // Auth state was wiped — signing key out of memory ASAP.
+        assert!(s.signing_key.is_none());
+        assert!(s.auth_nonce.is_none());
+        // FIX Logon ack is NOT sent yet — the client must wait until
+        // we've seeded melin_seq from the engine's HWM.
+        assert!(s.fix_send_buf.is_empty());
+        // QueryRequestSeq was queued for the engine.
+        let melin_payload = &s.melin_send_buf[4..]; // strip length prefix
+        let (_seq, req) = codec::decode_request(melin_payload).unwrap();
+        assert!(matches!(req, Request::QueryRequestSeq));
+    }
+
+    #[test]
+    fn request_seq_hwm_seeds_melin_seq_and_acks_fix_logon() {
+        // Session that's already past ServerReady: in SyncingRequestSeq
+        // waiting for the HWM.
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::SyncingRequestSeq;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.heartbeat_interval = Duration::from_secs(30);
+        s.fix_outbound_seq = 1;
+        s.melin_seq = 1; // pretend we sent the QueryRequestSeq with seq=1
+
+        let payload = encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 8423 });
+        let action = s.handle_request_seq_sync(&payload, &config);
+
+        assert_eq!(action, SessionAction::SendFix);
+        assert!(matches!(s.state, SessionState::Active));
+        // melin_seq seeded — next outbound bumps to 8424, past whatever
+        // the engine has already accepted under prior sessions.
+        assert_eq!(s.melin_seq, 8423);
+        // FIX Logon ack now released to the client.
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_LOGON);
+        assert_eq!(parsed.get_str(tags::HEART_BT_INT), Some("30"));
+    }
+
+    #[test]
+    fn request_seq_hwm_zero_unblocks_fresh_key() {
+        // A never-before-seen key reads back hwm=0 and the session
+        // becomes active normally; melin_seq stays at 0 so the next
+        // outbound increments to 1.
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::SyncingRequestSeq;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.heartbeat_interval = Duration::from_secs(30);
+
+        let payload = encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 0 });
+        let action = s.handle_request_seq_sync(&payload, &config);
+
+        assert_eq!(action, SessionAction::SendFix);
+        assert!(matches!(s.state, SessionState::Active));
+        assert_eq!(s.melin_seq, 0);
     }
 
     #[test]
