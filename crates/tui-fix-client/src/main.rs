@@ -702,6 +702,7 @@ fn run_md_session_once(
             }
             last_request = Instant::now();
         }
+        c.maintain_heartbeat()?;
         if let Some(msg) = c.try_recv()? {
             let mt_str = std::str::from_utf8(msg.msg_type()).unwrap_or("?");
             let _ = tx.send(UiMsg::Log(format!(
@@ -898,6 +899,8 @@ fn run_oe_session_once(
     // --- Main loop: send orders, process unsolicited ERs ---
 
     loop {
+        c.maintain_heartbeat()?;
+
         // Process order commands from the UI.
         while let Ok(cmd) = order_rx.try_recv() {
             match cmd {
