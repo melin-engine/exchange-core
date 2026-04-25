@@ -116,7 +116,15 @@ impl FixClient {
             // Loops back if it's a TestRequest we auto-answer.
             if let Some(raw) = parse::try_extract_message(&mut self.parse_buf) {
                 self.recv_buf = raw;
-                if self.handle_session_message()? {
+                // Peek the msg-type without a full parse so the parse on
+                // the non-TestRequest path is the *only* parse for this
+                // message — handing the FixMessage straight to the caller.
+                if peek_msg_type(&self.recv_buf) == tags::MSG_TEST_REQUEST {
+                    let id = FixMessage::parse(&self.recv_buf)?
+                        .get_str(tags::TEST_REQ_ID)
+                        .unwrap_or("")
+                        .to_owned();
+                    self.reply_to_test_request(&id)?;
                     continue;
                 }
                 return FixMessage::parse(&self.recv_buf).map_err(Into::into);
@@ -165,33 +173,31 @@ impl FixClient {
                 return Ok(None);
             };
             self.recv_buf = raw;
-            if self.handle_session_message()? {
+            // See `recv` — peek msg_type without parsing so the parse on
+            // the non-TestRequest path is the only parse for this message.
+            if peek_msg_type(&self.recv_buf) == tags::MSG_TEST_REQUEST {
+                let id = FixMessage::parse(&self.recv_buf)?
+                    .get_str(tags::TEST_REQ_ID)
+                    .unwrap_or("")
+                    .to_owned();
+                self.reply_to_test_request(&id)?;
                 continue;
             }
             return Ok(Some(FixMessage::parse(&self.recv_buf)?));
         }
     }
 
-    /// Inspect the message currently in `recv_buf`. If it's a session-level
-    /// administrative message we should answer transparently (currently
-    /// only TestRequest), reply and return `Ok(true)` so callers know to
-    /// skip it. Otherwise return `Ok(false)`.
-    fn handle_session_message(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
-        // Parse against `recv_buf`, extract any owned data we need, drop
-        // the borrow before sending so `&mut self` is available again.
-        let test_req_id = {
-            let msg = FixMessage::parse(&self.recv_buf)?;
-            if msg.msg_type() != tags::MSG_TEST_REQUEST {
-                return Ok(false);
-            }
-            msg.get_str(tags::TEST_REQ_ID).unwrap_or("").to_owned()
-        };
+    /// Send a Heartbeat (35=0) echoing the given TestReqID. FIX 4.4 §B.4
+    /// requires the response heartbeat to carry tag 112; an empty input
+    /// means the inbound TestRequest was malformed (no 112 set), in
+    /// which case we send a bare Heartbeat — the spec is silent on this
+    /// edge but most peers treat it as harmless keep-alive.
+    fn reply_to_test_request(&mut self, test_req_id: &str) -> io::Result<()> {
         let mut hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT);
         if !test_req_id.is_empty() {
-            hb = hb.str_tag(tags::TEST_REQ_ID, &test_req_id);
+            hb = hb.str_tag(tags::TEST_REQ_ID, test_req_id);
         }
-        self.send_builder(hb)?;
-        Ok(true)
+        self.send_builder(hb)
     }
 
     /// Send a Heartbeat (35=0) if our outbound has been silent for at
@@ -242,11 +248,60 @@ impl FixClient {
     }
 }
 
+/// Cheap msg-type extractor that scans for the `\x0135=…\x01` field
+/// without doing a full FIX parse. Used by the recv path to decide
+/// whether to swallow + auto-answer a TestRequest, so that the full
+/// `FixMessage::parse` only runs once per message — on the path that
+/// hands the parsed result to the caller. Returns an empty slice on
+/// any malformed input; callers fall back to the full parse error.
+///
+/// Safety against value collisions: FIX field values cannot contain
+/// SOH (0x01) by spec — that's the field separator — so the leading
+/// SOH guarantees the match is at a field boundary, not inside a
+/// value. The first FIX field (8=BeginString) has no leading SOH, so
+/// matching `\x0135=` always lands on the MsgType field.
+fn peek_msg_type(buf: &[u8]) -> &[u8] {
+    let needle = b"\x0135=";
+    let Some(start) = buf.windows(needle.len()).position(|w| w == needle) else {
+        return &[];
+    };
+    let val_start = start + needle.len();
+    let Some(soh_off) = buf[val_start..].iter().position(|&b| b == 0x01) else {
+        return &[];
+    };
+    &buf[val_start..val_start + soh_off]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    #[test]
+    fn peek_msg_type_finds_logon() {
+        let raw = FixMessageBuilder::new(tags::MSG_LOGON)
+            .str_tag(tags::ENCRYPT_METHOD, "0")
+            .u64_tag(tags::HEART_BT_INT, 30)
+            .build("S", "T", 1);
+        assert_eq!(peek_msg_type(&raw), tags::MSG_LOGON);
+    }
+
+    #[test]
+    fn peek_msg_type_finds_test_request() {
+        let raw = FixMessageBuilder::new(tags::MSG_TEST_REQUEST)
+            .str_tag(tags::TEST_REQ_ID, "PING")
+            .build("S", "T", 1);
+        assert_eq!(peek_msg_type(&raw), tags::MSG_TEST_REQUEST);
+    }
+
+    #[test]
+    fn peek_msg_type_returns_empty_on_garbage() {
+        assert!(peek_msg_type(b"not a fix message at all").is_empty());
+        assert!(peek_msg_type(b"").is_empty());
+        // Truncated mid-MsgType: leading SOH 35= present but no closing SOH.
+        assert!(peek_msg_type(b"\x0135=").is_empty());
+    }
 
     #[test]
     fn fix_client_type_is_constructible() {
