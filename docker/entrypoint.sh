@@ -134,13 +134,22 @@ SERVER_PID=$!
 #   9877 — event publisher (md-gateway subscriber)
 # Otherwise md-gateway races the server's event-publisher bind and logs a
 # spurious "MarketDataCore disconnected, reconnecting in 1s" warning.
+SERVER_READY=0
 for i in $(seq 1 50); do
     if nc -z 127.0.0.1 9876 2>/dev/null && nc -z 127.0.0.1 9877 2>/dev/null; then
         echo "  melin-server ready"
+        SERVER_READY=1
         break
     fi
     sleep 0.1
 done
+if [ "$SERVER_READY" -ne 1 ]; then
+    # The previous behaviour silently fell through, leaving the operator
+    # to infer "engine never bound" from a missing 'ready' line. Make the
+    # failure mode loud so a slow journal recovery (or a startup panic
+    # that doesn't even reach the bind) is obvious in the container log.
+    echo "  WARN: melin-server did not bind 9876+9877 within 5s — gateways will start anyway and may race or fail to connect" >&2
+fi
 
 echo "Starting oe-gateway..."
 melin-oe-gateway --config "$DATA_DIR/oe-gateway.toml" &
