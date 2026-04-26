@@ -1,0 +1,882 @@
+//! Receiver loop: drains incoming UDP datagrams into the subscription
+//! log, detects gaps in the byte stream, sends NAKs (with backoff for
+//! multicast NAK suppression), and emits periodic Status Messages so
+//! the publisher can drive its flow control.
+//!
+//! # Threading model
+//!
+//! The receiver runs on a single network thread, distinct from the
+//! subscriber thread that drains the [`SubscriptionLog`] via `poll`.
+//! Synchronization with the subscriber is the log's release/acquire
+//! protocol; this module performs no additional locking.
+//!
+//! # NAK suppression
+//!
+//! On a multicast fan-out, many receivers may see the same gap. To
+//! avoid a NAK storm we:
+//!
+//! 1. Schedule a [`PendingNak`] with a random backoff (50–200 µs)
+//!    when a gap is first detected.
+//! 2. When the backoff expires, re-check the gap: if a fragment
+//!    arrived in the meantime (because another receiver NAKed first
+//!    and the publisher's multicast retransmit reached us), suppress
+//!    our NAK.
+//!
+//! For unicast streams (replication) the backoff is wasted but
+//! harmless — there's only one receiver.
+//!
+//! ## Suppression limitation
+//!
+//! Gap-still-present checks use `partition_high_water_mark` and
+//! `subscriber_position`. HWM does NOT decrease when fragments fill
+//! the interior of a gap, so suppression only fires once the
+//! subscriber thread has actually consumed past the gap via
+//! [`SubscriptionLog::poll`]. In deployments where the subscriber
+//! polls aggressively (typical), this works as intended. With a slow
+//! subscriber, redundant NAKs may go out — wasted bandwidth, not a
+//! correctness issue. A proper Aeron-style LossDetector with
+//! per-range tracking is a v2 concern.
+//!
+//! [`SubscriptionLog::poll`]: crate::sub_log::SubscriptionLog::poll
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::storage::AlignedBuf;
+use crate::sub_log::{AcceptResult, SubscriptionLog};
+use crate::transport::UdpTransport;
+use crate::wire::{FrameView, NakFrame, ParseError, StatusMessage, parse_frame, position};
+
+/// Configuration for [`ReceiverLoop`].
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiverConfig {
+    /// Where to send NAK and Status Message frames (the publisher's
+    /// address — unicast back to the originator).
+    pub dst: SocketAddr,
+    /// Unique identifier for this subscriber within the stream. Sent
+    /// in every Status Message so the publisher can disambiguate
+    /// per-receiver state in a multicast fan-out.
+    pub receiver_id: u64,
+    /// Send a Status Message every this often.
+    pub sm_interval: Duration,
+    /// Minimum delay after gap detection before sending a NAK. Sets
+    /// a lower bound on suppression-window latency.
+    pub nak_backoff_min: Duration,
+    /// Maximum random delay added on top of `nak_backoff_min`. Each
+    /// receiver picks a uniform random delay in `[min, min+jitter]`,
+    /// so peers tend not to NAK simultaneously.
+    pub nak_backoff_jitter: Duration,
+    /// Maximum recv datagrams to drain per tick. Bounds work per
+    /// tick so the loop stays responsive to gap detection / NAK
+    /// processing.
+    pub max_recv_per_tick: u32,
+}
+
+impl ReceiverConfig {
+    pub fn defaults(dst: SocketAddr, receiver_id: u64) -> Self {
+        Self {
+            dst,
+            receiver_id,
+            sm_interval: Duration::from_millis(100),
+            nak_backoff_min: Duration::from_micros(50),
+            nak_backoff_jitter: Duration::from_micros(150),
+            max_recv_per_tick: 32,
+        }
+    }
+}
+
+/// Per-tick work counters returned by [`ReceiverLoop::tick`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickStats {
+    pub bytes_received: u64,
+    pub fragments_accepted: u32,
+    pub fragments_dropped: u32,
+    pub heartbeats_received: u32,
+    pub setups_received: u32,
+    pub naks_sent: u32,
+    pub naks_suppressed: u32,
+    pub sms_sent: u32,
+    pub send_errors: u32,
+    pub recv_errors: u32,
+    pub control_drops: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingNak {
+    term_id: u32,
+    term_offset: u32,
+    gap_length: u32,
+    /// When to re-check the gap and (if still present) send the NAK.
+    fire_at: Instant,
+}
+
+/// Tiny xorshift64 PRNG, seeded from `receiver_id` so each receiver
+/// picks an independent backoff series. Good enough for jitter.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        // xorshift's only forbidden state is 0; any non-zero seed
+        // produces a full-period 2^64 - 1 cycle.
+        Self(seed.max(1))
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    /// Uniform random in `[0, max_exclusive)`. Modulo bias is
+    /// negligible at the small ranges we use.
+    fn in_range(&mut self, max_exclusive: u64) -> u64 {
+        if max_exclusive == 0 {
+            0
+        } else {
+            self.next() % max_exclusive
+        }
+    }
+}
+
+/// Receiver loop. See module docs.
+pub struct ReceiverLoop<T: UdpTransport> {
+    log: Arc<SubscriptionLog>,
+    transport: T,
+    config: ReceiverConfig,
+    last_sm_at: Instant,
+    last_publisher_seen_at: Option<Instant>,
+    pending_naks: HashMap<(u32, u32, u32), PendingNak>,
+    rng: Rng,
+    recv_buf: Box<AlignedBuf<2048>>,
+}
+
+impl<T: UdpTransport> ReceiverLoop<T> {
+    pub fn new(log: Arc<SubscriptionLog>, transport: T, config: ReceiverConfig) -> Self {
+        let now = Instant::now();
+        Self {
+            rng: Rng::new(config.receiver_id),
+            log,
+            transport,
+            config,
+            last_sm_at: now,
+            last_publisher_seen_at: None,
+            pending_naks: HashMap::new(),
+            recv_buf: Box::new(AlignedBuf::new()),
+        }
+    }
+
+    /// Run one tick. Returns the work performed.
+    pub fn tick(&mut self) -> TickStats {
+        let mut stats = TickStats::default();
+        self.drain_recv(&mut stats);
+        self.detect_and_schedule_gap(&mut stats);
+        self.fire_due_naks(&mut stats);
+        self.maybe_send_sm(&mut stats);
+        stats
+    }
+
+    /// Most-recent instant we received any frame from the publisher
+    /// (Data, Setup, or Heartbeat). `None` until first contact.
+    pub fn last_publisher_seen_at(&self) -> Option<Instant> {
+        self.last_publisher_seen_at
+    }
+
+    /// Number of NAKs currently scheduled but not yet fired (waiting
+    /// for backoff). Useful for tests and diagnostics.
+    pub fn pending_nak_count(&self) -> usize {
+        self.pending_naks.len()
+    }
+
+    fn drain_recv(&mut self, stats: &mut TickStats) {
+        for _ in 0..self.config.max_recv_per_tick {
+            let len = {
+                let buf = self.recv_buf.slice_mut();
+                match self.transport.recv_from(buf) {
+                    Ok(Some((_from, len))) => len,
+                    Ok(None) => return,
+                    Err(_) => {
+                        stats.recv_errors += 1;
+                        continue;
+                    }
+                }
+            };
+            // recv_buf's mutable borrow ended above.
+            let bytes = &self.recv_buf.slice()[..len];
+            stats.bytes_received += len as u64;
+
+            // Multicast hygiene: drop frames not addressed to our
+            // session/stream. `parse_frame` doesn't enforce this
+            // (it's a generic dispatcher). last_publisher_seen_at is
+            // updated only for frames that pass the session check —
+            // a misaddressed frame should not look like liveness from
+            // our intended publisher.
+            let cfg_session = self.log.config().session_id;
+            let cfg_stream = self.log.config().stream_id;
+            let now = Instant::now();
+            match parse_frame(bytes) {
+                Ok(FrameView::Data { header, .. }) => {
+                    if header.session_id != cfg_session || header.stream_id != cfg_stream {
+                        stats.control_drops += 1;
+                        continue;
+                    }
+                    self.last_publisher_seen_at = Some(now);
+                    let term_id = header.term_id;
+                    let term_offset = header.term_offset;
+                    match self.log.on_fragment(term_id, term_offset, bytes) {
+                        AcceptResult::Accepted => stats.fragments_accepted += 1,
+                        _ => stats.fragments_dropped += 1,
+                    }
+                }
+                Ok(FrameView::Setup(s)) => {
+                    if s.session_id != cfg_session || s.stream_id != cfg_stream {
+                        stats.control_drops += 1;
+                    } else {
+                        self.last_publisher_seen_at = Some(now);
+                        stats.setups_received += 1;
+                    }
+                }
+                Ok(FrameView::Heartbeat(h)) => {
+                    if h.session_id != cfg_session || h.stream_id != cfg_stream {
+                        stats.control_drops += 1;
+                    } else {
+                        self.last_publisher_seen_at = Some(now);
+                        stats.heartbeats_received += 1;
+                    }
+                }
+                // Receiver doesn't process NAK / SM — those are sender-bound.
+                Ok(_) => stats.control_drops += 1,
+                Err(ParseError::Misaligned) | Err(_) => stats.control_drops += 1,
+            }
+        }
+    }
+
+    fn detect_and_schedule_gap(&mut self, _stats: &mut TickStats) {
+        let bits = self.log.term_length_bits();
+        let sub_pos = self.log.subscriber_position();
+        let sub_term_id = (sub_pos >> bits) as u32;
+        let sub_offset = (sub_pos & ((1u64 << bits) - 1)) as u32;
+
+        // Find the partition holding the subscriber's current term.
+        let Some(partition) = (0..3).find(|&p| self.log.partition_term_id(p) == sub_term_id) else {
+            return;
+        };
+
+        let hwm = self.log.partition_high_water_mark(partition);
+        if hwm <= sub_offset {
+            return; // no gap, fully contiguous up to HWM
+        }
+
+        let gap_length = hwm - sub_offset;
+        let key = (sub_term_id, sub_offset, gap_length);
+        if self.pending_naks.contains_key(&key) {
+            return; // already scheduled
+        }
+
+        // Pick a random backoff in [min, min + jitter].
+        let jitter_us = self
+            .rng
+            .in_range(self.config.nak_backoff_jitter.as_micros().max(1) as u64);
+        let fire_at =
+            Instant::now() + self.config.nak_backoff_min + Duration::from_micros(jitter_us);
+        self.pending_naks.insert(
+            key,
+            PendingNak {
+                term_id: sub_term_id,
+                term_offset: sub_offset,
+                gap_length,
+                fire_at,
+            },
+        );
+    }
+
+    fn fire_due_naks(&mut self, stats: &mut TickStats) {
+        let now = Instant::now();
+        let bits = self.log.term_length_bits();
+        let sub_pos = self.log.subscriber_position();
+
+        // Drain entries whose backoff has expired. We check inline
+        // whether the gap is still present (fragment may have arrived
+        // suppressing the NAK).
+        let mut to_remove: Vec<(u32, u32, u32)> = Vec::new();
+        for (&key, pending) in &self.pending_naks {
+            if pending.fire_at > now {
+                continue;
+            }
+            // Re-check the gap. `subscriber_position` may have advanced
+            // (gap filled and consumed) or the partition's term_id may
+            // have rotated (gap moved into the past). Either way:
+            // suppress.
+            let still_valid = self.gap_still_present(
+                sub_pos,
+                bits,
+                pending.term_id,
+                pending.term_offset,
+                pending.gap_length,
+            );
+            if !still_valid {
+                stats.naks_suppressed += 1;
+                to_remove.push(key);
+                continue;
+            }
+
+            let session_id = self.log.config().session_id;
+            let stream_id = self.log.config().stream_id;
+            let nak = NakFrame::new(
+                session_id,
+                stream_id,
+                pending.term_id,
+                pending.term_offset,
+                pending.gap_length,
+            );
+            match self
+                .transport
+                .send_to(self.config.dst, bytemuck::bytes_of(&nak))
+            {
+                Ok(_) => stats.naks_sent += 1,
+                Err(_) => stats.send_errors += 1,
+            }
+            to_remove.push(key);
+        }
+        for k in to_remove {
+            self.pending_naks.remove(&k);
+        }
+    }
+
+    /// Re-check whether a gap is still missing. The gap [t, o, l) is
+    /// still relevant iff:
+    ///   - subscriber_position has not advanced past it (it would have
+    ///     been consumed otherwise), AND
+    ///   - the partition still holds term `t`, AND
+    ///   - HWM in that partition is still beyond the gap start.
+    fn gap_still_present(
+        &self,
+        sub_pos: u64,
+        bits: u32,
+        term_id: u32,
+        term_offset: u32,
+        gap_length: u32,
+    ) -> bool {
+        let gap_start = position(term_id, term_offset, bits);
+        // If subscriber consumed past the gap entirely, no need.
+        if sub_pos >= gap_start + gap_length as u64 {
+            return false;
+        }
+        // Find the partition still holding term_id.
+        let Some(partition) = (0..3).find(|&p| self.log.partition_term_id(p) == term_id) else {
+            return false;
+        };
+        // If subscriber has consumed PAST the gap's start (but not its
+        // end), the trailing portion may still be missing — but we
+        // schedule NAKs from sub_pos forward on each tick, so this
+        // partial case is handled by the NEW NAK we schedule later.
+        // Conservatively suppress this old NAK (it covers some bytes
+        // we already have). Use strict `>` — when `sub_pos == gap_start`
+        // there has been NO consumption and the gap is still entirely
+        // relevant.
+        if sub_pos > gap_start {
+            return false;
+        }
+        let hwm = self.log.partition_high_water_mark(partition);
+        // Gap is meaningful only if HWM is still beyond its start.
+        hwm > term_offset
+    }
+
+    fn maybe_send_sm(&mut self, stats: &mut TickStats) {
+        let now = Instant::now();
+        if now.duration_since(self.last_sm_at) < self.config.sm_interval {
+            return;
+        }
+        self.send_sm(stats, now);
+    }
+
+    /// Send a Status Message immediately, regardless of `sm_interval`.
+    /// Useful at startup so the publisher learns about us before the
+    /// first interval elapses.
+    pub fn send_sm_now(&mut self) -> TickStats {
+        let mut stats = TickStats::default();
+        self.send_sm(&mut stats, Instant::now());
+        stats
+    }
+
+    fn send_sm(&mut self, stats: &mut TickStats, now: Instant) {
+        let cfg = self.log.config();
+        let bits = self.log.term_length_bits();
+        let sub_pos = self.log.subscriber_position();
+        let term_id = (sub_pos >> bits) as u32;
+        let offset = (sub_pos & ((1u64 << bits) - 1)) as u32;
+        let window = self.compute_receiver_window(offset);
+        let sm = StatusMessage::new(
+            cfg.session_id,
+            cfg.stream_id,
+            term_id,
+            offset,
+            window,
+            self.config.receiver_id,
+        );
+        match self
+            .transport
+            .send_to(self.config.dst, bytemuck::bytes_of(&sm))
+        {
+            Ok(_) => {
+                stats.sms_sent += 1;
+                self.last_sm_at = now;
+            }
+            Err(_) => stats.send_errors += 1,
+        }
+    }
+
+    /// How much further past `subscriber_position` we'll buffer:
+    /// `3 * term_length - bytes_into_active_term`. Capped to u32::MAX
+    /// (term_length is bounded ≤ 1 GiB so 3× fits in u32).
+    fn compute_receiver_window(&self, in_term_offset: u32) -> u32 {
+        let term_length = self.log.config().term_length;
+        // 3 * term_length fits in u32 since term_length <= 1 GiB.
+        3u32.saturating_mul(term_length)
+            .saturating_sub(in_term_offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sub_log::SubscriptionConfig;
+    use crate::transport::KernelUdp;
+    use crate::wire::{DataFrame, HeartbeatFrame, SetupFrame, data_flags};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    fn sub_cfg() -> SubscriptionConfig {
+        SubscriptionConfig {
+            session_id: 7,
+            stream_id: 11,
+            initial_term_id: 100,
+            term_length: 64 * 1024,
+        }
+    }
+
+    fn build_fragment(term_id: u32, term_offset: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let header = DataFrame::new(
+            sub_cfg().session_id,
+            sub_cfg().stream_id,
+            term_id,
+            term_offset,
+            flags,
+            payload.len() as u32,
+        );
+        let mut buf = Vec::with_capacity(DataFrame::HEADER_LEN + payload.len());
+        buf.extend_from_slice(bytemuck::bytes_of(&header));
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Build a receiver paired with a "publisher" socket on localhost.
+    /// Returns (log, receiver, publisher_socket, receiver_addr).
+    fn build_receiver(
+        sm_interval: Duration,
+        nak_min: Duration,
+        nak_jitter: Duration,
+    ) -> (
+        Arc<SubscriptionLog>,
+        ReceiverLoop<KernelUdp>,
+        KernelUdp,
+        SocketAddr,
+    ) {
+        let log = Arc::new(SubscriptionLog::new(sub_cfg()).unwrap());
+        let publisher = KernelUdp::bind(loopback(0)).unwrap();
+        let publisher_addr = publisher.local_addr().unwrap();
+        let recv_socket = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv_socket.local_addr().unwrap();
+        let mut config = ReceiverConfig::defaults(publisher_addr, 42);
+        config.sm_interval = sm_interval;
+        config.nak_backoff_min = nak_min;
+        config.nak_backoff_jitter = nak_jitter;
+        let receiver = ReceiverLoop::new(Arc::clone(&log), recv_socket, config);
+        (log, receiver, publisher, recv_addr)
+    }
+
+    fn drain_n(socket: &KernelUdp, count: usize) -> Vec<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut buf = [0u8; 2048];
+        while out.len() < count {
+            if Instant::now() > deadline {
+                panic!("timeout waiting for {count} datagrams; got {}", out.len());
+            }
+            match socket.recv_from(&mut buf).unwrap() {
+                Some((_, len)) => out.push(buf[..len].to_vec()),
+                None => std::thread::sleep(Duration::from_micros(100)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn receives_data_fragment_and_makes_it_pollable() {
+        let (log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+
+        let payload = vec![0x55u8; 64];
+        let frag = build_fragment(100, 0, data_flags::UNFRAGMENTED, &payload);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        // Drain until at least one fragment accepted.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = receiver.tick();
+            if stats.fragments_accepted >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("fragment not accepted within deadline");
+            }
+        }
+
+        // Subscriber-side poll delivers it.
+        let mut delivered = Vec::new();
+        log.poll(1024, |view| match view {
+            FrameView::Data { payload, .. } => delivered.push(payload.to_vec()),
+            _ => panic!("expected Data"),
+        });
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0], payload);
+    }
+
+    #[test]
+    fn heartbeat_updates_last_publisher_seen() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        assert!(receiver.last_publisher_seen_at().is_none());
+
+        let hb = HeartbeatFrame::new(sub_cfg().session_id, sub_cfg().stream_id);
+        publisher
+            .send_to(recv_addr, bytemuck::bytes_of(&hb))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = receiver.tick();
+            if stats.heartbeats_received >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("heartbeat not received");
+            }
+        }
+        assert!(receiver.last_publisher_seen_at().is_some());
+    }
+
+    #[test]
+    fn setup_frame_acknowledged_without_action() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        let setup = SetupFrame::new(
+            sub_cfg().session_id,
+            sub_cfg().stream_id,
+            100,
+            100,
+            0,
+            sub_cfg().term_length,
+        );
+        publisher
+            .send_to(recv_addr, bytemuck::bytes_of(&setup))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = receiver.tick();
+            if stats.setups_received >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("setup not received");
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_status_message_is_sent() {
+        let (_log, mut receiver, publisher, _recv_addr) = build_receiver(
+            Duration::from_micros(100),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let stats = receiver.tick();
+        assert!(stats.sms_sent >= 1);
+
+        // Drain the publisher socket to read the SM.
+        let dgrams = drain_n(&publisher, 1);
+        match parse_frame(&dgrams[0]).unwrap() {
+            FrameView::StatusMessage(sm) => {
+                assert_eq!(sm.session_id, sub_cfg().session_id);
+                assert_eq!(sm.receiver_id, 42);
+                assert_eq!(sm.consumption_term_id, 100);
+                assert_eq!(sm.consumption_term_offset, 0);
+            }
+            other => panic!("expected SM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_sm_now_emits_sm_immediately() {
+        let (_log, mut receiver, publisher, _recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        let stats = receiver.send_sm_now();
+        assert_eq!(stats.sms_sent, 1);
+        let _ = drain_n(&publisher, 1);
+    }
+
+    #[test]
+    fn gap_detected_schedules_pending_nak() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_millis(100), // long backoff so we can observe pending state
+            Duration::from_micros(0),
+        );
+        // Send fragment #2 only — leaves a gap at offset 0.
+        let frag = build_fragment(100, 96, data_flags::UNFRAGMENTED, &[0x77u8; 64]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            receiver.tick();
+            if receiver.pending_nak_count() >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("gap not detected");
+            }
+        }
+    }
+
+    #[test]
+    fn nak_fired_after_backoff() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_millis(2),
+            Duration::from_micros(0),
+        );
+        // Receive fragment #2, leaving a gap at offset 0.
+        let frag = build_fragment(100, 96, data_flags::UNFRAGMENTED, &[0xC9u8; 64]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        // Spin ticks until we see naks_sent.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut total_naks = 0u32;
+        loop {
+            let stats = receiver.tick();
+            total_naks += stats.naks_sent;
+            if total_naks >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("NAK not sent (pending={})", receiver.pending_nak_count());
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
+        // The publisher socket received the NAK.
+        let dgrams = drain_n(&publisher, 1);
+        match parse_frame(&dgrams[0]).unwrap() {
+            FrameView::Nak(n) => {
+                assert_eq!(n.term_id, 100);
+                assert_eq!(n.term_offset, 0);
+                assert_eq!(n.gap_length, 192); // hwm (96+96=192) - sub_pos_offset (0)
+            }
+            other => panic!("expected NAK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nak_suppressed_when_gap_filled_before_backoff_expires() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_millis(50), // long-ish backoff so we can fill the gap
+            Duration::from_micros(0),
+        );
+        // 1) Receive fragment #2 — schedules NAK for [0, 192).
+        let frag2 = build_fragment(100, 96, data_flags::UNFRAGMENTED, &[2u8; 64]);
+        publisher.send_to(recv_addr, &frag2).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            receiver.tick();
+            if receiver.pending_nak_count() >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("gap not detected");
+            }
+        }
+        // 2) Fill the gap before the backoff fires.
+        let frag1 = build_fragment(100, 0, data_flags::UNFRAGMENTED, &[1u8; 64]);
+        publisher.send_to(recv_addr, &frag1).unwrap();
+
+        // 3) Subscriber polls so subscriber_position advances past the gap.
+        let _log = Arc::clone(&receiver.log);
+        // Drain via tick (accepts the new fragment).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            receiver.tick();
+            // We need the subscriber to actually consume — call poll
+            // directly on the log.
+            receiver.log.poll(1024, |_| {});
+            // Wait for backoff to fire. Once it fires, the NAK should
+            // be suppressed because the gap is now consumed.
+            if Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(500));
+            if receiver.pending_nak_count() == 0 {
+                break;
+            }
+        }
+
+        // Confirm: no NAK was sent on the publisher socket.
+        let mut buf = [0u8; 2048];
+        let leftover = publisher.recv_from(&mut buf).unwrap();
+        // Could be the SM (we set sm_interval = 1 hr, so no SM). Could
+        // be nothing. We assert "not a NAK".
+        if let Some((_, len)) = leftover
+            && let FrameView::Nak(_) = parse_frame(&buf[..len]).unwrap()
+        {
+            panic!("NAK sent despite suppression");
+        }
+    }
+
+    #[test]
+    fn fragment_for_wrong_session_dropped() {
+        let (log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        // Build a DataFrame with the WRONG session_id but correct
+        // stream_id — should be dropped.
+        let bad_session = sub_cfg().session_id.wrapping_add(1);
+        let header = DataFrame::new(
+            bad_session,
+            sub_cfg().stream_id,
+            100,
+            0,
+            data_flags::UNFRAGMENTED,
+            32,
+        );
+        let mut frag = Vec::with_capacity(64);
+        frag.extend_from_slice(bytemuck::bytes_of(&header));
+        frag.extend_from_slice(&[0u8; 32]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut total_drops = 0u32;
+        loop {
+            let stats = receiver.tick();
+            total_drops += stats.control_drops;
+            if total_drops >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("frame not dropped (drops={total_drops})");
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        // Subscriber sees nothing.
+        let mut count = 0;
+        log.poll(1024, |_| count += 1);
+        assert_eq!(count, 0, "wrong-session frame must not reach subscriber");
+        // last_publisher_seen_at must NOT have been bumped.
+        assert!(
+            receiver.last_publisher_seen_at().is_none(),
+            "wrong-session frame must not signal publisher liveness"
+        );
+    }
+
+    #[test]
+    fn heartbeat_for_wrong_stream_dropped() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        let bad_stream = sub_cfg().stream_id.wrapping_add(99);
+        let hb = HeartbeatFrame::new(sub_cfg().session_id, bad_stream);
+        publisher
+            .send_to(recv_addr, bytemuck::bytes_of(&hb))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut total_drops = 0u32;
+        loop {
+            let stats = receiver.tick();
+            total_drops += stats.control_drops;
+            if total_drops >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("frame not dropped");
+            }
+        }
+        assert!(
+            receiver.last_publisher_seen_at().is_none(),
+            "wrong-stream HB must not signal publisher liveness"
+        );
+    }
+
+    #[test]
+    fn status_message_advertises_three_term_window_when_idle() {
+        let (_log, mut receiver, publisher, _recv_addr) = build_receiver(
+            Duration::from_micros(100),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let stats = receiver.tick();
+        assert!(stats.sms_sent >= 1);
+
+        let dgrams = drain_n(&publisher, 1);
+        match parse_frame(&dgrams[0]).unwrap() {
+            FrameView::StatusMessage(sm) => {
+                // Subscriber at start of term 100 (in_term offset = 0).
+                // Window = 3 * term_length - 0.
+                assert_eq!(sm.receiver_window, 3 * sub_cfg().term_length);
+            }
+            other => panic!("expected SM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rng_produces_different_sequences_for_different_seeds() {
+        let mut a = Rng::new(1);
+        let mut b = Rng::new(2);
+        let av: Vec<u64> = (0..16).map(|_| a.next()).collect();
+        let bv: Vec<u64> = (0..16).map(|_| b.next()).collect();
+        assert_ne!(av, bv);
+    }
+
+    #[test]
+    fn rng_in_range_stays_within_bound() {
+        let mut r = Rng::new(12345);
+        for _ in 0..1000 {
+            let v = r.in_range(100);
+            assert!(v < 100);
+        }
+        // in_range(0) returns 0.
+        assert_eq!(r.in_range(0), 0);
+    }
+}
