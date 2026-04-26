@@ -82,12 +82,19 @@ pub struct Exchange {
     instruments: Vec<Option<Box<InstrumentState>>>,
     /// Shared account balance manager across all instruments.
     accounts: AccountManager,
-    /// Per-account high-water mark for order IDs. Rejects submissions
-    /// with `order_id <= max_seen[account]` to prevent duplicate execution
-    /// on crash-recovery retry. Sparse HashMap: only accounts that have
-    /// submitted orders consume memory. Never evicted — prevents order ID
-    /// replay after account withdrawal.
-    max_order_id: HashMap4<AccountId, u64>,
+    /// Currently-live (account, order_id) pairs across all instruments.
+    /// A submission with an `(account, order_id)` already in this set is
+    /// rejected as `DuplicateOrderId` — required because cancel/replace
+    /// look up by that same key, so two simultaneously-live orders sharing
+    /// it would make the lookup ambiguous. Entries are removed when the
+    /// order leaves the book (full fill, cancel, expiry, instrument
+    /// disable). Reuse of an `OrderId` after its original closes is
+    /// permitted by design — the dedup invariant is "no two live orders
+    /// share `(account, order_id)`," not "an `OrderId` is consumed
+    /// forever," which keeps the gateway's session-local id_map workable
+    /// across reconnects without needing to query the engine for HWMs.
+    /// Used as a set: the unit value carries no information.
+    live_order_ids: HashMap4<(AccountId, OrderId), ()>,
     /// Per-account count of resting orders (on the book or pending stops).
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
@@ -112,7 +119,7 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            max_order_id: HashMap4::default(),
+            live_order_ids: HashMap4::default(),
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
@@ -126,10 +133,14 @@ impl Exchange {
             // 64 instrument slots — each empty slot is 8 bytes (null Box ptr).
             instruments: Vec::with_capacity(64),
             accounts: AccountManager::with_capacity(),
-            // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
-            // the default benchmark (1M accounts) with no hot-path resizes.
+            // 1M live-order slots × ~24 bytes per entry ≈ 24 MB. Sized
+            // for the default benchmark's peak resting depth — orders
+            // turn over fast at 10M ord/s so the live count is much
+            // smaller than the lifetime total.
+            live_order_ids: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            // 1M accounts × ~32 bytes per entry ≈ 32 MB. Covers the
+            // default benchmark (1M accounts) with no hot-path resizes.
             // Pages are faulted during prefault() via insert/clear.
-            max_order_id: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
@@ -141,26 +152,31 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        max_order_id: HashMap4<AccountId, u64>,
         key_hwm: HashMap<u64, u64>,
         scheduled_tasks: ScheduledTaskHeap,
     ) -> Self {
-        // Derive order_counts from order_index across all instruments.
+        // Derive order_counts and live_order_ids from order_index across
+        // all instruments. Both are fully reconstructible from the books,
+        // so the snapshot doesn't carry them — the only source of truth
+        // is the order index.
         let mut order_counts: HashMap4<AccountId, u32> = HashMap4::default();
+        let mut live_order_ids: HashMap4<(AccountId, OrderId), ()> = HashMap4::default();
         for inst in &instruments {
             if let Some(inst) = inst.as_deref() {
-                for ((account, _), _) in inst.book.active_order_slots() {
+                for ((account, order_id), _) in inst.book.active_order_slots() {
                     *order_counts.entry(account).or_default() += 1;
+                    live_order_ids.insert((account, order_id), ());
                 }
-                for ((account, _), _) in inst.book.active_stop_slots() {
+                for ((account, order_id), _) in inst.book.active_stop_slots() {
                     *order_counts.entry(account).or_default() += 1;
+                    live_order_ids.insert((account, order_id), ());
                 }
             }
         }
         Self {
             instruments,
             accounts,
-            max_order_id,
+            live_order_ids,
             order_counts,
             key_hwm,
             scheduled_tasks,
@@ -200,6 +216,7 @@ impl Exchange {
                     }
                     if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
                         self.accounts.release(slot);
+                        self.live_order_ids.remove(&(account, order_id));
                         if let Some(count) = self.order_counts.get_mut(&account) {
                             *count = count.saturating_sub(1);
                             if *count == 0 {
@@ -319,16 +336,6 @@ impl Exchange {
         self.accounts.snapshot_reservations(&active)
     }
 
-    /// Snapshot the per-account order ID high-water marks for serialization.
-    /// Only includes non-zero entries (accounts that have submitted orders).
-    pub(crate) fn snapshot_max_order_id(&self) -> Vec<(AccountId, u64)> {
-        self.max_order_id
-            .iter()
-            .filter(|(_, hwm)| **hwm > 0)
-            .map(|(&account, &hwm)| (account, hwm))
-            .collect()
-    }
-
     /// Set fat finger risk limits for an instrument. No-op if the
     /// instrument doesn't exist (matches previous behavior).
     pub fn set_risk_limits(&mut self, symbol: Symbol, limits: RiskLimits) {
@@ -427,6 +434,7 @@ impl Exchange {
         for (account, order_id) in to_cancel {
             if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
                 self.accounts.release(slot);
+                self.live_order_ids.remove(&(account, order_id));
                 if let Some(count) = self.order_counts.get_mut(&account) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
@@ -465,15 +473,16 @@ impl Exchange {
     /// orders. Skips maps that already contain data — their pages are already
     /// faulted from the insertions that populated them.
     pub fn prefault(&mut self) {
-        // Fault max_order_id and order_counts pages. with_capacity()
+        // Fault live_order_ids and order_counts pages. with_capacity()
         // allocated the backing table but didn't write to it — insert
         // dummy entries and clear to touch every page before the hot path.
-        if self.max_order_id.is_empty() {
-            let cap = self.max_order_id.capacity();
+        if self.live_order_ids.is_empty() {
+            let cap = self.live_order_ids.capacity();
             for i in 0..cap as u32 {
-                self.max_order_id.insert(AccountId(i), 0);
+                self.live_order_ids
+                    .insert((AccountId(i), OrderId(i as u64)), ());
             }
-            self.max_order_id.clear();
+            self.live_order_ids.clear();
         }
         if self.order_counts.is_empty() {
             let cap = self.order_counts.capacity();
@@ -568,15 +577,15 @@ impl Exchange {
         // InstrumentSpec is Copy (3 × u32 = 12 bytes).
         let spec = inst.spec;
 
-        // Dedup: reject if this account already submitted an order with
-        // the same or higher ID. Prevents duplicate execution on
-        // crash-recovery replay. The HWM advances unconditionally because
-        // the journal records every SubmitOrder regardless of matching
-        // outcome — a replayed InsufficientBalance rejection is harmless,
-        // but a replayed fill is not. Clients must use a new OrderId for
-        // genuinely new orders, even if the previous one was rejected.
-        let hwm = self.max_order_id.entry(order.account).or_insert(0);
-        if order.id.0 <= *hwm {
+        // Dedup: reject if `(account, order_id)` already names a live
+        // order. Cancel/replace look up by the same key, so two live
+        // orders sharing it would make those operations ambiguous.
+        // Replay-safety is provided one layer up by `check_request_seq`
+        // (transport-level idempotency on `(key_hash, request_seq)`),
+        // not here — duplicate journaled SubmitOrder events never reach
+        // this point. Reuse of an `OrderId` after the original closes
+        // is permitted by design.
+        if self.live_order_ids.contains_key(&(order.account, order.id)) {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
                 symbol,
@@ -585,10 +594,7 @@ impl Exchange {
             });
             return;
         }
-        *hwm = order.id.0;
 
-        // Re-lookup: the mutable borrow on max_order_id ended; we need
-        // a fresh immutable reference to instruments for validation.
         let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
 
         // Circuit breaker checks: trading halt rejects all orders; price
@@ -738,6 +744,11 @@ impl Exchange {
         };
 
         *self.order_counts.entry(order.account).or_default() += 1;
+        // Tentatively claim the (account, order_id) slot for the live
+        // dedup check. If the order closes within this `execute` call
+        // (IOC/FOK fill, FOK kill, etc.) the entry is freed in the
+        // `freed` loop below; if it rests, the entry stays put.
+        self.live_order_ids.insert((order.account, order.id), ());
 
         let taker_account = order.account;
         let taker_id = order.id;
@@ -894,14 +905,18 @@ impl Exchange {
             }
         }
 
-        // Decrement order_counts for all freed orders.
-        for &(account, _) in &freed {
+        // Decrement order_counts and free the live_order_ids entry
+        // for every order that closed this turn (consumed maker slots
+        // plus the taker if it didn't rest). Both maps are kept in
+        // lockstep — they have to agree on "which orders are live."
+        for &(account, order_id) in &freed {
             if let Some(count) = self.order_counts.get_mut(&account) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.order_counts.remove(&account);
                 }
             }
+            self.live_order_ids.remove(&(account, order_id));
         }
 
         // Schedule GTD expiry if the order rested (limit) or is now pending
@@ -935,8 +950,9 @@ impl Exchange {
             // cancel_all_for_account collects returned slots in consumed_slots.
             let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
                 inst.book.drain_consumed_slots().collect();
-            for &(_, _, _, slot) in &consumed {
+            for &(consumed_account, order_id, _, slot) in &consumed {
                 self.accounts.release(slot);
+                self.live_order_ids.remove(&(consumed_account, order_id));
             }
 
             let n_cancelled = reports.len() - report_start;
@@ -959,8 +975,9 @@ impl Exchange {
 
             inst.book.cancel_day_orders(reports);
 
-            for (account, _, _, slot) in inst.book.drain_consumed_slots() {
+            for (account, order_id, _, slot) in inst.book.drain_consumed_slots() {
                 self.accounts.release(slot);
+                self.live_order_ids.remove(&(account, order_id));
                 if let Some(count) = self.order_counts.get_mut(&account) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
@@ -986,8 +1003,9 @@ impl Exchange {
         inst.book.cancel_all_orders(reports);
 
         // Release reservations — same pattern as end_of_day.
-        for (account, _, _, slot) in inst.book.drain_consumed_slots() {
+        for (account, order_id, _, slot) in inst.book.drain_consumed_slots() {
             self.accounts.release(slot);
+            self.live_order_ids.remove(&(account, order_id));
             if let Some(count) = self.order_counts.get_mut(&account) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -1065,6 +1083,7 @@ impl Exchange {
 
         if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
             self.accounts.release(slot);
+            self.live_order_ids.remove(&(account, order_id));
             if let Some(count) = self.order_counts.get_mut(&account) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -3213,7 +3232,93 @@ mod tests {
     }
 
     #[test]
-    fn lower_order_id_rejected() {
+    fn order_id_reusable_after_cancel() {
+        // Cancelling a resting order frees its `(account, order_id)`
+        // entry from the live set, so the same id can be reused for a
+        // fresh submission. This is the bot's actual reconnect scenario:
+        // the gateway resets its session-local id counter, and we need
+        // the engine to accept the colliding ids once the prior session's
+        // orders are gone (e.g. via cancel-on-disconnect).
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+
+        reports.clear();
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 99, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "reuse after cancel should place, got {:?}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn order_id_reusable_after_full_fill() {
+        // A full fill closes the order: `(account, order_id)` leaves the
+        // live set in the same place every other close site does. The
+        // same id is then reusable for a fresh submission.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Maker (B) sells, taker (A) buys — A's order fully fills.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(7, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Fill { .. })),
+            "expected a fill, got {reports:?}"
+        );
+
+        // Reuse OrderId 7 — the prior order was fully filled, so it's
+        // gone from the live set.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(7, ACCT_A, Side::Buy, 99, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "reuse after full fill should place, got {:?}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn lower_order_id_accepted_when_not_live() {
+        // Under live-orders-only dedup, OrderIds aren't a monotonic
+        // counter — only currently-live `(account, order_id)` pairs are
+        // protected. Submitting a *different* (lower or higher) free ID
+        // while ID 5 is resting must succeed; the dedup only triggers
+        // when the same ID is reused while live.
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 100_000);
@@ -3229,24 +3334,24 @@ mod tests {
         reports.clear();
         exchange.execute(
             Symbol(1),
-            limit_order(3, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            limit_order(3, ACCT_A, Side::Buy, 99, 10, TimeInForce::GTC),
             &mut reports,
         );
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Rejected {
-                reason: RejectReason::DuplicateOrderId,
-                ..
-            }
-        ));
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "fresh lower id should place, got {:?}",
+            reports[0]
+        );
     }
 
     #[test]
-    fn rejected_order_consumes_id() {
-        // Even if an order is rejected (e.g., InsufficientBalance), the
-        // HWM advances because the journal already recorded the event.
-        // A retry with the same ID is a duplicate. The client must use
-        // a new OrderId for genuinely new orders.
+    fn rejected_order_id_can_be_reused() {
+        // Validation rejections (InsufficientBalance, OutsidePriceBand,
+        // TradingHalted, etc.) leave the live set untouched: the order
+        // never rested, so cancel/replace can't reference it. Reusing
+        // its OrderId for a fresh submission is therefore fine — the
+        // gateway's session-local id_map doesn't have to keep moving
+        // forward forever just because earlier attempts bounced.
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
 
@@ -3264,7 +3369,8 @@ mod tests {
             }
         ));
 
-        // Retry with the same ID — blocked by dedup even after depositing.
+        // Retry with the same ID after depositing — the previous
+        // rejection didn't consume the slot, so this places.
         exchange.deposit(ACCT_A, USD, 100_000);
         reports.clear();
         exchange.execute(
@@ -3272,22 +3378,11 @@ mod tests {
             limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
             &mut reports,
         );
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Rejected {
-                reason: RejectReason::DuplicateOrderId,
-                ..
-            }
-        ));
-
-        // A new, higher ID succeeds.
-        reports.clear();
-        exchange.execute(
-            Symbol(1),
-            limit_order(2, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "retry of rejected id should place, got {:?}",
+            reports[0]
         );
-        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
     }
 
     // --- Fat finger checks ---
@@ -4520,9 +4615,11 @@ mod tests {
     }
 
     #[test]
-    fn halted_order_still_consumes_order_id() {
-        // A halt-rejected order must consume its OrderId (HWM advances).
-        // Otherwise replaying the journal after recovery could double-execute.
+    fn halted_order_id_can_be_reused() {
+        // A halt-rejected order doesn't rest, so under live-orders-only
+        // dedup it doesn't claim the OrderId. Once trading resumes, the
+        // same id can be retried — clients/gateways don't need to skip
+        // an id just because the engine was halted when they first sent.
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 100_000);
@@ -4549,7 +4646,6 @@ mod tests {
             }
         ));
 
-        // Unhalt and retry with the same OrderId — should be rejected as duplicate.
         exchange.set_circuit_breaker(Symbol(1), CircuitBreakerConfig::default());
         reports.clear();
         exchange.execute(
@@ -4557,17 +4653,19 @@ mod tests {
             limit_order(5, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
             &mut reports,
         );
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Rejected {
-                reason: RejectReason::DuplicateOrderId,
-                ..
-            }
-        ));
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "retry after halt cleared should place, got {:?}",
+            reports[0]
+        );
     }
 
     #[test]
-    fn band_rejected_order_still_consumes_order_id() {
+    fn band_rejected_order_id_can_be_reused() {
+        // Same as `halted_order_id_can_be_reused` but for the price-band
+        // rejection path: an OutsidePriceBand reject doesn't rest the
+        // order, so the live set stays empty and the same id is free
+        // to retry once the bands are widened.
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 100_000);
@@ -4595,7 +4693,6 @@ mod tests {
             }
         ));
 
-        // Widen bands and retry same OrderId — should be duplicate.
         exchange.set_circuit_breaker(Symbol(1), CircuitBreakerConfig::default());
         reports.clear();
         exchange.execute(
@@ -4603,13 +4700,11 @@ mod tests {
             limit_order(5, ACCT_A, Side::Buy, 50, 10, TimeInForce::GTC),
             &mut reports,
         );
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Rejected {
-                reason: RejectReason::DuplicateOrderId,
-                ..
-            }
-        ));
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "retry after band widened should place, got {:?}",
+            reports[0]
+        );
     }
 
     #[test]
@@ -5813,7 +5908,10 @@ mod tests {
     }
 
     #[test]
-    fn post_only_rejected_still_consumes_order_id() {
+    fn post_only_rejected_order_id_can_be_reused() {
+        // PostOnlyWouldCross is another submit-time rejection: the order
+        // never rests, the live set never gains an entry, so the same
+        // OrderId is free to retry with a non-crossing price.
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
@@ -5830,7 +5928,7 @@ mod tests {
         );
         reports.clear();
 
-        // Post-only buy at 1000 with order_id=2 — rejected.
+        // Post-only buy at 1000 with order_id=2 — rejected (would cross).
         exchange.execute(
             btc,
             post_only_order(2, ACCT_A, Side::Buy, 1000, 10),
@@ -5838,7 +5936,8 @@ mod tests {
         );
         reports.clear();
 
-        // Resubmitting order_id=2 should be rejected as duplicate.
+        // Resubmitting order_id=2 below the ask must place — the prior
+        // rejection didn't claim the slot.
         exchange.execute(
             btc,
             limit_order(2, ACCT_A, Side::Buy, 900, 10, TimeInForce::GTC),
@@ -5846,14 +5945,9 @@ mod tests {
         );
 
         assert!(
-            reports.iter().any(|r| matches!(
-                r,
-                ExecutionReport::Rejected {
-                    reason: RejectReason::DuplicateOrderId,
-                    ..
-                }
-            )),
-            "rejected post-only should still consume the order ID"
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "retry of rejected post-only id should place, got {:?}",
+            reports[0],
         );
     }
 
@@ -5919,7 +6013,12 @@ mod tests {
     }
 
     #[test]
-    fn max_order_id_retained_after_full_withdrawal() {
+    fn order_id_reusable_after_full_withdrawal() {
+        // Under live-orders-only dedup there is no per-account HWM that
+        // persists across an account's lifetime. Once a fill closes an
+        // order the live set drops the entry; full account withdrawal
+        // doesn't change that. A re-deposited account can reuse the
+        // same OrderId because no live order claims it.
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 10_000);
@@ -5956,10 +6055,10 @@ mod tests {
             )
             .unwrap();
 
-        // Account has no balances, but HWM is retained.
         assert!(!exchange.accounts().has_balances(ACCT_A));
 
-        // Re-deposit and try to reuse OrderId 1 — should be rejected.
+        // Re-deposit and reuse OrderId 1 — must place because the
+        // earlier fill removed it from the live set.
         exchange.deposit(ACCT_A, USD, 10_000);
         reports.clear();
         exchange.execute(
@@ -5967,13 +6066,11 @@ mod tests {
             limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
             &mut reports,
         );
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Rejected {
-                reason: RejectReason::DuplicateOrderId,
-                ..
-            }
-        ));
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "reuse after fill+withdrawal should place, got {:?}",
+            reports[0]
+        );
     }
 
     #[test]

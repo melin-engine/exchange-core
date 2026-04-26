@@ -8,12 +8,12 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v14)
+//! ## File format (v15)
 //!
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 14               |
+//! | format_version | u16     | 2     | Current version = 15               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state            |
@@ -61,7 +61,11 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v12 → v13: added scheduled_tasks heap for the engine-internal scheduler.
 /// v13 → v14: scheduler heap removed from snapshot — rebuilt on restore from
 ///            GTD orders + pending stops (derived state).
-const SNAP_VERSION: u16 = 14;
+/// v14 → v15: per-account OrderId HWMs removed — replaced by a live-orders-only
+///            `(AccountId, OrderId)` set rebuilt on restore from `order_index`.
+///            Dedup semantics changed to allow OrderId reuse after the original
+///            closes (previously forbidden for the lifetime of the account).
+const SNAP_VERSION: u16 = 15;
 
 /// Re-exports for callers that serialize the Exchange payload without the
 /// full on-disk framing — e.g. the `melin-app::Application` impl which
@@ -234,8 +238,6 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
     pub(crate) order_sides: Vec<((AccountId, OrderId), Side)>,
     pub(crate) books: Vec<(Symbol, BookSnapshot)>,
-    /// Per-account OrderId high-water marks for client deduplication.
-    pub(crate) max_order_id: Vec<(AccountId, u64)>,
     /// Per-instrument fat finger risk limits.
     pub(crate) risk_limits: Vec<(Symbol, RiskLimits)>,
     /// Per-instrument circuit breaker configurations.
@@ -331,13 +333,6 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     for (symbol, book) in &state.books {
         le::push_u32(buf, symbol.0);
         encode_book_snapshot(book, buf);
-    }
-
-    // Per-account OrderId high-water marks (v3+).
-    le::push_u32(buf, state.max_order_id.len() as u32);
-    for (account, hwm) in &state.max_order_id {
-        le::push_u32(buf, account.0);
-        le::push_u64(buf, *hwm);
     }
 
     // Per-instrument risk limits (v4+).
@@ -627,21 +622,6 @@ fn decode_exchange_state(
         books.push((symbol, book));
     }
 
-    // Per-account OrderId high-water marks (v3+).
-    check(pos, 4)?;
-    let n_max_order_id = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
-    // Each entry is 12 bytes: account_id(4) + hwm(8).
-    validate_count(buf.len() - pos, n_max_order_id, 12)?;
-    let mut max_order_id = Vec::with_capacity(n_max_order_id);
-    for _ in 0..n_max_order_id {
-        check(pos, 12)?;
-        let account = AccountId(le::get_u32(&buf[pos..]));
-        let hwm = le::get_u64(&buf[pos + 4..]);
-        max_order_id.push((account, hwm));
-        pos += 12;
-    }
-
     // Per-instrument risk limits (v4+).
     check(pos, 4)?;
     let n_risk_limits = le::get_u32(&buf[pos..]) as usize;
@@ -822,7 +802,6 @@ fn decode_exchange_state(
             reservations,
             order_sides,
             books,
-            max_order_id,
             risk_limits,
             circuit_breakers,
             fee_schedules,
@@ -1191,7 +1170,6 @@ impl Exchange {
             .map(|(symbol, book)| (symbol, book.snapshot()))
             .collect();
 
-        let max_order_id = self.snapshot_max_order_id();
         let risk_limits = self.snapshot_risk_limits();
         let circuit_breakers = self.snapshot_circuit_breakers();
         let fee_schedules = self.snapshot_fee_schedules();
@@ -1204,7 +1182,6 @@ impl Exchange {
             reservations,
             order_sides,
             books,
-            max_order_id,
             risk_limits,
             circuit_breakers,
             fee_schedules,
@@ -1265,15 +1242,6 @@ impl Exchange {
             }
         }
 
-        // Build sparse HashMap4 from snapshot entries (4-entry buckets for hot path).
-        let mut max_order_id = crate::types::HashMap4::with_capacity_and_hasher(
-            state.max_order_id.len(),
-            Default::default(),
-        );
-        for (account, hwm) in state.max_order_id {
-            max_order_id.insert(account, hwm);
-        }
-
         // Build per-key request sequence HWM map from snapshot entries (v9+).
         let mut key_hwm: crate::types::HashMap<u64, u64> =
             crate::types::HashMap::with_capacity_and_hasher(
@@ -1287,15 +1255,11 @@ impl Exchange {
         // Rebuild the scheduler heap from order state. Every GTD order that
         // is currently resting (or pending as a stop) needs an ExpireOrder
         // task — the heap is derived state, never stored in the snapshot.
+        // `live_order_ids` is rebuilt the same way inside `from_parts`,
+        // straight from the per-instrument order_index.
         let scheduled_tasks = rebuild_scheduler_heap(&instruments);
 
-        Self::from_parts(
-            instruments,
-            accounts,
-            max_order_id,
-            key_hwm,
-            scheduled_tasks,
-        )
+        Self::from_parts(instruments, accounts, key_hwm, scheduled_tasks)
     }
 
     /// Create a deep copy of this Exchange by round-tripping through the
