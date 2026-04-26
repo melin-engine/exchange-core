@@ -1,0 +1,14 @@
+[package]
+name = "melin-rumcast"
+version = "0.4.0"
+edition = "2024"
+
+[lib]
+name = "melin_rumcast"
+path = "src/lib.rs"
+
+[dependencies]
+# Dependencies are intentionally absent at scaffold time. Each task adds
+# only what it actually needs (libc for syscalls, bytemuck for zero-copy
+# headers, tracing for diagnostics, etc.) so the crate's dependency surface
+# stays minimal and auditable.

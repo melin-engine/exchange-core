@@ -1688,6 +1688,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-rumcast"
+version = "0.4.0"
+
+[[package]]
 name = "melin-server"
 version = "0.5.0"
 dependencies = [
