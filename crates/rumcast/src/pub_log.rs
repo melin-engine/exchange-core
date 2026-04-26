@@ -24,10 +24,9 @@
 //! [`publisher_position`]: PublicationLog::publisher_position
 //! [`set_publisher_limit`]: PublicationLog::set_publisher_limit
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::storage::{CachePadded, LogStorage, align_up};
 use crate::wire::{DataFrame, data_flags, position, term_length_bits};
 
 /// Required per-fragment alignment within a term buffer. Matches
@@ -95,66 +94,6 @@ pub enum ClaimError {
     ///
     /// [`publisher_limit`]: PublicationLog::publisher_limit
     BackPressure { wanted_position: u64, limit: u64 },
-}
-
-/// 64-byte cache-line padding to keep hot atomics on their own cache line.
-/// Local copy to avoid a dependency on `melin-disruptor` for one tiny type.
-#[repr(align(64))]
-struct CachePadded<T>(T);
-
-impl<T> CachePadded<T> {
-    const fn new(value: T) -> Self {
-        Self(value)
-    }
-    fn get(&self) -> &T {
-        &self.0
-    }
-}
-
-/// Aligned, zero-initialized heap storage for the three term buffers.
-/// Allocated once at construction; never resized.
-struct LogStorage {
-    ptr: NonNull<u8>,
-    layout: Layout,
-}
-
-// SAFETY: The buffer is owned by the LogStorage; concurrent access is
-// coordinated by the surrounding atomic protocol (single producer +
-// single sender that reads bytes at positions the producer has released).
-unsafe impl Send for LogStorage {}
-unsafe impl Sync for LogStorage {}
-
-impl LogStorage {
-    fn new(size: usize) -> Self {
-        // 64-byte alignment guarantees DataFrame headers (8-byte align)
-        // sit aligned at every 32-byte slot boundary, and matches the
-        // cache-line size used elsewhere in the workspace. Hugepage
-        // backing is a deferred optimization (Task DEFER #C).
-        let layout = Layout::from_size_align(size, 64).expect("invalid log layout");
-        // SAFETY: layout has nonzero size — caller passes 3 * term_length
-        // and term_length is validated to be at least 64 KiB.
-        let raw = unsafe { alloc_zeroed(layout) };
-        // Construction-time allocation. Failing here means the host can't
-        // give us 3 * term_length bytes of contiguous heap, which is
-        // unrecoverable for a transport that needs the log buffer to
-        // exist. Propagating an error would force every caller into the
-        // same panic path one frame up; we panic directly with a clear
-        // message instead.
-        let ptr = NonNull::new(raw).expect("rumcast: log buffer allocation failed");
-        Self { ptr, layout }
-    }
-
-    #[inline]
-    fn as_ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-}
-
-impl Drop for LogStorage {
-    fn drop(&mut self) {
-        // SAFETY: same layout used to allocate.
-        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
-    }
 }
 
 /// Three-term publication log. See module docs for the concurrency model.
@@ -505,15 +444,6 @@ impl PublicationLog {
     }
 }
 
-/// Round `n` up to the next multiple of `alignment`. Alignment must be
-/// a power of two — this is enforced via debug_assert and is true for
-/// our only call site (`FRAGMENT_ALIGNMENT = 32`).
-#[inline]
-fn align_up(n: u32, alignment: u32) -> u32 {
-    debug_assert!(alignment.is_power_of_two());
-    (n + alignment - 1) & !(alignment - 1)
-}
-
 /// Reservation handle returned by [`PublicationLog::try_claim`]. Holds a
 /// writable region for the fragment payload. Call [`Claim::publish`] to
 /// make the fragment visible to the sender thread; dropping without
@@ -641,16 +571,6 @@ mod tests {
             term_length: 64 * 1024,
             mtu: 1024,
         }
-    }
-
-    #[test]
-    fn align_up_pow2() {
-        assert_eq!(align_up(0, 32), 0);
-        assert_eq!(align_up(1, 32), 32);
-        assert_eq!(align_up(31, 32), 32);
-        assert_eq!(align_up(32, 32), 32);
-        assert_eq!(align_up(33, 32), 64);
-        assert_eq!(align_up(100, 32), 128);
     }
 
     #[test]

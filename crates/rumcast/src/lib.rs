@@ -42,4 +42,6 @@ compile_error!(
 );
 
 pub mod pub_log;
+mod storage;
+pub mod sub_log;
 pub mod wire;
