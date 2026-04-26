@@ -34,3 +34,11 @@
 //!
 //! [`melin-journal`]: ../melin_journal/index.html
 //! [`Transport`]: crate::transport::Transport
+
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "melin-rumcast wire format assumes a little-endian target; \
+     bytemuck-based zero-copy header decode is unsafe on big-endian"
+);
+
+pub mod wire;

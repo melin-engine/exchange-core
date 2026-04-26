@@ -8,7 +8,9 @@ name = "melin_rumcast"
 path = "src/lib.rs"
 
 [dependencies]
-# Dependencies are intentionally absent at scaffold time. Each task adds
-# only what it actually needs (libc for syscalls, bytemuck for zero-copy
-# headers, tracing for diagnostics, etc.) so the crate's dependency surface
-# stays minimal and auditable.
+# Zero-copy decode of frame headers from received UDP packets. Headers are
+# read on every packet on the hot path, so we want a `&[u8] -> &Header` cast
+# rather than per-field byte copies. bytemuck's `Pod`/`Zeroable` derives give
+# us the alignment + no-padding guarantees safely. Tiny dep, no transitive
+# deps, well-maintained.
+bytemuck = { version = "1", features = ["derive"] }
