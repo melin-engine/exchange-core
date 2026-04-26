@@ -156,9 +156,14 @@ fn dpdk_num_queues(_cfg: &ServerConfig) -> u16 {
 fn rumcast_config_from(cfg: &ServerConfig) -> melin_server::rumcast_transport::RumcastConfig {
     melin_server::rumcast_transport::RumcastConfig {
         // Server's order-entry bind reuses the existing --bind flag —
-        // clients send orders to this address. Responses go back to
-        // the address each client publishes from (learned from
-        // incoming SetupFrames).
+        // clients send orders to this address.
         bind: cfg.bind,
+        // Client address responses are unicast to. Hard-required for
+        // Phase 1 (single-client). Multi-client routing comes in
+        // Phase 3, at which point the address will be learned from
+        // incoming Setup frames.
+        client_addr: cfg
+            .rumcast_client_addr
+            .expect("--rumcast-client-addr is required with --features rumcast in Phase 1"),
     }
 }

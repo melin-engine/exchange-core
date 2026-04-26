@@ -177,6 +177,13 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
+    /// Client address that rumcast responses are unicast to. Required
+    /// when the server is built with `--features rumcast`. Phase 1 of
+    /// the rumcast wire-up is single-client only; this is the bench
+    /// client's bind address.
+    #[arg(long)]
+    pub rumcast_client_addr: Option<std::net::SocketAddr>,
+
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -305,6 +312,7 @@ impl Default for ServerConfig {
             replication_ring_size: 256,
             no_quorum_durability: false,
             yield_idle: false,
+            rumcast_client_addr: None,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
@@ -2050,7 +2058,10 @@ pub(crate) fn empty_app() -> App {
 /// through the pipeline. The recovery paths (snapshot+journal, snapshot
 /// only, journal only, fresh) are transport-level concerns and work
 /// uniformly for any `A: Application` via `JournaledApp<A>`.
-fn init_engine(
+/// Same engine initialization the TCP / DPDK paths use; exposed at
+/// `pub(crate)` so the rumcast transport (Phase 1) can call it without
+/// duplicating the recovery / snapshot / rotation logic.
+pub(crate) fn init_engine(
     config: &ServerConfig,
 ) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
     // Check for a snapshot: either the explicit --snapshot path, or the
