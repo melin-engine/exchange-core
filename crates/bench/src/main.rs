@@ -24,11 +24,21 @@
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
+// Under `--features rumcast` (and similarly `dpdk`), the entire TCP-
+// path code in this file is unreachable from the dispatch in `main`.
+// Suppress the resulting dead-code warnings rather than cfg-gating
+// every TCP helper individually — same trade-off the existing DPDK
+// build implicitly relies on.
+#![cfg_attr(any(feature = "rumcast", feature = "dpdk"), allow(dead_code))]
+
 mod generator;
 mod health_poller;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
+
+#[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+mod rumcast;
 
 /// jemalloc: thread-local caches eliminate allocator lock contention,
 /// giving more predictable latency than glibc malloc under high throughput.
@@ -286,6 +296,14 @@ struct BenchArgs {
     /// real fsync. Default 4096. Try 256 for low-latency no-persist runs.
     #[arg(long, default_value_t = 4096)]
     max_journal_batch: usize,
+
+    /// Local UDP bind address for receiving rumcast responses. Required
+    /// when the bench is built with `--features rumcast`. Phase 1 of the
+    /// rumcast wire-up is single-client; this is the address the server
+    /// publishes responses back to (matched by the server's
+    /// `--rumcast-client-addr`).
+    #[arg(long)]
+    rumcast_bind: Option<std::net::SocketAddr>,
 }
 
 fn main() {
@@ -320,6 +338,31 @@ fn main() {
             );
         }
         "roundtrip" => {
+            #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+            {
+                let addr = args.addr.unwrap_or_else(|| {
+                    eprintln!("error: --addr is required for rumcast mode (no embedded server)");
+                    std::process::exit(1);
+                });
+                let bind = args.rumcast_bind.unwrap_or_else(|| {
+                    eprintln!(
+                        "error: --rumcast-bind is required for rumcast mode \
+                         (server publishes responses to this address)"
+                    );
+                    std::process::exit(1);
+                });
+                rumcast::run_rumcast_roundtrip(rumcast::RumcastBenchConfig {
+                    server_addr: addr,
+                    bind,
+                    pairs: args.pairs,
+                    window: args.window,
+                    warmup: args.warmup,
+                    accounts: args.accounts,
+                    instruments: args.instruments,
+                    json_path: json_path.map(|p| p.to_path_buf()),
+                });
+            }
+
             #[cfg(feature = "dpdk")]
             {
                 let addr = args.addr.unwrap_or_else(|| {
@@ -363,7 +406,7 @@ fn main() {
                 );
             }
 
-            #[cfg(not(feature = "dpdk"))]
+            #[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
             {
                 run_roundtrip_bench(
                     args.uds,

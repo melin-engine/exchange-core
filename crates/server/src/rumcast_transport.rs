@@ -183,7 +183,7 @@ pub fn run_rumcast(
     // the server processes at, so backpressure here would only stem
     // from a slow subscriber — out of scope for Phase 1.
     resp_pub_log.set_publisher_limit(u64::MAX);
-    let resp_socket = KernelUdp::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap())?;
+    let resp_socket = KernelUdp::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())?;
     let resp_send_config = {
         let mut c = SenderConfig::defaults(rumcast_config.client_addr);
         c.setup_interval = Duration::from_millis(100);
@@ -407,6 +407,17 @@ fn out_translator(
             thread::sleep(Duration::from_micros(10));
             continue;
         };
+
+        // Filter out seed events: they have connection_id = 0 (set
+        // by `seed_and_drain`) and aren't addressed to any client.
+        // Publishing them to the rumcast response log would advance
+        // publisher_position before the bench's subscription socket
+        // is bound, and the bench would then see an irrecoverable
+        // gap at positions 0..N (it can't NAK because it doesn't
+        // know the server resp_socket's ephemeral source addr).
+        if slot.connection_id == 0 {
+            continue;
+        }
 
         // Wait for journal cursor to reach this slot's input_seq —
         // persist-before-ack semantics, same as the TCP response path.

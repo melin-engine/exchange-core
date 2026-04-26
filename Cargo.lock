@@ -1539,6 +1539,7 @@ dependencies = [
  "melin-dpdk",
  "melin-engine",
  "melin-protocol",
+ "melin-rumcast",
  "melin-server",
  "melin-trading",
  "melin-transport-core",
