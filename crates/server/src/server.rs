@@ -765,21 +765,42 @@ fn run_as_primary<L: BlockingTransportListener>(
     let matching_utilization = matching_stage.utilization();
     let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
 
+    // Wrap each spawn closure with a tail log so a thread that returns
+    // (cleanly OR via `Err`) is visible in the trace stream — the
+    // accept loop's `is_finished` check fires error!("pipeline thread
+    // died") only on its next tick, which can lag the actual exit by
+    // up to 100ms and races with the listener teardown.
     let s1 = Arc::clone(&shutdown);
+    let shutdown_for_journal = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
             apply_affinity("journal", cores.journal);
-            journal_stage.run(&s1)
+            let result = journal_stage.run(&s1);
+            let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
+            match &result {
+                Ok(_) if was_shutdown => info!("journal thread exited cleanly on shutdown"),
+                Ok(_) => error!("journal thread returned without shutdown signal"),
+                Err(e) => error!(error = %e, "journal thread returned Err"),
+            }
+            result
         })
         .map_err(|e| format!("spawn journal thread: {e}"))?;
 
     let s2 = Arc::clone(&shutdown);
+    let shutdown_for_matching = Arc::clone(&shutdown);
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
             apply_affinity("matching", cores.matching);
-            matching_stage.run(&s2)
+            let app = matching_stage.run(&s2);
+            let was_shutdown = shutdown_for_matching.load(Ordering::Relaxed);
+            if was_shutdown {
+                info!("matching thread exited cleanly on shutdown");
+            } else {
+                error!("matching thread returned without shutdown signal");
+            }
+            app
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
@@ -790,6 +811,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
     let quorum_durability = !config.no_quorum_durability;
     let s3 = Arc::clone(&shutdown);
+    let shutdown_for_response = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
     let response_utilization_thread = Arc::clone(&response_utilization);
     let response_handle = std::thread::Builder::new()
@@ -810,6 +832,12 @@ fn run_as_primary<L: BlockingTransportListener>(
                 },
                 &s3,
             );
+            let was_shutdown = shutdown_for_response.load(Ordering::Relaxed);
+            if was_shutdown {
+                info!("response thread exited cleanly on shutdown");
+            } else {
+                error!("response thread returned without shutdown signal");
+            }
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
 

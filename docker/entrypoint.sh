@@ -117,7 +117,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting melin-server..."
-melin-server \
+# RUST_LOG=info on the engine: server.rs initializes tracing with
+# EnvFilter::from_default_env(), which defaults to error-only when the
+# variable is unset. info-level surfaces recovery progress, seeding
+# completion, and any error!/warn! the engine wants to emit before
+# exiting — without it, a silent crash leaves the operator with no
+# diagnostic. Gateway processes inherit and benefit similarly.
+RUST_LOG="${RUST_LOG:-info}" melin-server \
     --bind 127.0.0.1:9876 \
     --standalone \
     --authorized-keys "$DATA_DIR/authorized_keys" \
