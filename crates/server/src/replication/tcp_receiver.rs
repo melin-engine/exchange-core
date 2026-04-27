@@ -690,6 +690,160 @@ enum SessionExit {
     Fatal(Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// Live replica pipeline — built once on first connect (or after a snapshot
+/// transfer), persists across `Disconnected` reconnects so the orchestrator
+/// doesn't pay the journal-recover + thread-spawn cost on every drop.
+struct ReplicaPipelineHandles {
+    input_producer: melin_disruptor::ring::Producer<crate::InputSlot>,
+    journal_cursor: Arc<melin_disruptor::padding::Sequence>,
+    /// Highest journal sequence durably persisted, published by JournalStage
+    /// after each fsync. Read by the orchestrator to fill in the reconnect
+    /// handshake without owning the writer.
+    last_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// SeqLock-published chain hash (Option to mirror the primary-side
+    /// pattern; always Some on replicas now).
+    chain_hash_lock: Option<Arc<melin_disruptor::seqlock::SeqLock<[u8; 32]>>>,
+    /// Per-pipeline shutdown flag — flipped only on a controlled teardown
+    /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
+    pipeline_shutdown: Arc<AtomicBool>,
+    journal_handle:
+        std::thread::JoinHandle<Result<crate::JournalWriter, melin_journal::JournalError>>,
+    matching_handle: std::thread::JoinHandle<crate::App>,
+    drain_handle: std::thread::JoinHandle<()>,
+    shadow_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Build the replica pipeline and spawn its stage threads on the configured
+/// cores. Returns the bundle of state the orchestrator keeps across
+/// `Disconnected` reconnects.
+fn build_replica_pipeline_with_threads(
+    exchange: crate::App,
+    writer: crate::JournalWriter,
+    cores: crate::server::PipelineCores,
+    snapshot_interval_secs: u64,
+    snapshot_path: std::path::PathBuf,
+    busy_spin: bool,
+) -> Result<ReplicaPipelineHandles, Box<dyn std::error::Error>> {
+    let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
+
+    let enable_shadow = snapshot_interval_secs > 0;
+    let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
+        exchange,
+        writer,
+        4096, // max_journal_batch
+        busy_spin,
+        enable_shadow,
+    );
+
+    let pipeline_shutdown = Arc::new(AtomicBool::new(false));
+
+    let ps = Arc::clone(&pipeline_shutdown);
+    let journal_core = cores.journal;
+    let journal_stage = pipeline.journal_stage;
+    let journal_handle = std::thread::Builder::new()
+        .name("journal".into())
+        .spawn(move || {
+            pin_replica_thread("journal", journal_core);
+            journal_stage.run(&ps)
+        })
+        .expect("spawn journal thread");
+
+    let ps = Arc::clone(&pipeline_shutdown);
+    let matching_core = cores.matching;
+    let matching_stage = pipeline.matching_stage;
+    let matching_handle = std::thread::Builder::new()
+        .name("matching".into())
+        .spawn(move || {
+            pin_replica_thread("matching", matching_core);
+            matching_stage.run(&ps)
+        })
+        .expect("spawn matching thread");
+
+    // Drain thread uses the response core — replicas have no response stage,
+    // but the consumer needs to be drained so the output ring doesn't fill.
+    let ps = Arc::clone(&pipeline_shutdown);
+    let drain_core = cores.response;
+    let drain_consumer = pipeline.drain_consumer;
+    let drain_handle = std::thread::Builder::new()
+        .name("drain".into())
+        .spawn(move || {
+            pin_replica_thread("drain", drain_core);
+            let mut consumer = drain_consumer;
+            let mut batch = vec![crate::OutputSlot::default(); 256];
+            loop {
+                if ps.load(Ordering::Relaxed) {
+                    return;
+                }
+                let count = consumer.consume_batch(&mut batch, 256);
+                if count == 0 {
+                    if busy_spin {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        })
+        .expect("spawn drain thread");
+
+    let shadow_handle = if let Some(shadow_cons) = pipeline.shadow_consumer {
+        let snap_path = snapshot_path;
+        let chain_lock = pipeline
+            .chain_hash_lock
+            .as_ref()
+            .expect("chain hash lock with shadow")
+            .clone();
+        let ps = Arc::clone(&pipeline_shutdown);
+        let shadow_core = cores.shadow;
+        Some(
+            std::thread::Builder::new()
+                .name("replica-shadow".into())
+                .spawn(move || {
+                    pin_replica_thread("replica-shadow", shadow_core);
+                    crate::shadow::run(
+                        shadow_cons,
+                        shadow_exchange,
+                        snap_path,
+                        std::time::Duration::from_secs(snapshot_interval_secs),
+                        chain_lock,
+                        &ps,
+                        false,
+                    );
+                })
+                .expect("spawn shadow thread"),
+        )
+    } else {
+        None
+    };
+
+    Ok(ReplicaPipelineHandles {
+        input_producer: pipeline.input_producer,
+        journal_cursor: pipeline.journal_cursor,
+        last_seq: pipeline.last_seq,
+        chain_hash_lock: pipeline.chain_hash_lock,
+        pipeline_shutdown,
+        journal_handle,
+        matching_handle,
+        drain_handle,
+        shadow_handle,
+    })
+}
+
+/// Tear down the pipeline: signal shutdown, join all threads, return the
+/// recovered (App, JournalWriter) so the orchestrator can use them for the
+/// next pipeline build (e.g., post-snapshot) or pass them up on promotion.
+fn teardown_replica_pipeline(
+    handles: ReplicaPipelineHandles,
+) -> Option<(crate::App, crate::JournalWriter)> {
+    shutdown_pipeline(
+        &handles.pipeline_shutdown,
+        handles.journal_handle,
+        handles.matching_handle,
+        handles.drain_handle,
+        handles.shadow_handle,
+    )
+}
+
 /// Run the replication receiver. Connects to a primary, receives journal
 /// entries, persists them locally, replays into the App, and sends acks.
 ///
@@ -751,18 +905,49 @@ pub fn run_receiver(
     let mut send_buf = Vec::with_capacity(64);
     let mut accum_end_sequence: u64 = 0;
 
+    // Live pipeline state — built once on first connect (or after a snapshot
+    // transfer), persists across `Disconnected` reconnects so we don't pay
+    // the journal-recover + thread-spawn + warm-up cost on every TCP drop.
+    // None = no pipeline yet (first iteration, or just torn down for
+    // snapshot transfer); Some = running pipeline with threads + atomics
+    // we can read for the next reconnect handshake.
+    let mut pipeline: Option<ReplicaPipelineHandles> = None;
+
     // --- Outer reconnect loop ---
     //
-    // Each iteration: connect → auth → handshake → pipeline → stream.
-    // On disconnect (eviction or crash): shut down pipeline, recover
-    // App + JournalWriter, backoff, reconnect.
+    // Each iteration: connect → auth → handshake → (snapshot rebuild?) →
+    // (build pipeline if absent) → stream. On `Disconnected` the pipeline
+    // stays live — we just refresh handshake state from its atomics and
+    // reconnect. Only `Promote` / `Shutdown` / `Fatal` / snapshot-transfer
+    // tear it down.
     loop {
+        // Refresh handshake state from the running pipeline, if any. The
+        // primary uses this `last_sequence` to decide between live streaming,
+        // catch-up, and snapshot transfer; reading it from atomics rather
+        // than from locals keeps it accurate across reconnects without
+        // having to tear down the pipeline.
+        if let Some(p) = pipeline.as_ref() {
+            last_sequence = p.last_seq.load(Ordering::Acquire);
+            if let Some(ref lock) = p.chain_hash_lock {
+                chain_hash = lock.load();
+            }
+        }
+
         // Check shutdown/promote before attempting to connect.
         if shutdown.load(Ordering::Relaxed) {
+            if let Some(p) = pipeline.take() {
+                let _ = teardown_replica_pipeline(p);
+            }
             return Ok(None);
         }
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered while disconnected");
+            if let Some(p) = pipeline.take()
+                && let Some((e, w)) = teardown_replica_pipeline(p)
+            {
+                exchange = Some(e);
+                journal_writer = Some(w);
+            }
             return match (exchange, journal_writer) {
                 (Some(e), Some(w)) => Ok(Some((e, w))),
                 _ => Err("promotion requested but no local state available".into()),
@@ -787,6 +972,12 @@ pub fn run_receiver(
                 }
                 if promote.load(Ordering::Acquire) {
                     info!("promotion triggered during reconnect backoff");
+                    if let Some(p) = pipeline.take()
+                        && let Some((e, w)) = teardown_replica_pipeline(p)
+                    {
+                        exchange = Some(e);
+                        journal_writer = Some(w);
+                    }
                     return match (exchange, journal_writer) {
                         (Some(e), Some(w)) => Ok(Some((e, w))),
                         _ => Err("promotion requested but no local state available".into()),
@@ -866,6 +1057,14 @@ pub fn run_receiver(
             }
             PrimaryMessage::NeedSnapshot => {
                 info!("primary requires snapshot transfer — receiving snapshot");
+
+                // Tear down the running pipeline before wiping its journal
+                // file from under it. The recovered (App, JournalWriter) is
+                // discarded — snapshot loading reconstructs both fresh below
+                // and reassigns `exchange` / `journal_writer`.
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
 
                 let _ = std::fs::remove_file(journal_path);
                 let _ = std::fs::remove_file(&snapshot_path);
@@ -1009,217 +1208,96 @@ pub fn run_receiver(
             journal_writer = Some(writer);
         }
 
-        let cur_exchange = exchange.take().expect("exchange initialized");
-        let cur_writer = journal_writer.take().expect("journal_writer initialized");
-
-        // Unpin before spawning the pipeline. `pin_to_core` sets
-        // `SCHED_FIFO`, and on reconnects 2+ this thread is already
-        // pinned — children would inherit `{receiver_core}` + FIFO and
-        // never preempt the busy-spinning receiver to reach their own
-        // self-pin. See `clear_affinity` docs.
-        if let Err(e) = crate::affinity::clear_affinity() {
-            tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
+        // --- Build pipeline if absent ---
+        //
+        // Built once on first connect, or after a snapshot transfer tore
+        // the previous one down. On `Disconnected` the pipeline lives, so
+        // this branch is skipped.
+        if pipeline.is_none() {
+            let cur_exchange = exchange.take().expect("exchange initialized");
+            let cur_writer = journal_writer.take().expect("journal_writer initialized");
+            pipeline = Some(build_replica_pipeline_with_threads(
+                cur_exchange,
+                cur_writer,
+                cores,
+                snapshot_interval_secs,
+                snapshot_path.clone(),
+                busy_spin,
+            )?);
         }
 
-        // --- Build pipeline and spawn threads ---
-
-        let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
-
-        let enable_shadow = snapshot_interval_secs > 0;
-        let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
-            cur_exchange,
-            cur_writer,
-            4096, // max_journal_batch
-            busy_spin,
-            enable_shadow,
-        );
-        let mut input_producer = pipeline.input_producer;
-        let journal_stage = pipeline.journal_stage;
-        let matching_stage = pipeline.matching_stage;
-        let drain_consumer = pipeline.drain_consumer;
-        let journal_cursor = pipeline.journal_cursor;
-        let shadow_consumer = pipeline.shadow_consumer;
-        let chain_hash_lock = pipeline.chain_hash_lock;
-
-        let pipeline_shutdown = Arc::new(AtomicBool::new(false));
-
-        let ps = Arc::clone(&pipeline_shutdown);
-        let journal_core = cores.journal;
-        let journal_handle = std::thread::Builder::new()
-            .name("journal".into())
-            .spawn(move || {
-                pin_replica_thread("journal", journal_core);
-                journal_stage.run(&ps)
-            })
-            .expect("spawn journal thread");
-
-        let ps = Arc::clone(&pipeline_shutdown);
-        let matching_core = cores.matching;
-        let matching_handle = std::thread::Builder::new()
-            .name("matching".into())
-            .spawn(move || {
-                pin_replica_thread("matching", matching_core);
-                matching_stage.run(&ps)
-            })
-            .expect("spawn matching thread");
-
-        // Drain thread uses the response core — on the primary this core
-        // runs the response stage, but replicas have no response stage.
-        let ps = Arc::clone(&pipeline_shutdown);
-        let drain_core = cores.response;
-        let drain_handle = std::thread::Builder::new()
-            .name("drain".into())
-            .spawn(move || {
-                pin_replica_thread("drain", drain_core);
-                let mut consumer = drain_consumer;
-                let mut batch = vec![crate::OutputSlot::default(); 256];
-                loop {
-                    if ps.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let count = consumer.consume_batch(&mut batch, 256);
-                    if count == 0 {
-                        if busy_spin {
-                            std::hint::spin_loop();
-                        } else {
-                            std::thread::yield_now();
-                        }
-                    }
-                }
-            })
-            .expect("spawn drain thread");
-
-        let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
-            let snap_path = snapshot_path.clone();
-            let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
-            let ps = Arc::clone(&pipeline_shutdown);
-            let shadow_core = cores.shadow;
-            Some(
-                std::thread::Builder::new()
-                    .name("replica-shadow".into())
-                    .spawn(move || {
-                        pin_replica_thread("replica-shadow", shadow_core);
-                        crate::shadow::run(
-                            shadow_cons,
-                            shadow_exchange,
-                            snap_path,
-                            std::time::Duration::from_secs(snapshot_interval_secs),
-                            chain_lock,
-                            &ps,
-                            false,
-                        );
-                    })
-                    .expect("spawn shadow thread"),
-            )
-        } else {
-            None
-        };
-
-        // Pipeline children are spawned and will self-pin to their own
-        // cores. Now safe to pin the receive thread — mirrors the
-        // primary's `uring-reader` pin so `recvmsg` + journal-write
-        // doesn't get migrated across L3s mid-batch.
-        pin_replica_thread("receiver", receiver_core);
-
-        // --- Inner streaming receive loop ---
+        // --- Streaming session ---
         //
-        // Exits via `break` with a SessionExit value. All pipeline
-        // teardown happens after the loop to avoid ownership issues
-        // with thread handles across multiple break paths.
+        // The streaming loop runs on its own pinned thread (mirrors the
+        // primary's `reader.rs` layout). Borrows the input producer + journal
+        // cursor from the live pipeline; on `Disconnected` we just retake
+        // them next iteration.
 
         let mut pending_acks = PendingAckQueue::new();
         let mut received_data = false;
 
-        // Pin the streaming loop to its own dedicated core so the io_uring
-        // multishot RECV runs on a quiet thread instead of contending with
-        // the orchestrator (snapshot transfer, reconnect logic) on main.
-        // Mirrors the primary's `reader.rs` thread layout — same transport,
-        // same pinning model.
-        let exit_reason: SessionExit = std::thread::scope(|s| {
-            let handle = std::thread::Builder::new()
-                .name("replica-receiver".into())
-                .spawn_scoped(s, || {
-                    pin_replica_thread("replica-receiver", receiver_core);
-                    replica_stream_uring(
-                        &tcp_writer,
-                        &mut input_producer,
-                        &journal_cursor,
-                        &mut pending_acks,
-                        &mut received_data,
-                        &mut accum_end_sequence,
-                        shutdown,
-                        promote,
-                        async_ack,
-                        busy_spin,
-                    )
-                })
-                .expect("spawn replica-receiver thread");
-            handle.join().expect("replica-receiver thread panicked")
-        });
+        let exit_reason: SessionExit = {
+            let p = pipeline.as_mut().expect("pipeline must exist by here");
+            let input_producer = &mut p.input_producer;
+            let journal_cursor = p.journal_cursor.as_ref();
+            std::thread::scope(|s| {
+                let handle = std::thread::Builder::new()
+                    .name("replica-receiver".into())
+                    .spawn_scoped(s, || {
+                        pin_replica_thread("replica-receiver", receiver_core);
+                        replica_stream_uring(
+                            &tcp_writer,
+                            input_producer,
+                            journal_cursor,
+                            &mut pending_acks,
+                            &mut received_data,
+                            &mut accum_end_sequence,
+                            shutdown,
+                            promote,
+                            async_ack,
+                            busy_spin,
+                        )
+                    })
+                    .expect("spawn replica-receiver thread");
+                handle.join().expect("replica-receiver thread panicked")
+            })
+        };
 
-        // --- Common teardown (all exit paths) ---
-        // Wait for all pending batches to become durable.
-        if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+        // Wait for all pending batches to become durable, then ack.
+        if let Some(p) = pipeline.as_ref()
+            && let Some(seq) = pending_acks.pop_all_blocking(p.journal_cursor.as_ref())
+        {
             let _ = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf);
         }
 
-        // Shut down pipeline and recover state.
-        let pipeline_state = shutdown_pipeline(
-            &pipeline_shutdown,
-            journal_handle,
-            matching_handle,
-            drain_handle,
-            shadow_handle,
-        );
-
         match exit_reason {
-            SessionExit::Shutdown => return Ok(None),
+            SessionExit::Shutdown => {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
+                return Ok(None);
+            }
 
             SessionExit::Promote => {
-                return match pipeline_state {
-                    Some((e, w)) => Ok(Some((e, w))),
-                    None => Err("pipeline failed during promotion".into()),
+                return match pipeline.take() {
+                    Some(p) => match teardown_replica_pipeline(p) {
+                        Some((e, w)) => Ok(Some((e, w))),
+                        None => Err("pipeline failed during promotion".into()),
+                    },
+                    None => Err("pipeline missing on promote".into()),
                 };
             }
 
-            SessionExit::Fatal(e) => return Err(e),
+            SessionExit::Fatal(e) => {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
+                return Err(e);
+            }
 
             SessionExit::Disconnected => {
-                // Recover App + JournalWriter for the next iteration.
-                match pipeline_state {
-                    Some((e, w)) => {
-                        last_sequence = w.next_sequence().saturating_sub(1);
-                        chain_hash = w.chain_hash().unwrap_or([0u8; 32]);
-                        exchange = Some(e);
-                        journal_writer = Some(w);
-                    }
-                    None => {
-                        error!("pipeline thread panicked during disconnect recovery");
-                        if journal_path.exists() {
-                            match melin_transport_core::JournaledApp::<App>::recover(
-                                crate::server::empty_app(),
-                                journal_path,
-                            ) {
-                                Ok(engine) => {
-                                    last_sequence = engine.next_sequence().saturating_sub(1);
-                                    chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
-                                    let (e, w) = engine.into_parts();
-                                    exchange = Some(e);
-                                    journal_writer = Some(w);
-                                }
-                                Err(e) => {
-                                    return Err(format!(
-                                        "pipeline panicked and journal recovery failed: {e}"
-                                    )
-                                    .into());
-                                }
-                            }
-                        } else {
-                            return Err("pipeline panicked and no journal to recover from".into());
-                        }
-                    }
-                }
-
+                // Pipeline stays live — `last_sequence` and `chain_hash`
+                // refresh from its atomics at the top of the next iteration.
                 if received_data {
                     backoff = std::time::Duration::from_secs(1);
                 }
