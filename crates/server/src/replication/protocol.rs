@@ -8,6 +8,12 @@
 
 use std::io::{self, Read};
 
+use melin_app::AppEvent;
+use melin_journal::JournalEvent;
+use melin_trading::trading_event::TradingEvent;
+
+use crate::InputSlot;
+
 // --- Wire protocol message tags ---
 
 pub(super) const MSG_HANDSHAKE: u8 = 0x01;
@@ -24,7 +30,25 @@ pub(super) const MSG_SNAPSHOT_BEGIN: u8 = 0x13;
 pub(super) const MSG_SNAPSHOT_CHUNK: u8 = 0x14;
 pub(super) const MSG_SNAPSHOT_END: u8 = 0x15;
 pub(super) const MSG_DATA_BATCH: u8 = 0x20;
+/// Carries `InputSlot` records directly so the receiver can push them into
+/// its input ring without going through the journal codec on the wire.
+/// Replaces `MSG_DATA_BATCH` once the runtime is migrated.
+#[allow(dead_code)] // wired up in subsequent commits of feat/unified-pipeline
+pub(super) const MSG_INPUT_BATCH: u8 = 0x21;
 pub(super) const MSG_HEARTBEAT: u8 = 0x30;
+
+// Per-slot event tags, numerically aligned with the journal codec's private
+// constants. We don't pull them from the journal crate to keep the wire and
+// on-disk formats decoupled — they happen to share values today, but they're
+// independent contracts.
+#[allow(dead_code)]
+pub(super) const SLOT_TAG_GENESIS_HASH: u8 = 0x01;
+#[allow(dead_code)]
+pub(super) const SLOT_TAG_CHECKPOINT: u8 = 0x02;
+#[allow(dead_code)]
+pub(super) const SLOT_TAG_TICK: u8 = 0x03;
+#[allow(dead_code)]
+pub(super) const SLOT_TAG_APP: u8 = 0x80;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// Data batches can be much larger (up to 128 KiB of journal data).
@@ -432,5 +456,293 @@ pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessag
         other => Err(io::Error::other(format!(
             "unknown primary message type: 0x{other:02x}"
         ))),
+    }
+}
+
+// --- InputBatch (new wire format for input replication) ---
+//
+// `MSG_INPUT_BATCH` carries `InputSlot` records directly so the receiver
+// can push them into its input ring without round-tripping through the
+// journal codec on the wire. Replaces `MSG_DATA_BATCH` once the runtime
+// is migrated; for now both coexist.
+//
+// Wire layout (after the [length:u32] frame prefix):
+//   [type:0x21] [count:u16]
+//   for each slot:
+//     [event_size:u16]   ← bytes of event_payload only (after tag byte)
+//     [sequence:u64]
+//     [timestamp_ns:u64]
+//     [key_hash:u64]
+//     [request_seq:u64]
+//     [event_tag:u8]
+//     [event_payload: event_size bytes]
+//
+// No per-entry magic or CRC32C — TCP handles framing and integrity.
+// `connection_id`, `publish_ts`, `recv_ts` from `InputSlot` are not on
+// the wire (primary-internal bookkeeping); replica reconstructs them
+// with `Default::default()`.
+
+/// Encode an `InputBatch` frame into `buf` (length-prefixed).
+#[allow(dead_code)] // wired up in subsequent commits of feat/unified-pipeline
+pub(super) fn encode_input_batch(slots: &[InputSlot], buf: &mut Vec<u8>) {
+    // Reserve 4 bytes for the length prefix; back-fill after we know the
+    // total payload size (count + variable-size slot encodings).
+    let len_prefix_pos = buf.len();
+    buf.extend_from_slice(&[0u8; 4]);
+    let payload_start = buf.len();
+
+    buf.push(MSG_INPUT_BATCH);
+    let count = u16::try_from(slots.len()).expect("InputBatch slot count exceeds u16");
+    buf.extend_from_slice(&count.to_le_bytes());
+
+    for slot in slots {
+        // Reserve event_size; back-fill after event payload is written.
+        let size_pos = buf.len();
+        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&slot.sequence.to_le_bytes());
+        buf.extend_from_slice(&slot.timestamp_ns.to_le_bytes());
+        buf.extend_from_slice(&slot.key_hash.to_le_bytes());
+        buf.extend_from_slice(&slot.request_seq.to_le_bytes());
+
+        // Tag + payload. Payload starts after the tag byte; we measure
+        // event_size from there so the decoder doesn't double-count the tag.
+        let payload_start_in_slot = buf.len() + 1;
+        match &slot.event {
+            JournalEvent::GenesisHash { hash } => {
+                buf.push(SLOT_TAG_GENESIS_HASH);
+                buf.extend_from_slice(hash);
+            }
+            JournalEvent::Checkpoint {
+                chain_hash,
+                events_since_checkpoint,
+            } => {
+                buf.push(SLOT_TAG_CHECKPOINT);
+                buf.extend_from_slice(chain_hash);
+                buf.extend_from_slice(&events_since_checkpoint.to_le_bytes());
+            }
+            JournalEvent::Tick { now_ns } => {
+                buf.push(SLOT_TAG_TICK);
+                buf.extend_from_slice(&now_ns.to_le_bytes());
+            }
+            JournalEvent::App(e) => {
+                buf.push(SLOT_TAG_APP);
+                let n = e.encoded_size();
+                let start = buf.len();
+                buf.resize(start + n, 0);
+                let written = e.encode(&mut buf[start..start + n]);
+                debug_assert_eq!(written, n, "AppEvent::encode disagrees with encoded_size");
+            }
+        }
+
+        let event_size = u16::try_from(buf.len() - payload_start_in_slot)
+            .expect("event payload exceeds u16 max");
+        buf[size_pos..size_pos + 2].copy_from_slice(&event_size.to_le_bytes());
+    }
+
+    let payload_len =
+        u32::try_from(buf.len() - payload_start).expect("InputBatch payload exceeds u32");
+    buf[len_prefix_pos..len_prefix_pos + 4].copy_from_slice(&payload_len.to_le_bytes());
+}
+
+/// Decode an `InputBatch` frame payload (the bytes after the length prefix,
+/// starting with the type byte). Returns the reconstructed `InputSlot`
+/// vector with `connection_id`, `publish_ts`, `recv_ts` reset to defaults.
+#[allow(dead_code)] // wired up in subsequent commits of feat/unified-pipeline
+pub(super) fn try_decode_input_batch(payload: &[u8]) -> io::Result<Vec<InputSlot>> {
+    if payload.len() < 1 + 2 {
+        return Err(io::Error::other("InputBatch header truncated"));
+    }
+    if payload[0] != MSG_INPUT_BATCH {
+        return Err(io::Error::other(format!(
+            "expected InputBatch (0x{:02x}), got 0x{:02x}",
+            MSG_INPUT_BATCH, payload[0]
+        )));
+    }
+    let count = u16::from_le_bytes(payload[1..3].try_into().unwrap()) as usize;
+    let mut slots = Vec::with_capacity(count);
+    let mut offset = 3;
+
+    // Per-slot fixed header: event_size(2) + sequence(8) + timestamp_ns(8)
+    //                      + key_hash(8) + request_seq(8) + tag(1) = 35 bytes.
+    const SLOT_HEADER: usize = 2 + 8 + 8 + 8 + 8 + 1;
+
+    for _ in 0..count {
+        if payload.len() < offset + SLOT_HEADER {
+            return Err(io::Error::other("InputBatch slot header truncated"));
+        }
+        let event_size =
+            u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let sequence = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let timestamp_ns = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let key_hash = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let request_seq = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let event_tag = payload[offset];
+        offset += 1;
+
+        if payload.len() < offset + event_size {
+            return Err(io::Error::other("InputBatch slot payload truncated"));
+        }
+        let event_payload = &payload[offset..offset + event_size];
+        offset += event_size;
+
+        let event = match event_tag {
+            SLOT_TAG_GENESIS_HASH => {
+                if event_payload.len() < 32 {
+                    return Err(io::Error::other("GenesisHash payload too short"));
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&event_payload[..32]);
+                JournalEvent::GenesisHash { hash }
+            }
+            SLOT_TAG_CHECKPOINT => {
+                if event_payload.len() < 40 {
+                    return Err(io::Error::other("Checkpoint payload too short"));
+                }
+                let mut chain_hash = [0u8; 32];
+                chain_hash.copy_from_slice(&event_payload[..32]);
+                let events_since_checkpoint =
+                    u64::from_le_bytes(event_payload[32..40].try_into().unwrap());
+                JournalEvent::Checkpoint {
+                    chain_hash,
+                    events_since_checkpoint,
+                }
+            }
+            SLOT_TAG_TICK => {
+                if event_payload.len() < 8 {
+                    return Err(io::Error::other("Tick payload too short"));
+                }
+                let now_ns = u64::from_le_bytes(event_payload[..8].try_into().unwrap());
+                JournalEvent::Tick { now_ns }
+            }
+            SLOT_TAG_APP => {
+                let app = TradingEvent::decode(event_payload)
+                    .map_err(|e| io::Error::other(format!("App event decode failed: {e:?}")))?;
+                JournalEvent::App(app)
+            }
+            other => {
+                return Err(io::Error::other(format!("unknown slot tag: 0x{other:02x}")));
+            }
+        };
+
+        slots.push(InputSlot {
+            connection_id: 0,
+            key_hash,
+            request_seq,
+            sequence,
+            timestamp_ns,
+            event,
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+    }
+
+    Ok(slots)
+}
+
+#[cfg(test)]
+mod input_batch_tests {
+    use super::*;
+
+    fn sample_slot(sequence: u64, event: crate::JournalEvent) -> InputSlot {
+        InputSlot {
+            connection_id: 0,
+            key_hash: 0xabcd_ef00_1234_5678,
+            request_seq: 9_999,
+            sequence,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            event,
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_transport_variants() {
+        let slots = vec![
+            sample_slot(10, crate::JournalEvent::Tick { now_ns: 12_345_678 }),
+            sample_slot(
+                11,
+                crate::JournalEvent::Checkpoint {
+                    chain_hash: [0x42; 32],
+                    events_since_checkpoint: 1_000_000,
+                },
+            ),
+            sample_slot(12, crate::JournalEvent::GenesisHash { hash: [0x77; 32] }),
+        ];
+
+        let mut buf = Vec::new();
+        encode_input_batch(&slots, &mut buf);
+
+        // Strip the 4-byte length prefix to get the payload.
+        let payload_len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        assert_eq!(buf.len(), 4 + payload_len);
+        let payload = &buf[4..];
+
+        let decoded = try_decode_input_batch(payload).expect("decode succeeds");
+        assert_eq!(decoded.len(), 3);
+
+        for (orig, dec) in slots.iter().zip(decoded.iter()) {
+            assert_eq!(dec.sequence, orig.sequence);
+            assert_eq!(dec.timestamp_ns, orig.timestamp_ns);
+            assert_eq!(dec.key_hash, orig.key_hash);
+            assert_eq!(dec.request_seq, orig.request_seq);
+            assert_eq!(dec.connection_id, 0);
+        }
+
+        match decoded[0].event {
+            crate::JournalEvent::Tick { now_ns } => assert_eq!(now_ns, 12_345_678),
+            ref other => panic!("expected Tick, got {other:?}"),
+        }
+        match decoded[1].event {
+            crate::JournalEvent::Checkpoint {
+                chain_hash,
+                events_since_checkpoint,
+            } => {
+                assert_eq!(chain_hash, [0x42; 32]);
+                assert_eq!(events_since_checkpoint, 1_000_000);
+            }
+            ref other => panic!("expected Checkpoint, got {other:?}"),
+        }
+        match decoded[2].event {
+            crate::JournalEvent::GenesisHash { hash } => assert_eq!(hash, [0x77; 32]),
+            ref other => panic!("expected GenesisHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_batch_roundtrips() {
+        let slots: Vec<InputSlot> = Vec::new();
+        let mut buf = Vec::new();
+        encode_input_batch(&slots, &mut buf);
+        let payload = &buf[4..];
+        let decoded = try_decode_input_batch(payload).expect("decode succeeds");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn rejects_wrong_type_tag() {
+        let payload = [0xFF, 0x00, 0x00];
+        assert!(try_decode_input_batch(&payload).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_header() {
+        let payload = [MSG_INPUT_BATCH];
+        assert!(try_decode_input_batch(&payload).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_slot_payload() {
+        // Encode a valid batch, then truncate the last byte.
+        let slots = vec![sample_slot(1, crate::JournalEvent::Tick { now_ns: 0 })];
+        let mut buf = Vec::new();
+        encode_input_batch(&slots, &mut buf);
+        let payload = &buf[4..buf.len() - 1];
+        assert!(try_decode_input_batch(payload).is_err());
     }
 }
