@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{info, warn};
 
-use super::protocol::encode_data_batch;
+use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
 
 /// Result of a journal catch-up attempt.
 pub(super) enum CatchUpResult {
@@ -168,8 +168,15 @@ pub(super) fn catch_up_from_journal(
                 break; // EOF on this file.
             };
 
-            // Encode and send DataBatch frame.
-            encode_data_batch(batch_end_seq, &batch_buf, &mut send_buf);
+            // Decode the journal-batch bytes into InputSlots and re-encode
+            // as an InputBatch for the wire — same wire format the live
+            // streaming path uses (phase 2 of feat/unified-pipeline).
+            let slots = decode_journal_to_input_slots(&batch_buf).map_err(|e| {
+                io::Error::other(format!(
+                    "catch-up journal decode at seq {batch_end_seq}: {e}"
+                ))
+            })?;
+            encode_input_batch(&slots, &mut send_buf);
             writer
                 .write_all(&send_buf)
                 .map_err(|e| io::Error::other(format!("write catch-up batch: {e}")))?;

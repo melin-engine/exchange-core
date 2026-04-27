@@ -351,6 +351,12 @@ pub(super) fn shutdown_pipeline(
 /// auto-emits its own), but uses the primary's checkpoint chain hash
 /// for divergence detection — a mismatch means the replica's
 /// independently encoded journal has diverged from the primary's.
+///
+/// TCP path uses `try_decode_input_batch` directly instead — only the DPDK
+/// path still routes journal bytes through this helper. Marked dead-code-
+/// allow under non-DPDK builds; phase 4 of feat/unified-pipeline migrates
+/// the DPDK path to InputBatch and removes this entirely.
+#[allow(dead_code)]
 pub(super) fn submit_batch_to_pipeline(
     journal_bytes: &[u8],
     producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,

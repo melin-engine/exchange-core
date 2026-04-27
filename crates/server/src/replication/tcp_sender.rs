@@ -16,9 +16,9 @@ use melin_journal::replication::ReplicationConsumer;
 use super::auth::authenticate_replica;
 use super::catchup::{CatchUpResult, can_catch_up_from_journal, catch_up_from_journal};
 use super::protocol::{
-    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_data_batch, encode_heartbeat,
-    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-    encode_stream_start, read_frame,
+    MAX_CONTROL_FRAME, ReplicaMessage, decode_journal_to_input_slots, decode_replica_message,
+    encode_heartbeat, encode_input_batch, encode_need_snapshot, encode_snapshot_begin,
+    encode_snapshot_chunk, encode_snapshot_end, encode_stream_start, read_frame,
 };
 use super::{ReplicationMetrics, update_dual_replication_cursor};
 
@@ -550,7 +550,9 @@ fn handle_replica_connection(
             if meta.end_sequence > catchup_end {
                 // This batch has new data beyond catch-up. Send it now
                 // and commit so the live loop starts clean.
-                encode_data_batch(meta.end_sequence, _data, &mut send_buf);
+                let slots = decode_journal_to_input_slots(_data)
+                    .map_err(|e| io::Error::other(format!("repl-ring journal decode: {e}")))?;
+                encode_input_batch(&slots, &mut send_buf);
                 repl_consumer.commit();
                 writer.write_all(&send_buf)?;
                 writer.flush()?;
@@ -714,7 +716,13 @@ fn live_stream_uring(
             let mut coalesced = 0;
             while coalesced < batch_size {
                 if let Some((meta, data)) = repl_consumer.try_read() {
-                    encode_data_batch(meta.end_sequence, data, send_buf);
+                    // Convert the journal-encoded ring bytes to InputBatch
+                    // wire format. The replication ring still carries journal
+                    // bytes today; phase 3 will eliminate this round-trip by
+                    // having the journal stage publish InputSlots directly.
+                    let slots = decode_journal_to_input_slots(data)
+                        .map_err(|e| io::Error::other(format!("repl-ring journal decode: {e}")))?;
+                    encode_input_batch(&slots, send_buf);
                     repl_consumer.commit();
                     *last_sequence = meta.end_sequence;
                     coalesced += 1;

@@ -46,13 +46,12 @@ fn arm_tcp_quickack(fd: RawFd) {
 use super::auth::authenticate_with_primary;
 use super::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
-    encode_ack, encode_handshake, read_frame, try_decode_data_batch,
+    encode_ack, encode_handshake, read_frame, try_decode_input_batch,
 };
 use crate::amortized_timer::AmortizedTimer;
 
 use super::{
     PendingAckQueue, log_tcp_info, pin_replica_thread, shutdown_pipeline, sleep_checking_flags,
-    submit_batch_to_pipeline,
 };
 
 /// io_uring streaming receive loop for the replica.
@@ -81,7 +80,6 @@ fn replica_stream_uring(
     journal_cursor: &melin_disruptor::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
-    journal_accum: &mut Vec<u8>,
     accum_end_sequence: &mut u64,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
@@ -214,6 +212,8 @@ fn replica_stream_uring(
             // Drain any complete frames already in parse_buf for
             // maximum data freshness during promotion.
             let mut cursor = 0;
+            let mut last_target: u64 = 0;
+            let mut any_published = false;
             while cursor + 4 <= parse_buf.len() {
                 let frame_len =
                     u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap()) as usize;
@@ -224,23 +224,19 @@ fn replica_stream_uring(
                     break;
                 }
                 let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
-                // Same fast path as the steady-state loop — promotion
-                // drain runs once per failover, so the saved allocation
-                // only matters if there's a large pre-promotion backlog
-                // in parse_buf. Consistency with the main loop keeps
-                // the two code paths in sync.
-                if let Some((end_sequence, journal_bytes)) = try_decode_data_batch(payload) {
-                    journal_accum.extend_from_slice(journal_bytes);
-                    *accum_end_sequence = end_sequence;
+                if let Ok(slots) = try_decode_input_batch(payload) {
+                    for slot in slots {
+                        let primary_seq = slot.sequence;
+                        last_target = input_producer.publish(slot);
+                        *accum_end_sequence = primary_seq;
+                        any_published = true;
+                    }
                 }
                 cursor += 4 + frame_len;
             }
             // Submit any accumulated data before returning.
-            if !journal_accum.is_empty() && !pending_acks.is_full() {
-                if let Ok(target) = submit_batch_to_pipeline(journal_accum, input_producer) {
-                    pending_acks.push(target, *accum_end_sequence);
-                }
-                journal_accum.clear();
+            if any_published && !pending_acks.is_full() {
+                pending_acks.push(last_target, *accum_end_sequence);
             }
             return SessionExit::Promote;
         }
@@ -528,8 +524,13 @@ fn replica_stream_uring(
                     .user_data(TOKEN_PROVIDE);
                     unsafe { ring.submission().push(&provide_sqe).expect("SQ full") };
 
-                    // Extract complete frames from parse_buf.
+                    // Extract complete frames from parse_buf and publish
+                    // their InputSlots into the local input ring. Track the
+                    // burst's max producer-publish target so a single
+                    // pending_acks entry covers everything from this CQE.
                     let mut cursor = 0;
+                    let mut burst_any_published = false;
+                    let mut burst_last_target: u64 = 0;
                     while cursor + 4 <= parse_buf.len() {
                         let frame_len =
                             u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
@@ -543,51 +544,47 @@ fn replica_stream_uring(
                         }
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                         // Fast path: steady-state traffic is ~100% DataBatch
-                        // frames. `try_decode_data_batch` returns a slice
-                        // borrowed directly from `parse_buf`, avoiding the
-                        // ~40 KB Vec allocation that the general decoder
-                        // would perform on every batch.
-                        if let Some((end_sequence, journal_bytes)) = try_decode_data_batch(payload)
-                        {
-                            *received_data = true;
-                            journal_accum.extend_from_slice(journal_bytes);
-                            *accum_end_sequence = end_sequence;
-                        } else {
-                            // Control messages (heartbeat, need-snapshot,
-                            // hash-mismatch) fall through to the general
-                            // decoder. Rare compared to DataBatch, so the
-                            // allocation cost here is irrelevant.
-                            match decode_primary_message(payload) {
-                                Ok(PrimaryMessage::Heartbeat { sequence }) => {
-                                    debug!(sequence, "heartbeat from primary");
+                        // frames. `try_decode_input_batch` decodes the wire
+                        // format directly into `InputSlot`s — no journal-codec
+                        // round-trip, no per-entry CRC verification.
+                        match try_decode_input_batch(payload) {
+                            Ok(slots) => {
+                                if !slots.is_empty() {
+                                    *received_data = true;
+                                    for slot in slots {
+                                        let primary_seq = slot.sequence;
+                                        burst_last_target = input_producer.publish(slot);
+                                        *accum_end_sequence = primary_seq;
+                                        burst_any_published = true;
+                                    }
                                 }
-                                Ok(PrimaryMessage::NeedSnapshot) => {
-                                    return SessionExit::Fatal(
-                                        "primary says we need a snapshot transfer mid-stream"
-                                            .into(),
-                                    );
-                                }
-                                Ok(PrimaryMessage::HashMismatch) => {
-                                    return SessionExit::Fatal(
-                                        "chain hash mismatch from primary".into(),
-                                    );
-                                }
-                                Ok(PrimaryMessage::DataBatch { .. }) => {
-                                    // `try_decode_data_batch` rejected this
-                                    // payload as too short for the fixed
-                                    // header, so the general decoder should
-                                    // have surfaced it as an error. Reach
-                                    // here means the general decoder accepted
-                                    // it — treat as a protocol violation.
-                                    warn!("malformed DataBatch slipped past fast path");
-                                    return SessionExit::Disconnected;
-                                }
-                                Ok(_) => {
-                                    debug!("unexpected message during streaming");
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "failed to decode primary message");
-                                    return SessionExit::Disconnected;
+                            }
+                            Err(_) => {
+                                // Not an InputBatch — fall through to the
+                                // general decoder for control messages
+                                // (heartbeat, need-snapshot, hash-mismatch).
+                                match decode_primary_message(payload) {
+                                    Ok(PrimaryMessage::Heartbeat { sequence }) => {
+                                        debug!(sequence, "heartbeat from primary");
+                                    }
+                                    Ok(PrimaryMessage::NeedSnapshot) => {
+                                        return SessionExit::Fatal(
+                                            "primary says we need a snapshot transfer mid-stream"
+                                                .into(),
+                                        );
+                                    }
+                                    Ok(PrimaryMessage::HashMismatch) => {
+                                        return SessionExit::Fatal(
+                                            "chain hash mismatch from primary".into(),
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        debug!("unexpected message during streaming");
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to decode primary message");
+                                        return SessionExit::Disconnected;
+                                    }
                                 }
                             }
                         }
@@ -600,18 +597,10 @@ fn replica_stream_uring(
                         parse_buf.truncate(remaining);
                     }
 
-                    // Submit accumulated data to pipeline (if room in pending acks).
-                    if !journal_accum.is_empty() && !pending_acks.is_full() {
-                        match submit_batch_to_pipeline(journal_accum, input_producer) {
-                            Ok(target) => {
-                                pending_acks.push(target, *accum_end_sequence);
-                                journal_accum.clear();
-                            }
-                            Err(e) => {
-                                error!(error = %e, "failed to submit batch to pipeline");
-                                return SessionExit::Disconnected;
-                            }
-                        }
+                    // Submit one pending_acks entry covering everything
+                    // published from this RECV CQE's buffer.
+                    if burst_any_published && !pending_acks.is_full() {
+                        pending_acks.push(burst_last_target, *accum_end_sequence);
                     }
                 }
 
@@ -758,7 +747,6 @@ pub fn run_receiver(
 
     // Reusable buffers — survive across reconnections.
     let mut send_buf = Vec::with_capacity(64);
-    let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_end_sequence: u64 = 0;
 
     // --- Outer reconnect loop ---
@@ -1146,7 +1134,6 @@ pub fn run_receiver(
             &journal_cursor,
             &mut pending_acks,
             &mut received_data,
-            &mut journal_accum,
             &mut accum_end_sequence,
             shutdown,
             promote,
@@ -1155,14 +1142,6 @@ pub fn run_receiver(
         );
 
         // --- Common teardown (all exit paths) ---
-
-        // Flush any accumulated data not yet submitted.
-        if !journal_accum.is_empty() {
-            if let Ok(target) = submit_batch_to_pipeline(&journal_accum, &mut input_producer) {
-                pending_acks.push(target, accum_end_sequence);
-            }
-            journal_accum.clear();
-        }
         // Wait for all pending batches to become durable.
         if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
             let _ = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf);

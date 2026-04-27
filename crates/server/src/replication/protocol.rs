@@ -246,6 +246,7 @@ pub(super) fn encode_hash_mismatch(buf: &mut Vec<u8>) {
 /// re-encodes its own journal, so the primary's per-batch hash would not
 /// match the replica's. Divergence detection runs inside the replica's
 /// JournalStage at Checkpoint events instead.
+#[allow(dead_code)] // still used by the DPDK path; phase 4 removes it
 pub(super) fn encode_data_batch(end_sequence: u64, journal_bytes: &[u8], buf: &mut Vec<u8>) {
     // type(1) + end_sequence(8) + journal_bytes
     let payload_len: u32 = (1 + 8 + journal_bytes.len()) as u32;
@@ -376,6 +377,7 @@ pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessag
 ///   fixed header — indistinguishable from the non-data case here, so the
 ///   caller's general-decoder fallback will surface the truncation as a
 ///   protocol error.
+#[allow(dead_code)] // still used by the DPDK path; phase 4 removes it
 pub(super) fn try_decode_data_batch(payload: &[u8]) -> Option<(u64, &[u8])> {
     // Layout: type(1) + end_sequence(8) + journal_bytes
     const HEADER: usize = 1 + 8;
@@ -482,8 +484,41 @@ pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessag
 // the wire (primary-internal bookkeeping); replica reconstructs them
 // with `Default::default()`.
 
+/// Decode a journal-codec byte stream into `InputSlot` records.
+///
+/// The replication ring on the primary still carries journal-encoded bytes
+/// (so `JournalStage::publish_to_replication_rings` is unchanged). The
+/// sender uses this helper to convert those bytes into `InputSlot`s before
+/// re-encoding them as an `InputBatch` for the wire. Phase 3 of the
+/// unified-pipeline plan eliminates this round-trip by having the journal
+/// stage publish `InputSlot`s directly to the ring; until then this helper
+/// keeps the wire format change isolated.
+pub(super) fn decode_journal_to_input_slots(journal_bytes: &[u8]) -> io::Result<Vec<InputSlot>> {
+    let mut slots = Vec::with_capacity(64);
+    let mut offset = 0;
+    while offset < journal_bytes.len() {
+        let (consumed, sequence, timestamp_ns, key_hash, request_seq, event) =
+            melin_journal::codec::decode::<TradingEvent>(
+                &journal_bytes[offset..],
+                melin_journal::codec::FORMAT_VERSION,
+            )
+            .map_err(|e| io::Error::other(format!("journal decode at offset {offset}: {e:?}")))?;
+        offset += consumed;
+        slots.push(InputSlot {
+            connection_id: 0,
+            key_hash,
+            request_seq,
+            sequence,
+            timestamp_ns,
+            event,
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+    }
+    Ok(slots)
+}
+
 /// Encode an `InputBatch` frame into `buf` (length-prefixed).
-#[allow(dead_code)] // wired up in subsequent commits of feat/unified-pipeline
 pub(super) fn encode_input_batch(slots: &[InputSlot], buf: &mut Vec<u8>) {
     // Reserve 4 bytes for the length prefix; back-fill after we know the
     // total payload size (count + variable-size slot encodings).
@@ -547,7 +582,6 @@ pub(super) fn encode_input_batch(slots: &[InputSlot], buf: &mut Vec<u8>) {
 /// Decode an `InputBatch` frame payload (the bytes after the length prefix,
 /// starting with the type byte). Returns the reconstructed `InputSlot`
 /// vector with `connection_id`, `publish_ts`, `recv_ts` reset to defaults.
-#[allow(dead_code)] // wired up in subsequent commits of feat/unified-pipeline
 pub(super) fn try_decode_input_batch(payload: &[u8]) -> io::Result<Vec<InputSlot>> {
     if payload.len() < 1 + 2 {
         return Err(io::Error::other("InputBatch header truncated"));
