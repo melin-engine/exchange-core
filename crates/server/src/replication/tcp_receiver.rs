@@ -685,7 +685,9 @@ enum SessionExit {
     Shutdown,
     Promote,
     Disconnected,
-    Fatal(Box<dyn std::error::Error>),
+    // `Send + Sync` so the enum can cross thread boundaries (the streaming
+    // loop runs on a pinned receiver thread; the orchestrator joins on it).
+    Fatal(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Run the replication receiver. Connects to a primary, receives journal
@@ -1128,18 +1130,32 @@ pub fn run_receiver(
         let mut pending_acks = PendingAckQueue::new();
         let mut received_data = false;
 
-        let exit_reason: SessionExit = replica_stream_uring(
-            &tcp_writer,
-            &mut input_producer,
-            &journal_cursor,
-            &mut pending_acks,
-            &mut received_data,
-            &mut accum_end_sequence,
-            shutdown,
-            promote,
-            async_ack,
-            busy_spin,
-        );
+        // Pin the streaming loop to its own dedicated core so the io_uring
+        // multishot RECV runs on a quiet thread instead of contending with
+        // the orchestrator (snapshot transfer, reconnect logic) on main.
+        // Mirrors the primary's `reader.rs` thread layout — same transport,
+        // same pinning model.
+        let exit_reason: SessionExit = std::thread::scope(|s| {
+            let handle = std::thread::Builder::new()
+                .name("replica-receiver".into())
+                .spawn_scoped(s, || {
+                    pin_replica_thread("replica-receiver", receiver_core);
+                    replica_stream_uring(
+                        &tcp_writer,
+                        &mut input_producer,
+                        &journal_cursor,
+                        &mut pending_acks,
+                        &mut received_data,
+                        &mut accum_end_sequence,
+                        shutdown,
+                        promote,
+                        async_ack,
+                        busy_spin,
+                    )
+                })
+                .expect("spawn replica-receiver thread");
+            handle.join().expect("replica-receiver thread panicked")
+        });
 
         // --- Common teardown (all exit paths) ---
         // Wait for all pending batches to become durable.
