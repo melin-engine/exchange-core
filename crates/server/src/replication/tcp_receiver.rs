@@ -718,6 +718,7 @@ pub fn run_receiver(
     snapshot_interval_secs: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
+    receiver_core: usize,
     async_ack: bool,
     busy_spin: bool,
 ) -> ReceiverResult {
@@ -1021,6 +1022,15 @@ pub fn run_receiver(
         let cur_exchange = exchange.take().expect("exchange initialized");
         let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
+        // Unpin before spawning the pipeline. `pin_to_core` sets
+        // `SCHED_FIFO`, and on reconnects 2+ this thread is already
+        // pinned — children would inherit `{receiver_core}` + FIFO and
+        // never preempt the busy-spinning receiver to reach their own
+        // self-pin. See `clear_affinity` docs.
+        if let Err(e) = crate::affinity::clear_affinity() {
+            tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
+        }
+
         // --- Build pipeline and spawn threads ---
 
         let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
@@ -1114,6 +1124,12 @@ pub fn run_receiver(
         } else {
             None
         };
+
+        // Pipeline children are spawned and will self-pin to their own
+        // cores. Now safe to pin the receive thread — mirrors the
+        // primary's `uring-reader` pin so `recvmsg` + journal-write
+        // doesn't get migrated across L3s mid-batch.
+        pin_replica_thread("receiver", receiver_core);
 
         // --- Inner streaming receive loop ---
         //

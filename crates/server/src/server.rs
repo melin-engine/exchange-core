@@ -494,6 +494,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.snapshot_interval_secs,
             config.shadow_snapshot_path(),
             config.cores,
+            config.reader_cores,
             config.async_replica_ack,
             !config.yield_idle,
         )? {
@@ -1481,6 +1482,7 @@ pub fn run_dpdk(
             &promote_flag,
             config.snapshot_interval_secs,
             config.shadow_snapshot_path(),
+            config.reader_cores,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {

@@ -762,6 +762,7 @@ fn snapshot_transfer_dpdk(
 ///
 /// The protocol is identical to `run_receiver` — same wire format, same
 /// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
+#[allow(clippy::too_many_arguments)]
 pub fn run_receiver_dpdk(
     mut transport: melin_dpdk::DpdkTransport,
     primary_ip: std::net::Ipv4Addr,
@@ -771,6 +772,7 @@ pub fn run_receiver_dpdk(
     promote: &AtomicBool,
     snapshot_interval_secs: u64,
     snapshot_path: std::path::PathBuf,
+    receiver_core: usize,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -1051,6 +1053,13 @@ pub fn run_receiver_dpdk(
         // Clone exchange for shadow stage before moving into pipeline.
         let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
 
+        // Unpin before spawning the pipeline. Same rationale as the
+        // kernel-TCP receiver: see `clear_affinity` docs and the comment
+        // at the matching site in `tcp_receiver.rs`.
+        if let Err(e) = crate::affinity::clear_affinity() {
+            tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
+        }
+
         // Build the replica pipeline — same as the TCP receiver.
         let enable_shadow = snapshot_interval_secs > 0;
         let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
@@ -1123,6 +1132,12 @@ pub fn run_receiver_dpdk(
         } else {
             None
         };
+
+        // Pipeline children are spawned. Now safe to pin the receive
+        // thread — mirrors the primary's reader pin so the thread
+        // producing input-ring entries from the network isn't migrated
+        // across L3s mid-batch.
+        super::pin_replica_thread("receiver", receiver_core);
 
         let mut pending_acks = PendingAckQueue::new();
         let mut received_data = false;
