@@ -106,33 +106,68 @@ Phase 3 removes this round-trip.
 
 163 server tests pass.
 
-### Phase 3 — `feat(replication): replication ring carries InputSlots directly`
+### Phase 3 — `feat(replication): replication ring carries InputBatch bytes`
 
-**Status: not started.**
+**Status: ✅ in progress on `feat/unified-pipeline` (rolled phase 6 in —
+DPDK migrated alongside since both senders share the ring).**
 
-Change what the journal stage publishes to the replication ring: instead
-of journal-bytes (encoded for disk), push the `InputSlot` records it just
-durably journaled. The replication ring still sits *after* fsync, so
-durability semantics are preserved (we send only what's on disk).
+What's in it:
 
-Approach:
-1. The replication ring stays a byte-buffer ring (`ReplicationProducer` +
-   `SharedBuffers`), but the bytes stored are now `InputBatch` wire bytes
-   instead of journal-codec bytes
-2. `JournalStage` encodes each event into the writer's journal-codec buffer
-   AND into a parallel `InputBatch` buffer, then publishes the InputBatch
-   buffer to the replication ring at sync time
-3. Sender (TCP and later DPDK) reads bytes from the ring and forwards
-   directly — no more `decode_journal_to_input_slots`
+- New `crates/transport-core/src/replication_wire.rs` module owns the
+  `InputBatch` wire format: constants (`MSG_INPUT_BATCH = 0x21`,
+  `SLOT_TAG_*`), one-shot `encode_input_batch` / `try_decode_input_batch`
+  (used by catch-up paths), and a streaming triplet
+  `init_input_batch` / `append_input_slot` / `finalize_input_batch`
+  (used by the journal stage hot path)
+- `JournalStage` (in `transport-core/src/pipeline.rs`):
+  - `ReplicationState` gained `input_batch_buf: Vec<u8>` and
+    `input_batch_count: u16`, lazily initialized on the first slot of
+    each fsync batch
+  - `record_slot_for_replication` appends each just-encoded slot to the
+    buffer alongside `writer.encode_event` (no-op when no producers)
+  - `publish_input_batch_to_rings` finalizes the buffer (back-fills
+    length / type / count) and publishes to the replication rings at
+    the existing pre-fsync boundary, then resets count + clears bytes
+- `tcp_sender.rs`: live ring → wire is now a passthrough — ring chunk
+  bytes are wire-ready frames; the live path no longer calls
+  `decode_journal_to_input_slots` + `encode_input_batch`. Catch-up
+  overlap drain forwards as-is too.
+- DPDK migrated in the same commit (rolling phase 6's DPDK work in,
+  since the ring format is shared):
+  - DPDK live sender: `slot.send_buf.extend_from_slice(data)` instead
+    of wrapping in `encode_data_batch`
+  - DPDK catch-up overlap drain: same passthrough
+  - DPDK catch-up file path: decode journal bytes via
+    `decode_journal_to_input_slots`, re-encode via
+    `encode_input_batch` (same as TCP catch-up — journal *files* still
+    contain journal-codec bytes; only the live ring switched)
+  - DPDK receiver: `try_decode_input_batch` + per-slot
+    `input_producer.publish()` (mirrors `tcp_receiver.rs`); removed
+    `journal_accum` accumulator and the `submit_batch_to_pipeline`
+    call site
+- `replication/protocol.rs`: removed `MSG_DATA_BATCH`,
+  `encode_data_batch`, `try_decode_data_batch`, the
+  `PrimaryMessage::DataBatch` variant, and the `MSG_DATA_BATCH` arm in
+  `decode_primary_message`. `decode_journal_to_input_slots` stays —
+  catch-up paths still need it. `MSG_INPUT_BATCH` constants and the
+  encode/decode helpers re-export from transport-core.
+- `replication/mod.rs`: removed `submit_batch_to_pipeline`. Three
+  unit tests that exercised end-to-end `DataBatch` round-trips were
+  rewritten to use a small `encode_input_batch_with_seq` helper.
+- 7 wire-format unit tests live in `replication_wire.rs` (transport-
+  core), using a minimal `TestEvent: AppEvent`. The previous five in
+  `protocol.rs` are gone — the implementation moved with them.
 
-Tradeoff: extra encode pass on the journal hot path. Should be cheap
-(InputBatch encode skips CRC compute) and amortized over the fsync that
-already happens. Keeps the ring infrastructure unchanged.
+Validation:
+- Default build, `--features dpdk`, and `--features "dpdk noop"
+  --no-default-features` all clippy-clean
+- 154 server tests pass (down from 163: 9 obsolete `DataBatch` tests
+  deleted; the 7 wire-format tests now run in transport-core instead)
+- Two known-flaky failover tests passed on retry, same as pre-phase-3
 
-Alternative (more invasive): change ring storage from `[u8; CHUNK_SIZE]`
-to `[InputSlot; SLOTS]`, eliminating both encodes. Punt for now.
-
-Removes `decode_journal_to_input_slots` from the live + catch-up paths.
+Removed entirely: `MSG_DATA_BATCH`, `encode_data_batch`,
+`try_decode_data_batch`, `submit_batch_to_pipeline`,
+`PrimaryMessage::DataBatch`. Phase 6's cleanup landed here.
 
 ### Phase 4 — `refactor(transport-core): build_pipeline accepts a Role enum`
 
@@ -187,20 +222,10 @@ without needing the receiver to surrender state.
 
 ### Phase 6 — `feat(replication): DPDK uses InputBatch; remove DataBatch`
 
-Today's catch-up replays journal-bytes from disk. Under the new model:
-
-- Replica reconnects, sends `last_sequence` in handshake
-- Primary streams `InputBatch` from `last_sequence + 1` — read from journal,
-  decode the InputSlots that were stored there, send them as InputBatch
-  frames (one-shot batch loop, off the live streaming path)
-- If primary's journal doesn't go back that far, send `NeedSnapshot`
-
-Strictly simpler than the current `catch_up_from_journal_dpdk` path, which
-has its own framing + transport-level integration.
-
-Final cleanup: remove `MSG_DATA_BATCH`, `encode_data_batch`,
-`try_decode_data_batch`, `submit_batch_to_pipeline`, and the
-`#[allow(dead_code)]` annotations on the new symbols.
+**Status: ✅ landed inside the phase 3 commit.** Phase 3 forced the DPDK
+migration since both senders share the replication ring; rolling them
+together avoided the dual-format detour that "TCP only" would have
+required. See phase 3 above for the exact changes.
 
 ## Testing
 
@@ -235,18 +260,24 @@ Final cleanup: remove `MSG_DATA_BATCH`, `encode_data_batch`,
 
 ## Where we left off
 
-- On `feat/unified-pipeline` branched from `main`
-- Phases 1, 2, 5a, 5b committed (`f0b8e54`, `209840b`, `a8dcf2c`,
-  `08feffd`, `862078a`)
-- 163 server tests passing, clippy clean
-- Outstanding phases: 3 (ring carries InputSlots directly — eliminates
-  the sender-side journal-codec round-trip), 4 (collapse build_pipeline
-  /build_replica_pipeline), 6 (DPDK migrates to InputBatch + cleanup)
+- On `feat/unified-pipeline`, rebased onto `main` (which picked up
+  `91b6cbb perf(server): pin replica receive loop` — superseded by our
+  phase 5a `thread::scope` approach; the conflict resolved cleanly to
+  ours)
+- Phases 1, 2, 5a, 5b, 3 (incl. phase 6) all committed
+- 154 server tests passing (9 obsolete `DataBatch` tests deleted; 7 wire-
+  format tests moved to transport-core), clippy clean on default,
+  `--features dpdk`, and `--features "dpdk noop" --no-default-features`
+- Outstanding: phase 4 (cosmetic — collapse
+  `build_pipeline_with_replication` and `build_replica_pipeline` into one
+  `build_pipeline(role)`); DPDK port of 5a/5b (long-lived pipeline +
+  thread-scoped receiver, mirroring TCP)
 
-End-to-end bench validation can run now — phases 5a and 5b should both
-move tcp-repl numbers (5a removes contention with orchestrator on main;
-5b removes per-reconnect cost). Phase 2's sender-side journal round-trip
-will be eliminated by phase 3.
+End-to-end bench validation is now meaningful for phase 3 — the live
+TCP path lost an entire decode + re-encode pass per ring chunk. Combined
+with 5a (pinned receiver thread) and 5b (pipeline lives across
+reconnects), expect tcp-repl to close most of the gap with the
+standalone topology.
 
 ## Related branches (not part of this work but referenced)
 
