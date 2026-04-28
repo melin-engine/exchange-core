@@ -1616,6 +1616,87 @@ pub struct ReplicationRingProgress {
     pub active_flags: [Arc<AtomicBool>; 2],
 }
 
+/// Pieces of the input disruptor that primary and replica builders both
+/// need. Built by [`build_input_disruptor`] in one place so the two
+/// builders don't drift on consumer order or cursor wiring.
+struct InputDisruptorParts<E: AppEvent> {
+    input_producer: ring::Producer<InputSlot<E>>,
+    /// Type-erased cursor reader for queue-depth monitoring. Always
+    /// extracted before the producer is moved to its owning thread —
+    /// the replica builder discards it (no health probe today), the
+    /// primary builder threads it into [`Pipeline::input_cursor`].
+    input_cursor: Box<dyn ring::QueueCursor>,
+    journal_consumer: ring::Consumer<InputSlot<E>>,
+    matching_consumer: ring::Consumer<InputSlot<E>>,
+    shadow_consumer: Option<ring::Consumer<InputSlot<E>>>,
+    journal_cursor: Arc<Sequence>,
+    matching_cursor: Arc<Sequence>,
+}
+
+/// Build the shared input disruptor topology: journal + matching gated on
+/// the producer in parallel, plus an optional shadow consumer chained
+/// after journal (only sees events that have been durably fsynced).
+///
+/// Single producer: the ingress thread on primaries (which also emits
+/// ticks) or the replication receiver on replicas. The seed loop reuses
+/// the same producer before handing it off to the ingress thread, so the
+/// ring is single-producer at every moment of operation.
+fn build_input_disruptor<E: AppEvent + Send + 'static>(
+    enable_shadow: bool,
+) -> InputDisruptorParts<E> {
+    let mut builder = ring::DisruptorBuilder::<InputSlot<E>>::new(INPUT_RING_CAPACITY)
+        .add_consumer() // consumer 0: journal, gated on producer
+        .add_consumer(); // consumer 1: matching, gated on producer (parallel)
+    if enable_shadow {
+        builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
+    }
+    let (input_producer, mut consumers) = builder.build();
+
+    let input_cursor = input_producer.cursor_reader();
+
+    // Pop consumers in reverse order of addition: with shadow enabled the
+    // build order is [journal(0), matching(1), shadow(2)], so pop yields
+    // shadow → matching → journal.
+    let shadow_consumer = if enable_shadow {
+        Some(consumers.pop().expect("shadow consumer"))
+    } else {
+        None
+    };
+    let matching_consumer = consumers.pop().expect("matching consumer");
+    let journal_consumer = consumers.pop().expect("journal consumer");
+
+    let journal_cursor = journal_consumer.progress_counter();
+    let matching_cursor = matching_consumer.progress_counter();
+
+    InputDisruptorParts {
+        input_producer,
+        input_cursor,
+        journal_consumer,
+        matching_consumer,
+        shadow_consumer,
+        journal_cursor,
+        matching_cursor,
+    }
+}
+
+/// If shadow snapshots are enabled, allocate a SeqLock for publishing the
+/// BLAKE3 chain hash to the shadow stage and wire it into `journal_stage`.
+/// Returns the lock (so the caller can return it through its pipeline
+/// handle struct) or `None` when shadow is disabled — zero overhead in
+/// that case.
+fn setup_chain_hash_publisher<E: AppEvent>(
+    journal_stage: &mut JournalStage<E>,
+    enable_shadow: bool,
+) -> Option<Arc<SeqLock<[u8; 32]>>> {
+    if enable_shadow {
+        let lock = Arc::new(SeqLock::new([0u8; 32]));
+        journal_stage.set_chain_hash_lock(Arc::clone(&lock));
+        Some(lock)
+    } else {
+        None
+    }
+}
+
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A>(
@@ -1635,43 +1716,15 @@ where
     A::Event: Send + 'static,
     A::Report: Send + 'static,
 {
-    // Input disruptor. Single producer: the ingress thread on primaries
-    // (which also emits ticks) or the replication receiver on replicas.
-    // The seed loop reuses the same producer before handing it off to
-    // the ingress thread, so the ring is single-producer at every moment
-    // of operation. When shadow snapshots are enabled, a third consumer
-    // is chained after journal (consumer 0) — it only sees events that
-    // have been durably fsynced.
-    let mut builder = ring::DisruptorBuilder::<InputSlot<A::Event>>::new(INPUT_RING_CAPACITY)
-        .add_consumer() // consumer 0: journal, gated on producer
-        .add_consumer(); // consumer 1: matching, gated on producer (parallel)
-    if enable_shadow {
-        builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
-    }
-    let (input_producer, mut consumers) = builder.build();
-
-    // Type-erased cursor reader for queue depth monitoring.
-    // Extracted before the producer is cloned to producer threads.
-    let input_cursor = input_producer.cursor_reader();
-
-    // Pop consumers in reverse order of addition. With shadow enabled the
-    // build order is [journal(0), matching(1), shadow(2)], so pop yields:
-    // shadow(2), matching(1), journal(0).
-    let shadow_consumer = if enable_shadow {
-        Some(consumers.pop().expect("shadow consumer"))
-    } else {
-        None
-    };
-    let matching_consumer = consumers.pop().expect("matching consumer");
-    let journal_consumer = consumers.pop().expect("journal consumer");
-
-    // Grab the journal's progress cursor before moving it into the stage.
-    // The response stage will read this to gate on sync completion.
-    let journal_cursor = journal_consumer.progress_counter();
-    // Grab the matching consumer's progress cursor for seed drain gating.
-    // The server waits for both journal and matching to advance past the
-    // last seed sequence before accepting clients.
-    let matching_cursor = matching_consumer.progress_counter();
+    let InputDisruptorParts {
+        input_producer,
+        input_cursor,
+        journal_consumer,
+        matching_consumer,
+        shadow_consumer,
+        journal_cursor,
+        matching_cursor,
+    } = build_input_disruptor::<A::Event>(enable_shadow);
 
     // Output disruptor ring: matching → response (+ optional event publisher).
     // Single producer, N consumers (1 = response only, 2 = response + event publisher).
@@ -1742,17 +1795,7 @@ where
         (None, None)
     };
 
-    // SeqLock for publishing the BLAKE3 chain hash to the shadow snapshot
-    // stage. Allocated only when shadow is enabled — zero overhead otherwise.
-    // Initialized to all-zeros; the journal stage writes the real hash after
-    // the first fsync batch.
-    let chain_hash_lock = if enable_shadow {
-        let lock = Arc::new(SeqLock::new([0u8; 32]));
-        journal_stage.set_chain_hash_lock(Arc::clone(&lock));
-        Some(lock)
-    } else {
-        None
-    };
+    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, enable_shadow);
 
     // Connected replica count: when replication is enabled, starts at 0
     // (no replicas yet). The replication sender increments on connect,
@@ -1827,26 +1870,15 @@ where
     A::Event: Send + 'static,
     A::Report: Send + 'static,
 {
-    // Input disruptor: same topology as primary (journal + matching in parallel,
-    // optional shadow gated on journal).
-    let mut builder = ring::DisruptorBuilder::<InputSlot<A::Event>>::new(INPUT_RING_CAPACITY)
-        .add_consumer() // consumer 0: journal
-        .add_consumer(); // consumer 1: matching (parallel)
-    if enable_shadow {
-        builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
-    }
-    let (input_producer, mut consumers) = builder.build();
-
-    let shadow_consumer = if enable_shadow {
-        Some(consumers.pop().expect("shadow consumer"))
-    } else {
-        None
-    };
-    let matching_consumer = consumers.pop().expect("matching consumer");
-    let journal_consumer = consumers.pop().expect("journal consumer");
-
-    let journal_cursor = journal_consumer.progress_counter();
-    let matching_cursor = matching_consumer.progress_counter();
+    let InputDisruptorParts {
+        input_producer,
+        input_cursor: _, // replica has no health-probe consumer of input depth
+        journal_consumer,
+        matching_consumer,
+        shadow_consumer,
+        journal_cursor,
+        matching_cursor,
+    } = build_input_disruptor::<A::Event>(enable_shadow);
 
     // Output disruptor: single drain consumer (no response stage on replica).
     let output_builder = ring::DisruptorBuilder::<OutputSlot<A::Report, A::QueryResponse>>::new(
@@ -1868,14 +1900,7 @@ where
         busy_spin,
     );
 
-    // Chain hash SeqLock for shadow snapshots.
-    let chain_hash_lock = if enable_shadow {
-        let lock = Arc::new(SeqLock::new([0u8; 32]));
-        journal_stage.set_chain_hash_lock(Arc::clone(&lock));
-        Some(lock)
-    } else {
-        None
-    };
+    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, enable_shadow);
 
     // Last-journaled-sequence atomic — always populated for replicas. The
     // orchestrator reads it for reconnect handshakes without owning the
