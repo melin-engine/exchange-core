@@ -1,16 +1,24 @@
-//! Standalone server with rumcast (reliable UDP) as the order-entry
-//! transport. Mutually exclusive with the `dpdk` feature at build time.
+//! Server with rumcast (reliable UDP) as the order-entry transport.
+//! Mutually exclusive with the `dpdk` feature at build time.
 //!
 //! # What this is for
 //!
-//! Lets the LAN bench suite (`melin-bench`) compare TCP versus rumcast
-//! on the same engine pipeline. Phase 3 scope:
+//! Lets the LAN bench suite (`melin-bench`) run end-to-end against a
+//! full UDP cluster — primary, replica(s), and bench all over rumcast.
 //!
-//! - Standalone primary only (no replica, no promotion).
-//! - **Pure-UDP authentication** via Ed25519 challenge-response +
-//!   X25519 ECDH, with per-message BLAKE3 keyed-MAC envelopes on the
-//!   data plane. Same Ed25519 identities as the TCP path
-//!   (`authorized_keys`).
+//! Scope (post-Phase 4):
+//!
+//! - **Primary or replica** mode (selected by `--replica-of`). Primary
+//!   side spawns a separate rumcast replication endpoint on
+//!   `--replication-bind` when set, parallel to the order-entry
+//!   endpoint on `--bind`. Replica side connects out to the primary's
+//!   replication endpoint; promotion handoff is not yet wired (an
+//!   operator-triggered promotion errors out and asks for a process
+//!   restart in primary mode).
+//! - **Pure-UDP order-entry authentication** via Ed25519 challenge-
+//!   response + X25519 ECDH, with per-message BLAKE3 keyed-MAC
+//!   envelopes on the data plane. Same Ed25519 identities as the TCP
+//!   path (`authorized_keys`).
 //! - **Multi-client demux.** Each client picks its own random
 //!   `session_id`; the muxed receiver allocates a per-session
 //!   `SubscriptionLog` lazily on first contact, the muxed sender
@@ -20,6 +28,12 @@
 //!   client's first inbound frame — this requires the client to use
 //!   `melin_rumcast::shared_udp::SharedUdp` so its publisher source
 //!   addr equals its subscriber addr (single socket per peer).
+//! - **Replication** uses the same Ed25519 challenge-response that
+//!   `replication/auth.rs` runs on the TCP path, but inlined in
+//!   `replication/rumcast_sender.rs` to operate on rumcast message
+//!   payloads. No envelope wrapping for replication: it runs on a
+//!   separate UDP port operators firewall to internal/VLAN, the same
+//!   threat model the TCP path already accepts.
 //! - Kernel UDP only (rumcast's `KernelUdp`). DPDK rumcast backend is
 //!   a separate effort tracked under the rumcast crate's deferred list.
 //!
@@ -241,15 +255,30 @@ const MAX_SESSIONS: u32 = 1024;
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Entry point for the rumcast standalone server.
+/// Entry point for the rumcast server. Dispatches to replica mode if
+/// `--replica-of` is set, otherwise runs the primary path.
 pub fn run_rumcast(
+    config: ServerConfig,
+    rumcast_config: RumcastConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(primary_addr) = config.replica_of {
+        return run_rumcast_replica(config, rumcast_config, primary_addr, shutdown);
+    }
+    run_rumcast_primary(config, rumcast_config, shutdown)
+}
+
+/// Primary path. With `--replication-bind` set, also spawns the
+/// rumcast replication sender on a separate UDP port.
+fn run_rumcast_primary(
     config: ServerConfig,
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         bind = %rumcast_config.bind,
-        "starting rumcast standalone server"
+        replication_bind = ?config.replication_bind,
+        "starting rumcast primary"
     );
 
     // ---- Authorized keys ----
@@ -268,13 +297,27 @@ pub fn run_rumcast(
     // ---- Engine pipeline ----
     let (app, writer, needs_seeding) = init_engine(&config)?;
 
+    let enable_replication = config.replication_bind.is_some();
+    if enable_replication && config.standalone {
+        return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+
+    // Read raw genesis entry bytes before the writer is consumed by
+    // the pipeline. Sent to the replica via StreamStart so the BLAKE3
+    // hash chain starts from byte-identical bytes on both sides.
+    let genesis_entry = if enable_replication {
+        extract_genesis_entry(writer.path())?
+    } else {
+        Vec::new()
+    };
+
     let active_connections = Arc::new(AtomicU64::new(1));
     let pipeline: Pipeline<crate::App> = build_pipeline_with_replication(
         app,
         writer,
         Duration::from_micros(config.group_commit_us),
         Arc::clone(&active_connections),
-        false, // enable_replication
+        enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
         !config.yield_idle, // busy_spin
@@ -289,6 +332,10 @@ pub fn run_rumcast(
         mut output_consumers,
         journal_cursor,
         matching_cursor,
+        replication_consumers,
+        replication_cursor,
+        replicas_connected,
+        replication_ring_progress,
         ..
     } = pipeline;
 
@@ -365,6 +412,87 @@ pub fn run_rumcast(
                 let _final_app = matching_stage.run(&matching_shutdown);
             })?,
     );
+
+    // ---- Replication sender (rumcast) ----
+    //
+    // Spawned before seeding because the journal stage starts
+    // publishing into the replication ring as soon as a replica
+    // enters its Live phase. We don't gate seeding on `replica_ready`:
+    // a replica that connects after seeding still catches up via
+    // journal-file scan on its handshake — same model as TCP.
+    let replica_ready = Arc::new(AtomicBool::new(false));
+    if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers {
+        let repl_bind = config
+            .replication_bind
+            .ok_or("replication_bind must be set when replication is enabled")?;
+        let progress = replication_ring_progress
+            .ok_or("replication_ring_progress must be present when replication is enabled")?;
+        let connected = replicas_connected
+            .clone()
+            .ok_or("replicas_connected must be Some when replication is enabled")?;
+        let metrics = Arc::new(crate::replication::ReplicationMetrics::default());
+
+        let s_repl = Arc::clone(&shutdown);
+        let ready_flag = Arc::clone(&replica_ready);
+        let busy_spin = !config.yield_idle;
+        let heartbeat_secs = config.replication_heartbeat_secs;
+        let journal_path = config.journal.clone();
+        let repl_auth_keys = Arc::clone(&authorized_keys);
+        let repl_counters = Arc::clone(&counters);
+        let evict_flags = [
+            Arc::clone(&progress.evict_flags[0]),
+            Arc::clone(&progress.evict_flags[1]),
+        ];
+        let active_flags = [
+            Arc::clone(&progress.active_flags[0]),
+            Arc::clone(&progress.active_flags[1]),
+        ];
+        let cursor = Arc::clone(&replication_cursor);
+        // The TCP/DPDK paths track a separate fastest_replica_cursor for
+        // dual-replication tail-cuts. For Phase 4 the rumcast standalone
+        // path has no response stage that would consume it (responses
+        // gate on the journal cursor only), so we hand the sender a
+        // fresh AtomicU64 it writes to but nothing reads from. This
+        // keeps the sender API uniform across transports.
+        let fastest_for_sender = Arc::new(AtomicU64::new(0));
+        let connected_for_thread = Arc::clone(&connected);
+        let ready_for_thread = Arc::clone(&ready_flag);
+        let s_for_thread = Arc::clone(&s_repl);
+
+        handles.push(
+            thread::Builder::new()
+                .name("repl-rumcast-sender".into())
+                .spawn(move || {
+                    crate::replication::run_sender_rumcast(
+                        crate::replication::RumcastSender {
+                            bind_addr: repl_bind,
+                            repl_consumer_1,
+                            repl_consumer_2,
+                            replication_cursor: cursor,
+                            fastest_replica_cursor: fastest_for_sender,
+                            genesis_entry,
+                            journal_path,
+                            authorized_keys: repl_auth_keys,
+                            evict_flags,
+                            active_flags,
+                            metrics,
+                            heartbeat_secs,
+                            busy_spin,
+                            counters: Some(repl_counters),
+                        },
+                        &s_for_thread,
+                        &ready_for_thread,
+                        &connected_for_thread,
+                    );
+                })?,
+        );
+        info!(addr = %repl_bind, "rumcast replication sender thread started");
+    } else {
+        // Standalone — no replication. Mirror server.rs behavior.
+        if !config.standalone && config.replica_of.is_none() {
+            info!("running rumcast in standalone mode (no replication)");
+        }
+    }
 
     // ---- Seed accounts and instruments on first startup ----
     //
@@ -1145,4 +1273,107 @@ fn wall_clock_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Replica path
+// ---------------------------------------------------------------------------
+
+/// Replica-mode entry point. Dispatched from `run_rumcast` when
+/// `--replica-of` is set. Connects to the primary via rumcast,
+/// authenticates via Ed25519 challenge-response, and runs the streaming
+/// receive loop. On promotion, transitions back into the primary path.
+fn run_rumcast_replica(
+    config: ServerConfig,
+    rumcast_config: RumcastConfig,
+    primary_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        primary = %primary_addr,
+        bind = %rumcast_config.bind,
+        "starting in rumcast replica mode"
+    );
+
+    // Load the replication signing key — same `--replication-key` flag
+    // the TCP path uses; replication identity is transport-independent.
+    let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
+        std::io::Error::other("--replication-key is required in replica mode (--replica-of)")
+    })?;
+    let signing_key = {
+        let seed = std::fs::read(replication_key_path).map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to read replication key {}: {e}",
+                replication_key_path.display()
+            ))
+        })?;
+        if seed.len() != 32 {
+            return Err(format!(
+                "replication key must be 32 bytes, got {} ({})",
+                seed.len(),
+                replication_key_path.display()
+            )
+            .into());
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&seed);
+        ed25519_dalek::SigningKey::from_bytes(&bytes)
+    };
+
+    // Promotion path: not yet implemented for the rumcast transport.
+    // The TCP path spawns a TCP promote listener on `--promote-bind`;
+    // mirroring it on rumcast is out of scope for Phase 4 (the bench
+    // suite drives manual promotion via process restart, not a live
+    // promote signal).
+    let promote_flag = Arc::new(AtomicBool::new(false));
+
+    // The replica's local UDP bind for rumcast. We reuse the `--bind`
+    // flag (= `rumcast_config.bind`) — operators get one knob to
+    // configure the replica's local UDP address rather than two.
+    match crate::replication::run_receiver_rumcast(
+        primary_addr,
+        rumcast_config.bind,
+        &config.journal,
+        &signing_key,
+        &shutdown,
+        &promote_flag,
+        config.snapshot_interval_secs,
+        config.shadow_snapshot_path(),
+        config.cores,
+        config.async_replica_ack,
+        !config.yield_idle,
+    )? {
+        None => Ok(()), // clean shutdown
+        Some((mut _exchange, _writer)) => {
+            // Promotion was triggered. Phase 4 doesn't wire the rumcast
+            // promotion handoff into the primary path yet — surface a
+            // clear error so an operator who triggered promotion knows
+            // the process must be restarted as a primary instead.
+            Err(
+                "rumcast replica was promoted but rumcast promotion handoff is not yet \
+                 implemented; restart the process with --replication-bind to run as primary"
+                    .into(),
+            )
+        }
+    }
+}
+
+/// Read the raw genesis entry bytes from a journal file. Used to seed
+/// the `StreamStart` message so the replica writes a byte-identical
+/// genesis entry. Mirrors the inline logic in `server::run_as_primary`.
+fn extract_genesis_entry(
+    journal_path: &std::path::Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use melin_journal::codec::FILE_HEADER_SIZE;
+    let file_bytes = std::fs::read(journal_path)?;
+    let offset = FILE_HEADER_SIZE;
+    if file_bytes.len() < offset + 4 {
+        return Err("journal file too short to contain genesis entry".into());
+    }
+    let entry_len = u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
+    let total = 20 + entry_len + 4; // header(20) + payload + crc(4)
+    if file_bytes.len() < offset + total {
+        return Err("journal file truncated at genesis entry".into());
+    }
+    Ok(file_bytes[offset..offset + total].to_vec())
 }
