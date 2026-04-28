@@ -22,6 +22,16 @@ Follow-ups to take the FIX 4.4 gateway from minimum-viable to production-ready f
 | 2 | IPv6 support | Medium | Low | ★★★☆☆ | `server_addr` and `listen_addr` are IPv4-only today (validation rejects IPv6). Many modern data centers require IPv6 dual-stack. |
 | 3 | Market data (35=V/W/X) | Medium | High | ★★☆☆☆ | MarketDataRequest, snapshot/full refresh, incremental refresh. Requires a feed builder that consumes the engine's output event channel and maintains per-subscription book state. Larger surface than order entry. |
 
+## Rumcast Hardening
+
+Follow-ups to take the rumcast transport (Ed25519 + X25519 auth, per-session BLAKE3 keyed-MAC envelopes, multi-client demux) from feature-complete to production-ready. The foundation is on `main`; these items make it deployable for real exchange operators.
+
+| # | Feature | Commercial value | Complexity | Value/effort | Why |
+|---|---------|:---:|:---:|:---:|-----|
+| 1 | Per-deployment tunables (`MAX_SESSIONS`, `IDLE_TIMEOUT`, `TERM_LENGTH`) | Medium | Low | ★★★★☆ | All three are hardcoded `const`s in `rumcast_transport.rs` (with `TODO(config)` markers from Phase 3). Operators with small boxes need lower `MAX_SESSIONS`; trading deployments with clients quietly tracking market state during off-hours need longer `IDLE_TIMEOUT`; fully-saturating 10GbE workloads need larger `TERM_LENGTH` (current 1 MiB is borderline at 1.25 MiB BDP). Mechanical refactor: promote each to `ServerConfig`, plumb through, document defaults. |
+| 2 | Per-session observability via health endpoint | Medium | Low | ★★★★☆ | The rumcast `Counters` struct already aggregates per-tick stats (fragments accepted, NAKs sent, sessions created/rejected, gaps detected, etc.) and the muxers wire it through, but the existing health endpoint doesn't expose them. Operators debugging a multi-client deployment can't see per-session NAK rates, idle eviction counts, or handshake failures without reading server logs. Surface via the existing Prometheus-text health endpoint. |
+| 3 | Token rotation / TTL | Medium | Medium | ★★★☆☆ | Each authenticated rumcast session derives a BLAKE3 keyed-MAC token at handshake time and uses it forever. A long-running session keeps the same key indefinitely; if the token is ever leaked (memory dump, side-channel) an attacker can forge messages until the session ends. Add server-initiated periodic re-handshake (every N min): server emits a new control message, client responds with a fresh `ChallengeResponse`, both sides switch to the new token at a fixed sequence boundary. No wire-format change to Data frames. Defense-in-depth — protects long-lived connections. |
+
 ## DPDK Transport Optimization
 
 | # | Optimization | Est. impact | Complexity | Description |
