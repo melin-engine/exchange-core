@@ -1122,6 +1122,9 @@ fn handle_outbound(
             events_processed,
             journal_sequence,
         },
+        OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
+            ResponseKind::RequestSeqHwm { hwm }
+        }
         OutputPayload::BatchEnd => ResponseKind::BatchEnd,
         OutputPayload::EngineError => ResponseKind::EngineError,
     };
@@ -1382,7 +1385,7 @@ fn run_rumcast_replica(
         &signing_key,
         &shutdown,
         &promote_flag,
-        config.snapshot_interval_secs,
+        config.snapshot_interval_ms,
         config.shadow_snapshot_path(),
         config.cores,
         config.async_replica_ack,
