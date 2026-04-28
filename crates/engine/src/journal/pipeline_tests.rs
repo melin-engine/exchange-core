@@ -264,7 +264,6 @@ mod tests {
     #[test]
     fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
         use crate::journal::CHECKPOINT_INTERVAL;
-        use crate::journal::codec;
 
         let dir = tempfile::tempdir().unwrap();
         let primary_path = dir.path().join("primary.journal");
@@ -341,48 +340,43 @@ mod tests {
         let t_relay = std::thread::spawn(move || {
             loop {
                 let mut got_something = false;
-                // Ring 0: decode each batch's bytes into InputSlots with
-                // the primary's sequence stamped, then publish to the
-                // replica's input ring. Mirrors `submit_batch_to_pipeline`.
+                // Ring 0: each chunk is a wire-ready `InputBatch` frame
+                // ([length:u32][type:0x21][count:u16][slots...]) produced
+                // by the primary's journal stage. Strip the length prefix
+                // and decode the payload into `InputSlot`s with the
+                // primary's sequence stamped, then publish to the replica's
+                // input ring. Mirrors what `tcp_receiver.rs` does after
+                // `read_frame`.
                 if let Some((_meta, data)) = repl_c0.try_read() {
-                    let mut off = 0;
-                    while off < data.len() {
-                        match codec::decode(&data[off..], codec::FORMAT_VERSION) {
-                            Ok((
-                                consumed,
-                                sequence,
-                                timestamp_ns,
-                                key_hash,
-                                request_seq,
-                                event,
-                            )) => {
-                                off += consumed;
-                                // Skip the primary's auto-emitted
-                                // Checkpoint entries: the replica has a
-                                // chain hash seeded from its own (test-
-                                // local) genesis, so passing primary's
-                                // Checkpoint through verify_primary_
-                                // checkpoint would always diverge and
-                                // kill the replica's JournalStage. The
-                                // replica still auto-emits its own
-                                // Checkpoints at the same sequence
-                                // positions.
-                                if matches!(event, JournalEvent::Checkpoint { .. }) {
-                                    continue;
-                                }
-                                replica_input.publish(InputSlot {
-                                    connection_id: 0,
-                                    key_hash,
-                                    request_seq,
-                                    sequence,
-                                    timestamp_ns,
-                                    event,
-                                    publish_ts: trace_ts(),
-                                    recv_ts: trace_ts(),
-                                });
-                            }
-                            Err(e) => panic!("relay decode failed at off={off}: {e}"),
+                    let payload_len =
+                        u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
+                            as usize;
+                    let payload = &data[4..4 + payload_len];
+                    let slots: Vec<InputSlot> =
+                        melin_transport_core::replication_wire::try_decode_input_batch(payload)
+                            .expect("relay InputBatch decode");
+                    for slot in slots {
+                        // Skip the primary's auto-emitted Checkpoint
+                        // entries: the replica has a chain hash seeded
+                        // from its own (test-local) genesis, so passing
+                        // the primary's Checkpoint through
+                        // verify_primary_checkpoint would always diverge
+                        // and kill the replica's JournalStage. The
+                        // replica still auto-emits its own Checkpoints
+                        // at the same sequence positions.
+                        if matches!(slot.event, JournalEvent::Checkpoint { .. }) {
+                            continue;
                         }
+                        replica_input.publish(InputSlot {
+                            connection_id: 0,
+                            key_hash: slot.key_hash,
+                            request_seq: slot.request_seq,
+                            sequence: slot.sequence,
+                            timestamp_ns: slot.timestamp_ns,
+                            event: slot.event,
+                            publish_ts: trace_ts(),
+                            recv_ts: trace_ts(),
+                        });
                     }
                     repl_c0.commit();
                     got_something = true;
@@ -975,54 +969,29 @@ mod tests {
         );
         assert!(!repl_data.is_empty(), "replication batch should have data");
 
-        // Verify the replication batch contains valid journal entries with
-        // the same sequence numbers as the on-disk journal.
-        let (consumed, seq, _ts, _kh, _rs, event) =
-            melin_journal::codec::decode(&repl_data, melin_journal::codec::FORMAT_VERSION).unwrap();
-        assert!(consumed > 0);
+        // Replication chunk is a wire-ready `InputBatch` frame:
+        // [length:u32][type:0x21][count:u16][slots...]. Decode it and
+        // verify the slot's sequence + event match what we submitted.
+        let payload_len =
+            u32::from_le_bytes(repl_data[..4].try_into().expect("4-byte length prefix")) as usize;
+        assert_eq!(repl_data.len(), 4 + payload_len);
+        let payload = &repl_data[4..];
+        let slots: Vec<InputSlot> =
+            melin_transport_core::replication_wire::try_decode_input_batch(payload)
+                .expect("InputBatch decode");
+        assert!(
+            !slots.is_empty(),
+            "InputBatch should carry at least one slot"
+        );
+        let first = &slots[0];
         assert_eq!(
-            seq, FIRST_SEQ,
-            "replication sequence should match journal first user event"
+            first.sequence, FIRST_SEQ,
+            "first slot's sequence should match journal first user event"
         );
         assert!(matches!(
-            event,
+            first.event,
             JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder { .. })
         ));
-
-        // Verify the replicated bytes are byte-identical to what's on disk.
-        #[cfg(not(feature = "no-persist"))]
-        {
-            use melin_journal::codec::FILE_HEADER_SIZE;
-            let file_bytes = std::fs::read(&path).unwrap();
-
-            // Find the start of user entries (after file header and genesis if present).
-            let offset = {
-                #[cfg(feature = "hash-chain")]
-                {
-                    // Skip past the genesis entry.
-                    let genesis_len = u16::from_le_bytes([
-                        file_bytes[FILE_HEADER_SIZE + 2],
-                        file_bytes[FILE_HEADER_SIZE + 3],
-                    ]) as usize;
-                    FILE_HEADER_SIZE + 20 + genesis_len + 4
-                }
-                #[cfg(not(feature = "hash-chain"))]
-                {
-                    FILE_HEADER_SIZE
-                }
-            };
-
-            // Find end of valid data via reader.
-            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
-            while reader.next_entry().unwrap().is_some() {}
-            let data_end = reader.valid_file_end() as usize;
-
-            let disk_bytes = &file_bytes[offset..data_end];
-            assert_eq!(
-                repl_data, disk_bytes,
-                "replicated bytes must be byte-identical to journal file"
-            );
-        }
 
         // Simulate replica acking — update the replication cursor.
         replication_cursor.store(repl_meta.end_sequence + 1, Ordering::Release);

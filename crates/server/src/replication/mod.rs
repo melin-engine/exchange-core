@@ -341,59 +341,6 @@ pub(super) fn shutdown_pipeline(
     Some((exchange, writer))
 }
 
-/// Decode accumulated journal bytes into events and publish to the input
-/// disruptor with pre-assigned sequences and timestamps from the primary.
-/// Returns the disruptor sequence target that the caller must wait for
-/// before sending an ack (ensures persist-before-ack).
-///
-/// All events are published, including Checkpoint entries from the
-/// primary. The JournalStage skips encoding checkpoints (each node
-/// auto-emits its own), but uses the primary's checkpoint chain hash
-/// for divergence detection — a mismatch means the replica's
-/// independently encoded journal has diverged from the primary's.
-///
-/// TCP path uses `try_decode_input_batch` directly instead — only the DPDK
-/// path still routes journal bytes through this helper. Marked dead-code-
-/// allow under non-DPDK builds; phase 4 of feat/unified-pipeline migrates
-/// the DPDK path to InputBatch and removes this entirely.
-#[allow(dead_code)]
-pub(super) fn submit_batch_to_pipeline(
-    journal_bytes: &[u8],
-    producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    use crate::InputSlot;
-
-    let mut offset = 0;
-    let mut last_published_seq = 0u64;
-    while offset < journal_bytes.len() {
-        let remaining = &journal_bytes[offset..];
-        match melin_journal::codec::decode(remaining, melin_journal::codec::FORMAT_VERSION) {
-            Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
-                offset += consumed;
-                last_published_seq = producer.publish(InputSlot {
-                    connection_id: 0,
-                    key_hash,
-                    request_seq,
-                    sequence,
-                    timestamp_ns,
-                    event,
-                    publish_ts: Default::default(),
-                    recv_ts: Default::default(),
-                });
-            }
-            Err(e) => {
-                return Err(
-                    format!("failed to decode journal entry at offset {offset}: {e}").into(),
-                );
-            }
-        }
-    }
-
-    // Return the disruptor target — the caller waits for this before
-    // sending an ack.
-    Ok(last_published_seq + 1)
-}
-
 /// Wait for the journal cursor to reach the target sequence,
 /// confirming all submitted batches are durable on disk.
 pub(super) fn wait_for_journal_cursor(
@@ -435,11 +382,28 @@ mod tests {
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
         decode_challenge_response, decode_primary_message, decode_replica_message, encode_ack,
         encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response,
-        encode_data_batch, encode_handshake, encode_hash_mismatch, encode_heartbeat,
+        encode_handshake, encode_hash_mismatch, encode_heartbeat, encode_input_batch,
         encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-        encode_stream_start, read_frame, try_decode_data_batch,
+        encode_stream_start, read_frame, try_decode_input_batch,
     };
     use super::*;
+
+    /// Build a wire-ready `InputBatch` frame containing a single `Tick`
+    /// slot at the given sequence — the protocol-level tests don't need
+    /// real journal payloads, just something with a known max sequence.
+    fn encode_input_batch_with_seq(end_sequence: u64, buf: &mut Vec<u8>) {
+        let slot = crate::InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: end_sequence,
+            timestamp_ns: 0,
+            event: melin_journal::JournalEvent::Tick { now_ns: 0 },
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        };
+        encode_input_batch(&[slot], buf);
+    }
 
     #[test]
     fn handshake_encode_decode_round_trip() {
@@ -497,79 +461,6 @@ mod tests {
             }
             _ => panic!("expected StreamStart"),
         }
-    }
-
-    #[test]
-    fn data_batch_encode_decode_round_trip() {
-        let journal_bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let mut buf = Vec::new();
-        encode_data_batch(500, &journal_bytes, &mut buf);
-
-        let payload = &buf[4..];
-        let msg = decode_primary_message(payload).unwrap();
-        match msg {
-            PrimaryMessage::DataBatch {
-                end_sequence,
-                journal_bytes: data,
-            } => {
-                assert_eq!(end_sequence, 500);
-                assert_eq!(data, journal_bytes);
-            }
-            _ => panic!("expected DataBatch"),
-        }
-    }
-
-    #[test]
-    fn try_decode_data_batch_fast_path_matches_general_decoder() {
-        // The fast path is only correct if it returns the exact same
-        // header fields as the general decoder and a slice whose contents
-        // equal the original journal bytes.
-        let journal_bytes: Vec<u8> = (0..256u16).map(|i| (i & 0xFF) as u8).collect();
-        let mut buf = Vec::new();
-        encode_data_batch(4242, &journal_bytes, &mut buf);
-        let payload = &buf[4..];
-
-        let (end_seq, slice) = try_decode_data_batch(payload).expect("fast path");
-        assert_eq!(end_seq, 4242);
-        assert_eq!(slice, journal_bytes.as_slice());
-        // The fast-path slice must borrow from `payload`, not own a copy.
-        assert!(slice.as_ptr() >= payload.as_ptr());
-        assert!(slice.as_ptr() as usize + slice.len() <= payload.as_ptr() as usize + payload.len());
-    }
-
-    #[test]
-    fn try_decode_data_batch_rejects_non_data_batch() {
-        // Heartbeat frame: different type tag → fast path must return None
-        // so the caller falls through to the general decoder.
-        let mut buf = Vec::new();
-        encode_heartbeat(42, &mut buf);
-        assert!(try_decode_data_batch(&buf[4..]).is_none());
-
-        // Ack frame: replica-to-primary, same check.
-        let mut buf = Vec::new();
-        encode_ack(&Ack { acked_sequence: 7 }, &mut buf);
-        assert!(try_decode_data_batch(&buf[4..]).is_none());
-
-        // DataBatch-tagged but truncated below the fixed header: fast
-        // path returns None; the general decoder then surfaces the
-        // truncation as a protocol error (tested separately via the
-        // general decoder).
-        let mut short = vec![super::protocol::MSG_DATA_BATCH];
-        short.extend_from_slice(&[0u8; 4]); // Well short of 9-byte header.
-        assert!(try_decode_data_batch(&short).is_none());
-    }
-
-    #[test]
-    fn try_decode_data_batch_empty_journal_bytes() {
-        // Minimum-size DataBatch: 9-byte header and zero-length journal
-        // bytes. Should decode cleanly and return an empty slice (not
-        // error out).
-        let mut buf = Vec::new();
-        encode_data_batch(1, &[], &mut buf);
-        let payload = &buf[4..];
-        let (end_seq, slice) = try_decode_data_batch(payload).expect("empty-ok");
-        assert_eq!(end_seq, 1);
-        assert!(slice.is_empty());
     }
 
     #[test]
@@ -903,13 +794,14 @@ mod tests {
             let msg = decode_primary_message(&frame).unwrap();
             assert!(matches!(msg, PrimaryMessage::StreamStart { .. }));
 
-            // Read DataBatch.
+            // Read InputBatch.
             let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-            let msg = decode_primary_message(&frame).unwrap();
-            let end_seq = match &msg {
-                PrimaryMessage::DataBatch { end_sequence, .. } => *end_sequence,
-                _ => panic!("expected DataBatch, got {msg:?}"),
-            };
+            let slots: Vec<crate::InputSlot> =
+                try_decode_input_batch(&frame).expect("decode InputBatch");
+            let end_seq = slots
+                .last()
+                .map(|s| s.sequence)
+                .expect("InputBatch carried at least one slot");
 
             // Send ack.
             let ack = Ack {
@@ -941,9 +833,8 @@ mod tests {
         p_writer.flush().unwrap();
         buf.clear();
 
-        // Send a DataBatch with some fake journal bytes.
-        let journal_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        encode_data_batch(42, &journal_bytes, &mut buf);
+        // Send an InputBatch with a single Tick slot at seq 42.
+        encode_input_batch_with_seq(42, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1041,14 +932,16 @@ mod tests {
                 PrimaryMessage::StreamStart { .. }
             ));
 
-            // Read and ack 3 DataBatches.
+            // Read and ack 3 InputBatches.
             let mut acked_seqs = Vec::new();
             for _ in 0..3 {
                 let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-                let end_seq = match decode_primary_message(&frame).unwrap() {
-                    PrimaryMessage::DataBatch { end_sequence, .. } => end_sequence,
-                    other => panic!("expected DataBatch, got {other:?}"),
-                };
+                let slots: Vec<crate::InputSlot> =
+                    try_decode_input_batch(&frame).expect("decode InputBatch");
+                let end_seq = slots
+                    .last()
+                    .map(|s| s.sequence)
+                    .expect("InputBatch carried at least one slot");
                 acked_seqs.push(end_seq);
 
                 encode_ack(
@@ -1083,9 +976,9 @@ mod tests {
         p_writer.flush().unwrap();
         buf.clear();
 
-        // Send 3 DataBatches with increasing sequence numbers.
+        // Send 3 InputBatches with increasing sequence numbers.
         for seq in [10u64, 20, 30] {
-            encode_data_batch(seq, &[0xAA; 8], &mut buf);
+            encode_input_batch_with_seq(seq, &mut buf);
             p_writer.write_all(&buf).unwrap();
             p_writer.flush().unwrap();
             buf.clear();
@@ -1160,17 +1053,18 @@ mod tests {
                 other => panic!("expected StreamStart, got {other:?}"),
             }
 
-            // Read a DataBatch — should be for events AFTER 100.
+            // Read an InputBatch — should be for events AFTER 100.
             let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-            match decode_primary_message(&frame).unwrap() {
-                PrimaryMessage::DataBatch { end_sequence, .. } => {
-                    assert!(
-                        end_sequence > 100,
-                        "DataBatch should be after replica's last_sequence"
-                    );
-                }
-                other => panic!("expected DataBatch, got {other:?}"),
-            }
+            let slots: Vec<crate::InputSlot> =
+                try_decode_input_batch(&frame).expect("decode InputBatch");
+            let end_sequence = slots
+                .last()
+                .map(|s| s.sequence)
+                .expect("InputBatch carried at least one slot");
+            assert!(
+                end_sequence > 100,
+                "InputBatch should be after replica's last_sequence"
+            );
         });
 
         // Primary side.
@@ -1193,8 +1087,8 @@ mod tests {
         p_writer.flush().unwrap();
         buf.clear();
 
-        // Send DataBatch with sequence 150 (after replica's 100).
-        encode_data_batch(150, &[0xAA; 8], &mut buf);
+        // Send InputBatch with sequence 150 (after replica's 100).
+        encode_input_batch_with_seq(150, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
 

@@ -16,9 +16,9 @@ use melin_journal::replication::ReplicationConsumer;
 use super::auth::authenticate_replica;
 use super::catchup::{CatchUpResult, can_catch_up_from_journal, catch_up_from_journal};
 use super::protocol::{
-    MAX_CONTROL_FRAME, ReplicaMessage, decode_journal_to_input_slots, decode_replica_message,
-    encode_heartbeat, encode_input_batch, encode_need_snapshot, encode_snapshot_begin,
-    encode_snapshot_chunk, encode_snapshot_end, encode_stream_start, read_frame,
+    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_heartbeat,
+    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
+    encode_stream_start, read_frame,
 };
 use super::{ReplicationMetrics, update_dual_replication_cursor};
 
@@ -544,19 +544,14 @@ fn handle_replica_connection(
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up. Only discard entries whose
     // end_sequence is fully covered by the catch-up. Entries beyond
-    // catch-up are left in the ring for the live streaming loop.
+    // catch-up are left in the ring for the live streaming loop. Ring
+    // chunks are wire-ready `InputBatch` frames; forward as-is.
     if catchup_end > 0 {
-        while let Some((meta, _data)) = repl_consumer.try_read() {
+        while let Some((meta, data)) = repl_consumer.try_read() {
             if meta.end_sequence > catchup_end {
-                // This batch has new data beyond catch-up. Send it now
-                // and commit so the live loop starts clean.
-                let slots = decode_journal_to_input_slots(_data)
-                    .map_err(|e| io::Error::other(format!("repl-ring journal decode: {e}")))?;
-                encode_input_batch(&slots, &mut send_buf);
-                repl_consumer.commit();
-                writer.write_all(&send_buf)?;
+                writer.write_all(data)?;
                 writer.flush()?;
-                send_buf.clear();
+                repl_consumer.commit();
                 break;
             }
             repl_consumer.commit();
@@ -712,17 +707,15 @@ fn live_stream_uring(
         }
 
         // --- Drain replication ring into send_buf (memory, non-blocking) ---
+        //
+        // Ring chunks are wire-ready `InputBatch` frames produced by the
+        // journal stage (phase 3 of the unified-pipeline plan), so the
+        // sender is a passthrough — no decode + re-encode here.
         if !send_in_flight {
             let mut coalesced = 0;
             while coalesced < batch_size {
                 if let Some((meta, data)) = repl_consumer.try_read() {
-                    // Convert the journal-encoded ring bytes to InputBatch
-                    // wire format. The replication ring still carries journal
-                    // bytes today; phase 3 will eliminate this round-trip by
-                    // having the journal stage publish InputSlots directly.
-                    let slots = decode_journal_to_input_slots(data)
-                        .map_err(|e| io::Error::other(format!("repl-ring journal decode: {e}")))?;
-                    encode_input_batch(&slots, send_buf);
+                    send_buf.extend_from_slice(data);
                     repl_consumer.commit();
                     *last_sequence = meta.end_sequence;
                     coalesced += 1;

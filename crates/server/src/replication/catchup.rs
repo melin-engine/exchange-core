@@ -1,11 +1,12 @@
 //! Journal-based catch-up — replays historical journal entries to a
 //! reconnecting replica before live streaming resumes.
 //!
-//! Reads raw entry bytes from the primary's journal files and pushes
-//! them as `DataBatch` frames over the replica's TCP stream. Does NOT
-//! consume from the live replication ring during catch-up — the ring
-//! accumulates new data while this runs; the caller drains overlapping
-//! ring entries once catch-up completes.
+//! Reads raw entry bytes from the primary's journal files (journal-codec
+//! format), decodes them into `InputSlot` records, and pushes them as
+//! `InputBatch` frames over the replica's TCP stream. Does NOT consume
+//! from the live replication ring during catch-up — the ring accumulates
+//! new data while this runs; the caller drains overlapping ring entries
+//! once catch-up completes.
 
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -153,7 +154,7 @@ pub(super) fn catch_up_from_journal(
             .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
 
         // Read and send batches of raw entries.
-        // Target ~64 KiB per DataBatch frame (~800 entries at ~80 bytes each).
+        // Target ~64 KiB per InputBatch frame (~800 entries at ~80 bytes each).
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 return Ok(CatchUpResult::Ok(end_sequence));
@@ -168,9 +169,10 @@ pub(super) fn catch_up_from_journal(
                 break; // EOF on this file.
             };
 
-            // Decode the journal-batch bytes into InputSlots and re-encode
-            // as an InputBatch for the wire — same wire format the live
-            // streaming path uses (phase 2 of feat/unified-pipeline).
+            // Decode the journal-codec bytes into InputSlots and re-encode
+            // as an `InputBatch` for the wire. Catch-up reads journal
+            // *files* (still journal-codec); the live streaming path's
+            // ring chunks are already InputBatch frames so it skips this.
             let slots = decode_journal_to_input_slots(&batch_buf).map_err(|e| {
                 io::Error::other(format!(
                     "catch-up journal decode at seq {batch_end_seq}: {e}"

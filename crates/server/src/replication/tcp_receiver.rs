@@ -57,7 +57,7 @@ use super::{
 /// io_uring streaming receive loop for the replica.
 ///
 /// Uses `IORING_OP_RECV_MULTI` against a 16-buffer provided buffer pool
-/// for incoming `DataBatch` frames, so the kernel can deliver multiple
+/// for incoming `InputBatch` frames, so the kernel can deliver multiple
 /// completions while the receive thread is decoding the previous one.
 /// Acks are sent via single-shot SEND when the gating condition is
 /// satisfied:
@@ -543,7 +543,7 @@ fn replica_stream_uring(
                             break; // Incomplete frame — wait for more data.
                         }
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
-                        // Fast path: steady-state traffic is ~100% DataBatch
+                        // Fast path: steady-state traffic is ~100% InputBatch
                         // frames. `try_decode_input_batch` decodes the wire
                         // format directly into `InputSlot`s — no journal-codec
                         // round-trip, no per-entry CRC verification.
@@ -897,7 +897,7 @@ pub fn run_receiver(
         };
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
-    // Reset to 1s on successful streaming (first DataBatch received).
+    // Reset to 1s on successful streaming (first InputBatch received).
     let mut backoff = std::time::Duration::from_secs(1);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 

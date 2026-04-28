@@ -31,6 +31,8 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
 
+use crate::replication_wire::{append_input_slot, finalize_input_batch, init_input_batch};
+
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
 ///
 /// Each pipeline stage (journal, matching, response) owns one instance.
@@ -288,6 +290,14 @@ struct ReplicationState {
     evict: [Arc<AtomicBool>; 2],
     /// Per-ring active flags.
     active: [Arc<AtomicBool>; 2],
+    /// Wire-ready `InputBatch` frame accumulating between fsync points.
+    /// Initialized lazily on the first slot of each batch via
+    /// `init_input_batch`; finalized + published at sync time. Empty (and
+    /// unused) in standalone mode where both producers are `None`.
+    input_batch_buf: Vec<u8>,
+    /// Number of slots appended to `input_batch_buf` since the last
+    /// publish/reset. Stays in sync with `input_batch_buf`'s contents.
+    input_batch_count: u16,
 }
 
 impl Default for ReplicationState {
@@ -302,7 +312,16 @@ impl Default for ReplicationState {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             ],
+            input_batch_buf: Vec::new(),
+            input_batch_count: 0,
         }
+    }
+}
+
+impl ReplicationState {
+    #[inline]
+    fn any_producer(&self) -> bool {
+        self.producers[0].is_some() || self.producers[1].is_some()
     }
 }
 
@@ -523,6 +542,7 @@ impl<E: AppEvent> JournalStage<E> {
                                 "journal encode (run_sync, seq {seq}): {e}"
                             )))
                         })?;
+                    Self::record_slot_for_replication(&mut self.repl, slot, seq);
                 }
                 pending += count;
                 if first_write_ts.is_none() {
@@ -543,30 +563,28 @@ impl<E: AppEvent> JournalStage<E> {
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
 
                 if should_sync {
-                    // Snapshot batch bytes for replication BEFORE the flush
-                    // or discard below clears the buffer. Copies into a
-                    // pre-allocated ring slot — no heap allocation.
-                    // Guard: skip entirely in standalone mode (both producers None).
-                    // One field read — no atomics, no function call on the hot path.
-                    if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
-                        let bytes = self.writer.pending_batch_bytes();
-                        if !bytes.is_empty() {
-                            let end_seq = self.writer.next_sequence() - 1;
-                            Self::publish_to_replication_rings(
-                                &mut self.repl.producers,
-                                &self.repl.evict,
-                                &self.repl.active,
-                                bytes,
-                                end_seq,
-                            );
-                        }
+                    // Publish the accumulated `InputBatch` frame to the
+                    // replication rings BEFORE the flush or discard below
+                    // clears the buffer. The frame was built up alongside
+                    // the journal-codec writes via
+                    // `record_slot_for_replication` in the encode loop;
+                    // it's already wire-ready except for the back-fill
+                    // inside `publish_input_batch_to_rings`. No-op in
+                    // standalone mode (no producers) or when no slots
+                    // were appended (e.g., a sync that only flushed
+                    // checkpoint metadata).
+                    //
+                    // Runs unconditionally: under `no-persist` the
+                    // replication path must still run, otherwise the
+                    // response stage's replication-cursor gate deadlocks.
+                    if self.repl.any_producer() {
+                        let end_seq = self.writer.next_sequence() - 1;
+                        Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
                     }
 
                     // Persist mode: pwritev2+RWF_DSYNC; no-persist mode:
                     // drop the buffer. `no-persist` means "skip the fsync
-                    // syscall," not "skip everything that follows" — the
-                    // replication path above must still run, otherwise the
-                    // response stage's replication-cursor gate deadlocks.
+                    // syscall," not "skip everything that follows."
                     #[cfg(not(feature = "no-persist"))]
                     {
                         // Fatal: journal I/O failure means we can't
@@ -600,6 +618,49 @@ impl<E: AppEvent> JournalStage<E> {
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
         }
+    }
+
+    /// Append a slot to the in-progress `InputBatch` buffer for replication.
+    /// Lazily initializes the buffer header on the first slot of each batch.
+    /// `seq` is the sequence the journal stage allocated for the slot
+    /// (`slot.sequence` is zero on primary-side input).
+    ///
+    /// No-op when no replication producers are active (standalone mode).
+    #[inline]
+    fn record_slot_for_replication(repl: &mut ReplicationState, slot: &InputSlot<E>, seq: u64) {
+        if !repl.any_producer() {
+            return;
+        }
+        if repl.input_batch_count == 0 {
+            init_input_batch(&mut repl.input_batch_buf);
+        }
+        append_input_slot(&mut repl.input_batch_buf, slot, seq);
+        repl.input_batch_count = repl
+            .input_batch_count
+            .checked_add(1)
+            .expect("InputBatch slot count overflowed u16 in a single fsync batch");
+    }
+
+    /// Finalize the accumulated `InputBatch` buffer (back-fill length, type,
+    /// count) and publish it to all active replication rings, then reset
+    /// for the next fsync batch. No-op when no slots were appended this
+    /// batch (e.g., a fsync that only flushed checkpoint metadata).
+    fn publish_input_batch_to_rings(repl: &mut ReplicationState, end_seq: u64) {
+        if repl.input_batch_count == 0 {
+            return;
+        }
+        finalize_input_batch(&mut repl.input_batch_buf, repl.input_batch_count);
+        Self::publish_to_replication_rings(
+            &mut repl.producers,
+            &repl.evict,
+            &repl.active,
+            &repl.input_batch_buf,
+            end_seq,
+        );
+        // Reset for the next batch. Drop content but keep capacity so
+        // subsequent batches don't reallocate.
+        repl.input_batch_buf.clear();
+        repl.input_batch_count = 0;
     }
 
     /// Publish a batch to all active replication rings. Fully non-blocking:
@@ -742,22 +803,16 @@ impl<E: AppEvent> JournalStage<E> {
                         slot.request_seq,
                     ) {
                         tracing::error!(error = %e, "journal encode error on drain");
+                        continue;
                     }
+                    Self::record_slot_for_replication(&mut self.repl, slot, seq);
                 }
 
-                // Snapshot for replication before flush.
-                if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
-                    let bytes = self.writer.pending_batch_bytes();
-                    if !bytes.is_empty() {
-                        let end_seq = self.writer.next_sequence() - 1;
-                        Self::publish_to_replication_rings(
-                            &mut self.repl.producers,
-                            &self.repl.evict,
-                            &self.repl.active,
-                            bytes,
-                            end_seq,
-                        );
-                    }
+                // Publish accumulated InputBatch frame to replication rings
+                // before flush, mirroring the steady-state sync path.
+                if self.repl.any_producer() {
+                    let end_seq = self.writer.next_sequence() - 1;
+                    Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
                 }
 
                 if let Err(e) = self.writer.flush_batch_sync() {
@@ -933,6 +988,7 @@ impl<E: AppEvent> JournalStage<E> {
                                 "journal encode (run_uring, seq {seq}): {e}"
                             )))
                         })?;
+                    Self::record_slot_for_replication(&mut self.repl, slot, seq);
                 }
                 pending += count;
                 if first_write_ts.is_none() {
@@ -992,20 +1048,15 @@ impl<E: AppEvent> JournalStage<E> {
                         self.writer.confirm_async_write(batch_data);
                     }
 
-                    // Snapshot batch bytes for replication BEFORE
-                    // take_batch_for_async_write (which swaps the buffer).
-                    if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
-                        let bytes = self.writer.pending_batch_bytes();
-                        if !bytes.is_empty() {
-                            let end_seq = self.writer.next_sequence() - 1;
-                            Self::publish_to_replication_rings(
-                                &mut self.repl.producers,
-                                &self.repl.evict,
-                                &self.repl.active,
-                                bytes,
-                                end_seq,
-                            );
-                        }
+                    // Publish the accumulated InputBatch frame to
+                    // replication rings BEFORE take_batch_for_async_write
+                    // (which swaps the journal-codec buffer). The InputBatch
+                    // buffer is independent of that swap, but publish at the
+                    // same boundary so the ring's `end_sequence` matches the
+                    // batch about to be submitted.
+                    if self.repl.any_producer() {
+                        let end_seq = self.writer.next_sequence() - 1;
+                        Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
                     }
 
                     // Take the batch buffer and submit async write.

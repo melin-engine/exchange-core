@@ -17,13 +17,13 @@ use melin_journal::replication::ReplicationConsumer;
 use super::catchup::{can_catch_up_from_journal, discover_journal_files};
 use super::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
-    decode_primary_message, decode_replica_message, encode_ack, encode_data_batch,
-    encode_handshake, encode_heartbeat, encode_need_snapshot, encode_snapshot_begin,
-    encode_snapshot_chunk, encode_snapshot_end, encode_stream_start, try_decode_data_batch,
+    decode_primary_message, decode_replica_message, encode_ack, encode_handshake, encode_heartbeat,
+    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
+    encode_stream_start, try_decode_input_batch,
 };
 use super::{
     PendingAckQueue, ReceiverResult, ReplicationMetrics, shutdown_pipeline, sleep_checking_flags,
-    submit_batch_to_pipeline, update_dual_replication_cursor,
+    update_dual_replication_cursor,
 };
 
 enum FrameResult {
@@ -404,17 +404,12 @@ impl DpdkReplicationDriver {
                                     slot.last_send = std::time::Instant::now();
 
                                     // Drain overlapping ring entries from catch-up.
-                                    while let Some((meta, _data)) = slot.consumer.try_read() {
+                                    // Ring chunks are wire-ready InputBatch frames;
+                                    // forward as-is.
+                                    while let Some((meta, data)) = slot.consumer.try_read() {
                                         if meta.end_sequence > h.last_sequence {
-                                            // This batch has new data beyond catch-up.
-                                            // Send it now and commit so the live loop
-                                            // starts clean.
                                             slot.send_buf.clear();
-                                            encode_data_batch(
-                                                meta.end_sequence,
-                                                _data,
-                                                &mut slot.send_buf,
-                                            );
+                                            slot.send_buf.extend_from_slice(data);
                                             slot.consumer.commit();
                                             transport.queue_send(handle, &slot.send_buf);
                                             slot.send_buf.clear();
@@ -540,20 +535,19 @@ impl DpdkReplicationDriver {
                         continue;
                     }
 
-                    // 2. Send data batches. Pre-check the per-socket TX
-                    //    queue: if we encode and commit a batch but
-                    //    queue_send rejects it (TX full), the data is gone
-                    //    from the ring without ever reaching the replica
-                    //    — replica never acks, replication_cursor stalls,
-                    //    and the response gate freezes the whole exchange.
-                    //    We saw this exact symptom on dpdk-dual-repl.
+                    // 2. Send data batches. Ring chunks are wire-ready
+                    //    `InputBatch` frames produced by the journal stage
+                    //    — the sender is a passthrough. Pre-check the
+                    //    per-socket TX queue: if we commit a batch from
+                    //    the ring but `queue_send` rejects it (TX full),
+                    //    the data is gone from the ring without ever
+                    //    reaching the replica — replica never acks,
+                    //    replication_cursor stalls, and the response
+                    //    gate freezes the whole exchange. We saw this
+                    //    exact symptom on dpdk-dual-repl.
                     let max_tx = melin_dpdk::DpdkTransport::max_tx_queue_size();
                     let used = transport.tx_queue_bytes(handle);
                     let mut available = max_tx.saturating_sub(used);
-                    // DataBatch frame overhead: 4-byte length prefix +
-                    // 1-byte tag + 8-byte sequence. Bound oversizing so
-                    // a single oversized batch can't blow past available.
-                    const FRAME_OVERHEAD: usize = 32;
 
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
@@ -565,16 +559,16 @@ impl DpdkReplicationDriver {
                         let Some((meta, data)) = slot.consumer.try_read() else {
                             break;
                         };
-                        let need = data.len() + FRAME_OVERHEAD;
-                        if need > available {
+                        let data_len = data.len();
+                        if data_len > available {
                             // Don't commit; retry next iteration.
                             break;
                         }
-                        encode_data_batch(meta.end_sequence, data, &mut slot.send_buf);
+                        slot.send_buf.extend_from_slice(data);
                         slot.consumer.commit();
                         slot.last_sequence = meta.end_sequence;
                         batches_sent += 1;
-                        available = available.saturating_sub(need);
+                        available = available.saturating_sub(data_len);
                     }
 
                     if !slot.send_buf.is_empty() {
@@ -653,9 +647,10 @@ impl DpdkReplicationDriver {
     }
 }
 
-/// DPDK-adapted journal catch-up: reads journal files and sends DataBatch
-/// frames via the DPDK transport. Periodically polls the transport to flush
-/// TX and keep smoltcp's timers alive.
+/// DPDK-adapted journal catch-up: reads journal files (journal-codec
+/// bytes), decodes them into `InputSlot` records, and sends them as
+/// `InputBatch` frames via the DPDK transport. Periodically polls the
+/// transport to flush TX and keep smoltcp's timers alive.
 fn catch_up_from_journal_dpdk(
     journal_path: &std::path::Path,
     last_sequence: u64,
@@ -733,8 +728,17 @@ fn catch_up_from_journal_dpdk(
                 break;
             };
 
+            // Decode the journal-batch bytes into InputSlots and re-encode
+            // as an InputBatch for the wire — same wire format the live
+            // streaming path uses.
+            let slots =
+                super::protocol::decode_journal_to_input_slots(&batch_buf).map_err(|e| {
+                    io::Error::other(format!(
+                        "catch-up journal decode at seq {batch_end_seq}: {e}"
+                    ))
+                })?;
             send_buf.clear();
-            encode_data_batch(batch_end_seq, &batch_buf, send_buf);
+            super::protocol::encode_input_batch(&slots, send_buf);
             // Retry-with-poll: a 64 KiB batch can fill the TX queue even
             // after a previous poll. Spin-poll until queue_send accepts
             // the batch (or the replica drops). This is bounded — TX
@@ -776,7 +780,7 @@ fn catch_up_from_journal_dpdk(
 
 /// Transfer a snapshot to a replica via DPDK, then catch up from journals.
 /// Sends: NeedSnapshot → SnapshotBegin → SnapshotChunk* → SnapshotEnd →
-/// StreamStart → DataBatch* (catch-up).
+/// StreamStart → InputBatch* (catch-up).
 fn snapshot_transfer_dpdk(
     journal_path: &std::path::Path,
     genesis_entry: &[u8],
@@ -921,7 +925,7 @@ pub fn run_receiver_dpdk(
         };
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
-    // Reset to 1s on successful streaming (first DataBatch received).
+    // Reset to 1s on successful streaming (first InputBatch received).
     let mut backoff = std::time::Duration::from_secs(1);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1258,7 +1262,6 @@ pub fn run_receiver_dpdk(
 
         let mut pending_acks = PendingAckQueue::new();
         let mut received_data = false;
-        let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
         let mut accum_end_sequence: u64 = 0;
 
         // Encode an ack into send_buf and queue it on the DPDK transport.
@@ -1323,18 +1326,20 @@ pub fn run_receiver_dpdk(
                         break;
                     }
                     let mut consumed = 0;
+                    let mut drain_last_target = 0u64;
+                    let mut drain_any_published = false;
                     loop {
                         let remaining = &recv_buf[consumed..];
                         match try_extract_frame(remaining, MAX_DATA_FRAME) {
                             FrameResult::Complete(ps, fe) => {
-                                // Fast path: borrowed decoder avoids the Vec
-                                // allocation on steady-state DataBatch frames.
-                                // Mirrors the io_uring receiver path.
-                                if let Some((end_sequence, journal_bytes)) =
-                                    try_decode_data_batch(&remaining[ps..fe])
-                                {
-                                    journal_accum.extend_from_slice(journal_bytes);
-                                    accum_end_sequence = end_sequence;
+                                let payload = &remaining[ps..fe];
+                                if let Ok(slots) = try_decode_input_batch(payload) {
+                                    for slot in slots {
+                                        let primary_seq = slot.sequence;
+                                        drain_last_target = input_producer.publish(slot);
+                                        accum_end_sequence = primary_seq;
+                                        drain_any_published = true;
+                                    }
                                 }
                                 consumed += fe;
                             }
@@ -1342,14 +1347,9 @@ pub fn run_receiver_dpdk(
                         }
                     }
                     compact_recv_buf(&mut recv_buf, consumed);
-                }
-                if !journal_accum.is_empty() {
-                    if let Ok(target) =
-                        submit_batch_to_pipeline(&journal_accum, &mut input_producer)
-                    {
-                        pending_acks.push(target, accum_end_sequence);
+                    if drain_any_published && !pending_acks.is_full() {
+                        pending_acks.push(drain_last_target, accum_end_sequence);
                     }
-                    journal_accum.clear();
                 }
                 if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
                     send_ack_dpdk!(seq);
@@ -1392,42 +1392,32 @@ pub fn run_receiver_dpdk(
                 break 'streaming false; // disconnected
             }
 
-            // Parse frames from the receive buffer.
+            // Parse frames from the receive buffer and publish slots
+            // straight into the input ring (mirrors the io_uring TCP
+            // receiver — no journal-codec round-trip on the wire).
             let mut consumed = 0;
-            let mut got_data = false;
+            let mut burst_last_target = 0u64;
+            let mut burst_any_published = false;
             loop {
                 let remaining = &recv_buf[consumed..];
                 match try_extract_frame(remaining, MAX_DATA_FRAME) {
                     FrameResult::Complete(payload_start, frame_end) => {
                         let payload = &remaining[payload_start..frame_end];
-                        // Fast path: borrowed DataBatch decoder avoids the
-                        // per-batch Vec allocation that used to dominate the
-                        // DPDK replica's CPU profile under load.
-                        if let Some((end_sequence, journal_bytes)) = try_decode_data_batch(payload)
-                        {
-                            journal_accum.extend_from_slice(journal_bytes);
-                            accum_end_sequence = end_sequence;
-                            got_data = true;
-                            received_data = true;
-                        } else {
-                            match decode_primary_message(payload) {
+                        match try_decode_input_batch(payload) {
+                            Ok(slots) => {
+                                if !slots.is_empty() {
+                                    received_data = true;
+                                    for slot in slots {
+                                        let primary_seq = slot.sequence;
+                                        burst_last_target = input_producer.publish(slot);
+                                        accum_end_sequence = primary_seq;
+                                        burst_any_published = true;
+                                    }
+                                }
+                            }
+                            Err(_) => match decode_primary_message(payload) {
                                 Ok(PrimaryMessage::Heartbeat { sequence }) => {
                                     debug!(sequence, "heartbeat from primary (DPDK)");
-                                }
-                                Ok(PrimaryMessage::DataBatch { .. }) => {
-                                    // try_decode_data_batch rejected this frame
-                                    // as too short; the general decoder should
-                                    // have surfaced it as Err. Treat as a
-                                    // protocol violation.
-                                    warn!("malformed DataBatch slipped past fast path (DPDK)");
-                                    shutdown_pipeline(
-                                        &pipeline_shutdown,
-                                        journal_handle,
-                                        matching_handle,
-                                        drain_handle,
-                                        shadow_handle,
-                                    );
-                                    return Err("malformed DataBatch".into());
                                 }
                                 Ok(other) => {
                                     debug!("unexpected message during streaming: {other:?}");
@@ -1444,7 +1434,7 @@ pub fn run_receiver_dpdk(
                                         format!("failed to decode primary message: {e}").into()
                                     );
                                 }
-                            }
+                            },
                         }
                         consumed += frame_end;
                     }
@@ -1463,13 +1453,11 @@ pub fn run_receiver_dpdk(
             }
             compact_recv_buf(&mut recv_buf, consumed);
 
-            // Submit to pipeline and record pending ack.
-            if got_data {
-                let target = submit_batch_to_pipeline(&journal_accum, &mut input_producer)?;
-
-                pending_acks.push(target, accum_end_sequence);
-                journal_accum.clear();
-            } else {
+            // One pending_acks entry per recv burst — covers all slots
+            // published from this RECV's buffer.
+            if burst_any_published && !pending_acks.is_full() {
+                pending_acks.push(burst_last_target, accum_end_sequence);
+            } else if !burst_any_published {
                 std::thread::yield_now();
             }
         };

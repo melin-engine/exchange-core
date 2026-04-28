@@ -18,6 +18,7 @@
 
 pub mod journaled_app;
 pub mod pipeline;
+pub mod replication_wire;
 pub mod snapshot;
 
 #[cfg(test)]
