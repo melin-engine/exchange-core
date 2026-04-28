@@ -51,7 +51,7 @@ use crate::amortized_timer::AmortizedTimer;
 
 use super::{
     PendingAckQueue, ReplicaPipelineHandles, build_replica_pipeline_with_threads, log_tcp_info,
-    pin_replica_thread, sleep_checking_flags, teardown_replica_pipeline,
+    sleep_checking_flags, teardown_replica_pipeline,
 };
 
 /// io_uring streaming receive loop for the replica.
@@ -1090,7 +1090,7 @@ pub fn run_receiver(
                 let handle = std::thread::Builder::new()
                     .name("replica-receiver".into())
                     .spawn_scoped(s, || {
-                        pin_replica_thread("replica-receiver", receiver_core);
+                        crate::affinity::pin_thread("replica-receiver", receiver_core);
                         replica_stream_uring(
                             &tcp_writer,
                             input_producer,

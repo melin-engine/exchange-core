@@ -776,7 +776,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            apply_affinity("journal", cores.journal);
+            crate::affinity::pin_thread("journal", cores.journal);
             let result = journal_stage.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
@@ -793,7 +793,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            apply_affinity("matching", cores.matching);
+            crate::affinity::pin_thread("matching", cores.matching);
             let app = matching_stage.run(&s2);
             let was_shutdown = shutdown_for_matching.load(Ordering::Relaxed);
             if was_shutdown {
@@ -818,7 +818,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            apply_affinity("response", cores.response);
+            crate::affinity::pin_thread("response", cores.response);
             crate::response::run(
                 output_consumer,
                 control_rx,
@@ -911,7 +911,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
-                apply_affinity("repl-sender", cores.repl_sender);
+                crate::affinity::pin_thread("repl-sender", cores.repl_sender);
                 crate::replication::run_sender(
                     crate::replication::Sender {
                         bind_addr: repl_bind,
@@ -973,7 +973,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         let handle = std::thread::Builder::new()
             .name("shadow".into())
             .spawn(move || {
-                apply_affinity("shadow", cores.shadow);
+                crate::affinity::pin_thread("shadow", cores.shadow);
                 crate::shadow::run(
                     shadow_cons,
                     shadow_ex,
@@ -1655,7 +1655,7 @@ pub fn run_dpdk(
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            apply_affinity("journal", cores.journal);
+            crate::affinity::pin_thread("journal", cores.journal);
             journal_stage.run(&s1)
         })
         .map_err(|e| format!("spawn journal thread: {e}"))?;
@@ -1664,7 +1664,7 @@ pub fn run_dpdk(
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            apply_affinity("matching", cores.matching);
+            crate::affinity::pin_thread("matching", cores.matching);
             matching_stage.run(&s2)
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
@@ -1681,7 +1681,7 @@ pub fn run_dpdk(
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            apply_affinity("response", cores.response);
+            crate::affinity::pin_thread("response", cores.response);
             crate::dpdk_response::run(
                 output_consumer,
                 control_rx,
@@ -1711,7 +1711,7 @@ pub fn run_dpdk(
         let handle = std::thread::Builder::new()
             .name("shadow".into())
             .spawn(move || {
-                apply_affinity("shadow", cores.shadow);
+                crate::affinity::pin_thread("shadow", cores.shadow);
                 crate::shadow::run(
                     shadow_cons,
                     shadow_ex,
@@ -2013,7 +2013,7 @@ pub fn run_dpdk(
     );
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
-    apply_affinity("dpdk-poll-0", reader_cores);
+    crate::affinity::pin_thread("dpdk-poll-0", reader_cores);
     crate::dpdk_transport::run_dpdk_poll(
         transport_0,
         input_producer,
@@ -2169,7 +2169,7 @@ fn spawn_event_publisher(
     let event_handle = std::thread::Builder::new()
         .name("event-publisher".into())
         .spawn(move || {
-            apply_affinity("event-publisher", event_core);
+            crate::affinity::pin_thread("event-publisher", event_core);
             crate::event_publisher::run(
                 event_consumer,
                 event_bind,
@@ -2196,14 +2196,6 @@ fn spawn_event_publisher(
     // under the noop feature, so the consumer is always None.
     debug_assert!(consumer.is_none());
     Ok(None)
-}
-
-/// Apply CPU core affinity for a pipeline thread, logging the result.
-fn apply_affinity(thread_name: &str, core_id: usize) {
-    match crate::affinity::pin_to_core(core_id) {
-        Ok(c) => info!(core = c, thread = thread_name, "pinned to core"),
-        Err(e) => tracing::warn!(thread = thread_name, error = e, "core pinning failed"),
-    }
 }
 
 /// Perform challenge-response authentication on a new connection.

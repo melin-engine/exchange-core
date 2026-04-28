@@ -1264,7 +1264,7 @@ pub fn run_receiver_dpdk(
             // pin the receive thread — mirrors the primary's reader pin
             // so the thread producing input-ring entries from the network
             // isn't migrated across L3s mid-batch.
-            super::pin_replica_thread("receiver", receiver_core);
+            crate::affinity::pin_thread("receiver", receiver_core);
         }
 
         let mut pending_acks = PendingAckQueue::new();

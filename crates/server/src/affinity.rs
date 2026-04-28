@@ -87,6 +87,19 @@ fn set_realtime_fifo(priority: i32) {
     }
 }
 
+/// Pin the calling thread to `core` with logging on success/failure.
+///
+/// Thin convenience wrapper around [`pin_to_core`] that emits a
+/// structured log entry — `info!` on success, `warn!` on failure — so
+/// every pipeline thread (primary and replica, journal/matching/response
+/// /shadow/sender/receiver) reports its pin outcome consistently.
+pub(crate) fn pin_thread(name: &str, core: usize) {
+    match pin_to_core(core) {
+        Ok(c) => tracing::info!(core = c, thread = name, "pinned to core"),
+        Err(e) => tracing::warn!(thread = name, error = e, "core pinning failed"),
+    }
+}
+
 /// Clear CPU affinity and reset scheduling policy for the calling thread.
 ///
 /// Child threads spawned from a pinned parent inherit both the parent's

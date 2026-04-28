@@ -238,15 +238,6 @@ impl PendingAckQueue {
     }
 }
 
-/// Send an ack for `acked_sequence` over TCP, coalescing into `send_buf`.
-/// Flushes the buffer immediately.
-pub(super) fn pin_replica_thread(name: &str, core: usize) {
-    match crate::affinity::pin_to_core(core) {
-        Ok(c) => tracing::info!(core = c, thread = name, "pinned to core"),
-        Err(e) => tracing::warn!(thread = name, error = e, "core pinning failed"),
-    }
-}
-
 /// Diagnostic: emit a `tcp_info` span at debug level describing the
 /// kernel's view of the socket (rtt, cwnd, retrans, unacked, rcv_space,
 /// rto). Guarded internally with `tracing::enabled!` so the
@@ -405,7 +396,7 @@ pub(super) fn build_replica_pipeline_with_threads(
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            pin_replica_thread("journal", journal_core);
+            crate::affinity::pin_thread("journal", journal_core);
             journal_stage.run(&ps)
         })
         .expect("spawn journal thread");
@@ -416,7 +407,7 @@ pub(super) fn build_replica_pipeline_with_threads(
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            pin_replica_thread("matching", matching_core);
+            crate::affinity::pin_thread("matching", matching_core);
             matching_stage.run(&ps)
         })
         .expect("spawn matching thread");
@@ -429,7 +420,7 @@ pub(super) fn build_replica_pipeline_with_threads(
     let drain_handle = std::thread::Builder::new()
         .name("drain".into())
         .spawn(move || {
-            pin_replica_thread("drain", drain_core);
+            crate::affinity::pin_thread("drain", drain_core);
             let mut consumer = drain_consumer;
             let mut batch = vec![crate::OutputSlot::default(); 256];
             loop {
@@ -461,7 +452,7 @@ pub(super) fn build_replica_pipeline_with_threads(
             std::thread::Builder::new()
                 .name("replica-shadow".into())
                 .spawn(move || {
-                    pin_replica_thread("replica-shadow", shadow_core);
+                    crate::affinity::pin_thread("replica-shadow", shadow_core);
                     crate::shadow::run(
                         shadow_cons,
                         shadow_exchange,
