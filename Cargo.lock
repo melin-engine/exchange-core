@@ -1731,6 +1731,7 @@ dependencies = [
  "melin-journal",
  "tempfile",
  "tracing",
+ "zerocopy",
 ]
 
 [[package]]

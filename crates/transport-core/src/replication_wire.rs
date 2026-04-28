@@ -28,6 +28,8 @@ use std::io;
 
 use melin_app::AppEvent;
 use melin_journal::JournalEvent;
+use zerocopy::little_endian::{U16, U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::pipeline::InputSlot;
 
@@ -40,9 +42,54 @@ pub const SLOT_TAG_CHECKPOINT: u8 = 0x02;
 pub const SLOT_TAG_TICK: u8 = 0x03;
 pub const SLOT_TAG_APP: u8 = 0x80;
 
-/// `[length:u32] [type:u8] [count:u16]`. Streaming encoders reserve this
-/// up front and back-fill it at finalize time.
-const FRAME_HEADER_LEN: usize = 4 + 1 + 2;
+// --- Wire structs ---
+//
+// `little_endian::U{16,32,64}` are 1-byte-aligned LE wrappers, so a `repr(C)`
+// struct of them is byte-packed (no padding), can be safely viewed over any
+// `&[u8]` regardless of alignment, and serialises bit-for-bit identically to
+// the previous hand-rolled `to_le_bytes` chains. The wire layout is
+// authoritative — `const _: () = assert!(...)` below pins it.
+
+/// `[length:u32] [type:u8] [count:u16]` — full frame preamble (length-prefixed).
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct FrameHeader {
+    length: U32,
+    msg_type: u8,
+    count: U16,
+}
+
+/// `[type:u8] [count:u16]` — bytes after the length prefix. The decoder is
+/// handed the post-length payload by the framing layer, so it only sees this.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct BatchPreamble {
+    msg_type: u8,
+    count: U16,
+}
+
+/// Per-slot fixed prefix; variable-length event payload follows. `event_size`
+/// counts only the payload bytes (after this struct), not the header itself.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SlotHeader {
+    event_size: U16,
+    sequence: U64,
+    timestamp_ns: U64,
+    key_hash: U64,
+    request_seq: U64,
+    event_tag: u8,
+}
+
+const FRAME_HEADER_LEN: usize = core::mem::size_of::<FrameHeader>();
+const SLOT_HEADER_LEN: usize = core::mem::size_of::<SlotHeader>();
+
+// Pin the wire layout. Reordering or extending these structs would silently
+// break compatibility with peers running the previous build, so we fail the
+// compile instead.
+const _: () = assert!(FRAME_HEADER_LEN == 7);
+const _: () = assert!(SLOT_HEADER_LEN == 35);
+const _: () = assert!(core::mem::size_of::<BatchPreamble>() == 3);
 
 // --- Streaming encode (used by the journal stage on the hot path) ---
 
@@ -69,47 +116,52 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
         "append_input_slot requires init_input_batch first (buf.len() = {})",
         buf.len()
     );
-    // Reserve event_size; back-fill after the tag + payload are written.
-    let size_pos = buf.len();
-    buf.extend_from_slice(&[0u8; 2]);
-    buf.extend_from_slice(&seq.to_le_bytes());
-    buf.extend_from_slice(&slot.timestamp_ns.to_le_bytes());
-    buf.extend_from_slice(&slot.key_hash.to_le_bytes());
-    buf.extend_from_slice(&slot.request_seq.to_le_bytes());
 
-    // Tag + payload. event_size measures from after the tag byte so the
-    // decoder doesn't double-count it.
-    let payload_start = buf.len() + 1;
-    match &slot.event {
+    // Reserve a zeroed slot header; back-fill the typed view in one block
+    // once the payload is written and event_size is known. The payload
+    // writes may grow the Vec and reallocate, so we cannot hold a borrow
+    // into `buf` across them — the typed view is taken at the end.
+    let header_start = buf.len();
+    buf.resize(header_start + SLOT_HEADER_LEN, 0);
+
+    let tag = match &slot.event {
         JournalEvent::GenesisHash { hash } => {
-            buf.push(SLOT_TAG_GENESIS_HASH);
             buf.extend_from_slice(hash);
+            SLOT_TAG_GENESIS_HASH
         }
         JournalEvent::Checkpoint {
             chain_hash,
             events_since_checkpoint,
         } => {
-            buf.push(SLOT_TAG_CHECKPOINT);
             buf.extend_from_slice(chain_hash);
             buf.extend_from_slice(&events_since_checkpoint.to_le_bytes());
+            SLOT_TAG_CHECKPOINT
         }
         JournalEvent::Tick { now_ns } => {
-            buf.push(SLOT_TAG_TICK);
             buf.extend_from_slice(&now_ns.to_le_bytes());
+            SLOT_TAG_TICK
         }
         JournalEvent::App(e) => {
-            buf.push(SLOT_TAG_APP);
             let n = e.encoded_size();
             let start = buf.len();
             buf.resize(start + n, 0);
             let written = e.encode(&mut buf[start..start + n]);
             debug_assert_eq!(written, n, "AppEvent::encode disagrees with encoded_size");
+            SLOT_TAG_APP
         }
-    }
+    };
 
-    let event_size =
-        u16::try_from(buf.len() - payload_start).expect("event payload exceeds u16 max");
-    buf[size_pos..size_pos + 2].copy_from_slice(&event_size.to_le_bytes());
+    let payload_bytes = buf.len() - (header_start + SLOT_HEADER_LEN);
+    let event_size = u16::try_from(payload_bytes).expect("event payload exceeds u16 max");
+
+    let header = SlotHeader::mut_from_bytes(&mut buf[header_start..header_start + SLOT_HEADER_LEN])
+        .expect("SLOT_HEADER_LEN slice matches struct size");
+    header.event_size = U16::new(event_size);
+    header.sequence = U64::new(seq);
+    header.timestamp_ns = U64::new(slot.timestamp_ns);
+    header.key_hash = U64::new(slot.key_hash);
+    header.request_seq = U64::new(slot.request_seq);
+    header.event_tag = tag;
 }
 
 /// Back-fill the frame header so `buf` is wire-ready (length-prefixed,
@@ -118,9 +170,11 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
 pub fn finalize_input_batch(buf: &mut [u8], slot_count: u16) {
     debug_assert!(buf.len() >= FRAME_HEADER_LEN);
     let payload_len = u32::try_from(buf.len() - 4).expect("InputBatch payload exceeds u32");
-    buf[0..4].copy_from_slice(&payload_len.to_le_bytes());
-    buf[4] = MSG_INPUT_BATCH;
-    buf[5..7].copy_from_slice(&slot_count.to_le_bytes());
+    let header = FrameHeader::mut_from_bytes(&mut buf[..FRAME_HEADER_LEN])
+        .expect("FRAME_HEADER_LEN slice matches struct size");
+    header.length = U32::new(payload_len);
+    header.msg_type = MSG_INPUT_BATCH;
+    header.count = U16::new(slot_count);
 }
 
 // --- One-shot encode (used by catch-up paths that already have a slot vec) ---
@@ -146,68 +200,29 @@ pub fn encode_input_batch<E: AppEvent>(slots: &[InputSlot<E>], buf: &mut Vec<u8>
 /// starting with the type byte). Returns the reconstructed `InputSlot`
 /// vector with `connection_id`, `publish_ts`, `recv_ts` reset to defaults.
 pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<InputSlot<E>>> {
-    if payload.len() < 1 + 2 {
-        return Err(io::Error::other("InputBatch header truncated"));
-    }
-    if payload[0] != MSG_INPUT_BATCH {
+    let (preamble, mut rest) = BatchPreamble::ref_from_prefix(payload)
+        .map_err(|_| io::Error::other("InputBatch header truncated"))?;
+    if preamble.msg_type != MSG_INPUT_BATCH {
         return Err(io::Error::other(format!(
             "expected InputBatch (0x{:02x}), got 0x{:02x}",
-            MSG_INPUT_BATCH, payload[0]
+            MSG_INPUT_BATCH, preamble.msg_type
         )));
     }
-    let count =
-        u16::from_le_bytes(payload[1..3].try_into().expect("2-byte slice into [u8; 2]")) as usize;
+    let count = preamble.count.get() as usize;
     let mut slots = Vec::with_capacity(count);
-    let mut offset = 3;
-
-    // Per-slot fixed header: event_size(2) + sequence(8) + timestamp_ns(8)
-    //                      + key_hash(8) + request_seq(8) + tag(1) = 35 bytes.
-    const SLOT_HEADER: usize = 2 + 8 + 8 + 8 + 8 + 1;
 
     for _ in 0..count {
-        if payload.len() < offset + SLOT_HEADER {
-            return Err(io::Error::other("InputBatch slot header truncated"));
-        }
-        let event_size = u16::from_le_bytes(
-            payload[offset..offset + 2]
-                .try_into()
-                .expect("2-byte slice into [u8; 2]"),
-        ) as usize;
-        offset += 2;
-        let sequence = u64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("8-byte slice into [u8; 8]"),
-        );
-        offset += 8;
-        let timestamp_ns = u64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("8-byte slice into [u8; 8]"),
-        );
-        offset += 8;
-        let key_hash = u64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("8-byte slice into [u8; 8]"),
-        );
-        offset += 8;
-        let request_seq = u64::from_le_bytes(
-            payload[offset..offset + 8]
-                .try_into()
-                .expect("8-byte slice into [u8; 8]"),
-        );
-        offset += 8;
-        let event_tag = payload[offset];
-        offset += 1;
+        let (header, after_header) = SlotHeader::ref_from_prefix(rest)
+            .map_err(|_| io::Error::other("InputBatch slot header truncated"))?;
 
-        if payload.len() < offset + event_size {
+        let event_size = header.event_size.get() as usize;
+        if after_header.len() < event_size {
             return Err(io::Error::other("InputBatch slot payload truncated"));
         }
-        let event_payload = &payload[offset..offset + event_size];
-        offset += event_size;
+        let event_payload = &after_header[..event_size];
+        rest = &after_header[event_size..];
 
-        let event = match event_tag {
+        let event = match header.event_tag {
             SLOT_TAG_GENESIS_HASH => {
                 if event_payload.len() < 32 {
                     return Err(io::Error::other("GenesisHash payload too short"));
@@ -255,10 +270,10 @@ pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<Inp
 
         slots.push(InputSlot {
             connection_id: 0,
-            key_hash,
-            request_seq,
-            sequence,
-            timestamp_ns,
+            key_hash: header.key_hash.get(),
+            request_seq: header.request_seq.get(),
+            sequence: header.sequence.get(),
+            timestamp_ns: header.timestamp_ns.get(),
             event,
             publish_ts: Default::default(),
             recv_ts: Default::default(),
@@ -430,5 +445,51 @@ mod tests {
         finalize_input_batch(&mut streaming, slots.len() as u16);
 
         assert_eq!(one_shot, streaming);
+    }
+
+    /// Pins the on-wire byte layout of a 1-slot Tick batch. Sentinel u64
+    /// values are chosen so each LE byte sequence is human-readable
+    /// (0x0807_0605_0403_0201 → `[01,02,03,04,05,06,07,08]`). Any future
+    /// field reorder, padding insertion, or endianness flip — including
+    /// "harmless" struct edits that pass roundtrip — fails this test
+    /// before it can break compatibility with peers running older builds.
+    #[test]
+    fn wire_format_is_byte_pinned() {
+        let slot = InputSlot::<TestEvent> {
+            connection_id: 0,
+            key_hash: 0x0807_0605_0403_0201,
+            request_seq: 0x1817_1615_1413_1211,
+            sequence: 0x2827_2625_2423_2221,
+            timestamp_ns: 0x3837_3635_3433_3231,
+            event: JournalEvent::Tick {
+                now_ns: 0x4847_4645_4443_4241,
+            },
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        };
+
+        let mut buf = Vec::new();
+        encode_input_batch(&[slot], &mut buf);
+
+        // Total = FrameHeader(7) + SlotHeader(35) + Tick payload(8) = 50.
+        // length field = total - 4 (the length field itself) = 46 = 0x2E.
+        let expected: &[u8] = &[
+            // FrameHeader: length(u32) + type(u8) + count(u16)
+            0x2E, 0x00, 0x00, 0x00, // length = 46
+            0x21, // MSG_INPUT_BATCH
+            0x01, 0x00, // count = 1
+            // SlotHeader: event_size(u16) + sequence(u64) + timestamp_ns(u64)
+            //           + key_hash(u64) + request_seq(u64) + event_tag(u8)
+            0x08, 0x00, // event_size = 8 (Tick payload)
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
+            0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // request_seq
+            0x03, // SLOT_TAG_TICK
+            // Tick payload: now_ns(u64)
+            0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+        ];
+        assert_eq!(buf, expected, "wire format byte layout must not change");
+        assert_eq!(buf.len(), 50);
     }
 }

@@ -27,6 +27,10 @@ crc32c = "0.6"
 io-uring = "0.7"
 libc = { workspace = true }
 tracing = { workspace = true }
+# Typed views over raw byte buffers for the replication wire format —
+# replaces field-by-field extend_from_slice / try_into chains with a
+# single struct write/read. derive feature for `FromBytes` / `IntoBytes`.
+zerocopy = { version = "0.8", features = ["derive"] }
 melin-app = { path = "../app" }
 melin-disruptor = { path = "../disruptor" }
 melin-journal = { path = "../journal" }
