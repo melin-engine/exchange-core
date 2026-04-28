@@ -220,6 +220,38 @@ phase 5 motivation) becomes trivial from here — `HealthState` can
 read directly from the long-lived `ReplicaPipelineHandles` atomics
 without needing the receiver to surrender state.
 
+### Phase 5b — DPDK port
+
+**Status: ✅ in progress on `feat/unified-pipeline`.**
+
+Mirrors the TCP work above onto `run_receiver_dpdk`:
+
+- `ReplicaPipelineHandles`, `build_replica_pipeline_with_threads`,
+  `teardown_replica_pipeline` moved from `tcp_receiver.rs` to
+  `mod.rs` so both transports share them
+- `run_receiver_dpdk` gains `cores: PipelineCores` and `busy_spin:
+  bool` parameters; pipeline children pin to the configured cores
+  instead of running unpinned (matches TCP's behaviour)
+- Hoisted `pipeline: Option<ReplicaPipelineHandles>` above the outer
+  reconnect loop; top of each iteration refreshes `last_sequence`
+  and `chain_hash` from the atomics when `Some`
+- `NeedSnapshot` path tears down the live pipeline before wiping the
+  journal/snapshot files (necessary — the journal stage holds the
+  file open and the App lives on the matching thread)
+- `clear_affinity` + `pin_replica_thread("receiver", ...)` wrap the
+  build block so children spawn on un-pinned context, then the
+  receiver re-pins (same dance as TCP)
+- Inner streaming loop now `break`s with a `SessionExit` enum
+  (`Disconnected` / `Shutdown` / `Promote` / `Fatal(err)`) instead of
+  inline `return`; the post-loop match drives teardown
+
+Phase 5a-equivalent ("split the receiver onto its own pinned thread")
+doesn't apply on DPDK — smoltcp is single-threaded and DPDK's
+transport poll loop has to run continuously, so all
+orchestration + streaming live on the same pinned thread by design.
+The existing `pin_replica_thread("receiver", receiver_core)` call
+already covers the architectural intent.
+
 ### Phase 6 — `feat(replication): DPDK uses InputBatch; remove DataBatch`
 
 **Status: ✅ landed inside the phase 3 commit.** Phase 3 forced the DPDK
@@ -265,13 +297,13 @@ required. See phase 3 above for the exact changes.
   phase 5a `thread::scope` approach; the conflict resolved cleanly to
   ours)
 - Phases 1, 2, 5a, 5b, 3 (incl. phase 6) all committed
-- 154 server tests passing (9 obsolete `DataBatch` tests deleted; 7 wire-
-  format tests moved to transport-core), clippy clean on default,
-  `--features dpdk`, and `--features "dpdk noop" --no-default-features`
+- 906 workspace tests pass (DPDK port of 5b adds no new tests but
+  exercises the same shared `ReplicaPipelineHandles` machinery as
+  TCP); clippy clean on default, `--features dpdk`, and
+  `--features "dpdk noop" --no-default-features`
 - Outstanding: phase 4 (cosmetic — collapse
   `build_pipeline_with_replication` and `build_replica_pipeline` into one
-  `build_pipeline(role)`); DPDK port of 5a/5b (long-lived pipeline +
-  thread-scoped receiver, mirroring TCP)
+  `build_pipeline(role)`)
 
 End-to-end bench validation is now meaningful for phase 3 — the live
 TCP path lost an entire decode + re-encode pass per ring chunk. Combined
