@@ -11,19 +11,23 @@ Primary:
   Readers → Disruptor → JournalStage  (consumer 0) → disk + replication rings
                        → MatchingStage (consumer 1) → OutputSPSC
 
-  JournalStage: after flush_batch_sync(), publishes batch bytes to
-  two independent SPSC replication rings (one per replica slot).
+  JournalStage: encodes each input slot into both the journal-codec
+  buffer (for disk) and a parallel InputBatch buffer (for the
+  replication ring), then publishes the InputBatch buffer to two
+  independent SPSC replication rings (one per replica slot).
 
   ReplicationSender threads: each consumes from its own ring,
-  streams DataBatch frames to its replica via io_uring SEND,
-  receives acks via io_uring RECV, updates replication_cursor.
+  forwards the wire-ready InputBatch frames to its replica via
+  io_uring SEND, receives acks via io_uring RECV, updates
+  replication_cursor.
 
   ResponseStage gates on replication_cursor (quorum mode, 2 replicas)
   or min(journal_cursor, replication_cursor) (degraded/no-quorum mode)
 
 Replica:
-  TCP → ReplicationReceiver → decode entries, publish to disruptor
-                                (with pre-assigned sequences + timestamps)
+  TCP → ReplicationReceiver → decode InputBatch frames, publish slots
+                                directly to disruptor (sequences and
+                                timestamps already on the wire)
       → JournalStage encodes independently (same sequences as primary)
       → MatchingStage processes through own Exchange
       → ack sequence back to primary after journal cursor advances
@@ -31,7 +35,7 @@ Replica:
 
 ### Replication rings and fault isolation
 
-Each replica slot has its own independent ring buffer (configurable via `--replication-ring-size`, default 64 slots x 512 KiB = 32 MiB per ring, 64 MiB total for dual replication). The replicated bytes are the encoded journal batches from the primary. The replica decodes them, publishes events to its own pipeline with the primary's pre-assigned sequences and timestamps, and encodes its own journal independently. Journals are logically identical (same sequences, same events) but each node encodes independently.
+Each replica slot has its own independent ring buffer (configurable via `--replication-ring-size`, default 64 slots x 512 KiB = 32 MiB per ring, 64 MiB total for dual replication). The replicated bytes are wire-ready `InputBatch` frames produced by the primary's JournalStage at fsync time — no decode + re-encode on the sender. The replica decodes the frames straight back into `InputSlot`s, publishes them to its own pipeline with the primary's pre-assigned sequences and timestamps, and encodes its own journal independently. Journals are logically identical (same sequences, same events) but each node encodes independently.
 
 **Fault isolation**: a slow replica only stalls its own ring, not the other replica's. If a ring is full for longer than 500ms (replica not keeping up), the primary automatically disconnects that replica and frees the ring. The slot becomes available for a new connection. The surviving replica and client trading are unaffected.
 
@@ -125,12 +129,12 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 | SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB) |
 | SnapshotEnd | `[len:u32][type=0x15][crc32c:u32]` | End of snapshot transfer with CRC32C for integrity |
 | HashMismatch | `[len:u32][type=0x12]` | Chain hash doesn't match at the replica's reported sequence (not yet validated) |
-| DataBatch | `[len:u32][type=0x20][end_sequence:u64][journal_bytes...]` | Batch of encoded journal entries; divergence is verified at Checkpoint events inside the entry stream |
+| InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of `InputSlot` records (sequence + timestamp + key/request hash + journaled event); divergence is verified at Checkpoint events inside the slot stream |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5-second interval) advertising the primary's last published sequence |
 
 ### Design rationale
 
-- **Independent encoding**: DataBatch payloads contain encoded journal entries from the primary. The replica decodes them, extracts the pre-assigned sequences and timestamps, and re-encodes through its own JournalStage. Journals are logically identical across nodes (same sequences, same events), enabling deterministic replay and independent verification.
+- **Input replication**: The primary streams `InputBatch` frames carrying the events the replica must apply. Each slot already includes the primary's pre-assigned sequence and timestamp, so the replica's pipeline produces a logically identical journal — same sequences, same events — without round-tripping through the journal codec on the wire. Each node encodes its own on-disk journal independently, enabling deterministic replay and independent verification.
 - **Dual replication**: The primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If a replica disconnects, its slot becomes available for a new connection. Trading halts only when all replicas disconnect.
 
 ## Replica Mode
@@ -139,7 +143,7 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 
 - Authenticates with the primary via Ed25519 challenge-response (`--replication-key`).
 - Connects to the primary and sends a `Handshake`.
-- Receives `DataBatch` frames, decodes entries, publishes them to a local disruptor pipeline.
+- Receives `InputBatch` frames, publishes the slots to a local disruptor pipeline.
 - Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of the reader thread.
 - The journal stage encodes events independently using the primary's pre-assigned sequences and timestamps (carried in each `InputSlot`). Each node produces its own journal — logically identical to the primary's but independently encoded.
 - The matching stage processes events through its own `Exchange` independently, maintaining warm state for promotion.
@@ -169,7 +173,7 @@ TCP Stream → Replication Receiver (decode + publish with pre-assigned seq/ts)
          Ack to primary
 ```
 
-The receiver thread uses io_uring for TCP I/O: a single RECV is always in-flight for DataBatch frames, and SEND is submitted when an ack becomes ready. It decodes events from DataBatch frames and publishes them to the input disruptor with the primary's pre-assigned sequences and timestamps. Checkpoint events are filtered out — each node auto-emits its own. The journal and matching stages consume events in parallel (same topology as the primary).
+The receiver thread uses io_uring for TCP I/O: multishot RECV is always in-flight against a 16-buffer provided buffer pool for incoming `InputBatch` frames, and SEND is submitted when an ack becomes ready. The receiver decodes each `InputBatch` directly into `InputSlot`s and publishes them to the input disruptor with the primary's pre-assigned sequences and timestamps. Checkpoint events are filtered by the journal stage — each node auto-emits its own. The journal and matching stages consume events in parallel (same topology as the primary).
 
 The pipelined ack queue (8 entries) decouples the receiver's TCP loop from NVMe write latency — the receiver can push up to 8 batches ahead while previous writes are in flight. Acks are sent as soon as the journal cursor confirms durability, checked on every event loop iteration with zero syscall overhead.
 
@@ -253,7 +257,7 @@ These are known limitations of the current implementation. Each is documented he
 
 ### ~~No catch-up from journal files~~ (IMPLEMENTED)
 
-When a replica connects, the primary reads its journal archive files and streams historical entries as DataBatch frames before switching to live ring data. The `RawJournalScanner` reads entry boundaries without full decoding (no CRC validation, no event parsing) for efficient streaming. The replication ring is NOT consumed during catch-up — live data accumulates in the ring and overlapping entries are drained after catch-up completes.
+When a replica connects, the primary reads its journal archive files, decodes the historical entries into `InputSlot`s, and streams them as `InputBatch` frames before switching to live ring data. The `RawJournalScanner` reads entry boundaries without full validation (no per-entry CRC check on the streaming path — the replica's own journal stage will rewrite and verify each entry) for efficient streaming. The replication ring is NOT consumed during catch-up — live data accumulates in the ring and overlapping entries are drained after catch-up completes.
 
 This works for both reconnecting replicas (`last_sequence > 0`, catches up the gap) and fresh replicas (`last_sequence = 0`, streams the entire journal history). No operator intervention required — a new replica can join a running primary at any time.
 

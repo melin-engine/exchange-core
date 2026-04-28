@@ -1,15 +1,20 @@
-//! Replication — synchronous journal streaming from primary to replica.
+//! Replication — synchronous input-stream streaming from primary to replica.
 //!
-//! The JournalStage sends byte-for-byte copies of encoded journal batches
-//! through a bounded channel. The `ReplicationSender` streams them to the
-//! replica as `DataBatch` frames. The replica decodes events from the
-//! batch, publishes them to its input disruptor with pre-assigned
-//! sequences and timestamps, and the replica's JournalStage re-encodes
-//! and persists them independently.
+//! The primary's JournalStage encodes each `InputSlot` it just durably
+//! journaled into a wire-ready `InputBatch` frame in the replication ring
+//! (separately from the journal-codec bytes it writes to disk). The
+//! `ReplicationSender` thread forwards those frames as-is over TCP/DPDK
+//! — no decode + re-encode on the hot path. The replica decodes the
+//! frames straight back into `InputSlot`s, publishes them to its local
+//! input disruptor with the primary's pre-assigned sequences and
+//! timestamps, and the replica's JournalStage re-encodes them through
+//! its own writer for byte-exact-on-replay durability.
 //!
 //! ## Wire Protocol
 //!
-//! Length-prefixed frames, little-endian, over a dedicated TCP connection.
+//! Length-prefixed frames, little-endian, over a dedicated TCP connection
+//! (or DPDK pipe). The full `InputBatch` payload layout lives in
+//! [`crate::replication::protocol`] / `transport-core::replication_wire`.
 //!
 //! ### Auth (before handshake)
 //! - **Challenge** (Primary → Replica): `[len:u32][0x03][nonce:[u8;32]]`
@@ -22,18 +27,18 @@
 //! - **Ack**: `[len:u32][0x02][acked_sequence:u64]`
 //!
 //! ### Primary → Replica
-//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64]`
+//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][genesis_len:u32][genesis_bytes...]`
 //! - **NeedSnapshot**: `[len:u32][0x11]`
 //! - **HashMismatch**: `[len:u32][0x12]`
 //! - **SnapshotBegin**: `[len:u32][0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]`
 //! - **SnapshotChunk**: `[len:u32][0x14][data...]`
 //! - **SnapshotEnd**: `[len:u32][0x15][crc32c:u32]`
-//! - **DataBatch**: `[len:u32][0x20][end_sequence:u64][chain_hash:[u8;32]][journal_bytes...]`
-//! - **Heartbeat**: `[len:u32][0x30][sequence:u64][chain_hash:[u8;32]]`
+//! - **InputBatch**: `[len:u32][0x21][count:u16][slot...]` — see
+//!   `transport-core::replication_wire` for the per-slot layout
+//! - **Heartbeat**: `[len:u32][0x30][sequence:u64]`
 //!
 //! ## v1 Limitations
 //!
-//! - No chain hash verification on received DataBatch (CRC per-entry only)
 //! - No handshake chain hash validation (HashMismatch never sent)
 //! - Dual replication (up to 2 replicas in parallel)
 //!
@@ -1062,7 +1067,7 @@ mod tests {
 
     #[test]
     fn multiple_data_batches_acked_in_order() {
-        // Send multiple DataBatch frames, verify replica acks each one
+        // Send multiple InputBatch frames, verify replica acks each one
         // and the cursor advances correctly.
         use std::os::unix::net::UnixStream;
 
