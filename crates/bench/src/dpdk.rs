@@ -302,11 +302,64 @@ pub fn run_dpdk_roundtrip(
     // server may accept them in arbitrary order, causing auth deadlocks.
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
+
+    // Pre-generate wire frames for all clients in parallel. Frame
+    // generation is pure CPU (no DPDK or smoltcp state), so it can
+    // run on a rayon pool while the main thread later drives the
+    // single DPDK transport sequentially. This dominates setup
+    // time at ~12.6M frames/client.
+    use rayon::prelude::*;
+    eprintln!("  generating frames for {num_clients} clients...");
+    let all_frames: Vec<(Vec<Vec<u8>>, usize)> = (0..num_clients)
+        .into_par_iter()
+        .map(|client_id| {
+            let client_pairs = if client_id == num_clients - 1 {
+                pairs_per_client + remainder
+            } else {
+                pairs_per_client
+            };
+            let total_orders = warmup + client_pairs * 2;
+            let order_id_offset: u64 = (0..client_id)
+                .map(|c| {
+                    let p = if c == num_clients - 1 {
+                        pairs_per_client + remainder
+                    } else {
+                        pairs_per_client
+                    };
+                    (warmup + p * 2) as u64
+                })
+                .sum();
+            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+                num_accounts,
+                num_instruments,
+                start_order_id: order_id_offset + 1,
+                ..Default::default()
+            });
+            // Pre-build wire frames: [u32 LE length][payload].
+            // Single send_slice per frame instead of two (prefix + payload).
+            let frames: Vec<Vec<u8>> = flow
+                .generate_frames(total_orders)
+                .into_iter()
+                .map(|payload| {
+                    let mut wire = Vec::with_capacity(4 + payload.len());
+                    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    wire.extend_from_slice(&payload);
+                    wire
+                })
+                .collect();
+            (frames, total_orders)
+        })
+        .collect();
+    eprintln!("  frames generated for all {num_clients} clients");
+
+    // Sequential connect + auth — smoltcp's TCP stack is single-threaded
+    // and shared across all sockets via the same `Interface` poll loop.
+    // Per-client SYN-then-auth ordering avoids the auth-deadlock risk of
+    // sending all SYNs at once and accepting them in arbitrary order.
     let mut connections: Vec<DpdkBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
-
     eprintln!("  connecting {num_clients} clients via DPDK...");
-    for client_id in 0..num_clients {
+    for (client_id, (frames, total_orders)) in all_frames.into_iter().enumerate() {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -329,44 +382,6 @@ pub fn run_dpdk_roundtrip(
             .unwrap_or_else(|e| panic!("connect failed for client {client_id}: {e}"));
 
         let handle = sockets.add(socket);
-
-        let client_pairs = if client_id == num_clients - 1 {
-            pairs_per_client + remainder
-        } else {
-            pairs_per_client
-        };
-        let total_orders = warmup + client_pairs * 2;
-
-        let order_id_offset: u64 = (0..client_id)
-            .map(|c| {
-                let p = if c == num_clients - 1 {
-                    pairs_per_client + remainder
-                } else {
-                    pairs_per_client
-                };
-                (warmup + p * 2) as u64
-            })
-            .sum();
-
-        let frames = {
-            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
-                num_accounts,
-                num_instruments,
-                start_order_id: order_id_offset + 1,
-                ..Default::default()
-            });
-            // Pre-build wire frames: [u32 LE length][payload].
-            // Single send_slice per frame instead of two (prefix + payload).
-            flow.generate_frames(total_orders)
-                .into_iter()
-                .map(|payload| {
-                    let mut wire = Vec::with_capacity(4 + payload.len());
-                    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                    wire.extend_from_slice(&payload);
-                    wire
-                })
-                .collect::<Vec<_>>()
-        };
 
         connections.push(DpdkBenchConn {
             handle,
@@ -409,11 +424,7 @@ pub fn run_dpdk_roundtrip(
             );
         }
 
-        eprintln!(
-            "  client {}/{num_clients}: connected, {} frames generated",
-            client_id + 1,
-            total_orders,
-        );
+        eprintln!("  client {}/{num_clients}: connected", client_id + 1);
     }
     eprintln!(
         "  all {num_clients} clients ready ({:.1}s setup)",
