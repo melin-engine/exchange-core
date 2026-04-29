@@ -4,10 +4,6 @@
 //! engine-side trading types. Phase 3 may consolidate these into a single
 //! shared utility crate if more consumers emerge.
 
-pub fn put_u16(buf: &mut [u8], v: u16) {
-    buf[..2].copy_from_slice(&v.to_le_bytes());
-}
-
 pub fn put_u32(buf: &mut [u8], v: u32) {
     buf[..4].copy_from_slice(&v.to_le_bytes());
 }

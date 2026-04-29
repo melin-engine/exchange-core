@@ -1607,6 +1607,7 @@ dependencies = [
  "melin-disruptor",
  "tempfile",
  "tracing",
+ "zerocopy",
 ]
 
 [[package]]
