@@ -46,6 +46,11 @@ path = "src/lib.rs"
 name = "melin-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "melin-replication-bench"
+path = "src/bin/replication-bench.rs"
+required-features = ["noop"]
+
 [dependencies]
 melin-app = { path = "../app" }
 melin-engine = { path = "../engine", optional = true }
@@ -58,6 +63,7 @@ melin-market-data = { path = "../market-data", optional = true }
 melin-protocol = { path = "../protocol" }
 blake3 = "1"
 clap = { workspace = true }
+base64 = { workspace = true }
 crc32c = "0.6"
 ed25519-dalek = { workspace = true }
 getrandom = "0.3"
