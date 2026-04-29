@@ -19,7 +19,7 @@ use crate::InputSlot;
 // depending on the server crate. Re-export the helpers at server scope so
 // existing `super::protocol::{...}` imports keep working.
 pub(super) use melin_transport_core::replication_wire::{
-    encode_input_batch, try_decode_input_batch,
+    encode_input_batch, try_decode_input_batch, try_decode_input_batch_into,
 };
 
 // --- Wire protocol message tags ---

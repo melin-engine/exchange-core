@@ -206,7 +206,15 @@ pub fn encode_input_batch<E: AppEvent>(slots: &[InputSlot<E>], buf: &mut Vec<u8>
 /// Decode an `InputBatch` frame payload (the bytes after the length prefix,
 /// starting with the type byte). Returns the reconstructed `InputSlot`
 /// vector with `connection_id`, `publish_ts`, `recv_ts` reset to defaults.
-pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<InputSlot<E>>> {
+/// Decode an `InputBatch` frame payload into a caller-supplied buffer.
+/// The buffer is cleared then filled; capacity is grown on demand but never
+/// shrunk, so the allocator is hit at most once per batch size seen so far.
+/// Prefer this over `try_decode_input_batch` on hot paths to avoid per-call
+/// heap allocation.
+pub fn try_decode_input_batch_into<E: AppEvent>(
+    payload: &[u8],
+    slots: &mut Vec<InputSlot<E>>,
+) -> io::Result<()> {
     let (preamble, mut rest) = BatchPreamble::ref_from_prefix(payload)
         .map_err(|_| io::Error::other("InputBatch header truncated"))?;
     if preamble.msg_type != MSG_INPUT_BATCH {
@@ -216,7 +224,10 @@ pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<Inp
         )));
     }
     let count = preamble.count.get() as usize;
-    let mut slots = Vec::with_capacity(count);
+    slots.clear();
+    if slots.capacity() < count {
+        slots.reserve(count - slots.capacity());
+    }
 
     for _ in 0..count {
         let (header, after_header) = SlotHeader::ref_from_prefix(rest)
@@ -293,6 +304,15 @@ pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<Inp
         });
     }
 
+    Ok(())
+}
+
+/// Decode an `InputBatch` frame payload (the bytes after the length prefix,
+/// starting with the type byte). Returns the reconstructed `InputSlot`
+/// vector with `connection_id`, `publish_ts`, `recv_ts` reset to defaults.
+pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<InputSlot<E>>> {
+    let mut slots = Vec::new();
+    try_decode_input_batch_into(payload, &mut slots)?;
     Ok(slots)
 }
 

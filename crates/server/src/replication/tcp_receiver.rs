@@ -45,7 +45,7 @@ fn arm_tcp_quickack(fd: RawFd) {
 use super::auth::authenticate_with_primary;
 use super::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
-    encode_ack, encode_handshake, read_frame, try_decode_input_batch,
+    encode_ack, encode_handshake, read_frame, try_decode_input_batch, try_decode_input_batch_into,
 };
 use crate::amortized_timer::AmortizedTimer;
 
@@ -85,6 +85,7 @@ fn replica_stream_uring(
     promote: &AtomicBool,
     async_ack: bool,
     busy_spin: bool,
+    slot_buf: &mut Vec<crate::InputSlot>,
 ) -> SessionExit {
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::AsRawFd;
@@ -443,7 +444,13 @@ fn replica_stream_uring(
         }
 
         // --- Submit SQEs and drain CQEs ---
-        if let Err(e) = ring.submit() {
+        // Skip the syscall when no SQEs are pending — same reasoning as in
+        // the sender: empty io_uring_enter costs ~200 ns of mode-switch
+        // overhead and appeared as several percent of total CPU in profiles.
+        let pending = ring.submission().len();
+        if pending > 0
+            && let Err(e) = ring.submit()
+        {
             tracing::error!(error = %e, "io_uring submit failed");
             return SessionExit::Disconnected;
         }
@@ -544,14 +551,15 @@ fn replica_stream_uring(
                         }
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                         // Fast path: steady-state traffic is ~100% InputBatch
-                        // frames. `try_decode_input_batch` decodes the wire
-                        // format directly into `InputSlot`s — no journal-codec
-                        // round-trip, no per-entry CRC verification.
-                        match try_decode_input_batch(payload) {
-                            Ok(slots) => {
-                                if !slots.is_empty() {
+                        // frames. `try_decode_input_batch_into` decodes the
+                        // wire format directly into `InputSlot`s — no
+                        // journal-codec round-trip, no per-entry CRC, and no
+                        // per-batch Vec allocation (slot_buf is reused).
+                        match try_decode_input_batch_into(payload, slot_buf) {
+                            Ok(()) => {
+                                if !slot_buf.is_empty() {
                                     *received_data = true;
-                                    for slot in slots {
+                                    for slot in slot_buf.drain(..) {
                                         let primary_seq = slot.sequence;
                                         burst_last_target = input_producer.publish(slot);
                                         *accum_end_sequence = primary_seq;
@@ -749,6 +757,9 @@ pub fn run_receiver(
 
     // Reusable buffers — survive across reconnections.
     let mut send_buf = Vec::with_capacity(64);
+    // Grows to the sender's batch size on the first batch, then never
+    // reallocates — even across reconnects.
+    let mut slot_buf: Vec<crate::InputSlot> = Vec::new();
     let mut accum_end_sequence: u64 = 0;
 
     // Live pipeline state — built once on first connect (or after a snapshot
@@ -1102,6 +1113,7 @@ pub fn run_receiver(
                             promote,
                             async_ack,
                             busy_spin,
+                            &mut slot_buf,
                         )
                     })
                     .expect("spawn replica-receiver thread");
