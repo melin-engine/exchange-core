@@ -145,7 +145,7 @@ RUN_PLOTS="${RUN_PLOTS:-0}"
 # writes, relying on the NVMe drive's Power Loss Protection (PLP) capacitors
 # for crash durability. Drops flush latency from ~10-100µs to ~1-5µs.
 # Override with SERVER_EXTRA_ARGS="" on drives without confirmed PLP support.
-SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS----journal-no-fua}"
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS---journal-no-fua}"
 
 # Replica args. Default enables --async-replica-ack (replicas ack as soon as
 # the batch is queued for their local journal, before fsync completes — removes
