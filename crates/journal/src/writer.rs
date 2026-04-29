@@ -108,6 +108,13 @@ pub struct JournalWriter<E: AppEvent> {
     /// builds to keep the hot path cost at exactly zero.
     #[cfg(debug_assertions)]
     last_encoded_seq: u64,
+    /// Byte range of the most-recent user entry within `batch_buf`.
+    /// Captured by `encode_event` BEFORE any auto-checkpoint emission,
+    /// so `last_user_entry_replication_slice` returns the user entry
+    /// only — not a trailing checkpoint that may have been auto-emitted
+    /// in the same call. `(0, 0)` means no user entry encoded yet.
+    last_user_entry_offset: usize,
+    last_user_entry_len: usize,
 }
 
 /// Running BLAKE3 hash chain state for tamper evidence.
@@ -272,6 +279,8 @@ impl<E: AppEvent> JournalWriter<E> {
             hash_chain: None,
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
+            last_user_entry_offset: 0,
+            last_user_entry_len: 0,
         })
     }
 
@@ -344,6 +353,8 @@ impl<E: AppEvent> JournalWriter<E> {
             }),
             #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
+            last_user_entry_offset: 0,
+            last_user_entry_len: 0,
         };
 
         // When resuming mid-segment (events since last checkpoint > 0),
@@ -489,6 +500,11 @@ impl<E: AppEvent> JournalWriter<E> {
         }
 
         self.warn_if_batch_overflow(written);
+        // Record the user entry's position in batch_buf BEFORE the
+        // auto-checkpoint append below, so `last_user_entry_replication_slice`
+        // returns the user entry only — not a trailing checkpoint.
+        self.last_user_entry_offset = self.batch_buf.len();
+        self.last_user_entry_len = written;
         self.batch_buf.extend_from_slice(&self.buffer[..written]);
 
         // Auto-emit a checkpoint if we've hit the interval.
@@ -584,6 +600,7 @@ impl<E: AppEvent> JournalWriter<E> {
         self.file.write_all_at(&self.batch_buf, self.write_pos)?;
         self.write_pos += self.batch_buf.len() as u64;
         self.batch_buf.clear();
+        self.last_user_entry_len = 0;
         Ok(())
     }
 
@@ -609,6 +626,7 @@ impl<E: AppEvent> JournalWriter<E> {
 
         self.write_pos += self.batch_buf.len() as u64;
         self.batch_buf.clear();
+        self.last_user_entry_len = 0;
         Ok(())
     }
 
@@ -620,6 +638,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// the `write_pos` advance.
     pub fn discard_batch_buf(&mut self) {
         self.batch_buf.clear();
+        self.last_user_entry_len = 0;
     }
 
     /// Take the current batch buffer for async writing via io_uring.
@@ -653,6 +672,7 @@ impl<E: AppEvent> JournalWriter<E> {
             .take()
             .unwrap_or_else(|| Vec::with_capacity(BATCH_BUF_CAPACITY));
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
+        self.last_user_entry_len = 0;
 
         Ok(Some(AsyncWriteBatch {
             buf: full_buf,
@@ -761,6 +781,37 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Returns an empty slice if no data is pending.
     pub fn pending_batch_bytes(&self) -> &[u8] {
         &self.batch_buf
+    }
+
+    /// Slice of the most-recent user entry in `batch_buf`, with the
+    /// 2-byte journal magic stripped from the front and the 4-byte CRC
+    /// stripped from the back. Layout matches the replication wire's
+    /// `SlotHeader + payload` exactly:
+    ///
+    /// ```text
+    /// [length:u16] [sequence:u64] [timestamp_ns:u64] [key_hash:u64]
+    /// [request_seq:u64] [event_tag:u8] [payload]
+    /// ```
+    ///
+    /// Lets the journal stage ship the just-encoded entry to replication
+    /// without a second encode pass — `record_slot_for_replication`
+    /// memcpys this slice into the InputBatch buffer.
+    ///
+    /// Must be called immediately after `encode_event`. Returns an empty
+    /// slice if no entry has been encoded yet, or if `flush_batch` /
+    /// `discard_batch_buf` has cleared the buffer since the last encode.
+    pub fn last_user_entry_replication_slice(&self) -> &[u8] {
+        if self.last_user_entry_len == 0 {
+            return &[];
+        }
+        let start = self.last_user_entry_offset;
+        let end = start + self.last_user_entry_len;
+        debug_assert!(
+            end <= self.batch_buf.len(),
+            "last_user_entry_replication_slice: stale offset (batch_buf was cleared)"
+        );
+        // Strip the 2-byte entry magic and 4-byte CRC trailer.
+        &self.batch_buf[start + 2..end - 4]
     }
 
     /// Ensure enough pre-allocated space exists for the next write.

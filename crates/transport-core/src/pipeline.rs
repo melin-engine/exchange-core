@@ -31,7 +31,7 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
 
-use crate::replication_wire::{append_input_slot, finalize_input_batch, init_input_batch};
+use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
 ///
@@ -542,7 +542,8 @@ impl<E: AppEvent> JournalStage<E> {
                                 "journal encode (run_sync, seq {seq}): {e}"
                             )))
                         })?;
-                    Self::record_slot_for_replication(&mut self.repl, slot, seq);
+                    let journal_slice = self.writer.last_user_entry_replication_slice();
+                    Self::record_slot_for_replication(&mut self.repl, journal_slice);
                 }
                 pending += count;
                 if first_write_ts.is_none() {
@@ -622,19 +623,23 @@ impl<E: AppEvent> JournalStage<E> {
 
     /// Append a slot to the in-progress `InputBatch` buffer for replication.
     /// Lazily initializes the buffer header on the first slot of each batch.
-    /// `seq` is the sequence the journal stage allocated for the slot
-    /// (`slot.sequence` is zero on primary-side input).
+    /// Append the just-encoded journal entry's bytes to the InputBatch
+    /// buffer. `journal_slice` comes from
+    /// [`JournalWriter::last_user_entry_replication_slice`] and is laid
+    /// out exactly as the on-the-wire slot — the journal codec's frame
+    /// minus its 2-byte magic and 4-byte CRC. No re-encode on the
+    /// hot path; the hand-off is a single `extend_from_slice`.
     ///
     /// No-op when no replication producers are active (standalone mode).
     #[inline]
-    fn record_slot_for_replication(repl: &mut ReplicationState, slot: &InputSlot<E>, seq: u64) {
+    fn record_slot_for_replication(repl: &mut ReplicationState, journal_slice: &[u8]) {
         if !repl.any_producer() {
             return;
         }
         if repl.input_batch_count == 0 {
             init_input_batch(&mut repl.input_batch_buf);
         }
-        append_input_slot(&mut repl.input_batch_buf, slot, seq);
+        repl.input_batch_buf.extend_from_slice(journal_slice);
         repl.input_batch_count = repl
             .input_batch_count
             .checked_add(1)
@@ -805,7 +810,8 @@ impl<E: AppEvent> JournalStage<E> {
                         tracing::error!(error = %e, "journal encode error on drain");
                         continue;
                     }
-                    Self::record_slot_for_replication(&mut self.repl, slot, seq);
+                    let journal_slice = self.writer.last_user_entry_replication_slice();
+                    Self::record_slot_for_replication(&mut self.repl, journal_slice);
                 }
 
                 // Publish accumulated InputBatch frame to replication rings
@@ -988,7 +994,8 @@ impl<E: AppEvent> JournalStage<E> {
                                 "journal encode (run_uring, seq {seq}): {e}"
                             )))
                         })?;
-                    Self::record_slot_for_replication(&mut self.repl, slot, seq);
+                    let journal_slice = self.writer.last_user_entry_replication_slice();
+                    Self::record_slot_for_replication(&mut self.repl, journal_slice);
                 }
                 pending += count;
                 if first_write_ts.is_none() {
