@@ -4,8 +4,9 @@
 //! without any pipeline or matching engine overhead.
 //!
 //! Usage:
-//!     cargo run --release -p melin-bench --bin journal_writer_bench
+//!     cargo run --release -p melin-bench --bin journal_writer_bench --mode <primary|replica>
 
+use io_uring::IoUring;
 use std::num::NonZero;
 use std::time::Instant;
 
@@ -24,26 +25,32 @@ const WARMUP_EVENTS: usize = 100_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("primary");
     let num_events = args
-        .get(1)
+        .get(2)
         .and_then(|a| a.parse().ok())
         .unwrap_or(DEFAULT_EVENTS);
     let batch_size = args
-        .get(2)
+        .get(3)
         .and_then(|a| a.parse().ok())
         .unwrap_or(DEFAULT_BATCH);
     let warmup = args
-        .get(3)
+        .get(4)
         .and_then(|a| a.parse().ok())
         .unwrap_or(WARMUP_EVENTS);
 
     println!("=== Journal Writer Benchmark ===");
+    println!("Mode: {}", mode);
     println!("Events: {}", num_events);
     println!("Batch size: {}", batch_size);
     println!("Warmup: {}", warmup);
     println!();
 
-    run_journal_writer_bench(num_events, batch_size, warmup);
+    if mode == "replica" {
+        run_replica_mode(num_events, batch_size, warmup);
+    } else {
+        run_journal_writer_bench(num_events, batch_size, warmup);
+    }
 }
 
 fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize) {
@@ -134,6 +141,162 @@ fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize
     println!();
 
     // Verify file size.
+    if let Ok(metadata) = std::fs::metadata(&journal_path) {
+        let size_bytes = metadata.len();
+        println!(
+            "  Journal file size: {} bytes ({:.2} MB)",
+            size_bytes,
+            size_bytes as f64 / 1_048_576.0
+        );
+    }
+}
+
+fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize) {
+    let nz = |v: u64| NonZero::new(v).expect("non-zero");
+
+    // Set up minimal exchange state.
+    let mut exchange = melin_engine::exchange::Exchange::with_capacity();
+    exchange.add_instrument(melin_trading::InstrumentSpec {
+        symbol: melin_trading::Symbol(1),
+        base: melin_trading::CurrencyId(1),
+        quote: melin_trading::CurrencyId(2),
+    });
+    exchange.deposit(
+        melin_trading::AccountId(1),
+        melin_trading::CurrencyId(1),
+        u64::MAX / 2,
+    );
+    exchange.deposit(
+        melin_trading::AccountId(1),
+        melin_trading::CurrencyId(2),
+        u64::MAX / 2,
+    );
+
+    // Use a fixed journal file path.
+    let journal_path = std::path::PathBuf::from("/tmp/journal_writer_bench_replica.journal");
+    let _ = std::fs::remove_file(&journal_path);
+    let mut writer = JournalWriter::create(&journal_path).expect("create journal");
+
+    // Set up io_uring for async writes.
+    let mut io_uring = IoUring::new(256).expect("create io_uring ring");
+
+    println!("Measurement phase...");
+    let start = Instant::now();
+
+    let mut events_written = 0;
+    let num_batches = num_events.div_ceil(batch_size);
+    let mut inflight_count: usize = 0;
+    let inflight_limit = 32;
+
+    for batch_idx in 0..num_batches {
+        let batch_start = batch_idx * batch_size;
+        let batch_end = std::cmp::min(batch_start + batch_size, num_events);
+
+        // Encode batch into writer's buffer.
+        for i in batch_start..batch_end {
+            let order_id = melin_trading::OrderId((i as u64) + 1);
+            let side = if i % 2 == 0 {
+                melin_trading::Side::Buy
+            } else {
+                melin_trading::Side::Sell
+            };
+
+            let event = JournalEvent::App(TradingEvent::SubmitOrder {
+                symbol: melin_trading::Symbol(1),
+                order: melin_trading::Order {
+                    id: order_id,
+                    account: melin_trading::AccountId(1),
+                    side,
+                    order_type: melin_trading::OrderType::Limit {
+                        price: melin_trading::Price(nz(100)),
+                        post_only: false,
+                    },
+                    time_in_force: melin_trading::TimeInForce::GTC,
+                    quantity: melin_trading::Quantity(nz(1)),
+                    stp: melin_trading::SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+            });
+
+            writer
+                .batch_append_with_ts(&event, 0, 0, 0)
+                .expect("batch_append_with_ts");
+            events_written += 1;
+        }
+
+        // Take batch for async write (replica path).
+        match writer.take_batch_for_async_write() {
+            Ok(Some(async_batch)) => {
+                let sqe = io_uring::opcode::Write::new(
+                    io_uring::types::Fd(writer.fd()),
+                    async_batch.buf.as_ptr(),
+                    async_batch.buf.len() as u32,
+                )
+                .offset(async_batch.offset)
+                .rw_flags(libc::RWF_DSYNC)
+                .build()
+                .user_data(1);
+
+                unsafe {
+                    io_uring.submission().push(&sqe).expect("SQ full");
+                }
+                inflight_count += 1;
+            }
+            Ok(None) => {
+                // Empty batch (shouldn't happen with data), just commit.
+                return;
+            }
+            Err(e) => {
+                panic!("take_batch_for_async_write failed: {:?}", e);
+            }
+        }
+
+        // Wait for inflight limit if needed.
+        if inflight_count >= inflight_limit {
+            // Wait for one completion.
+            while let Some(cqe) = io_uring.completion().next() {
+                if cqe.result() < 0 {
+                    panic!("io_uring write failed: {}", -cqe.result());
+                }
+                inflight_count -= 1;
+                if inflight_count == 0 {
+                    break;
+                }
+            }
+        }
+
+        // Submit pending SQEs.
+        if inflight_count > 0 {
+            io_uring.submit().expect("io_uring submit");
+        }
+
+        // Wait for completions.
+        while inflight_count > 0 {
+            while let Some(cqe) = io_uring.completion().next() {
+                if cqe.result() < 0 {
+                    panic!("io_uring write failed: {}", -cqe.result());
+                }
+                inflight_count -= 1;
+            }
+        }
+
+        if events_written % 10000 == 0 {
+            println!("  Written {} events", events_written);
+        }
+    }
+
+    let elapsed_us = start.elapsed().as_micros();
+    let throughput = (num_events as f64 * 1_000_000.0) / elapsed_us as f64;
+
+    println!("  Events: {}", num_events);
+    println!("  Time: {} us", elapsed_us);
+    println!("  Throughput: {:.2} events/sec", throughput);
+    println!(
+        "  Latency: {:.2} us/event",
+        elapsed_us as f64 / num_events as f64
+    );
+    println!();
+
     if let Ok(metadata) = std::fs::metadata(&journal_path) {
         let size_bytes = metadata.len();
         println!(
