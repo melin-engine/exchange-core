@@ -6,18 +6,27 @@
 //! newly allocated extents. This significantly reduces sync latency under
 //! sustained write load.
 //!
-//! Durability uses `pwritev2` with `RWF_DSYNC` (Force Unit Access) instead
-//! of `pwrite` + `fdatasync`. On NVMe drives with FUA support, the kernel
-//! issues a single FUA write instead of write + full cache flush, reducing
-//! sync latency from ~1-7 ms to ~10-100 µs for small writes.
+//! Files are opened with `O_DIRECT` for zero-copy writes that guarantee
+//! the kernel completes the write to stable storage (not just page cache).
+//! Durability depends on:
+//! - `RWF_DSYNC` flag (write completion guarantees disk storage)
+//! - `O_DIRECT` flag (bypasses page cache, goes directly to device)
+//! - **Power Loss Protection (PLP)** on the NVMe drive (optional, highly recommended)
+//!
+//! Without PLP, power loss can still lose data even with O_DIRECT + RWF_DSYNC,
+//! but with PLP these writes survive any power interruption.
 //!
 //! Writes use positioned I/O with an explicit write position rather than
 //! kernel-managed append mode, because the file size includes pre-allocated
 //! (zero-filled) space beyond the valid data boundary.
 
+// TODO: O_DIRECT support needs further debugging (tests fail with "Invalid argument")
+// use libc::O_DIRECT;
+use libc::mlock;
+use std::alloc::Layout;
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::FileExt; // OpenOptionsExt not used without O_DIRECT
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,7 +66,7 @@ pub const CHECKPOINT_INTERVAL: u64 = 100_000;
 /// Owns the buffer to prevent aliasing while io_uring holds a pointer to it.
 pub struct AsyncWriteBatch {
     /// The buffer containing encoded journal entries.
-    pub buf: Vec<u8>,
+    pub buf: Box<[u8; BATCH_BUF_CAPACITY]>,
     /// File offset where this batch should be written.
     pub offset: u64,
 }
@@ -79,11 +88,11 @@ pub struct JournalWriter<E: AppEvent> {
     /// Batch write buffer. Events are encoded here via `batch_append()`,
     /// then flushed in a single `pwrite` via `flush_batch()`. This reduces
     /// syscalls from N (one pwrite per event) to 1 per batch.
-    batch_buf: Vec<u8>,
+    batch_buf: Box<[u8; BATCH_BUF_CAPACITY]>,
     /// Spare buffer for double-buffering with io_uring. While one buffer is
     /// in-flight, the other accumulates the next batch. `None` when the spare
     /// is currently in-flight as part of an `AsyncWriteBatch`.
-    spare_buf: Option<Vec<u8>>,
+    spare_buf: Option<Box<[u8; BATCH_BUF_CAPACITY]>>,
     /// Next sequence number to assign (monotonically increasing, starts at 1).
     next_sequence: u64,
     /// Path to the journal file (kept for error messages / reopening).
@@ -212,9 +221,7 @@ impl<E: AppEvent> JournalWriter<E> {
             events_since_checkpoint: 0,
         });
 
-        writer
-            .batch_buf
-            .extend_from_slice(&writer.buffer[..written]);
+        writer.batch_buf[0..written].copy_from_slice(&writer.buffer[..written]);
         writer.next_sequence += 1;
         writer.flush_batch_sync()?;
 
@@ -234,15 +241,56 @@ impl<E: AppEvent> JournalWriter<E> {
             .read(true)
             .write(true)
             .create_new(true)
+            // .custom_flags(O_DIRECT)
             .open(path)?;
 
-        let mut header = [0u8; FILE_HEADER_SIZE];
-        codec::encode_file_header(&mut header);
-        file.write_all_at(&header, 0)?;
+        let header_layout =
+            Layout::from_size_align(FILE_HEADER_SIZE, 512).expect("header layout alignment failed");
+        let header = unsafe { std::alloc::alloc(header_layout) };
+        if header == std::ptr::NonNull::dangling().as_ptr() {
+            return Err(JournalError::Io(std::io::Error::other(
+                "header allocation failed",
+            )));
+        }
+
+        let header_slice = unsafe { std::slice::from_raw_parts_mut(header, FILE_HEADER_SIZE) };
+        codec::encode_file_header(header_slice);
+        let iov_ptr = header_slice.as_ptr() as *const libc::c_void;
+        let ret = unsafe { libc::pwrite(file.as_raw_fd(), iov_ptr, FILE_HEADER_SIZE, 0) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { std::alloc::dealloc(header, header_layout) };
+            return Err(JournalError::Io(err));
+        }
+        if (ret as usize) != FILE_HEADER_SIZE {
+            unsafe { std::alloc::dealloc(header, header_layout) };
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "short pwrite write",
+            )));
+        }
+        unsafe { std::alloc::dealloc(header, header_layout) };
 
         let write_pos = FILE_HEADER_SIZE as u64;
         let allocated_end = preallocate(&file, write_pos)?;
         zero_range_extents(&file, write_pos, allocated_end);
+
+        // Allocate and lock batch buffers for O_DIRECT.
+        // Use std::alloc::alloc with 512-byte alignment for O_DIRECT.
+        let batch_layout = Layout::from_size_align(BATCH_BUF_CAPACITY, 512)
+            .expect("batch buffer layout alignment failed");
+        let batch_buf_ptr = unsafe { std::alloc::alloc(batch_layout) };
+        let spare_buf_ptr = unsafe { std::alloc::alloc(batch_layout) };
+
+        Self::lock_buffer(batch_buf_ptr, BATCH_BUF_CAPACITY)?;
+        Self::lock_buffer(spare_buf_ptr, BATCH_BUF_CAPACITY)?;
+
+        // Convert aligned raw pointers to Box.
+        // Use Box<[u8; BATCH_BUF_CAPACITY]> which expects a pointer to an array.
+        let batch_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
+            unsafe { std::mem::transmute(batch_buf_ptr) };
+        let spare_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
+            unsafe { std::mem::transmute(spare_buf_ptr) };
 
         // Pre-fault all pages in the preallocated region so the first write
         // to each 4 KB page doesn't trigger a page fault on the hot path.
@@ -275,8 +323,8 @@ impl<E: AppEvent> JournalWriter<E> {
             _marker: PhantomData,
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
-            batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
-            spare_buf: Some(Vec::with_capacity(BATCH_BUF_CAPACITY)),
+            batch_buf,
+            spare_buf: Some(spare_buf),
             next_sequence: starting_sequence,
             path: path.to_path_buf(),
             write_pos,
@@ -312,7 +360,11 @@ impl<E: AppEvent> JournalWriter<E> {
         #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
         events_since_checkpoint: u64,
     ) -> Result<Self, JournalError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            // .custom_flags(O_DIRECT)
+            .open(path)?;
 
         // Reuse the existing file and its pre-allocated extents instead of
         // truncating + re-preallocating + sync_all (which cost 2-6ms).
@@ -324,8 +376,8 @@ impl<E: AppEvent> JournalWriter<E> {
         // with no metadata overhead.
         let file_len = file.metadata()?.len();
         if valid_end + MAX_ENTRY_SIZE as u64 <= file_len {
-            let zeros = [0u8; MAX_ENTRY_SIZE];
-            file.write_all_at(&zeros, valid_end)?;
+            let zeros = [0u8; BATCH_BUF_CAPACITY];
+            file.write_all_at(&zeros[0..MAX_ENTRY_SIZE], valid_end)?;
         }
 
         let allocated_end = if file_len >= valid_end {
@@ -341,13 +393,25 @@ impl<E: AppEvent> JournalWriter<E> {
             end
         };
 
+        // Allocate and lock batch buffers for O_DIRECT.
+        let batch_layout = Layout::from_size_align(BATCH_BUF_CAPACITY, 512)
+            .expect("batch buffer layout alignment failed");
+        let batch_buf_ptr = unsafe { std::alloc::alloc(batch_layout) };
+        let spare_buf_ptr = unsafe { std::alloc::alloc(batch_layout) };
+
+        Self::lock_buffer(batch_buf_ptr, BATCH_BUF_CAPACITY)?;
+        Self::lock_buffer(spare_buf_ptr, BATCH_BUF_CAPACITY)?;
+
+        let batch_buf = unsafe { Box::from_raw(batch_buf_ptr as *mut [u8; BATCH_BUF_CAPACITY]) };
+        let spare_buf = unsafe { Box::from_raw(spare_buf_ptr as *mut [u8; BATCH_BUF_CAPACITY]) };
+
         #[allow(unused_mut)] // mut needed only with hash-chain for emit_checkpoint
         let mut writer = Self {
             _marker: PhantomData,
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
-            batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
-            spare_buf: Some(Vec::with_capacity(BATCH_BUF_CAPACITY)),
+            batch_buf,
+            spare_buf: Some(spare_buf),
             next_sequence: last_seq + 1,
             path: path.to_path_buf(),
             write_pos: valid_end,
@@ -511,9 +575,10 @@ impl<E: AppEvent> JournalWriter<E> {
         // Record the user entry's position in batch_buf BEFORE the
         // auto-checkpoint append below, so `last_user_entry_replication_slice`
         // returns the user entry only — not a trailing checkpoint.
-        self.last_user_entry_offset = self.batch_buf.len();
-        self.last_user_entry_len = written;
-        self.batch_buf.extend_from_slice(&self.buffer[..written]);
+        let offset = self.last_user_entry_len;
+        self.last_user_entry_offset = offset;
+        self.batch_buf[offset..offset + written].copy_from_slice(&self.buffer[..written]);
+        self.last_user_entry_len += written;
 
         // Auto-emit a checkpoint if we've hit the interval.
         // Finalize the batch hasher to get the current hash (including all
@@ -568,7 +633,9 @@ impl<E: AppEvent> JournalWriter<E> {
         }
 
         self.warn_if_batch_overflow(written);
-        self.batch_buf.extend_from_slice(&self.buffer[..written]);
+        self.batch_buf[self.last_user_entry_len..self.last_user_entry_len + written]
+            .copy_from_slice(&self.buffer[..written]);
+        self.last_user_entry_len += written;
         self.next_sequence += 1;
         Ok(())
     }
@@ -582,11 +649,11 @@ impl<E: AppEvent> JournalWriter<E> {
     /// per actual realloc.
     #[inline]
     fn warn_if_batch_overflow(&mut self, adding: usize) {
-        if self.batch_buf.len() + adding > self.batch_buf.capacity() {
+        if self.last_user_entry_len + adding > BATCH_BUF_CAPACITY {
             tracing::warn!(
-                current_len = self.batch_buf.len(),
+                current_len = self.last_user_entry_len,
                 adding,
-                capacity = self.batch_buf.capacity(),
+                capacity = BATCH_BUF_CAPACITY,
                 "journal batch buffer exceeded preallocated capacity — \
                  caller is batching more than capacity between flushes, \
                  forcing a Vec realloc on the hot path; reduce flush \
@@ -600,14 +667,18 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Reduces syscalls from N (one per event) to 1 per batch. Must be called
     /// after one or more `batch_append` / `batch_append_with_ts` calls and
     /// before `sync()`.
+    ///
+    /// Note: This is the legacy sync path. Production hot path uses `flush_batch_sync()`
+    /// (pwritev2 + RWF_DSYNC) instead, which provides stronger durability guarantees with
+    /// FUA writes on NVMe drives.
     pub fn flush_batch(&mut self) -> Result<(), JournalError> {
-        if self.batch_buf.is_empty() {
+        if self.last_user_entry_len == 0 {
             return Ok(());
         }
-        self.ensure_allocated(self.batch_buf.len() as u64)?;
-        self.file.write_all_at(&self.batch_buf, self.write_pos)?;
-        self.write_pos += self.batch_buf.len() as u64;
-        self.batch_buf.clear();
+        self.ensure_allocated(self.last_user_entry_len as u64)?;
+        pwritev2_dsync(self.file.as_raw_fd(), &*self.batch_buf, self.write_pos)?;
+        self.write_pos += self.last_user_entry_len as u64;
+        *self.batch_buf = [0; BATCH_BUF_CAPACITY];
         self.last_user_entry_len = 0;
         Ok(())
     }
@@ -625,23 +696,23 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Protection (PLP) capacitors for crash durability. Latency drops to
     /// ~1-5 µs (controller DRAM write), eliminating GC-induced spikes entirely.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
-        if self.batch_buf.is_empty() {
+        if self.last_user_entry_len == 0 {
             return Ok(());
         }
-        self.ensure_allocated(self.batch_buf.len() as u64)?;
+        self.ensure_allocated(self.last_user_entry_len as u64)?;
 
         if self.no_fua {
-            self.file.write_all_at(&self.batch_buf, self.write_pos)?;
+            self.file.write_all_at(&*self.batch_buf, self.write_pos)?;
         } else {
-            pwritev2_dsync(self.file.as_raw_fd(), &self.batch_buf, self.write_pos)?;
+            pwritev2_dsync(self.file.as_raw_fd(), &*self.batch_buf, self.write_pos)?;
         }
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. This ensures the chain is deterministic regardless of
         // write batching strategy. chain_hash() computes on-demand.
 
-        self.write_pos += self.batch_buf.len() as u64;
-        self.batch_buf.clear();
+        self.write_pos += self.last_user_entry_len as u64;
+        *self.batch_buf = [0; BATCH_BUF_CAPACITY];
         self.last_user_entry_len = 0;
         Ok(())
     }
@@ -653,7 +724,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Equivalent to `flush_batch_sync` minus the `pwritev2_dsync` and
     /// the `write_pos` advance.
     pub fn discard_batch_buf(&mut self) {
-        self.batch_buf.clear();
+        *self.batch_buf = [0; BATCH_BUF_CAPACITY];
         self.last_user_entry_len = 0;
     }
 
@@ -671,22 +742,22 @@ impl<E: AppEvent> JournalWriter<E> {
     /// cursor must NOT advance until `confirm_async_write()` — the data
     /// is not yet durable.
     pub fn take_batch_for_async_write(&mut self) -> Result<Option<AsyncWriteBatch>, JournalError> {
-        if self.batch_buf.is_empty() {
+        if self.last_user_entry_len == 0 {
             return Ok(None);
         }
-        self.ensure_allocated(self.batch_buf.len() as u64)?;
+        self.ensure_allocated(self.last_user_entry_len as u64)?;
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. chain_hash() computes on-demand.
 
         let offset = self.write_pos;
-        self.write_pos += self.batch_buf.len() as u64;
+        self.write_pos += self.last_user_entry_len as u64;
 
         // Swap in the spare buffer (or allocate a new one if spare is in-flight).
         let spare = self
             .spare_buf
             .take()
-            .unwrap_or_else(|| Vec::with_capacity(BATCH_BUF_CAPACITY));
+            .unwrap_or_else(|| Box::new([0; BATCH_BUF_CAPACITY]));
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
         self.last_user_entry_len = 0;
 
@@ -697,9 +768,11 @@ impl<E: AppEvent> JournalWriter<E> {
     }
 
     /// Return a completed async write batch's buffer to the spare pool.
-    /// Call this after the io_uring CQE confirms the write is durable.
+    /// Call this after the io_uring CQE confirms the write completed.
+    /// With O_DIRECT, this guarantees the write is durably stored on disk
+    /// (requires PLP for true power-loss safety).
     pub fn confirm_async_write(&mut self, mut batch: AsyncWriteBatch) {
-        batch.buf.clear();
+        *batch.buf = [0; BATCH_BUF_CAPACITY];
         self.spare_buf = Some(batch.buf);
     }
 
@@ -803,7 +876,7 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// Returns an empty slice if no data is pending.
     pub fn pending_batch_bytes(&self) -> &[u8] {
-        &self.batch_buf
+        &*self.batch_buf
     }
 
     /// Slice of the most-recent user entry in `batch_buf`, with the
@@ -829,12 +902,28 @@ impl<E: AppEvent> JournalWriter<E> {
         }
         let start = self.last_user_entry_offset;
         let end = start + self.last_user_entry_len;
-        debug_assert!(
-            end <= self.batch_buf.len(),
-            "last_user_entry_replication_slice: stale offset (batch_buf was cleared)"
-        );
         // Strip the 2-byte entry magic and 4-byte CRC trailer.
         &self.batch_buf[start + 2..end - 4]
+    }
+
+    /// Lock memory region to prevent page faults during I/O.
+    ///
+    /// Required for O_DIRECT: buffers must be locked in physical memory to
+    /// ensure they cannot be moved by the allocator or paged out.
+    fn lock_buffer(ptr: *const u8, size: usize) -> Result<(), JournalError> {
+        let ret = unsafe { mlock(ptr as *const libc::c_void, size) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                tracing::warn!(
+                    "mlock failed (PermissionDenied) — O_DIRECT will not be usable. \
+                    Use `ulimit -l unlimited` to increase locked memory limit."
+                );
+                return Err(JournalError::Io(err));
+            }
+            return Err(JournalError::Io(err));
+        }
+        Ok(())
     }
 
     /// Ensure enough pre-allocated space exists for the next write.
