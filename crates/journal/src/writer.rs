@@ -270,10 +270,15 @@ impl<E: AppEvent> JournalWriter<E> {
 
     /// Shared file setup: header, pre-allocation, sync.
     fn create_bare(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
-        // Open without O_DIRECT; the FUA path (default) uses pwritev2+RWF_DSYNC
-        // which already guarantees persistence without bypassing the page cache.
-        // O_DIRECT is activated later by set_no_fua(true) for PLP drives.
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        // Open with O_RDWR: O_DIRECT is activated later by set_no_fua(true) for
+        // PLP drives. Read permission is also required for prefault_pages, which
+        // uses mmap(MAP_SHARED) to pre-fault the page cache — mmap(PROT_WRITE,
+        // MAP_SHARED) on a write-only fd fails with EACCES.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
 
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
         codec::encode_file_header(&mut header_buf);
@@ -290,7 +295,7 @@ impl<E: AppEvent> JournalWriter<E> {
         // MADV_POPULATE_WRITE forces the kernel to fault all pages now
         // (startup cost ~10-30ms for 256 MiB) rather than lazily during
         // hot-path writes.
-        prefault_pages(&file, allocated_end);
+        prefault_pages(&file, FILE_HEADER_SIZE as u64, allocated_end);
 
         // Allocate batch buffers with 512-byte alignment so they remain valid
         // for O_DIRECT if set_no_fua(true) is called later. Allocated once at
@@ -345,9 +350,10 @@ impl<E: AppEvent> JournalWriter<E> {
         #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
         events_since_checkpoint: u64,
     ) -> Result<Self, JournalError> {
-        // Open without O_DIRECT — same rationale as create_bare. If set_no_fua(true)
-        // is called, enable_o_direct() will reopen with O_DIRECT + reconstruct tail state.
-        let file = OpenOptions::new().write(true).open(path)?;
+        // Open with O_RDWR — same rationale as create_bare. Read permission is
+        // required for prefault_pages (mmap MAP_SHARED) and for enable_o_direct
+        // which reads the partial tail sector via pread.
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         let file_len = file.metadata()?.len();
         let allocated_end = if file_len >= valid_end {
@@ -367,11 +373,11 @@ impl<E: AppEvent> JournalWriter<E> {
             )?;
         }
 
-        // Pre-fault pages near valid_end. The journal may have grown beyond
-        // what's in the OS page cache (e.g. after a long run with page
-        // eviction). Faulting the region around the write cursor at startup
-        // prevents io_uring page-cache misses on the hot path.
-        prefault_pages(&file, allocated_end);
+        // Pre-fault only the new prealloc chunk near the write cursor, not the
+        // entire (potentially multi-GB) file. Old pages are either still in
+        // the page cache or irrelevant — we only care about the region that
+        // will receive new writes.
+        prefault_pages(&file, valid_end, allocated_end);
 
         let (batch_buf, spare_buf) = Self::alloc_batch_bufs();
         let tail_sector = Self::alloc_tail_sector();
@@ -1186,39 +1192,52 @@ impl<E: AppEvent> JournalWriter<E> {
     }
 }
 
-/// Pre-fault all pages in a file region into the page cache using
-/// `mmap` + `MADV_POPULATE_WRITE`. This prevents page-cache misses during
+/// Pre-fault pages in `[start, end)` into the page cache using
+/// `mmap` + `MADV_POPULATE_READ`. This prevents page-cache misses during
 /// io_uring writes, which would otherwise be handled by io-wq workers on the
 /// IRQ core and can stall for hundreds of milliseconds under TCP load.
+///
+/// `start` is aligned down to a 4 KiB page boundary (mmap offset requirement).
+/// `end` is typically `allocated_end` — the pre-allocated chunk boundary.
+///
+/// Uses `PROT_READ` (not `PROT_WRITE`) so pages land in the page cache as clean.
+/// Clean pages don't appear in the sync_all() writeback after `create_bare` —
+/// only data that io_uring actually writes (and thereby dirties) needs flushing.
+/// `MADV_POPULATE_WRITE` would dirty all 256 MiB preallocated pages immediately,
+/// forcing `sync_all()` to flush them even though nothing was written yet.
 ///
 /// Best-effort: silently skips if `mmap` fails (e.g. insufficient VA space).
 /// Not called on the O_DIRECT path — O_DIRECT bypasses the page cache.
 #[cfg(target_os = "linux")]
-fn prefault_pages(file: &File, file_size: u64) {
-    if file_size == 0 {
+fn prefault_pages(file: &File, start: u64, end: u64) {
+    if end <= start {
         return;
     }
+    // mmap requires page-aligned offsets.
+    let aligned_start = start & !4095;
+    let size = end - aligned_start;
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            file_size as libc::size_t,
-            libc::PROT_WRITE,
+            size as libc::size_t,
+            libc::PROT_READ,
             libc::MAP_SHARED,
             file.as_raw_fd(),
-            0,
+            aligned_start as libc::off_t,
         )
     };
     if ptr == libc::MAP_FAILED {
         return;
     }
-    // MADV_POPULATE_WRITE (23): pre-fault pages for write access now,
-    // paying the cost once at startup rather than on the io_uring hot path.
-    unsafe { libc::madvise(ptr, file_size as libc::size_t, 23) };
-    unsafe { libc::munmap(ptr, file_size as libc::size_t) };
+    // MADV_POPULATE_READ (22): fault all pages as clean reads now.
+    // Pages land in the page cache; subsequent io_uring writes find them
+    // in cache without triggering a fault → no io-wq involvement on core 0.
+    unsafe { libc::madvise(ptr, size as libc::size_t, 22) };
+    unsafe { libc::munmap(ptr, size as libc::size_t) };
 }
 
 #[cfg(not(target_os = "linux"))]
-fn prefault_pages(_file: &File, _file_size: u64) {}
+fn prefault_pages(_file: &File, _start: u64, _end: u64) {}
 
 /// Pre-allocate disk blocks from the current position forward by one chunk.
 ///
