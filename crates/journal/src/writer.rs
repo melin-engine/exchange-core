@@ -822,10 +822,16 @@ impl<E: AppEvent> JournalWriter<E> {
         // Swap in the spare: full_buf = source (batch data), self.batch_buf =
         // destination (complete sectors). Using separate allocations avoids
         // aliasing between the source read and sector output writes.
-        let spare = self
-            .spare_buf
-            .take()
-            .unwrap_or_else(|| Box::new([0; BATCH_BUF_CAPACITY]));
+        let spare = self.spare_buf.take().unwrap_or_else(|| {
+            // Fallback: both buffers in-flight simultaneously (shouldn't happen
+            // in normal operation — the pipeline blocks in wait_for_cqe before
+            // the second take). Allocate with 512-byte alignment so the buffer
+            // is valid for O_DIRECT writes if it does reach io_uring.
+            let layout = Layout::from_size_align(BATCH_BUF_CAPACITY, 512)
+                .expect("batch buffer layout alignment failed");
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            unsafe { std::mem::transmute::<*mut u8, Box<[u8; BATCH_BUF_CAPACITY]>>(ptr) }
+        });
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
 
         // Drain full_buf into tail_sector, collecting complete sectors into
