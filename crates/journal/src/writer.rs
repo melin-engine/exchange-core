@@ -902,21 +902,10 @@ impl<E: AppEvent> JournalWriter<E> {
             .open(&self.path)?;
 
         if tail_len > 0 {
-            let ret = unsafe {
-                libc::pread(
-                    new_file.as_raw_fd(),
-                    self.tail_sector.as_mut_ptr() as *mut libc::c_void,
-                    SECTOR_SIZE,
-                    sector_base as libc::off_t,
-                )
-            };
-            if ret < 0 {
-                return Err(JournalError::Io(std::io::Error::last_os_error()));
-            }
+            new_file.read_at(self.tail_sector.as_mut(), sector_base)?;
             // Zero bytes past valid data so trailing garbage isn't visible.
-            let valid = (ret as usize).min(tail_len);
-            self.tail_sector[valid..].fill(0);
-            self.tail_sector_len = valid;
+            self.tail_sector[tail_len..].fill(0);
+            self.tail_sector_len = tail_len;
         } else {
             self.tail_sector.fill(0);
             self.tail_sector_len = 0;
@@ -1302,7 +1291,7 @@ fn zero_range_extents(file: &File, start: u64, end: u64) {
     };
     if ret < 0 {
         tracing::warn!(
-            errno = unsafe { *libc::__errno_location() },
+            error = %std::io::Error::last_os_error(),
             start,
             end,
             "FALLOC_FL_ZERO_RANGE failed — expect periodic 1-2ms tail latency spikes"
