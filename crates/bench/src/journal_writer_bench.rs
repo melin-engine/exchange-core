@@ -202,6 +202,7 @@ fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize, no_fua
 
     // Set up io_uring for async writes.
     let mut io_uring = IoUring::new(256).expect("create io_uring ring");
+    let rw_flags = writer.io_uring_rw_flags();
 
     println!("Measurement phase...");
     let start = Instant::now();
@@ -253,10 +254,10 @@ fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize, no_fua
                 let sqe = io_uring::opcode::Write::new(
                     io_uring::types::Fd(writer.fd()),
                     async_batch.buf.as_ptr(),
-                    async_batch.buf.len() as u32,
+                    async_batch.len as u32,
                 )
                 .offset(async_batch.offset)
-                .rw_flags(libc::RWF_DSYNC)
+                .rw_flags(rw_flags)
                 .build()
                 .user_data(1);
 
