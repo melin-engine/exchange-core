@@ -902,7 +902,15 @@ impl<E: AppEvent> JournalWriter<E> {
             .open(&self.path)?;
 
         if tail_len > 0 {
-            new_file.read_at(self.tail_sector.as_mut(), sector_base)?;
+            let n = new_file.read_at(self.tail_sector.as_mut(), sector_base)?;
+            if n < tail_len {
+                return Err(JournalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "partial sector read at {sector_base}: got {n} bytes, expected at least {tail_len}"
+                    ),
+                )));
+            }
             // Zero bytes past valid data so trailing garbage isn't visible.
             self.tail_sector[tail_len..].fill(0);
             self.tail_sector_len = tail_len;
