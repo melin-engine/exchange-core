@@ -843,6 +843,15 @@ impl<E: AppEvent> JournalWriter<E> {
         self.file.as_raw_fd()
     }
 
+    /// `rw_flags` value to use for io_uring `Write` operations on this journal.
+    ///
+    /// Returns `RWF_DSYNC` on the default FUA path, or `0` on the PLP path
+    /// where O_DIRECT already guarantees the write reaches device DRAM and
+    /// the PLP capacitors handle crash durability — no FUA round-trip needed.
+    pub fn io_uring_rw_flags(&self) -> i32 {
+        if self.no_fua { 0 } else { libc::RWF_DSYNC }
+    }
+
     /// Enable PLP mode. When `true`, flushes use plain `pwrite` with `O_DIRECT`
     /// instead of `pwritev2+RWF_DSYNC`. Only safe on drives with Power Loss
     /// Protection (PLP) capacitors — see `--journal-no-fua`.

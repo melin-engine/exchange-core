@@ -861,6 +861,7 @@ impl<E: AppEvent> JournalStage<E> {
         // lookup + atomic refcount) on every SQE. Use types::Fixed(0) in
         // SQEs instead of types::Fd(raw_fd).
         let raw_fd = self.writer.fd();
+        let rw_flags = self.writer.io_uring_rw_flags();
         ring.submitter().register_files(&[raw_fd]).map_err(|e| {
             JournalError::Io(std::io::Error::other(format!(
                 "io_uring register_files: {e}"
@@ -1074,7 +1075,7 @@ impl<E: AppEvent> JournalStage<E> {
                                 async_batch.len as u32,
                             )
                             .offset(async_batch.offset)
-                            .rw_flags(libc::RWF_DSYNC)
+                            .rw_flags(rw_flags)
                             .build()
                             .user_data(1);
 
