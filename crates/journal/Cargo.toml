@@ -27,7 +27,7 @@ tracing = { workspace = true }
 # Typed views over raw byte buffers for the on-disk frame layout —
 # replaces field-by-field le::put / le::get chains with single struct
 # read/writes. derive feature for `FromBytes` / `IntoBytes`.
-zerocopy = { version = "0.8", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 melin-app = { path = "../app" }
 melin-disruptor = { path = "../disruptor" }
 

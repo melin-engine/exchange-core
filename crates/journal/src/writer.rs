@@ -35,7 +35,6 @@
 //! (zero-filled) space beyond the valid data boundary.
 
 use libc::mlock;
-use std::alloc::Layout;
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
 use std::os::unix::fs::FileExt;
@@ -82,7 +81,7 @@ pub const CHECKPOINT_INTERVAL: u64 = 100_000;
 /// Owns the buffer to prevent aliasing while io_uring holds a pointer to it.
 pub struct AsyncWriteBatch {
     /// The buffer containing encoded journal entries.
-    pub buf: Box<[u8; BATCH_BUF_CAPACITY]>,
+    pub buf: Box<AlignedBuf<BATCH_BUF_CAPACITY>>,
     /// Number of valid bytes in `buf`. Only `buf[..len]` should be written.
     pub len: usize,
     /// File offset where this batch should be written.
@@ -106,11 +105,11 @@ pub struct JournalWriter<E: AppEvent> {
     /// Batch write buffer. Events are encoded here via `batch_append()`,
     /// then flushed in a single `pwrite` via `flush_batch()`. This reduces
     /// syscalls from N (one pwrite per event) to 1 per batch.
-    batch_buf: Box<[u8; BATCH_BUF_CAPACITY]>,
+    batch_buf: Box<AlignedBuf<BATCH_BUF_CAPACITY>>,
     /// Spare buffer for double-buffering with io_uring. While one buffer is
     /// in-flight, the other accumulates the next batch. `None` when the spare
     /// is currently in-flight as part of an `AsyncWriteBatch`.
-    spare_buf: Option<Box<[u8; BATCH_BUF_CAPACITY]>>,
+    spare_buf: Option<Box<AlignedBuf<BATCH_BUF_CAPACITY>>>,
     /// Next sequence number to assign (monotonically increasing, starts at 1).
     next_sequence: u64,
     /// Path to the journal file (kept for error messages / reopening).
@@ -150,7 +149,7 @@ pub struct JournalWriter<E: AppEvent> {
     /// One-sector tail buffer for O_DIRECT (PLP path only). Holds the current
     /// partially-filled sector in memory. Written (and rewritten in-place) on
     /// every flush; `write_pos` advances only when this sector is full.
-    tail_sector: Box<[u8; SECTOR_SIZE]>,
+    tail_sector: Box<AlignedBuf<SECTOR_SIZE>>,
     /// Bytes of real data in `tail_sector`. Always < SECTOR_SIZE.
     tail_sector_len: usize,
     /// When true, flushes use plain `pwrite` instead of `pwritev2+RWF_DSYNC`.
@@ -296,10 +295,10 @@ impl<E: AppEvent> JournalWriter<E> {
         // Encode the file header into the sector-aligned tail_sector scratch
         // buffer and write it as one O_DIRECT pwrite. Reset the buffer
         // afterwards — at construction the partial tail is empty.
-        codec::encode_file_header(tail_sector.as_mut());
+        codec::encode_file_header(&mut tail_sector[..]);
         pwrite_aligned_sector(
             file.as_raw_fd(),
-            tail_sector.as_ref(),
+            &tail_sector[..],
             0,
             /*no_fua=*/ false,
         )?;
@@ -393,7 +392,7 @@ impl<E: AppEvent> JournalWriter<E> {
         let sector_base = valid_end & !(SECTOR_SIZE as u64 - 1);
         let tail_len = (valid_end - sector_base) as usize;
         if tail_len > 0 {
-            let n = file.read_at(tail_sector.as_mut(), sector_base)?;
+            let n = file.read_at(&mut tail_sector[..], sector_base)?;
             if n < tail_len {
                 return Err(JournalError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -405,7 +404,7 @@ impl<E: AppEvent> JournalWriter<E> {
             tail_sector[tail_len..].fill(0);
             pwrite_aligned_sector(
                 file.as_raw_fd(),
-                tail_sector.as_ref(),
+                &tail_sector[..],
                 sector_base,
                 /*no_fua=*/ false,
             )?;
@@ -715,7 +714,7 @@ impl<E: AppEvent> JournalWriter<E> {
         let batch_len = self.batch_len;
 
         // Swap in the spare as output buffer; full_buf holds the encoded data.
-        let spare = self.spare_buf.take().unwrap_or_else(Self::alloc_one_buf);
+        let spare = self.spare_buf.take().unwrap_or_else(alloc_aligned);
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
 
         let mut data_cursor = 0usize;
@@ -731,7 +730,7 @@ impl<E: AppEvent> JournalWriter<E> {
 
             if self.tail_sector_len == SECTOR_SIZE {
                 self.batch_buf[output_cursor..output_cursor + SECTOR_SIZE]
-                    .copy_from_slice(self.tail_sector.as_ref());
+                    .copy_from_slice(&self.tail_sector[..]);
                 output_cursor += SECTOR_SIZE;
                 self.write_pos += SECTOR_SIZE as u64;
                 self.tail_sector.fill(0);
@@ -992,7 +991,7 @@ impl<E: AppEvent> JournalWriter<E> {
     fn pwrite_sector(&self, offset: u64) -> Result<(), JournalError> {
         pwrite_aligned_sector(
             self.file.as_raw_fd(),
-            self.tail_sector.as_ref(),
+            &self.tail_sector[..],
             offset,
             self.no_fua,
         )
@@ -1054,26 +1053,57 @@ impl<E: AppEvent> JournalWriter<E> {
         Ok(())
     }
 
-    /// Allocate two 512-byte-aligned batch buffers (batch_buf + spare_buf).
-    fn alloc_batch_bufs() -> (Box<[u8; BATCH_BUF_CAPACITY]>, Box<[u8; BATCH_BUF_CAPACITY]>) {
-        (Self::alloc_one_buf(), Self::alloc_one_buf())
+    /// Allocate two zeroed sector-aligned batch buffers (batch_buf + spare_buf).
+    fn alloc_batch_bufs() -> (
+        Box<AlignedBuf<BATCH_BUF_CAPACITY>>,
+        Box<AlignedBuf<BATCH_BUF_CAPACITY>>,
+    ) {
+        (alloc_aligned(), alloc_aligned())
     }
 
-    /// Allocate one 512-byte-aligned, zeroed batch buffer.
-    fn alloc_one_buf() -> Box<[u8; BATCH_BUF_CAPACITY]> {
-        let layout = Layout::from_size_align(BATCH_BUF_CAPACITY, 512)
-            .expect("batch buffer layout alignment failed");
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        unsafe { std::mem::transmute(ptr) }
+    /// Allocate one zeroed sector-aligned tail sector buffer.
+    fn alloc_tail_sector() -> Box<AlignedBuf<SECTOR_SIZE>> {
+        alloc_aligned()
     }
+}
 
-    /// Allocate one 512-byte-aligned, zeroed tail sector buffer.
-    fn alloc_tail_sector() -> Box<[u8; SECTOR_SIZE]> {
-        let layout = Layout::from_size_align(SECTOR_SIZE, SECTOR_SIZE)
-            .expect("tail sector layout alignment failed");
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        unsafe { std::mem::transmute(ptr) }
+/// 512-byte-aligned byte buffer used for O_DIRECT I/O.
+///
+/// O_DIRECT requires the buffer pointer, write length, and file offset to
+/// all be sector-aligned (512 B). The `repr(align(512))` attribute makes
+/// the *type* carry that alignment, so the allocator returns a sector-
+/// aligned address and the matching alignment is used on dealloc — no
+/// manual `Layout` dance, no allocator/deallocator layout mismatch.
+///
+/// `Deref` / `DerefMut` to `[u8; N]` so call sites see a plain byte array.
+/// (Slicing — `&buf[..]` — gets you a `&[u8]` for functions that take one.)
+#[derive(zerocopy::FromZeros, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C, align(512))]
+pub struct AlignedBuf<const N: usize>([u8; N]);
+
+impl<const N: usize> std::ops::Deref for AlignedBuf<N> {
+    type Target = [u8; N];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
+}
+
+impl<const N: usize> std::ops::DerefMut for AlignedBuf<N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Allocate a zeroed `AlignedBuf<N>` directly on the heap.
+///
+/// `FromZeros::new_box_zeroed` performs the allocation in-place — no 512 KB
+/// stack copy that `Box::new(AlignedBuf([0; N]))` would otherwise produce
+/// in debug builds.
+fn alloc_aligned<const N: usize>() -> Box<AlignedBuf<N>> {
+    use zerocopy::FromZeros;
+    AlignedBuf::<N>::new_box_zeroed().expect("aligned heap allocation for journal buffer")
 }
 
 /// Pre-fault pages in `[start, end)` into the page cache using
@@ -1187,7 +1217,7 @@ fn zero_range_extents(file: &File, start: u64, end: u64) {
 /// Write one sector-aligned buffer at a sector-aligned offset.
 ///
 /// Caller must guarantee that `data.len() == SECTOR_SIZE`, the buffer is
-/// 512-byte aligned (allocated via `alloc_one_buf` / `alloc_tail_sector`),
+/// 512-byte aligned (the buffers used here come from `alloc_aligned`),
 /// and `offset % SECTOR_SIZE == 0` — required by O_DIRECT.
 ///
 /// `no_fua = false`: `pwritev2 + RWF_DSYNC` — kernel issues one FUA write,
