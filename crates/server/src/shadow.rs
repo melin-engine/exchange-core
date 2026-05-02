@@ -784,8 +784,11 @@ mod tests {
         });
 
         // Wait for the snapshot to be written (idle-check triggers it
-        // after the 50ms interval elapses).
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // after the 50ms interval elapses). Generous deadline because
+        // nextest runs many tests concurrently and the shadow worker can
+        // be starved on a busy machine — the test still completes
+        // quickly in the common case via the tight poll.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !snap_path.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }

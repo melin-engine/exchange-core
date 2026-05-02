@@ -127,6 +127,23 @@ fn wait_ready(addr: SocketAddr, timeout: Duration) {
     }
 }
 
+/// Inverse of `wait_ready` — poll until the server has flipped to
+/// `trading == false` (e.g. after losing all replicas in a replication
+/// quorum). Replaces a fixed `sleep(1s)` placed after the kill that
+/// triggers the halt.
+fn wait_halted(addr: SocketAddr, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            panic!("server {addr} did not halt within {timeout:?}");
+        }
+        if let Ok((_, _, _, false)) = query_health(addr) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -1311,10 +1328,11 @@ fn dual_replication_halts_when_both_disconnect() {
     }
     cluster.wait_replicated();
 
-    // Kill both replicas.
+    // Kill both replicas, then wait for the primary to register the loss
+    // and flip to halted (no quorum of replicas → no acks).
     cluster.kill_replica1();
     cluster.kill_replica2();
-    std::thread::sleep(Duration::from_millis(1000));
+    wait_halted(cluster.primary.health_addr, Duration::from_secs(5));
 
     // Trading should be halted.
     assert!(
@@ -2123,7 +2141,10 @@ fn snapshot_transfer_when_archives_purged() {
     }
     drop(client);
 
-    // Wait for the shadow snapshot to be taken.
+    // Wait for the shadow snapshot to be taken. Tight 20 ms poll so the
+    // wall-time tracks the actual snapshot completion, not the polling
+    // granularity. Snapshot interval is 1 s so this typically converges
+    // in ~1.0–1.1 s.
     let snap_path = primary_journal.with_extension("snapshot");
     let start = Instant::now();
     while !snap_path.exists() {
@@ -2133,14 +2154,15 @@ fn snapshot_transfer_when_archives_purged() {
                 snap_path.display()
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(20));
     }
     eprintln!("Snapshot created at {}", snap_path.display());
 
-    // Stop the standalone primary.
+    // Stop the standalone primary. `wait()` already blocks until the
+    // process exits and its files are flushed by the kernel — no extra
+    // sleep needed.
     unsafe { libc::kill(primary.child.id() as i32, libc::SIGINT) };
     let _ = primary.child.wait();
-    std::thread::sleep(Duration::from_millis(500));
 
     // Delete journal archive files (simulate archive purge).
     // Keep the current journal and snapshot, delete .1, .2, etc.
