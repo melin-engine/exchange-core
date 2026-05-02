@@ -666,6 +666,32 @@ fn run_rumcast_primary_with_state(
 /// that wait, which prevents per-session SubscriptionLogs from
 /// filling during a long fsync.
 #[allow(clippy::too_many_arguments)]
+/// Per-stage counters for diagnosing where the rumcast-session loop
+/// is starving when the bench hangs. Gated by `RUMCAST_DIAG=1`; printed
+/// to stderr every ~1s. Single-threaded — plain `u64` is sufficient
+/// (no atomics needed).
+#[derive(Default)]
+struct DiagCounters {
+    iters: u64,
+    idle_iters: u64,
+    recv_frags: u64,
+    send_frags: u64,
+    inbound_drained: u64,
+    outputs_consumed: u64,
+    outputs_seed_dropped: u64,
+    outputs_journal_blocked: u64,
+    encode_attempts: u64,
+    encode_returned_none: u64,
+    publish_inline_ok: u64,
+    publish_inline_backpressured: u64,
+    publish_inline_no_session: u64,
+    publish_pending_ok: u64,
+    publish_pending_backpressured: u64,
+    publish_pending_session_evicted: u64,
+    pending_publish_held: u64,
+    pending_outbound_held: u64,
+}
+
 fn session_translator(
     mut muxed_receiver: MuxedReceiver<KernelUdp>,
     mut muxed_sender: MuxedSender<KernelUdp>,
@@ -680,6 +706,12 @@ fn session_translator(
     let mut pending_outbound: Option<OutputSlot> = None;
     let mut response_buf = vec![0u8; RESPONSE_ENCODE_BUF_SIZE];
     let mut envelope_buf = vec![0u8; ENVELOPE_BUF_SIZE];
+
+    let diag_enabled = std::env::var("RUMCAST_DIAG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut diag = DiagCounters::default();
+    let mut diag_last_dump = Instant::now();
     // Encoded envelope awaiting publish on its session's PublicationLog.
     // Set when an outbound slot has been encoded but the rumcast pub_log
     // can't accept it yet (publisher_limit not advanced — typically the
@@ -698,6 +730,7 @@ fn session_translator(
 
     while !shutdown.load(Ordering::Acquire) {
         let mut did_work = false;
+        diag.iters += 1;
 
         // ---- Drive the rumcast wire-layer ticks ----
         //
@@ -707,6 +740,8 @@ fn session_translator(
         // idle and proportional to per-session work otherwise.
         let recv_stats = muxed_receiver.tick();
         let send_stats = muxed_sender.tick();
+        diag.recv_frags += recv_stats.fragments_accepted as u64;
+        diag.send_frags += send_stats.fragments_sent as u64;
         if recv_stats.fragments_accepted > 0
             || recv_stats.bytes_received > 0
             || send_stats.fragments_sent > 0
@@ -741,6 +776,7 @@ fn session_translator(
                 shutdown,
             );
         });
+        diag.inbound_drained += drained as u64;
         if drained > 0 {
             did_work = true;
         }
@@ -814,6 +850,7 @@ fn session_translator(
 
         // Stage 2: drain a previously-encoded envelope first.
         if let Some((session_id, env_len)) = pending_publish {
+            diag.pending_publish_held += 1;
             match sessions.get(&session_id) {
                 Some(AuthStage::Authenticated { pub_log, .. }) => {
                     match pub_log.try_claim(env_len as u32) {
@@ -823,10 +860,12 @@ fn session_translator(
                                 .copy_from_slice(&envelope_buf[..env_len]);
                             claim.publish(data_flags::UNFRAGMENTED);
                             pending_publish = None;
+                            diag.publish_pending_ok += 1;
                             did_work = true;
                         }
                         Err(_) => {
                             // Backpressure: leave pending, try next loop.
+                            diag.publish_pending_backpressured += 1;
                         }
                     }
                 }
@@ -834,6 +873,7 @@ fn session_translator(
                     // Session evicted (auth timeout or peer disconnect)
                     // between encode and publish. Drop the response.
                     pending_publish = None;
+                    diag.publish_pending_session_evicted += 1;
                 }
             }
         }
@@ -845,6 +885,7 @@ fn session_translator(
                 && let Some((_, slot)) = output_consumer.try_consume()
             {
                 pending_outbound = Some(slot);
+                diag.outputs_consumed += 1;
                 did_work = true;
             }
             if let Some(slot) = pending_outbound.as_ref() {
@@ -852,6 +893,7 @@ fn session_translator(
                 // No client to route them to — drop.
                 if slot.connection_id == 0 {
                     pending_outbound = None;
+                    diag.outputs_seed_dropped += 1;
                     // Mark progress so the loop immediately tries to
                     // consume the next slot — otherwise yield-idle mode
                     // would sleep 10µs per dropped seed event, turning
@@ -859,6 +901,7 @@ fn session_translator(
                     did_work = true;
                 } else if journal_cursor.get().load(Ordering::Acquire) > slot.input_seq {
                     let slot = pending_outbound.take().expect("checked is_some above");
+                    diag.encode_attempts += 1;
                     if let Some(env_len) =
                         encode_outbound(&slot, &mut sessions, &mut response_buf, &mut envelope_buf)
                     {
@@ -873,19 +916,27 @@ fn session_translator(
                                             .payload_mut()
                                             .copy_from_slice(&envelope_buf[..env_len]);
                                         claim.publish(data_flags::UNFRAGMENTED);
+                                        diag.publish_inline_ok += 1;
                                     }
                                     Err(_) => {
                                         // Pub_log full — defer.
                                         pending_publish = Some((session_id, env_len));
+                                        diag.publish_inline_backpressured += 1;
                                     }
                                 }
                             }
                             _ => {
                                 // Race: session evicted between encode and publish.
+                                diag.publish_inline_no_session += 1;
                             }
                         }
+                    } else {
+                        diag.encode_returned_none += 1;
                     }
                     did_work = true;
+                } else {
+                    diag.outputs_journal_blocked += 1;
+                    diag.pending_outbound_held += 1;
                 }
                 // else: not durable yet, leave pending and re-check next loop.
             }
@@ -893,10 +944,47 @@ fn session_translator(
 
         // ---- Idle ----
         if !did_work {
+            diag.idle_iters += 1;
             if yield_idle {
                 thread::sleep(Duration::from_micros(10));
             } else {
                 std::hint::spin_loop();
+            }
+        }
+
+        // ---- Diagnostic dump ----
+        if diag_enabled {
+            let now = Instant::now();
+            if now.duration_since(diag_last_dump) >= Duration::from_secs(1) {
+                eprintln!(
+                    "[rumcast-diag] iters={} idle={} recv_frags={} send_frags={} \
+                     inbound_drained={} outputs_consumed={} seed_dropped={} \
+                     journal_blocked={} encode_attempts={} encode_none={} \
+                     pub_inline_ok={} pub_inline_bp={} pub_inline_nosess={} \
+                     pub_pending_ok={} pub_pending_bp={} pub_pending_evict={} \
+                     pending_publish_held={} pending_outbound_held={} sessions={}",
+                    diag.iters,
+                    diag.idle_iters,
+                    diag.recv_frags,
+                    diag.send_frags,
+                    diag.inbound_drained,
+                    diag.outputs_consumed,
+                    diag.outputs_seed_dropped,
+                    diag.outputs_journal_blocked,
+                    diag.encode_attempts,
+                    diag.encode_returned_none,
+                    diag.publish_inline_ok,
+                    diag.publish_inline_backpressured,
+                    diag.publish_inline_no_session,
+                    diag.publish_pending_ok,
+                    diag.publish_pending_backpressured,
+                    diag.publish_pending_session_evicted,
+                    diag.pending_publish_held,
+                    diag.pending_outbound_held,
+                    sessions.len(),
+                );
+                diag = DiagCounters::default();
+                diag_last_dump = now;
             }
         }
     }

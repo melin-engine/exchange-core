@@ -161,6 +161,14 @@ REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack}"
 # socket, slow-SEND completions, and replica-side queue depths.
 BENCH_RUST_LOG="${RUST_LOG:-info}"
 
+# Forward RUMCAST_DIAG=1 to rumcast server invocations to enable
+# the per-second session_translator counter dump on stderr.
+if [[ "${RUMCAST_DIAG:-}" == "1" ]]; then
+    RUMCAST_DIAG_ENV="RUMCAST_DIAG=1 "
+else
+    RUMCAST_DIAG_ENV=""
+fi
+
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
@@ -966,7 +974,7 @@ transport_start_udp() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -996,7 +1004,7 @@ transport_start_udp_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -1009,7 +1017,7 @@ transport_start_udp_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${REPLICA_VLAN}:9876 \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
@@ -1049,7 +1057,7 @@ transport_start_udp_dual_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -1062,7 +1070,7 @@ transport_start_udp_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${REPLICA_VLAN}:9876 \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
@@ -1073,7 +1081,7 @@ transport_start_udp_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA2" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
+    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${REPLICA2_VLAN}:9876 \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
