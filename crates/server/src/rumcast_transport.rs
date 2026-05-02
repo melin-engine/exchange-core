@@ -429,7 +429,19 @@ fn run_rumcast_primary_with_state(
         setup_interval: Duration::from_millis(100),
         heartbeat_interval: Duration::from_millis(50),
         max_drain_per_tick: 1024 * 1024,
-        max_control_per_tick: 32,
+        // Symmetric with the receiver side's `max_recv_per_tick`. SMs
+        // and NAKs from N clients arrive on the response socket at
+        // `N / sm_interval` rate; with N=16 clients and a 2 ms
+        // interval that's ~8 k SMs/sec. A single recv-side tick can
+        // drain up to 1024 inbound order packets and take ~ms, during
+        // which SMs accumulate in the kernel rmem buffer. Capping
+        // drain at 32 here means the server falls behind, the rmem
+        // cap (~212 KB) fills, the kernel drops further SMs, and
+        // MuxedSender's flow control stops advancing the publisher
+        // limit — the response pub_log fills and the whole pipeline
+        // deadlocks. `drain_control` exits early when there's nothing
+        // to read, so a high cap costs nothing on idle.
+        max_control_per_tick: 1024,
         // Phase 3: leave flow control as `Min` (the rumcast default).
         // We don't expect to be flow-control-bound on a healthy LAN
         // — backpressure here would stem from a slow subscriber, and
