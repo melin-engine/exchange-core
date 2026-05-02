@@ -106,6 +106,27 @@ fn wait_healthy(addr: SocketAddr, timeout: Duration) -> (u64, u64, u64, bool) {
     }
 }
 
+/// Poll the health endpoint until the server is ready to accept client
+/// traffic (pipeline up, `trading` flag set), not just responding to
+/// /healthz.
+///
+/// Replaces the `wait_healthy(...) + sleep(1s)` pattern where the sleep
+/// was a fixed-duration workaround for the gap between the health
+/// endpoint answering and the pipeline being ready. With a real readiness
+/// check the wait is bounded by actual readiness, not a magic constant.
+fn wait_ready(addr: SocketAddr, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            panic!("server {addr} did not become ready within {timeout:?}");
+        }
+        if let Ok((_, _, _, true)) = query_health(addr) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -488,10 +509,7 @@ impl TestCluster {
         let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.promote_port).parse().unwrap();
         promote(promote_addr, &self.operator_key);
 
-        wait_healthy(self.replica.health_addr, Duration::from_secs(30));
-
-        // Brief pause for pipeline init.
-        std::thread::sleep(Duration::from_secs(1));
+        wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
         Client::connect(self.replica.client_addr, &self.key2).expect("connect to promoted replica")
     }
@@ -755,8 +773,7 @@ fn crashed_primary_recovers_from_journal() {
         }
     };
 
-    wait_healthy(recovered.health_addr, Duration::from_secs(30));
-    std::thread::sleep(Duration::from_secs(1));
+    wait_ready(recovered.health_addr, Duration::from_secs(30));
 
     let mut client3 = Client::connect(recovered.client_addr, &cluster.key2)
         .expect("connect to recovered primary");
@@ -1026,8 +1043,7 @@ fn same_key_retry_after_failover_is_rejected() {
     }
     let _ = cluster.primary.child.wait();
     promote(promote_addr, &cluster.operator_key);
-    wait_healthy(cluster.replica.health_addr, Duration::from_secs(30));
-    std::thread::sleep(Duration::from_secs(1));
+    wait_ready(cluster.replica.health_addr, Duration::from_secs(30));
 
     // Reconnect with the SAME key (key, not key2). The promoted replica's
     // per-key HWM for this key should be 10 (from the 10 requests above).
@@ -1202,8 +1218,7 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
-        wait_healthy(self.replica1.health_addr, Duration::from_secs(30));
-        std::thread::sleep(Duration::from_secs(1));
+        wait_ready(self.replica1.health_addr, Duration::from_secs(30));
         Client::connect(self.replica1.client_addr, &self.key2)
             .expect("connect to promoted replica 1")
     }
@@ -1213,8 +1228,7 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
-        wait_healthy(self.replica2.health_addr, Duration::from_secs(30));
-        std::thread::sleep(Duration::from_secs(1));
+        wait_ready(self.replica2.health_addr, Duration::from_secs(30));
         Client::connect(self.replica2.client_addr, &self.key2)
             .expect("connect to promoted replica 2")
     }
@@ -1603,8 +1617,7 @@ fn replacement_replica_catches_up_from_journal() {
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
     let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
-    wait_healthy(r3_health_addr, Duration::from_secs(30));
-    std::thread::sleep(Duration::from_secs(1));
+    wait_ready(r3_health_addr, Duration::from_secs(30));
 
     let mut client2 = Client::connect(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
@@ -1734,11 +1747,10 @@ fn catchup_with_fills_during_gap() {
         format!("127.0.0.1:{r3_promote}").parse().unwrap(),
         &cluster.operator_key,
     );
-    wait_healthy(
+    wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
     );
-    std::thread::sleep(Duration::from_secs(1));
 
     let mut client2 = Client::connect(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
@@ -1859,11 +1871,10 @@ fn catchup_then_immediate_failover() {
         format!("127.0.0.1:{r3_promote}").parse().unwrap(),
         &cluster.operator_key,
     );
-    wait_healthy(
+    wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
     );
-    std::thread::sleep(Duration::from_secs(1));
 
     let mut client2 = Client::connect(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
@@ -1994,11 +2005,10 @@ fn fresh_replica_full_catchup() {
         format!("127.0.0.1:{r3_promote}").parse().unwrap(),
         &cluster.operator_key,
     );
-    wait_healthy(
+    wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
     );
-    std::thread::sleep(Duration::from_secs(1));
 
     let mut client2 = Client::connect(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
