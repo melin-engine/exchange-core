@@ -101,6 +101,13 @@ pub struct TickStats {
     /// network or destination configuration problem; spikes correlate
     /// with kernel send-buffer pressure.
     pub send_errors: u32,
+    /// `drain_data` ticks where the producer has published past
+    /// `last_sent_position` but the partition holding `last_sent_position`
+    /// is no longer resident in `term_ids[]` — the producer rotated past
+    /// us and overwrote the term we were about to send. Non-zero values
+    /// indicate a permanent send-side stall on that session: see
+    /// `MuxedSender`'s tick docs for recovery semantics.
+    pub partition_misses: u32,
 }
 
 /// Sender loop. See module docs.

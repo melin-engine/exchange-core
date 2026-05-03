@@ -367,6 +367,13 @@ impl SessionOutbound {
         let mut drained = 0u32;
         while drained < max_drain_per_tick {
             let Some(fragment) = self.log.published_fragment(self.last_sent_position) else {
+                // Discriminate "nothing new to send" from "we got rotated
+                // past our cursor" — if the producer has published past
+                // our last_sent_position but the term is no longer
+                // resident, we're permanently stalled on this session.
+                if self.last_sent_position < self.log.publisher_position() {
+                    stats.partition_misses += 1;
+                }
                 break;
             };
             let len = fragment.len();

@@ -689,6 +689,12 @@ struct DiagCounters {
     iters: u64,
     idle_iters: u64,
     recv_frags: u64,
+    recv_bytes: u64,
+    recv_dropped: u64,
+    recv_errors: u64,
+    setups_recv: u64,
+    naks_sent: u64,
+    sms_sent: u64,
     send_frags: u64,
     inbound_drained: u64,
     outputs_consumed: u64,
@@ -755,6 +761,12 @@ fn session_translator(
         let recv_stats = muxed_receiver.tick();
         let send_stats = muxed_sender.tick();
         diag.recv_frags += recv_stats.fragments_accepted as u64;
+        diag.recv_bytes += recv_stats.bytes_received;
+        diag.recv_dropped += recv_stats.fragments_dropped as u64;
+        diag.recv_errors += recv_stats.recv_errors as u64;
+        diag.setups_recv += recv_stats.setups_received as u64;
+        diag.naks_sent += recv_stats.naks_sent as u64;
+        diag.sms_sent += recv_stats.sms_sent as u64;
         diag.send_frags += send_stats.fragments_sent as u64;
         if recv_stats.fragments_accepted > 0
             || recv_stats.bytes_received > 0
@@ -971,15 +983,22 @@ fn session_translator(
             let now = Instant::now();
             if now.duration_since(diag_last_dump) >= Duration::from_secs(1) {
                 eprintln!(
-                    "[rumcast-diag] iters={} idle={} recv_frags={} send_frags={} \
-                     inbound_drained={} outputs_consumed={} seed_dropped={} \
-                     journal_blocked={} encode_attempts={} encode_none={} \
+                    "[rumcast-diag] iters={} idle={} recv_frags={} recv_bytes={} \
+                     recv_dropped={} recv_errors={} setups_recv={} naks_sent={} \
+                     sms_sent={} send_frags={} inbound_drained={} outputs_consumed={} \
+                     seed_dropped={} journal_blocked={} encode_attempts={} encode_none={} \
                      pub_inline_ok={} pub_inline_bp={} pub_inline_nosess={} \
                      pub_pending_ok={} pub_pending_bp={} pub_pending_evict={} \
                      pending_publish_held={} pending_outbound_held={} sessions={}",
                     diag.iters,
                     diag.idle_iters,
                     diag.recv_frags,
+                    diag.recv_bytes,
+                    diag.recv_dropped,
+                    diag.recv_errors,
+                    diag.setups_recv,
+                    diag.naks_sent,
+                    diag.sms_sent,
                     diag.send_frags,
                     diag.inbound_drained,
                     diag.outputs_consumed,

@@ -263,6 +263,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let mut diag_sms_received: u64 = 0;
     let mut diag_naks_received: u64 = 0;
     let mut diag_topup_skipped_sessions: u64 = 0;
+    let mut diag_send_errors: u64 = 0;
+    let mut diag_partition_misses: u64 = 0;
     let mut diag_last_dump = Instant::now();
 
     // ---- Hot loop ----
@@ -279,6 +281,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         diag_send_frags += send_stats.fragments_sent as u64;
         diag_naks_received += send_stats.naks_received as u64;
         diag_sms_received += send_stats.sms_received as u64;
+        diag_send_errors += send_stats.send_errors as u64;
+        diag_partition_misses += send_stats.partition_misses as u64;
         diag_recv_frags += recv_stats.fragments_accepted as u64;
 
         // Top up each session's outbound window.
@@ -389,7 +393,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                 let recv_sum: usize = total_received.iter().sum();
                 eprintln!(
                     "[bench-diag] iters={} claim_ok={} claim_bp={} topup_skipped={} \
-                     responses={} recv_frags={} send_frags={} sms_recv={} naks_recv={} \
+                     responses={} recv_frags={} send_frags={} send_errors={} \
+                     partition_misses={} sms_recv={} naks_recv={} \
                      inflight_max={} inflight_sum={} sent={} recv={}",
                     diag_iters,
                     diag_claim_ok,
@@ -398,6 +403,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                     diag_responses,
                     diag_recv_frags,
                     diag_send_frags,
+                    diag_send_errors,
+                    diag_partition_misses,
                     diag_sms_received,
                     diag_naks_received,
                     inflight_max,
@@ -411,6 +418,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                 diag_responses = 0;
                 diag_recv_frags = 0;
                 diag_send_frags = 0;
+                diag_send_errors = 0;
+                diag_partition_misses = 0;
                 diag_sms_received = 0;
                 diag_naks_received = 0;
                 diag_topup_skipped_sessions = 0;
