@@ -20,7 +20,7 @@
 //! resting book depth. Events are pre-generated before the measured run.
 //!
 //! Usage:
-//!     cargo run --release -p melin-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--health-addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
+//!     cargo run --release --bin melin-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--health-addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 

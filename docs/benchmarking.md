@@ -71,7 +71,7 @@ Each client connection gets its own generator instance with a partitioned order 
 ## CLI Parameters
 
 ```
-cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
+cargo run --release --bin melin-bench [-- [OPTIONS] [PAIRS]]
 ```
 
 ### Positional arguments
@@ -298,7 +298,7 @@ The release profile is configured for maximum performance:
 
 Build with:
 ```sh
-cargo build --release -p melin-bench
+cargo build --release --bin melin-bench
 ```
 
 The binary is at `target/release/melin-bench`.

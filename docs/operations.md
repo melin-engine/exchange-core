@@ -667,7 +667,7 @@ This records timestamps at each pipeline stage transition and builds histograms 
 Histograms are reported on shutdown. The bench crate passes these features through:
 
 ```sh
-cargo run --release -p melin-bench --features latency-trace,pipeline-stats
+cargo run --release --bin melin-bench --features latency-trace,pipeline-stats
 ```
 
 **Warning**: Latency trace adds overhead (~tens of nanoseconds per event for `rdtsc` calls). Do not enable in production unless actively diagnosing a latency issue.
