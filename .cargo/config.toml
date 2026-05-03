@@ -2,4 +2,7 @@
 # Emit instructions tuned for the build machine's CPU (AVX2, BMI2, etc.).
 # Produces faster code but binaries are not portable across CPU generations.
 # Remove or change to a specific target (e.g., "x86-64-v3") for distributed builds.
-rustflags = ["-C", "target-cpu=native"]
+#
+# lld: LLVM's linker handles fat LTO natively, significantly reducing
+# release build times compared to GNU ld's LTO plugin handoff.
+rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=lld"]

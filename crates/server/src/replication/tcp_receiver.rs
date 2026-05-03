@@ -198,7 +198,7 @@ fn replica_stream_uring(
     // entry, ack_send_in_flight is 0–1. Deviations tell us where data
     // is piling up during a slowdown. `AmortizedTimer` keeps the
     // per-iteration cost to a single `AND` + predictable branch.
-    let mut info_log_timer = AmortizedTimer::new();
+    let mut info_log_timer = AmortizedTimer::new(busy_spin);
     let mut bytes_received_since_log: u64 = 0;
     let mut acks_sent_since_log: u64 = 0;
 

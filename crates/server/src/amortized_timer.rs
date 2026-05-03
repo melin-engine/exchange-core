@@ -25,7 +25,13 @@
 
 pub(crate) struct AmortizedTimer {
     last: std::time::Instant,
+    /// Iteration counter used in amortized mode; unused when `amortize = false`.
     iter: u64,
+    /// When `true`, reads the clock only every `CHECK_MASK + 1` iterations.
+    /// When `false`, reads the clock on every call — suitable for yield-idle
+    /// loops where the iteration rate is too low (~250 iters/s under load)
+    /// for amortization to be effective.
+    amortize: bool,
 }
 
 impl AmortizedTimer {
@@ -33,10 +39,13 @@ impl AmortizedTimer {
     /// At ~10 M loop iters/s this yields ~10 clock reads per second.
     const CHECK_MASK: u64 = (1 << 20) - 1;
 
-    pub(crate) fn new() -> Self {
+    /// `amortize = true`: busy-spin mode — clock read every ~1 M iterations.
+    /// `amortize = false`: yield-idle mode — clock read on every call.
+    pub(crate) fn new(amortize: bool) -> Self {
         Self {
             last: std::time::Instant::now(),
             iter: 0,
+            amortize,
         }
     }
 
@@ -49,9 +58,11 @@ impl AmortizedTimer {
     /// clock read.
     #[inline]
     pub(crate) fn tick(&mut self, period: std::time::Duration) -> Option<std::time::Duration> {
-        self.iter = self.iter.wrapping_add(1);
-        if self.iter & Self::CHECK_MASK != 0 {
-            return None;
+        if self.amortize {
+            self.iter = self.iter.wrapping_add(1);
+            if self.iter & Self::CHECK_MASK != 0 {
+                return None;
+            }
         }
         let elapsed = self.last.elapsed();
         if elapsed < period {

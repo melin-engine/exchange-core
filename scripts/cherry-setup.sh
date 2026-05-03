@@ -61,6 +61,8 @@ fi
 # nasm: required for blake3 to compile its AVX-512 compress_in_place assembly
 # stubs (blake3_avx512_ffi); without it blake3 falls back to the SSE4.1 path
 # even on AVX-512-capable CPUs (e.g., EPYC 9255 / Zen 4).
+# lld: LLVM linker used via .cargo/config.toml; handles fat LTO natively,
+# cutting release build times vs GNU ld's LTO plugin handoff.
 apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
@@ -69,6 +71,7 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     clang \
     llvm \
+    lld \
     libelf-dev \
     nasm
 

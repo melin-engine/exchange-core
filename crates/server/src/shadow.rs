@@ -71,7 +71,7 @@ pub fn run(
     // 50 min (default `snapshot_interval_ms=3_000_000`). `AmortizedTimer`
     // defers the clock read to roughly 1 Hz, collapsing the overhead
     // to a single `AND` + predictable branch per iteration.
-    let mut snapshot_timer = AmortizedTimer::new();
+    let mut snapshot_timer = AmortizedTimer::new(busy_spin);
     let mut idle_spins: u32 = 0;
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.

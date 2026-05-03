@@ -2178,11 +2178,15 @@ fn snapshot_transfer_when_archives_purged() {
     }
     drop(client);
 
-    // Wait for the shadow snapshot to be taken. Tight 20 ms poll so the
-    // wall-time tracks the actual snapshot completion, not the polling
-    // granularity. Snapshot interval is 1 s so this typically converges
-    // in ~1.0–1.1 s.
+    // All 20 orders are now committed (each submit_order waited for a
+    // response gated on journal fsync). Remove any snapshot taken before
+    // this point — in yield-idle mode the timer fires promptly, so a
+    // partial snapshot (e.g. only orders 1–N) may already exist. The
+    // next snapshot is guaranteed to include all 20 orders.
     let snap_path = primary_journal.with_extension("snapshot");
+    let _ = std::fs::remove_file(&snap_path);
+
+    // Wait for a fresh snapshot that captures the full committed state.
     let start = Instant::now();
     while !snap_path.exists() {
         if start.elapsed() > Duration::from_secs(60) {
