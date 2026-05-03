@@ -289,6 +289,11 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                     } else {
                         self.last_publisher_seen_at = Some(now);
                         self.effective_dst = from;
+                        // Forward publisher position so gap detection
+                        // can NAK silently-dropped tail fragments —
+                        // see SubscriptionLog::advertise_publisher_position.
+                        self.log
+                            .advertise_publisher_position(s.active_term_id, s.term_offset);
                         stats.setups_received += 1;
                     }
                 }

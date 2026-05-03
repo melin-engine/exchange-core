@@ -168,6 +168,74 @@ impl SubscriptionLog {
         self.term_ids[partition].get().load(Ordering::Acquire)
     }
 
+    /// Advance the high-water mark of the partition currently holding
+    /// `term_id` to at least `term_offset`. Called by the receiver loop
+    /// when a `SetupFrame` arrives advertising the publisher's current
+    /// position — without this, a silently-dropped *tail* fragment
+    /// (kernel rmem overflow, lost packet on the wire) is permanently
+    /// undetected because `partition_high_water_mark` only advances on
+    /// successfully-received data fragments. Bumping the HWM via Setup
+    /// gives `detect_and_schedule_gap` something to NAK against.
+    ///
+    /// No-op if the partition isn't resident (a Setup for a not-yet-
+    /// allocated term; data fragments will rotate on arrival and gap
+    /// detection will fire then) or if HWM is already past `term_offset`.
+    /// Does NOT rotate partitions itself: rotating speculatively on a
+    /// control frame would risk evicting still-in-use payload.
+    #[inline]
+    pub fn advertise_publisher_position(&self, advert_term_id: u32, advert_term_offset: u32) {
+        let bits = self.term_length_bits;
+        let sub_pos = self.subscriber_position();
+        if position(advert_term_id, advert_term_offset, bits) <= sub_pos {
+            return;
+        }
+        let sub_term_id = (sub_pos >> bits) as u32;
+        let term_length = self.config.term_length;
+
+        // Determine the HWM bump for the subscriber's *current* term.
+        // `detect_and_schedule_gap` scans the partition holding
+        // `sub_term_id` — bumping HWM in any other partition is dead
+        // code from the gap detector's perspective.
+        //
+        // If the publisher has rotated past `sub_term_id`, the rest of
+        // sub_term is missing — bump HWM to full term_length so the
+        // gap covers the tail. If the publisher is still in sub_term,
+        // bump HWM to the advertised offset.
+        let target_offset_in_sub_term = if advert_term_id == sub_term_id {
+            advert_term_offset.min(term_length)
+        } else {
+            // advert_term_id > sub_term_id (advert_pos > sub_pos checked)
+            term_length
+        };
+
+        if let Some(partition) = self.find_partition(sub_term_id) {
+            let hwm = self.high_water_marks[partition].get();
+            let cur = hwm.load(Ordering::Relaxed);
+            if target_offset_in_sub_term > cur {
+                // Release pairs with the Acquire in
+                // `partition_high_water_mark` — gap detection on the
+                // receiver loop reads HWM with Acquire.
+                hwm.store(target_offset_in_sub_term, Ordering::Release);
+            }
+        }
+
+        // If the publisher is in a term *past* sub_term, also bump HWM
+        // in any intermediate or advertised terms that happen to be
+        // resident. Subscriber will rotate to them only after consuming
+        // the gap-filled fragments from sub_term, but having HWM ready
+        // avoids a second-pass NAK delay once it does rotate.
+        if advert_term_id != sub_term_id
+            && let Some(p) = self.find_partition(advert_term_id)
+        {
+            let hwm = self.high_water_marks[p].get();
+            let cur = hwm.load(Ordering::Relaxed);
+            let clamped = advert_term_offset.min(term_length);
+            if clamped > cur {
+                hwm.store(clamped, Ordering::Release);
+            }
+        }
+    }
+
     /// Write an incoming fragment into the log at `(term_id, term_offset)`.
     /// `fragment` must contain exactly one valid `DataFrame` whose header
     /// `frame_length` equals `fragment.len()`.

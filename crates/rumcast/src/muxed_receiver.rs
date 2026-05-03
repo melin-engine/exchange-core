@@ -304,6 +304,11 @@ impl<T: UdpTransport> MuxedReceiver<T> {
             },
             Setup {
                 session_id: u32,
+                // Publisher's current position. Forwarded into the
+                // SubscriptionLog's HWM so gap detection can NAK
+                // silently-dropped tail fragments.
+                active_term_id: u32,
+                term_offset: u32,
             },
             Heartbeat {
                 session_id: u32,
@@ -346,6 +351,8 @@ impl<T: UdpTransport> MuxedReceiver<T> {
                         } else {
                             FrameKind::Setup {
                                 session_id: s.session_id,
+                                active_term_id: s.active_term_id,
+                                term_offset: s.term_offset,
                             }
                         }
                     }
@@ -391,10 +398,22 @@ impl<T: UdpTransport> MuxedReceiver<T> {
                         _ => stats.fragments_dropped += 1,
                     }
                 }
-                FrameKind::Setup { session_id } => {
+                FrameKind::Setup {
+                    session_id,
+                    active_term_id,
+                    term_offset,
+                } => {
                     if let Some(s) = self.get_or_create_session(session_id, from, stats) {
                         s.last_publisher_seen_at = Some(now);
                         s.effective_dst = from;
+                        // Forward publisher position into the sublog's
+                        // HWM so gap detection can NAK silently-dropped
+                        // tail fragments. Without this, a packet drop
+                        // at the very end of a publisher's send burst
+                        // is permanently undetected because HWM only
+                        // advances on accepted data fragments.
+                        s.log
+                            .advertise_publisher_position(active_term_id, term_offset);
                         stats.setups_received += 1;
                     }
                 }
