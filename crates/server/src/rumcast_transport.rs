@@ -251,6 +251,12 @@ const SERVER_RECEIVER_ID: u64 = 1;
 /// boxes) or higher (busy gateways). Promote to `ServerConfig`.
 const MAX_SESSIONS: u32 = 1024;
 
+/// Requested `SO_RCVBUF` for the orders (inbound) socket. With 16 clients at
+/// window 128, up to 2048 datagrams can be in-flight simultaneously; the
+/// kernel default (208 KiB) overflows in <100 ms under load. Requires
+/// `net.core.rmem_max` >= this value on the host.
+const ORDERS_RCVBUF_BYTES: usize = 32 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -303,6 +309,9 @@ fn run_rumcast_primary(
     // client connecting at server startup loses its first Hello/
     // Heartbeat to the unbound-port race.
     let orders_socket = KernelUdp::bind(rumcast_config.bind)?;
+    if let Err(e) = orders_socket.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
+        warn!(error = ?e, requested = ORDERS_RCVBUF_BYTES, "failed to bump pre-bound orders socket SO_RCVBUF");
+    }
 
     // ---- Engine pipeline ----
     let (app, writer, needs_seeding) = init_engine(&config)?;
@@ -440,6 +449,9 @@ fn run_rumcast_primary_with_state(
         Some(s) => s,
         None => KernelUdp::bind(rumcast_config.bind)?,
     };
+    if let Err(e) = orders_socket.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
+        warn!(error = ?e, requested = ORDERS_RCVBUF_BYTES, "failed to bump orders socket SO_RCVBUF");
+    }
     let muxed_receiver_config = MuxedReceiverConfig {
         stream_id: RUMCAST_ORDERS_STREAM,
         receiver_id: SERVER_RECEIVER_ID,
