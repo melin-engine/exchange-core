@@ -290,13 +290,15 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let mut total_received_overall = 0usize;
     while total_received_overall < total_msgs {
         diag_iters += 1;
-        let send_stats = muxed_sender.tick();
+        // Drain inbound first so the top-up below can react to any
+        // SMs that just arrived (publisher_limit advancement). The
+        // sender's tick lives AFTER top-up so freshly published
+        // fragments go out on the wire in the same iteration —
+        // otherwise a publish recorded its `inflight` timestamp
+        // here and the actual datagram wouldn't leave until the
+        // next iter (a 2 ms park sat in between, dominating
+        // single-msg round-trip latency).
         let recv_stats = muxed_receiver.tick();
-        diag_send_frags += send_stats.fragments_sent as u64;
-        diag_naks_received += send_stats.naks_received as u64;
-        diag_sms_received += send_stats.sms_received as u64;
-        diag_send_errors += send_stats.send_errors as u64;
-        diag_partition_misses += send_stats.partition_misses as u64;
         diag_recv_frags += recv_stats.fragments_accepted as u64;
 
         // Top up each session's outbound window.
@@ -347,6 +349,17 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                 }
             }
         }
+
+        // Flush freshly published fragments + process control
+        // (NAKs / SMs) immediately. Was at the top of the loop body;
+        // moved after top-up so a publish→wire round-trip happens in
+        // a single iteration.
+        let send_stats = muxed_sender.tick();
+        diag_send_frags += send_stats.fragments_sent as u64;
+        diag_naks_received += send_stats.naks_received as u64;
+        diag_sms_received += send_stats.sms_received as u64;
+        diag_send_errors += send_stats.send_errors as u64;
+        diag_partition_misses += send_stats.partition_misses as u64;
 
         // Drain responses for all sessions in one poll pass. The poll
         // callback routes by `session_id` and updates per-session
