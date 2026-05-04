@@ -51,9 +51,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::counters::Counters;
-use crate::storage::AlignedBuf;
 use crate::sub_log::{AcceptResult, SubscriptionConfig, SubscriptionLog};
-use crate::transport::UdpTransport;
+use crate::transport::{DatagramBuf, UdpTransport};
 use crate::wire::{FrameView, NakFrame, ParseError, StatusMessage, parse_frame, position};
 
 // Re-use the per-tick stats type from the single-session receiver
@@ -180,17 +179,22 @@ pub struct MuxedReceiver<T: UdpTransport> {
     transport: T,
     config: MuxedReceiverConfig,
     sessions: HashMap<u32, SessionInbound>,
-    recv_buf: Box<AlignedBuf<2048>>,
+    /// Pool of receive slots reused across ticks for the batched
+    /// `recv_batch` call. Sized to `config.max_recv_per_tick`.
+    batch_slots: Vec<DatagramBuf>,
     counters: Option<Arc<Counters>>,
 }
 
 impl<T: UdpTransport> MuxedReceiver<T> {
     pub fn new(transport: T, config: MuxedReceiverConfig) -> Self {
+        let batch_slots = (0..config.max_recv_per_tick)
+            .map(|_| DatagramBuf::new(2048))
+            .collect();
         Self {
             transport,
             config,
             sessions: HashMap::new(),
-            recv_buf: Box::new(AlignedBuf::new()),
+            batch_slots,
             counters: None,
         }
     }
@@ -299,20 +303,33 @@ impl<T: UdpTransport> MuxedReceiver<T> {
     }
 
     fn drain_recv(&mut self, stats: &mut TickStats) {
-        // Header fields extracted from a frame so we can drop the
-        // recv_buf borrow before calling &mut self methods. None
-        // means "drop the frame" (parse error, wrong stream, NAK/SM).
+        // One batched recv per tick (sendmmsg-equivalent on KernelUdp,
+        // single SPSC drain on the io_uring endpoint). Each filled
+        // slot is parsed and dispatched to its session.
+        let n = match self.transport.recv_batch(&mut self.batch_slots) {
+            Ok(n) => n,
+            Err(_) => {
+                stats.recv_errors += 1;
+                return;
+            }
+        };
+        if n == 0 {
+            return;
+        }
+
+        // Header fields extracted in a first pass so we can drop the
+        // slot borrow before calling &mut self methods on the second
+        // pass. The recv_batch slot byte borrows are stable across
+        // both passes (we don't touch batch_slots between).
         enum FrameKind {
             Data {
                 session_id: u32,
                 term_id: u32,
                 term_offset: u32,
+                frame_length: u32,
             },
             Setup {
                 session_id: u32,
-                // Publisher's current position. Forwarded into the
-                // SubscriptionLog's HWM so gap detection can NAK
-                // silently-dropped tail fragments.
                 active_term_id: u32,
                 term_offset: u32,
             },
@@ -322,62 +339,53 @@ impl<T: UdpTransport> MuxedReceiver<T> {
             Drop,
         }
 
-        for _ in 0..self.config.max_recv_per_tick {
-            let (from, len) = {
-                let buf = self.recv_buf.slice_mut();
-                match self.transport.recv_from(buf) {
-                    Ok(Some(x)) => x,
-                    Ok(None) => return,
-                    Err(_) => {
-                        stats.recv_errors += 1;
-                        continue;
+        let cfg_stream = self.config.stream_id;
+        let now = Instant::now();
+
+        for slot_idx in 0..n {
+            let slot = &self.batch_slots[slot_idx];
+            stats.bytes_received += slot.len as u64;
+            let from = slot.from;
+            let bytes = slot.payload();
+
+            let kind = match parse_frame(bytes) {
+                Ok(FrameView::Data { header, .. }) => {
+                    if header.stream_id != cfg_stream {
+                        FrameKind::Drop
+                    } else {
+                        FrameKind::Data {
+                            session_id: header.session_id,
+                            term_id: header.term_id,
+                            term_offset: header.term_offset,
+                            frame_length: header.common.frame_length,
+                        }
                     }
                 }
-            };
-            stats.bytes_received += len as u64;
-
-            let cfg_stream = self.config.stream_id;
-            let kind = {
-                let bytes = &self.recv_buf.slice()[..len];
-                match parse_frame(bytes) {
-                    Ok(FrameView::Data { header, .. }) => {
-                        if header.stream_id != cfg_stream {
-                            FrameKind::Drop
-                        } else {
-                            FrameKind::Data {
-                                session_id: header.session_id,
-                                term_id: header.term_id,
-                                term_offset: header.term_offset,
-                            }
+                Ok(FrameView::Setup(s)) => {
+                    if s.stream_id != cfg_stream {
+                        FrameKind::Drop
+                    } else {
+                        FrameKind::Setup {
+                            session_id: s.session_id,
+                            active_term_id: s.active_term_id,
+                            term_offset: s.term_offset,
                         }
                     }
-                    Ok(FrameView::Setup(s)) => {
-                        if s.stream_id != cfg_stream {
-                            FrameKind::Drop
-                        } else {
-                            FrameKind::Setup {
-                                session_id: s.session_id,
-                                active_term_id: s.active_term_id,
-                                term_offset: s.term_offset,
-                            }
-                        }
-                    }
-                    Ok(FrameView::Heartbeat(h)) => {
-                        if h.stream_id != cfg_stream {
-                            FrameKind::Drop
-                        } else {
-                            FrameKind::Heartbeat {
-                                session_id: h.session_id,
-                            }
-                        }
-                    }
-                    // NAK / SM are sender-bound — drop here.
-                    Ok(_) => FrameKind::Drop,
-                    Err(ParseError::Misaligned) | Err(_) => FrameKind::Drop,
                 }
+                Ok(FrameView::Heartbeat(h)) => {
+                    if h.stream_id != cfg_stream {
+                        FrameKind::Drop
+                    } else {
+                        FrameKind::Heartbeat {
+                            session_id: h.session_id,
+                        }
+                    }
+                }
+                // NAK / SM are sender-bound — drop here.
+                Ok(_) => FrameKind::Drop,
+                Err(ParseError::Misaligned) | Err(_) => FrameKind::Drop,
             };
 
-            let now = Instant::now();
             match kind {
                 FrameKind::Drop => {
                     stats.control_drops += 1;
@@ -386,10 +394,8 @@ impl<T: UdpTransport> MuxedReceiver<T> {
                     session_id,
                     term_id,
                     term_offset,
+                    frame_length,
                 } => {
-                    // Look up / create the session, clone out the
-                    // SubscriptionLog Arc so we can call on_fragment
-                    // without holding the &mut self borrow.
                     let log = match self.get_or_create_session(session_id, from, stats) {
                         Some(s) => {
                             s.last_publisher_seen_at = Some(now);
@@ -398,8 +404,12 @@ impl<T: UdpTransport> MuxedReceiver<T> {
                         }
                         None => continue,
                     };
-                    let bytes = &self.recv_buf.slice()[..len];
-                    match log.on_fragment(term_id, term_offset, bytes) {
+                    // Re-borrow the slot bytes (the get_or_create_session
+                    // call took &mut self, briefly invalidating the
+                    // earlier `bytes` borrow).
+                    let bytes = self.batch_slots[slot_idx].payload();
+                    let frame = &bytes[..frame_length as usize];
+                    match log.on_fragment_parsed(term_id, term_offset, frame) {
                         AcceptResult::Accepted => stats.fragments_accepted += 1,
                         _ => stats.fragments_dropped += 1,
                     }
@@ -412,12 +422,6 @@ impl<T: UdpTransport> MuxedReceiver<T> {
                     if let Some(s) = self.get_or_create_session(session_id, from, stats) {
                         s.last_publisher_seen_at = Some(now);
                         s.effective_dst = from;
-                        // Forward publisher position into the sublog's
-                        // HWM so gap detection can NAK silently-dropped
-                        // tail fragments. Without this, a packet drop
-                        // at the very end of a publisher's send burst
-                        // is permanently undetected because HWM only
-                        // advances on accepted data fragments.
                         s.log
                             .advertise_publisher_position(active_term_id, term_offset);
                         stats.setups_received += 1;

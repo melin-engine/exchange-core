@@ -262,6 +262,14 @@ pub fn run_sender_rumcast(
     let mut idle_spins: u32 = 0;
     let heartbeat_interval = Duration::from_secs(heartbeat_secs.max(1));
 
+    // Reusable scratch buffers for the per-iteration two-phase poll.
+    // Allocating once and clearing each iteration avoids a per-frame
+    // `payload.to_vec()` heap allocation on the replication hot path
+    // (was up to one alloc per inbound rumcast Data frame). Sized to
+    // the typical batch we see; grows lazily if a tick observes more.
+    let mut inbound_index: Vec<(u32, std::ops::Range<usize>)> = Vec::with_capacity(16);
+    let mut inbound_bytes: Vec<u8> = Vec::with_capacity(16 * MAX_DATA_FRAME);
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("rumcast replication sender shutting down");
@@ -335,27 +343,34 @@ pub fn run_sender_rumcast(
         // ---- Process inbound frames per session ----
         //
         // Two-phase pattern (same trick as `rumcast_transport.rs`): the
-        // poll callback only borrows the muxed_receiver, so we copy
-        // routed events into a stack-local Vec and process them after
-        // the poll returns where we can mutate auth_states / muxed_sender.
-        struct Inbound {
-            session_id: u32,
-            payload: Vec<u8>,
-        }
-        let mut inbound: Vec<Inbound> = Vec::with_capacity(8);
+        // poll callback only borrows the muxed_receiver, so we record
+        // routed events and process them after the poll returns where
+        // we can mutate auth_states / muxed_sender.
+        //
+        // We append payload bytes into a single reusable `inbound_bytes`
+        // buffer and remember each frame's `(session_id, range)` —
+        // avoids a per-frame heap allocation on the replication hot
+        // path. The buffers are cleared (length-only) at the end of
+        // each iteration; capacity is retained.
+        inbound_index.clear();
+        inbound_bytes.clear();
         muxed_receiver.poll(MAX_DATA_FRAME as u32, |session_id, _src, view| {
             if let FrameView::Data { payload, .. } = view {
-                inbound.push(Inbound {
-                    session_id,
-                    payload: payload.to_vec(),
-                });
+                let start = inbound_bytes.len();
+                inbound_bytes.extend_from_slice(payload);
+                let end = inbound_bytes.len();
+                inbound_index.push((session_id, start..end));
             }
         });
 
-        for ev in inbound {
+        for (session_id, range) in inbound_index.drain(..) {
+            // Borrow the slice afresh per iteration — we've already
+            // finished extending `inbound_bytes` so the slice is stable
+            // for the lifetime of this loop body.
+            let payload = &inbound_bytes[range];
             handle_inbound_frame(
-                ev.session_id,
-                &ev.payload,
+                session_id,
+                payload,
                 &mut auth_states,
                 &mut muxed_sender,
                 &mut muxed_receiver,

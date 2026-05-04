@@ -45,9 +45,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::counters::{Counters, LossCallback, LossEvent};
-use crate::storage::AlignedBuf;
 use crate::sub_log::{AcceptResult, SubscriptionLog};
-use crate::transport::UdpTransport;
+use crate::transport::{DatagramBuf, UdpTransport};
 use crate::wire::{FrameView, NakFrame, ParseError, StatusMessage, parse_frame, position};
 
 /// Configuration for [`ReceiverLoop`].
@@ -162,7 +161,11 @@ pub struct ReceiverLoop<T: UdpTransport> {
     last_publisher_seen_at: Option<Instant>,
     pending_naks: HashMap<(u32, u32, u32), PendingNak>,
     rng: Rng,
-    recv_buf: Box<AlignedBuf<2048>>,
+    /// Pool of receive slots reused across ticks for the batched
+    /// `recv_batch` call. Sized to `config.max_recv_per_tick`.
+    /// Allocated once at construction; the per-tick loop fills them
+    /// in place.
+    batch_slots: Vec<DatagramBuf>,
     /// Optional cumulative counters folded from each tick's stats.
     counters: Option<Arc<Counters>>,
     /// Optional callback invoked once per detected gap (i.e. when a
@@ -175,6 +178,9 @@ impl<T: UdpTransport> ReceiverLoop<T> {
     pub fn new(log: Arc<SubscriptionLog>, transport: T, config: ReceiverConfig) -> Self {
         let now = Instant::now();
         let effective_dst = config.dst;
+        let batch_slots = (0..config.max_recv_per_tick)
+            .map(|_| DatagramBuf::new(2048))
+            .collect();
         Self {
             rng: Rng::new(config.receiver_id),
             log,
@@ -184,7 +190,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
             last_sm_at: now,
             last_publisher_seen_at: None,
             pending_naks: HashMap::new(),
-            recv_buf: Box::new(AlignedBuf::new()),
+            batch_slots,
             counters: None,
             loss_callback: None,
         }
@@ -242,32 +248,37 @@ impl<T: UdpTransport> ReceiverLoop<T> {
     }
 
     fn drain_recv(&mut self, stats: &mut TickStats) {
-        for _ in 0..self.config.max_recv_per_tick {
-            let (from, len) = {
-                let buf = self.recv_buf.slice_mut();
-                match self.transport.recv_from(buf) {
-                    Ok(Some((from, len))) => (from, len),
-                    Ok(None) => return,
-                    Err(_) => {
-                        stats.recv_errors += 1;
-                        continue;
-                    }
-                }
-            };
-            // recv_buf's mutable borrow ended above.
-            let bytes = &self.recv_buf.slice()[..len];
-            stats.bytes_received += len as u64;
+        // One batched recv per tick: on KernelUdp this is one
+        // `recvmmsg(2)` syscall for up to `max_recv_per_tick` frames;
+        // on the io_uring endpoint it's one `Mutex` acquire on the
+        // SPSC consumer that drains all available frames in one
+        // critical section. Either way: N→1 on the most expensive
+        // per-frame cost.
+        let n = match self.transport.recv_batch(&mut self.batch_slots) {
+            Ok(n) => n,
+            Err(_) => {
+                stats.recv_errors += 1;
+                return;
+            }
+        };
+        if n == 0 {
+            return;
+        }
+
+        let cfg_session = self.log.config().session_id;
+        let cfg_stream = self.log.config().stream_id;
+        let now = Instant::now();
+
+        for slot in &self.batch_slots[..n] {
+            let bytes = slot.payload();
+            let from = slot.from;
+            stats.bytes_received += bytes.len() as u64;
 
             // Multicast hygiene: drop frames not addressed to our
-            // session/stream. `parse_frame` doesn't enforce this
-            // (it's a generic dispatcher). last_publisher_seen_at and
-            // effective_dst are updated only for frames that pass the
-            // session check — a misaddressed frame should not look
-            // like liveness from our intended publisher, nor steer
-            // our SMs/NAKs to the wrong endpoint.
-            let cfg_session = self.log.config().session_id;
-            let cfg_stream = self.log.config().stream_id;
-            let now = Instant::now();
+            // session/stream. last_publisher_seen_at / effective_dst
+            // updates only for matching frames so a misaddressed
+            // frame doesn't look like liveness from our intended
+            // publisher.
             match parse_frame(bytes) {
                 Ok(FrameView::Data { header, .. }) => {
                     if header.session_id != cfg_session || header.stream_id != cfg_stream {
@@ -278,7 +289,9 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                     self.effective_dst = from;
                     let term_id = header.term_id;
                     let term_offset = header.term_offset;
-                    match self.log.on_fragment(term_id, term_offset, bytes) {
+                    let frame_length = header.common.frame_length as usize;
+                    let frame = &bytes[..frame_length];
+                    match self.log.on_fragment_parsed(term_id, term_offset, frame) {
                         AcceptResult::Accepted => stats.fragments_accepted += 1,
                         _ => stats.fragments_dropped += 1,
                     }
@@ -289,9 +302,6 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                     } else {
                         self.last_publisher_seen_at = Some(now);
                         self.effective_dst = from;
-                        // Forward publisher position so gap detection
-                        // can NAK silently-dropped tail fragments —
-                        // see SubscriptionLog::advertise_publisher_position.
                         self.log
                             .advertise_publisher_position(s.active_term_id, s.term_offset);
                         stats.setups_received += 1;
@@ -306,7 +316,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                         stats.heartbeats_received += 1;
                     }
                 }
-                // Receiver doesn't process NAK / SM — those are sender-bound.
+                // Receiver doesn't process NAK / SM — sender-bound.
                 Ok(_) => stats.control_drops += 1,
                 Err(ParseError::Misaligned) | Err(_) => stats.control_drops += 1,
             }

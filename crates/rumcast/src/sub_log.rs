@@ -243,14 +243,59 @@ impl SubscriptionLog {
     /// Idempotent: receiving the same fragment twice rewrites identical
     /// bytes the second time.
     ///
-    /// **Performance note**: this path re-parses the fragment for
-    /// validation even though the receiver loop will already have
-    /// called [`parse_frame`] to dispatch by frame type. The cost is
-    /// ~10–20 ns per fragment (one length / alignment / version check).
-    /// Defense-in-depth is intentional in v1; a "trusted" entry point
-    /// can be added if this shows up in profiles.
+    /// Defensive entry point: re-parses the fragment to confirm the
+    /// header agrees with the caller-supplied `term_id` / `term_offset`
+    /// and `fragment.len()`. Use this from callers whose upstream
+    /// hasn't already parsed the fragment via [`parse_frame`].
+    ///
+    /// Receiver loops that already parsed once for dispatch should
+    /// prefer [`on_fragment_parsed`] to skip the second parse — at
+    /// high packet rates that duplicate parse adds ~15–25 ns per
+    /// fragment.
+    ///
+    /// [`on_fragment_parsed`]: Self::on_fragment_parsed
     pub fn on_fragment(&self, term_id: u32, term_offset: u32, fragment: &[u8]) -> AcceptResult {
-        // ---- Validate input ----
+        // Re-parse the fragment to confirm its header agrees with the
+        // length the caller supplied. Catches caller bugs at the cost
+        // of one extra parse per fragment.
+        let parsed = match parse_frame(fragment) {
+            Ok(view) => view,
+            Err(ParseError::Misaligned) => return AcceptResult::Malformed,
+            Err(_) => return AcceptResult::Malformed,
+        };
+        let header = match parsed {
+            FrameView::Data { header, .. } => header,
+            _ => return AcceptResult::Malformed,
+        };
+        if header.term_id != term_id || header.term_offset != term_offset {
+            return AcceptResult::Malformed;
+        }
+        // parse_frame guarantees `fragment.len() >= frame_length`; we
+        // additionally require equality so callers don't smuggle
+        // trailing bytes past the frame.
+        if header.common.frame_length as usize != fragment.len() {
+            return AcceptResult::Malformed;
+        }
+        self.on_fragment_parsed(term_id, term_offset, fragment)
+    }
+
+    /// Fast-path entry point: caller has already parsed the fragment
+    /// via [`parse_frame`] and confirmed its header's `term_id` /
+    /// `term_offset` agree with the arguments and that the slice is
+    /// exactly `frame_length` bytes long. Skips the redundant
+    /// `parse_frame` call but still does the cheap bounds /
+    /// alignment checks that `parse_frame` doesn't cover (term_offset
+    /// alignment, term_length bound) — so this remains memory-safe
+    /// even if the caller's assertions are wrong: the worst case is
+    /// a `Malformed` return.
+    pub fn on_fragment_parsed(
+        &self,
+        term_id: u32,
+        term_offset: u32,
+        fragment: &[u8],
+    ) -> AcceptResult {
+        // Bounds + alignment that `parse_frame` does NOT enforce —
+        // these protect the unchecked pointer writes below.
         if fragment.len() < DataFrame::HEADER_LEN {
             return AcceptResult::Malformed;
         }
@@ -263,29 +308,7 @@ impl SubscriptionLog {
         if frag_end > self.config.term_length as usize {
             return AcceptResult::Malformed;
         }
-        // Re-parse the fragment to validate its header agrees with the
-        // length the caller supplied. This is cheap (zero-copy) and
-        // catches receiver-loop bugs.
-        let parsed = match parse_frame(fragment) {
-            Ok(view) => view,
-            Err(ParseError::Misaligned) => {
-                // Caller's recv buffer alignment is the receiver loop's
-                // problem; we still write what we got.
-                return AcceptResult::Malformed;
-            }
-            Err(_) => return AcceptResult::Malformed,
-        };
-        let header = match parsed {
-            FrameView::Data { header, .. } => header,
-            _ => return AcceptResult::Malformed,
-        };
-        if header.term_id != term_id || header.term_offset != term_offset {
-            return AcceptResult::Malformed;
-        }
-        let frame_length = header.common.frame_length;
-        if frame_length as usize != fragment.len() {
-            return AcceptResult::Malformed;
-        }
+        let frame_length = fragment.len() as u32;
 
         // ---- Locate or rotate into a partition ----
         let partition = match self.find_partition(term_id) {

@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use crate::counters::Counters;
 use crate::flow_control::{FlowControl, ReceiverState};
 use crate::pub_log::{FRAGMENT_ALIGNMENT, PublicationConfig, PublicationLog};
-use crate::storage::{AlignedBuf, align_up};
-use crate::transport::UdpTransport;
+use crate::storage::align_up;
+use crate::transport::{DatagramBuf, UdpTransport};
 use crate::wire::{
     FrameView, HeartbeatFrame, NakFrame, SetupFrame, StatusMessage, parse_frame, position,
 };
@@ -160,17 +160,22 @@ pub struct MuxedSender<T: UdpTransport> {
     transport: T,
     config: MuxedSenderConfig,
     sessions: HashMap<u32, SessionOutbound>,
-    recv_buf: Box<AlignedBuf<2048>>,
+    /// Pool of receive slots reused for the batched control-recv
+    /// path. Sized to `max_control_per_tick`.
+    batch_slots: Vec<DatagramBuf>,
     counters: Option<Arc<Counters>>,
 }
 
 impl<T: UdpTransport> MuxedSender<T> {
     pub fn new(transport: T, config: MuxedSenderConfig) -> Self {
+        let batch_slots = (0..config.max_control_per_tick)
+            .map(|_| DatagramBuf::new(2048))
+            .collect();
         Self {
             transport,
             config,
             sessions: HashMap::new(),
-            recv_buf: Box::new(AlignedBuf::new()),
+            batch_slots,
             counters: None,
         }
     }
@@ -293,28 +298,30 @@ impl<T: UdpTransport> MuxedSender<T> {
     }
 
     fn drain_control(&mut self, stats: &mut TickStats) {
-        for _ in 0..self.config.max_control_per_tick {
-            let len = {
-                let buf = self.recv_buf.slice_mut();
-                match self.transport.recv_from(buf) {
-                    Ok(Some((_from, len))) => len,
-                    Ok(None) => return,
-                    Err(_) => {
-                        stats.control_drops += 1;
-                        continue;
-                    }
-                }
-            };
-            let bytes = &self.recv_buf.slice()[..len];
-            // Copy out the routed frame's session_id and the
-            // structured payload before dropping the recv_buf
-            // borrow — same trick as MuxedReceiver, lets us route
-            // through &mut self after.
-            enum Routed {
-                Nak { session_id: u32, nak: NakFrame },
-                Sm { session_id: u32, sm: StatusMessage },
-                Drop,
+        // One batched recv per tick — sender-side control traffic
+        // (NAK/SM) is lower volume than data, but the same N→1
+        // syscall amortization applies.
+        let n = match self.transport.recv_batch(&mut self.batch_slots) {
+            Ok(n) => n,
+            Err(_) => {
+                stats.control_drops += 1;
+                return;
             }
+        };
+        if n == 0 {
+            return;
+        }
+
+        // Copy out the structured frame so we can route through
+        // &mut self after — same two-phase trick as MuxedReceiver.
+        enum Routed {
+            Nak { session_id: u32, nak: NakFrame },
+            Sm { session_id: u32, sm: StatusMessage },
+            Drop,
+        }
+
+        for slot in &self.batch_slots[..n] {
+            let bytes = slot.payload();
             let routed = match parse_frame(bytes) {
                 Ok(FrameView::Nak(nak)) => Routed::Nak {
                     session_id: nak.session_id,
@@ -325,8 +332,7 @@ impl<T: UdpTransport> MuxedSender<T> {
                     sm: *sm,
                 },
                 // Sender side ignores Data / Setup / Heartbeat —
-                // those are subscriber-bound or our own echoes
-                // (multicast loop).
+                // subscriber-bound or own echoes (multicast loop).
                 _ => Routed::Drop,
             };
             match routed {
@@ -335,9 +341,6 @@ impl<T: UdpTransport> MuxedSender<T> {
                     if let Some(session) = self.sessions.get_mut(&session_id) {
                         session.handle_nak(&self.transport, &nak, stats);
                     } else {
-                        // NAK for an unknown session — could be a
-                        // stale frame from an evicted session, or
-                        // an attacker probing. Drop.
                         stats.control_drops += 1;
                     }
                 }
@@ -364,32 +367,58 @@ impl SessionOutbound {
         stats: &mut TickStats,
         max_drain_per_tick: u32,
     ) {
+        // Stage up to BATCH fragments and ship via `send_batch_to`
+        // (one sendmmsg syscall on the kernel transport). See
+        // sender.rs::drain_data for the rationale; this is the
+        // muxed-session equivalent.
+        const BATCH: usize = 32;
+        let mut frags: [&[u8]; BATCH] = [&[]; BATCH];
+        let mut aligned_sizes: [u32; BATCH] = [0; BATCH];
+
         let mut drained = 0u32;
         while drained < max_drain_per_tick {
-            let Some(fragment) = self.log.published_fragment(self.last_sent_position) else {
-                // Discriminate "nothing new to send" from "we got rotated
-                // past our cursor" — if the producer has published past
-                // our last_sent_position but the term is no longer
-                // resident, we're permanently stalled on this session.
+            let mut count = 0usize;
+            let mut probe_pos = self.last_sent_position;
+            let mut staged_aligned: u32 = 0;
+            while count < BATCH && drained + staged_aligned < max_drain_per_tick {
+                let Some(fragment) = self.log.published_fragment(probe_pos) else {
+                    break;
+                };
+                let aligned = align_up(fragment.len() as u32, FRAGMENT_ALIGNMENT);
+                frags[count] = fragment;
+                aligned_sizes[count] = aligned;
+                probe_pos += aligned as u64;
+                staged_aligned += aligned;
+                count += 1;
+            }
+            if count == 0 {
+                // Discriminate "nothing new to send" from "we got
+                // rotated past our cursor".
                 if self.last_sent_position < self.log.publisher_position() {
                     stats.partition_misses += 1;
                 }
                 break;
-            };
-            let len = fragment.len();
-            let aligned = align_up(len as u32, FRAGMENT_ALIGNMENT);
-            match transport.send_to(self.dst, fragment) {
-                Ok(_) => {
-                    self.last_sent_position += aligned as u64;
-                    stats.bytes_sent += len as u64;
-                    stats.fragments_sent += 1;
-                    drained += aligned;
-                    self.last_send_at = Instant::now();
-                }
+            }
+
+            let sent = match transport.send_batch_to(self.dst, &frags[..count]) {
+                Ok(n) => n,
                 Err(_) => {
                     stats.send_errors += 1;
                     break;
                 }
+            };
+            if sent == 0 {
+                break;
+            }
+            for i in 0..sent {
+                self.last_sent_position += aligned_sizes[i] as u64;
+                stats.bytes_sent += frags[i].len() as u64;
+                stats.fragments_sent += 1;
+                drained += aligned_sizes[i];
+            }
+            self.last_send_at = Instant::now();
+            if sent < count {
+                break;
             }
         }
     }

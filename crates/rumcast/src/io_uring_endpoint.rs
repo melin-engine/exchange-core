@@ -66,7 +66,7 @@ use io_uring::{IoUring, opcode};
 
 use crate::shared_udp::{Direction, classify};
 use crate::spsc::{self, Consumer, Producer};
-use crate::transport::UdpTransport;
+use crate::transport::{DatagramBuf, UdpTransport};
 
 /// Pre-submitted RecvMsg SQE pool size. The kernel keeps up to this
 /// many recv buffers in flight at any moment.
@@ -575,9 +575,24 @@ impl UdpTransport for EndpointSend {
         self.socket.send_to(bytes, dst)
     }
 
+    fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+        // Same kernel-fast-path sendmmsg as KernelUdp — io_uring's
+        // SendMsg SQEs aren't a meaningful win for UDP sends and
+        // would add ring contention with the recv poller.
+        crate::transport::sendmmsg_to(self.socket.as_raw_fd(), dst, payloads)
+    }
+
     #[inline]
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         consume_one(&self.consumer, buf)
+    }
+
+    fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+        // Drain N frames from the SPSC under ONE Mutex acquire —
+        // turns N lock/unlock cmpxchgs into one. The kernel-side
+        // batching already happened in the poller's CQE harvest;
+        // this batches the consumer hop too.
+        consume_batch(&self.consumer, slots)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -599,9 +614,17 @@ impl UdpTransport for EndpointRecv {
         self.socket.send_to(bytes, dst)
     }
 
+    fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+        crate::transport::sendmmsg_to(self.socket.as_raw_fd(), dst, payloads)
+    }
+
     #[inline]
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         consume_one(&self.consumer, buf)
+    }
+
+    fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+        consume_batch(&self.consumer, slots)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -657,6 +680,32 @@ fn consume_one(
             Ok(Some((frame.from(), len)))
         }
     }
+}
+
+/// Drain up to `slots.len()` frames from the SPSC consumer under one
+/// `Mutex` acquire. Each filled slot has its `from` and `len` updated
+/// in place. Returns the number filled.
+fn consume_batch(
+    consumer: &Mutex<Consumer<Frame>>,
+    slots: &mut [DatagramBuf],
+) -> io::Result<usize> {
+    let mut guard = consumer.lock().expect("consumer mutex poisoned");
+    let mut filled = 0;
+    for slot in slots.iter_mut() {
+        match guard.try_pop() {
+            None => break,
+            Some(frame) => {
+                let payload = frame.payload();
+                let buf = slot.as_mut_slice();
+                let len = payload.len().min(buf.len());
+                buf[..len].copy_from_slice(&payload[..len]);
+                slot.from = frame.from();
+                slot.len = len;
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// Convert kernel-filled sockaddr_storage to SocketAddr. Anything

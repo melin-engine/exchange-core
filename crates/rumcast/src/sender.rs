@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use crate::counters::Counters;
 use crate::flow_control::{FlowControl, ReceiverState};
 use crate::pub_log::{FRAGMENT_ALIGNMENT, PublicationLog};
-use crate::storage::{AlignedBuf, align_up};
+use crate::storage::align_up;
+use crate::transport::DatagramBuf;
 use crate::transport::UdpTransport;
 use crate::wire::{
     FrameView, HeartbeatFrame, NakFrame, SetupFrame, StatusMessage, parse_frame, position,
@@ -125,8 +126,9 @@ pub struct SenderLoop<T: UdpTransport> {
     /// `heartbeat_interval`.
     last_send_at: Instant,
     receivers: HashMap<u64, ReceiverState>,
-    /// Aligned recv buffer for incoming control frames.
-    recv_buf: Box<AlignedBuf<2048>>,
+    /// Pool of receive slots for the batched control-recv path.
+    /// Sized to `max_control_per_tick`.
+    batch_slots: Vec<DatagramBuf>,
     /// Optional cumulative counters for monitoring. When `Some`,
     /// every tick folds its [`TickStats`] into the shared totals.
     counters: Option<Arc<Counters>>,
@@ -137,6 +139,9 @@ impl<T: UdpTransport> SenderLoop<T> {
         let bits = log.term_length_bits();
         let last_sent_position = position(log.config().initial_term_id, 0, bits);
         let now = Instant::now();
+        let batch_slots = (0..config.max_control_per_tick)
+            .map(|_| DatagramBuf::new(2048))
+            .collect();
         Self {
             log,
             transport,
@@ -149,7 +154,7 @@ impl<T: UdpTransport> SenderLoop<T> {
             last_setup_at: now,
             last_send_at: now,
             receivers: HashMap::new(),
-            recv_buf: Box::new(AlignedBuf::new()),
+            batch_slots,
             counters: None,
         }
     }
@@ -183,35 +188,50 @@ impl<T: UdpTransport> SenderLoop<T> {
     }
 
     fn drain_control(&mut self, stats: &mut TickStats) {
-        for _ in 0..self.config.max_control_per_tick {
-            let len = {
-                let buf = self.recv_buf.slice_mut();
-                match self.transport.recv_from(buf) {
-                    Ok(Some((_from, len))) => len,
-                    Ok(None) => return,
-                    Err(_) => {
-                        stats.control_drops += 1;
-                        continue;
-                    }
+        // One batched recv per tick — sender control traffic
+        // (NAK/SM) amortizes its per-frame syscall the same way the
+        // receiver's data path does.
+        let n = match self.transport.recv_batch(&mut self.batch_slots) {
+            Ok(n) => n,
+            Err(_) => {
+                stats.control_drops += 1;
+                return;
+            }
+        };
+        if n == 0 {
+            return;
+        }
+
+        // First pass: copy out the structured frame so we can route
+        // through &mut self after. NakFrame and StatusMessage are
+        // small POD structs; copy is ~30 bytes, cheaper than threading
+        // a borrow + drop through the borrow checker.
+        enum Routed {
+            Nak(NakFrame),
+            Sm(StatusMessage),
+            Drop,
+        }
+        for i in 0..n {
+            // Re-borrow per iteration so the slot borrow ends before
+            // the &mut self call (handle_nak / handle_sm).
+            let routed = {
+                let bytes = self.batch_slots[i].payload();
+                match parse_frame(bytes) {
+                    Ok(FrameView::Nak(nak)) => Routed::Nak(*nak),
+                    Ok(FrameView::StatusMessage(sm)) => Routed::Sm(*sm),
+                    _ => Routed::Drop,
                 }
             };
-            // recv_buf's mutable borrow ended above; safe to re-borrow.
-            let bytes = &self.recv_buf.slice()[..len];
-            match parse_frame(bytes) {
-                Ok(FrameView::Nak(nak)) => {
-                    let nak = *nak; // copy out so the borrow on bytes can end
+            match routed {
+                Routed::Nak(nak) => {
                     stats.naks_received += 1;
                     self.handle_nak(&nak, stats);
                 }
-                Ok(FrameView::StatusMessage(sm)) => {
-                    let sm = *sm;
+                Routed::Sm(sm) => {
                     stats.sms_received += 1;
                     self.handle_sm(&sm);
                 }
-                // Sender ignores Data / Setup / Heartbeat — those are
-                // subscriber-bound or our own echoes (multicast loop).
-                Ok(_) => stats.control_drops += 1,
-                Err(_) => stats.control_drops += 1,
+                Routed::Drop => stats.control_drops += 1,
             }
         }
     }
@@ -300,33 +320,69 @@ impl<T: UdpTransport> SenderLoop<T> {
     }
 
     fn drain_data(&mut self, stats: &mut TickStats) {
+        // Collect up to BATCH fragments at once and ship them via
+        // `send_batch_to` (one `sendmmsg` syscall on the kernel
+        // backend). At sustained rate this turns one syscall per
+        // fragment into one syscall per BATCH fragments.
+        //
+        // Stack-resident — no heap allocation per tick.
+        const BATCH: usize = 32;
+        let mut frags: [&[u8]; BATCH] = [&[]; BATCH];
+        let mut aligned_sizes: [u32; BATCH] = [0; BATCH];
+
         let mut drained = 0u32;
         while drained < self.config.max_drain_per_tick {
-            let Some(fragment) = self.log.published_fragment(self.last_sent_position) else {
+            // Stage as many fragments as we can without exceeding the
+            // tick budget or the batch cap.
+            let mut count = 0usize;
+            let mut probe_pos = self.last_sent_position;
+            let mut staged_aligned: u32 = 0;
+            while count < BATCH && drained + staged_aligned < self.config.max_drain_per_tick {
+                let Some(fragment) = self.log.published_fragment(probe_pos) else {
+                    break;
+                };
+                let aligned = align_up(fragment.len() as u32, FRAGMENT_ALIGNMENT);
+                frags[count] = fragment;
+                aligned_sizes[count] = aligned;
+                probe_pos += aligned as u64;
+                staged_aligned += aligned;
+                count += 1;
+            }
+            if count == 0 {
                 break;
-            };
-            // The log returned a borrow; copy length / aligned size
-            // before we send (so we can release the borrow if needed).
-            let len = fragment.len();
-            let aligned = align_up(len as u32, FRAGMENT_ALIGNMENT);
-            // SAFETY: `fragment` borrows from the log buffer; the
-            // documented contract is that the sender consumes promptly
-            // (one send_to call) before any rotation could overtake.
-            match self.transport.send_to(self.config.dst, fragment) {
-                Ok(_) => {
-                    self.last_sent_position += aligned as u64;
-                    stats.bytes_sent += len as u64;
-                    stats.fragments_sent += 1;
-                    drained += aligned;
-                    self.last_send_at = Instant::now();
-                }
+            }
+
+            // SAFETY (re: borrows): `frags[..count]` are all borrows
+            // into the log buffer. The log's contract is that the
+            // sender consumes promptly before rotation could overtake;
+            // consuming a batch of `count` fragments in a single
+            // syscall is still "prompt" — the rotation guard is on
+            // term boundaries, not per-fragment.
+            let sent = match self
+                .transport
+                .send_batch_to(self.config.dst, &frags[..count])
+            {
+                Ok(n) => n,
                 Err(_) => {
-                    // WouldBlock or similar — try again next tick.
-                    // Don't advance last_sent_position so we re-send
-                    // next time.
                     stats.send_errors += 1;
                     break;
                 }
+            };
+            if sent == 0 {
+                break;
+            }
+            for i in 0..sent {
+                self.last_sent_position += aligned_sizes[i] as u64;
+                stats.bytes_sent += frags[i].len() as u64;
+                stats.fragments_sent += 1;
+                drained += aligned_sizes[i];
+            }
+            self.last_send_at = Instant::now();
+            // If the kernel accepted fewer than we staged, the rest
+            // were a partial tail — break and let the next tick
+            // re-stage from the new last_sent_position.
+            if sent < count {
+                break;
             }
         }
     }

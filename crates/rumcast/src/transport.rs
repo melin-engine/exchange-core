@@ -20,7 +20,239 @@
 //! [`KernelUdp`]: KernelUdp
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::unix::io::RawFd;
+
+/// One reusable receive buffer + metadata, used by the batched
+/// `recv_batch` API. Owners pre-allocate a pool sized to the per-tick
+/// receive cap and reuse them across ticks — no per-frame allocation.
+pub struct DatagramBuf {
+    buf: Box<[u8]>,
+    /// Sender address. Filled by `recv_batch`; unspecified before
+    /// the slot has been written to.
+    pub from: SocketAddr,
+    /// Number of valid bytes in `buf` after `recv_batch`. Reads past
+    /// `len` are stale.
+    pub len: usize,
+}
+
+impl DatagramBuf {
+    /// Allocate a new buffer of `capacity` bytes. Typical capacity is
+    /// `2048` (rumcast's frame cap).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buf: vec![0u8; capacity].into_boxed_slice(),
+            // Placeholder address; never read before being written.
+            from: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            len: 0,
+        }
+    }
+
+    /// Valid bytes received in the most recent batch fill.
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Mutable view of the full backing buffer. Used by transports
+    /// to write incoming bytes.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+}
+
+/// Cap on the number of datagrams pushed in one `sendmmsg` call.
+/// Bounded so the per-call stack arrays stay small (~16 KB at this
+/// cap) and one transient send error doesn't waste a huge batch.
+/// Larger batches are split across multiple syscalls automatically.
+const SENDMMSG_BATCH_CAP: usize = 64;
+
+/// Issue `sendmmsg(2)` against `fd`, sending each entry in `payloads`
+/// as one UDP datagram to `dst`. Returns the count successfully
+/// queued; partial-success swallows the trailing error (matching the
+/// `UdpTransport::send_batch_to` contract).
+///
+/// Shared between [`KernelUdp`] and the io_uring endpoint halves —
+/// both hold a `RawFd` for an unconnected `UdpSocket`, and sendmmsg
+/// is the kernel-fast-path send regardless of which transport drives
+/// recv. Stays in this module since `KernelUdp` is its primary user.
+pub(crate) fn sendmmsg_to(fd: RawFd, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+    if payloads.is_empty() {
+        return Ok(0);
+    }
+
+    // One destination shared across all mmsghdrs — encode once.
+    let (sa_storage, sa_len) = sockaddr_from_socket_addr(dst);
+
+    let mut total: usize = 0;
+    let mut start = 0;
+    while start < payloads.len() {
+        let chunk_len = (payloads.len() - start).min(SENDMMSG_BATCH_CAP);
+        // Stack-allocated arrays sized to the cap; only the first
+        // chunk_len entries are populated.
+        // mmsghdr layout: { msg_hdr: msghdr, msg_len: u32 }.
+        let mut iovs: [libc::iovec; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+
+        for i in 0..chunk_len {
+            let bytes = payloads[start + i];
+            iovs[i].iov_base = bytes.as_ptr() as *mut libc::c_void;
+            iovs[i].iov_len = bytes.len();
+
+            let hdr = &mut msgs[i].msg_hdr;
+            hdr.msg_name = &sa_storage as *const _ as *mut libc::c_void;
+            hdr.msg_namelen = sa_len;
+            hdr.msg_iov = &mut iovs[i] as *mut _;
+            hdr.msg_iovlen = 1;
+            // msg_control / msg_controllen / msg_flags zeroed above.
+        }
+
+        // Safety: msgs[..chunk_len] is fully initialized; the sockaddr
+        // pointer outlives the syscall (sa_storage is on this stack
+        // frame); iov pointers point at caller-supplied slices that
+        // outlive the call.
+        let ret = unsafe {
+            libc::sendmmsg(
+                fd,
+                msgs.as_mut_ptr(),
+                chunk_len as libc::c_uint,
+                0, // no MSG_DONTWAIT — socket is already non-blocking
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            // Partial success on prior chunks: return the count
+            // already accepted by the kernel.
+            if total > 0 {
+                return Ok(total);
+            }
+            // Map WouldBlock the same way std::net does so callers
+            // can retry on the next tick uniformly.
+            return Err(err);
+        }
+        let sent = ret as usize;
+        total += sent;
+        if sent < chunk_len {
+            // Kernel accepted fewer than we asked — usually the send
+            // buffer is full. Stop here and let the caller retry.
+            return Ok(total);
+        }
+        start += chunk_len;
+    }
+    Ok(total)
+}
+
+/// Issue `recvmmsg(2)` against `fd`, filling up to `slots.len()`
+/// `DatagramBuf`s. Returns the number written. Non-blocking: returns
+/// `Ok(0)` when nothing is ready (matching the `recv_batch` contract).
+///
+/// Shared between [`KernelUdp::recv_batch`] and any future caller
+/// that wants to drain a non-connected `UdpSocket` fd in batches.
+pub(crate) fn recvmmsg_into(fd: RawFd, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+    if slots.is_empty() {
+        return Ok(0);
+    }
+    let chunk_len = slots.len().min(SENDMMSG_BATCH_CAP);
+
+    // Stack-resident parallel arrays sized to the cap. Only the first
+    // `chunk_len` entries are populated.
+    let mut iovs: [libc::iovec; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+    let mut names: [libc::sockaddr_storage; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+
+    for i in 0..chunk_len {
+        let buf = slots[i].as_mut_slice();
+        iovs[i].iov_base = buf.as_mut_ptr() as *mut libc::c_void;
+        iovs[i].iov_len = buf.len();
+
+        let hdr = &mut msgs[i].msg_hdr;
+        hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
+        hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        hdr.msg_iov = &mut iovs[i] as *mut _;
+        hdr.msg_iovlen = 1;
+    }
+
+    // Safety: msgs[..chunk_len] fully initialized; iovs/names/slots
+    // all outlive the syscall. MSG_DONTWAIT mirrors `recv_from`'s
+    // non-blocking semantics — return `Ok(0)` instead of blocking
+    // when nothing is ready.
+    let ret = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            chunk_len as libc::c_uint,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(), // timeout
+        )
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Ok(0);
+        }
+        return Err(err);
+    }
+    let n = ret as usize;
+    for i in 0..n {
+        slots[i].len = msgs[i].msg_len as usize;
+        slots[i].from = sockaddr_storage_to_socket_addr(&names[i]);
+    }
+    Ok(n)
+}
+
+/// Decode a kernel-filled `sockaddr_storage` back into a
+/// `SocketAddr`. Anything that isn't AF_INET / AF_INET6 falls back to
+/// `0.0.0.0:0` — the protocol parser drops it later.
+fn sockaddr_storage_to_socket_addr(storage: &libc::sockaddr_storage) -> SocketAddr {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            SocketAddr::new(ip.into(), port)
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            SocketAddr::new(ip.into(), port)
+        }
+        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    }
+}
+
+/// Render a `SocketAddr` into a `sockaddr_storage` + length pair
+/// suitable for `msg_name` / `msg_namelen` in a `msghdr`. IPv4 →
+/// `sockaddr_in`, IPv6 → `sockaddr_in6`.
+fn sockaddr_from_socket_addr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            // Safety: SocketAddr::V4 → sockaddr_in fits in storage.
+            let sin = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_addr.s6_addr = v6.ip().octets();
+            sin6.sin6_scope_id = v6.scope_id();
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
 
 /// Pluggable UDP datagram transport. Implementations represent one bound
 /// endpoint (a `local_addr`) that can send to and receive from arbitrary
@@ -39,10 +271,65 @@ pub trait UdpTransport: Send + Sync {
     /// send rates).
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize>;
 
+    /// Send up to `payloads.len()` datagrams to `dst` in one batched
+    /// call when the transport supports it. Returns the number of
+    /// datagrams accepted by the kernel; remaining payloads can be
+    /// retried on the next tick.
+    ///
+    /// Default impl loops over [`send_to`]. Backends like
+    /// [`KernelUdp`] override with `sendmmsg(2)` to amortize the
+    /// syscall cost across the batch — at high fragment rates this
+    /// is the difference between ~150 ns/fragment and ~1.5 ns/fragment
+    /// of syscall overhead.
+    ///
+    /// On partial success (some datagrams sent, then an error), the
+    /// fn returns the count of successful sends and swallows the
+    /// error so the caller can re-attempt the unsent tail. An error
+    /// at index 0 propagates, since no progress was made.
+    ///
+    /// [`send_to`]: Self::send_to
+    fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+        for (i, p) in payloads.iter().enumerate() {
+            match self.send_to(dst, p) {
+                Ok(_) => continue,
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => return Ok(i),
+            }
+        }
+        Ok(payloads.len())
+    }
+
     /// Try to receive one datagram into `buf`. Returns `Ok(None)` when
     /// no datagram is ready. On `Ok(Some((addr, len)))`, the first
     /// `len` bytes of `buf` are valid and `addr` is the sender.
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>>;
+
+    /// Receive up to `slots.len()` datagrams in one batched call.
+    /// Each filled slot has its `from` and `len` fields written; the
+    /// payload sits in `slot.buf[..slot.len]`. Returns the number of
+    /// slots filled. `Ok(0)` means no datagram is ready (or all the
+    /// kernel has is one that returned WouldBlock first time).
+    ///
+    /// Default impl loops over [`recv_from`]. Backends like
+    /// [`KernelUdp`] override with `recvmmsg(2)` to amortize the
+    /// syscall cost; the io_uring endpoint specializes by draining N
+    /// frames under one mutex acquire on its SPSC consumer.
+    ///
+    /// [`recv_from`]: Self::recv_from
+    fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            match self.recv_from(slot.as_mut_slice()) {
+                Ok(Some((from, len))) => {
+                    slot.from = from;
+                    slot.len = len;
+                }
+                Ok(None) => return Ok(i),
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => return Ok(i),
+            }
+        }
+        Ok(slots.len())
+    }
 
     /// Local socket address (after binding).
     fn local_addr(&self) -> io::Result<SocketAddr>;
@@ -122,6 +409,16 @@ impl UdpTransport for KernelUdp {
     #[inline]
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
         self.socket.send_to(bytes, dst)
+    }
+
+    fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        sendmmsg_to(self.socket.as_raw_fd(), dst, payloads)
+    }
+
+    fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        recvmmsg_into(self.socket.as_raw_fd(), slots)
     }
 
     fn park(&self, timeout: std::time::Duration) {
@@ -320,5 +617,98 @@ mod tests {
         let send = KernelUdp::bind(loopback(0)).unwrap();
         let n = echo_one(&send, recv.local_addr().unwrap(), b"hi");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn send_batch_to_delivers_each_payload_as_separate_datagram() {
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+
+        let payloads: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 8]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        let sent = send.send_batch_to(recv_addr, &refs).unwrap();
+        assert_eq!(sent, 5);
+
+        let mut buf = [0u8; 32];
+        for i in 0..5u8 {
+            let (_, len) = recv_one(&recv, &mut buf);
+            assert_eq!(len, 8);
+            assert!(buf[..len].iter().all(|&b| b == i));
+        }
+    }
+
+    #[test]
+    fn send_batch_to_handles_chunks_larger_than_cap() {
+        // Drive past SENDMMSG_BATCH_CAP to exercise the chunked loop.
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        // Bump SO_RCVBUF so the kernel doesn't drop our localhost
+        // burst before the test reads them.
+        let _ = recv.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+
+        const N: usize = SENDMMSG_BATCH_CAP + 16;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![(i & 0xff) as u8; 16]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+
+        let sent = send.send_batch_to(recv_addr, &refs).unwrap();
+        // Kernel may report fewer if SO_SNDBUF / receiver-side queue
+        // pressure kicks in mid-batch; we only require >= 1 chunk
+        // round-trip plus some, proving the chunk loop runs.
+        assert!(sent > SENDMMSG_BATCH_CAP, "sent={}", sent);
+    }
+
+    #[test]
+    fn send_batch_to_empty_is_noop() {
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+        let dst = loopback(1);
+        let sent = send.send_batch_to(dst, &[]).unwrap();
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
+    fn recv_batch_drains_pending_datagrams_in_one_call() {
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let _ = recv.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+        let send_addr = send.local_addr().unwrap();
+
+        // Fire 8 datagrams with distinct payloads.
+        for i in 0..8u8 {
+            send.send_to(recv_addr, &[i; 16]).unwrap();
+        }
+
+        // Spin briefly until at least one shows up — UDP loopback can
+        // race with the test thread on slow CI.
+        let mut slots: Vec<DatagramBuf> = (0..16).map(|_| DatagramBuf::new(2048)).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut total = 0usize;
+        while total < 8 && std::time::Instant::now() < deadline {
+            let n = recv.recv_batch(&mut slots[total..]).unwrap();
+            for slot in &slots[total..total + n] {
+                assert_eq!(slot.len, 16);
+                assert_eq!(slot.from, send_addr);
+            }
+            total += n;
+            if n == 0 {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+        assert_eq!(total, 8, "expected all 8 datagrams within deadline");
+
+        // Bytes preserved in order (loopback).
+        for (i, slot) in slots.iter().enumerate().take(8) {
+            assert!(slot.payload().iter().all(|&b| b == i as u8));
+        }
+    }
+
+    #[test]
+    fn recv_batch_returns_zero_when_idle() {
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let mut slots: Vec<DatagramBuf> = (0..4).map(|_| DatagramBuf::new(2048)).collect();
+        let n = recv.recv_batch(&mut slots).unwrap();
+        assert_eq!(n, 0);
     }
 }
