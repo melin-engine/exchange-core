@@ -387,6 +387,7 @@ fn main() {
                     json_path: json_path.map(|p| p.to_path_buf()),
                     busy_spin: args.rumcast_busy_spin,
                     signing_key,
+                    bench_core_start: args.bench_cores,
                 });
             }
 

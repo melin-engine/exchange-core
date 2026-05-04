@@ -83,10 +83,21 @@ pub struct RumcastBenchConfig {
     /// path, where every client connection authenticates as the same
     /// trader pubkey.
     pub signing_key: SigningKey,
+    /// First CPU core for bench thread pinning. When `Some(s)`:
+    ///   s   → main hot-loop thread
+    ///   s+1 → IoUringEndpoint poller thread
+    /// When `None`, both threads are unpinned (OS scheduler decides).
+    pub bench_core_start: Option<usize>,
 }
 
 pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     assert!(cfg.clients >= 1, "clients must be >= 1");
+
+    if let Some(core) = cfg.bench_core_start {
+        if let Err(e) = melin_server::affinity::pin_to_core(core) {
+            eprintln!("warning: could not pin rumcast bench loop to core {core}: {e}");
+        }
+    }
 
     // Each session gets a distinct session_id. Picking a random base
     // and incrementing keeps inter-bench collisions astronomically
@@ -148,8 +159,14 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // unpinned by default; if you want to pin it, set
     // EndpointConfig::poller_core. Idle fallback (park_timeout) is on
     // so an idle bench doesn't burn a core.
-    let endpoint =
-        IoUringEndpoint::bind(cfg.bind, EndpointConfig::default()).expect("io_uring endpoint bind");
+    let endpoint = IoUringEndpoint::bind(
+        cfg.bind,
+        EndpointConfig {
+            poller_core: cfg.bench_core_start.map(|s| s + 1),
+            ..EndpointConfig::default()
+        },
+    )
+    .expect("io_uring endpoint bind");
     let (send_half, recv_half) = endpoint.split();
 
     let max_sessions = (cfg.clients as u32).saturating_add(4);
@@ -542,6 +559,15 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         "=== rumcast roundtrip (clients={}, {} measured msgs) ===",
         cfg.clients, measured
     );
+    if let Some(start) = cfg.bench_core_start {
+        println!(
+            "  Bench cores: {} (hot-loop), {} (poller)",
+            start,
+            start + 1
+        );
+    } else {
+        println!("  Bench cores: unpinned");
+    }
     println!("  elapsed:    {:?}", elapsed);
     println!(
         "  throughput: {:.2} K msgs/sec",
