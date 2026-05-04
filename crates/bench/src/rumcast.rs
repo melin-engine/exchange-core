@@ -27,12 +27,10 @@ use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::session::{ClientHandshake, encode_envelope, verify_and_decode_envelope};
 use melin_rumcast::flow_control::FlowControl;
-use melin_rumcast::io_uring_endpoint::{
-    EndpointConfig, EndpointRecv, EndpointSend, IoUringEndpoint,
-};
 use melin_rumcast::muxed_receiver::{MuxedReceiver, MuxedReceiverConfig};
 use melin_rumcast::muxed_sender::{MuxedSender, MuxedSenderConfig};
 use melin_rumcast::pub_log::PublicationLog;
+use melin_rumcast::shared_udp::{SharedUdp, SharedUdpRecv, SharedUdpSend};
 use melin_rumcast::wire::{FrameView, data_flags};
 
 use crate::generator::{GeneratorConfig, OrderFlowGenerator};
@@ -83,10 +81,8 @@ pub struct RumcastBenchConfig {
     /// path, where every client connection authenticates as the same
     /// trader pubkey.
     pub signing_key: SigningKey,
-    /// First CPU core for bench thread pinning. When `Some(s)`:
-    ///   s   → main hot-loop thread
-    ///   s+1 → IoUringEndpoint poller thread
-    /// When `None`, both threads are unpinned (OS scheduler decides).
+    /// CPU core for bench thread pinning. When `Some(c)`, pins the
+    /// main hot-loop thread to core `c`. When `None`, unpinned.
     pub bench_core_start: Option<usize>,
 }
 
@@ -150,23 +146,14 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         cfg.clients
     );
 
-    // ---- Rumcast endpoints (io_uring single-owner poller + SPSC) ----
+    // ---- Rumcast endpoints (SharedUdp inline demux) ----
     //
-    // IoUringEndpoint owns one bound socket and a single poller thread
-    // that harvests CQEs, classifies each frame, and fans out to two
-    // SPSC rings. EndpointSend / EndpointRecv consume from those rings
-    // lock-free. Production layout for the bench: poller stays
-    // unpinned by default; if you want to pin it, set
-    // EndpointConfig::poller_core. Idle fallback (park_timeout) is on
-    // so an idle bench doesn't burn a core.
-    let endpoint = IoUringEndpoint::bind(
-        cfg.bind,
-        EndpointConfig {
-            poller_core: cfg.bench_core_start.map(|s| s + 1),
-            ..EndpointConfig::default()
-        },
-    )
-    .expect("io_uring endpoint bind");
+    // One bound kernel socket; `SharedUdp` demultiplexes inbound
+    // frames inline in the calling thread's `recv_from` — no
+    // background poller, no SPSC ring crossings. Data/Setup/HB
+    // route to the recv half; NAK/SM route to the send half.
+    // The single hot-loop thread drives everything.
+    let endpoint = SharedUdp::bind(cfg.bind).expect("SharedUdp bind");
     let (send_half, recv_half) = endpoint.split();
 
     let max_sessions = (cfg.clients as u32).saturating_add(4);
@@ -559,14 +546,10 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         "=== rumcast roundtrip (clients={}, {} measured msgs) ===",
         cfg.clients, measured
     );
-    if let Some(start) = cfg.bench_core_start {
-        println!(
-            "  Bench cores: {} (hot-loop), {} (poller)",
-            start,
-            start + 1
-        );
+    if let Some(core) = cfg.bench_core_start {
+        println!("  Bench core:  {} (hot-loop)", core);
     } else {
-        println!("  Bench cores: unpinned");
+        println!("  Bench core:  unpinned");
     }
     println!("  elapsed:    {:?}", elapsed);
     println!(
@@ -620,8 +603,8 @@ fn perform_handshake(
     signing_key: &SigningKey,
     session_id: u32,
     pub_log: &PublicationLog,
-    muxed_sender: &mut MuxedSender<EndpointSend>,
-    muxed_receiver: &mut MuxedReceiver<EndpointRecv>,
+    muxed_sender: &mut MuxedSender<SharedUdpSend>,
+    muxed_receiver: &mut MuxedReceiver<SharedUdpRecv>,
 ) -> [u8; 32] {
     let mut x25519_secret_bytes = [0u8; 32];
     getrandom::fill(&mut x25519_secret_bytes).expect("getrandom for X25519 ephemeral");
@@ -713,8 +696,8 @@ fn publish_blocking(pub_log: &PublicationLog, payload: &[u8]) {
 /// `deadline` expires. Used for the four handshake replies — once we
 /// switch to envelope-wrapped traffic, the bench loop polls inline.
 fn recv_match(
-    muxed_receiver: &mut MuxedReceiver<EndpointRecv>,
-    muxed_sender: &mut MuxedSender<EndpointSend>,
+    muxed_receiver: &mut MuxedReceiver<SharedUdpRecv>,
+    muxed_sender: &mut MuxedSender<SharedUdpSend>,
     target_sid: u32,
     deadline: Instant,
     predicate: impl Fn(&[u8]) -> bool,

@@ -81,12 +81,11 @@ use melin_protocol::session::{
     EnvelopeError, encode_envelope, verify_and_decode_envelope, verify_client_handshake,
 };
 use melin_rumcast::counters::Counters;
-use melin_rumcast::io_uring_endpoint::{
-    EndpointConfig, EndpointRecv, EndpointSend, IoUringEndpoint, PausedEndpoint,
-};
 use melin_rumcast::muxed_receiver::{MuxedReceiver, MuxedReceiverConfig};
 use melin_rumcast::muxed_sender::{MuxedSender, MuxedSenderConfig};
 use melin_rumcast::pub_log::PublicationLog;
+use melin_rumcast::shared_udp::SharedUdp;
+use melin_rumcast::transport::{KernelUdp, UdpTransport};
 use melin_rumcast::wire::{FrameView, data_flags};
 use melin_trading::types::QueryResponse;
 use melin_transport_core::pipeline::{OutputPayload, Pipeline, build_pipeline_with_replication};
@@ -309,14 +308,11 @@ fn run_rumcast_primary(
     // queue any client packets that arrive during init instead of
     // dropping them with ICMP Port Unreachable. Without this, a
     // client connecting at server startup loses its first Hello/
-    // Heartbeat to the unbound-port race.
-    // Bind paused so the io_uring poller doesn't start harvesting
-    // frames into a small SPSC ring while `init_engine` (below) is
-    // running for hundreds of ms — kernel rcvbuf absorbs the burst,
-    // poller starts later via `PausedEndpoint::start`.
-    let orders_paused =
-        IoUringEndpoint::bind_paused(rumcast_config.bind, EndpointConfig::default())?;
-    if let Err(e) = orders_paused.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
+    // Heartbeat to the unbound-port race. Kernel rcvbuf absorbs
+    // the burst; frames are drained once the session translator
+    // thread starts.
+    let orders = SharedUdp::bind(rumcast_config.bind)?;
+    if let Err(e) = orders.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
         warn!(error = ?e, requested = ORDERS_RCVBUF_BYTES, "failed to bump pre-bound orders socket SO_RCVBUF");
     }
 
@@ -331,7 +327,7 @@ fn run_rumcast_primary(
         app,
         writer,
         needs_seeding,
-        Some(orders_paused),
+        Some(orders),
     )
 }
 
@@ -354,7 +350,7 @@ fn run_rumcast_primary_with_state(
     // don't lose packets to an unbound port. The promotion path
     // (replica → primary) passes `None` and binds here — promotion
     // happens after a failover where clients are already retrying.
-    pre_bound_orders_socket: Option<PausedEndpoint>,
+    pre_bound_orders_socket: Option<SharedUdp<KernelUdp>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
@@ -452,11 +448,11 @@ fn run_rumcast_primary_with_state(
     // direction and a per-session SubscriptionLog / PublicationLog
     // map; sessions are allocated lazily on first contact (inbound)
     // or when authentication completes (outbound).
-    let orders_paused = match pre_bound_orders_socket {
-        Some(e) => e,
-        None => IoUringEndpoint::bind_paused(rumcast_config.bind, EndpointConfig::default())?,
+    let orders = match pre_bound_orders_socket {
+        Some(s) => s,
+        None => SharedUdp::bind(rumcast_config.bind)?,
     };
-    if let Err(e) = orders_paused.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
+    if let Err(e) = orders.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
         warn!(error = ?e, requested = ORDERS_RCVBUF_BYTES, "failed to bump orders socket SO_RCVBUF");
     }
     let muxed_receiver_config = MuxedReceiverConfig {
@@ -481,7 +477,7 @@ fn run_rumcast_primary_with_state(
     // `0.0.0.0:0` would also work but on multi-NIC hosts the kernel
     // could pick a source IP the client doesn't expect.
     let resp_bind = SocketAddr::new(rumcast_config.bind.ip(), 0);
-    let resp_paused = IoUringEndpoint::bind_paused(resp_bind, EndpointConfig::default())?;
+    let resp = SharedUdp::bind(resp_bind)?;
     // Bump the response socket's kernel recv buffer to absorb bursts
     // of SMs/NAKs from many concurrent subscribers. With 16 clients
     // sending 1 SM per 2 ms, baseline is ~8 k SMs/sec; under load
@@ -493,7 +489,7 @@ fn run_rumcast_primary_with_state(
     // take effect; we log a warning if the kernel returns a smaller
     // effective size than requested.
     const RESP_RCVBUF_BYTES: usize = 64 * 1024 * 1024;
-    if let Err(e) = resp_paused.set_recv_buffer_bytes(RESP_RCVBUF_BYTES) {
+    if let Err(e) = resp.set_recv_buffer_bytes(RESP_RCVBUF_BYTES) {
         warn!(error = ?e, requested = RESP_RCVBUF_BYTES, "failed to bump response socket SO_RCVBUF");
     }
 
@@ -755,21 +751,13 @@ fn run_rumcast_primary_with_state(
     // MatchingStage (which take the same flag inverted as `busy_spin`).
     let yield_idle = config.yield_idle;
 
-    // Start both io_uring pollers now that the engine pipeline is
-    // seeded and the session_translator is one spawn away from
-    // draining frames. Pre-`start`, packets queued in the kernel
-    // rcvbuf during init/seed/handshake-warmup; post-`start`, they
-    // flow into the SPSC rings and get drained promptly by the loop
-    // below.
-    //
-    // Orders socket is a subscriber (clients publish, server receives
-    // Data + sends NAKs back) — only the recv half feeds frames.
-    // Response socket is a publisher (server sends Data + receives
-    // NAK/SM) — only the send half receives control frames. The
-    // unused halves are dropped so their SPSC consumer ends are
-    // released.
-    let (_orders_send_unused, orders_recv_half) = orders_paused.start()?.split();
-    let (resp_send_half, _resp_recv_unused) = resp_paused.start()?.split();
+    // Split both sockets after seeding. SharedUdp demuxes inline —
+    // no poller thread to start. Orders socket: recv half handles
+    // inbound Data/Setup/HB; unused send half is dropped. Response
+    // socket: send half handles outbound Data + inbound NAK/SM;
+    // unused recv half is dropped.
+    let (_orders_send_unused, orders_recv_half) = orders.split();
+    let (resp_send_half, _resp_recv_unused) = resp.split();
     let muxed_receiver = MuxedReceiver::new(orders_recv_half, muxed_receiver_config);
     let muxed_sender = MuxedSender::new(resp_send_half, muxed_sender_config);
 
@@ -905,9 +893,9 @@ struct DiagCounters {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn session_translator(
-    mut muxed_receiver: MuxedReceiver<EndpointRecv>,
-    mut muxed_sender: MuxedSender<EndpointSend>,
+fn session_translator<S, R>(
+    mut muxed_receiver: MuxedReceiver<R>,
+    mut muxed_sender: MuxedSender<S>,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
@@ -923,7 +911,10 @@ fn session_translator(
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
     yield_idle: bool,
-) {
+) where
+    S: UdpTransport,
+    R: UdpTransport,
+{
     let mut sessions: HashMap<u32, AuthStage> = HashMap::new();
     let mut pending_outbound: Option<OutputSlot> = None;
     let mut response_buf = vec![0u8; RESPONSE_ENCODE_BUF_SIZE];
@@ -1316,14 +1307,14 @@ fn session_translator(
 /// iterating its `poll`, we append the session_id to `to_evict`
 /// and let the caller apply it after the poll returns.
 #[allow(clippy::too_many_arguments)]
-fn handle_inbound(
+fn handle_inbound<S: UdpTransport>(
     session_id: u32,
     src_addr: SocketAddr,
     payload: &[u8],
     sessions: &mut HashMap<u32, AuthStage>,
     authorized_keys: &AuthorizedKeys,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
-    muxed_sender: &mut MuxedSender<EndpointSend>,
+    muxed_sender: &mut MuxedSender<S>,
     response_buf: &mut [u8],
     to_evict: &mut Vec<u32>,
     shutdown: &AtomicBool,

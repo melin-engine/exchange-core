@@ -117,6 +117,13 @@ impl SharedUdp<KernelUdp> {
         let socket = KernelUdp::bind(local)?;
         Ok(Self::new(socket))
     }
+
+    /// Request a larger `SO_RCVBUF` on the underlying socket. Call
+    /// before splitting so the buffer is sized before any frames
+    /// arrive. Delegates to `KernelUdp::set_recv_buffer_bytes`.
+    pub fn set_recv_buffer_bytes(&self, bytes: usize) -> io::Result<()> {
+        self.inner.socket.set_recv_buffer_bytes(bytes)
+    }
 }
 
 impl<T: UdpTransport> SharedUdp<T> {
