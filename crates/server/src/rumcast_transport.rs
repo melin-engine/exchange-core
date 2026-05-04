@@ -960,16 +960,33 @@ fn session_translator(
         // UDP into per-session sublogs / out of per-session publogs
         // and processes NAK/SM control frames. They're cheap when
         // idle and proportional to per-session work otherwise.
-        // Rolling clock for per-stage attribution. One `Instant::now()`
-        // per stage boundary — cheap on x86 vDSO but not free, so we
-        // keep the call count to the minimum needed (5 per iter total).
-        let stage_start = Instant::now();
-        let recv_stats = muxed_receiver.tick();
-        let after_recv = Instant::now();
-        let send_stats = muxed_sender.tick();
-        let after_send = Instant::now();
-        diag.recv_tick_ns += after_recv.duration_since(stage_start).as_nanos() as u64;
-        diag.send_tick_ns += after_send.duration_since(after_recv).as_nanos() as u64;
+        //
+        // Per-stage attribution timestamps are taken only when
+        // RUMCAST_DIAG=1. Skipping them in production saves 5
+        // `Instant::now()` calls per iter — at the ~1.87 M iters/sec
+        // busy-spin rate seen at clients=1 window=1 this is ~280 ms/sec
+        // of clock_gettime() calls that perf was attributing to the
+        // session_translator thread.
+        let recv_stats;
+        let send_stats;
+        // Carries the `Instant` after `muxed_sender.tick()` so the
+        // post-poll timing block below can attribute `poll_ns`
+        // correctly. `None` when diag is off (no timestamps taken).
+        let after_send: Option<Instant>;
+        if diag_enabled {
+            let stage_start = Instant::now();
+            recv_stats = muxed_receiver.tick();
+            let after_recv = Instant::now();
+            send_stats = muxed_sender.tick();
+            let t = Instant::now();
+            diag.recv_tick_ns += after_recv.duration_since(stage_start).as_nanos() as u64;
+            diag.send_tick_ns += t.duration_since(after_recv).as_nanos() as u64;
+            after_send = Some(t);
+        } else {
+            recv_stats = muxed_receiver.tick();
+            send_stats = muxed_sender.tick();
+            after_send = None;
+        }
         diag.recv_frags += recv_stats.fragments_accepted as u64;
         diag.recv_bytes += recv_stats.bytes_received;
         diag.recv_dropped += recv_stats.fragments_dropped as u64;
@@ -1038,12 +1055,14 @@ fn session_translator(
         // Both cases evict from the auth table AND both muxers
         // — otherwise the session's sublog/publog memory would pin
         // until process restart.
-        // `after_poll` doubles as the post-poll timing boundary AND
-        // the wall-clock reference for the sweep below — a single
-        // `Instant::now()` covers both purposes.
-        let after_poll = Instant::now();
-        diag.poll_ns += after_poll.duration_since(after_send).as_nanos() as u64;
-        let now = after_poll;
+        // `now` is the wall-clock reference for the sweep below; the
+        // sweep is throttled by `SWEEP_INTERVAL` so we always need a
+        // real `Instant`. When diag is on it doubles as the post-poll
+        // boundary for `poll_ns` attribution.
+        let now = Instant::now();
+        if let Some(t) = after_send {
+            diag.poll_ns += now.duration_since(t).as_nanos() as u64;
+        }
         if now.duration_since(last_sweep_at) >= SWEEP_INTERVAL {
             let mut expired: Vec<u32> = Vec::new();
             sessions.retain(|session_id, stage| match stage {
@@ -1202,8 +1221,16 @@ fn session_translator(
             did_work = true;
         }
 
-        let after_outbound = Instant::now();
-        diag.outbound_ns += after_outbound.duration_since(after_poll).as_nanos() as u64;
+        // Outbound + idle attribution — only sampled when diag is on.
+        // `now` is the post-poll boundary captured above for the
+        // sweep; reusing it avoids an extra `Instant::now()` here.
+        let after_outbound = if diag_enabled {
+            let t = Instant::now();
+            diag.outbound_ns += t.duration_since(now).as_nanos() as u64;
+            Some(t)
+        } else {
+            None
+        };
 
         // ---- Idle ----
         if !did_work {
@@ -1213,10 +1240,9 @@ fn session_translator(
             } else {
                 std::hint::spin_loop();
             }
-            // One more `Instant::now()` to attribute idle time. Only
-            // taken on the idle path so the busy hot-loop stays at 5
-            // calls per iter; idle iters get 6.
-            diag.idle_ns += after_outbound.elapsed().as_nanos() as u64;
+            if let Some(t) = after_outbound {
+                diag.idle_ns += t.elapsed().as_nanos() as u64;
+            }
         }
 
         // ---- Diagnostic dump ----
