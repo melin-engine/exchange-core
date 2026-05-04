@@ -48,13 +48,11 @@ pub use crate::sender::TickStats;
 const DRAIN_BATCH: usize = 32;
 
 /// One fragment staged for the cross-session sendmmsg call in
-/// [`MuxedSender::tick`]. Data is copied into the flat
-/// `staging_data` buffer so no lifetime ties back to the pub_log.
+/// [`MuxedSender::tick`]. Carries only the fields needed by Phase 3
+/// (position accounting); destination and offset are captured in
+/// `send_entries` for the actual syscall.
 struct StagedFrag {
-    dst: SocketAddr,
-    /// Byte offset into `MuxedSender::staging_data`.
-    data_start: usize,
-    /// Payload length (wire bytes, not aligned).
+    /// Payload length (wire bytes, not aligned). Used for stats.
     len: usize,
     /// Position advance: aligned frame size in the pub_log.
     aligned: u32,
@@ -197,6 +195,9 @@ pub struct MuxedSender<T: UdpTransport> {
     /// Metadata for each staged fragment. Pre-allocated to
     /// `max_sessions × DRAIN_BATCH` to eliminate hot-path allocation.
     send_staging: Vec<StagedFrag>,
+    /// `(dst, offset, len)` entries parallel to `send_staging`, passed
+    /// directly to `send_staged` so Phase 2 needs no per-tick allocation.
+    send_entries: Vec<(SocketAddr, usize, usize)>,
     /// Per-session range within `send_staging` for the current tick.
     session_ranges: Vec<SessionSendRange>,
 }
@@ -218,6 +219,7 @@ impl<T: UdpTransport> MuxedSender<T> {
             // subsequent ticks.
             staging_data: Vec::new(),
             send_staging: Vec::with_capacity(max_s * DRAIN_BATCH),
+            send_entries: Vec::with_capacity(max_s * DRAIN_BATCH),
             session_ranges: Vec::with_capacity(max_s),
         }
     }
@@ -313,6 +315,7 @@ impl<T: UdpTransport> MuxedSender<T> {
         // Phase 1: stage outbound fragments from every session.
         self.staging_data.clear();
         self.send_staging.clear();
+        self.send_entries.clear();
         self.session_ranges.clear();
 
         for (session_id, session) in &self.sessions {
@@ -335,11 +338,11 @@ impl<T: UdpTransport> MuxedSender<T> {
                     let data_start = self.staging_data.len();
                     self.staging_data.extend_from_slice(fragment);
                     self.send_staging.push(StagedFrag {
-                        dst: session.dst,
-                        data_start,
                         len: fragment.len(),
                         aligned,
                     });
+                    self.send_entries
+                        .push((session.dst, data_start, fragment.len()));
                     probe_pos += aligned as u64;
                     aligned_this_round += aligned;
                     count += 1;
@@ -368,15 +371,12 @@ impl<T: UdpTransport> MuxedSender<T> {
             }
         }
 
-        // Phase 2: one cross-session sendmmsg call.
-        let total_sent = if !self.send_staging.is_empty() {
-            let staging_data = &self.staging_data;
-            let entries: Vec<(SocketAddr, &[u8])> = self
-                .send_staging
-                .iter()
-                .map(|f| (f.dst, &staging_data[f.data_start..f.data_start + f.len]))
-                .collect();
-            match self.transport.send_multi_to(&entries) {
+        // Phase 2: one cross-session sendmmsg call — no allocation.
+        let total_sent = if !self.send_entries.is_empty() {
+            match self
+                .transport
+                .send_staged(&self.staging_data, &self.send_entries)
+            {
                 Ok(n) => n,
                 Err(_) => {
                     stats.send_errors += 1;

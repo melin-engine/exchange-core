@@ -151,15 +151,44 @@ pub(crate) fn sendmmsg_to(fd: RawFd, dst: SocketAddr, payloads: &[&[u8]]) -> io:
 /// Used by [`MuxedSender::tick`] to batch all sessions' outbound
 /// fragments in a single syscall rather than one per session.
 pub(crate) fn sendmmsg_multi_to(fd: RawFd, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
-    if entries.is_empty() {
+    sendmmsg_staged_impl(fd, entries.len(), |i| {
+        let (dst, payload) = entries[i];
+        (dst, payload.as_ptr(), payload.len())
+    })
+}
+
+/// Issue `sendmmsg(2)` against `fd` where each message's payload is a
+/// `(offset, len)` slice into a shared `data` buffer. Avoids the
+/// per-tick `Vec<(SocketAddr, &[u8])>` collect in [`MuxedSender::tick`]
+/// by referencing payload bytes by offset rather than by pointer slice.
+pub(crate) fn sendmmsg_staged(
+    fd: RawFd,
+    data: &[u8],
+    entries: &[(SocketAddr, usize, usize)],
+) -> io::Result<usize> {
+    sendmmsg_staged_impl(fd, entries.len(), |i| {
+        let (dst, offset, len) = entries[i];
+        (dst, data[offset..].as_ptr(), len)
+    })
+}
+
+/// Common `sendmmsg` loop used by both [`sendmmsg_multi_to`] and
+/// [`sendmmsg_staged`]. `get_entry(i)` returns `(dst, payload_ptr, len)`
+/// for message index `i`. Extracted so the two callers share chunking
+/// and error-handling without an intermediate allocation.
+fn sendmmsg_staged_impl(
+    fd: RawFd,
+    count: usize,
+    get_entry: impl Fn(usize) -> (SocketAddr, *const u8, usize),
+) -> io::Result<usize> {
+    if count == 0 {
         return Ok(0);
     }
     let mut total = 0usize;
     let mut start = 0;
-    while start < entries.len() {
-        let chunk_end = entries.len().min(start + SENDMMSG_BATCH_CAP);
-        let chunk = &entries[start..chunk_end];
-        let chunk_len = chunk.len();
+    while start < count {
+        let chunk_end = count.min(start + SENDMMSG_BATCH_CAP);
+        let chunk_len = chunk_end - start;
 
         // Per-message sockaddr storage — each message has its own dst.
         let mut addrs: [libc::sockaddr_storage; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
@@ -167,11 +196,11 @@ pub(crate) fn sendmmsg_multi_to(fd: RawFd, entries: &[(SocketAddr, &[u8])]) -> i
         let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
 
         for i in 0..chunk_len {
-            let (dst, payload) = chunk[i];
+            let (dst, ptr, len) = get_entry(start + i);
             let (sa, sa_len) = sockaddr_from_socket_addr(dst);
             addrs[i] = sa;
-            iovs[i].iov_base = payload.as_ptr() as *mut libc::c_void;
-            iovs[i].iov_len = payload.len();
+            iovs[i].iov_base = ptr as *mut libc::c_void;
+            iovs[i].iov_len = len;
             let hdr = &mut msgs[i].msg_hdr;
             hdr.msg_name = &addrs[i] as *const _ as *mut libc::c_void;
             hdr.msg_namelen = sa_len;
@@ -375,6 +404,32 @@ pub trait UdpTransport: Send + Sync {
         Ok(entries.len())
     }
 
+    /// Send multiple datagrams each to a distinct destination, where
+    /// each entry is `(dst, offset, len)` into a shared `data` buffer.
+    /// Avoids the `Vec<(SocketAddr, &[u8])>` collect that
+    /// [`send_multi_to`] would require — the caller pre-allocates
+    /// `entries` once and reuses it across ticks.
+    ///
+    /// Default impl loops over [`send_to`]. [`KernelUdp`] and the
+    /// io_uring endpoints override with [`sendmmsg_staged`].
+    ///
+    /// [`send_to`]: Self::send_to
+    /// [`send_multi_to`]: Self::send_multi_to
+    fn send_staged(
+        &self,
+        data: &[u8],
+        entries: &[(SocketAddr, usize, usize)],
+    ) -> io::Result<usize> {
+        for (i, &(dst, offset, len)) in entries.iter().enumerate() {
+            match self.send_to(dst, &data[offset..offset + len]) {
+                Ok(_) => {}
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => return Ok(i),
+            }
+        }
+        Ok(entries.len())
+    }
+
     /// Try to receive one datagram into `buf`. Returns `Ok(None)` when
     /// no datagram is ready. On `Ok(Some((addr, len)))`, the first
     /// `len` bytes of `buf` are valid and `addr` is the sender.
@@ -495,6 +550,15 @@ impl UdpTransport for KernelUdp {
     fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
         use std::os::unix::io::AsRawFd;
         sendmmsg_multi_to(self.socket.as_raw_fd(), entries)
+    }
+
+    fn send_staged(
+        &self,
+        data: &[u8],
+        entries: &[(SocketAddr, usize, usize)],
+    ) -> io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        sendmmsg_staged(self.socket.as_raw_fd(), data, entries)
     }
 
     fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {

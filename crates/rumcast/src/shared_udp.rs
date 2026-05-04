@@ -301,6 +301,14 @@ impl<T: UdpTransport> UdpTransport for SharedUdpSend<T> {
         self.inner.socket.send_multi_to(entries)
     }
 
+    fn send_staged(
+        &self,
+        data: &[u8],
+        entries: &[(SocketAddr, usize, usize)],
+    ) -> io::Result<usize> {
+        self.inner.socket.send_staged(data, entries)
+    }
+
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         try_recv(&self.inner, Direction::Send, buf)
     }
@@ -334,6 +342,14 @@ impl<T: UdpTransport> UdpTransport for SharedUdpRecv<T> {
 
     fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
         self.inner.socket.send_multi_to(entries)
+    }
+
+    fn send_staged(
+        &self,
+        data: &[u8],
+        entries: &[(SocketAddr, usize, usize)],
+    ) -> io::Result<usize> {
+        self.inner.socket.send_staged(data, entries)
     }
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
