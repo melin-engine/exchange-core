@@ -1896,6 +1896,36 @@ fn uring_fill_windows(
 // Shared reporting
 // ===========================================================================
 
+/// Print a latency histogram in µs. Adaptive nines: only prints p99.9, p99.99,
+/// etc. when `sample_count` is large enough (10×  per extra nine).
+pub(crate) fn print_latency_histogram(hist: &Histogram<u64>, sample_count: usize) {
+    println!("    min:     {:>8.2} µs", hist.min() as f64 / 1_000.0);
+    println!(
+        "    p50:     {:>8.2} µs",
+        hist.value_at_quantile(0.50) as f64 / 1_000.0
+    );
+    println!(
+        "    p90:     {:>8.2} µs",
+        hist.value_at_quantile(0.90) as f64 / 1_000.0
+    );
+    let mut nines = 2;
+    let mut threshold = 1_000usize;
+    while threshold <= sample_count {
+        let quantile = 1.0 - 10.0f64.powi(-(nines as i32));
+        let label = if nines <= 2 {
+            "p99".to_string()
+        } else {
+            format!("p99.{}", "9".repeat(nines - 2))
+        };
+        let value = hist.value_at_quantile(quantile) as f64 / 1_000.0;
+        let padded = format!("{label}:");
+        println!("    {padded:<9}{value:>8.2} µs");
+        nines += 1;
+        threshold *= 10;
+    }
+    println!("    max:     {:>8.2} µs", hist.max() as f64 / 1_000.0);
+}
+
 /// Print benchmark results: header, throughput, latency histogram.
 /// Optionally writes results to a JSON file for post-processing.
 #[allow(clippy::too_many_arguments)]
@@ -1926,35 +1956,7 @@ pub(crate) fn print_results(
     );
     println!();
     println!("  Per-Order Latency");
-    println!("    min:     {:>8.2} µs", histogram.min() as f64 / 1000.0);
-    println!(
-        "    p50:     {:>8.2} µs",
-        histogram.value_at_quantile(0.50) as f64 / 1000.0
-    );
-    println!(
-        "    p90:     {:>8.2} µs",
-        histogram.value_at_quantile(0.90) as f64 / 1000.0
-    );
-    // Print the highest meaningful p9X percentiles based on sample size.
-    // Each additional 9 requires 10x more samples for statistical support.
-    // p99 needs >=1K, p99.9 needs >=10K, p99.99 needs >=100K, etc.
-    let mut nines = 2; // start at p99
-    let mut threshold = 1_000usize;
-    while threshold <= measured_orders {
-        let quantile = 1.0 - 10.0f64.powi(-(nines as i32));
-        // Format: p99, p99.9, p99.99, p99.999, ...
-        let label = if nines <= 2 {
-            "p99".to_string()
-        } else {
-            format!("p99.{}", "9".repeat(nines - 2))
-        };
-        let value = histogram.value_at_quantile(quantile) as f64 / 1000.0;
-        let padded = format!("{label}:");
-        println!("    {padded:<9}{value:>8.2} µs");
-        nines += 1;
-        threshold *= 10;
-    }
-    println!("    max:     {:>8.2} µs", histogram.max() as f64 / 1000.0);
+    print_latency_histogram(histogram, measured_orders);
 
     // Print health summary if we have samples.
     if !health_samples.is_empty() {

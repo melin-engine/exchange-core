@@ -516,13 +516,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         "  throughput: {:.2} K msgs/sec",
         (measured as f64 / elapsed.as_secs_f64()) / 1_000.0
     );
-    println!("  min:    {:>10} ns", hist.min());
-    println!("  p50:    {:>10} ns", hist.value_at_quantile(0.50));
-    println!("  p90:    {:>10} ns", hist.value_at_quantile(0.90));
-    println!("  p99:    {:>10} ns", hist.value_at_quantile(0.99));
-    println!("  p99.9:  {:>10} ns", hist.value_at_quantile(0.999));
-    println!("  p99.99: {:>10} ns", hist.value_at_quantile(0.9999));
-    println!("  max:    {:>10} ns", hist.max());
+    println!("  Latency");
+    crate::print_latency_histogram(&hist, measured);
 
     if let Some(path) = cfg.json_path.as_ref() {
         let json = serde_json::json!({
