@@ -296,10 +296,13 @@ fn try_recv<T: UdpTransport>(
 }
 
 /// Drain up to `slots.len()` frames into pre-allocated `DatagramBuf`
-/// slots for the given `direction`. Acquires `inner.queues` ONCE to
-/// drain the own-direction queue, then calls `drain_until` for any
-/// remaining capacity. Reduces lock acquisitions from N (default
-/// `recv_batch` loop) to at most 1 + remaining_slots.
+/// slots for the given `direction`.
+///
+/// Phase 1 acquires `inner.queues` once and drains the own-direction
+/// queue with no syscall. Phase 2 issues a single `recvmmsg` into the
+/// remaining slots, classifies each frame in-place, compacts matching
+/// frames to the front, and routes wrong-direction frames to the other
+/// half's queue. Total syscall cost: O(1) per call instead of O(n).
 fn recv_batch_for<T: UdpTransport>(
     inner: &SharedInner<T>,
     direction: Direction,
@@ -325,16 +328,51 @@ fn recv_batch_for<T: UdpTransport>(
         }
         count
     };
-    // Phase 2: drain the socket for any remaining slots.
-    while filled < slots.len() {
-        match drain_until(inner, direction)? {
-            None => break,
-            Some(frame) => {
-                fill_slot(&mut slots[filled], frame);
-                filled += 1;
+    if filled == slots.len() {
+        return Ok(filled);
+    }
+
+    // Phase 2: one recvmmsg syscall into the remaining slots.
+    // Classify each received frame in-place: matching frames are
+    // compacted to the front of the scratch window; wrong-direction
+    // frames are moved to the other half's queue (one lock acquire
+    // per misdirected frame, rare in practice).
+    let start = filled;
+    let n = inner.socket.recv_batch(&mut slots[start..])?;
+    let mut out = 0usize;
+    for i in 0..n {
+        let dir = classify(slots[start + i].payload());
+        if dir == direction {
+            if i != out {
+                slots.swap(start + i, start + out);
+            }
+            out += 1;
+        } else {
+            let from = slots[start + i].from;
+            let bytes = slots[start + i].payload().to_vec();
+            let mut q = inner.queues.lock().expect("queues mutex poisoned");
+            match dir {
+                Direction::Recv => {
+                    if q.recv.len() < PER_DIRECTION_QUEUE_CAP {
+                        q.recv.push_back(QueuedFrame { from, bytes });
+                    } else {
+                        q.recv_dropped += 1;
+                    }
+                }
+                Direction::Send => {
+                    if q.send.len() < PER_DIRECTION_QUEUE_CAP {
+                        q.send.push_back(QueuedFrame { from, bytes });
+                    } else {
+                        q.send_dropped += 1;
+                    }
+                }
+                Direction::Drop => {
+                    q.parse_dropped += 1;
+                }
             }
         }
     }
+    filled += out;
     Ok(filled)
 }
 
