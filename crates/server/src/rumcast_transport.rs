@@ -936,6 +936,16 @@ fn session_translator<S, R>(
     // wouldn't run, SMs would never be processed, publisher_limit would
     // never advance, and the loop would deadlock.
     let mut pending_publish: Option<(u32, usize)> = None;
+    // Cached durability position. Mirrors the TCP/DPDK response stages
+    // (see `crate::response::run` and `crate::dpdk_response::run`):
+    // matching is a *parallel* consumer of the input ring (not gated on
+    // journal), so an output slot can land in the output ring before
+    // its input is journaled. The gate enforces persist-before-ack.
+    // Caching avoids three atomic loads per slot and lets one journal
+    // observation cover every slot below the cached position. Persists
+    // across outer iterations: when journal advances during tick/poll,
+    // the next outbound pass sees the new value on first use.
+    let mut cached_durable_pos: u64 = 0;
     // Wall-clock checkpoint for handshake-timeout sweeps. Throttled
     // because the sweep is O(n) over `sessions` and would otherwise
     // run millions of times per second under busy-spin idle.
@@ -1162,17 +1172,53 @@ fn session_translator<S, R>(
                 did_work = true;
                 continue;
             }
-            if crate::response::durable_pos(
-                journal_cursor.get().load(Ordering::Acquire),
-                replication_cursor.load(Ordering::Acquire),
-                fastest_replica_cursor.load(Ordering::Acquire),
-                quorum_durability,
-            ) <= slot.input_seq
-            {
-                // Not durable yet; leave pending, retry next outer iter.
-                diag.outputs_journal_blocked += 1;
-                diag.pending_outbound_held += 1;
-                break;
+            // Durability gate. `needed` is the cursor value at which
+            // `slot.input_seq` is confirmed durable (journal_cursor is
+            // "next sequence to be read" — it must reach input_seq+1).
+            let needed = slot.input_seq + 1;
+            if cached_durable_pos < needed {
+                cached_durable_pos = crate::response::durable_pos(
+                    journal_cursor.get().load(Ordering::Acquire),
+                    replication_cursor.load(Ordering::Acquire),
+                    fastest_replica_cursor.load(Ordering::Acquire),
+                    quorum_durability,
+                );
+                if cached_durable_pos < needed {
+                    // Bounded spin. Matching publishes outputs in
+                    // parallel with the journal, so the journal often
+                    // catches up within tens of µs. Spinning here
+                    // avoids the ~200µs round-trip back through
+                    // tick()+poll() before we could re-check.
+                    // Cap is generous enough to cover one journal
+                    // fsync (~35µs) but well under one outer iter.
+                    const SPIN_RECHECKS: u32 = 64;
+                    const PAUSES_PER_RECHECK: u32 = 1024;
+                    let mut still_blocked = true;
+                    'spin: for _ in 0..SPIN_RECHECKS {
+                        for _ in 0..PAUSES_PER_RECHECK {
+                            std::hint::spin_loop();
+                        }
+                        cached_durable_pos = crate::response::durable_pos(
+                            journal_cursor.get().load(Ordering::Acquire),
+                            replication_cursor.load(Ordering::Acquire),
+                            fastest_replica_cursor.load(Ordering::Acquire),
+                            quorum_durability,
+                        );
+                        if cached_durable_pos >= needed {
+                            still_blocked = false;
+                            break 'spin;
+                        }
+                    }
+                    if still_blocked {
+                        // Journal still behind after the spin. Defer
+                        // to the next outer iter so tick()+poll() get
+                        // CPU and the journal thread isn't starved by
+                        // an unbounded spin on the same socket.
+                        diag.outputs_journal_blocked += 1;
+                        diag.pending_outbound_held += 1;
+                        break;
+                    }
+                }
             }
             let slot = pending_outbound.take().expect("checked is_some above");
             diag.encode_attempts += 1;
