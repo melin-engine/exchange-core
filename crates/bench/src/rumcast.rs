@@ -154,6 +154,12 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // route to the recv half; NAK/SM route to the send half.
     // The single hot-loop thread drives everything.
     let endpoint = SharedUdp::bind(cfg.bind).expect("SharedUdp bind");
+    // Absorb burst traffic from the server without kernel drops. The default
+    // rmem_max (208KB) is far below a 16-client × 128-window burst (~400KB);
+    // without this, the kernel drops frames immediately and NAK storms ensue.
+    if let Err(e) = endpoint.set_recv_buffer_bytes(32 * 1024 * 1024) {
+        eprintln!("warning: could not bump bench socket SO_RCVBUF: {e}");
+    }
     let (send_half, recv_half) = endpoint.split();
 
     let max_sessions = (cfg.clients as u32).saturating_add(4);
