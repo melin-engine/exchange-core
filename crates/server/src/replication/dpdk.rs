@@ -897,6 +897,7 @@ pub fn run_receiver_dpdk(
     cores: crate::server::PipelineCores,
     receiver_core: usize,
     group_commit_delay: std::time::Duration,
+    pipeline_depth: usize,
     busy_spin: bool,
 ) -> ReceiverResult {
     use crate::App;
@@ -1272,7 +1273,7 @@ pub fn run_receiver_dpdk(
             crate::affinity::pin_thread("receiver", receiver_core);
         }
 
-        let mut pending_acks = PendingAckQueue::new();
+        let mut pending_acks = PendingAckQueue::new(pipeline_depth);
         let mut received_data = false;
         let mut accum_end_sequence: u64 = 0;
 
