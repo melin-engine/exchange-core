@@ -92,6 +92,10 @@
 #                       PERF_BENCH_CORE. Replica captures the reader
 #                       core (default 4); override with PERF_REPLICA_CORE
 #                       / PERF_REPLICA2_CORE.
+#   SKIP_REBOOT=1       Skip the post-DPDK reboot of all machines.
+#                       Saves time when chaining DPDK runs back-to-back;
+#                       remember to reboot manually before switching to
+#                       a kernel transport.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -1912,7 +1916,7 @@ done
 # ---------------------------------------------------------------------------
 # DPDK cleanup: reboot if any DPDK transport ran
 # ---------------------------------------------------------------------------
-if [[ "$DPDK_RAN" == "1" && "$DPDK_MODE" != "tap" ]]; then
+if [[ "$DPDK_RAN" == "1" && "$DPDK_MODE" != "tap" && "${SKIP_REBOOT:-0}" != "1" ]]; then
     echo ""
     echo "============================================================"
     echo "  Rebooting all machines to clean up DPDK state"
