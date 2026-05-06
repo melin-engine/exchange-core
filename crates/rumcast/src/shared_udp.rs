@@ -95,6 +95,13 @@ struct Queues {
     /// Frames classified as publisher-bound (NAK/StatusMessage)
     /// queued for the [`SharedUdpSend`] half.
     send: VecDeque<QueuedFrame>,
+    /// Slab freelist. Pre-allocated `QueuedFrame`s with their `bytes`
+    /// `Vec` already at `RECV_BUF_SIZE` capacity. Misroute paths pop
+    /// from here (or fall back to a fresh allocation if exhausted —
+    /// rare since queue caps bound concurrent in-flight frames);
+    /// consume paths push the drained `QueuedFrame` back. Cap is
+    /// `FREE_CAP` so a runaway allocator can't grow it unboundedly.
+    free: Vec<QueuedFrame>,
     /// Frames dropped because the destination half's queue was full.
     /// Surfaced through [`SharedUdp::dropped_counts`] for diagnostics.
     recv_dropped: u64,
@@ -104,10 +111,79 @@ struct Queues {
     parse_dropped: u64,
 }
 
+/// Maximum freelist size. Sized to comfortably cover both queues at
+/// full + a couple in-flight slabs the consume path is holding.
+const FREE_CAP: usize = 2 * PER_DIRECTION_QUEUE_CAP + 4;
+
 #[derive(Debug)]
 struct QueuedFrame {
     from: SocketAddr,
+    /// Capacity is always `RECV_BUF_SIZE` once allocated. Reuse goes
+    /// through `clear()` followed by `extend_from_slice()` instead of
+    /// replacing the buffer, which preserves the heap allocation
+    /// across reuse cycles.
     bytes: Vec<u8>,
+}
+
+impl QueuedFrame {
+    fn new() -> Self {
+        Self {
+            // Placeholder — overwritten on every fill.
+            from: SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            bytes: Vec::with_capacity(RECV_BUF_SIZE),
+        }
+    }
+}
+
+/// Pop a `QueuedFrame` from the freelist, falling back to a fresh
+/// allocation if exhausted. Caller is expected to immediately fill
+/// `from` / `bytes`.
+#[inline]
+fn acquire_frame(q: &mut Queues) -> QueuedFrame {
+    q.free.pop().unwrap_or_else(QueuedFrame::new)
+}
+
+/// Push a drained `QueuedFrame` back onto the freelist. If the
+/// freelist is at `FREE_CAP`, drop the frame instead — keeps memory
+/// bounded if a transient allocation grew the pool.
+#[inline]
+fn release_frame(q: &mut Queues, frame: QueuedFrame) {
+    if q.free.len() < FREE_CAP {
+        q.free.push(frame);
+    }
+}
+
+/// Misroute path: a frame the local half doesn't want. Pull a slab
+/// from the freelist, fill it from `src`, and push it onto the other
+/// half's queue (or bump a drop counter if that queue is at cap).
+fn enqueue_misrouted(q: &mut Queues, dir: Direction, from: SocketAddr, src: &[u8]) {
+    match dir {
+        Direction::Drop => {
+            q.parse_dropped += 1;
+        }
+        Direction::Recv => {
+            if q.recv.len() >= PER_DIRECTION_QUEUE_CAP {
+                q.recv_dropped += 1;
+                return;
+            }
+            let mut frame = acquire_frame(q);
+            frame.from = from;
+            frame.bytes.clear();
+            frame.bytes.extend_from_slice(src);
+            q.recv.push_back(frame);
+        }
+        Direction::Send => {
+            if q.send.len() >= PER_DIRECTION_QUEUE_CAP {
+                q.send_dropped += 1;
+                return;
+            }
+            let mut frame = acquire_frame(q);
+            frame.from = from;
+            frame.bytes.clear();
+            frame.bytes.extend_from_slice(src);
+            q.send.push_back(frame);
+        }
+    }
 }
 
 impl SharedUdp<KernelUdp> {
@@ -129,12 +205,21 @@ impl SharedUdp<KernelUdp> {
 impl<T: UdpTransport> SharedUdp<T> {
     /// Wrap an already-constructed transport for shared use.
     pub fn new(socket: T) -> Self {
+        // Pre-allocate the freelist to FREE_CAP. Each slab carries a
+        // `Vec<u8>` with capacity == RECV_BUF_SIZE; clear+extend on
+        // reuse preserves the heap buffer, so steady-state misroute
+        // dispatch does no allocation.
+        let mut free: Vec<QueuedFrame> = Vec::with_capacity(FREE_CAP);
+        for _ in 0..FREE_CAP {
+            free.push(QueuedFrame::new());
+        }
         Self {
             inner: Arc::new(SharedInner {
                 socket,
                 queues: Mutex::new(Queues {
                     recv: VecDeque::with_capacity(PER_DIRECTION_QUEUE_CAP),
                     send: VecDeque::with_capacity(PER_DIRECTION_QUEUE_CAP),
+                    free,
                     recv_dropped: 0,
                     send_dropped: 0,
                     parse_dropped: 0,
@@ -198,15 +283,18 @@ pub(crate) fn classify(bytes: &[u8]) -> Direction {
 
 /// Drain the underlying socket, dispatching every parseable frame
 /// to the appropriate queue, and stop as soon as we get one that
-/// matches `want`. Returns the (from, bytes) of that frame on
-/// success, or `Ok(None)` if the socket has nothing pending.
+/// matches `want`. Writes the matched frame directly into `out_buf`
+/// (no slab allocation on the match path). Returns the (from, n) of
+/// that frame on success, or `Ok(None)` if the socket has nothing
+/// pending.
 ///
 /// Caller must NOT be holding `inner.queues` lock — we acquire it
-/// per dispatch to keep the lock-hold window short.
+/// per misrouted frame to keep the lock-hold window short.
 fn drain_until<T: UdpTransport>(
     inner: &SharedInner<T>,
     want: Direction,
-) -> io::Result<Option<QueuedFrame>> {
+    out_buf: &mut [u8],
+) -> io::Result<Option<(SocketAddr, usize)>> {
     let mut tmp = [0u8; RECV_BUF_SIZE];
     loop {
         match inner.socket.recv_from(&mut tmp) {
@@ -215,46 +303,22 @@ fn drain_until<T: UdpTransport>(
             Ok(Some((from, len))) => {
                 let dir = classify(&tmp[..len]);
                 if dir == want {
-                    return Ok(Some(QueuedFrame {
-                        from,
-                        bytes: tmp[..len].to_vec(),
-                    }));
+                    let n = len.min(out_buf.len());
+                    out_buf[..n].copy_from_slice(&tmp[..n]);
+                    return Ok(Some((from, n)));
                 }
-                // Route to the OTHER half's queue or drop.
                 let mut q = inner.queues.lock().expect("queues mutex poisoned");
-                match dir {
-                    Direction::Recv => {
-                        if q.recv.len() >= PER_DIRECTION_QUEUE_CAP {
-                            q.recv_dropped += 1;
-                        } else {
-                            q.recv.push_back(QueuedFrame {
-                                from,
-                                bytes: tmp[..len].to_vec(),
-                            });
-                        }
-                    }
-                    Direction::Send => {
-                        if q.send.len() >= PER_DIRECTION_QUEUE_CAP {
-                            q.send_dropped += 1;
-                        } else {
-                            q.send.push_back(QueuedFrame {
-                                from,
-                                bytes: tmp[..len].to_vec(),
-                            });
-                        }
-                    }
-                    Direction::Drop => {
-                        q.parse_dropped += 1;
-                    }
-                }
+                enqueue_misrouted(&mut q, dir, from, &tmp[..len]);
             }
         }
     }
 }
 
 /// Copy a `QueuedFrame` into a pre-allocated `DatagramBuf` slot.
+/// Caller is responsible for returning the drained `frame` to the
+/// freelist.
 #[inline]
-fn fill_slot(slot: &mut DatagramBuf, frame: QueuedFrame) {
+fn fill_slot(slot: &mut DatagramBuf, frame: &QueuedFrame) {
     let buf = slot.as_mut_slice();
     let n = frame.bytes.len().min(buf.len());
     buf[..n].copy_from_slice(&frame.bytes[..n]);
@@ -270,7 +334,9 @@ fn try_recv<T: UdpTransport>(
     direction: Direction,
     buf: &mut [u8],
 ) -> io::Result<Option<(SocketAddr, usize)>> {
-    // Fast path: pop from our own queue if anything's waiting.
+    // Fast path: pop from our own queue if anything's waiting. Copy
+    // the bytes out under the lock, then return the slab to the
+    // freelist before releasing.
     {
         let mut q = inner.queues.lock().expect("queues mutex poisoned");
         let queue = match direction {
@@ -281,18 +347,15 @@ fn try_recv<T: UdpTransport>(
         if let Some(frame) = queue.pop_front() {
             let n = frame.bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&frame.bytes[..n]);
-            return Ok(Some((frame.from, n)));
+            let from = frame.from;
+            release_frame(&mut q, frame);
+            return Ok(Some((from, n)));
         }
     }
-    // Slow path: drain the socket until we find one for us or it's empty.
-    match drain_until(inner, direction)? {
-        None => Ok(None),
-        Some(frame) => {
-            let n = frame.bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&frame.bytes[..n]);
-            Ok(Some((frame.from, n)))
-        }
-    }
+    // Slow path: drain the socket until we find one for us or it's
+    // empty. drain_until writes the match directly into `buf` and
+    // routes any misrouted frames through the slab freelist.
+    drain_until(inner, direction, buf)
 }
 
 /// Drain up to `slots.len()` frames into pre-allocated `DatagramBuf`
@@ -308,20 +371,24 @@ fn recv_batch_for<T: UdpTransport>(
     direction: Direction,
     slots: &mut [DatagramBuf],
 ) -> io::Result<usize> {
-    // Phase 1: drain our own queue under one lock acquire.
+    // Phase 1: drain our own queue under one lock acquire. Each
+    // pop'd slab is copied into a caller slot then immediately
+    // returned to the freelist (still under the same lock, so no
+    // extra lock-acquire cost).
     let mut filled = {
         let mut q = inner.queues.lock().expect("queues mutex poisoned");
-        let queue = match direction {
-            Direction::Recv => &mut q.recv,
-            Direction::Send => &mut q.send,
-            Direction::Drop => unreachable!(),
-        };
         let mut count = 0;
         while count < slots.len() {
+            let queue = match direction {
+                Direction::Recv => &mut q.recv,
+                Direction::Send => &mut q.send,
+                Direction::Drop => unreachable!(),
+            };
             match queue.pop_front() {
                 None => break,
                 Some(frame) => {
-                    fill_slot(&mut slots[count], frame);
+                    fill_slot(&mut slots[count], &frame);
+                    release_frame(&mut q, frame);
                     count += 1;
                 }
             }
@@ -335,8 +402,9 @@ fn recv_batch_for<T: UdpTransport>(
     // Phase 2: one recvmmsg syscall into the remaining slots.
     // Classify each received frame in-place: matching frames are
     // compacted to the front of the scratch window; wrong-direction
-    // frames are moved to the other half's queue (one lock acquire
-    // per misdirected frame, rare in practice).
+    // frames are moved to the other half's queue via the slab
+    // freelist (one lock acquire per misdirected frame, rare in
+    // practice).
     let start = filled;
     let n = inner.socket.recv_batch(&mut slots[start..])?;
     let mut out = 0usize;
@@ -349,27 +417,8 @@ fn recv_batch_for<T: UdpTransport>(
             out += 1;
         } else {
             let from = slots[start + i].from;
-            let bytes = slots[start + i].payload().to_vec();
             let mut q = inner.queues.lock().expect("queues mutex poisoned");
-            match dir {
-                Direction::Recv => {
-                    if q.recv.len() < PER_DIRECTION_QUEUE_CAP {
-                        q.recv.push_back(QueuedFrame { from, bytes });
-                    } else {
-                        q.recv_dropped += 1;
-                    }
-                }
-                Direction::Send => {
-                    if q.send.len() < PER_DIRECTION_QUEUE_CAP {
-                        q.send.push_back(QueuedFrame { from, bytes });
-                    } else {
-                        q.send_dropped += 1;
-                    }
-                }
-                Direction::Drop => {
-                    q.parse_dropped += 1;
-                }
-            }
+            enqueue_misrouted(&mut q, dir, from, slots[start + i].payload());
         }
     }
     filled += out;
@@ -503,6 +552,16 @@ impl<T: UdpTransport> SharedUdpRecv<T> {
     pub fn dropped_counts(&self) -> (u64, u64, u64) {
         let q = self.inner.queues.lock().expect("queues mutex poisoned");
         (q.recv_dropped, q.send_dropped, q.parse_dropped)
+    }
+
+    #[cfg(test)]
+    fn free_len(&self) -> usize {
+        self.inner
+            .queues
+            .lock()
+            .expect("queues mutex poisoned")
+            .free
+            .len()
     }
 }
 
@@ -781,6 +840,45 @@ mod tests {
             send_dropped > 0,
             "expected send_dropped > 0 after queue overflow, got {send_dropped}",
         );
+    }
+
+    #[test]
+    fn slab_freelist_reused_across_misroute_cycles() {
+        // Misroute path: NAKs sent to a SharedUdp are drained by
+        // recv_half but belong to send_half. Each one consumes a
+        // slab from the freelist; once send_half drains, the slab
+        // returns. Run multiple cycles and verify the freelist
+        // bounces between FREE_CAP and FREE_CAP - 1 instead of
+        // shrinking — proves slabs are reused, not freshly allocated
+        // and dropped on every cycle.
+        let shared = SharedUdp::bind(loopback(0)).unwrap();
+        let bound = shared.local_addr().unwrap();
+        let (send_half, recv_half) = shared.split();
+        let peer = KernelUdp::bind(loopback(0)).unwrap();
+        let nak = nak_frame();
+
+        // Sanity: pre-allocated freelist starts full.
+        assert_eq!(recv_half.free_len(), FREE_CAP);
+
+        let mut buf = [0u8; 2048];
+        for _ in 0..8 {
+            peer.send_to(bound, &nak).unwrap();
+            // Wait for kernel delivery before draining.
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                let _ = recv_half.recv_from(&mut buf).unwrap();
+                let queued = FREE_CAP - recv_half.free_len();
+                if queued >= 1 || Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            // One slab is currently held by send_half's queue.
+            assert_eq!(recv_half.free_len(), FREE_CAP - 1);
+            // send_half drains it; slab returns to free.
+            assert!(send_half.recv_from(&mut buf).unwrap().is_some());
+            assert_eq!(recv_half.free_len(), FREE_CAP);
+        }
     }
 
     #[test]
