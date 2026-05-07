@@ -519,7 +519,12 @@ For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4
 
 ---
 
-## Kernel UDP Tuning
+## Kernel UDP Tuning (experimental)
+
+The rumcast UDP transport is **experimental** and not yet recommended
+for production deployments. The tuning below applies only to operators
+running the rumcast wire protocol; the kernel-TCP and DPDK transports
+do not need it.
 
 The rumcast wire protocol uses UDP datagrams with reliable delivery (NAK + retransmit) on top. The kernel's default UDP socket buffer size is much smaller than rumcast's burst patterns require; without tuning, the kernel drops frames on arrival, the protocol issues a NAK, the retransmit arrives a few milliseconds later, and steady-state throughput collapses by an order of magnitude under load. **This tuning is mandatory for any rumcast-transport deployment.**
 
