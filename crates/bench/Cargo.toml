@@ -24,7 +24,19 @@ no-persist = ["melin-server/no-persist"]
 latency-trace = ["melin-server/latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
-dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]
+## DPDK userspace TCP transport. Implies `trading` + `release-tracing`
+## because the server crate needs an app selected to compile, and
+## `release-tracing` matches the production-style binary the DPDK rig
+## benches against. Add `--features=hash-chain` separately if you want
+## to measure with the journal hash chain on; add `noop` and drop
+## `trading` to bench transport-only.
+dpdk = [
+    "dep:melin-dpdk",
+    "melin-dpdk/dpdk-sys",
+    "dep:smoltcp",
+    "trading",
+    "release-tracing",
+]
 ## Single-client rumcast roundtrip mode for the LAN bench suite.
 ## Mutually exclusive with `dpdk` at build time. Mirrors the server's
 ## `--features rumcast` path.
