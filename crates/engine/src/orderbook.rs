@@ -134,9 +134,12 @@ struct LevelHead {
 
 /// A node in the per-level intrusive doubly-linked list.
 ///
-/// Layout note: `RestingOrder` is currently 40 bytes; with two `u32` links
-/// the node is 48 bytes — fits 1.33 per cache line. Future micro-opt:
-/// pack `prev`/`next` into 32-bit indices alongside `account` to hit 64B.
+/// **Layout:** `RestingOrder` is 40 bytes plus two `u32` links — 48 bytes
+/// total. Forcing 64-byte alignment was tested and *regressed* throughput
+/// ~4% on the realistic-flow bench because sequential level walks
+/// (`available_quantity`, `for_each_order`) lost cache density that
+/// outweighed the per-node single-line read on cancel. The 48-byte
+/// natural layout wins on this workload.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OrderNode {
     pub(crate) order: RestingOrder,
@@ -285,6 +288,47 @@ impl BookSide {
         }
     }
 
+    /// Touch every slab page so first-use page faults happen at startup
+    /// rather than on the hot path. Mirrors the HashMap prefault on
+    /// `OrderBook`. Pushes dummy nodes up to `capacity()` then clears
+    /// the Vec — `Vec::clear` retains the allocation (and its physical
+    /// pages), so subsequent `alloc_node` writes hit warm memory.
+    ///
+    /// **No-op when the slab is non-empty.** `Exchange::prefault` is
+    /// called once at startup *after* snapshot restore has placed
+    /// orders. Clearing a populated slab would leave dangling
+    /// `LevelHead.head`/`tail` indices pointing at empty memory.
+    /// Idempotent and safe to re-run on an empty book.
+    fn prefault(&mut self) {
+        if !self.nodes.is_empty() {
+            // Already has live orders → pages are faulted by the
+            // existing nodes; touching them again would corrupt state.
+            return;
+        }
+        // Build a dummy node once and reuse via `Copy`.
+        let dummy = OrderNode {
+            order: RestingOrder {
+                id: OrderId(0),
+                account: AccountId(0),
+                remaining: Quantity(NonZeroU64::new(1).expect("non-zero literal")),
+                time_in_force: TimeInForce::GTC,
+                expiry_ns: 0,
+                side: Side::Buy,
+                reservation: ReservationSlot::DUMMY,
+            },
+            prev: INVALID_NODE,
+            next: INVALID_NODE,
+        };
+        let cap = self.nodes.capacity();
+        for _ in 0..cap {
+            self.nodes.push(dummy);
+        }
+        self.nodes.clear();
+        // Free list stays empty: subsequent `alloc_node` calls take the
+        // fresh-push path, overwriting the warm pages from index 0.
+        self.free_head = INVALID_NODE;
+    }
+
     /// Binary search for a price level. Returns `Ok(index)` if found,
     /// `Err(index)` for the insertion point.
     #[inline]
@@ -359,12 +403,12 @@ impl BookSide {
         new_idx
     }
 
-    /// Remove a node from the book in O(1) given its slab index and the
-    /// price level it belongs to. Frees the slab slot. Removes the price
-    /// level from `levels` if it becomes empty. Returns the removed
-    /// `RestingOrder`, or `None` if `price` doesn't match a live level.
-    pub(crate) fn remove_node(&mut self, price: Price, node_idx: u32) -> Option<RestingOrder> {
-        let level_idx = self.search(price).ok()?;
+    /// Splice `node_idx` out of the level at `level_idx`, free the slab
+    /// slot, and remove the level from `levels` if it became empty.
+    /// Returns the removed `RestingOrder`. Caller has already located the
+    /// level — used by `remove_node` and `pop_front` to skip a redundant
+    /// binary search on the hot path.
+    fn unlink_node_at_level(&mut self, level_idx: usize, node_idx: u32) -> RestingOrder {
         let prev = self.nodes[node_idx as usize].prev;
         let next = self.nodes[node_idx as usize].next;
 
@@ -391,17 +435,28 @@ impl BookSide {
         if became_empty {
             self.levels.remove(level_idx);
         }
-        Some(order)
+        order
+    }
+
+    /// Remove a node from the book in O(1) given its slab index and the
+    /// price level it belongs to. Frees the slab slot. Removes the price
+    /// level from `levels` if it becomes empty. Returns the removed
+    /// `RestingOrder`, or `None` if `price` doesn't match a live level.
+    pub(crate) fn remove_node(&mut self, price: Price, node_idx: u32) -> Option<RestingOrder> {
+        let level_idx = self.search(price).ok()?;
+        Some(self.unlink_node_at_level(level_idx, node_idx))
     }
 
     /// Pop the front (oldest, highest-priority) order at `price`.
     /// Frees the slab slot and removes the level if it becomes empty.
     /// Used by the matching loop and STP `CancelOldest`/`CancelBoth`.
-    /// Returns `(node_idx, order)` so callers can clean up auxiliary state.
+    /// Returns `(node_idx, order)` so callers can clean up auxiliary
+    /// state. Shares `unlink_node_at_level` with `remove_node` so we
+    /// only do one binary search.
     pub(crate) fn pop_front(&mut self, price: Price) -> Option<(u32, RestingOrder)> {
         let level_idx = self.search(price).ok()?;
         let head_idx = self.levels[level_idx].1.head;
-        let order = self.remove_node(price, head_idx)?;
+        let order = self.unlink_node_at_level(level_idx, head_idx);
         Some((head_idx, order))
     }
 
@@ -704,6 +759,11 @@ impl OrderBook {
             );
         }
         self.stop_index.clear();
+
+        // Touch every slab page on both sides so the first matching
+        // pop / cancel after warmup doesn't pay a page-fault stall.
+        self.bids.prefault();
+        self.asks.prefault();
     }
 
     /// Reconstruct an OrderBook from pre-built parts (used by snapshot restore).
@@ -2888,6 +2948,77 @@ mod tests {
             })
             .collect();
         assert_eq!(makers, vec![OrderId(2), OrderId(1)]);
+    }
+
+    /// `prefault` must be a no-op on a non-empty book. `Exchange::prefault`
+    /// can be called after snapshot restore has placed orders, so wiping
+    /// the slab would leave `LevelHead` indices pointing at empty memory
+    /// and crash the next operation that touches them.
+    #[test]
+    fn prefault_on_populated_book_is_noop() {
+        let mut book = OrderBook::with_capacity(TEST_SYMBOL);
+        let mut reports = Vec::new();
+        book.execute(
+            limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+
+        // Calling prefault now must NOT clear the slab.
+        book.prefault();
+
+        // The resting order must still match.
+        reports.clear();
+        book.execute(
+            limit_order(2, Side::Buy, 100, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Fill {
+                maker_order_id: OrderId(1),
+                ..
+            }
+        ));
+    }
+
+    /// `prefault` must be idempotent and must not corrupt subsequent
+    /// book operations. Run it twice on a pre-sized book, then exercise
+    /// matching to confirm the slab is in a usable state.
+    #[test]
+    fn prefault_is_idempotent_and_safe() {
+        let mut book = OrderBook::with_capacity(TEST_SYMBOL);
+        book.prefault();
+        book.prefault();
+
+        let mut reports = Vec::new();
+        book.execute(
+            limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(2, Side::Buy, 100, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        // Should produce one Placed and one Fill — proves the slab pages
+        // are usable and the linked-list invariants survived the prefault.
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        assert!(matches!(
+            reports[1],
+            ExecutionReport::Fill {
+                maker_order_id: OrderId(1),
+                taker_order_id: OrderId(2),
+                ..
+            }
+        ));
+        assert!(book.is_empty());
     }
 
     // -- Multi-level matching --
