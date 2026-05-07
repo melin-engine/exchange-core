@@ -338,75 +338,101 @@ pub fn run(
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
 
-            // Query responses arrive as `OutputPayload::QueryResponse`;
-            // the response stage translates them to the public wire
-            // variants so client-visible framing stays unchanged.
-            let kind = match slot.payload {
+            // Each slot expands to at most two wire frames: the payload
+            // (Report / QueryResponse / EngineError) and an optional
+            // trailing `BatchEnd` when `is_last_in_request` is set.
+            // `OutputPayload::BatchEnd` carries no payload of its own —
+            // the wire BatchEnd is emitted purely from the flag.
+            let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
+            let mut kinds_len: usize = 0;
+            match slot.payload {
                 OutputPayload::QueryResponse(QueryResponse::Stats {
                     active_connections,
                     events_processed,
                     journal_sequence,
-                }) => ResponseKind::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                },
+                }) => {
+                    kinds[kinds_len] = ResponseKind::StatsHeader {
+                        active_connections,
+                        events_processed,
+                        journal_sequence,
+                    };
+                    kinds_len += 1;
+                }
                 OutputPayload::QueryResponse(QueryResponse::Position {
                     account,
                     balances,
                     count,
-                }) => ResponseKind::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                },
-                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
-                    ResponseKind::RequestSeqHwm { hwm }
+                }) => {
+                    kinds[kinds_len] = ResponseKind::PositionSnapshot {
+                        account,
+                        balances,
+                        count,
+                    };
+                    kinds_len += 1;
                 }
-                OutputPayload::Report(report) => ResponseKind::Report(report),
-                OutputPayload::BatchEnd => ResponseKind::BatchEnd,
-                OutputPayload::EngineError => ResponseKind::EngineError,
-            };
+                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
+                    kinds[kinds_len] = ResponseKind::RequestSeqHwm { hwm };
+                    kinds_len += 1;
+                }
+                OutputPayload::Report(report) => {
+                    kinds[kinds_len] = ResponseKind::Report(report);
+                    kinds_len += 1;
+                }
+                OutputPayload::BatchEnd => {
+                    // No payload — terminator only. is_last_in_request
+                    // is always set on BatchEnd-payload slots.
+                }
+                OutputPayload::EngineError => {
+                    kinds[kinds_len] = ResponseKind::EngineError;
+                    kinds_len += 1;
+                }
+            }
+            if slot.is_last_in_request {
+                kinds[kinds_len] = ResponseKind::BatchEnd;
+                kinds_len += 1;
+            }
 
             if let Some(entry) = connections.get_mut(&slot.connection_id) {
-                // Encode the response (includes 4-byte length prefix).
-                let written = match codec::encode_response(&kind, &mut encode_buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!(
+                for kind in &kinds[..kinds_len] {
+                    // Encode the response (includes 4-byte length prefix).
+                    let written = match codec::encode_response(kind, &mut encode_buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::error!(
+                                connection_id = slot.connection_id,
+                                error = %e,
+                                "encode error"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Drop slow clients whose send buffer has grown too large.
+                    // This prevents unbounded memory growth from a single laggy
+                    // connection causing allocator pressure and tail latency spikes.
+                    if entry.send_buf.len() + written > MAX_SEND_BUF {
+                        debug!(
                             connection_id = slot.connection_id,
-                            error = %e,
-                            "encode error"
+                            send_buf_len = entry.send_buf.len(),
+                            "send buffer exceeded limit, dropping connection"
                         );
-                        continue;
+                        to_remove.push(slot.connection_id);
+                        break;
                     }
-                };
 
-                // Drop slow clients whose send buffer has grown too large.
-                // This prevents unbounded memory growth from a single laggy
-                // connection causing allocator pressure and tail latency spikes.
-                if entry.send_buf.len() + written > MAX_SEND_BUF {
-                    debug!(
-                        connection_id = slot.connection_id,
-                        send_buf_len = entry.send_buf.len(),
-                        "send buffer exceeded limit, dropping connection"
-                    );
-                    to_remove.push(slot.connection_id);
-                    continue;
-                }
+                    // Append the full wire frame to the connection's send buffer.
+                    // encode_response writes [length(4) | payload], which is the
+                    // complete wire format — no extra framing needed.
+                    entry.send_buf.extend_from_slice(&encode_buf[..written]);
+                    entry.last_send = batch_now;
+                    dirty_connections.insert(slot.connection_id);
 
-                // Append the full wire frame to the connection's send buffer.
-                // encode_response writes [length(4) | payload], which is the
-                // complete wire format — no extra framing needed.
-                entry.send_buf.extend_from_slice(&encode_buf[..written]);
-                entry.last_send = batch_now;
-                dirty_connections.insert(slot.connection_id);
-
-                // Record server-side end-to-end: reader recv → response flush.
-                #[cfg(feature = "latency-trace")]
-                if matches!(kind, ResponseKind::BatchEnd) {
-                    server_e2e_hist
-                        .record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
+                    // Record server-side end-to-end: reader recv → response flush.
+                    #[cfg(feature = "latency-trace")]
+                    if matches!(kind, ResponseKind::BatchEnd) {
+                        server_e2e_hist
+                            .record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
+                    }
                 }
             }
         }

@@ -76,8 +76,12 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
 /// Convert an `OutputPayload` to the wire `ResponseKind`. Translates
 /// query responses (`QueryResponse::Stats` / `::Position` /
 /// `::RequestSeqHwm`) to the public wire variants.
-fn payload_to_response(payload: OutputPayload) -> ResponseKind {
-    match payload {
+///
+/// Returns `None` for `OutputPayload::BatchEnd` — that slot carries
+/// no payload of its own; the wire `BatchEnd` is emitted from the
+/// `is_last_in_request` flag (see `slot_to_kinds`).
+fn payload_to_response(payload: OutputPayload) -> Option<ResponseKind> {
+    Some(match payload {
         OutputPayload::QueryResponse(QueryResponse::Stats {
             active_connections,
             events_processed,
@@ -100,9 +104,27 @@ fn payload_to_response(payload: OutputPayload) -> ResponseKind {
             ResponseKind::RequestSeqHwm { hwm }
         }
         OutputPayload::Report(report) => ResponseKind::Report(report),
-        OutputPayload::BatchEnd => ResponseKind::BatchEnd,
+        OutputPayload::BatchEnd => return None,
         OutputPayload::EngineError => ResponseKind::EngineError,
+    })
+}
+
+/// Expand a slot into the wire `ResponseKind`s subscribers should see:
+/// the payload (if any) plus a trailing `BatchEnd` when
+/// `is_last_in_request` is set. Returns the populated count
+/// (`0..=2`); the array is filled from index 0.
+fn slot_to_kinds(slot: &OutputSlot) -> ([ResponseKind; 2], usize) {
+    let mut kinds = [ResponseKind::BatchEnd; 2];
+    let mut len = 0;
+    if let Some(k) = payload_to_response(slot.payload) {
+        kinds[len] = k;
+        len += 1;
     }
+    if slot.is_last_in_request {
+        kinds[len] = ResponseKind::BatchEnd;
+        len += 1;
+    }
+    (kinds, len)
 }
 
 /// Run the event publisher loop. Blocks the calling thread until shutdown.
@@ -195,36 +217,39 @@ pub fn run(
 
             last_seq = ring_seq;
 
-            // Encode and broadcast.
-            let kind = payload_to_response(slot.payload);
-            frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
-            let response_len = match codec::encode_response(&kind, &mut frame_buf[8..]) {
-                Ok(n) => n,
-                Err(e) => {
-                    debug!(error = %e, "event publisher: encode failed, skipping");
-                    continue;
-                }
-            };
-            let total_len = 8 + response_len;
-            let frame = &frame_buf[..total_len];
-
-            // Write to streaming subscribers only, removing failed ones.
-            subscribers.retain_mut(|sub| {
-                if !matches!(sub.state, SubscriberState::Streaming) {
-                    return true; // keep pending subscribers
-                }
-                match sub.stream.write_all(frame) {
-                    Ok(()) => true,
+            // Encode and broadcast — one slot may expand to up to two
+            // wire frames (payload + trailing BatchEnd).
+            let (kinds, kinds_len) = slot_to_kinds(slot);
+            for kind in &kinds[..kinds_len] {
+                frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
+                let response_len = match codec::encode_response(kind, &mut frame_buf[8..]) {
+                    Ok(n) => n,
                     Err(e) => {
-                        if e.kind() == io::ErrorKind::WouldBlock {
-                            debug!(addr = %sub.addr, "event subscriber too slow, disconnecting");
-                        } else {
-                            debug!(addr = %sub.addr, error = %e, "event subscriber write error");
-                        }
-                        false
+                        debug!(error = %e, "event publisher: encode failed, skipping");
+                        continue;
                     }
-                }
-            });
+                };
+                let total_len = 8 + response_len;
+                let frame = &frame_buf[..total_len];
+
+                // Write to streaming subscribers only, removing failed ones.
+                subscribers.retain_mut(|sub| {
+                    if !matches!(sub.state, SubscriberState::Streaming) {
+                        return true; // keep pending subscribers
+                    }
+                    match sub.stream.write_all(frame) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            if e.kind() == io::ErrorKind::WouldBlock {
+                                debug!(addr = %sub.addr, "event subscriber too slow, disconnecting");
+                            } else {
+                                debug!(addr = %sub.addr, error = %e, "event subscriber write error");
+                            }
+                            false
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -590,7 +615,8 @@ mod tests {
             side: Side::Buy,
             price: Price(std::num::NonZeroU64::new(100).unwrap()),
             quantity: Quantity(std::num::NonZeroU64::new(50).unwrap()),
-        }));
+        }))
+        .expect("Report payload always has a wire kind");
 
         let ring_seq: u64 = 42;
         let mut buf = [0u8; MAX_FRAME_BUF];
@@ -627,20 +653,21 @@ mod tests {
             price: Price(std::num::NonZeroU64::new(50).unwrap()),
             quantity: Quantity(std::num::NonZeroU64::new(10).unwrap()),
         }));
-        assert!(matches!(r, ResponseKind::Report(_)));
+        assert!(matches!(r, Some(ResponseKind::Report(_))));
 
-        let r = payload_to_response(OutputPayload::BatchEnd);
-        assert!(matches!(r, ResponseKind::BatchEnd));
+        // BatchEnd-payload slots have no payload of their own; the
+        // wire BatchEnd is emitted via `is_last_in_request`.
+        assert!(payload_to_response(OutputPayload::BatchEnd).is_none());
 
         let r = payload_to_response(OutputPayload::EngineError);
-        assert!(matches!(r, ResponseKind::EngineError));
+        assert!(matches!(r, Some(ResponseKind::EngineError)));
 
         let r = payload_to_response(OutputPayload::QueryResponse(QueryResponse::Stats {
             active_connections: 5,
             events_processed: 1000,
             journal_sequence: 500,
         }));
-        assert!(matches!(r, ResponseKind::StatsHeader { .. }));
+        assert!(matches!(r, Some(ResponseKind::StatsHeader { .. })));
     }
 
     #[test]
@@ -694,7 +721,9 @@ mod tests {
             test_subscriber(server2, addr2),
         ];
 
-        let kind = payload_to_response(OutputPayload::BatchEnd);
+        // Use a wire BatchEnd frame directly — these tests just need a
+        // small dummy payload to push to subscribers.
+        let kind = ResponseKind::BatchEnd;
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         let ring_seq: u64 = 7;
         frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
@@ -740,7 +769,8 @@ mod tests {
         let mut sub = test_subscriber(server_stream, client_addr);
 
         for seq in 0u64..10 {
-            let kind = payload_to_response(OutputPayload::BatchEnd);
+            // Wire BatchEnd frame directly — synthetic test payload.
+            let kind = ResponseKind::BatchEnd;
             let mut frame_buf = [0u8; MAX_FRAME_BUF];
             frame_buf[..8].copy_from_slice(&seq.to_le_bytes());
             let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
@@ -805,7 +835,9 @@ mod tests {
         drop(_client2);
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        let kind = payload_to_response(OutputPayload::BatchEnd);
+        // Use a wire BatchEnd frame directly — these tests just need a
+        // small dummy payload to push to subscribers.
+        let kind = ResponseKind::BatchEnd;
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         frame_buf[..8].copy_from_slice(&0u64.to_le_bytes());
         let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();

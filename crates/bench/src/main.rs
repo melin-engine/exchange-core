@@ -887,7 +887,12 @@ fn run_pipeline_bench(
             std::hint::spin_loop();
             continue;
         };
-        if matches!(slot.payload, melin_engine::journal::OutputPayload::BatchEnd) {
+        // The matching stage now signals end-of-request via the
+        // `is_last_in_request` flag on the final slot for one input
+        // event, instead of a separate `OutputPayload::BatchEnd` slot.
+        // The flag is set on the last Report (or QueryResponse, or
+        // a BatchEnd-payload slot when the event produced no payload).
+        if slot.is_last_in_request {
             let (_, sent_at) = loop {
                 if let Some(v) = ts_rx.try_consume() {
                     break v;

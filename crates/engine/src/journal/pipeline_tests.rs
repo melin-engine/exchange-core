@@ -745,14 +745,10 @@ mod tests {
             output.payload,
             OutputPayload::Report(ExecutionReport::Placed { .. })
         ));
-
-        let batch_end = loop {
-            if let Some((_, slot)) = output_consumer.try_consume() {
-                break slot;
-            }
-            std::hint::spin_loop();
-        };
-        assert!(matches!(batch_end.payload, OutputPayload::BatchEnd));
+        // The Placed slot now also carries the request terminator —
+        // the response stage emits the wire BatchEnd from this flag,
+        // saving the separate BatchEnd-payload slot.
+        assert!(output.is_last_in_request);
 
         shutdown.store(true, Ordering::Relaxed);
         let _exchange = handle.join().unwrap();
@@ -1113,15 +1109,19 @@ mod tests {
         (input_producer, output_consumer, counter, shutdown, handle)
     }
 
-    /// Consume outputs until we see a BatchEnd, returning all reports.
+    /// Consume outputs until we see the request terminator, returning
+    /// all reports. The terminator is now `is_last_in_request=true`
+    /// on the final slot — it may be a Report (when the event produced
+    /// at least one) or a `BatchEnd`-payload slot (zero-report case).
     fn collect_reports(output: &mut ring::Consumer<OutputSlot>) -> Vec<ExecutionReport> {
         let mut reports = Vec::new();
         loop {
             if let Some((_, slot)) = output.try_consume() {
-                match slot.payload {
-                    OutputPayload::Report(r) => reports.push(r),
-                    OutputPayload::BatchEnd => return reports,
-                    _ => {}
+                if let OutputPayload::Report(r) = slot.payload {
+                    reports.push(r);
+                }
+                if slot.is_last_in_request {
+                    return reports;
                 }
             }
             std::hint::spin_loop();
@@ -1210,27 +1210,29 @@ mod tests {
             recv_ts: trace_ts(),
         });
 
-        // QueryStats produces StatsHeader + BatchEnd, not a Rejected.
+        // QueryStats produces a single slot — StatsHeader carrying the
+        // request terminator (is_last_in_request=true). The wire
+        // BatchEnd is emitted by the response stage from that flag.
         let mut got_stats = false;
-        let mut got_batch_end = false;
+        let mut got_terminator = false;
         for _ in 0..1_000_000 {
             if let Some((_, slot)) = output.try_consume() {
                 match slot.payload {
                     OutputPayload::QueryResponse(QueryResponse::Stats { .. }) => got_stats = true,
-                    OutputPayload::BatchEnd => {
-                        got_batch_end = true;
-                        break;
-                    }
                     OutputPayload::Report(ExecutionReport::Rejected { reason, .. }) => {
                         panic!("QueryStats should not be rejected, got: {reason:?}");
                     }
                     _ => {}
                 }
+                if slot.is_last_in_request {
+                    got_terminator = true;
+                    break;
+                }
             }
             std::hint::spin_loop();
         }
         assert!(got_stats, "should have received StatsHeader");
-        assert!(got_batch_end, "should have received BatchEnd");
+        assert!(got_terminator, "should have received request terminator");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();

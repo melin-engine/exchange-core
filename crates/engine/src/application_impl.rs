@@ -31,7 +31,7 @@ use crate::types::{
 // genuine field addition requires it.
 const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 104);
 const _: () = assert!(
-    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 408
+    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 416
 );
 const _: () = assert!(size_of::<melin_journal::JournalEvent<TradingEvent>>() == 64);
 const _: () = assert!(size_of::<ExecutionReport>() == 64);

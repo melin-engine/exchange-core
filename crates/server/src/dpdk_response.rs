@@ -228,61 +228,89 @@ pub fn run(
         // per response — heartbeat interval is 10s, sub-ms precision is plenty.
         let batch_now = Instant::now();
 
-        // Encode and queue responses.
+        // Encode and queue responses. Each slot expands to at most two
+        // wire frames: the payload (Report / QueryResponse / EngineError)
+        // and an optional trailing `BatchEnd` when `is_last_in_request`
+        // is set. `OutputPayload::BatchEnd` carries no payload of its
+        // own — the wire BatchEnd is emitted purely from the flag.
         for slot in &batch[..count] {
-            let kind = match slot.payload {
+            let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
+            let mut kinds_len: usize = 0;
+            match slot.payload {
                 OutputPayload::QueryResponse(QueryResponse::Stats {
                     active_connections,
                     events_processed,
                     journal_sequence,
-                }) => ResponseKind::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                },
+                }) => {
+                    kinds[kinds_len] = ResponseKind::StatsHeader {
+                        active_connections,
+                        events_processed,
+                        journal_sequence,
+                    };
+                    kinds_len += 1;
+                }
                 OutputPayload::QueryResponse(QueryResponse::Position {
                     account,
                     balances,
                     count,
-                }) => ResponseKind::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                },
-                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
-                    ResponseKind::RequestSeqHwm { hwm }
+                }) => {
+                    kinds[kinds_len] = ResponseKind::PositionSnapshot {
+                        account,
+                        balances,
+                        count,
+                    };
+                    kinds_len += 1;
                 }
-                OutputPayload::Report(report) => ResponseKind::Report(report),
-                OutputPayload::BatchEnd => ResponseKind::BatchEnd,
-                OutputPayload::EngineError => ResponseKind::EngineError,
-            };
+                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
+                    kinds[kinds_len] = ResponseKind::RequestSeqHwm { hwm };
+                    kinds_len += 1;
+                }
+                OutputPayload::Report(report) => {
+                    kinds[kinds_len] = ResponseKind::Report(report);
+                    kinds_len += 1;
+                }
+                OutputPayload::BatchEnd => {
+                    // No payload — terminator only via is_last_in_request.
+                }
+                OutputPayload::EngineError => {
+                    kinds[kinds_len] = ResponseKind::EngineError;
+                    kinds_len += 1;
+                }
+            }
+            if slot.is_last_in_request {
+                kinds[kinds_len] = ResponseKind::BatchEnd;
+                kinds_len += 1;
+            }
 
             if !connections.contains_key(&slot.connection_id) {
                 continue;
             }
 
-            let written = match codec::encode_response(&kind, &mut encode_buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!(
-                        connection_id = slot.connection_id,
-                        error = %e,
-                        "encode error"
-                    );
-                    continue;
-                }
-            };
+            for kind in &kinds[..kinds_len] {
+                let written = match codec::encode_response(kind, &mut encode_buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(
+                            connection_id = slot.connection_id,
+                            error = %e,
+                            "encode error"
+                        );
+                        continue;
+                    }
+                };
 
-            // Send the complete wire frame (with length prefix) to the
-            // DPDK poll thread for transmission via lock-free SPSC.
-            let mut frame = TxFrame {
-                connection_id: slot.connection_id,
-                len: written as u16,
-                ..Default::default()
-            };
-            frame.data[..written].copy_from_slice(&encode_buf[..written]);
-            let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
-            tx_producers[tid].publish(frame);
+                // Send the complete wire frame (with length prefix) to
+                // the DPDK poll thread for transmission via lock-free
+                // SPSC.
+                let mut frame = TxFrame {
+                    connection_id: slot.connection_id,
+                    len: written as u16,
+                    ..Default::default()
+                };
+                frame.data[..written].copy_from_slice(&encode_buf[..written]);
+                let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
+                tx_producers[tid].publish(frame);
+            }
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
                 state.last_send = batch_now;

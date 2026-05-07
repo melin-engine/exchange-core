@@ -189,9 +189,18 @@ impl<E: AppEvent> InputSlot<E> {
 
 /// Slot in the output SPSC queue (matching → response).
 ///
-/// Each slot carries either an execution report or a batch-end marker
-/// for a specific connection, plus the input sequence it originated from
-/// so the response stage can gate on journal completion.
+/// Each slot carries an execution report, a query response, or a
+/// terminator marker for a specific connection, plus the input
+/// sequence it originated from so the response stage can gate on
+/// journal completion.
+///
+/// The matching stage sets `is_last_in_request` on the final slot
+/// it emits for one input event; the response stage uses that to
+/// emit a wire `ResponseKind::BatchEnd` after the payload, so
+/// matching no longer needs to publish a separate `BatchEnd` slot
+/// when the event already produced at least one report or query
+/// response. Events with no reports still emit a single
+/// `BatchEnd`-payload slot with `is_last_in_request=true`.
 #[derive(Debug, Clone, Copy)]
 pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Which client connection receives this response.
@@ -209,6 +218,11 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Carried through the pipeline to measure server-side end-to-end latency.
     /// `()` (zero-sized) when `latency-trace` is disabled.
     pub recv_ts: TraceTimestamp,
+    /// True when this is the final slot the matching stage emits for
+    /// the originating input event. The response stage emits a wire
+    /// `ResponseKind::BatchEnd` after the payload (skipped when the
+    /// payload itself is `BatchEnd` — which is its own terminator).
+    pub is_last_in_request: bool,
 }
 
 /// Payload within an output slot.
@@ -245,6 +259,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
             payload: OutputPayload::BatchEnd,
             match_complete_ts: trace_ts(),
             recv_ts: trace_ts(),
+            is_last_in_request: true,
         }
     }
 }
@@ -1541,39 +1556,53 @@ impl<A: Application> MatchingStage<A> {
                 // the scratch vec; query responses (stats, position)
                 // are returned directly by the app and pushed here
                 // without ever entering the vec.
-                for report in &reports {
+                //
+                // The terminating wire `BatchEnd` is signalled via
+                // `is_last_in_request` on the final slot — saving one
+                // ring slot per event when there is at least one
+                // report or query response to mark. When the event
+                // produces no payload at all, fall back to a single
+                // `BatchEnd`-payload slot.
+                let report_count = reports.len();
+                let last_is_query = query_report.is_some();
+                if report_count == 0 && !last_is_query {
                     out_batch.push_with(|s| {
                         *s = OutputSlot {
                             connection_id: slot.connection_id,
                             input_seq,
-                            payload: OutputPayload::Report(*report),
+                            payload: OutputPayload::BatchEnd,
                             match_complete_ts,
                             recv_ts: slot.recv_ts,
+                            is_last_in_request: true,
                         };
                     });
+                } else {
+                    for (j, report) in reports.iter().enumerate() {
+                        let is_last = j + 1 == report_count && !last_is_query;
+                        out_batch.push_with(|s| {
+                            *s = OutputSlot {
+                                connection_id: slot.connection_id,
+                                input_seq,
+                                payload: OutputPayload::Report(*report),
+                                match_complete_ts,
+                                recv_ts: slot.recv_ts,
+                                is_last_in_request: is_last,
+                            };
+                        });
+                    }
+                    if let Some(qr) = query_report {
+                        out_batch.push_with(|s| {
+                            *s = OutputSlot {
+                                connection_id: slot.connection_id,
+                                input_seq,
+                                payload: OutputPayload::QueryResponse(qr),
+                                match_complete_ts,
+                                recv_ts: slot.recv_ts,
+                                is_last_in_request: true,
+                            };
+                        });
+                    }
                 }
-                if let Some(qr) = query_report {
-                    out_batch.push_with(|s| {
-                        *s = OutputSlot {
-                            connection_id: slot.connection_id,
-                            input_seq,
-                            payload: OutputPayload::QueryResponse(qr),
-                            match_complete_ts,
-                            recv_ts: slot.recv_ts,
-                        };
-                    });
-                }
-
-                // Signal end of batch for this request.
-                out_batch.push_with(|s| {
-                    *s = OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::BatchEnd,
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                    };
-                });
             }
 
             // Single Release store on the output cursor for everything
@@ -1648,22 +1677,33 @@ impl<A: Application> MatchingStage<A> {
             #[allow(clippy::let_unit_value)]
             let match_complete_ts = trace_ts();
 
-            for report in &*reports {
+            // Same is_last_in_request convention as the run loop: mark
+            // the final report (or a fallback BatchEnd-payload slot) as
+            // the request terminator so the response stage emits the
+            // wire BatchEnd.
+            let report_count = reports.len();
+            if report_count == 0 {
                 self.output.publish(OutputSlot {
                     connection_id: slot.connection_id,
                     input_seq,
-                    payload: OutputPayload::Report(*report),
+                    payload: OutputPayload::BatchEnd,
                     match_complete_ts,
                     recv_ts: slot.recv_ts,
+                    is_last_in_request: true,
                 });
+            } else {
+                for (j, report) in reports.iter().enumerate() {
+                    let is_last = j + 1 == report_count;
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::Report(*report),
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                        is_last_in_request: is_last,
+                    });
+                }
             }
-            self.output.publish(OutputSlot {
-                connection_id: slot.connection_id,
-                input_seq,
-                payload: OutputPayload::BatchEnd,
-                match_complete_ts,
-                recv_ts: slot.recv_ts,
-            });
         }
     }
 
