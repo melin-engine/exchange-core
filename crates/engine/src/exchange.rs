@@ -404,28 +404,24 @@ impl Exchange {
         let mut to_adjust: Vec<(AccountId, OrderId, ReservationSlot, u64)> = Vec::new();
 
         // Resting limit buys (bids).
-        for (price, queue) in inst.book.bids().levels_iter() {
-            for order in queue {
-                let new_required = required_with_fee(price.get(), order.remaining().get(), new_max);
-                to_adjust.push((
-                    order.account(),
-                    order.id(),
-                    order.reservation(),
-                    new_required,
-                ));
-            }
-        }
+        inst.book.bids().for_each_order(|price, order| {
+            let new_required = required_with_fee(price.get(), order.remaining().get(), new_max);
+            to_adjust.push((
+                order.account(),
+                order.id(),
+                order.reservation(),
+                new_required,
+            ));
+        });
 
         // Pending stop-limit buys (have a known limit_price).
-        for stops in inst.book.stop_buys().values() {
-            for stop in stops {
-                if let Some(limit_price) = stop.limit_price() {
-                    let new_required =
-                        required_with_fee(limit_price.get(), stop.quantity().get(), new_max);
-                    to_adjust.push((stop.account(), stop.id(), stop.reservation(), new_required));
-                }
+        inst.book.stop_buys().for_each_stop(|stop| {
+            if let Some(limit_price) = stop.limit_price() {
+                let new_required =
+                    required_with_fee(limit_price.get(), stop.quantity().get(), new_max);
+                to_adjust.push((stop.account(), stop.id(), stop.reservation(), new_required));
             }
-        }
+        });
 
         // Adjust reservations. Cancel orders that can't afford the new fee.
         let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
