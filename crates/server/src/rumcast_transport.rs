@@ -961,7 +961,12 @@ fn session_translator<S, R>(
     R: UdpTransport,
 {
     let mut sessions: HashMap<u32, AuthStage> = HashMap::new();
-    let mut pending_outbound: Option<OutputSlot> = None;
+    // In-flight per-slot progress: a slot expands to up to two wire
+    // kinds (payload + trailing BatchEnd via `is_last_in_request`),
+    // and we publish them sequentially. The progress survives across
+    // outer-loop iterations so a backpressured first publish doesn't
+    // lose the trailing BatchEnd. See `PendingOutbound`.
+    let mut pending_outbound: Option<PendingOutbound> = None;
     let mut response_buf = vec![0u8; RESPONSE_ENCODE_BUF_SIZE];
     let mut envelope_buf = vec![0u8; ENVELOPE_BUF_SIZE];
 
@@ -1163,7 +1168,11 @@ fn session_translator<S, R>(
         // cap of 32 at 1.7K iters/sec yields only 55K responses/sec ÷ 2
         // responses/order = ~28K orders/sec regardless of window size).
         loop {
-            // Stage 2: drain a previously-encoded envelope first.
+            // Stage 2: drain a previously-encoded envelope first. The
+            // envelope corresponds to `pending_outbound`'s
+            // `next_kind` — on success we advance that cursor so the
+            // next iteration encodes the *following* kind (e.g. the
+            // trailing BatchEnd after a Report).
             if let Some((session_id, env_len)) = pending_publish {
                 diag.pending_publish_held += 1;
                 match sessions.get(&session_id) {
@@ -1177,6 +1186,12 @@ fn session_translator<S, R>(
                                 pending_publish = None;
                                 diag.publish_pending_ok += 1;
                                 did_work = true;
+                                if let Some(prog) = pending_outbound.as_mut() {
+                                    prog.next_kind += 1;
+                                    if prog.next_kind >= prog.total {
+                                        pending_outbound = None;
+                                    }
+                                }
                             }
                             Err(_) => {
                                 // Publog still full — `tick` needs to drain
@@ -1187,96 +1202,132 @@ fn session_translator<S, R>(
                         }
                     }
                     _ => {
+                        // Session vanished — drop the encoded envelope
+                        // *and* the in-flight slot it belongs to,
+                        // since the trailing kinds (if any) target the
+                        // same gone session.
                         pending_publish = None;
+                        pending_outbound = None;
                         diag.publish_pending_session_evicted += 1;
                     }
                 }
             }
 
-            // Stage 1: encode + publish a new outbound slot. Skipped
-            // when a pending envelope still occupies envelope_buf.
+            // Stage 1: encode + publish the next kind. Skipped when a
+            // pending envelope still occupies envelope_buf.
             if pending_publish.is_some() {
                 break;
             }
-            if pending_outbound.is_none()
-                && let Some((_, slot)) = output_consumer.try_consume()
-            {
-                pending_outbound = Some(slot);
+
+            // Acquire a fresh slot if none is in flight, expanding it
+            // into its (up to two) wire kinds up front.
+            if pending_outbound.is_none() {
+                let Some((_, slot)) = output_consumer.try_consume() else {
+                    // Nothing to consume — coalescing is done for this iter.
+                    break;
+                };
                 diag.outputs_consumed += 1;
                 did_work = true;
+                // Seed events (connection_id=0) come from `seed_and_drain`.
+                // No client to route them to — drop.
+                if slot.connection_id == 0 {
+                    diag.outputs_seed_dropped += 1;
+                    continue;
+                }
+                let (kinds, total) = slot_to_kinds(&slot);
+                if total == 0 {
+                    // Defensive: a slot with neither a payload nor
+                    // `is_last_in_request` produces no wire output.
+                    // The matching stage never emits these today.
+                    continue;
+                }
+                pending_outbound = Some(PendingOutbound {
+                    slot,
+                    kinds,
+                    total,
+                    next_kind: 0,
+                    durable: false,
+                });
             }
-            let Some(slot) = pending_outbound.as_ref() else {
-                // Nothing to consume — coalescing is done for this iter.
-                break;
-            };
-            // Seed events (connection_id=0) come from `seed_and_drain`.
-            // No client to route them to — drop.
-            if slot.connection_id == 0 {
-                pending_outbound = None;
-                diag.outputs_seed_dropped += 1;
-                did_work = true;
-                continue;
-            }
-            // Durability gate. `needed` is the cursor value at which
-            // `slot.input_seq` is confirmed durable (journal_cursor is
-            // "next sequence to be read" — it must reach input_seq+1).
-            let needed = slot.input_seq + 1;
-            if cached_durable_pos < needed {
-                cached_durable_pos = crate::response::durable_pos(
-                    journal_cursor.get().load(Ordering::Acquire),
-                    replication_cursor.load(Ordering::Acquire),
-                    fastest_replica_cursor.load(Ordering::Acquire),
-                    quorum_durability,
-                );
+            let prog = pending_outbound
+                .as_mut()
+                .expect("pending_outbound just set above");
+
+            // Durability gate. Once a slot is durable, all of its
+            // kinds inherit the gate — recheck only on the first kind.
+            // `needed` is the cursor value at which `slot.input_seq`
+            // is confirmed durable (journal_cursor is "next sequence
+            // to be read" — it must reach input_seq+1).
+            if !prog.durable {
+                let needed = prog.slot.input_seq + 1;
                 if cached_durable_pos < needed {
-                    // Bounded spin. Matching publishes outputs in
-                    // parallel with the journal, so the journal often
-                    // catches up within tens of µs. Spinning here
-                    // avoids the ~200µs round-trip back through
-                    // tick()+poll() before we could re-check.
-                    // Cap is generous enough to cover one journal
-                    // fsync (~35µs) but well under one outer iter.
-                    const SPIN_RECHECKS: u32 = 64;
-                    const PAUSES_PER_RECHECK: u32 = 1024;
-                    let mut still_blocked = true;
-                    'spin: for _ in 0..SPIN_RECHECKS {
-                        for _ in 0..PAUSES_PER_RECHECK {
-                            std::hint::spin_loop();
+                    cached_durable_pos = crate::response::durable_pos(
+                        journal_cursor.get().load(Ordering::Acquire),
+                        replication_cursor.load(Ordering::Acquire),
+                        fastest_replica_cursor.load(Ordering::Acquire),
+                        quorum_durability,
+                    );
+                    if cached_durable_pos < needed {
+                        // Bounded spin. Matching publishes outputs in
+                        // parallel with the journal, so the journal often
+                        // catches up within tens of µs. Spinning here
+                        // avoids the ~200µs round-trip back through
+                        // tick()+poll() before we could re-check.
+                        // Cap is generous enough to cover one journal
+                        // fsync (~35µs) but well under one outer iter.
+                        const SPIN_RECHECKS: u32 = 64;
+                        const PAUSES_PER_RECHECK: u32 = 1024;
+                        let mut still_blocked = true;
+                        'spin: for _ in 0..SPIN_RECHECKS {
+                            for _ in 0..PAUSES_PER_RECHECK {
+                                std::hint::spin_loop();
+                            }
+                            cached_durable_pos = crate::response::durable_pos(
+                                journal_cursor.get().load(Ordering::Acquire),
+                                replication_cursor.load(Ordering::Acquire),
+                                fastest_replica_cursor.load(Ordering::Acquire),
+                                quorum_durability,
+                            );
+                            if cached_durable_pos >= needed {
+                                still_blocked = false;
+                                break 'spin;
+                            }
                         }
-                        cached_durable_pos = crate::response::durable_pos(
-                            journal_cursor.get().load(Ordering::Acquire),
-                            replication_cursor.load(Ordering::Acquire),
-                            fastest_replica_cursor.load(Ordering::Acquire),
-                            quorum_durability,
-                        );
-                        if cached_durable_pos >= needed {
-                            still_blocked = false;
-                            break 'spin;
+                        if still_blocked {
+                            // Journal still behind after the spin. Defer
+                            // to the next outer iter so tick()+poll() get
+                            // CPU and the journal thread isn't starved by
+                            // an unbounded spin on the same socket.
+                            diag.outputs_journal_blocked += 1;
+                            diag.pending_outbound_held += 1;
+                            break;
                         }
-                    }
-                    if still_blocked {
-                        // Journal still behind after the spin. Defer
-                        // to the next outer iter so tick()+poll() get
-                        // CPU and the journal thread isn't starved by
-                        // an unbounded spin on the same socket.
-                        diag.outputs_journal_blocked += 1;
-                        diag.pending_outbound_held += 1;
-                        break;
                     }
                 }
+                prog.durable = true;
             }
-            let slot = pending_outbound.take().expect("checked is_some above");
+
+            // Encode the next kind.
             diag.encode_attempts += 1;
-            let Some(env_len) =
-                encode_outbound(&slot, &mut sessions, &mut response_buf, &mut envelope_buf)
-            else {
+            let kind = prog.kinds[prog.next_kind as usize];
+            let session_id = prog.slot.connection_id as u32;
+            let Some(env_len) = encode_outbound(
+                session_id,
+                &kind,
+                &mut sessions,
+                &mut response_buf,
+                &mut envelope_buf,
+            ) else {
+                // Encoding failed (session unknown / codec error) —
+                // drop the whole slot; subsequent kinds for this
+                // session would fail the same way.
                 diag.encode_returned_none += 1;
+                pending_outbound = None;
                 did_work = true;
                 continue;
             };
             // Try the first publish inline so the common (uncongested)
             // case avoids a loop iteration.
-            let session_id = slot.connection_id as u32;
             match sessions.get(&session_id) {
                 Some(AuthStage::Authenticated { pub_log, .. }) => {
                     match pub_log.try_claim(env_len as u32) {
@@ -1286,18 +1337,27 @@ fn session_translator<S, R>(
                                 .copy_from_slice(&envelope_buf[..env_len]);
                             claim.publish(data_flags::UNFRAGMENTED);
                             diag.publish_inline_ok += 1;
+                            prog.next_kind += 1;
+                            if prog.next_kind >= prog.total {
+                                pending_outbound = None;
+                            }
                         }
                         Err(_) => {
                             // Pub_log full — defer; outer loop will
                             // retry stage 2 next iter once tick drains.
+                            // `prog.next_kind` stays put: stage 2 will
+                            // advance it on successful publish.
                             pending_publish = Some((session_id, env_len));
                             diag.publish_inline_backpressured += 1;
                         }
                     }
                 }
                 _ => {
-                    // Race: session evicted between encode and publish.
+                    // Race: session evicted between encode and publish —
+                    // drop the slot, no point encoding subsequent kinds
+                    // for the same gone session.
                     diag.publish_inline_no_session += 1;
+                    pending_outbound = None;
                 }
             }
             did_work = true;
@@ -1667,6 +1727,85 @@ fn handle_inbound<S: UdpTransport>(
 /// disappeared between request and response (handshake timed out,
 /// client disconnected, etc.).
 /// Encode an outbound slot into an envelope inside `envelope_buf`.
+/// Expand an `OutputSlot` into the up-to-two wire `ResponseKind`s
+/// the rumcast subscriber should see: the payload (if any) and a
+/// trailing `BatchEnd` when `is_last_in_request` is set. Returns the
+/// populated count (`0..=2`); the array is filled from index 0.
+///
+/// `OutputPayload::BatchEnd` carries no payload of its own — the wire
+/// `BatchEnd` is emitted from the `is_last_in_request` flag, mirroring
+/// the TCP/DPDK response stages.
+fn slot_to_kinds(slot: &OutputSlot) -> ([ResponseKind; 2], u8) {
+    let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
+    let mut len: u8 = 0;
+    match slot.payload {
+        OutputPayload::Report(report) => {
+            kinds[len as usize] = ResponseKind::Report(report);
+            len += 1;
+        }
+        OutputPayload::QueryResponse(QueryResponse::Position {
+            account,
+            balances,
+            count,
+        }) => {
+            kinds[len as usize] = ResponseKind::PositionSnapshot {
+                account,
+                balances,
+                count,
+            };
+            len += 1;
+        }
+        OutputPayload::QueryResponse(QueryResponse::Stats {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        }) => {
+            kinds[len as usize] = ResponseKind::StatsHeader {
+                active_connections,
+                events_processed,
+                journal_sequence,
+            };
+            len += 1;
+        }
+        OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
+            kinds[len as usize] = ResponseKind::RequestSeqHwm { hwm };
+            len += 1;
+        }
+        OutputPayload::BatchEnd => {
+            // No payload — terminator is emitted via is_last_in_request below.
+        }
+        OutputPayload::EngineError => {
+            kinds[len as usize] = ResponseKind::EngineError;
+            len += 1;
+        }
+    }
+    if slot.is_last_in_request {
+        kinds[len as usize] = ResponseKind::BatchEnd;
+        len += 1;
+    }
+    (kinds, len)
+}
+
+/// Per-slot outbound progress. Carries the originating slot, the
+/// pre-computed wire kinds it expands to, and a cursor for which kind
+/// to encode next. Set by stage 1 the first time it touches a slot,
+/// advanced after each successful publish, cleared when all kinds
+/// have been published. Persists across loop iterations so a
+/// backpressured publish (`pending_publish`) doesn't lose track of
+/// the trailing `BatchEnd` for that slot.
+struct PendingOutbound {
+    slot: OutputSlot,
+    kinds: [ResponseKind; 2],
+    total: u8,
+    next_kind: u8,
+    /// `true` once the durability gate has been satisfied for this
+    /// slot. Recomputing it for every kind would issue redundant
+    /// atomic loads (durability only progresses forward).
+    durable: bool,
+}
+
+/// Encode one wire `ResponseKind` into an envelope for `session_id`.
+///
 /// Returns the envelope length on success, or `None` if the session
 /// isn't authenticated or encoding fails. The caller is responsible
 /// for publishing the bytes to the session's PublicationLog — kept
@@ -1674,13 +1813,12 @@ fn handle_inbound<S: UdpTransport>(
 /// iterations without re-encoding (which would re-bump `outbound_seq`
 /// and create a sequence gap on the receiver).
 fn encode_outbound(
-    slot: &OutputSlot,
+    session_id: u32,
+    kind: &ResponseKind,
     sessions: &mut HashMap<u32, AuthStage>,
     response_buf: &mut [u8],
     envelope_buf: &mut [u8],
 ) -> Option<usize> {
-    let session_id = slot.connection_id as u32;
-
     let Some(AuthStage::Authenticated {
         token,
         outbound_seq,
@@ -1695,34 +1833,7 @@ fn encode_outbound(
         return None;
     };
 
-    let kind = match slot.payload {
-        OutputPayload::Report(report) => ResponseKind::Report(report),
-        OutputPayload::QueryResponse(QueryResponse::Position {
-            account,
-            balances,
-            count,
-        }) => ResponseKind::PositionSnapshot {
-            account,
-            balances,
-            count,
-        },
-        OutputPayload::QueryResponse(QueryResponse::Stats {
-            active_connections,
-            events_processed,
-            journal_sequence,
-        }) => ResponseKind::StatsHeader {
-            active_connections,
-            events_processed,
-            journal_sequence,
-        },
-        OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
-            ResponseKind::RequestSeqHwm { hwm }
-        }
-        OutputPayload::BatchEnd => ResponseKind::BatchEnd,
-        OutputPayload::EngineError => ResponseKind::EngineError,
-    };
-
-    let written = match codec::encode_response(&kind, response_buf) {
+    let written = match codec::encode_response(kind, response_buf) {
         Ok(n) => n,
         Err(e) => {
             error!(error = ?e, "failed to encode response");
