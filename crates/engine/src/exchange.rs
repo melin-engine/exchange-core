@@ -404,17 +404,15 @@ impl Exchange {
         let mut to_adjust: Vec<(AccountId, OrderId, ReservationSlot, u64)> = Vec::new();
 
         // Resting limit buys (bids).
-        for (price, queue) in inst.book.bids().levels_iter() {
-            for order in queue {
-                let new_required = required_with_fee(price.get(), order.remaining().get(), new_max);
-                to_adjust.push((
-                    order.account(),
-                    order.id(),
-                    order.reservation(),
-                    new_required,
-                ));
-            }
-        }
+        inst.book.bids().for_each_order(|price, order| {
+            let new_required = required_with_fee(price.get(), order.remaining().get(), new_max);
+            to_adjust.push((
+                order.account(),
+                order.id(),
+                order.reservation(),
+                new_required,
+            ));
+        });
 
         // Pending stop-limit buys (have a known limit_price).
         for stops in inst.book.stop_buys().values() {

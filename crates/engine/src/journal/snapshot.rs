@@ -20,7 +20,7 @@
 //! | data           | ...     | var   | Serialized Exchange state          |
 //! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
-use std::collections::{BTreeMap, HashMap as StdHashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap as StdHashMap};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -1277,10 +1277,11 @@ impl OrderBook {
     pub(crate) fn snapshot(&self) -> BookSnapshot {
         let snapshot_side =
             |side: &crate::orderbook::BookSide| -> Vec<(Price, Vec<RestingOrderSnapshot>)> {
-                side.levels_iter()
-                    .map(|(&price, queue)| {
-                        let orders = queue
-                            .iter()
+                side.levels_snapshot()
+                    .into_iter()
+                    .map(|(price, orders)| {
+                        let snaps = orders
+                            .into_iter()
                             .map(|o| RestingOrderSnapshot {
                                 id: o.id(),
                                 account: o.account(),
@@ -1289,7 +1290,7 @@ impl OrderBook {
                                 expiry_ns: o.expiry_ns(),
                             })
                             .collect();
-                        (price, orders)
+                        (price, snaps)
                     })
                     .collect()
             };
@@ -1331,13 +1332,13 @@ impl OrderBook {
 
     /// Restore an order book from a snapshot.
     pub(crate) fn restore(symbol: Symbol, snap: BookSnapshot) -> Self {
+        // Reconstruct a side and return the slab-index assignments so the
+        // caller can populate `order_index` with valid node handles.
         let restore_side = |levels: Vec<(Price, Vec<RestingOrderSnapshot>)>, side: Side| {
-            // Build sorted Vec of (Price, VecDeque) — input is already sorted
-            // by price from the snapshot codec.
-            let sorted: Vec<(Price, VecDeque<crate::orderbook::RestingOrder>)> = levels
+            let materialized: Vec<(Price, Vec<crate::orderbook::RestingOrder>)> = levels
                 .into_iter()
                 .map(|(price, orders)| {
-                    let queue = orders
+                    let restored = orders
                         .into_iter()
                         .map(|o| {
                             crate::orderbook::RestingOrder::new(
@@ -1351,10 +1352,10 @@ impl OrderBook {
                             )
                         })
                         .collect();
-                    (price, queue)
+                    (price, restored)
                 })
                 .collect();
-            crate::orderbook::BookSide::from_levels(sorted)
+            crate::orderbook::BookSide::from_levels_snapshot(materialized)
         };
 
         let restore_stops = |levels: Vec<(Price, Vec<PendingStopSnapshot>)>| {
@@ -1383,14 +1384,39 @@ impl OrderBook {
             btree
         };
 
+        // Build sides first; they tell us each order's slab index, which
+        // we need to populate `order_index` so cancel/amend stay O(1).
+        let (bids, bid_node_idx) = restore_side(snap.bids, Side::Buy);
+        let (asks, ask_node_idx) = restore_side(snap.asks, Side::Sell);
+
+        // Combine slab-index assignments into a lookup keyed by
+        // (account, order_id). Both sides share the (account, order_id)
+        // namespace via the snapshot codec, but each order lives in
+        // exactly one side, so there are no key collisions.
+        let mut node_for: std::collections::HashMap<(AccountId, OrderId), u32> =
+            std::collections::HashMap::with_capacity(bid_node_idx.len() + ask_node_idx.len());
+        node_for.extend(bid_node_idx);
+        node_for.extend(ask_node_idx);
+
         let order_index: crate::types::HashMap4<
             (AccountId, OrderId),
-            (Side, Price, ReservationSlot),
+            (Side, Price, ReservationSlot, u32),
         > = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| {
-                ((account, id), (side, price, ReservationSlot::DUMMY))
+                let node_idx = node_for
+                    .get(&(account, id))
+                    .copied()
+                    // Snapshot self-consistency: every order_index entry
+                    // must correspond to a resting order in the same
+                    // snapshot. If it doesn't, the snapshot is corrupt and
+                    // we'd rather fail loudly than silently skip cancels.
+                    .expect("snapshot order_index references missing book entry");
+                (
+                    (account, id),
+                    (side, price, ReservationSlot::DUMMY, node_idx),
+                )
             })
             .collect();
 
@@ -1402,8 +1428,8 @@ impl OrderBook {
 
         Self::from_parts(
             symbol,
-            restore_side(snap.bids, Side::Buy),
-            restore_side(snap.asks, Side::Sell),
+            bids,
+            asks,
             order_index,
             restore_stops(snap.stop_buys),
             restore_stops(snap.stop_sells),

@@ -3,9 +3,19 @@
 //! Bids are stored in descending price order, asks in ascending.
 //! Within a price level, orders are matched FIFO.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use std::num::NonZeroU64;
+
+/// Sentinel for "no node" in the intrusive doubly-linked lists used by
+/// `BookSide`. `u32::MAX` saves 4 bytes vs `Option<u32>` and keeps `OrderNode`
+/// a tight 64 bytes (one cache line) on x86_64.
+const INVALID_NODE: u32 = u32::MAX;
+
+/// Snapshot-restore output: `(account, order_id)` paired with the slab
+/// index assigned to that resting order. `OrderBook::restore` consumes
+/// this to populate `order_index` with valid node handles.
+pub(crate) type SnapshotNodeMapping = Vec<((AccountId, OrderId), u32)>;
 
 use crate::types::{
     AccountId, ExecutionReport, HashMap4, Order, OrderId, OrderType, Price, Quantity, RejectReason,
@@ -66,17 +76,77 @@ pub(crate) struct PendingStop {
 
 /// One side of the order book (either all bids or all asks).
 ///
-/// Uses a sorted `Vec` instead of `BTreeMap` for price levels. Typical books
-/// have 5-20 active levels per side — at ~32 bytes per entry (Price + VecDeque
-/// header), the entire side fits in 1-3 L1 cache lines. Binary search gives
-/// O(log n) lookup with zero pointer chasing; insert/remove shift ~160-640
-/// bytes, which is a single memcpy in L1. BTreeMap's node-per-entry layout
-/// causes cache misses on every traversal.
-#[derive(Debug, Default)]
+/// **Storage layout:** a sorted `Vec<(Price, LevelHead)>` of price levels,
+/// each holding `(head, tail, len)` of an intrusive doubly-linked FIFO list
+/// of `OrderNode`s. All nodes (across all price levels on this side) live in
+/// a single slab `Vec<OrderNode>`; freed nodes form a singly-linked free
+/// list via `next`. Indices (`u32`) are stable for the lifetime of an order
+/// on the book, which lets `OrderBook::order_index` map an
+/// `(AccountId, OrderId)` directly to its node — making cancel and amend
+/// O(1) instead of O(level_depth).
+///
+/// **Why per-side and not a `BTreeMap`:** typical books have 5-20 active
+/// levels — the sorted `Vec` fits in 1-3 L1 cache lines and binary search
+/// has zero pointer-chasing. A `BTreeMap` would allocate a node per level.
+///
+/// **Time priority:** `head` is the oldest order at a price (matches
+/// first); `tail` is the newest. Matching pops from `head`; new resting
+/// orders splice onto `tail`.
+#[derive(Debug)]
 pub(crate) struct BookSide {
     /// Sorted ascending by Price. Binary search for all lookups.
-    /// VecDeque at each level: FIFO queue for time priority.
-    levels: Vec<(Price, VecDeque<RestingOrder>)>,
+    levels: Vec<(Price, LevelHead)>,
+    /// Slab of order nodes. Indices are stable; freed slots are recycled
+    /// via the `free_head` free list.
+    nodes: Vec<OrderNode>,
+    /// Head of the free list, or `INVALID_NODE` if empty. Free nodes
+    /// chain through `OrderNode::next`. `Default` on `u32` would give 0,
+    /// which is a valid node index — so we hand-implement `Default` to
+    /// initialize this to `INVALID_NODE`.
+    free_head: u32,
+}
+
+impl Default for BookSide {
+    fn default() -> Self {
+        Self {
+            levels: Vec::new(),
+            nodes: Vec::new(),
+            free_head: INVALID_NODE,
+        }
+    }
+}
+
+/// Per-price-level head/tail of the intrusive list.
+/// `len` lets `available_quantity` and balance audits skip walking
+/// dead levels and gives O(1) "is this level empty?" checks.
+#[derive(Debug, Clone, Copy)]
+struct LevelHead {
+    /// Index of the oldest order (front of FIFO). `INVALID_NODE` only
+    /// during transient unlink-then-relink sequences — invariant: a level
+    /// in `levels` always has at least one node.
+    head: u32,
+    /// Index of the newest order (back of FIFO).
+    tail: u32,
+    /// Number of orders at this price. `u32` is plenty — even a pathological
+    /// 4 billion-deep level would exhaust the slab first.
+    len: u32,
+}
+
+/// A node in the per-level intrusive doubly-linked list.
+///
+/// Layout note: `RestingOrder` is currently 40 bytes; with two `u32` links
+/// the node is 48 bytes — fits 1.33 per cache line. Future micro-opt:
+/// pack `prev`/`next` into 32-bit indices alongside `account` to hit 64B.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OrderNode {
+    pub(crate) order: RestingOrder,
+    /// Previous node in this level's FIFO, or `INVALID_NODE` at the head.
+    /// On free, this is set to `INVALID_NODE` (the free list is singly
+    /// linked through `next`).
+    prev: u32,
+    /// Next node in this level's FIFO, or `INVALID_NODE` at the tail.
+    /// While freed, this points at the next free slot.
+    next: u32,
 }
 
 impl RestingOrder {
@@ -203,6 +273,18 @@ impl PendingStop {
 }
 
 impl BookSide {
+    /// Pre-allocate the slab. Used by `with_capacity` to avoid resize stalls
+    /// once warm. The free list is left empty — `alloc_node` will push fresh
+    /// entries until the Vec reaches its capacity, at which point freed
+    /// nodes get reused in LIFO order.
+    fn with_capacity(node_capacity: usize) -> Self {
+        Self {
+            levels: Vec::with_capacity(64),
+            nodes: Vec::with_capacity(node_capacity),
+            free_head: INVALID_NODE,
+        }
+    }
+
     /// Binary search for a price level. Returns `Ok(index)` if found,
     /// `Err(index)` for the insertion point.
     #[inline]
@@ -210,72 +292,241 @@ impl BookSide {
         self.levels.binary_search_by_key(&price, |(p, _)| *p)
     }
 
-    /// Iterate over price levels in ascending order.
-    pub(crate) fn levels_iter(&self) -> impl Iterator<Item = (&Price, &VecDeque<RestingOrder>)> {
-        self.levels.iter().map(|(p, q)| (p, q))
+    /// Allocate a slab slot for `order`. Reuses a freed node if available,
+    /// else grows the slab. Returns the stable node index. Caller must
+    /// link the node into a level.
+    #[inline]
+    fn alloc_node(&mut self, order: RestingOrder) -> u32 {
+        if self.free_head != INVALID_NODE {
+            let idx = self.free_head;
+            let node = &mut self.nodes[idx as usize];
+            self.free_head = node.next;
+            node.order = order;
+            node.prev = INVALID_NODE;
+            node.next = INVALID_NODE;
+            idx
+        } else {
+            // Slab full — push a new entry. `as u32` is fine: the slab is
+            // bounded by HashMap capacity (4K-ish) in practice.
+            let idx = self.nodes.len() as u32;
+            self.nodes.push(OrderNode {
+                order,
+                prev: INVALID_NODE,
+                next: INVALID_NODE,
+            });
+            idx
+        }
     }
 
-    /// Reconstruct a BookSide from pre-sorted levels (used by snapshot restore).
-    /// Input must be sorted ascending by Price.
-    pub(crate) fn from_levels(levels: Vec<(Price, VecDeque<RestingOrder>)>) -> Self {
-        Self { levels }
+    /// Return a node to the free list. Caller must have already unlinked
+    /// it from its level. The freed node's `prev`/`next` are clobbered.
+    #[inline]
+    fn free_node(&mut self, idx: u32) {
+        let node = &mut self.nodes[idx as usize];
+        node.prev = INVALID_NODE;
+        node.next = self.free_head;
+        self.free_head = idx;
     }
 
-    fn add(&mut self, price: Price, order: RestingOrder) {
+    /// Push `order` onto the back (newest end) of the price level. Creates
+    /// the level if it doesn't exist. Returns the stable slab index that
+    /// the caller should store in `OrderBook::order_index` for O(1) cancel.
+    pub(crate) fn add(&mut self, price: Price, order: RestingOrder) -> u32 {
+        let new_idx = self.alloc_node(order);
         match self.search(price) {
-            Ok(idx) => self.levels[idx].1.push_back(order),
-            Err(idx) => {
-                let mut queue = VecDeque::new();
-                queue.push_back(order);
-                self.levels.insert(idx, (price, queue));
+            Ok(level_idx) => {
+                // Splice onto the tail of an existing level.
+                let old_tail = self.levels[level_idx].1.tail;
+                self.levels[level_idx].1.tail = new_idx;
+                self.levels[level_idx].1.len += 1;
+                self.nodes[new_idx as usize].prev = old_tail;
+                self.nodes[old_tail as usize].next = new_idx;
+            }
+            Err(level_idx) => {
+                self.levels.insert(
+                    level_idx,
+                    (
+                        price,
+                        LevelHead {
+                            head: new_idx,
+                            tail: new_idx,
+                            len: 1,
+                        },
+                    ),
+                );
+            }
+        }
+        new_idx
+    }
+
+    /// Remove a node from the book in O(1) given its slab index and the
+    /// price level it belongs to. Frees the slab slot. Removes the price
+    /// level from `levels` if it becomes empty. Returns the removed
+    /// `RestingOrder`, or `None` if `price` doesn't match a live level.
+    pub(crate) fn remove_node(&mut self, price: Price, node_idx: u32) -> Option<RestingOrder> {
+        let level_idx = self.search(price).ok()?;
+        let prev = self.nodes[node_idx as usize].prev;
+        let next = self.nodes[node_idx as usize].next;
+
+        // Splice out of the doubly-linked list.
+        if prev != INVALID_NODE {
+            self.nodes[prev as usize].next = next;
+        }
+        if next != INVALID_NODE {
+            self.nodes[next as usize].prev = prev;
+        }
+
+        let head = &mut self.levels[level_idx].1;
+        if head.head == node_idx {
+            head.head = next;
+        }
+        if head.tail == node_idx {
+            head.tail = prev;
+        }
+        head.len -= 1;
+        let became_empty = head.len == 0;
+
+        let order = self.nodes[node_idx as usize].order;
+        self.free_node(node_idx);
+        if became_empty {
+            self.levels.remove(level_idx);
+        }
+        Some(order)
+    }
+
+    /// Pop the front (oldest, highest-priority) order at `price`.
+    /// Frees the slab slot and removes the level if it becomes empty.
+    /// Used by the matching loop and STP `CancelOldest`/`CancelBoth`.
+    /// Returns `(node_idx, order)` so callers can clean up auxiliary state.
+    pub(crate) fn pop_front(&mut self, price: Price) -> Option<(u32, RestingOrder)> {
+        let level_idx = self.search(price).ok()?;
+        let head_idx = self.levels[level_idx].1.head;
+        let order = self.remove_node(price, head_idx)?;
+        Some((head_idx, order))
+    }
+
+    /// Index of the front (oldest) node at `price`, or `None` if no level.
+    /// Cheap query used by the matching loop's outer guard.
+    #[inline]
+    pub(crate) fn front_node_idx(&self, price: Price) -> Option<u32> {
+        let level_idx = self.search(price).ok()?;
+        Some(self.levels[level_idx].1.head)
+    }
+
+    /// Borrow a node by slab index. Used by the matching loop to read the
+    /// front maker's metadata without locking the borrow checker.
+    #[inline]
+    pub(crate) fn node(&self, idx: u32) -> &OrderNode {
+        &self.nodes[idx as usize]
+    }
+
+    /// Mutably borrow a node by slab index. Used to apply partial fills
+    /// in-place.
+    #[inline]
+    pub(crate) fn node_mut(&mut self, idx: u32) -> &mut OrderNode {
+        &mut self.nodes[idx as usize]
+    }
+
+    /// Iterate every order on this side, calling `f` with the price level
+    /// and a reference to each order. Walks levels in ascending price
+    /// order, and within a level walks oldest→newest. Used by snapshot,
+    /// fee-schedule re-reservation, and bulk-cancel paths.
+    pub(crate) fn for_each_order<F: FnMut(Price, &RestingOrder)>(&self, mut f: F) {
+        for (price, head) in &self.levels {
+            let mut cur = head.head;
+            while cur != INVALID_NODE {
+                let n = &self.nodes[cur as usize];
+                f(*price, &n.order);
+                cur = n.next;
             }
         }
     }
 
-    /// Get a mutable reference to the queue at a price level.
-    fn get_mut(&mut self, price: Price) -> Option<&mut VecDeque<RestingOrder>> {
-        match self.search(price) {
-            Ok(idx) => Some(&mut self.levels[idx].1),
-            Err(_) => None,
+    /// Mutable variant of `for_each_order`. Used by snapshot-restore slot
+    /// injection to patch reservation slots in place.
+    pub(crate) fn for_each_order_mut<F: FnMut(Price, &mut RestingOrder)>(&mut self, mut f: F) {
+        for (price, head) in &self.levels {
+            let mut cur = head.head;
+            while cur != INVALID_NODE {
+                // Split borrow: read links before handing &mut order to `f`.
+                let next = self.nodes[cur as usize].next;
+                f(*price, &mut self.nodes[cur as usize].order);
+                cur = next;
+            }
         }
     }
 
-    /// Remove the price level entirely.
-    fn remove_level(&mut self, price: Price) {
-        if let Ok(idx) = self.search(price) {
-            self.levels.remove(idx);
-        }
+    /// Iterate price levels (ascending) yielding only prices. Used by the
+    /// matching engine to collect a snapshot of prices to visit before
+    /// mutating the book.
+    pub(crate) fn prices_ascending(&self) -> impl DoubleEndedIterator<Item = Price> + '_ {
+        self.levels.iter().map(|(p, _)| *p)
     }
 
-    /// Remove a resting order and return its account, remaining quantity,
-    /// and reservation slot. Used by cancel paths.
-    fn remove_with_account(
-        &mut self,
-        price: Price,
-        account: AccountId,
-        order_id: OrderId,
-    ) -> Option<(AccountId, Quantity, ReservationSlot)> {
-        let idx = self.search(price).ok()?;
-        let level = &mut self.levels[idx].1;
-        // Match on both account and order_id — two accounts may have the
-        // same OrderId resting at the same price level.
-        let pos = level
+    /// Snapshot: walk every level in ascending order, yielding
+    /// `(price, ordered_orders)` where `ordered_orders` preserves time
+    /// priority (oldest first). Used by the snapshot codec — not on the
+    /// hot path, so the per-level `Vec` allocation is fine.
+    pub(crate) fn levels_snapshot(&self) -> Vec<(Price, Vec<RestingOrder>)> {
+        self.levels
             .iter()
-            .position(|o| o.id == order_id && o.account == account)?;
-        let order = level.remove(pos).expect("position was valid");
-        if level.is_empty() {
-            self.levels.remove(idx);
-        }
-        Some((order.account, order.remaining, order.reservation))
+            .map(|(price, head)| {
+                let mut v = Vec::with_capacity(head.len as usize);
+                let mut cur = head.head;
+                while cur != INVALID_NODE {
+                    let n = &self.nodes[cur as usize];
+                    v.push(n.order);
+                    cur = n.next;
+                }
+                (*price, v)
+            })
+            .collect()
     }
 
-    fn is_empty(&self) -> bool {
+    /// Reconstruct a `BookSide` from pre-sorted snapshot levels.
+    /// Returns `(side, mapping)` where `mapping` records the slab index
+    /// assigned to each `(account, order_id)` so the caller can populate
+    /// `OrderBook::order_index` with valid node indices.
+    pub(crate) fn from_levels_snapshot(
+        levels: Vec<(Price, Vec<RestingOrder>)>,
+    ) -> (Self, SnapshotNodeMapping) {
+        // Pre-size the slab to the total order count to avoid re-allocations.
+        let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
+        let mut side = Self::with_capacity(total.max(64));
+        let mut mapping = Vec::with_capacity(total);
+        for (price, orders) in levels {
+            for order in orders {
+                let key = (order.account, order.id);
+                let idx = side.add(price, order);
+                mapping.push((key, idx));
+            }
+        }
+        (side, mapping)
+    }
+
+    /// True if no resting orders remain on this side.
+    pub(crate) fn is_empty(&self) -> bool {
         self.levels.is_empty()
     }
 
-    /// Total available quantity at prices that would match the given limit price.
+    /// Best price on this side: highest for bids, lowest for asks. Since
+    /// `levels` is sorted ascending, callers pick `last()` for bids and
+    /// `first()` for asks.
+    fn first_price(&self) -> Option<Price> {
+        self.levels.first().map(|(p, _)| *p)
+    }
+
+    fn last_price(&self) -> Option<Price> {
+        self.levels.last().map(|(p, _)| *p)
+    }
+
+    /// Total available quantity at prices that would match the given limit.
     /// If `exclude_account` is `Some`, orders from that account are skipped
     /// (used for FOK pre-check with STP CancelNewest/CancelBoth).
+    ///
+    /// Walks levels from best→worst until `limit` is exceeded; within a
+    /// level, walks the linked list head→tail (which is order-agnostic
+    /// for summing).
     fn available_quantity(
         &self,
         side: Side,
@@ -283,37 +534,39 @@ impl BookSide {
         exclude_account: Option<AccountId>,
     ) -> u64 {
         let mut total: u64 = 0;
+        // Closure: walk one level's intrusive list and accumulate qty.
+        // Captured outside the match so it isn't duplicated.
+        let walk = |head_idx: u32, total: &mut u64| {
+            let mut cur = head_idx;
+            while cur != INVALID_NODE {
+                let n = &self.nodes[cur as usize];
+                if exclude_account.is_none_or(|acct| acct != n.order.account) {
+                    *total = total.saturating_add(n.order.remaining.get());
+                }
+                cur = n.next;
+            }
+        };
         match side {
             Side::Buy => {
-                // Bids: iterate from highest price downward
-                for (price, level) in self.levels.iter().rev() {
+                // Bids: iterate from highest price downward.
+                for (price, head) in self.levels.iter().rev() {
                     if let Some(limit) = limit
                         && *price < limit
                     {
                         break;
                     }
-                    for order in level {
-                        if exclude_account.is_some_and(|acct| acct == order.account) {
-                            continue;
-                        }
-                        total = total.saturating_add(order.remaining.get());
-                    }
+                    walk(head.head, &mut total);
                 }
             }
             Side::Sell => {
-                // Asks: iterate from lowest price upward
-                for (price, level) in &self.levels {
+                // Asks: iterate from lowest price upward.
+                for (price, head) in &self.levels {
                     if let Some(limit) = limit
                         && *price > limit
                     {
                         break;
                     }
-                    for order in level {
-                        if exclude_account.is_some_and(|acct| acct == order.account) {
-                            continue;
-                        }
-                        total = total.saturating_add(order.remaining.get());
-                    }
+                    walk(head.head, &mut total);
                 }
             }
         }
@@ -330,15 +583,19 @@ pub struct OrderBook {
     symbol: Symbol,
     bids: BookSide,
     asks: BookSide,
-    /// HashMap: O(1) amortized lookup for cancel operations. Maps
-    /// (account, order_id) to its location (side, price) and reservation
-    /// slot so we don't need to scan the book. Keyed by (AccountId, OrderId)
+    /// HashMap: O(1) lookup mapping `(account, order_id)` to a resting
+    /// order's location and slab handle. Keyed by `(AccountId, OrderId)`
     /// to eliminate cross-account collisions — different accounts can
     /// independently use the same OrderId without index conflicts.
     ///
-    /// The ReservationSlot is stored here (in addition to RestingOrder) so
-    /// cancel_replace can look up the slot in O(1) without a VecDeque scan.
-    order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot)>,
+    /// The 4-tuple stores:
+    /// - `Side` — which `BookSide` slab the node lives in
+    /// - `Price` — the price level (used to update `LevelHead` on remove)
+    /// - `ReservationSlot` — so cancel/amend release balance without an
+    ///   extra HashMap lookup
+    /// - `u32` — the slab index, making `BookSide::remove_node` O(1)
+    ///   instead of an O(level_depth) `VecDeque` scan
+    order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot, u32)>,
     /// BTreeMap keyed by trigger price so we can efficiently find all stops
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
@@ -394,10 +651,13 @@ impl OrderBook {
     /// Hashbrown resizes by doubling, so a 4K→8K resize moves ~128 KB —
     /// a one-time ~5 µs stall that appears in p99.99 at most.
     pub fn with_capacity(symbol: Symbol) -> Self {
+        // Pre-size each side's slab to ~2K nodes — half the order_index
+        // capacity, since orders split roughly bid/ask. Avoids growing the
+        // slab during the warmup phase of a hot book.
         Self {
             symbol,
-            bids: BookSide::default(),
-            asks: BookSide::default(),
+            bids: BookSide::with_capacity(2_048),
+            asks: BookSide::with_capacity(2_048),
             // One entry per resting order for O(1) cancel lookups.
             // 4096 slots ≈ 128 KB (key 12 B + value 16 B + control 1 B per
             // slot) — fits in L2 cache for fast probes. Typical book depth
@@ -427,6 +687,7 @@ impl OrderBook {
                     Side::Buy,
                     Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
                     ReservationSlot::DUMMY,
+                    INVALID_NODE,
                 ),
             );
         }
@@ -454,7 +715,7 @@ impl OrderBook {
         symbol: Symbol,
         bids: BookSide,
         asks: BookSide,
-        order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot)>,
+        order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot, u32)>,
         stop_buys: BTreeMap<Price, Vec<PendingStop>>,
         stop_sells: BTreeMap<Price, Vec<PendingStop>>,
         stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
@@ -505,7 +766,7 @@ impl OrderBook {
     pub(crate) fn snapshot_order_index(&self) -> Vec<(OrderId, AccountId, Side, Price)> {
         self.order_index
             .iter()
-            .map(|(&(account, id), &(side, price, _slot))| (id, account, side, price))
+            .map(|(&(account, id), &(side, price, _slot, _node))| (id, account, side, price))
             .collect()
     }
 
@@ -526,17 +787,19 @@ impl OrderBook {
         account: AccountId,
         order_id: OrderId,
     ) -> Option<(Side, Price, ReservationSlot)> {
-        self.order_index.get(&(account, order_id)).copied()
+        self.order_index
+            .get(&(account, order_id))
+            .map(|&(side, price, slot, _node_idx)| (side, price, slot))
     }
 
     /// Best bid price (highest), or `None` if the bid side is empty.
     pub(crate) fn best_bid(&self) -> Option<Price> {
-        self.bids.levels.last().map(|(p, _)| *p)
+        self.bids.last_price()
     }
 
     /// Best ask price (lowest), or `None` if the ask side is empty.
     pub(crate) fn best_ask(&self) -> Option<Price> {
-        self.asks.levels.first().map(|(p, _)| *p)
+        self.asks.first_price()
     }
 
     /// Replace a resting order's price and/or quantity in-place.
@@ -556,52 +819,44 @@ impl OrderBook {
         new_price: Price,
         new_quantity: Quantity,
     ) -> Option<(Price, Quantity)> {
-        let &(side, old_price, slot) = self.order_index.get(&(account, order_id))?;
+        let &(side, old_price, slot, node_idx) = self.order_index.get(&(account, order_id))?;
         let book_side = match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
 
         if old_price == new_price {
-            // Same price level — check if we can keep time priority.
-            let level = book_side.get_mut(old_price)?;
-            let pos = level
-                .iter()
-                .position(|o| o.id == order_id && o.account == account)?;
-            let old_remaining = level[pos].remaining;
+            // Same price level — O(1) via direct slab index, no list scan.
+            let node = book_side.node_mut(node_idx);
+            let old_remaining = node.order.remaining;
 
             if new_quantity <= old_remaining {
                 // Qty decrease (or same) → in-place update, keep priority.
-                level[pos].remaining = new_quantity;
+                node.order.remaining = new_quantity;
             } else {
-                // Qty increase → remove and push to back (lose priority).
-                let mut order = level.remove(pos).expect("position was valid");
+                // Qty increase → unlink and append to tail (lose priority).
+                // The slab index changes because `add` allocates a fresh
+                // node slot for the re-insert, so we must update
+                // `order_index` accordingly.
+                let mut order = book_side.remove_node(old_price, node_idx)?;
                 order.remaining = new_quantity;
-                level.push_back(order);
+                let new_node_idx = book_side.add(old_price, order);
+                self.order_index
+                    .insert((account, order_id), (side, old_price, slot, new_node_idx));
             }
             Some((old_price, old_remaining))
         } else {
             // Price change → remove from old level, add to new level.
-            // Manipulate the VecDeque directly to preserve the RestingOrder
-            // (including account), since BookSide::remove only returns Quantity.
-            let old_level = book_side.get_mut(old_price)?;
-            let pos = old_level
-                .iter()
-                .position(|o| o.id == order_id && o.account == account)?;
-            let mut order = old_level.remove(pos).expect("position was valid");
+            // Both ends are O(1) — no list scan on either side.
+            let mut order = book_side.remove_node(old_price, node_idx)?;
             let old_remaining = order.remaining;
             order.remaining = new_quantity;
 
-            if old_level.is_empty() {
-                book_side.remove_level(old_price);
-            }
-
-            // Add at back of new price level (loses time priority).
-            book_side.add(new_price, order);
-
-            // Update the order index to reflect the new price.
+            // `add` returns the new slab index; record it so future cancels
+            // on this order remain O(1).
+            let new_node_idx = book_side.add(new_price, order);
             self.order_index
-                .insert((account, order_id), (side, new_price, slot));
+                .insert((account, order_id), (side, new_price, slot, new_node_idx));
 
             Some((old_price, old_remaining))
         }
@@ -697,20 +952,19 @@ impl OrderBook {
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
     ) -> Option<(Side, ReservationSlot)> {
-        // Try resting orders first.
-        if let Some((side, price, slot)) = self.order_index.remove(&(account, order_id)) {
+        // Try resting orders first. O(1): the index gives us the slab
+        // node directly, so removal is a constant-time linked-list splice.
+        if let Some((side, price, slot, node_idx)) = self.order_index.remove(&(account, order_id)) {
             let book_side = match side {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
             };
-            if let Some((_acct, remaining, _slot)) =
-                book_side.remove_with_account(price, account, order_id)
-            {
+            if let Some(order) = book_side.remove_node(price, node_idx) {
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
                     symbol: self.symbol,
                     account,
-                    remaining_quantity: remaining,
+                    remaining_quantity: order.remaining,
                 });
             }
             return Some((side, slot));
@@ -761,20 +1015,16 @@ impl OrderBook {
         // carries the account field we need to filter on.
         let mut to_cancel: Vec<OrderId> = Vec::new();
 
-        for (_, queue) in &self.bids.levels {
-            for order in queue {
-                if order.account == account {
-                    to_cancel.push(order.id);
-                }
+        self.bids.for_each_order(|_, order| {
+            if order.account == account {
+                to_cancel.push(order.id);
             }
-        }
-        for (_, queue) in &self.asks.levels {
-            for order in queue {
-                if order.account == account {
-                    to_cancel.push(order.id);
-                }
+        });
+        self.asks.for_each_order(|_, order| {
+            if order.account == account {
+                to_cancel.push(order.id);
             }
-        }
+        });
 
         // Scan pending stops.
         for stops in self.stop_buys.values() {
@@ -808,20 +1058,16 @@ impl OrderBook {
         self.consumed_slots.clear();
         let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
 
-        for (_, queue) in &self.bids.levels {
-            for order in queue {
-                if order.time_in_force == TimeInForce::Day {
-                    to_cancel.push((order.account, order.id));
-                }
+        self.bids.for_each_order(|_, order| {
+            if order.time_in_force == TimeInForce::Day {
+                to_cancel.push((order.account, order.id));
             }
-        }
-        for (_, queue) in &self.asks.levels {
-            for order in queue {
-                if order.time_in_force == TimeInForce::Day {
-                    to_cancel.push((order.account, order.id));
-                }
+        });
+        self.asks.for_each_order(|_, order| {
+            if order.time_in_force == TimeInForce::Day {
+                to_cancel.push((order.account, order.id));
             }
-        }
+        });
 
         for stops in self.stop_buys.values() {
             for stop in stops {
@@ -1046,26 +1292,20 @@ impl OrderBook {
         self.match_price_buf.clear();
         match taker_side {
             Side::Buy => {
-                // Buy matches against asks (lowest first)
+                // Buy matches against asks (lowest first).
                 self.match_price_buf.extend(
                     opposite
-                        .levels
-                        .iter()
-                        .map(|(p, _)| p)
-                        .take_while(|&&p| price_limit.is_none_or(|limit| p <= limit))
-                        .copied(),
+                        .prices_ascending()
+                        .take_while(|&p| price_limit.is_none_or(|limit| p <= limit)),
                 );
             }
             Side::Sell => {
-                // Sell matches against bids (highest first)
+                // Sell matches against bids (highest first).
                 self.match_price_buf.extend(
                     opposite
-                        .levels
-                        .iter()
+                        .prices_ascending()
                         .rev()
-                        .map(|(p, _)| p)
-                        .take_while(|&&p| price_limit.is_none_or(|limit| p >= limit))
-                        .copied(),
+                        .take_while(|&p| price_limit.is_none_or(|limit| p >= limit)),
                 );
             }
         };
@@ -1079,14 +1319,24 @@ impl OrderBook {
         'outer: while price_idx < self.match_price_buf.len() {
             let price = self.match_price_buf[price_idx];
             price_idx += 1;
-            let Some(level) = opposite.get_mut(price) else {
-                continue;
-            };
 
-            while let Some(maker) = level.front_mut() {
+            // Walk this price level's intrusive FIFO from the head. `pop_front`
+            // already removes the level when it empties, so we don't need a
+            // separate `remove_level` after the inner loop exits.
+            while let Some(maker_idx) = opposite.front_node_idx(price) {
+                // Snapshot the maker fields we need; releasing the borrow so
+                // we can mutate via `pop_front`/`node_mut` on subsequent
+                // branches without aliasing.
+                let maker_node = opposite.node(maker_idx);
+                let maker_account = maker_node.order.account;
+                let maker_id = maker_node.order.id;
+                let maker_remaining = maker_node.order.remaining;
+                let maker_side = maker_node.order.side;
+                let maker_reservation = maker_node.order.reservation;
+
                 // Self-trade prevention: check if taker and maker belong to
                 // the same account before generating a fill.
-                if stp != SelfTradeProtection::Allow && maker.account == taker_account {
+                if stp != SelfTradeProtection::Allow && maker_account == taker_account {
                     match stp {
                         SelfTradeProtection::Allow => unreachable!(),
                         SelfTradeProtection::CancelNewest => {
@@ -1096,49 +1346,44 @@ impl OrderBook {
                         }
                         SelfTradeProtection::CancelOldest => {
                             // Cancel the maker, continue matching the taker.
-                            let cancelled_maker = level.pop_front().expect("front existed");
-                            self.order_index
-                                .remove(&(cancelled_maker.account, cancelled_maker.id));
+                            opposite.pop_front(price).expect("front existed");
+                            self.order_index.remove(&(maker_account, maker_id));
                             self.consumed_slots.push((
-                                cancelled_maker.account,
-                                cancelled_maker.id,
-                                cancelled_maker.side,
-                                cancelled_maker.reservation,
+                                maker_account,
+                                maker_id,
+                                maker_side,
+                                maker_reservation,
                             ));
                             reports.push(ExecutionReport::Cancelled {
-                                order_id: cancelled_maker.id,
+                                order_id: maker_id,
                                 symbol: self.symbol,
-                                account: cancelled_maker.account,
-                                remaining_quantity: cancelled_maker.remaining,
+                                account: maker_account,
+                                remaining_quantity: maker_remaining,
                             });
                             continue;
                         }
                         SelfTradeProtection::CancelBoth => {
                             // Cancel the maker and the taker.
-                            let cancelled_maker = level.pop_front().expect("front existed");
-                            self.order_index
-                                .remove(&(cancelled_maker.account, cancelled_maker.id));
+                            opposite.pop_front(price).expect("front existed");
+                            self.order_index.remove(&(maker_account, maker_id));
                             self.consumed_slots.push((
-                                cancelled_maker.account,
-                                cancelled_maker.id,
-                                cancelled_maker.side,
-                                cancelled_maker.reservation,
+                                maker_account,
+                                maker_id,
+                                maker_side,
+                                maker_reservation,
                             ));
                             reports.push(ExecutionReport::Cancelled {
-                                order_id: cancelled_maker.id,
+                                order_id: maker_id,
                                 symbol: self.symbol,
-                                account: cancelled_maker.account,
-                                remaining_quantity: cancelled_maker.remaining,
+                                account: maker_account,
+                                remaining_quantity: maker_remaining,
                             });
-                            if level.is_empty() {
-                                opposite.remove_level(price);
-                            }
                             return (Some(quantity), true);
                         }
                     }
                 }
 
-                let mut fill_qty = quantity.min(maker.remaining);
+                let mut fill_qty = quantity.min(maker_remaining);
 
                 // Enforce quote budget: limit fill to what the taker can afford.
                 if let Some(budget) = quote_budget {
@@ -1159,10 +1404,10 @@ impl OrderBook {
                 // Fees are zero here — the Exchange computes and sets
                 // them after matching, before balance updates.
                 reports.push(ExecutionReport::Fill {
-                    maker_order_id: maker.id,
+                    maker_order_id: maker_id,
                     taker_order_id: taker_id,
                     symbol: self.symbol,
-                    maker_account: maker.account,
+                    maker_account,
                     taker_account,
                     price,
                     quantity: fill_qty,
@@ -1177,21 +1422,21 @@ impl OrderBook {
                     *budget = budget.saturating_sub(cost);
                 }
 
-                match maker.remaining.checked_sub(fill_qty) {
+                match maker_remaining.checked_sub(fill_qty) {
                     Some(new_remaining) => {
-                        maker.remaining = new_remaining;
+                        // Partial maker fill — update remaining in place.
+                        opposite.node_mut(maker_idx).order.remaining = new_remaining;
                     }
                     None => {
                         // Maker fully filled — remove from book and record
                         // the slot so the Exchange can release the reservation.
-                        let filled_maker = level.pop_front().expect("front existed");
-                        self.order_index
-                            .remove(&(filled_maker.account, filled_maker.id));
+                        opposite.pop_front(price).expect("front existed");
+                        self.order_index.remove(&(maker_account, maker_id));
                         self.consumed_slots.push((
-                            filled_maker.account,
-                            filled_maker.id,
-                            filled_maker.side,
-                            filled_maker.reservation,
+                            maker_account,
+                            maker_id,
+                            maker_side,
+                            maker_reservation,
                         ));
                     }
                 }
@@ -1206,16 +1451,10 @@ impl OrderBook {
                     }
                     None => {
                         // Taker fully filled.
-                        if level.is_empty() {
-                            opposite.remove_level(price);
-                        }
                         return (None, false);
                     }
                 }
             }
-
-            // Level fully consumed.
-            opposite.remove_level(price);
         }
 
         (Some(quantity), stp_cancelled)
@@ -1383,7 +1622,7 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
-        book_side.add(
+        let node_idx = book_side.add(
             price,
             RestingOrder {
                 id,
@@ -1395,8 +1634,9 @@ impl OrderBook {
                 reservation,
             },
         );
+        // Record the slab index so cancel/amend stays O(1).
         self.order_index
-            .insert((account, id), (side, price, reservation));
+            .insert((account, id), (side, price, reservation, node_idx));
         reports.push(ExecutionReport::Placed {
             order_id: id,
             symbol: self.symbol,
@@ -1422,16 +1662,10 @@ impl OrderBook {
         self.consumed_slots.clear();
         let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
 
-        for (_, queue) in &self.bids.levels {
-            for order in queue {
-                to_cancel.push((order.account, order.id));
-            }
-        }
-        for (_, queue) in &self.asks.levels {
-            for order in queue {
-                to_cancel.push((order.account, order.id));
-            }
-        }
+        self.bids
+            .for_each_order(|_, order| to_cancel.push((order.account, order.id)));
+        self.asks
+            .for_each_order(|_, order| to_cancel.push((order.account, order.id)));
 
         for stops in self.stop_buys.values() {
             for stop in stops {
@@ -1510,20 +1744,16 @@ impl OrderBook {
         }
 
         // Patch resting orders in bids and asks.
-        for (_, queue) in &mut self.bids.levels {
-            for order in queue.iter_mut() {
-                if let Some(&slot) = slot_map.get(&(order.account, order.id)) {
-                    order.reservation = slot;
-                }
+        self.bids.for_each_order_mut(|_, order| {
+            if let Some(&slot) = slot_map.get(&(order.account, order.id)) {
+                order.reservation = slot;
             }
-        }
-        for (_, queue) in &mut self.asks.levels {
-            for order in queue.iter_mut() {
-                if let Some(&slot) = slot_map.get(&(order.account, order.id)) {
-                    order.reservation = slot;
-                }
+        });
+        self.asks.for_each_order_mut(|_, order| {
+            if let Some(&slot) = slot_map.get(&(order.account, order.id)) {
+                order.reservation = slot;
             }
-        }
+        });
 
         // Patch pending stops.
         for stops in self.stop_buys.values_mut() {
@@ -1550,7 +1780,7 @@ impl OrderBook {
     ) -> impl Iterator<Item = ((AccountId, OrderId), (Side, ReservationSlot))> + '_ {
         self.order_index
             .iter()
-            .map(|(&key, &(side, _price, slot))| (key, (side, slot)))
+            .map(|(&key, &(side, _price, slot, _node))| (key, (side, slot)))
     }
 
     /// Collect (account, order_id) → (side, slot) for all pending stops.
@@ -1573,23 +1803,26 @@ impl OrderBook {
     /// Iterate every GTD order on the book, resting or pending stop, yielding
     /// `(account, order_id, expiry_ns)`. Used after snapshot restore to
     /// rebuild the scheduler heap from order state.
-    pub(crate) fn iter_gtd_orders(&self) -> impl Iterator<Item = (AccountId, OrderId, u64)> + '_ {
-        let resting = self
-            .bids
-            .levels
-            .iter()
-            .chain(self.asks.levels.iter())
-            .flat_map(|(_, queue)| queue.iter())
-            .filter(|o| o.time_in_force == TimeInForce::GTD)
-            .map(|o| (o.account, o.id, o.expiry_ns));
-        let stops = self
-            .stop_buys
-            .values()
-            .chain(self.stop_sells.values())
-            .flat_map(|stops| stops.iter())
-            .filter(|s| s.time_in_force == TimeInForce::GTD)
-            .map(|s| (s.account, s.id, s.expiry_ns));
-        resting.chain(stops)
+    pub(crate) fn iter_gtd_orders(&self) -> Vec<(AccountId, OrderId, u64)> {
+        // Called once at snapshot restore — not a hot path, so collect
+        // into a Vec rather than fight the borrow checker for a streaming
+        // iterator over the slab-walking closures.
+        let mut out = Vec::new();
+        let mut push_if_gtd = |order: &RestingOrder| {
+            if order.time_in_force == TimeInForce::GTD {
+                out.push((order.account, order.id, order.expiry_ns));
+            }
+        };
+        self.bids.for_each_order(|_, o| push_if_gtd(o));
+        self.asks.for_each_order(|_, o| push_if_gtd(o));
+        for stops in self.stop_buys.values().chain(self.stop_sells.values()) {
+            for s in stops {
+                if s.time_in_force == TimeInForce::GTD {
+                    out.push((s.account, s.id, s.expiry_ns));
+                }
+            }
+        }
+        out
     }
 
     /// Look up a resting limit or pending stop by `(account, order_id)` and
@@ -1603,17 +1836,15 @@ impl OrderBook {
     /// in the queue length at that price (which cancel/cancel-replace pay
     /// too).
     pub(crate) fn find_gtd_expiry(&self, account: AccountId, order_id: OrderId) -> Option<u64> {
-        if let Some(&(side, price, _slot)) = self.order_index.get(&(account, order_id)) {
+        if let Some(&(side, _price, _slot, node_idx)) = self.order_index.get(&(account, order_id)) {
+            // O(1): the slab index points directly at the order.
             let book_side = match side {
                 Side::Buy => &self.bids,
                 Side::Sell => &self.asks,
             };
-            if let Ok(idx) = book_side.search(price) {
-                for o in &book_side.levels[idx].1 {
-                    if o.id == order_id && o.account == account {
-                        return (o.time_in_force == TimeInForce::GTD).then_some(o.expiry_ns);
-                    }
-                }
+            let order = &book_side.node(node_idx).order;
+            if order.id == order_id && order.account == account {
+                return (order.time_in_force == TimeInForce::GTD).then_some(order.expiry_ns);
             }
         }
         if let Some(&(side, trigger_price)) = self.stop_index.get(&(account, order_id)) {

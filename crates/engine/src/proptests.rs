@@ -419,13 +419,13 @@ fn build_submitted_quantities(
 /// Sum all resting and pending-stop quantities on the book.
 fn book_total_quantity(book: &OrderBook) -> u64 {
     let mut total = 0u64;
-    for (_price, level) in book.bids().levels_iter() {
-        for order in level {
+    for (_price, level) in book.bids().levels_snapshot() {
+        for order in &level {
             total += order.remaining().get();
         }
     }
-    for (_price, level) in book.asks().levels_iter() {
-        for order in level {
+    for (_price, level) in book.asks().levels_snapshot() {
+        for order in &level {
             total += order.remaining().get();
         }
     }
@@ -462,13 +462,13 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
     let mut book_ids: std::collections::HashSet<(AccountId, OrderId)> =
         std::collections::HashSet::new();
     for (_sym, book) in exchange.books() {
-        for (_price, level) in book.bids().levels_iter() {
-            for order in level {
+        for (_price, level) in book.bids().levels_snapshot() {
+            for order in &level {
                 book_ids.insert((order.account(), order.id()));
             }
         }
-        for (_price, level) in book.asks().levels_iter() {
-            for order in level {
+        for (_price, level) in book.asks().levels_snapshot() {
+            for order in &level {
                 book_ids.insert((order.account(), order.id()));
             }
         }
@@ -826,13 +826,13 @@ proptest! {
         let index = book.snapshot_order_index();
         let mut ids_from_book = std::collections::HashSet::new();
 
-        for (_price, level) in book.bids().levels_iter() {
-            for order in level {
+        for (_price, level) in book.bids().levels_snapshot() {
+            for order in &level {
                 ids_from_book.insert((order.account(), order.id()));
             }
         }
-        for (_price, level) in book.asks().levels_iter() {
-            for order in level {
+        for (_price, level) in book.asks().levels_snapshot() {
+            for order in &level {
                 ids_from_book.insert((order.account(), order.id()));
             }
         }
@@ -855,10 +855,10 @@ proptest! {
         );
 
         // --- No empty levels ---
-        for (_price, level) in book.bids().levels_iter() {
+        for (_price, level) in book.bids().levels_snapshot() {
             prop_assert!(!level.is_empty(), "empty bid level should have been removed");
         }
-        for (_price, level) in book.asks().levels_iter() {
+        for (_price, level) in book.asks().levels_snapshot() {
             prop_assert!(!level.is_empty(), "empty ask level should have been removed");
         }
 
@@ -1352,13 +1352,13 @@ proptest! {
         // Collect all (account, order_id) pairs on the book (resting + pending stops).
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {
-            for (_price, level) in book.bids().levels_iter() {
-                for order in level {
+            for (_price, level) in book.bids().levels_snapshot() {
+                for order in &level {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
-            for (_price, level) in book.asks().levels_iter() {
-                for order in level {
+            for (_price, level) in book.asks().levels_snapshot() {
+                for order in &level {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
@@ -1416,13 +1416,13 @@ proptest! {
 
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {
-            for (_price, level) in book.bids().levels_iter() {
-                for order in level {
+            for (_price, level) in book.bids().levels_snapshot() {
+                for order in &level {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
-            for (_price, level) in book.asks().levels_iter() {
-                for order in level {
+            for (_price, level) in book.asks().levels_snapshot() {
+                for order in &level {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
