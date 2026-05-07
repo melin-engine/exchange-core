@@ -571,7 +571,10 @@ pub fn run_dpdk_poll(
         #[cfg(feature = "latency-trace")]
         {
             let now = melin_journal::trace::trace_ts();
-            if work_done_this_iter {
+            // Skip records once shutdown has been observed: matches the
+            // gate on the journal / matching / response stages and keeps
+            // diagnostic numbers comparable across runs.
+            if work_done_this_iter && !shutdown.load(Ordering::Relaxed) {
                 poll_iter_hist
                     .record_ns(melin_journal::trace::trace_elapsed_ns(poll_iter_start, now));
             }

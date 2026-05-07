@@ -213,6 +213,10 @@ pub fn run(
 
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
+        // Skip records on the shutdown drain (see pipeline.rs for the
+        // same gate on the journal/matching stages).
+        #[cfg(feature = "latency-trace")]
+        let record_this_batch = !shutdown.load(Ordering::Relaxed);
 
         // Wait for durability (see response.rs for full explanation).
         {
@@ -257,7 +261,9 @@ pub fn run(
         // own — the wire BatchEnd is emitted purely from the flag.
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
-            spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
+            if record_this_batch {
+                spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
+            }
 
             let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
             let mut kinds_len: usize = 0;
@@ -343,7 +349,7 @@ pub fn run(
             // so we record one sample per logical request, matching the
             // kernel response stage.
             #[cfg(feature = "latency-trace")]
-            if slot.is_last_in_request {
+            if record_this_batch && slot.is_last_in_request {
                 server_e2e_hist.record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
             }
 
@@ -353,7 +359,9 @@ pub fn run(
         }
 
         #[cfg(feature = "latency-trace")]
-        dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
+        if record_this_batch {
+            dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
+        }
     }
 }
 

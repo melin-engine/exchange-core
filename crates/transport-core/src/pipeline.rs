@@ -516,12 +516,23 @@ impl<E: AppEvent> JournalStage<E> {
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
 
+                // Skip latency-trace records on the final batch (shutdown
+                // observed externally OR sentinel present): the producer
+                // may have queued slots over a quiet period that ends at
+                // shutdown, inflating wakeup samples for percentiles
+                // without saying anything about steady-state behaviour.
                 #[cfg(feature = "latency-trace")]
-                for slot in &batch[..count] {
-                    wakeup_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
-                        slot.publish_ts,
-                        batch_start,
-                    ));
+                let record_this_batch = !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    && !batch[..count].iter().any(|s| s.event.is_shutdown());
+
+                #[cfg(feature = "latency-trace")]
+                if record_this_batch {
+                    for slot in &batch[..count] {
+                        wakeup_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
+                            slot.publish_ts,
+                            batch_start,
+                        ));
+                    }
                 }
 
                 // Batch-encode all events into the writer's internal buffer.
@@ -594,10 +605,12 @@ impl<E: AppEvent> JournalStage<E> {
                 }
 
                 #[cfg(feature = "latency-trace")]
-                batch_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
-                    batch_start,
-                    trace_ts(),
-                ));
+                if record_this_batch {
+                    batch_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
+                        batch_start,
+                        trace_ts(),
+                    ));
+                }
             }
 
             // Sync when: we have data AND (batch full OR delay expired OR no delay).
@@ -1468,6 +1481,15 @@ impl<A: Application> MatchingStage<A> {
             // matching → response cursor by up to MAX_MATCHING_BATCH×.
             let mut out_batch = self.output.batch();
 
+            // Skip latency-trace records on the final batch: see the
+            // matching twin of this comment in the journal stage above.
+            #[cfg(feature = "latency-trace")]
+            let record_this_batch = !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                && !slots_a
+                    .iter()
+                    .chain(slots_b.iter())
+                    .any(|s| s.event.is_shutdown());
+
             for (i, slot) in slots_a.iter().chain(slots_b.iter()).enumerate() {
                 if slot.event.is_shutdown() {
                     // Sentinel — every event the producer published before
@@ -1480,7 +1502,7 @@ impl<A: Application> MatchingStage<A> {
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
-                {
+                if record_this_batch {
                     let now = trace_ts();
                     wakeup_hist
                         .record_ns(melin_journal::trace::trace_elapsed_ns(slot.publish_ts, now));
@@ -1549,8 +1571,10 @@ impl<A: Application> MatchingStage<A> {
                 let exec_end = trace_ts();
 
                 #[cfg(feature = "latency-trace")]
-                execute_hist
-                    .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
+                if record_this_batch {
+                    execute_hist
+                        .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
+                }
 
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
                 let match_complete_ts = trace_ts();
