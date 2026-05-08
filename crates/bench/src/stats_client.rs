@@ -32,8 +32,13 @@ use std::time::Duration;
 /// already plenty.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// Read timeout. Stats dump is small (<8 KiB) so 500ms is generous.
-const READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Read timeout. The server's `/stats-dump` handler calls
+/// `SyncHistogram::refresh_timeout(500ms)` to merge pending recorder
+/// buffers before serializing — the read here has to outlast that
+/// worst case plus headroom for body transfer. 2 s is generous; the
+/// fetch happens once per bench run so the bound only matters when
+/// the server is genuinely unreachable.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Recv buffer size — matches the server's max body (8 KiB) plus
 /// HTTP headers (~256 bytes) with comfortable slack.
