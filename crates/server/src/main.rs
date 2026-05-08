@@ -69,6 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
+    if !config.no_mlock {
+        try_lock_memory();
+    }
+
     #[cfg(feature = "dpdk")]
     {
         let dpdk_config = dpdk_config_from(&config);
@@ -85,6 +89,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
         melin_server::server::run_with_shutdown(listener, config, shutdown)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory locking
+// ---------------------------------------------------------------------------
+
+/// Pin the entire process address space into RAM with `mlockall`.
+///
+/// Without locking, the kernel can fault out engine pages on memory
+/// pressure, surfacing as 100µs–10ms tail spikes the next time the
+/// matching thread touches the evicted page. Pinning is best-effort:
+/// it requires `CAP_IPC_LOCK` (or root) and `RLIMIT_MEMLOCK` raised
+/// to a value larger than the resident set. We raise the rlimit
+/// ourselves to [`libc::RLIM_INFINITY`] before calling `mlockall`,
+/// but the rlimit raise itself needs `CAP_SYS_RESOURCE` (also held
+/// by root) to go above the hard ceiling. On a non-privileged dev
+/// run we log a warning and continue — the server still works,
+/// just without the tail-latency benefit. Use `--no-mlock` to skip
+/// this entirely without the warning noise.
+fn try_lock_memory() {
+    // Raise RLIMIT_MEMLOCK so mlockall isn't artificially capped at
+    // 64 KiB (typical default). EPERM here is non-fatal: the existing
+    // hard limit may already be high enough, in which case mlockall
+    // will succeed regardless.
+    let unlim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    let setrlimit_rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlim) };
+    if setrlimit_rc != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %err,
+            "could not raise RLIMIT_MEMLOCK; mlockall may fail or be capped"
+        );
+    }
+
+    // Lock current AND future mappings — covers heap growth, mmap'd
+    // journal regions, and lazily-faulted stacks of threads spawned
+    // later. ONFAULT (lock pages only when they're first accessed)
+    // would be cheaper but defeats the purpose: we want the whole
+    // working set resident before any latency-sensitive work runs.
+    let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+    if rc == 0 {
+        tracing::info!("mlockall(MCL_CURRENT | MCL_FUTURE) succeeded");
+    } else {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %err,
+            "mlockall failed; running without memory lock — tail latency may be affected. \
+             Pass --no-mlock to suppress this warning."
+        );
     }
 }
 
