@@ -116,6 +116,64 @@ impl<T: Copy + Default> Producer<T> {
             }
         }
     }
+
+    /// Publish a batch of values atomically with a single Release store.
+    ///
+    /// Writes up to `values.len()` slots and advances the head cursor
+    /// once at the end. Returns the number actually written, capped by
+    /// available ring capacity. Returning 0 means the ring is full —
+    /// the caller should retry after the consumer makes progress.
+    ///
+    /// Compared to calling [`Self::try_publish`] per element, this
+    /// amortizes the cursor Release store across the batch:
+    /// per-element work is just a `*slot = value` write, with one
+    /// Release at the end. That removes most of the ~300 ns/slot
+    /// dispatch cost the response stage was paying under saturation.
+    pub fn try_publish_batch(&mut self, values: &[T]) -> usize {
+        if values.is_empty() {
+            return 0;
+        }
+        let head = self.shared.head.get().load(Ordering::Relaxed);
+        let capacity = self.shared.mask + 1;
+
+        // Re-read tail if the cached view says we're full.
+        let mut available = capacity.saturating_sub(head - self.cached_tail);
+        if available == 0 {
+            self.cached_tail = self.shared.tail.get().load(Ordering::Acquire);
+            available = capacity.saturating_sub(head - self.cached_tail);
+            if available == 0 {
+                return 0;
+            }
+        }
+
+        let count = (values.len() as u64).min(available) as usize;
+        for (i, value) in values.iter().take(count).enumerate() {
+            let idx = ((head + i as u64) & self.shared.mask) as usize;
+            // Safety: consumer won't read these slots until we advance head.
+            unsafe { *self.shared.slots[idx].get() = *value };
+        }
+        // Single Release store covers all `count` slots.
+        self.shared
+            .head
+            .get()
+            .store(head + count as u64, Ordering::Release);
+        count
+    }
+
+    /// Publish all `values`, spinning until each fits. Equivalent to
+    /// looping [`Self::publish`] per value, but amortizes the cursor
+    /// Release store via [`Self::try_publish_batch`].
+    pub fn publish_batch_blocking(&mut self, values: &[T]) {
+        let mut written = 0;
+        while written < values.len() {
+            let n = self.try_publish_batch(&values[written..]);
+            if n == 0 {
+                std::hint::spin_loop();
+            } else {
+                written += n;
+            }
+        }
+    }
 }
 
 impl<T: Copy + Default> Consumer<T> {
@@ -259,5 +317,73 @@ mod tests {
         assert_eq!(producer.publish(1), 0);
         assert_eq!(producer.publish(2), 1);
         assert_eq!(producer.publish(3), 2);
+    }
+
+    #[test]
+    fn try_publish_batch_writes_all_when_capacity_available() {
+        let (mut producer, mut consumer) = channel::<u64>(16);
+        let values = [10, 20, 30, 40, 50];
+        let n = producer.try_publish_batch(&values);
+        assert_eq!(n, 5);
+        let mut buf = [0u64; 5];
+        let read = consumer.consume_batch(&mut buf, 5);
+        assert_eq!(read, 5);
+        assert_eq!(buf, values);
+    }
+
+    #[test]
+    fn try_publish_batch_caps_at_available_capacity() {
+        // Ring of capacity 8. Fill 6 slots, then try to publish 5 — only
+        // 2 should land; caller is responsible for retrying the rest.
+        let (mut producer, _consumer) = channel::<u64>(8);
+        for i in 0..6 {
+            producer.try_publish(i).unwrap();
+        }
+        let n = producer.try_publish_batch(&[100, 101, 102, 103, 104]);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn try_publish_batch_returns_zero_when_full() {
+        let (mut producer, _consumer) = channel::<u64>(4);
+        for i in 0..4 {
+            producer.try_publish(i).unwrap();
+        }
+        assert_eq!(producer.try_publish_batch(&[99, 100]), 0);
+    }
+
+    #[test]
+    fn try_publish_batch_empty_input_returns_zero() {
+        let (mut producer, _consumer) = channel::<u64>(8);
+        let empty: [u64; 0] = [];
+        assert_eq!(producer.try_publish_batch(&empty), 0);
+    }
+
+    #[test]
+    fn publish_batch_blocking_handles_capacity_pressure() {
+        // Ring of 8, batch of 20. Producer must block multiple times
+        // while consumer drains. End result: all 20 values delivered
+        // in order.
+        let (mut producer, mut consumer) = channel::<u64>(8);
+        let values: Vec<u64> = (0..20).collect();
+
+        let consumer_thread = std::thread::spawn(move || {
+            let mut received = Vec::with_capacity(20);
+            loop {
+                if let Some((_, v)) = consumer.try_consume() {
+                    received.push(v);
+                    if received.len() == 20 {
+                        break;
+                    }
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            received
+        });
+
+        producer.publish_batch_blocking(&values);
+        let received = consumer_thread.join().unwrap();
+        assert_eq!(received, values);
     }
 }

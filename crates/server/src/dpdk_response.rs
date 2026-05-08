@@ -150,6 +150,26 @@ pub fn run(
     #[cfg(feature = "tick-to-trade")]
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
 
+    // Per-tid TX accumulation buffers. Filled during the slot loop and
+    // flushed in one batched SPSC publish at end of batch. Each
+    // OutputSlot expands to at most 2 frames (payload + optional
+    // BatchEnd terminator), so 2× MAX_BATCH is the upper bound. The
+    // SPSC ring is 4096-deep so a single flush never blocks at this
+    // saturation level.
+    let num_tids = tx_producers.len();
+    let mut tx_buffers: Vec<Vec<TxFrame>> = (0..num_tids)
+        .map(|_| Vec::with_capacity(MAX_BATCH * 2))
+        .collect();
+    // Per-tid recv_ts list for the BatchEnd frames in each pending TX
+    // buffer. After the batch flushes, we walk this list and record one
+    // server-e2e sample per request — capturing the full path from NIC
+    // ingress to the moment the response is visible to the DPDK poll
+    // thread (i.e. after the SPSC Release store fires).
+    #[cfg(feature = "latency-trace")]
+    let mut e2e_pending: Vec<Vec<melin_journal::trace::TraceTimestamp>> = (0..num_tids)
+        .map(|_| Vec::with_capacity(MAX_BATCH))
+        .collect();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -358,9 +378,13 @@ pub fn run(
                 #[cfg(feature = "tick-to-trade")]
                 encode_rec.record_elapsed(encode_start, trace::trace_ts());
 
-                // Send the complete wire frame (with length prefix) to
-                // the DPDK poll thread for transmission via lock-free
-                // SPSC.
+                // Build the wire frame and queue it for the DPDK poll
+                // thread. We accumulate per-tid here and publish the
+                // whole batch with a single SPSC Release store at end
+                // of the slot loop (see flush below). That amortizes
+                // the per-frame Release cost — at saturation it was
+                // ~340 ns/frame in the dispatch stage, dominating
+                // encode (~40 ns) by 8×.
                 let mut frame = TxFrame {
                     connection_id: slot.connection_id,
                     len: written as u16,
@@ -368,19 +392,43 @@ pub fn run(
                 };
                 frame.data[..written].copy_from_slice(&encode_buf[..written]);
                 let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
-                tx_producers[tid].publish(frame);
+                tx_buffers[tid].push(frame);
 
-                // Server-side end-to-end (DPDK): reader recv → SPSC publish.
-                // The actual NIC TX happens in the DPDK poll thread —
-                // see `dpdk_transport.rs` for a follow-up egress histogram.
+                // Stash the recv_ts for the per-request e2e sample —
+                // the BatchEnd frame is the request terminator. We
+                // record after the flush so the measurement covers
+                // the actual SPSC publish time, including any
+                // backpressure wait when the ring is full.
                 #[cfg(feature = "latency-trace")]
                 if matches!(kind, ResponseKind::BatchEnd) {
-                    server_e2e_rec.record_elapsed(slot.recv_ts, trace::trace_ts());
+                    e2e_pending[tid].push(slot.recv_ts);
                 }
             }
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
                 state.last_send = batch_now;
+            }
+        }
+
+        // Flush each per-tid accumulation buffer to its SPSC producer
+        // in a single batched publish (one Release store per tid),
+        // then record the per-request server-e2e samples relative to
+        // the post-flush wall-clock time so the metric reflects "the
+        // moment the DPDK poll thread can see this response".
+        for tid in 0..tx_buffers.len() {
+            if !tx_buffers[tid].is_empty() {
+                tx_producers[tid].publish_batch_blocking(&tx_buffers[tid]);
+                tx_buffers[tid].clear();
+            }
+        }
+        #[cfg(feature = "latency-trace")]
+        {
+            let now = trace::trace_ts();
+            for tid_e2e in e2e_pending.iter_mut() {
+                for &recv_ts in tid_e2e.iter() {
+                    server_e2e_rec.record_elapsed(recv_ts, now);
+                }
+                tid_e2e.clear();
             }
         }
 
