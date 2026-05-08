@@ -138,7 +138,8 @@ pub fn run(
     #[cfg(feature = "latency-trace")]
     let mut dispatch_rec = trace::register_stage("response: dispatch (consume → SPSC publish)");
     #[cfg(feature = "latency-trace")]
-    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response SPSC publish)");
+    let mut server_e2e_rec =
+        trace::register_stage("server e2e (reader recv → response SPSC publish)");
     #[cfg(feature = "tick-to-trade")]
     let mut journal_wait_rec =
         trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
