@@ -737,6 +737,7 @@ pub fn run_dpdk_roundtrip(
     // Fetch the server-side per-stage histogram dump before the
     // server shuts down. Best-effort; missing data is rendered as a
     // one-line note in print_results.
+    eprintln!("  [diag] dpdk roundtrip about to fetch; health_addr={health_addr:?}");
     let server_stages = match health_addr {
         Some(addr) => crate::stats_client::fetch(addr),
         None => crate::stats_client::Body::Empty,
