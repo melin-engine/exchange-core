@@ -331,9 +331,18 @@ fn reader_loop<R: AsRawFd>(
     // Submit the initial eventfd read so we wake on first connection.
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
 
+    // Stage histograms via the global registry. `publish` is the
+    // narrow ring-publish call cost; `ingest` is the full per-frame
+    // reader cost (decode + auth/dedup + slot construction + publish)
+    // — which is the input to the bench's tick-to-trade decomposition.
     #[cfg(feature = "latency-trace")]
-    let mut publish_hist =
-        melin_journal::trace::StageHistogram::new("reader: publish (decode → disruptor publish)");
+    let publish_rec = melin_journal::trace::register_stage(
+        "reader: publish (decode → disruptor publish)",
+    );
+    #[cfg(feature = "latency-trace")]
+    let ingest_rec = melin_journal::trace::register_stage(
+        "reader: ingest (recv_ts → publish complete)",
+    );
 
     // Coarse gate for timeout scanning — avoids scanning on every
     // submit_and_wait return during high throughput.
@@ -576,7 +585,9 @@ fn reader_loop<R: AsRawFd>(
                     &server_busy_frame,
                     batch_wall_ns,
                     #[cfg(feature = "latency-trace")]
-                    &mut publish_hist,
+                    &publish_rec,
+                    #[cfg(feature = "latency-trace")]
+                    &ingest_rec,
                 );
                 if drop_conn {
                     Action::Remove {
@@ -646,9 +657,6 @@ fn reader_loop<R: AsRawFd>(
     unsafe {
         libc::close(wakeup_fd);
     }
-
-    #[cfg(feature = "latency-trace")]
-    publish_hist.print_report();
 }
 
 /// What to do after processing a RECV CQE.
@@ -760,7 +768,8 @@ fn process_frames<R>(
     producer: &mut ring::Producer<InputSlot>,
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
-    #[cfg(feature = "latency-trace")] publish_hist: &mut melin_journal::trace::StageHistogram,
+    #[cfg(feature = "latency-trace")] publish_rec: &melin_journal::trace::StageRecorder,
+    #[cfg(feature = "latency-trace")] ingest_rec: &melin_journal::trace::StageRecorder,
 ) -> bool {
     let mut cursor = 0;
 
@@ -876,10 +885,16 @@ fn process_frames<R>(
         }
 
         #[cfg(feature = "latency-trace")]
-        publish_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
-            pre_publish,
-            trace_ts(),
-        ));
+        {
+            let publish_done = trace_ts();
+            publish_rec.record_elapsed(pre_publish, publish_done);
+            // Ingest covers the entire reader cost for this frame:
+            // decode + auth/dedup + slot construction + publish.
+            // `recv_ts` is the frame-extraction timestamp (a software
+            // approximation of NIC ingress — true HW timestamping is
+            // a follow-up; see `docs/benchmarking.md`).
+            ingest_rec.record_elapsed(recv_ts, publish_done);
+        }
     }
 
     // Compact: shift remaining bytes to the front of the parse buffer.
