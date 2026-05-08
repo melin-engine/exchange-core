@@ -78,18 +78,8 @@ pub enum Body {
 /// aborts a benchmark run.
 pub fn fetch(addr: SocketAddr) -> Body {
     match fetch_inner(addr) {
-        Ok(text) => {
-            eprintln!(
-                "  [stats_client debug] fetched {} bytes from {addr}; first 200: {:?}",
-                text.len(),
-                &text[..text.len().min(200)],
-            );
-            parse_body(&text)
-        }
-        Err(e) => {
-            eprintln!("  [stats_client debug] fetch from {addr} failed: {e}");
-            Body::Empty
-        }
+        Ok(text) => parse_body(&text),
+        Err(_) => Body::Empty,
     }
 }
 

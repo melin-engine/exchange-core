@@ -1709,6 +1709,7 @@ workload_throughput() {
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
             ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
+                --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${threads_arg} \
@@ -1737,6 +1738,7 @@ workload_single() {
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
             ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
+                --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} \
