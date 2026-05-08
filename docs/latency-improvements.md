@@ -42,7 +42,6 @@ across 200M+ events.
 
 | ID | Idea | Est. win | Effort | Notes |
 |---|---|---|---|---|
-| F2 | `idle=poll` on isolated cores in GRUB | tightens p99/p99.9 | Trivial | C1 wakeup currently allowed (`max_cstate=1` lets C1 through) |
 | F3 | smoltcp TCP tuning: PSH every send + immediate ACK | a few µs of bench RTT | Low | Off-server (consumer side); helps client-perceived latency at window=1 |
 | F4 | Strip per-iteration `tick_check_counter` work when `tick_interval_ms=0` | one branch / iter | Trivial | Confirmed not on critical path; almost cosmetic |
 | F6 | Try mimalloc as alternative to jemalloc | unclear without testing | Low | Mostly mooted by T5 unless mimalloc has a meaningfully tighter purge model |
@@ -52,7 +51,6 @@ across 200M+ events.
 | ID | Idea | Est. win | Effort | Notes |
 |---|---|---|---|---|
 | T6 | Explicit hugepages for the engine heap (hugetlbfs / `madvise(MADV_HUGEPAGE)` despite global `transparent_hugepage=never`) | TLB miss + page-fault reduction | Medium | Could yield ms-level wins on rare paths |
-| T10 | NIC IRQ coalescing + RX descriptor tuning | tightens NIC-path max | Low | We already pin IRQs; this is the next NIC-side knob |
 
 ## Newly identified
 
@@ -74,10 +72,11 @@ across 200M+ events.
 | ID | Idea | Why ruled out |
 |---|---|---|
 | F1 | Fuse `dpdk_response` into the DPDK poll thread | Judged too risky vs the win; the poll loop is currently 1.2 µs/iter and adding encode work could widen its tail. |
+| F2 | `idle=poll` on isolated cores in GRUB | Tested on a fresh-boot rig: **no measurable effect** on either single-order or throughput percentiles. The hot threads already busy-spin and we already gated `sched_yield` out (T7's busy_spin), so the kernel idle path almost never runs. Cost is real (100 % CPU on every isolated core, ~10 W per core extra power, hotter rig). Industry-standard for HFT/exchange deployments, but on this codebase it's a power/heat tax with no observable latency win. Reverted. |
+| T10 | Disable Ethernet PAUSE frames on the PFs (`ethtool -A rx off tx off`) | Tested: **no measurable effect**. PAUSE doesn't fire at our load (single-order at 20 K/s or throughput at 5 M/s, both far below NIC saturation), so disabling it removes a class of event that wasn't happening anyway. **Non-trivial caveat:** with PAUSE off, NIC overflow events become packet drops + TCP retransmits (100s of ms tail) instead of brief stalls — strictly worse failure mode if overflow ever happens. Not worth the trade for zero observable benefit. Reverted. |
 
 ## Suggested ordering
 
 1. **N1** — measurable customer-visible win for failover; concrete signal from T1 telling us where the work is.
-2. **F2 + T10** — both are config changes on the rig, very cheap to test. Pair in one bench run.
-3. **T6** — if N1 doesn't fully attack the page-fault axis.
-4. **F3** — bench-RTT specifically. Note that N2 ruled out smoltcp processing as the source of the body of the bench-RTT spread, so F3's gain is now bounded to the consumer-side delay component (a few µs at most). Pursue only if it's cheap and we want to chase the bench number for marketing purposes.
+2. **T6** — if N1 doesn't fully attack the page-fault axis.
+3. **F3** — bench-RTT specifically. Note that N2 ruled out smoltcp processing as the source of the body of the bench-RTT spread, so F3's gain is now bounded to the consumer-side delay component (a few µs at most). Pursue only if it's cheap and we want to chase the bench number for marketing purposes.
