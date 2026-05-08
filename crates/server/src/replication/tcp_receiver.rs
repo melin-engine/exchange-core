@@ -226,12 +226,14 @@ fn replica_stream_uring(
                 }
                 let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                 if let Ok(slots) = try_decode_input_batch(payload) {
+                    let mut batch = input_producer.batch();
                     for slot in slots {
                         let primary_seq = slot.sequence;
-                        last_target = input_producer.publish(slot);
+                        last_target = batch.push_with(|s| *s = slot);
                         *accum_end_sequence = primary_seq;
                         any_published = true;
                     }
+                    batch.commit();
                 }
                 cursor += 4 + frame_len;
             }
@@ -538,6 +540,11 @@ fn replica_stream_uring(
                     let mut cursor = 0;
                     let mut burst_any_published = false;
                     let mut burst_last_target: u64 = 0;
+                    // Open one batch across all frames in this CQE buffer so the
+                    // consumer-visible cursor advances with a single Release store
+                    // per recv, not once per InputSlot. A 100KB recv carries 100+
+                    // slots; this collapses 100+ Release stores into one.
+                    let mut batch = input_producer.batch();
                     while cursor + 4 <= parse_buf.len() {
                         let frame_len =
                             u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
@@ -561,7 +568,7 @@ fn replica_stream_uring(
                                     *received_data = true;
                                     for slot in slot_buf.drain(..) {
                                         let primary_seq = slot.sequence;
-                                        burst_last_target = input_producer.publish(slot);
+                                        burst_last_target = batch.push_with(|s| *s = slot);
                                         *accum_end_sequence = primary_seq;
                                         burst_any_published = true;
                                     }
@@ -598,6 +605,10 @@ fn replica_stream_uring(
                         }
                         cursor += 4 + frame_len;
                     }
+                    // Single Release store on the producer cursor, making every
+                    // slot written above visible to the apply consumer at once.
+                    batch.commit();
+
                     // Compact parse_buf.
                     if cursor > 0 {
                         let remaining = parse_buf.len() - cursor;
