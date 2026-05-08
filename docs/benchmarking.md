@@ -146,10 +146,21 @@ The JSON also includes `server_stages` populated by the tick-to-trade decomposit
 
 The bench's full client-to-client round-trip percentiles answer "how long did one order take, end to end?" but not "where did that time go?". Exchange RFPs and serious diligence conversations typically ask for the latency profile decomposed into per-stage components: NIC ingress → parse → match → durability gate → encode → NIC egress.
 
-Roundtrip mode collects this decomposition automatically when both ends are built with the `latency-trace` Cargo feature, by:
+Roundtrip mode collects this decomposition automatically when both ends are built with the `tick-to-trade` Cargo feature, by:
 
 1. Server-side: each pipeline stage records nanosecond samples into a global `StatsRegistry` (one HDR histogram per stage). Production builds compile the entire path to ZSTs and inlined no-ops, so this is dev/bench only.
 2. Bench-side: at end of run, the bench fetches `GET /stats-dump` from the server's health endpoint, parses the tab-separated body, and prints a `Server-side Per-Stage Latency` section under the per-order RTT histogram. The same data appears in the `--json` output as `server_stages.entries[]`.
+
+### Two feature flags, two cost levels
+
+The instrumentation is split across two opt-in flags, both off by default:
+
+| Feature | Stages recorded | Per-event cost |
+|---|---|---|
+| `latency-trace` | 4 stages — journal/matching wakeup + execute, journal batch, plus reader publish, response SPSC wakeup, response dispatch, server e2e | ~3–5 mutex acquisitions (~100 ns / event at 4 M ops/s) |
+| `tick-to-trade` (implies `latency-trace`) | adds 5 commercial-grade stages — reader: ingest, response: journal-wait, replica-wait, encode, egress | ~5 more mutex acquisitions on top (~200 ns / event total) |
+
+`latency-trace` is the lighter mode for narrow stage-level debugging. `tick-to-trade` is the full decomposition for headline-quality bench artifacts, at roughly double the hot-path mutex traffic. Production builds (default features) carry zero overhead either way.
 
 ### Stages reported
 
@@ -191,18 +202,22 @@ A future enhancement would expose a `/stats-reset` endpoint so the bench can cle
 ### Building and running
 
 ```sh
-# Server and bench both need the feature flag
-cargo build --release -p melin-server --features latency-trace
-cargo build --release -p melin-bench  --features latency-trace
+# Both server and bench built with `tick-to-trade` for the full
+# decomposition. The flag implies `latency-trace`, so this also
+# enables the lighter 4-stage histograms.
+cargo build --release -p melin-server --features tick-to-trade
+cargo build --release -p melin-bench  --features tick-to-trade
 
-# Roundtrip benchmark — decomposition appears under the latency table
-./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 100000
+# Roundtrip benchmark — decomposition appears under the latency table.
+# Use 1M+ orders so warmup phase doesn't dominate the percentiles
+# (see "Measurement window" below).
+./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 1000000
 
-# Or fetch the dump directly without running the bench
+# Or fetch the dump directly without running the bench.
 curl http://127.0.0.1:9878/stats-dump
 ```
 
-When the server is built without `latency-trace`, the bench prints a one-line note pointing at the feature flag rather than failing.
+When the server is built without `tick-to-trade`, the bench prints a one-line note pointing at the feature flag rather than failing — `latency-trace`-only servers still return the lighter 4-stage dump but won't include the journal-wait / replica-wait / encode / egress / reader-ingest stages.
 
 ## Pipelining
 

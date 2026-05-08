@@ -332,14 +332,15 @@ fn reader_loop<R: AsRawFd>(
     push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
 
     // Stage histograms via the global registry. `publish` is the
-    // narrow ring-publish call cost; `ingest` is the full per-frame
-    // reader cost (decode + auth/dedup + slot construction + publish)
-    // — which is the input to the bench's tick-to-trade decomposition.
+    // narrow ring-publish call cost (lightweight, gated on
+    // `latency-trace`); `ingest` is the full per-frame reader cost
+    // and feeds the bench's tick-to-trade decomposition (heavier,
+    // gated on `tick-to-trade`).
     #[cfg(feature = "latency-trace")]
     let publish_rec = melin_journal::trace::register_stage(
         "reader: publish (decode → disruptor publish)",
     );
-    #[cfg(feature = "latency-trace")]
+    #[cfg(feature = "tick-to-trade")]
     let ingest_rec = melin_journal::trace::register_stage(
         "reader: ingest (recv_ts → publish complete)",
     );
@@ -586,7 +587,7 @@ fn reader_loop<R: AsRawFd>(
                     batch_wall_ns,
                     #[cfg(feature = "latency-trace")]
                     &publish_rec,
-                    #[cfg(feature = "latency-trace")]
+                    #[cfg(feature = "tick-to-trade")]
                     &ingest_rec,
                 );
                 if drop_conn {
@@ -769,7 +770,7 @@ fn process_frames<R>(
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
     #[cfg(feature = "latency-trace")] publish_rec: &melin_journal::trace::StageRecorder,
-    #[cfg(feature = "latency-trace")] ingest_rec: &melin_journal::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &melin_journal::trace::StageRecorder,
 ) -> bool {
     let mut cursor = 0;
 
@@ -885,16 +886,16 @@ fn process_frames<R>(
         }
 
         #[cfg(feature = "latency-trace")]
-        {
-            let publish_done = trace_ts();
-            publish_rec.record_elapsed(pre_publish, publish_done);
-            // Ingest covers the entire reader cost for this frame:
-            // decode + auth/dedup + slot construction + publish.
-            // `recv_ts` is the frame-extraction timestamp (a software
-            // approximation of NIC ingress — true HW timestamping is
-            // a follow-up; see `docs/benchmarking.md`).
-            ingest_rec.record_elapsed(recv_ts, publish_done);
-        }
+        let publish_done = trace_ts();
+        #[cfg(feature = "latency-trace")]
+        publish_rec.record_elapsed(pre_publish, publish_done);
+        // Ingest covers the entire reader cost for this frame:
+        // decode + auth/dedup + slot construction + publish.
+        // `recv_ts` is the frame-extraction timestamp (a software
+        // approximation of NIC ingress — true HW timestamping is
+        // a follow-up; see `docs/benchmarking.md`).
+        #[cfg(feature = "tick-to-trade")]
+        ingest_rec.record_elapsed(recv_ts, publish_done);
     }
 
     // Compact: shift remaining bytes to the front of the parse buffer.

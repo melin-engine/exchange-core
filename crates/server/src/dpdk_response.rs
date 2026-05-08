@@ -142,15 +142,15 @@ pub fn run(
     #[cfg(feature = "latency-trace")]
     let server_e2e_rec =
         trace::register_stage("server e2e (reader recv → response SPSC publish)");
-    #[cfg(feature = "latency-trace")]
+    #[cfg(feature = "tick-to-trade")]
     let journal_wait_rec = trace::register_stage(
         "response: journal-wait (match_complete → journal cursor crossed)",
     );
-    #[cfg(feature = "latency-trace")]
+    #[cfg(feature = "tick-to-trade")]
     let replica_wait_rec = trace::register_stage(
         "response: replica-wait (match_complete → replication cursor crossed)",
     );
-    #[cfg(feature = "latency-trace")]
+    #[cfg(feature = "tick-to-trade")]
     let encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
 
     loop {
@@ -227,7 +227,7 @@ pub fn run(
         // Per-slot journal-wait / replica-wait tracker. Same shape as
         // the TCP response — see `crate::response::GateCrossTracker`
         // for the rationale and edge cases.
-        #[cfg(feature = "latency-trace")]
+        #[cfg(feature = "tick-to-trade")]
         let mut gate_tracker;
 
         // Wait for durability (see response.rs for full explanation).
@@ -238,7 +238,7 @@ pub fn run(
                 .max()
                 .expect("non-empty batch");
             let needed = max_seq + 1;
-            #[cfg(feature = "latency-trace")]
+            #[cfg(feature = "tick-to-trade")]
             {
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
             }
@@ -247,7 +247,7 @@ pub fn run(
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
 
-                    #[cfg(feature = "latency-trace")]
+                    #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
 
                     cached_durable_pos = crate::response::durable_pos(
@@ -283,11 +283,11 @@ pub fn run(
             #[cfg(feature = "latency-trace")]
             spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
 
-            #[cfg(feature = "latency-trace")]
+            #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.journal_crossed() {
                 journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
-            #[cfg(feature = "latency-trace")]
+            #[cfg(feature = "tick-to-trade")]
             if let Some(ts) = gate_tracker.replica_crossed() {
                 replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
@@ -345,7 +345,7 @@ pub fn run(
             }
 
             for kind in &kinds[..kinds_len] {
-                #[cfg(feature = "latency-trace")]
+                #[cfg(feature = "tick-to-trade")]
                 let encode_start = trace::trace_ts();
                 let written = match codec::encode_response(kind, &mut encode_buf) {
                     Ok(n) => n,
@@ -358,7 +358,7 @@ pub fn run(
                         continue;
                     }
                 };
-                #[cfg(feature = "latency-trace")]
+                #[cfg(feature = "tick-to-trade")]
                 encode_rec.record_elapsed(encode_start, trace::trace_ts());
 
                 // Send the complete wire frame (with length prefix) to

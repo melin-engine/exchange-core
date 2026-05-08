@@ -183,7 +183,7 @@ pub fn run_dpdk_poll(
     // publish-call histogram because `batch.push_with` is a slot
     // assignment in a pre-allocated batch — the work is dominated by
     // the surrounding decode + dedup, which is what `ingest` measures.
-    #[cfg(feature = "latency-trace")]
+    #[cfg(feature = "tick-to-trade")]
     let ingest_rec = melin_journal::trace::register_stage(
         "reader: ingest (recv_ts → publish complete)",
     );
@@ -555,7 +555,7 @@ pub fn run_dpdk_poll(
                         &control_tx,
                         &mut id_to_handle,
                         *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
-                        #[cfg(feature = "latency-trace")]
+                        #[cfg(feature = "tick-to-trade")]
                         &ingest_rec,
                     );
                 }
@@ -790,7 +790,7 @@ fn process_trading_frames(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
-    #[cfg(feature = "latency-trace")] ingest_rec: &melin_journal::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &melin_journal::trace::StageRecorder,
 ) {
     let mut cursor = 0;
 
@@ -850,7 +850,7 @@ fn process_trading_frames(
                         slot.publish_ts = publish_ts;
                         slot.recv_ts = recv_ts;
                     });
-                    #[cfg(feature = "latency-trace")]
+                    #[cfg(feature = "tick-to-trade")]
                     ingest_rec.record_elapsed(recv_ts, trace_ts());
                 }
             }
