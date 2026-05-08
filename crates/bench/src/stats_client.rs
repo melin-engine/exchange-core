@@ -33,12 +33,14 @@ use std::time::Duration;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Read timeout. The server's `/stats-dump` handler calls
-/// `SyncHistogram::refresh_timeout(500ms)` to merge pending recorder
-/// buffers before serializing — the read here has to outlast that
-/// worst case plus headroom for body transfer. 2 s is generous; the
-/// fetch happens once per bench run so the bound only matters when
-/// the server is genuinely unreachable.
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// `SyncHistogram::refresh_timeout(500ms)` per registered stage,
+/// serially. With ~11 stages today the worst-case wall time is
+/// ~5.5 s before the body even starts transferring. 10 s gives that
+/// full budget plus headroom; the fetch happens once per bench run
+/// so the bound only matters when the server is genuinely
+/// unreachable. A future optimization could refresh stages in
+/// parallel to compress the worst case to a single 500 ms wait.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Recv buffer size — matches the server's max body (8 KiB) plus
 /// HTTP headers (~256 bytes) with comfortable slack.
