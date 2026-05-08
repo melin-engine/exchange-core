@@ -184,7 +184,7 @@ pub fn run_dpdk_poll(
     // assignment in a pre-allocated batch — the work is dominated by
     // the surrounding decode + dedup, which is what `ingest` measures.
     #[cfg(feature = "tick-to-trade")]
-    let ingest_rec =
+    let mut ingest_rec =
         melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
@@ -231,18 +231,16 @@ pub fn run_dpdk_poll(
     // this iteration. Idle iterations would otherwise drown the percentiles
     // in ~100ns samples; what we want is "how long does a poll cycle take
     // when there's actual work to do" — which is the cycle an in-flight
-    // order experiences.
+    // order experiences. Registered with the global stats registry; the
+    // /stats-dump endpoint snapshots it alongside the other stages.
     #[cfg(feature = "latency-trace")]
-    let mut poll_iter_hist = melin_journal::trace::StageHistogram::new(
-        "dpdk poll: outer iteration (work-iterations only)",
-    );
+    let mut poll_iter_rec =
+        melin_journal::trace::register_stage("dpdk poll: outer iteration (work-iterations only)");
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_start = trace_ts();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            #[cfg(feature = "latency-trace")]
-            poll_iter_hist.print_report();
             break;
         }
 
@@ -555,7 +553,7 @@ pub fn run_dpdk_poll(
                         &mut id_to_handle,
                         *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
                         #[cfg(feature = "tick-to-trade")]
-                        &ingest_rec,
+                        &mut ingest_rec,
                     );
                 }
             }
@@ -587,8 +585,7 @@ pub fn run_dpdk_poll(
             // gate on the journal / matching / response stages and keeps
             // diagnostic numbers comparable across runs.
             if work_done_this_iter && !shutdown.load(Ordering::Relaxed) {
-                poll_iter_hist
-                    .record_ns(melin_journal::trace::trace_elapsed_ns(poll_iter_start, now));
+                poll_iter_rec.record_elapsed(poll_iter_start, now);
             }
             poll_iter_start = now;
         }
@@ -789,7 +786,7 @@ fn process_trading_frames(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
-    #[cfg(feature = "tick-to-trade")] ingest_rec: &melin_journal::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_journal::trace::StageRecorder,
 ) {
     let mut cursor = 0;
 
