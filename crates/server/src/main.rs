@@ -3,6 +3,27 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc tuning, applied at allocator init via the well-known
+/// `malloc_conf` symbol. Set for tail-latency stability:
+///
+/// - `background_thread:true` — spawn a dedicated thread to do page
+///   purging asynchronously instead of synchronously on the allocating
+///   thread. Default jemalloc does the purge work on whatever thread
+///   happens to free memory, which on the matching/journal hot path
+///   shows up as occasional multi-millisecond stalls in `process_event`.
+/// - `dirty_decay_ms:60000` / `muzzy_decay_ms:60000` — hold dirty/muzzy
+///   pages for 60 s (vs the 10 s default) before reclaiming. Trades
+///   marginally higher steady-state RSS for fewer purge events; with
+///   the background thread this also bounds how often that thread runs.
+///
+/// The trailing NUL is required: jemalloc reads `malloc_conf` as a C
+/// string. `non_upper_case_globals` is the documented spelling — the
+/// symbol name has to match exactly.
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "malloc_conf")]
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:60000,muzzy_decay_ms:60000\0";
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
