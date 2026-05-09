@@ -970,6 +970,16 @@ impl<E: AppEvent> JournalWriter<E> {
         match Self::create_continuing(&path, next_seq, genesis) {
             Ok(new_writer) => {
                 *self = new_writer;
+                // Durably commit both the rename (archive_live) and the
+                // new live file's dirent in a single dir fsync. Without
+                // this, power loss between rotation and the next
+                // dir-metadata flush could leave recovery seeing the
+                // pre-rotation layout (acceptable) — or worse, the
+                // archive present without the new live (handled as
+                // Phase B but loses post-rotation crash recovery).
+                if let Err(e) = crate::segment::fsync_parent_dir(&path) {
+                    return Err(JournalError::Io(e));
+                }
                 Ok(archived)
             }
             Err(e) => {

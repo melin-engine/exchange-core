@@ -106,11 +106,32 @@ pub fn next_archive_path(live: &Path) -> std::io::Result<PathBuf> {
 /// archive path the live file was renamed to.
 ///
 /// The caller is responsible for any flushing/syncing of the live file
-/// before this call, and for opening a new live segment afterward.
+/// before this call, and for opening a new live segment afterward. The
+/// directory entry is *not* fsynced here — call [`fsync_parent_dir`]
+/// after the new live segment has been created and its dirent is
+/// written, so a single dir fsync covers both metadata changes.
 pub fn archive_live(live: &Path) -> std::io::Result<PathBuf> {
     let target = next_archive_path(live)?;
     std::fs::rename(live, &target)?;
     Ok(target)
+}
+
+/// Fsync the parent directory of `live` to durably commit dirent
+/// changes (renames, file creations). Without this, a rename + new-file
+/// pair that has reached the page cache may be lost on power loss even
+/// though both file contents are durable.
+///
+/// Treats a missing parent directory as a no-op (the rename would have
+/// already failed in that case).
+pub fn fsync_parent_dir(live: &Path) -> std::io::Result<()> {
+    let dir = match live.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    // Open with read-only — fsync(2) on a directory fd flushes its
+    // metadata regardless of open mode.
+    let f = std::fs::File::open(&dir)?;
+    f.sync_all()
 }
 
 #[cfg(test)]
