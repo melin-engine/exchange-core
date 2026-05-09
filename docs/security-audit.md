@@ -9,24 +9,11 @@ The engine is **fundamentally sound** on the critical path: price-time priority,
 
 The primary risks are:
 - **Denial of service** via resource exhaustion (connections, memory, disk)
-- **Slow-client attacks** blocking the single-threaded response stage
-- **Missing operational limits** (max orders, max connections, order throttling)
+- **Missing operational limits** (max orders, per-IP connections, order throttling)
 
 ---
 
 ## Findings
-
-### SEC-01: Response stage blocks on slow clients (HIGH)
-
-**File**: `crates/server/src/response.rs`
-
-The response stage writes to client sockets on a **single thread** serving all clients. If a client stops reading, one slow client could stall responses to every other client.
-
-**Impact**: Latency spike or complete stall for all clients.
-**Exploitable remotely**: Yes — connect, authenticate, stop reading.
-**Status**: **FIXED** — 5-second `SO_SNDTIMEO` set on response sockets before handoff to response stage. Timed-out writes return an error, and the response stage already drops connections on write error.
-
----
 
 ### SEC-02: No connection limits or rate limiting (HIGH)
 
@@ -117,48 +104,18 @@ All traffic including auth signatures, order data, and fill reports is sent unen
 
 ---
 
-### SEC-09: Snapshot file tampering (MEDIUM)
+### SEC-09: Snapshot file tampering — cross-invariant validation (MEDIUM)
 
 **Files**: `crates/engine/src/journal/snapshot.rs:418-571`
 
-A corrupted or malicious snapshot file can:
-- **OOM**: Large count fields (e.g., `n_balances = 1_000_000_000`) cause `Vec::with_capacity()` to allocate gigabytes before reading data. The `validate_count` check bounds against remaining buffer but the Vec is allocated first.
+The OOM-via-large-count vector was closed (counts are now bounded against remaining buffer before `Vec::with_capacity`). Remaining issues:
+
 - **Dedup bypass**: A tampered snapshot can reset per-account OrderId high-water marks, allowing previously-executed orders to be replayed.
 - **Balance forgery**: Balances and reservations are loaded without cross-validation against each other or the order book.
 
-**Impact**: Server crash (OOM) or state corruption on recovery.
+**Impact**: State corruption on recovery from a tampered snapshot.
 **Exploitable remotely**: No — requires write access to the snapshot file.
-**Mitigation**: Validate snapshot invariants after loading (reservation↔book consistency, balance conservation). Cap count fields to reasonable maximums before allocation.
-
----
-
-### SEC-10: Nonce RNG not explicitly cryptographic (LOW)
-
-**File**: `crates/server/src/server.rs:482`
-
-Auth nonce uses `rand::fill(&mut nonce)` which defaults to the thread-local CSPRNG. This is secure in practice, but doesn't explicitly specify `OsRng` for cryptographic material.
-
-**Status**: **FIXED** — replaced `rand::fill()` with `getrandom::fill()` which calls the OS CSPRNG directly.
-
----
-
-### SEC-11: No explicit auth state on connections (LOW)
-
-**File**: `crates/server/src/reader.rs`
-
-Connection state has no `is_authenticated` field. Authentication is enforced structurally (only authenticated connections reach the reader), but a future refactor could accidentally allow unauthenticated traffic.
-
-**Status**: **N/A** — on closer inspection, `ConnectionState` already carries a typed `permission: Permission` field set only from the auth handshake. This is stronger than a boolean — unauthenticated connections never reach the reader.
-
----
-
-### SEC-12: Market orders bypass price bands by design (LOW)
-
-**File**: `crates/engine/src/exchange.rs:252-278`
-
-Market and stop orders skip price band checks because they have no submission-time price. A large market order can fill far outside the intended price bands.
-
-**Status**: **DOCUMENTED** — added comment in `exchange.rs` explaining the design choice and pointing to Phase 3 (automatic volatility halts) as the proper mitigation.
+**Mitigation**: Validate snapshot invariants after loading (reservation↔book consistency, balance conservation).
 
 ---
 
@@ -166,26 +123,21 @@ Market and stop orders skip price band checks because they have no submission-ti
 
 | ID | Issue | Severity | Remote |
 |----|-------|----------|--------|
-| SEC-01 | ~~Response stage blocks on slow client~~ | ~~HIGH~~ FIXED | Yes |
-| SEC-02 | ~~No connection limits~~ / rate limiting | ~~HIGH~~ PARTIAL | Yes |
+| SEC-02 | No connection limits / rate limiting (PARTIAL) | HIGH | Yes |
 | SEC-03 | Unbounded order book growth | HIGH | Yes |
 | SEC-04 | No order throttling | MEDIUM | Yes |
 | SEC-05 | Journal disk exhaustion hangs server | MEDIUM | Indirect |
 | SEC-06 | Disruptor backpressure spins CPU | MEDIUM | Partial |
 | SEC-07 | Saturating arithmetic masks errors | MEDIUM | No |
 | SEC-08 | No TLS | MEDIUM | MITM |
-| SEC-09 | Snapshot file tampering | MEDIUM | No |
-| SEC-10 | ~~Nonce RNG not explicit~~ | ~~LOW~~ FIXED | No |
-| SEC-11 | ~~No explicit auth state field~~ | ~~LOW~~ N/A | No |
-| SEC-12 | ~~Market orders bypass price bands~~ | ~~LOW~~ DOCUMENTED | N/A |
+| SEC-09 | Snapshot cross-invariant validation | MEDIUM | No |
 
 ## Recommended Priority
 
-1. **SEC-01** — write timeout on response sockets (quick fix, high impact)
-2. **SEC-02** — connection limits + per-IP throttling
-3. **SEC-03** — per-account max open orders
-4. **SEC-04** — per-account order rate limiter
-5. **SEC-08** — TLS support
-6. **SEC-05** — journal rotation + disk usage monitoring
-7. **SEC-07** — checked arithmetic in financial paths
-8. **SEC-09** — snapshot invariant validation on load
+1. **SEC-02** — per-IP connection cap + auth-failure backoff (`--max-connections` already landed)
+2. **SEC-03** — per-account max open orders
+3. **SEC-04** — per-account order rate limiter
+4. **SEC-08** — TLS support
+5. **SEC-05** — disk usage monitoring (rotation already landed)
+6. **SEC-07** — checked arithmetic in financial paths
+7. **SEC-09** — snapshot invariant validation on load
