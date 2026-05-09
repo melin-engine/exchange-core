@@ -969,6 +969,9 @@ impl<E: AppEvent> JournalWriter<E> {
         // silently break tamper-evidence — the new segment would anchor
         // to zeros and `verify_segment_boundary` would still pass on
         // recovery. Refuse to rotate.
+        // clippy suggests unwrap_or_default, but the None arm has a
+        // feature-gated `return Err(...)` that the suggestion would erase.
+        #[allow(clippy::manual_unwrap_or_default)]
         let genesis = match self.chain_hash() {
             Some(h) => h,
             None => {

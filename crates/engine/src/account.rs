@@ -21,6 +21,56 @@ use crate::types::{
     RejectReason, Side,
 };
 
+/// Saturating fallback for a checked subtraction in a balance path.
+///
+/// Used when a u64 balance/reservation field would underflow. Logs a
+/// structured `error!` (which the audit requires for SEC-07 — silent
+/// `saturating_sub` previously masked balance corruption) and returns 0.
+/// `#[cold]` keeps the failure branch off the hot path.
+#[cold]
+#[inline(never)]
+fn log_underflow(
+    op: &'static str,
+    account: AccountId,
+    currency: CurrencyId,
+    current: u64,
+    requested: u64,
+) -> u64 {
+    tracing::error!(
+        op,
+        account = account.0,
+        currency = currency.0,
+        current,
+        requested,
+        "balance arithmetic underflow in fill path — clamping to zero; possible state corruption"
+    );
+    0
+}
+
+/// Saturating fallback for a checked addition in a balance path. Returns
+/// `u64::MAX` and logs on overflow. u64 overflow is not reachable at
+/// realistic exchange scales, but the audit asks us to surface it rather
+/// than silently saturate.
+#[cold]
+#[inline(never)]
+fn log_overflow(
+    op: &'static str,
+    account: AccountId,
+    currency: CurrencyId,
+    current: u64,
+    addend: u64,
+) -> u64 {
+    tracing::error!(
+        op,
+        account = account.0,
+        currency = currency.0,
+        current,
+        addend,
+        "balance arithmetic overflow in fill path — clamping to u64::MAX; possible state corruption"
+    );
+    u64::MAX
+}
+
 /// Reserved account for collected trading fees. Fees deducted from traders
 /// are credited here so they remain in the system (balance conservation).
 /// The exchange operator can withdraw from this account via the admin API.
@@ -319,6 +369,16 @@ impl AccountManager {
         Ok((amount, slot))
     }
 
+    /// Read the total (`available + reserved`) for an `(account, currency)`
+    /// pair, treating a missing entry as zero. Used by the fill conservation
+    /// check; returns `u64` (Copy) so the caller doesn't hold a borrow.
+    fn balance_total(&self, account: AccountId, currency: CurrencyId) -> u64 {
+        self.balances
+            .get(&(account, currency))
+            .map(|b| b.total())
+            .unwrap_or(0)
+    }
+
     /// Update balances after a fill. Called once per `ExecutionReport::Fill`.
     ///
     /// The buyer's reserved quote decreases by `cost + buyer_fee`, available
@@ -326,6 +386,13 @@ impl AccountManager {
     /// `quantity`, available quote increases by `cost - seller_fee`.
     ///
     /// Takes `ReservationSlot` handles for O(1) slab access (no hashing).
+    ///
+    /// Arithmetic on the balance fields uses `checked_*` operations: an
+    /// overflow or underflow logs a structured `error!` (with op, account,
+    /// currency, and operand context) and falls back to 0 / `u64::MAX`. A
+    /// post-fill conservation check verifies that total quote across
+    /// {buyer, seller, fee account} and total base across {buyer, seller}
+    /// are unchanged; a violation is logged for forensic analysis.
     pub fn fill(
         &mut self,
         buyer_slot: ReservationSlot,
@@ -339,8 +406,8 @@ impl AccountManager {
         // cost = price × quantity, using u128 to avoid overflow.
         // This fits in u64 because reservation validated price × quantity
         // at order placement (limit buys) or the quote budget caps total
-        // cost (market buys). Assert in debug builds; saturate in release
-        // as a defensive fallback.
+        // cost (market buys). Assert in debug builds; clamp + log in
+        // release as a defensive fallback.
         let cost = (price.get() as u128) * (quantity.get() as u128);
         debug_assert!(
             cost <= u64::MAX as u128,
@@ -348,15 +415,59 @@ impl AccountManager {
             price.get(),
             quantity.get()
         );
-        let cost_u64 = u64::try_from(cost).unwrap_or(u64::MAX);
+        let cost_u64 = match u64::try_from(cost) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::error!(
+                    cost = %cost,
+                    price = price.get(),
+                    quantity = quantity.get(),
+                    "fill cost overflows u64 — clamping; balance conservation will be violated"
+                );
+                u64::MAX
+            }
+        };
         let qty = quantity.get();
+
+        // Resolve accounts up front so we can snapshot pre-fill totals for
+        // the conservation check. Both reservations are read-only here.
+        let buyer_account = self.reservation_slab[buyer_slot.0 as usize].account;
+        let seller_account = self.reservation_slab[seller_slot.0 as usize].account;
+
+        // Account aliasing: STP normally prevents buyer == seller, but the
+        // AccountManager layer accepts it (unit-tested directly). FEE_ACCOUNT
+        // is reserved and traders should not collide with it. Dedup before
+        // summing so the conservation check below doesn't double-count a
+        // shared balance.
+        let seller_distinct = seller_account != buyer_account;
+        let fee_distinct = FEE_ACCOUNT != buyer_account && FEE_ACCOUNT != seller_account;
+
+        // Pre-fill conservation snapshot. u128 sums to avoid overflow when
+        // adding three u64 totals (max ≈ 3 × 1.8e19, well under 2^128).
+        let pre_total_quote = {
+            let mut t = self.balance_total(buyer_account, spec.quote) as u128;
+            if seller_distinct {
+                t += self.balance_total(seller_account, spec.quote) as u128;
+            }
+            if fee_distinct {
+                t += self.balance_total(FEE_ACCOUNT, spec.quote) as u128;
+            }
+            t
+        };
+        let pre_total_base = {
+            let mut t = self.balance_total(buyer_account, spec.base) as u128;
+            if seller_distinct {
+                t += self.balance_total(seller_account, spec.base) as u128;
+            }
+            t
+        };
 
         // Buyer: reserved quote decreases by cost + fee, available base increases.
         // The reservation includes a fee cushion (reserved at placement time
         // with max_fee_bps), so cost + fee normally fits within the reservation.
         // If the fee schedule changed after order placement, the cushion may
-        // be insufficient — saturating_sub prevents underflow, and the actual
-        // deducted amount is tracked for fee account crediting below.
+        // be insufficient — checked_sub clamps to zero and logs, and the
+        // actual deducted amount is tracked for fee account crediting below.
         //
         // Signed fees: positive = fee deducted, negative = rebate credited.
         let buyer_actual_deducted;
@@ -373,11 +484,18 @@ impl AccountManager {
                  market buy budget that didn't account for fees",
                 remaining = res.remaining,
             );
-            // Track actual deduction (may be less than requested due to saturation).
+            // Track actual deduction (may be less than requested if checked_sub clamps).
             let old_remaining = res.remaining;
-            res.remaining = res.remaining.saturating_sub(total_deduct);
+            res.remaining = res.remaining.checked_sub(total_deduct).unwrap_or_else(|| {
+                log_underflow(
+                    "buyer.reservation.remaining",
+                    res.account,
+                    res.currency,
+                    res.remaining,
+                    total_deduct,
+                )
+            });
             buyer_actual_deducted = old_remaining - res.remaining;
-            let buyer_account = res.account;
 
             let quote_bal = self
                 .balances
@@ -388,10 +506,29 @@ impl AccountManager {
             // When the fee schedule changed after placement, total_deduct may
             // exceed this slot's remaining, and the excess would eat into
             // other slots' share of the aggregate.
-            quote_bal.reserved = quote_bal.reserved.saturating_sub(buyer_actual_deducted);
+            quote_bal.reserved = quote_bal
+                .reserved
+                .checked_sub(buyer_actual_deducted)
+                .unwrap_or_else(|| {
+                    log_underflow(
+                        "buyer.quote.reserved",
+                        buyer_account,
+                        spec.quote,
+                        quote_bal.reserved,
+                        buyer_actual_deducted,
+                    )
+                });
 
             let base_bal = self.balances.entry((buyer_account, spec.base)).or_default();
-            base_bal.available = base_bal.available.saturating_add(qty);
+            base_bal.available = base_bal.available.checked_add(qty).unwrap_or_else(|| {
+                log_overflow(
+                    "buyer.base.available",
+                    buyer_account,
+                    spec.base,
+                    base_bal.available,
+                    qty,
+                )
+            });
         }
 
         // Seller: reserved base decreases, available quote increases by cost - fee.
@@ -399,14 +536,29 @@ impl AccountManager {
         let seller_actual_proceeds;
         {
             let res = &mut self.reservation_slab[seller_slot.0 as usize];
-            res.remaining = res.remaining.saturating_sub(qty);
-            let seller_account = res.account;
+            res.remaining = res.remaining.checked_sub(qty).unwrap_or_else(|| {
+                log_underflow(
+                    "seller.reservation.remaining",
+                    res.account,
+                    res.currency,
+                    res.remaining,
+                    qty,
+                )
+            });
 
             let base_bal = self
                 .balances
                 .entry((seller_account, spec.base))
                 .or_default();
-            base_bal.reserved = base_bal.reserved.saturating_sub(qty);
+            base_bal.reserved = base_bal.reserved.checked_sub(qty).unwrap_or_else(|| {
+                log_underflow(
+                    "seller.base.reserved",
+                    seller_account,
+                    spec.base,
+                    base_bal.reserved,
+                    qty,
+                )
+            });
 
             let quote_bal = self
                 .balances
@@ -414,7 +566,18 @@ impl AccountManager {
                 .or_default();
             let proceeds_i128 = cost_u64 as i128 - seller_fee as i128;
             let proceeds = u64::try_from(proceeds_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
-            quote_bal.available = quote_bal.available.saturating_add(proceeds);
+            quote_bal.available = quote_bal
+                .available
+                .checked_add(proceeds)
+                .unwrap_or_else(|| {
+                    log_overflow(
+                        "seller.quote.available",
+                        seller_account,
+                        spec.quote,
+                        quote_bal.available,
+                        proceeds,
+                    )
+                });
             seller_actual_proceeds = proceeds;
         }
 
@@ -422,19 +585,90 @@ impl AccountManager {
         // computed from actual balance movements to maintain conservation:
         //   fee_credit = buyer_deducted - seller_proceeds
         // This equals buyer_fee + seller_fee when reservations have
-        // sufficient cushion, but is naturally capped when saturation occurs
+        // sufficient cushion, but is naturally capped when checked_* clamps
         // (e.g., fee schedule changed after order placement).
         let fee_credit = buyer_actual_deducted as i128 - seller_actual_proceeds as i128;
         if fee_credit > 0 {
+            let amount = u64::try_from(fee_credit).unwrap_or(u64::MAX);
             let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
-            fee_bal.available = fee_bal
-                .available
-                .saturating_add(u64::try_from(fee_credit).unwrap_or(u64::MAX));
+            fee_bal.available = fee_bal.available.checked_add(amount).unwrap_or_else(|| {
+                log_overflow(
+                    "fee.quote.available",
+                    FEE_ACCOUNT,
+                    spec.quote,
+                    fee_bal.available,
+                    amount,
+                )
+            });
         } else if fee_credit < 0 {
             // Net rebate: funded from fee account.
             let rebate = u64::try_from(-fee_credit).unwrap_or(u64::MAX);
             let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
-            fee_bal.available = fee_bal.available.saturating_sub(rebate);
+            fee_bal.available = fee_bal.available.checked_sub(rebate).unwrap_or_else(|| {
+                log_underflow(
+                    "fee.quote.available",
+                    FEE_ACCOUNT,
+                    spec.quote,
+                    fee_bal.available,
+                    rebate,
+                )
+            });
+        }
+
+        // Post-fill conservation check. Total quote across {buyer, seller,
+        // fee} and total base across {buyer, seller} must be unchanged. A
+        // violation means the saturating fallback in one of the checked_*
+        // calls above fired (or a future bug introduced a balance leak).
+        //
+        // Cost: up to 5 HashMap reads (fewer when accounts collide), all
+        // cache-warm because `entry()` just mutated the same buckets. At
+        // ~20-50 ns per `HashMap4` lookup this adds ~100-250 ns to fills,
+        // which is meaningful next to the ~100 ns/order target. If a future
+        // profiling pass shows fills dominating the budget, gate this
+        // block behind `cfg(debug_assertions)` or a feature flag — the
+        // checked_* calls above already log on individual saturations.
+        let post_total_quote = {
+            let mut t = self.balance_total(buyer_account, spec.quote) as u128;
+            if seller_distinct {
+                t += self.balance_total(seller_account, spec.quote) as u128;
+            }
+            if fee_distinct {
+                t += self.balance_total(FEE_ACCOUNT, spec.quote) as u128;
+            }
+            t
+        };
+        let post_total_base = {
+            let mut t = self.balance_total(buyer_account, spec.base) as u128;
+            if seller_distinct {
+                t += self.balance_total(seller_account, spec.base) as u128;
+            }
+            t
+        };
+
+        if post_total_quote != pre_total_quote || post_total_base != pre_total_base {
+            tracing::error!(
+                buyer_account = buyer_account.0,
+                seller_account = seller_account.0,
+                base = spec.base.0,
+                quote = spec.quote.0,
+                price = price.get(),
+                quantity = qty,
+                buyer_fee,
+                seller_fee,
+                pre_total_quote = %pre_total_quote,
+                post_total_quote = %post_total_quote,
+                pre_total_base = %pre_total_base,
+                post_total_base = %post_total_base,
+                "balance conservation violated in fill — total quote or base changed across (buyer, seller, fee)"
+            );
+            debug_assert_eq!(
+                post_total_quote, pre_total_quote,
+                "balance conservation: quote total changed in fill"
+            );
+            debug_assert_eq!(
+                post_total_base, pre_total_base,
+                "balance conservation: base total changed in fill"
+            );
         }
 
         // Note: reservation cleanup (free_slot when remaining == 0) is
@@ -1100,5 +1334,131 @@ mod tests {
         // FEE_ACCOUNT can receive new deposits/credits after hitting zero.
         mgr.deposit(FEE_ACCOUNT, USD, 50);
         assert_eq!(mgr.balance(FEE_ACCOUNT, USD).available, 50);
+    }
+
+    // -- Conservation invariant (SEC-07 follow-up) --
+    //
+    // The fill path runs a post-mutation check that total quote across
+    // {buyer, seller, fee} and total base across {buyer, seller} are
+    // unchanged. The proptests cover this indirectly; the tests below
+    // exercise it explicitly, including the dedup branches for
+    // buyer == seller and trader == FEE_ACCOUNT collisions. If the check
+    // fails, `debug_assert_eq!` in `fill()` will panic in test builds.
+
+    /// Helper: returns (total quote across {buyer, seller, fee}, total base
+    /// across {buyer, seller}) — matching what `fill()` snapshots.
+    fn conserved_totals(mgr: &AccountManager, buyer: AccountId, seller: AccountId) -> (u128, u128) {
+        let mut q = mgr.balance(buyer, USD).total() as u128;
+        if seller != buyer {
+            q += mgr.balance(seller, USD).total() as u128;
+        }
+        if FEE_ACCOUNT != buyer && FEE_ACCOUNT != seller {
+            q += mgr.balance(FEE_ACCOUNT, USD).total() as u128;
+        }
+        let mut b = mgr.balance(buyer, BTC).total() as u128;
+        if seller != buyer {
+            b += mgr.balance(seller, BTC).total() as u128;
+        }
+        (q, b)
+    }
+
+    #[test]
+    fn fill_conserves_totals_with_fees() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+        mgr.deposit(FEE_ACCOUNT, USD, 0); // present so dedup branches see it
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 50).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 50).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+        // 5 bps each side at price 100 × qty 10 = 1000 → fee 5/side.
+        mgr.fill(bs, ss, price(100), qty(10), 5, 5, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+
+        assert_eq!(post_q, pre_q, "quote conservation across buyer+seller+fee");
+        assert_eq!(post_b, pre_b, "base conservation across buyer+seller");
+        // Fee account credited the net.
+        assert_eq!(mgr.balance(FEE_ACCOUNT, USD).available, 10);
+    }
+
+    #[test]
+    fn fill_conserves_totals_with_rebate() {
+        // Negative fees: rebates funded from FEE_ACCOUNT; total quote across
+        // {buyer, seller, fee} must still hold (fee account loses what
+        // traders gain).
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+        mgr.deposit(FEE_ACCOUNT, USD, 1_000); // rebate funding
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+        mgr.fill(bs, ss, price(100), qty(10), -3, -2, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+
+        assert_eq!(post_q, pre_q, "quote conservation under net rebate");
+        assert_eq!(post_b, pre_b, "base conservation under net rebate");
+        // Fee account paid out the net rebate (5).
+        assert_eq!(mgr.balance(FEE_ACCOUNT, USD).available, 995);
+    }
+
+    #[test]
+    fn fill_conserves_totals_self_trade() {
+        // buyer == seller: the dedup branch must not double-count, and
+        // conservation must still hold (zero-sum on the trader, with the
+        // fee account absorbing the net fee).
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_A, BTC, 100);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_A, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 50).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 50).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, ACCT_A, ACCT_A);
+        mgr.fill(bs, ss, price(100), qty(10), 5, 5, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, ACCT_A, ACCT_A);
+
+        assert_eq!(post_q, pre_q, "quote conservation under self-trade");
+        assert_eq!(post_b, pre_b, "base conservation under self-trade");
+        assert_eq!(mgr.balance(FEE_ACCOUNT, USD).available, 10);
+    }
+
+    #[test]
+    fn fill_conserves_totals_when_trader_is_fee_account() {
+        // Pathological: a trader collides with FEE_ACCOUNT. Nothing in
+        // `fill()` itself prevents this, and the dedup branch
+        // `fee_distinct = false` must keep the conservation check correct
+        // by counting the shared balance only once.
+        let mut mgr = AccountManager::new();
+        mgr.deposit(FEE_ACCOUNT, USD, 10_000); // FEE_ACCOUNT acting as buyer
+        mgr.deposit(ACCT_B, BTC, 100);
+
+        let buy = limit_buy(1, FEE_ACCOUNT, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 50).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 50).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, FEE_ACCOUNT, ACCT_B);
+        mgr.fill(bs, ss, price(100), qty(10), 5, 5, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, FEE_ACCOUNT, ACCT_B);
+
+        assert_eq!(
+            post_q, pre_q,
+            "quote conservation when buyer collides with FEE_ACCOUNT"
+        );
+        assert_eq!(
+            post_b, pre_b,
+            "base conservation under FEE_ACCOUNT collision"
+        );
     }
 }
