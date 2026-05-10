@@ -185,6 +185,7 @@ pub fn run_sender(
                         active_flags[i].store(false, Ordering::Release);
                         // Reset per-slot metrics for the disconnected replica.
                         metrics.acked_sequence[i].store(0, Ordering::Relaxed);
+                        metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
                         metrics.catching_up[i].store(false, Ordering::Relaxed);
                         // Clear eviction flag after reclaiming the consumer.
                         if evict_flags[i].load(Ordering::Relaxed) {
@@ -840,6 +841,8 @@ fn live_stream_uring(
                             );
                             metrics.acked_sequence[slot_idx]
                                 .store(ack.acked_sequence, Ordering::Relaxed);
+                            metrics.in_memory_sequence[slot_idx]
+                                .store(ack.in_memory_sequence, Ordering::Relaxed);
                             metrics.ack_latency_us[slot_idx]
                                 .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }

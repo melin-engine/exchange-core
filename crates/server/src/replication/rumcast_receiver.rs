@@ -357,7 +357,7 @@ pub fn run_receiver_rumcast(
 
         // ---- Common teardown ----
         if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
-            let _ = session_state.send_ack(seq);
+            let _ = session_state.send_ack(seq, accum_end_sequence);
         }
 
         let pipeline_state = shutdown_pipeline(
@@ -584,9 +584,15 @@ impl SessionState {
     /// emits the `[len:u32][type][payload]` framing — we publish the
     /// whole encoded buffer so the primary's `strip_length_prefix`
     /// finds what it expects.
-    fn send_ack(&self, acked_sequence: u64) -> io::Result<()> {
+    fn send_ack(&self, acked_sequence: u64, in_memory_sequence: u64) -> io::Result<()> {
         let mut buf = Vec::with_capacity(16);
-        encode_ack(&Ack { acked_sequence }, &mut buf);
+        encode_ack(
+            &Ack {
+                acked_sequence,
+                in_memory_sequence,
+            },
+            &mut buf,
+        );
         let dummy_shutdown = AtomicBool::new(false);
         self.publish(&buf, &dummy_shutdown)
     }
@@ -594,9 +600,20 @@ impl SessionState {
     /// Same as `send_ack` but observes the supplied shutdown flag —
     /// the streaming loop uses this so a shutdown during a backpressure
     /// spin-wait short-circuits.
-    fn send_ack_with(&self, acked_sequence: u64, shutdown: &AtomicBool) -> io::Result<()> {
+    fn send_ack_with(
+        &self,
+        acked_sequence: u64,
+        in_memory_sequence: u64,
+        shutdown: &AtomicBool,
+    ) -> io::Result<()> {
         let mut buf = Vec::with_capacity(16);
-        encode_ack(&Ack { acked_sequence }, &mut buf);
+        encode_ack(
+            &Ack {
+                acked_sequence,
+                in_memory_sequence,
+            },
+            &mut buf,
+        );
         self.publish(&buf, shutdown)
     }
 }
@@ -1020,7 +1037,7 @@ fn streaming_loop(
             pending_acks.pop_ready(journal_cursor)
         };
         if let Some(seq) = ready_seq {
-            if let Err(e) = session.send_ack_with(seq, shutdown) {
+            if let Err(e) = session.send_ack_with(seq, *accum_end_sequence, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
@@ -1040,7 +1057,7 @@ fn streaming_loop(
             } else {
                 pending_acks.pop_oldest_blocking(journal_cursor)
             };
-            if let Err(e) = session.send_ack_with(seq, shutdown) {
+            if let Err(e) = session.send_ack_with(seq, *accum_end_sequence, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
@@ -1058,7 +1075,8 @@ fn streaming_loop(
         // one. Without this, no new orders → no new acks → the primary's
         // ack-timeout evicts a perfectly healthy replica.
         if last_sent_ack_seq > 0 && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
-            if let Err(e) = session.send_ack_with(last_sent_ack_seq, shutdown) {
+            if let Err(e) = session.send_ack_with(last_sent_ack_seq, *accum_end_sequence, shutdown)
+            {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }

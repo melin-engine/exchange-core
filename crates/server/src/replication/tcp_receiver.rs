@@ -269,6 +269,12 @@ fn replica_stream_uring(
             encode_ack(
                 &Ack {
                     acked_sequence: seq,
+                    // In-memory cursor = highest sequence published to
+                    // the input ring. `accum_end_sequence` advances each
+                    // time a slot lands in the ring (pre-journal); `seq`
+                    // is gated on the journal cursor. Always
+                    // `accum_end_sequence >= seq`.
+                    in_memory_sequence: *accum_end_sequence,
                 },
                 &mut ack_send_buf,
             );
@@ -408,6 +414,7 @@ fn replica_stream_uring(
             encode_ack(
                 &Ack {
                     acked_sequence: seq,
+                    in_memory_sequence: *accum_end_sequence,
                 },
                 &mut ack_send_buf,
             );
@@ -689,10 +696,17 @@ fn replica_stream_uring(
 
 fn send_ack_tcp(
     acked_sequence: u64,
+    in_memory_sequence: u64,
     writer: &mut TcpStream,
     send_buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    encode_ack(&Ack { acked_sequence }, send_buf);
+    encode_ack(
+        &Ack {
+            acked_sequence,
+            in_memory_sequence,
+        },
+        send_buf,
+    );
     writer.write_all(send_buf)?;
     writer.flush()?;
     send_buf.clear();
@@ -1177,7 +1191,7 @@ pub fn run_receiver(
         if let Some(p) = pipeline.as_ref()
             && let Some(seq) = pending_acks.pop_all_blocking(p.journal_cursor.as_ref())
         {
-            let _ = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf);
+            let _ = send_ack_tcp(seq, accum_end_sequence, &mut tcp_writer, &mut send_buf);
         }
 
         // For terminal session exits (Shutdown / Promote / Fatal) the

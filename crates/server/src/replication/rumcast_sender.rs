@@ -1007,6 +1007,8 @@ impl SlotState {
                     );
                     metrics.acked_sequence[self.slot_idx]
                         .store(ack.acked_sequence, Ordering::Relaxed);
+                    metrics.in_memory_sequence[self.slot_idx]
+                        .store(ack.in_memory_sequence, Ordering::Relaxed);
                 }
                 Ok(ReplicaMessage::Handshake(_)) => {
                     warn!(

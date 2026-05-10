@@ -225,6 +225,7 @@ impl DpdkReplicationDriver {
             slot.active_flag.store(false, Ordering::Release);
             slot.evict_flag.store(false, Ordering::Release);
             metrics.acked_sequence[i].store(0, Ordering::Relaxed);
+            metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
             metrics.catching_up[i].store(false, Ordering::Relaxed);
             slot.acked_cursor = u64::MAX;
             slot.recv_buf.clear();
@@ -495,6 +496,8 @@ impl DpdkReplicationDriver {
                                     slot.acked_cursor = ack.acked_sequence + 1;
                                     metrics.acked_sequence[slot_idx]
                                         .store(ack.acked_sequence, Ordering::Relaxed);
+                                    metrics.in_memory_sequence[slot_idx]
+                                        .store(ack.in_memory_sequence, Ordering::Relaxed);
                                     update_dual_replication_cursor(
                                         slot.acked_cursor,
                                         other_acked,
@@ -521,6 +524,7 @@ impl DpdkReplicationDriver {
                         slot.active_flag.store(false, Ordering::Release);
                         slot.acked_cursor = u64::MAX;
                         metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
@@ -590,6 +594,7 @@ impl DpdkReplicationDriver {
                             slot.active_flag.store(false, Ordering::Release);
                             slot.acked_cursor = u64::MAX;
                             metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                            metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
                             slot.recv_buf.clear();
                             slot.state = SlotState::Idle;
                             replicas_connected.fetch_sub(1, Ordering::Release);
@@ -621,6 +626,7 @@ impl DpdkReplicationDriver {
                         slot.active_flag.store(false, Ordering::Release);
                         slot.acked_cursor = u64::MAX;
                         metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
@@ -1322,6 +1328,9 @@ pub fn run_receiver_dpdk(
                 encode_ack(
                     &Ack {
                         acked_sequence: $seq,
+                        // In-memory cursor = highest sequence published
+                        // to the input ring on this replica.
+                        in_memory_sequence: accum_end_sequence,
                     },
                     &mut send_buf,
                 );
