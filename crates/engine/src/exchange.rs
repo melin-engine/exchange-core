@@ -257,6 +257,15 @@ impl TokenBucket {
     ///    600 µs apart correctly issues exactly one token, not zero.
     #[inline]
     fn refill(&mut self, now_ns: u64, rate: u32, burst: u32) {
+        // Defensive cap: a tampered snapshot, a primary/replica `--max-orders-burst`
+        // mismatch, or any future bug that produces `tokens > burst` would otherwise
+        // grant unbounded credit on the next event (the `now_ns > last_refill_ns`
+        // branch below can leave `tokens` untouched). Clamping at the point of use
+        // keeps the bucket invariant `tokens <= burst` independent of how the state
+        // was loaded. One cmp on the hot path.
+        if self.tokens > burst as u64 {
+            self.tokens = burst as u64;
+        }
         // Clock can only go forward in our timeline (event ts_ns is
         // assigned by the reader at ingest and journaled). If we ever
         // see now_ns < last_refill_ns it means the operator changed the
@@ -11115,6 +11124,39 @@ mod tests {
             exchange.order_bucket_count(),
             1,
             "deactivation preserves buckets — close path must not erode them",
+        );
+    }
+
+    #[test]
+    fn rate_limit_refill_clamps_tokens_above_burst() {
+        // A tampered snapshot, a primary/replica burst-config mismatch,
+        // or any future bug producing `tokens > burst` must NOT grant
+        // unbounded credit. Without the clamp at the top of `refill`,
+        // a bucket with `tokens = u64::MAX` and `last_refill_ns` in the
+        // future would skip the elapsed-time branch and let the caller
+        // drain ~u64::MAX orders before reaching zero.
+        let mut bucket = TokenBucket {
+            tokens: u64::MAX,
+            // In the future relative to the call — refill's elapsed-time
+            // branch is skipped, exercising ONLY the new defensive clamp.
+            last_refill_ns: 10_000_000_000,
+        };
+        let burst: u32 = 5;
+        let rate: u32 = 100;
+        let allowed = bucket.refill_and_consume(1_000_000_000, rate, burst);
+        assert!(allowed, "first call should consume one token");
+        assert_eq!(
+            bucket.tokens,
+            burst as u64 - 1,
+            "tokens must be clamped to burst before consume",
+        );
+        // Drain the rest of the burst.
+        for _ in 0..(burst - 1) {
+            assert!(bucket.refill_and_consume(1_000_000_000, rate, burst));
+        }
+        assert!(
+            !bucket.refill_and_consume(1_000_000_000, rate, burst),
+            "after burst orders the bucket must reject — no phantom credit from u64::MAX",
         );
     }
 }

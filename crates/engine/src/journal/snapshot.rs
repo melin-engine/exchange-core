@@ -879,11 +879,22 @@ fn decode_exchange_state(
         pos += 4;
         validate_count(buf.len() - pos, n, 20)?;
         let mut buckets = Vec::with_capacity(n);
+        // Track seen accounts to reject duplicate keys: the encoder writes
+        // each AccountId at most once (HashMap iteration), so a duplicate
+        // here means the snapshot is corrupt or tampered. Silent overwrite
+        // would let an attacker shadow a legitimate bucket with a synthetic
+        // full-credit one. HashSet is u32-keyed and only built during
+        // recovery — not on the hot path.
+        let mut seen: std::collections::HashSet<AccountId> =
+            std::collections::HashSet::with_capacity(n);
         for _ in 0..n {
             check(pos, 20)?;
             let account = AccountId(le::get_u32(&buf[pos..]));
             let tokens = le::get_u64(&buf[pos + 4..]);
             let last_refill_ns = le::get_u64(&buf[pos + 12..]);
+            if !seen.insert(account) {
+                return Err(corrupt("duplicate account in order_buckets section"));
+            }
             buckets.push((account, tokens, last_refill_ns));
             pos += 20;
         }
@@ -2213,6 +2224,54 @@ mod tests {
             Err(JournalError::TruncatedEntry) => {}
             Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
             Ok(_) => panic!("truncated v18 payload must not decode silently as empty"),
+        }
+    }
+
+    /// SEC-04 v18+: the decoder must reject a payload that contains the
+    /// same `AccountId` twice in the rate-limiter bucket section. The
+    /// encoder writes each account at most once (HashMap iteration), so
+    /// a duplicate means the snapshot was tampered or corrupted. Silent
+    /// overwrite would let an attacker shadow a depleted bucket with a
+    /// synthetic full-credit one.
+    #[test]
+    fn duplicate_account_in_v18_bucket_section_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(1_000, 5);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        exchange.set_current_event_ts_ns(1_000_000_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1),
+            &mut reports,
+        );
+
+        let mut payload = encode_exchange_payload(&exchange);
+        // Bucket section is the trailing run: [u32 count][entry × count],
+        // entry = AccountId(u32) + tokens(u64) + last_refill_ns(u64) = 20 B.
+        // Bump the count by one and append a duplicate of the existing entry.
+        let entry_start = payload.len() - 20;
+        let dup_entry = payload[entry_start..].to_vec();
+        let count_pos = entry_start - 4;
+        let count = le::get_u32(&payload[count_pos..]);
+        // u32 is the on-wire count type; if this ever overflows the test
+        // setup is the bug, not the production code.
+        let new_count = count
+            .checked_add(1)
+            .expect("test fixture must keep count within u32");
+        payload[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
+        payload.extend_from_slice(&dup_entry);
+
+        match decode_exchange_payload(&payload, SNAP_VERSION) {
+            Err(JournalError::CorruptEntry { reason, .. }) => {
+                assert!(
+                    reason.contains("duplicate account"),
+                    "expected duplicate-account corruption, got: {reason}",
+                );
+            }
+            Err(other) => panic!("expected CorruptEntry, got {other:?}"),
+            Ok(_) => panic!("duplicate-account payload must not decode silently"),
         }
     }
 
