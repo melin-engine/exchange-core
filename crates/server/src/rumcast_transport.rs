@@ -2149,8 +2149,10 @@ fn run_rumcast_replica(
         config.snapshot_interval_ms,
         config.shadow_snapshot_path(),
         config.cores,
-        // async_ack: see comment in `run_as_replica` (TCP path) — flag
-        // gone, hardcoded false here pending ack-on-receive plumbing.
+        // async_ack: legacy `--async-replica-ack` flag is retired. The
+        // ack-on-receive dual-track flush (in-memory cursor advances
+        // before durable cursor) supersedes it; passing false keeps the
+        // documented `PendingAckQueue::pop_ready` branch.
         false,
         !config.yield_idle,
         rotation,

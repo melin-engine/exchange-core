@@ -568,6 +568,79 @@ pub(super) fn update_dual_replication_cursor(
     cursor_max.store(this_acked.max(other_acked), Ordering::Release);
 }
 
+/// Build the next replica → primary `Ack` to fire under the dual-track
+/// model. Returns `Some(Ack)` when one of the two cursor tracks has
+/// advanced beyond the last value sent on the wire.
+///
+/// Tracks:
+///
+/// 1. **Persisted** — `pop_ready(journal_cursor)` returns the latest
+///    primary sequence whose local-ring target the journal has crossed.
+///    [`PendingAckQueue`] is what maps local-ring positions (the
+///    space `journal_cursor` indexes) to primary sequences (the space
+///    the wire `acked_sequence` field is in). The receive path no
+///    longer waits on the queue for ack-on-receive, but the queue is
+///    still load-bearing for this namespace translation.
+/// 2. **In-memory** — `accum_end_sequence` directly. That's the
+///    highest primary sequence the receiver has published to the
+///    local input ring (pre-journal). Advances on every received
+///    batch.
+///
+/// Either track advancing past the corresponding `last_sent_*` value
+/// triggers an ack. Coalescing is per-call: while a SEND is in flight
+/// the caller gates this function (skipping it), so both tracks can
+/// advance freely; the next call after SEND completes fires one ack
+/// carrying the latest values.
+///
+/// # Tracker update contract
+///
+/// **Callers MUST update `*last_sent_acked` / `*last_sent_in_memory`
+/// to the returned ack's fields AFTER the wire SEND succeeds, not
+/// before.** Marking a value as sent before the actual send completes
+/// would silently skip resending after a transient send failure (DPDK
+/// `ACK_RETRY_CAP` drop, rumcast SEND error). Cursors are monotonic,
+/// so a subsequent successful pop subsumes any lost value — but only
+/// if the trackers haven't been advanced past it.
+///
+/// # async_ack mode
+///
+/// `async_ack=true` swaps `pop_ready` for `pop_all_async`, which
+/// returns the highest queued primary seq without waiting on the
+/// journal cursor. Used historically by `--async-replica-ack`; with
+/// that flag retired the parameter is hardcoded `false` at all
+/// production call sites and only the queue's documented behaviour
+/// keeps the branch wired.
+#[inline]
+pub(super) fn try_flush_dual_track(
+    pending_acks: &mut PendingAckQueue,
+    journal_cursor: &melin_disruptor::padding::Sequence,
+    accum_end_sequence: u64,
+    last_sent_acked: u64,
+    last_sent_in_memory: u64,
+    async_ack: bool,
+) -> Option<crate::replication::protocol::Ack> {
+    let popped = if async_ack {
+        pending_acks.pop_all_async()
+    } else {
+        pending_acks.pop_ready(journal_cursor)
+    };
+    let acked_now = popped.unwrap_or(last_sent_acked);
+    debug_assert!(
+        acked_now >= last_sent_acked,
+        "acked_sequence regression: {last_sent_acked} -> {acked_now} \
+         (queue popped a value below last-sent; namespace-translation bug?)",
+    );
+    let in_mem_now = accum_end_sequence;
+    if acked_now > last_sent_acked || in_mem_now > last_sent_in_memory {
+        Some(crate::replication::protocol::Ack {
+            acked_sequence: acked_now,
+            in_memory_sequence: in_mem_now,
+        })
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -1841,6 +1914,78 @@ mod tests {
         let mut q = PendingAckQueue::new(8);
         let cursor = make_journal_cursor(0);
         assert!(q.pop_all_blocking(&cursor).is_none());
+    }
+
+    // --- try_flush_dual_track tests ---
+
+    #[test]
+    fn dual_track_returns_none_when_both_tracks_idle() {
+        let mut q = PendingAckQueue::new(8);
+        let cursor = make_journal_cursor(0);
+        assert!(
+            try_flush_dual_track(&mut q, &cursor, 0, 0, 0, false).is_none(),
+            "no advance on either track → no ack"
+        );
+    }
+
+    #[test]
+    fn dual_track_fires_on_persisted_advance_only() {
+        // Persisted track moves: pop_ready returns 100; in-memory
+        // stayed at 50 (last_sent). Expect ack with acked=100,
+        // in_memory=50 (no regression — the wire field carries the
+        // current sample, not a "no change" marker).
+        let mut q = PendingAckQueue::new(8);
+        q.push(10, 100);
+        let cursor = make_journal_cursor(20);
+        let ack =
+            try_flush_dual_track(&mut q, &cursor, 50, 0, 50, false).expect("persisted advanced");
+        assert_eq!(ack.acked_sequence, 100);
+        assert_eq!(ack.in_memory_sequence, 50);
+    }
+
+    #[test]
+    fn dual_track_fires_on_in_memory_advance_only() {
+        // Persisted is idle (queue empty): unwrap_or keeps the
+        // last-sent acked at 100. In-memory bumped from 100 to 200.
+        let mut q = PendingAckQueue::new(8);
+        let cursor = make_journal_cursor(0);
+        let ack = try_flush_dual_track(&mut q, &cursor, 200, 100, 100, false)
+            .expect("in-memory advanced");
+        assert_eq!(ack.acked_sequence, 100);
+        assert_eq!(ack.in_memory_sequence, 200);
+    }
+
+    #[test]
+    fn dual_track_coalesces_until_caller_updates_trackers() {
+        // Caller did not advance trackers between calls. The queue
+        // popped on call 1; on call 2 it's empty so persisted stays
+        // at 100 (unwrap_or). In-memory advanced 50 → 80 between
+        // calls. Second call must still fire because tracker is
+        // still 50.
+        let mut q = PendingAckQueue::new(8);
+        q.push(10, 100);
+        let cursor = make_journal_cursor(20);
+        let ack1 = try_flush_dual_track(&mut q, &cursor, 50, 0, 50, false).expect("call 1 fires");
+        assert_eq!(ack1.acked_sequence, 100);
+        // Caller "forgot" to update trackers (simulates send failure).
+        let ack2 = try_flush_dual_track(&mut q, &cursor, 80, 0, 50, false)
+            .expect("call 2 fires on in-memory advance");
+        assert_eq!(
+            ack2.acked_sequence, 0,
+            "no new persisted pop → unwrap_or(last_sent)"
+        );
+        assert_eq!(ack2.in_memory_sequence, 80);
+    }
+
+    #[test]
+    fn dual_track_async_mode_pops_without_cursor() {
+        // async_ack=true: pop_all_async returns highest pushed seq
+        // regardless of cursor position.
+        let mut q = PendingAckQueue::new(8);
+        q.push(u64::MAX, 300);
+        let cursor = make_journal_cursor(0);
+        let ack = try_flush_dual_track(&mut q, &cursor, 0, 0, 0, true).expect("async pops eagerly");
+        assert_eq!(ack.acked_sequence, 300);
     }
 
     // --- Dual-replica cursor update tests ---

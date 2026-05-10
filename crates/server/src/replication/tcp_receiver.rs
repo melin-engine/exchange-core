@@ -51,7 +51,7 @@ use crate::amortized_timer::AmortizedTimer;
 
 use super::{
     PendingAckQueue, ReplicaPipelineHandles, build_replica_pipeline_with_threads, log_tcp_info,
-    sleep_checking_flags, teardown_replica_pipeline,
+    sleep_checking_flags, teardown_replica_pipeline, try_flush_dual_track,
 };
 
 /// io_uring streaming receive loop for the replica.
@@ -251,64 +251,42 @@ fn replica_stream_uring(
             return SessionExit::Promote;
         }
 
-        // --- Flush acks ---
+        // --- Flush acks (dual-track) ---
         //
-        // Two-track ack model. Each iteration:
-        //
-        //   1. Advance the *persisted* track via the queue: if the
-        //      journal cursor has caught up to a queued entry's
-        //      target, the entry's primary-side sequence becomes the
-        //      replica's `acked_sequence`. The queue is what maps
-        //      local-ring positions to primary sequences.
-        //   2. Sample the *in-memory* track from `accum_end_sequence`
-        //      directly — that's the highest primary sequence the
-        //      receiver has published to the local ring (pre-journal).
-        //   3. If either track has advanced past the last value we
-        //      put on the wire, fire one ack carrying the latest
-        //      values of both. Coalescing falls out naturally — while
-        //      a SEND is in flight, both tracks may advance freely;
-        //      the next iteration after SEND completes fires one ack.
-        //
-        // Two trigger sources covered by this single check:
-        //
-        //   - On receive: `accum_end_sequence` advances when a batch
-        //     publishes to the input ring. The very next loop iteration
-        //     fires an ack carrying the new in-memory cursor — the
-        //     latency win for `in_memory>=N` policies.
-        //   - On journal advance: the queue's `pop_ready` returns the
-        //     newly-durable primary sequence, which becomes the
-        //     replica's `acked_sequence` on the next ack.
-        if !ack_send_in_flight {
-            let popped_acked = if async_ack {
-                pending_acks.pop_all_async()
-            } else {
-                pending_acks.pop_ready(journal_cursor)
-            };
-            let acked_now = popped_acked.unwrap_or(last_sent_acked_seq);
-            let in_mem_now = *accum_end_sequence;
-            if acked_now > last_sent_acked_seq || in_mem_now > last_sent_in_memory_seq {
-                ack_send_buf.clear();
-                encode_ack(
-                    &Ack {
-                        acked_sequence: acked_now,
-                        in_memory_sequence: in_mem_now,
-                    },
-                    &mut ack_send_buf,
-                );
-                let sqe = opcode::Send::new(
-                    types::Fixed(0),
-                    ack_send_buf.as_ptr(),
-                    ack_send_buf.len() as u32,
-                )
-                .build()
-                .user_data(TOKEN_SEND);
-                unsafe { ring.submission().push(&sqe).expect("SQ full") };
-                ack_send_in_flight = true;
-                ack_send_offset = 0;
-                last_sent_acked_seq = acked_now;
-                last_sent_in_memory_seq = in_mem_now;
-                acks_sent_since_log += 1;
-            }
+        // See `try_flush_dual_track` in `replication/mod.rs` for the
+        // persisted-vs-in-memory model. The helper centralises the
+        // namespace translation between local-ring positions
+        // (`journal_cursor` space) and primary sequences (wire space)
+        // so this receiver and the DPDK / rumcast siblings can't
+        // drift on that translation.
+        if !ack_send_in_flight
+            && let Some(ack) = try_flush_dual_track(
+                pending_acks,
+                journal_cursor,
+                *accum_end_sequence,
+                last_sent_acked_seq,
+                last_sent_in_memory_seq,
+                async_ack,
+            )
+        {
+            ack_send_buf.clear();
+            encode_ack(&ack, &mut ack_send_buf);
+            let sqe = opcode::Send::new(
+                types::Fixed(0),
+                ack_send_buf.as_ptr(),
+                ack_send_buf.len() as u32,
+            )
+            .build()
+            .user_data(TOKEN_SEND);
+            unsafe { ring.submission().push(&sqe).expect("SQ full") };
+            ack_send_in_flight = true;
+            ack_send_offset = 0;
+            // Update trackers AFTER successful submission. io_uring SEND
+            // submission panics on SQ full (no recoverable error path),
+            // so reaching this line means the wire send is enqueued.
+            last_sent_acked_seq = ack.acked_sequence;
+            last_sent_in_memory_seq = ack.in_memory_sequence;
+            acks_sent_since_log += 1;
         }
 
         // --- Backpressure: if pending_acks full, drain in-flight SEND
@@ -430,11 +408,12 @@ fn replica_stream_uring(
             } else {
                 pending_acks.pop_oldest_blocking(journal_cursor)
             };
+            let in_mem_now = *accum_end_sequence;
             ack_send_buf.clear();
             encode_ack(
                 &Ack {
                     acked_sequence: seq,
-                    in_memory_sequence: *accum_end_sequence,
+                    in_memory_sequence: in_mem_now,
                 },
                 &mut ack_send_buf,
             );
@@ -448,6 +427,16 @@ fn replica_stream_uring(
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
             ack_send_in_flight = true;
             ack_send_offset = 0;
+            // Backpressure-drain just sent an ack carrying (seq,
+            // in_mem_now). Update trackers so the next flush-block
+            // call doesn't refire — without this the dual-track
+            // coalescer would see "in_mem_now > last_sent_in_memory_seq"
+            // (or "seq > last_sent_acked_seq") and emit a duplicate
+            // ack right after, with the worst case being a wire-side
+            // regression of `acked_sequence` if the flush block then
+            // popped something smaller.
+            last_sent_acked_seq = seq;
+            last_sent_in_memory_seq = in_mem_now;
             acks_sent_since_log += 1;
         }
 

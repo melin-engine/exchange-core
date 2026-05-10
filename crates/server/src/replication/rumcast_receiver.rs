@@ -31,7 +31,7 @@ use super::protocol::{
     decode_primary_message, encode_ack, encode_challenge_response, encode_handshake,
     try_decode_input_batch,
 };
-use super::{PendingAckQueue, shutdown_pipeline, sleep_checking_flags};
+use super::{PendingAckQueue, shutdown_pipeline, sleep_checking_flags, try_flush_dual_track};
 
 // ---------------------------------------------------------------------------
 // Wire-format constants — must match `replication/rumcast_sender.rs`.
@@ -1036,27 +1036,29 @@ fn streaming_loop(
 
         // ---- Flush acks ----
         //
-        // Two-track model (see `tcp_receiver` for the full rationale):
-        // pop the queue for the persisted-cursor track; sample
-        // `accum_end_sequence` for the in-memory track; fire one ack
-        // iff either has advanced past the last value sent.
-        let popped_acked = if async_ack {
-            pending_acks.pop_all_async()
-        } else {
-            pending_acks.pop_ready(journal_cursor)
-        };
-        let acked_now = popped_acked.unwrap_or(last_sent_ack_seq);
-        let in_mem_now = *accum_end_sequence;
-        if acked_now > last_sent_ack_seq || in_mem_now > last_sent_in_memory_seq {
-            if let Err(e) = session.send_ack_with(acked_now, in_mem_now, shutdown) {
+        // Two-track model (see `try_flush_dual_track` for the full
+        // rationale): pop the queue for the persisted-cursor track,
+        // sample `accum_end_sequence` for the in-memory track, fire one
+        // ack iff either has advanced past the last value sent.
+        if let Some(ack) = try_flush_dual_track(
+            pending_acks,
+            journal_cursor,
+            *accum_end_sequence,
+            last_sent_ack_seq,
+            last_sent_in_memory_seq,
+            async_ack,
+        ) {
+            if let Err(e) =
+                session.send_ack_with(ack.acked_sequence, ack.in_memory_sequence, shutdown)
+            {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "ack send failed");
                 return SessionExit::Disconnected;
             }
-            last_sent_ack_seq = acked_now;
-            last_sent_in_memory_seq = in_mem_now;
+            last_sent_ack_seq = ack.acked_sequence;
+            last_sent_in_memory_seq = ack.in_memory_sequence;
             last_keepalive = Instant::now();
         }
 
@@ -1069,14 +1071,17 @@ fn streaming_loop(
             } else {
                 pending_acks.pop_oldest_blocking(journal_cursor)
             };
-            if let Err(e) = session.send_ack_with(seq, *accum_end_sequence, shutdown) {
+            let in_mem_now = *accum_end_sequence;
+            if let Err(e) = session.send_ack_with(seq, in_mem_now, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "ack send failed during backpressure drain");
                 return SessionExit::Disconnected;
             }
+            // Sync both trackers so the flush block doesn't refire.
             last_sent_ack_seq = seq;
+            last_sent_in_memory_seq = in_mem_now;
             last_keepalive = Instant::now();
         }
 
@@ -1087,14 +1092,18 @@ fn streaming_loop(
         // one. Without this, no new orders → no new acks → the primary's
         // ack-timeout evicts a perfectly healthy replica.
         if last_sent_ack_seq > 0 && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
-            if let Err(e) = session.send_ack_with(last_sent_ack_seq, *accum_end_sequence, shutdown)
-            {
+            let in_mem_now = *accum_end_sequence;
+            if let Err(e) = session.send_ack_with(last_sent_ack_seq, in_mem_now, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "keepalive ack send failed");
                 return SessionExit::Disconnected;
             }
+            // Keepalive may advance the in-memory track even if the
+            // persisted track is idle; keep the tracker in sync so the
+            // flush block doesn't refire on a stale comparison.
+            last_sent_in_memory_seq = in_mem_now;
             last_keepalive = Instant::now();
         }
 

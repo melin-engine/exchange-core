@@ -10,29 +10,6 @@ not tracked here.
 
 ## Bugs to fix on `feat/ack-on-receive` before merge
 
-### Backpressure / keepalive paths leak the coalescing tracker
-
-The dual-track flush block in each receiver maintains
-`last_sent_acked_seq` and `last_sent_in_memory_seq` to coalesce acks.
-Backpressure-drain and keepalive sites send acks without updating
-these — directly after a backpressure event the regular flush block
-sees its tracker as stale and either fires a duplicate ack or, in
-pathological cases, sends an `acked_sequence` on the wire that's
-lower than the value the backpressure path already published
-(monotonicity violation on the primary's view of the cursor).
-
-Sites:
-
-- `crates/server/src/replication/tcp_receiver.rs:441-451` — backpressure-drain ack
-- `crates/server/src/replication/dpdk.rs:1343, :1472, :1482` — close-time ack, backpressure, disconnect-drain
-- `crates/server/src/replication/rumcast_receiver.rs:1054, :1072` — backpressure-drain and idle-keepalive
-
-Fix: assign both tracking variables wherever an ack goes out. Pair
-with a `debug_assert!(acked_now >= last_sent_acked_seq)` in the
-flush block to catch the namespace-translation class of bug (a prior
-implementation attempt sent `journal_cursor.load()` on the wire,
-mixing local-ring-position and primary-sequence spaces).
-
 ### Coalescing is per-iteration, not per-time-window
 
 On a `busy_spin` loop, iterations are sub-microsecond. Each cursor
@@ -50,11 +27,19 @@ Fix path (decide after bench):
 - Otherwise document the per-iteration behaviour as acceptable and
   correct the overstated comment at `tcp_receiver.rs:262`.
 
-### Stale comments and docs after the ack-on-receive landing
+### Stale roadmap framing after the ack-on-receive landing
 
-- `crates/server/src/server.rs:636` and `crates/server/src/rumcast_transport.rs:2153` reference "pending ack-on-receive plumbing" — stale.
-- `docs/replication.md:160` reads "Sends `Ack` frames after the journal stage confirms durable write" — now misleading; acks also fire on receive via the in-memory cursor track.
-- `docs/roadmap.md:16` (item #5) phrased as future work. Receiver-side has landed on `feat/ack-on-receive`; CLI-flag swap (next section) remains.
+- `docs/roadmap.md:16` (item #5) is still phrased as future work. The receiver-side dual-track flush has landed on `feat/ack-on-receive`; the CLI-flag swap (3-variant `DurabilityMode`, next section) is what remains.
+
+---
+
+## Refactor: extract `try_flush_dual_track` helper — done
+
+Landed on `feat/ack-on-receive`: shared helper in
+`crates/server/src/replication/mod.rs` (`try_flush_dual_track`) now
+backs all three receivers (`tcp_receiver`, `dpdk`, `rumcast_receiver`).
+Carries the load-bearing namespace-translation comment and the
+`debug_assert!` for cursor monotonicity in one place.
 
 ---
 
@@ -63,33 +48,6 @@ Fix path (decide after bench):
 - **Regression for the namespace bug**: set `--durability-policy in_memory>=2`, drive traffic through a 1+2 cluster, assert the primary's `metrics.in_memory_sequence[slot]` advances *before* `metrics.acked_sequence[slot]`. A prior implementation attempt mixed local-ring-position and primary-sequence spaces on the wire; this test would catch any re-introduction.
 - **Backpressure-drain → flush duplicate-ack sequence**: simulate a queue-full event, drive a follow-up batch, assert the next ack does not regress `acked_sequence` on the primary.
 - **Unit test for the dual-track coalescing rule**: a focused test (not full integration) on the flush block's `acked_now > last_sent || in_mem_now > last_sent` logic.
-
----
-
-## Refactor: extract `try_flush_dual_track` helper
-
-Three near-identical inlined flush blocks live in `tcp_receiver`,
-`dpdk`, and `rumcast_receiver`. Drift between them is exactly the
-shape of bug the first implementation attempt produced (namespace
-mismatch in one receiver but not another). Extract a shared helper
-so future changes apply uniformly:
-
-```rust
-fn try_flush_dual_track(
-    pending_acks: &mut PendingAckQueue,
-    journal_cursor: &Sequence,
-    accum_end_sequence: u64,
-    last_sent_acked: &mut u64,
-    last_sent_in_memory: &mut u64,
-    async_ack: bool,
-) -> Option<Ack> { /* ... */ }
-```
-
-Each receiver still owns its send-side I/O (io_uring SEND, DPDK
-queue, rumcast publish) but the cursor-advance + coalescing logic
-becomes one tested function. Carry the load-bearing comment about
-namespace translation (currently at `tcp_receiver.rs:262`) on the
-helper, not on each call site.
 
 ---
 

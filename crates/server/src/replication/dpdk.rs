@@ -24,7 +24,7 @@ use super::protocol::{
 use super::{
     PendingAckQueue, ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
-    update_dual_replication_cursor,
+    try_flush_dual_track, update_dual_replication_cursor,
 };
 
 enum FrameResult {
@@ -1346,17 +1346,9 @@ pub fn run_receiver_dpdk(
         // with an updated cursor.
         const ACK_RETRY_CAP: u32 = 32;
         macro_rules! send_ack_dpdk {
-            ($seq:expr) => {{
+            ($ack:expr) => {{
                 send_buf.clear();
-                encode_ack(
-                    &Ack {
-                        acked_sequence: $seq,
-                        // In-memory cursor = highest sequence published
-                        // to the input ring on this replica.
-                        in_memory_sequence: accum_end_sequence,
-                    },
-                    &mut send_buf,
-                );
+                encode_ack(&$ack, &mut send_buf);
                 let mut attempts: u32 = 0;
                 loop {
                     if transport.queue_send(handle, &send_buf) {
@@ -1399,7 +1391,10 @@ pub fn run_receiver_dpdk(
             if shutdown.load(Ordering::Relaxed) {
                 info!("replica shutting down (DPDK)");
                 if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
-                    send_ack_dpdk!(seq);
+                    send_ack_dpdk!(Ack {
+                        acked_sequence: seq,
+                        in_memory_sequence: accum_end_sequence,
+                    });
                     transport.poll();
                 }
                 break 'streaming SessionExit::Shutdown;
@@ -1442,34 +1437,32 @@ pub fn run_receiver_dpdk(
                     }
                 }
                 if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
-                    send_ack_dpdk!(seq);
+                    send_ack_dpdk!(Ack {
+                        acked_sequence: seq,
+                        in_memory_sequence: accum_end_sequence,
+                    });
                     transport.poll();
                 }
                 break 'streaming SessionExit::Promote;
             }
 
-            // --- Flush acks ---
+            // --- Flush acks (dual-track) ---
             //
-            // Two-track model (see `tcp_receiver` for the full rationale):
-            //
-            //   1. Persisted track via the queue: `pop_ready` yields the
-            //      newly-durable primary sequence when journal_cursor
-            //      catches up to a queued entry's local-ring target.
-            //   2. In-memory track: read `accum_end_sequence` directly.
-            //
-            // Fire one ack iff either track has advanced past the last
-            // value sent. Coalesces multiple advances naturally.
-            let popped_acked = if async_ack {
-                pending_acks.pop_all_async()
-            } else {
-                pending_acks.pop_ready(journal_cursor)
-            };
-            let acked_now = popped_acked.unwrap_or(last_sent_acked_seq);
-            let in_mem_now = accum_end_sequence;
-            if acked_now > last_sent_acked_seq || in_mem_now > last_sent_in_memory_seq {
-                send_ack_dpdk!(acked_now);
-                last_sent_acked_seq = acked_now;
-                last_sent_in_memory_seq = in_mem_now;
+            // See `try_flush_dual_track` in `replication/mod.rs` for the
+            // model. The helper centralises the persisted-vs-in-memory
+            // logic and the namespace translation between local-ring
+            // positions and primary sequences across all three receivers.
+            if let Some(ack) = try_flush_dual_track(
+                &mut pending_acks,
+                journal_cursor,
+                accum_end_sequence,
+                last_sent_acked_seq,
+                last_sent_in_memory_seq,
+                async_ack,
+            ) {
+                send_ack_dpdk!(ack);
+                last_sent_acked_seq = ack.acked_sequence;
+                last_sent_in_memory_seq = ack.in_memory_sequence;
             }
 
             // Backpressure: if pipeline is saturated, block until the oldest
@@ -1482,7 +1475,15 @@ pub fn run_receiver_dpdk(
                 } else {
                     pending_acks.pop_oldest_blocking(journal_cursor)
                 };
-                send_ack_dpdk!(seq);
+                let in_mem_now = accum_end_sequence;
+                send_ack_dpdk!(Ack {
+                    acked_sequence: seq,
+                    in_memory_sequence: in_mem_now,
+                });
+                // Sync trackers so the flush block doesn't refire — see
+                // tcp_receiver for the full rationale.
+                last_sent_acked_seq = seq;
+                last_sent_in_memory_seq = in_mem_now;
             }
 
             // Poll smoltcp and receive data.
@@ -1492,7 +1493,10 @@ pub fn run_receiver_dpdk(
             // Check for disconnect.
             if !transport.is_active(handle) && recv_buf.is_empty() {
                 if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
-                    send_ack_dpdk!(seq);
+                    send_ack_dpdk!(Ack {
+                        acked_sequence: seq,
+                        in_memory_sequence: accum_end_sequence,
+                    });
                     transport.poll();
                 }
                 break 'streaming SessionExit::Disconnected;

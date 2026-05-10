@@ -652,11 +652,11 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
-            // async_ack: hardcoded false now that `--async-replica-ack` is
-            // gone. The receiver gates acks on the local journal cursor.
-            // Equivalent fast-path semantics are reachable via an
-            // `in_memory>=N` clause in `--durability-policy` once we plumb
-            // ack-on-receive through the receiver (separate task).
+            // async_ack: hardcoded false now that `--async-replica-ack`
+            // is gone. The receiver's dual-track flush already publishes
+            // the in-memory cursor on receive (separate from the durable
+            // cursor), so an `in_memory>=N` clause in `--durability-policy`
+            // reaches fast-path semantics without flipping this branch.
             false,
             config.group_commit_delay(),
             config.replication_pipeline_depth,
