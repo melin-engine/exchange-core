@@ -124,19 +124,53 @@ pub fn run(
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position to avoid atomic reads on every slot.
-    // Updated via `evaluate_durability` whenever the gate iterates; the
-    // value is the minimum sequence confirmed durable under the current
-    // policy.
-    let mut cached_durable_pos: u64 = 0;
+    // Initialised below from the policy's startup evaluation; updated
+    // via `evaluate_durability` on every gate iteration.
+    let mut cached_durable_pos: u64;
 
-    // Degradation logger state. The gate loop sets the `policy_degraded`
-    // utilization flag every iteration; this tracks transitions and
-    // re-emits a warn at a slow heartbeat so an operator who missed the
-    // initial log line still sees the degraded state in the journal.
+    // Degradation logger state. The gate loop and the idle path both
+    // call `update_degraded_state` to refresh the `policy_degraded`
+    // utilization flag and emit transition / heartbeat logs. Driving
+    // this from the idle path matters for two operator scenarios:
+    //
+    // 1. Standalone deployments running the default `persisted>=2!`
+    //    are degraded from t=0 — the flag must reflect that even
+    //    before any traffic flows.
+    // 2. A quiet venue that loses a replica overnight should see the
+    //    `/healthz` gauge flip and the warn re-emit promptly, not
+    //    lazily on the next batch.
     let mut last_degraded_state: bool = false;
     let mut last_degraded_log: Option<Instant> = None;
+    let mut last_policy_check = Instant::now();
     /// Re-emit interval for the "still degraded" reminder.
     const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
+    /// Cadence at which the idle path re-evaluates the policy. Bounds
+    /// the lag between a connection-state change and the `/healthz`
+    /// gauge / warn-log reflecting it. Cheap (a handful of atomic
+    /// loads + the policy evaluator) at this rate.
+    const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+    // Initial evaluation so `policy_degraded` and the cached durable
+    // position reflect the cluster's startup shape before the first
+    // batch arrives.
+    {
+        let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+        let metrics_ref = replication_metrics.as_deref();
+        let active_ref = replica_active.as_ref();
+        let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
+        cached_durable_pos = status.durable_pos;
+        utilization
+            .policy_degraded
+            .store(status.degraded, Ordering::Relaxed);
+        if status.degraded {
+            tracing::warn!(
+                policy = %policy,
+                "durability policy starts in degraded mode — fewer connected nodes than the target count"
+            );
+            last_degraded_state = true;
+            last_degraded_log = Some(Instant::now());
+        }
+    }
 
     // Stage histograms registered with the global registry — see
     // `melin_journal::trace`. The four breakdown stages
@@ -303,6 +337,35 @@ pub fn run(
                 }
             }
 
+            // Re-evaluate the durability policy on a slow timer so the
+            // `policy_degraded` flag and the periodic warn track the
+            // cluster's real state even on idle / quiet venues. The
+            // gate-open block also calls `update_degraded_state` after
+            // each consumed batch; this is the equivalent for the
+            // no-batch path.
+            {
+                let now_ts = Instant::now();
+                if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
+                    last_policy_check = now_ts;
+                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
+                    update_degraded_state(
+                        &policy,
+                        &utilization,
+                        status.degraded,
+                        now_ts,
+                        DEGRADED_LOG_INTERVAL,
+                        &mut last_degraded_state,
+                        &mut last_degraded_log,
+                    );
+                    // Cache the position so the next batch's gate sees a
+                    // fresh value rather than spinning from a stale cache.
+                    cached_durable_pos = status.durable_pos;
+                }
+            }
+
             idle_count += 1;
             if idle_count.is_multiple_of(1024) {
                 utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -382,30 +445,24 @@ pub fn run(
 
         let batch_now = Instant::now();
 
-        // Log degradation transitions and re-emit the reminder while
-        // it persists. Cheap because we only enter this block once per
-        // batch (not per gate-poll), and the clock read is reused from
-        // `batch_now`. `policy_degraded` is the latest hot-path value.
+        // Log degradation transitions and re-emit the reminder. Same
+        // logic the idle path runs on its 1-second timer; consolidated
+        // in `update_degraded_state` so transitions are reported
+        // consistently regardless of whether the response stage is
+        // busy or idle.
         let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        if degraded_now {
-            let should_log = !last_degraded_state
-                || last_degraded_log
-                    .is_none_or(|t| batch_now.duration_since(t) >= DEGRADED_LOG_INTERVAL);
-            if should_log {
-                tracing::warn!(
-                    policy = %policy,
-                    "durability policy operating in degraded mode — fewer replicas connected than the target count, gate clamped to surviving cluster"
-                );
-                last_degraded_log = Some(batch_now);
-            }
-        } else if last_degraded_state {
-            tracing::info!(
-                policy = %policy,
-                "durability policy returned to target shape"
-            );
-            last_degraded_log = Some(batch_now);
-        }
-        last_degraded_state = degraded_now;
+        update_degraded_state(
+            &policy,
+            &utilization,
+            degraded_now,
+            batch_now,
+            DEGRADED_LOG_INTERVAL,
+            &mut last_degraded_state,
+            &mut last_degraded_log,
+        );
+        // Bump the idle-path's check timestamp too so we don't fire
+        // both branches in quick succession when traffic stops.
+        last_policy_check = batch_now;
 
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
@@ -706,6 +763,47 @@ pub(crate) fn evaluate_durability(
         }
     }
     policy.evaluate_with_status(&CursorView::new(&nodes[..len]))
+}
+
+/// Update the `policy_degraded` flag and emit transition / heartbeat
+/// logs. Called from both the gate-open path (per consumed batch) and
+/// the idle path (slow timer) so observability tracks the cluster
+/// state regardless of traffic level.
+///
+/// Mutates `last_degraded_state` and `last_degraded_log` so callers
+/// can keep a coherent view of when the last log line fired without
+/// duplicating the transition / heartbeat decision logic.
+#[inline]
+pub(crate) fn update_degraded_state(
+    policy: &Policy,
+    utilization: &StageUtilization,
+    degraded_now: bool,
+    now: Instant,
+    log_interval: Duration,
+    last_degraded_state: &mut bool,
+    last_degraded_log: &mut Option<Instant>,
+) {
+    utilization
+        .policy_degraded
+        .store(degraded_now, Ordering::Relaxed);
+    if degraded_now {
+        let should_log = !*last_degraded_state
+            || last_degraded_log.is_none_or(|t| now.duration_since(t) >= log_interval);
+        if should_log {
+            tracing::warn!(
+                policy = %policy,
+                "durability policy operating in degraded mode — fewer connected nodes than the target count, gate clamped to surviving cluster"
+            );
+            *last_degraded_log = Some(now);
+        }
+    } else if *last_degraded_state {
+        tracing::info!(
+            policy = %policy,
+            "durability policy returned to target shape"
+        );
+        *last_degraded_log = Some(now);
+    }
+    *last_degraded_state = degraded_now;
 }
 
 /// Minimum persisted cursor across currently-connected replica slots.

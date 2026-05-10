@@ -116,7 +116,39 @@ pub fn run(
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position (see response.rs for full explanation).
-    let mut cached_durable_pos: u64 = 0;
+    // Initialised below from the policy's startup evaluation.
+    let mut cached_durable_pos: u64;
+
+    // Degradation logger state — same scheme as the TCP response
+    // stage (see `response::run`). Initialised below from an explicit
+    // policy evaluation so a degraded startup state shows up on
+    // `/healthz` and in the journal even before the first batch.
+    let mut last_degraded_state: bool = false;
+    let mut last_degraded_log: Option<Instant> = None;
+    let mut last_policy_check = Instant::now();
+    const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
+    const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+    // Initial evaluation.
+    {
+        let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+        let metrics_ref = replication_metrics.as_deref();
+        let active_ref = replica_active.as_ref();
+        let status =
+            crate::response::evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
+        cached_durable_pos = status.durable_pos;
+        utilization
+            .policy_degraded
+            .store(status.degraded, Ordering::Relaxed);
+        if status.degraded {
+            tracing::warn!(
+                policy = %policy,
+                "durability policy starts in degraded mode — fewer connected nodes than the target count"
+            );
+            last_degraded_state = true;
+            last_degraded_log = Some(Instant::now());
+        }
+    }
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
@@ -215,6 +247,37 @@ pub fn run(
                     active_connections.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+
+            // Re-evaluate the policy on a slow timer so the
+            // `policy_degraded` flag and warn-log track the cluster
+            // state even when no batches are flowing. See response.rs
+            // for the rationale.
+            {
+                let now_ts = Instant::now();
+                if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
+                    last_policy_check = now_ts;
+                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    let status = crate::response::evaluate_durability(
+                        &policy,
+                        journal_pos,
+                        metrics_ref,
+                        active_ref,
+                    );
+                    crate::response::update_degraded_state(
+                        &policy,
+                        &utilization,
+                        status.degraded,
+                        now_ts,
+                        DEGRADED_LOG_INTERVAL,
+                        &mut last_degraded_state,
+                        &mut last_degraded_log,
+                    );
+                    cached_durable_pos = status.durable_pos;
+                }
+            }
+
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
@@ -286,6 +349,20 @@ pub fn run(
         // One Instant::now() per batch for heartbeat tracking instead of
         // per response — heartbeat interval is 10s, sub-ms precision is plenty.
         let batch_now = Instant::now();
+
+        // Log degradation transitions / heartbeat after the gate
+        // opens. Same scheme as the TCP response stage.
+        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
+        crate::response::update_degraded_state(
+            &policy,
+            &utilization,
+            degraded_now,
+            batch_now,
+            DEGRADED_LOG_INTERVAL,
+            &mut last_degraded_state,
+            &mut last_degraded_log,
+        );
+        last_policy_check = batch_now;
 
         // Encode and queue responses. Each slot expands to at most two
         // wire frames: the payload (Report / QueryResponse / EngineError)
