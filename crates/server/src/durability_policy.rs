@@ -71,21 +71,39 @@ impl fmt::Display for Level {
 /// Single AND-combined clause of a [`Policy`].
 ///
 /// Read as: "at least `count` nodes have reached `level` for the
-/// candidate sequence".
+/// candidate sequence", with optional best-effort degrade behaviour
+/// when fewer than `count` nodes are connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clause {
-    /// Minimum number of nodes that must satisfy `level`. Counted across
+    /// Target number of nodes that must satisfy `level`. Counted across
     /// the primary and all connected replicas. `0` is rejected by the
     /// parser — a zero-count clause is trivially true and almost always
     /// a config mistake.
     pub count: u8,
     /// Durability level required.
     pub level: Level,
+    /// When `true`, evaluate against `min(count, connected_node_count)`
+    /// rather than `count` itself. Spelled `!` in the policy string —
+    /// e.g. `persisted>=2!` reads as "two persisted when two are
+    /// available, otherwise as many as we have". Strict-by-default
+    /// (`persisted>=2`) leaves the gate closed if fewer than two nodes
+    /// are connected.
+    ///
+    /// Importantly, "degrade" preserves the *count* semantic against the
+    /// reduced cluster — a 1-replica-remaining cluster with
+    /// `persisted>=2!` still requires both surviving nodes (primary +
+    /// survivor) to persist, not just any one. The legacy auto-degrade
+    /// quietly dropped to 1-node durability; this is strictly stronger.
+    pub degrade: bool,
 }
 
 impl fmt::Display for Clause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}>={}", self.level, self.count)
+        write!(f, "{}>={}", self.level, self.count)?;
+        if self.degrade {
+            f.write_str("!")?;
+        }
+        Ok(())
     }
 }
 
@@ -125,13 +143,36 @@ impl Policy {
     /// Highest sequence at which every clause is satisfied given the
     /// supplied cursor view.
     ///
-    /// Returns `0` if no sequence satisfies all clauses (e.g. a clause
-    /// requires more nodes than exist at the requested level).
+    /// Returns `0` if no sequence satisfies all clauses (e.g. a strict
+    /// clause requires more nodes than are connected). Clauses with
+    /// `degrade = true` clamp their count against `cursors.len()` so
+    /// the gate keeps moving in degraded cluster shapes.
     #[inline]
     pub fn evaluate(&self, cursors: &CursorView<'_>) -> u64 {
+        self.evaluate_with_status(cursors).durable_pos
+    }
+
+    /// Like [`evaluate`](Self::evaluate) but also reports whether any
+    /// clause was actively clamped — i.e. the policy is currently
+    /// running degraded. The response stage uses this to surface a
+    /// `policy_degraded` health metric and emit periodic warnings while
+    /// the cluster is operating below the policy's target shape.
+    #[inline]
+    pub fn evaluate_with_status(&self, cursors: &CursorView<'_>) -> EvalStatus {
         let mut result = u64::MAX;
+        let mut degraded = false;
         for clause in &self.clauses {
-            let satisfied = nth_largest_cursor(cursors, clause.level, clause.count);
+            let effective_count = if clause.degrade {
+                let view_len = cursors.len() as u8;
+                let clamped = clause.count.min(view_len.max(1));
+                if clamped < clause.count {
+                    degraded = true;
+                }
+                clamped
+            } else {
+                clause.count
+            };
+            let satisfied = nth_largest_cursor(cursors, clause.level, effective_count);
             if satisfied < result {
                 result = satisfied;
             }
@@ -140,7 +181,11 @@ impl Policy {
         // an empty cluster gates nothing. `Policy::new` rejects an empty
         // clause list, so reaching here with `u64::MAX` requires an
         // empty `CursorView`, which the response stage never constructs.
-        if result == u64::MAX { 0 } else { result }
+        let durable_pos = if result == u64::MAX { 0 } else { result };
+        EvalStatus {
+            durable_pos,
+            degraded,
+        }
     }
 }
 
@@ -154,6 +199,20 @@ impl fmt::Display for Policy {
         }
         Ok(())
     }
+}
+
+/// Outcome of a single policy evaluation.
+///
+/// `durable_pos` is the highest sequence at which every clause is
+/// satisfied. `degraded` is true iff at least one degrade-friendly
+/// clause was actively clamped against a smaller-than-target cluster
+/// shape — i.e. the policy is honouring availability over the strict
+/// target count for this evaluation. Operators surface this via
+/// `/healthz` and a periodic warn-level log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalStatus {
+    pub durable_pos: u64,
+    pub degraded: bool,
 }
 
 /// Read-only view over per-node, per-level cursor values used by
@@ -266,14 +325,24 @@ impl fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-/// Parse a policy string of the form `"<level>>=<n> [&& <level>>=<n>]*"`.
+/// Parse a policy string of the form
+/// `"<level>>=<n>[!] [&& <level>>=<n>[!]]*"`.
 ///
 /// Whitespace around tokens is ignored. Level names match
-/// [`Level::as_str`] (`"in_memory"`, `"persisted"`). Examples:
+/// [`Level::as_str`] (`"in_memory"`, `"persisted"`). A trailing `!`
+/// marks the clause as best-effort: it clamps to the connected cluster
+/// shape rather than failing closed when fewer nodes than the target
+/// count are connected.
+///
+/// Examples:
 ///
 /// - `"persisted>=1"` — at least one node has persisted (single-node
 ///   durability).
-/// - `"persisted>=2"` — replaces the old `--quorum-durability` default.
+/// - `"persisted>=2"` — strict two-node quorum; gate stalls if a
+///   replica is lost.
+/// - `"persisted>=2!"` — two-node quorum when two nodes are connected,
+///   degrade to as many as remain (still requires *all* survivors to
+///   persist).
 /// - `"persisted>=1 && in_memory>=2"` — one node persisted, plus a
 ///   second node with the event in memory.
 pub fn parse(input: &str) -> Result<Policy, PolicyError> {
@@ -291,9 +360,9 @@ pub fn parse(input: &str) -> Result<Policy, PolicyError> {
 }
 
 fn parse_clause(token: &str) -> Result<Clause, PolicyError> {
-    let (lvl_str, count_str) = token.split_once(">=").ok_or_else(|| {
+    let (lvl_str, rhs) = token.split_once(">=").ok_or_else(|| {
         PolicyError::Parse(format!(
-            "clause `{token}` is not of the form `<level>>=<n>`"
+            "clause `{token}` is not of the form `<level>>=<n>[!]`"
         ))
     })?;
     let level = match lvl_str.trim() {
@@ -305,12 +374,23 @@ fn parse_clause(token: &str) -> Result<Clause, PolicyError> {
             )));
         }
     };
-    let count: u8 = count_str.trim().parse().map_err(|_| {
+    let rhs = rhs.trim();
+    // Trailing `!` marks the clause as best-effort / degrade-friendly.
+    // Strip it before parsing the integer count.
+    let (count_str, degrade) = match rhs.strip_suffix('!') {
+        Some(stripped) => (stripped.trim_end(), true),
+        None => (rhs, false),
+    };
+    let count: u8 = count_str.parse().map_err(|_| {
         PolicyError::Parse(format!(
             "clause `{token}` count must be a non-negative integer ≤ 255"
         ))
     })?;
-    Ok(Clause { count, level })
+    Ok(Clause {
+        count,
+        level,
+        degrade,
+    })
 }
 
 #[cfg(test)]
@@ -338,6 +418,7 @@ mod tests {
         let c = Clause {
             count: 0,
             level: Level::Persisted,
+            degrade: false,
         };
         assert_eq!(Policy::new(vec![c]), Err(PolicyError::ZeroCount(c)));
     }
@@ -348,6 +429,24 @@ mod tests {
         assert_eq!(p.clauses().len(), 1);
         assert_eq!(p.clauses()[0].count, 2);
         assert_eq!(p.clauses()[0].level, Level::Persisted);
+        assert!(!p.clauses()[0].degrade);
+    }
+
+    #[test]
+    fn parse_degrade_suffix() {
+        let p = parse("persisted>=2!").unwrap();
+        assert_eq!(p.clauses()[0].count, 2);
+        assert!(p.clauses()[0].degrade);
+    }
+
+    #[test]
+    fn parse_degrade_suffix_with_whitespace() {
+        // Parser strips trailing whitespace inside the right-hand side
+        // so `persisted>=2 !` is rejected (the `!` must hug the count)
+        // but `persisted>=2! ` (trailing space outside) is fine —
+        // outer trim covers it.
+        let p = parse("  persisted>=2!  ").unwrap();
+        assert!(p.clauses()[0].degrade);
     }
 
     #[test]
@@ -382,7 +481,9 @@ mod tests {
         for s in [
             "persisted>=1",
             "persisted>=2",
+            "persisted>=2!",
             "persisted>=1 && in_memory>=3",
+            "persisted>=2! && in_memory>=1",
         ] {
             let p = parse(s).unwrap();
             assert_eq!(format!("{p}"), s);
@@ -440,6 +541,67 @@ mod tests {
         // 2-node cluster, policy requires 3 persisted — gate stays at 0.
         let p = parse("persisted>=3").unwrap();
         let nodes = [[100, 100], [100, 100]];
+        assert_eq!(p.evaluate(&view(&nodes)), 0);
+    }
+
+    // --- Degrade-friendly clauses ---
+
+    #[test]
+    fn degrade_clamps_to_view_len_when_under_target() {
+        // `persisted>=2!` on a 1-node view (just the primary, all
+        // replicas disconnected): clamp to 1, gate opens at the primary.
+        let p = parse("persisted>=2!").unwrap();
+        let nodes = [[u64::MAX, 50]];
+        assert_eq!(p.evaluate(&view(&nodes)), 50);
+    }
+
+    #[test]
+    fn degrade_no_op_when_view_meets_target() {
+        // `persisted>=2!` on a 3-node view behaves identically to the
+        // strict form when the cluster is healthy.
+        let strict = parse("persisted>=2").unwrap();
+        let degrade = parse("persisted>=2!").unwrap();
+        let nodes = [[u64::MAX, 100], [120, 80], [110, 70]];
+        let v = view(&nodes);
+        assert_eq!(strict.evaluate(&v), degrade.evaluate(&v));
+    }
+
+    #[test]
+    fn degrade_one_replica_down_requires_both_survivors() {
+        // `persisted>=2!` on 2 connected nodes (primary + 1 surviving
+        // replica): clamp to 2, gate opens only when both have persisted.
+        // This is the key win over legacy auto-degrade, which would have
+        // dropped to 1-node durability here.
+        let p = parse("persisted>=2!").unwrap();
+        // Primary persisted=100, survivor persisted=50.
+        // 2nd-largest = 50 (both must reach this).
+        let nodes = [[u64::MAX, 100], [70, 50]];
+        assert_eq!(p.evaluate(&view(&nodes)), 50);
+
+        // If the survivor lags, the gate waits for it.
+        let nodes = [[u64::MAX, 200], [10, 10]];
+        assert_eq!(p.evaluate(&view(&nodes)), 10);
+    }
+
+    #[test]
+    fn strict_clause_stalls_when_under_target() {
+        // Without `!`, `persisted>=2` returns 0 on a 1-node view.
+        let p = parse("persisted>=2").unwrap();
+        let nodes = [[u64::MAX, 500]];
+        assert_eq!(p.evaluate(&view(&nodes)), 0);
+    }
+
+    #[test]
+    fn degrade_floors_at_one_node() {
+        // Defensive: even if `cursors.len()` were somehow 0 the clamp
+        // shouldn't allow `effective_count = 0` (that would trivially
+        // satisfy the clause — exactly what `Policy::new` rejects). The
+        // `view_len.max(1)` floor in evaluate guards against this.
+        // In practice the response stage always includes the primary,
+        // so view.len() >= 1.
+        let p = parse("persisted>=2!").unwrap();
+        let nodes: [[u64; 2]; 0] = [];
+        // Empty view: nth_largest_cursor returns 0 (no nodes to satisfy).
         assert_eq!(p.evaluate(&view(&nodes)), 0);
     }
 
