@@ -722,6 +722,60 @@ mod tests {
         assert_eq!(p.evaluate(&view(&nodes)), 30);
     }
 
+    /// AND-composing a `best_effort` clause with a strict clause is
+    /// the operator-facing pattern for "try for N, never below F".
+    /// `persisted>=3 best_effort && persisted>=2` reads as "try for
+    /// 3, but never below 2". This test pins the behaviour across
+    /// the three cluster shapes the operator actually cares about.
+    ///
+    /// (This is the `docs/durability-policy-followups.md` "degrade
+    /// floor" P2 item — solved by composition rather than new syntax.)
+    #[test]
+    fn floor_pattern_via_and_composition() {
+        let p = parse("persisted>=3 best_effort && persisted>=2").unwrap();
+
+        // Full health: 3 nodes, all persisted at e.g. {500, 400, 300}.
+        // Clause 1 (best_effort, target 3): 3rd-largest persisted = 300.
+        // Clause 2 (strict, target 2):     2nd-largest persisted = 400.
+        // AND → min(300, 400) = 300. Gate at the slowest of the three.
+        let nodes_full = [[500, 500], [400, 400], [300, 300]];
+        let r = p.evaluate_with_status(&view(&nodes_full));
+        assert_eq!(r.durable_pos, 300, "full health should gate at 3rd-largest");
+        assert!(!r.degraded, "full health should not flag degraded");
+
+        // Degraded to 2 nodes: e.g. primary + one survivor at {500, 400}.
+        // Clause 1 clamps from 3 to 2: 2nd-largest = 400. (Sets degraded.)
+        // Clause 2 strict at 2:        2nd-largest = 400.
+        // AND → 400. Gate keeps moving at the slower of the two
+        // survivors — strictly stronger than dropping to 1-of-2.
+        let nodes_two = [[500, 500], [400, 400]];
+        let r = p.evaluate_with_status(&view(&nodes_two));
+        assert_eq!(
+            r.durable_pos, 400,
+            "2-node degrade should gate at 2nd-largest"
+        );
+        assert!(
+            r.degraded,
+            "2-node degrade should flag degraded (clause 1 clamped 3 -> 2)"
+        );
+
+        // Floor enforced: only the primary is connected. Clause 1
+        // clamps from 3 to 1 (gate would open at primary alone).
+        // Clause 2 strict at 2 is UNSATISFIABLE on a 1-node view —
+        // returns 0 from `nth_largest_cursor` since `count > nodes.len()`.
+        // AND → min(primary_pos, 0) = 0. Gate stalls. Floor honoured.
+        let nodes_alone = [[500, 500]];
+        let r = p.evaluate_with_status(&view(&nodes_alone));
+        assert_eq!(
+            r.durable_pos, 0,
+            "1-node degrade must stall — the strict clause at 2 is the floor"
+        );
+        // The `degraded` flag fires on clamp activity; the strict
+        // clause didn't clamp (it stalled), so the flag tracks
+        // clause 1's behaviour. Clause 1 clamped 3 -> 1, so degraded=true.
+        assert!(r.degraded);
+    }
+
     // -- Property-based tests --
     //
     // `--durability-policy` is operator-facing input; we want hard
