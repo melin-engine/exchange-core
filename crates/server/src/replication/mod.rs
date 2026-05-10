@@ -644,6 +644,32 @@ mod tests {
         }
     }
 
+    /// Pin the exact on-the-wire byte layout of an Ack frame. A future
+    /// `repr(C)` field reorder, alignment change, or accidental
+    /// big-endian wrapper substitution would silently break replica/
+    /// primary compatibility — the const `size_of` assert in
+    /// `protocol.rs` only catches size changes, not layout changes.
+    /// This test pins the expected bytes so any such break shows up
+    /// loudly on the next CI run.
+    #[test]
+    fn ack_wire_byte_pattern() {
+        let ack = Ack {
+            acked_sequence: 0xDEAD_BEEF_CAFE_F00D,
+            in_memory_sequence: 0x1122_3344_5566_7788,
+        };
+        let mut buf = Vec::new();
+        encode_ack(&ack, &mut buf);
+        // [length:u32 LE = 17][tag:u8 = MSG_ACK = 0x02]
+        // [acked_sequence:u64 LE][in_memory_sequence:u64 LE]
+        let expected: &[u8] = &[
+            0x11, 0x00, 0x00, 0x00, // length = 17 LE
+            0x02, // MSG_ACK
+            0x0D, 0xF0, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE, // acked_sequence LE
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // in_memory_sequence LE
+        ];
+        assert_eq!(buf.as_slice(), expected, "Ack wire layout drifted");
+    }
+
     #[test]
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();

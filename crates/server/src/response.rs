@@ -695,10 +695,7 @@ pub(crate) fn evaluate_durability(
     let mut len = 1;
     if let (Some(m), Some(active)) = (metrics, replica_active) {
         for (i, slot_active) in active.iter().enumerate() {
-            // Only include slots that are currently active. A slot
-            // that just-disconnected has its active flag cleared
-            // before the cursor metrics are reset, so reading the
-            // flag first avoids racing through a zero-cursor view.
+            // Skip inactive slots up-front.
             if !slot_active.load(Ordering::Acquire) {
                 continue;
             }
@@ -1048,6 +1045,30 @@ mod tests {
         // No metrics wired → u64::MAX, which makes attribution always
         // credit the journal. Correct for a standalone deployment.
         assert_eq!(connected_persisted_min(None, None), u64::MAX);
+    }
+
+    /// Fresh-cluster catch-up: a replica that handshakes at sequence
+    /// 0 (the legitimate genesis case, not a stale-flag race) must be
+    /// included in the cursor view with its zero cursors so the policy
+    /// behaves the same way it would for a 1-replica deployment that
+    /// has just produced its first batch. The disconnect-race
+    /// mitigations (B1 seed-on-connect + B2 reorder) keep this from
+    /// being conflated with the stale-flag-paired-with-zero-cursor
+    /// case under normal cluster lifecycles.
+    #[test]
+    fn fresh_cluster_zero_cursors_included_in_view() {
+        let p = parse("persisted>=2!").unwrap();
+        // Both replicas just handshook at seq 0, primary also at 0
+        // (fresh cluster, no events yet). View = 3 nodes; clamp from
+        // target=2 to 2 is a no-op; 2nd-largest persisted = 0.
+        let m = metrics((0, 0), (0, 0));
+        let a = both_active();
+        let r = evaluate_durability(&p, 0, Some(&m), Some(&a));
+        assert_eq!(r.durable_pos, 0);
+        assert!(
+            !r.degraded,
+            "all 3 nodes present, no clamp — should not flag degraded"
+        );
     }
 
     #[test]
