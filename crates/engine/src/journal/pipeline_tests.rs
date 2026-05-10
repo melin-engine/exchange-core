@@ -1210,12 +1210,15 @@ mod tests {
             recv_ts: trace_ts(),
         });
 
-        // QueryStats produces a single slot — StatsHeader carrying the
-        // request terminator (is_last_in_request=true). The wire
-        // BatchEnd is emitted by the response stage from that flag.
+        // QueryStats always produces a single output slot — StatsHeader
+        // carrying the request terminator (`is_last_in_request=true`).
+        // The wire BatchEnd is emitted by the response stage from that
+        // flag. Spin-poll without an iteration cap, matching
+        // `collect_reports` and the other halt tests: under load the
+        // matching thread can take longer than any fixed iteration
+        // budget, but the response is guaranteed to arrive.
         let mut got_stats = false;
-        let mut got_terminator = false;
-        for _ in 0..1_000_000 {
+        loop {
             if let Some((_, slot)) = output.try_consume() {
                 match slot.payload {
                     OutputPayload::QueryResponse(QueryResponse::Stats { .. }) => got_stats = true,
@@ -1225,14 +1228,12 @@ mod tests {
                     _ => {}
                 }
                 if slot.is_last_in_request {
-                    got_terminator = true;
                     break;
                 }
             }
             std::hint::spin_loop();
         }
         assert!(got_stats, "should have received StatsHeader");
-        assert!(got_terminator, "should have received request terminator");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
