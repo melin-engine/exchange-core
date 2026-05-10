@@ -1325,6 +1325,12 @@ impl Exchange {
         // otherwise a capped account on the primary would be unbounded
         // on the shadow, and shadow validation would diverge.
         cloned.set_max_open_orders_per_account(self.max_open_orders_per_account());
+        // Same reasoning as above for the SEC-04 rate-limit config: not
+        // journaled (operator config), but Rejected reports differ if the
+        // shadow clone runs unthrottled — carry it over so the shadow
+        // makes identical accept/reject decisions.
+        let (rate, burst) = self.max_orders_per_second();
+        cloned.set_max_orders_per_second(rate, burst);
         cloned
     }
 }

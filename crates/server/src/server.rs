@@ -108,6 +108,24 @@ pub struct ServerConfig {
     /// replay divergence.
     #[arg(long, default_value_t = 10_000)]
     pub max_orders_per_account: u32,
+    /// Per-account sustained order-submission rate (orders/sec). Token
+    /// bucket refills at this rate; clients exceeding it (after burning
+    /// the burst) are rejected with `ExceedsOrderRate`. `0` disables the
+    /// limiter. Prevents a single client from monopolizing matching
+    /// throughput (SEC-04). Must match across primary and every replica
+    /// — same determinism caveat as `--max-orders-per-account`. Default
+    /// (1000/s) is loose enough not to disturb legitimate HFT clients
+    /// while bounding worst-case load from a rogue account.
+    #[arg(long, default_value_t = 1_000)]
+    pub max_orders_per_second: u32,
+    /// Per-account burst capacity (max consecutive orders allowed after a
+    /// quiet period). Paired with `--max-orders-per-second`. `0` disables
+    /// the limiter. Default (5000) lets normal trading bursts through —
+    /// e.g. a market open or a strategy initialization batch — without
+    /// false positives, while still capping the absolute spike a single
+    /// account can produce.
+    #[arg(long, default_value_t = 5_000)]
+    pub max_orders_burst: u32,
 
     /// Address to listen for replica connections (enables synchronous replication).
     /// Mutually exclusive with `--standalone` and `--replica-of`.
@@ -366,6 +384,8 @@ impl Default for ServerConfig {
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
             max_orders_per_account: 10_000,
+            max_orders_per_second: 1_000,
+            max_orders_burst: 5_000,
 
             replication_bind: None,
             standalone: false,
@@ -636,6 +656,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             !config.yield_idle,
             rotation,
             config.max_orders_per_account,
+            config.max_orders_per_second,
+            config.max_orders_burst,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1683,6 +1705,8 @@ pub fn run_dpdk(
             config.async_replica_ack,
             rotation,
             config.max_orders_per_account,
+            config.max_orders_per_second,
+            config.max_orders_burst,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -2269,16 +2293,29 @@ pub fn run_dpdk(
 /// application-agnostic via the `Application` trait.
 /// Apply operator-set runtime knobs that aren't carried in the journal /
 /// snapshot. Called on every fresh / recovered / restored engine — the
-/// per-account open-order cap (SEC-03) lives in `Exchange` state but is
-/// operator policy, so primary and replicas must converge on it via
-/// configuration rather than replay.
+/// per-account open-order cap (SEC-03) and the order-submission rate
+/// limit (SEC-04) live in `Exchange` state but are operator policy, so
+/// primary and replicas must converge on them via configuration rather
+/// than replay.
 #[cfg(all(feature = "trading", not(feature = "noop")))]
-pub fn apply_max_orders(app: &mut App, max_orders_per_account: u32) {
+pub fn apply_max_orders(
+    app: &mut App,
+    max_orders_per_account: u32,
+    max_orders_per_second: u32,
+    max_orders_burst: u32,
+) {
     app.set_max_open_orders_per_account(max_orders_per_account);
+    app.set_max_orders_per_second(max_orders_per_second, max_orders_burst);
 }
 
 #[cfg(all(feature = "noop", not(feature = "trading")))]
-pub fn apply_max_orders(_app: &mut App, _max_orders_per_account: u32) {}
+pub fn apply_max_orders(
+    _app: &mut App,
+    _max_orders_per_account: u32,
+    _max_orders_per_second: u32,
+    _max_orders_burst: u32,
+) {
+}
 
 #[cfg(all(feature = "trading", not(feature = "noop")))]
 pub(crate) fn empty_app() -> App {
@@ -2306,7 +2343,12 @@ pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
         config.accounts as usize,
         config.instruments as usize,
     );
-    apply_max_orders(&mut ex, config.max_orders_per_account);
+    apply_max_orders(
+        &mut ex,
+        config.max_orders_per_account,
+        config.max_orders_per_second,
+        config.max_orders_burst,
+    );
     ex
 }
 
@@ -2375,7 +2417,12 @@ pub(crate) fn init_engine(
     // Apply runtime config that the snapshot doesn't carry. The cap is
     // operator policy, not journaled state, so a recovered engine starts
     // at `DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT` and we override here.
-    apply_max_orders(engine.app_mut(), config.max_orders_per_account);
+    apply_max_orders(
+        engine.app_mut(),
+        config.max_orders_per_account,
+        config.max_orders_per_second,
+        config.max_orders_burst,
+    );
 
     // Rotate journal if it exceeds the configured size threshold.
     // This saves a snapshot, archives the old journal, and starts
