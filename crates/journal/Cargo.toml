@@ -15,6 +15,14 @@ hash-chain = ["dep:blake3"]
 ## Record per-stage latency histograms. Adds ~20 ns of clock overhead
 ## per event; not for production. Consumed by pipeline stages downstream.
 latency-trace = ["dep:hdrhistogram"]
+## Open the journal *without* `O_DIRECT`. Writes still go through the
+## same sector-aligned path but land in the kernel page cache instead
+## of bypassing it. For benchmarking on consumer NVMe drives that lack
+## Power Loss Protection — every O_DIRECT submit on those drives pays
+## the full device-side latency. Production deployments on PLP drives
+## must leave this off; with `no-o-direct` enabled, durability becomes
+## best-effort (no per-batch flush).
+no-o-direct = []
 
 [dependencies]
 blake3 = { version = "1", optional = true }

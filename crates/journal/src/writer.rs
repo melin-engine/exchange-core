@@ -31,6 +31,7 @@ use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
+#[cfg(not(feature = "no-o-direct"))]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -290,12 +291,11 @@ impl<E: AppEvent> JournalWriter<E> {
         // O_DIRECT requires writes aligned to the device's physical sector
         // size. Read permission is required for prefault_pages (mmap
         // MAP_SHARED) and for partial-tail recovery on open_append.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(not(feature = "no-o-direct"))]
+        opts.custom_flags(libc::O_DIRECT);
+        let file = opts.open(path)?;
 
         let sector_size = detect_sector_size(file.as_fd());
         Self::create_bare_inner(file, path, starting_sequence, sector_size)
@@ -308,12 +308,11 @@ impl<E: AppEvent> JournalWriter<E> {
         starting_sequence: u64,
         sector_size: usize,
     ) -> Result<Self, JournalError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(not(feature = "no-o-direct"))]
+        opts.custom_flags(libc::O_DIRECT);
+        let file = opts.open(path)?;
         Self::create_bare_inner(file, path, starting_sequence, sector_size)
     }
 
@@ -396,11 +395,11 @@ impl<E: AppEvent> JournalWriter<E> {
     ) -> Result<Self, JournalError> {
         // Open with O_DIRECT for all writes. Read permission is required for
         // prefault_pages (mmap MAP_SHARED) and for partial-tail reconstruction.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        #[cfg(not(feature = "no-o-direct"))]
+        opts.custom_flags(libc::O_DIRECT);
+        let file = opts.open(path)?;
 
         // Read the file header to recover the journal's sector_size. Use a
         // MAX_SECTOR_SIZE-aligned scratch buffer so O_DIRECT is satisfied on

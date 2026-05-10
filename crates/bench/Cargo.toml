@@ -21,6 +21,10 @@ release-tracing = ["melin-server/release-tracing"]
 ## the pipeline without the matching engine.
 noop = ["melin-server/noop"]
 no-persist = ["melin-server/no-persist"]
+## Open the journal without `O_DIRECT`. Passthrough — see the
+## `melin-journal` feature of the same name. Use this when benching on
+## consumer NVMe drives that lack Power Loss Protection.
+no-o-direct = ["melin-server/no-o-direct"]
 ## Forward to `melin-server/latency-trace` — lightweight 4-stage
 ## histograms only.
 latency-trace = ["melin-server/latency-trace"]

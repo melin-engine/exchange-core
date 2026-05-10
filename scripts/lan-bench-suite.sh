@@ -67,6 +67,12 @@
 #                       Composes with any transport × workload combination;
 #                       result filenames get a `-no-persist` suffix so runs
 #                       can coexist with durable-mode results.
+#   MAIN_EXTRA_FEATURES=<list>
+#                       Comma-separated cargo features appended to the
+#                       kernel-TCP / kernel-rumcast main build. Composes
+#                       with NO_PERSIST. Use e.g. `no-o-direct` to bench
+#                       the journal without `O_DIRECT` (consumer NVMe
+#                       drives without Power Loss Protection).
 #   NOOP=1              Build `melin-server` with the no-op matching engine
 #                       (--no-default-features --features noop) so the run
 #                       isolates durable-transport cost from matching cost.
@@ -415,11 +421,21 @@ if [[ "${NOOP:-0}" == "1" ]]; then
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
         NOOP_MAIN_FEATURES="noop,no-persist"
     fi
+    if [[ -n "${MAIN_EXTRA_FEATURES:-}" ]]; then
+        NOOP_MAIN_FEATURES="${NOOP_MAIN_FEATURES},${MAIN_EXTRA_FEATURES}"
+    fi
     MAIN_BUILD="cargo build --release -p melin-bench && \
         cargo build --release -p melin-server --no-default-features --features ${NOOP_MAIN_FEATURES}"
 else
+    MAIN_FEATURES=""
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
-        MAIN_BUILD="cargo build --release --features no-persist"
+        MAIN_FEATURES="no-persist"
+    fi
+    if [[ -n "${MAIN_EXTRA_FEATURES:-}" ]]; then
+        MAIN_FEATURES="${MAIN_FEATURES:+${MAIN_FEATURES},}${MAIN_EXTRA_FEATURES}"
+    fi
+    if [[ -n "${MAIN_FEATURES}" ]]; then
+        MAIN_BUILD="cargo build --release --features ${MAIN_FEATURES}"
     else
         MAIN_BUILD="cargo build --release"
     fi
