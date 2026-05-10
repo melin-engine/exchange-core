@@ -117,6 +117,13 @@ struct HealthSnapshot {
     per_replica_catching_up: [bool; 2],
     /// Per-replica last acked sequence number.
     per_replica_acked_sequence: [u64; 2],
+    /// Per-replica last in-memory sequence number (highest seq the
+    /// replica has accepted into its input ring, pre-journal). Always
+    /// `>= per_replica_acked_sequence` under correct operation —
+    /// inversion or equality under sustained traffic indicates a
+    /// namespace-translation bug between local-ring positions and
+    /// primary sequences.
+    per_replica_in_memory_sequence: [u64; 2],
     /// Per-slot replication-ring depth: producer_cursor - consumer.processed.
     /// 0 in standalone mode or when ring cursors aren't available.
     per_replica_ring_depth: [u64; 2],
@@ -182,9 +189,18 @@ impl HealthSnapshot {
             .as_ref()
             .map_or(0, |c| c.load(Ordering::Relaxed));
 
-        type ReplMetricsTuple = ([u64; 2], [u64; 2], [u64; 2], [u64; 2], [bool; 2], u64);
+        type ReplMetricsTuple = (
+            [u64; 2],
+            [u64; 2],
+            [u64; 2],
+            [u64; 2],
+            [u64; 2],
+            [bool; 2],
+            u64,
+        );
         let (
             per_replica_acked_sequence,
+            per_replica_in_memory_sequence,
             per_replica_lag,
             per_replica_bytes_sent,
             per_replica_ack_latency_us,
@@ -194,6 +210,10 @@ impl HealthSnapshot {
             let acked = [
                 rm.acked_sequence[0].load(Ordering::Relaxed),
                 rm.acked_sequence[1].load(Ordering::Relaxed),
+            ];
+            let in_memory = [
+                rm.in_memory_sequence[0].load(Ordering::Relaxed),
+                rm.in_memory_sequence[1].load(Ordering::Relaxed),
             ];
             let lag = [
                 if acked[0] == 0 {
@@ -220,9 +240,9 @@ impl HealthSnapshot {
                 rm.catching_up[1].load(Ordering::Relaxed),
             ];
             let evictions = rm.evictions_total.load(Ordering::Relaxed);
-            (acked, lag, bytes, latency, catching, evictions)
+            (acked, in_memory, lag, bytes, latency, catching, evictions)
         } else {
-            ([0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
+            ([0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
         };
 
         // Per-slot replication ring depth: producer_cursor - consumer.processed.
@@ -268,6 +288,7 @@ impl HealthSnapshot {
             per_replica_ack_latency_us,
             per_replica_catching_up,
             per_replica_acked_sequence,
+            per_replica_in_memory_sequence,
             per_replica_ring_depth,
             fastest_replica_cursor,
             evictions_total,
@@ -349,10 +370,14 @@ impl HealthSnapshot {
              # HELP melin_replicas_connected Number of replicas currently connected.\n\
              # TYPE melin_replicas_connected gauge\n\
              melin_replicas_connected {}\n\
-             # HELP melin_replica_acked_sequence Last sequence acked by each replica slot.\n\
+             # HELP melin_replica_acked_sequence Last sequence acked by each replica slot (persisted to journal).\n\
              # TYPE melin_replica_acked_sequence gauge\n\
              melin_replica_acked_sequence{{slot=\"0\"}} {}\n\
              melin_replica_acked_sequence{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_in_memory_sequence Last sequence the replica has accepted into its input ring (pre-journal).\n\
+             # TYPE melin_replica_in_memory_sequence gauge\n\
+             melin_replica_in_memory_sequence{{slot=\"0\"}} {}\n\
+             melin_replica_in_memory_sequence{{slot=\"1\"}} {}\n\
              # HELP melin_replica_lag Per-replica replication lag (journal_seq - acked_sequence).\n\
              # TYPE melin_replica_lag gauge\n\
              melin_replica_lag{{slot=\"0\"}} {}\n\
@@ -407,6 +432,8 @@ impl HealthSnapshot {
             self.replicas_connected,
             self.per_replica_acked_sequence[0],
             self.per_replica_acked_sequence[1],
+            self.per_replica_in_memory_sequence[0],
+            self.per_replica_in_memory_sequence[1],
             self.per_replica_lag[0],
             self.per_replica_lag[1],
             self.per_replica_bytes_sent[0],

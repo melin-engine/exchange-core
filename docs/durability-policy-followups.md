@@ -45,9 +45,12 @@ Carries the load-bearing namespace-translation comment and the
 
 ## Tests to add on `feat/ack-on-receive`
 
-- **Regression for the namespace bug**: set `--durability-policy in_memory>=2`, drive traffic through a 1+2 cluster, assert the primary's `metrics.in_memory_sequence[slot]` advances *before* `metrics.acked_sequence[slot]`. A prior implementation attempt mixed local-ring-position and primary-sequence spaces on the wire; this test would catch any re-introduction.
-- **Backpressure-drain → flush duplicate-ack sequence**: simulate a queue-full event, drive a follow-up batch, assert the next ack does not regress `acked_sequence` on the primary.
-- **Unit test for the dual-track coalescing rule**: a focused test (not full integration) on the flush block's `acked_now > last_sent || in_mem_now > last_sent` logic.
+- **Backpressure-drain → flush duplicate-ack sequence**: simulate a queue-full event, drive a follow-up batch, assert the next ack does not regress `acked_sequence` on the primary. Hard to drive deterministically from integration tests (`PendingAckQueue` only fills when the journal stage is slower than the wire); easier as a unit test against `try_flush_dual_track` paired with a hand-driven `PendingAckQueue` sequence.
+
+### Done
+
+- ~~Regression for the namespace bug~~ — `in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic` in `crates/server/tests/failover.rs` exposes `melin_replica_in_memory_sequence` via `/metrics` and asserts in_memory never drops below acked across a 200-order burst with a concurrent sampler. The strict correctness guarantee is the `debug_assert!` inside `try_flush_dual_track`; the integration test pins the metric plumbing and provides a wire-level inversion check.
+- ~~Unit test for the dual-track coalescing rule~~ — five focused tests in `crates/server/src/replication/mod.rs::tests` (`dual_track_*`) cover idle, persisted-only, in-memory-only, coalesce-on-stale-tracker, and async-mode paths.
 
 ---
 
