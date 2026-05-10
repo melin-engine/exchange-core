@@ -437,13 +437,30 @@ fn run_rumcast_primary_with_state(
     } = pipeline;
 
     // Fastest-replica cursor: max(slot0_acked, slot1_acked). Mirrors the
-    // TCP path's allocation in `server::run_as_primary`. Read by the
-    // response-gate `durable_pos` call in `session_translator`; written
-    // by the rumcast replication sender when present (None in the
-    // standalone case keeps it at u64::MAX so the gate degrades to the
-    // journal-only path).
+    // TCP path's allocation in `server::run_as_primary`. Written by the
+    // rumcast replication sender; consumed by the health endpoint. The
+    // response gate now reads per-slot cursors from `replication_metrics`
+    // (built below) instead.
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
-    let quorum_durability = !config.no_quorum_durability;
+
+    // Bridge the legacy `--no-quorum-durability` flag to a durability
+    // policy. See `server::run_as_primary` for the rationale; same
+    // defaults. Removed in the follow-up task #5.
+    let policy_str = if config.no_quorum_durability {
+        "persisted>=1"
+    } else {
+        "persisted>=2!"
+    };
+    let policy = crate::durability_policy::parse(policy_str)
+        .map_err(|e| format!("internal: failed to parse default policy: {e}"))?;
+
+    let replica_active: Option<[Arc<AtomicBool>; 2]> =
+        replication_ring_progress.as_ref().map(|rp| {
+            [
+                Arc::clone(&rp.active_flags[0]),
+                Arc::clone(&rp.active_flags[1]),
+            ]
+        });
 
     // Wire runtime journal rotation: size threshold + the shared
     // admin flag so `ROTATE` keeps working across a replica → primary
@@ -671,8 +688,9 @@ fn run_rumcast_primary_with_state(
     // enabled; left None in standalone. Mirrors the TCP path's
     // shape so the `/healthz` endpoint reports the same fields
     // regardless of transport.
-    let mut replication_metrics_for_health: Option<Arc<crate::replication::ReplicationMetrics>> =
-        None;
+    // Per-slot replica cursor metrics. Populated when replication is
+    // enabled; used by both the health endpoint and the response gate.
+    let mut replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> = None;
     let mut replication_ring_producer_cursors: Option<
         [Arc<dyn melin_disruptor::ring::QueueCursor>; 2],
     > = None;
@@ -690,7 +708,7 @@ fn run_rumcast_primary_with_state(
             .clone()
             .ok_or("replicas_connected must be Some when replication is enabled")?;
         let metrics = Arc::new(crate::replication::ReplicationMetrics::default());
-        replication_metrics_for_health = Some(Arc::clone(&metrics));
+        replication_metrics = Some(Arc::clone(&metrics));
         replication_ring_producer_cursors = Some([
             Arc::clone(&progress.producer_cursors[0]),
             Arc::clone(&progress.producer_cursors[1]),
@@ -784,7 +802,7 @@ fn run_rumcast_primary_with_state(
                 replication_cursor: Arc::clone(&replication_cursor),
                 pipeline_healthy: Arc::clone(&pipeline_healthy),
                 replicas_connected: replicas_connected.clone(),
-                replication_metrics: replication_metrics_for_health,
+                replication_metrics: replication_metrics.as_ref().map(Arc::clone),
                 replication_ring_producer_cursors,
                 replication_ring_consumer_cursors,
                 fastest_replica_cursor: fastest_replica_cursor_for_health,
@@ -841,8 +859,9 @@ fn run_rumcast_primary_with_state(
     {
         let shutdown = Arc::clone(&shutdown);
         let cursor = Arc::clone(&journal_cursor);
-        let repl_cursor = Arc::clone(&replication_cursor);
-        let fastest_cursor = Arc::clone(&fastest_replica_cursor);
+        let replication_metrics = replication_metrics.as_ref().map(Arc::clone);
+        let replica_active = replica_active.clone();
+        let policy = policy.clone();
         let authorized_keys = Arc::clone(&authorized_keys);
         let mut muxed_receiver = muxed_receiver;
         let mut muxed_sender = muxed_sender;
@@ -864,9 +883,9 @@ fn run_rumcast_primary_with_state(
                         &mut input_producer,
                         response_consumer,
                         cursor,
-                        repl_cursor,
-                        fastest_cursor,
-                        quorum_durability,
+                        policy,
+                        replication_metrics,
+                        replica_active,
                         authorized_keys,
                         &shutdown,
                         yield_idle,
@@ -976,15 +995,15 @@ fn session_translator<S, R>(
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
-    // Replication-cursor inputs for the response gate. `replication_cursor`
-    // = min(slot0_acked, slot1_acked) — both replicas have confirmed up to
-    // here. `fastest_replica_cursor` = max(slot0, slot1). Both stay at
-    // u64::MAX in standalone mode, which makes `durable_pos` collapse to
-    // the journal-only path. See `crate::response::durable_pos` for the
-    // formula.
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
-    quorum_durability: bool,
+    // Durability gate inputs. The policy is evaluated against a view
+    // built from the primary's journal cursor + per-slot replica
+    // cursors (in-memory and persisted) read from `replication_metrics`,
+    // filtered to only currently-connected slots via `replica_active`.
+    // Both `None` in standalone mode, in which case the view contains
+    // only the primary.
+    policy: crate::durability_policy::Policy,
+    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    replica_active: Option<[Arc<AtomicBool>; 2]>,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
     yield_idle: bool,
@@ -1293,12 +1312,15 @@ fn session_translator<S, R>(
             if !prog.durable {
                 let needed = prog.slot.input_seq + 1;
                 if cached_durable_pos < needed {
-                    cached_durable_pos = crate::response::durable_pos(
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    cached_durable_pos = crate::response::evaluate_durability(
+                        &policy,
                         journal_cursor.get().load(Ordering::Acquire),
-                        replication_cursor.load(Ordering::Acquire),
-                        fastest_replica_cursor.load(Ordering::Acquire),
-                        quorum_durability,
-                    );
+                        metrics_ref,
+                        active_ref,
+                    )
+                    .durable_pos;
                     if cached_durable_pos < needed {
                         // Bounded spin. Matching publishes outputs in
                         // parallel with the journal, so the journal often
@@ -1314,12 +1336,13 @@ fn session_translator<S, R>(
                             for _ in 0..PAUSES_PER_RECHECK {
                                 std::hint::spin_loop();
                             }
-                            cached_durable_pos = crate::response::durable_pos(
+                            cached_durable_pos = crate::response::evaluate_durability(
+                                &policy,
                                 journal_cursor.get().load(Ordering::Acquire),
-                                replication_cursor.load(Ordering::Acquire),
-                                fastest_replica_cursor.load(Ordering::Acquire),
-                                quorum_durability,
-                            );
+                                metrics_ref,
+                                active_ref,
+                            )
+                            .durable_pos;
                             if cached_durable_pos >= needed {
                                 still_blocked = false;
                                 break 'spin;

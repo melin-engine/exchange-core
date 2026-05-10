@@ -21,6 +21,8 @@ use tracing::{debug, error};
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 
+use crate::durability_policy::{CursorView, EvalStatus, Policy};
+use crate::replication::ReplicationMetrics;
 use crate::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
 use melin_journal::trace;
@@ -54,9 +56,19 @@ pub use crate::ControlEvent;
 /// Configuration and shared state for the response stage.
 pub struct Response {
     pub journal_cursor: Arc<Sequence>,
-    pub replication_cursor: Arc<std::sync::atomic::AtomicU64>,
-    pub fastest_replica_cursor: Arc<std::sync::atomic::AtomicU64>,
-    pub quorum_durability: bool,
+    /// Durability policy evaluated per gate iteration. See
+    /// [`crate::durability_policy`] for the policy model.
+    pub policy: Policy,
+    /// Per-slot replica cursors. `None` for standalone deployments
+    /// (no replication wiring) — the policy then evaluates against the
+    /// primary alone.
+    pub replication_metrics: Option<Arc<ReplicationMetrics>>,
+    /// Per-slot replica active flags. Only "true" slots are included in
+    /// the cursor view fed to `Policy::evaluate`, so degrade-friendly
+    /// clauses (`persisted>=2!`) clamp against the *connected* count
+    /// rather than counting disconnected slots as zero-cursor nodes.
+    /// Mirrors `replication_metrics` — `None` in standalone.
+    pub replica_active: Option<[Arc<AtomicBool>; 2]>,
     pub heartbeat_interval: Option<Duration>,
     pub busy_spin: bool,
     pub utilization: Arc<StageUtilization>,
@@ -82,11 +94,10 @@ struct ConnectionEntry {
 /// Consumes from the output SPSC, waits for durability confirmation, and
 /// sends responses via io_uring SEND.
 ///
-/// Durability gating (quorum mode, default):
-///   `durable = max(repl_min, min(journal, repl_max))`
-/// An event is durable when it exists on 2+ nodes: either both replicas
-/// acked, or the journal fsynced and the fastest replica acked.
-/// With `--no-quorum-durability`: `durable = min(journal, repl_min)`.
+/// Durability gating: every gate iteration reads the journal cursor
+/// (primary persisted) plus per-slot replica cursors (in-memory and
+/// persisted) from `replication_metrics` and feeds them through the
+/// configured [`Policy`]. See [`evaluate_durability`].
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
@@ -95,9 +106,9 @@ pub fn run(
 ) {
     let Response {
         journal_cursor,
-        replication_cursor,
-        fastest_replica_cursor,
-        quorum_durability,
+        policy,
+        replication_metrics,
+        replica_active,
         heartbeat_interval,
         busy_spin,
         utilization,
@@ -113,9 +124,19 @@ pub fn run(
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position to avoid atomic reads on every slot.
-    // This is the minimum confirmed-durable sequence across all durability
-    // sources (journal + replication, or replication-only in quorum mode).
+    // Updated via `evaluate_durability` whenever the gate iterates; the
+    // value is the minimum sequence confirmed durable under the current
+    // policy.
     let mut cached_durable_pos: u64 = 0;
+
+    // Degradation logger state. The gate loop sets the `policy_degraded`
+    // utilization flag every iteration; this tracks transitions and
+    // re-emits a warn at a slow heartbeat so an operator who missed the
+    // initial log line still sees the degraded state in the journal.
+    let mut last_degraded_state: bool = false;
+    let mut last_degraded_log: Option<Instant> = None;
+    /// Re-emit interval for the "still degraded" reminder.
+    const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
     // Stage histograms registered with the global registry — see
     // `melin_journal::trace`. The four breakdown stages
@@ -303,24 +324,17 @@ pub fn run(
 
         // Wait for durability confirmation before sending responses.
         //
-        // An event is durable when it exists on at least two nodes:
+        // Each iteration: read the primary journal cursor + per-slot
+        // replica cursors (both in-memory and persisted), build a
+        // `CursorView`, and evaluate the configured policy. Spin until
+        // the durable position catches up to the batch's max input_seq.
         //
-        //   durable = max(both_replicas_acked, min(journal_synced, fastest_replica_acked))
-        //
-        // - `replication_cursor` = min(slot0, slot1): both replicas acked.
-        // - `fastest_replica_cursor` = max(slot0, slot1): fastest replica acked.
-        // - `journal_cursor`: local fsync confirmed.
-        //
-        // This gives the best of both paths: if both replicas ack before
-        // fsync, NVMe latency is off the critical path. If one replica is
-        // slow but fsync is fast, we respond as soon as fsync + fast replica
-        // confirms (two durable copies via different routes).
-        //
-        // Without quorum (--no-quorum-durability): gate on
-        // min(journal_cursor, replication_cursor) as before.
         // Per-slot journal-wait / replica-wait tracker. See
         // `GateCrossTracker` for the rationale (only records cursors
-        // that were actually on the critical path).
+        // that were actually on the critical path). Attribution uses
+        // `repl_min` = min of connected-replica persisted cursors so
+        // operators see "which subsystem to optimize" the same way as
+        // before the policy refactor.
         #[cfg(feature = "tick-to-trade")]
         let mut gate_tracker;
         {
@@ -337,25 +351,23 @@ pub fn run(
             if cached_durable_pos < needed {
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                    let repl_min = replication_cursor.load(Ordering::Acquire);
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    let repl_min = connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
 
-                    cached_durable_pos = durable_pos(
-                        journal_pos,
-                        repl_min,
-                        fastest_replica_cursor.load(Ordering::Acquire),
-                        quorum_durability,
-                    );
+                    let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
+                    cached_durable_pos = status.durable_pos;
+                    utilization
+                        .policy_degraded
+                        .store(status.degraded, Ordering::Relaxed);
 
                     if cached_durable_pos >= needed {
-                        // Record which cursor was slower at the moment the
-                        // gate opened. This answers "which subsystem should
-                        // I optimize?" — not "which path provided durability"
-                        // (in quorum mode, durability can come from replicas
-                        // alone even when the journal is slower).
-                        // Relaxed is fine — health reads are infrequent.
+                        // Attribution: which subsystem was slowest at
+                        // the moment the gate opened. Relaxed is fine —
+                        // health reads are infrequent.
                         if journal_pos <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {
@@ -369,6 +381,31 @@ pub fn run(
         }
 
         let batch_now = Instant::now();
+
+        // Log degradation transitions and re-emit the reminder while
+        // it persists. Cheap because we only enter this block once per
+        // batch (not per gate-poll), and the clock read is reused from
+        // `batch_now`. `policy_degraded` is the latest hot-path value.
+        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
+        if degraded_now {
+            let should_log = !last_degraded_state
+                || last_degraded_log
+                    .is_none_or(|t| batch_now.duration_since(t) >= DEGRADED_LOG_INTERVAL);
+            if should_log {
+                tracing::warn!(
+                    policy = %policy,
+                    "durability policy operating in degraded mode — fewer replicas connected than the target count, gate clamped to surviving cluster"
+                );
+                last_degraded_log = Some(batch_now);
+            }
+        } else if last_degraded_state {
+            tracing::info!(
+                policy = %policy,
+                "durability policy returned to target shape"
+            );
+            last_degraded_log = Some(batch_now);
+        }
+        last_degraded_state = degraded_now;
 
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
@@ -632,34 +669,75 @@ fn retry_send(
     }
 }
 
-/// Compute the durable position from journal and replication cursors.
+/// Evaluate the durability policy against the live cursor state.
 ///
-/// Quorum mode (2 replicas connected — both cursors finite):
-///   `durable = max(repl_min, min(journal_pos, repl_max))`
-/// An event is durable when it exists on 2+ nodes.
+/// Builds a `CursorView` containing the primary plus every *currently
+/// connected* replica slot and returns the highest sequence at which
+/// the policy is satisfied. The primary's in-memory cursor is modeled
+/// as `u64::MAX` because the response stage only gates events that have
+/// already been processed by the matching engine — those are trivially
+/// in-memory on the primary by construction.
 ///
-/// Standalone / degraded (0-1 replicas — either cursor is `u64::MAX`):
-///   `durable = min(journal_pos, repl_min)`
-/// Falls back to journal + replication gating.
-#[inline(always)]
-pub(crate) fn durable_pos(
+/// Disconnected slots are *omitted from the view* rather than included
+/// with zero cursors. This is what gives degrade-friendly clauses
+/// (`persisted>=2!`) the correct "clamp to connected count" semantics
+/// — the view's `len()` reflects how many nodes are actually available.
+#[inline]
+pub(crate) fn evaluate_durability(
+    policy: &Policy,
     journal_pos: u64,
-    repl_min: u64,
-    repl_max: u64,
-    quorum_durability: bool,
-) -> u64 {
-    // Quorum requires both replica slots active (neither cursor is
-    // u64::MAX). With only 1 replica, repl_max = u64::MAX (the idle
-    // slot), and the formula would degrade to max(repl_min, journal)
-    // which can skip the replica ack — only 1-node durability.
-    if quorum_durability && repl_min != u64::MAX && repl_max != u64::MAX {
-        // Both replicas connected: two durable copies via whichever
-        // path completes first.
-        repl_min.max(journal_pos.min(repl_max))
-    } else {
-        // Standalone or degraded: gate on journal fsync + replication.
-        journal_pos.min(repl_min)
+    metrics: Option<&ReplicationMetrics>,
+    replica_active: Option<&[Arc<AtomicBool>; 2]>,
+) -> EvalStatus {
+    // Primary + up to 2 replica slots = 3 nodes max.
+    let mut nodes: [[u64; 2]; 3] = [[0, 0]; 3];
+    nodes[0] = [u64::MAX, journal_pos];
+    let mut len = 1;
+    if let (Some(m), Some(active)) = (metrics, replica_active) {
+        for (i, slot_active) in active.iter().enumerate() {
+            // Only include slots that are currently active. A slot
+            // that just-disconnected has its active flag cleared
+            // before the cursor metrics are reset, so reading the
+            // flag first avoids racing through a zero-cursor view.
+            if !slot_active.load(Ordering::Acquire) {
+                continue;
+            }
+            let in_mem = m.in_memory_sequence[i].load(Ordering::Acquire);
+            let persisted = m.acked_sequence[i].load(Ordering::Acquire);
+            nodes[len] = [in_mem, persisted];
+            len += 1;
+        }
     }
+    policy.evaluate_with_status(&CursorView::new(&nodes[..len]))
+}
+
+/// Minimum persisted cursor across currently-connected replica slots.
+/// Used for gate-bottleneck attribution and the journal-wait /
+/// replica-wait histograms — *not* for durability decisions, which go
+/// through [`evaluate_durability`].
+///
+/// Returns `u64::MAX` when no replica is connected, which makes
+/// attribution always credit the journal — correct, because in
+/// standalone mode the journal is the only path.
+#[inline]
+pub(crate) fn connected_persisted_min(
+    metrics: Option<&ReplicationMetrics>,
+    replica_active: Option<&[Arc<AtomicBool>; 2]>,
+) -> u64 {
+    let (Some(m), Some(active)) = (metrics, replica_active) else {
+        return u64::MAX;
+    };
+    let mut min = u64::MAX;
+    for (i, slot_active) in active.iter().enumerate() {
+        if !slot_active.load(Ordering::Acquire) {
+            continue;
+        }
+        let v = m.acked_sequence[i].load(Ordering::Acquire);
+        if v < min {
+            min = v;
+        }
+    }
+    min
 }
 
 /// Tracks per-cursor "first observed transition from below to >= needed"
@@ -751,205 +829,232 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
-    use super::durable_pos;
+    use super::{connected_persisted_min, evaluate_durability};
+    use crate::durability_policy::parse;
+    use crate::replication::ReplicationMetrics;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    // --- Standalone (no replicas) ---
+    /// Build a `ReplicationMetrics` with both slots populated. Tests
+    /// that need to simulate a disconnected slot use [`flags`] to mark
+    /// it inactive — its cursors are then ignored regardless of value.
+    fn metrics(slot0: (u64, u64), slot1: (u64, u64)) -> Arc<ReplicationMetrics> {
+        let m = Arc::new(ReplicationMetrics::default());
+        m.in_memory_sequence[0].store(slot0.0, Ordering::Relaxed);
+        m.acked_sequence[0].store(slot0.1, Ordering::Relaxed);
+        m.in_memory_sequence[1].store(slot1.0, Ordering::Relaxed);
+        m.acked_sequence[1].store(slot1.1, Ordering::Relaxed);
+        m
+    }
+
+    /// Build a `[active; 2]` flags array.
+    fn flags(slot0_active: bool, slot1_active: bool) -> [Arc<AtomicBool>; 2] {
+        [
+            Arc::new(AtomicBool::new(slot0_active)),
+            Arc::new(AtomicBool::new(slot1_active)),
+        ]
+    }
+
+    /// Both replicas active — the common healthy-cluster case.
+    fn both_active() -> [Arc<AtomicBool>; 2] {
+        flags(true, true)
+    }
+
+    // --- Standalone (no replicas wired) ---
 
     #[test]
-    fn standalone_gates_on_journal() {
-        // repl_min = repl_max = u64::MAX → must return journal_pos,
-        // NOT u64::MAX. This was the bug: the quorum formula produced
-        // u64::MAX in standalone mode, bypassing all durability gating.
-        let journal = 500;
-        let pos = durable_pos(journal, u64::MAX, u64::MAX, true);
-        assert_eq!(pos, journal);
+    fn standalone_persisted_one_gates_on_journal() {
+        // No metrics → only the primary is in the view. `persisted>=1`
+        // is satisfied by the primary alone at journal_pos.
+        let p = parse("persisted>=1").unwrap();
+        assert_eq!(evaluate_durability(&p, 500, None, None).durable_pos, 500);
     }
 
     #[test]
-    fn standalone_non_quorum_gates_on_journal() {
-        let journal = 500;
-        let pos = durable_pos(journal, u64::MAX, u64::MAX, false);
-        assert_eq!(pos, journal);
+    fn standalone_strict_persisted_two_never_opens() {
+        // Strict `persisted>=2` on a standalone primary stays at 0:
+        // the operator asked for two copies and there is only one.
+        let p = parse("persisted>=2").unwrap();
+        let r = evaluate_durability(&p, 500, None, None);
+        assert_eq!(r.durable_pos, 0);
+        // Strict clauses don't surface as "degraded" — the operator
+        // chose fail-closed and got it. Degraded is reserved for
+        // clauses with `!` that actively clamped.
+        assert!(!r.degraded);
     }
 
-    // --- Quorum mode, 2 replicas connected ---
+    #[test]
+    fn standalone_degrade_persisted_two_opens_at_primary() {
+        // Same shape with `!`: clamp to the connected count (=1) and
+        // gate opens at journal_pos. The clamp from 2 → 1 is exactly
+        // what `degraded` reports.
+        let p = parse("persisted>=2!").unwrap();
+        let r = evaluate_durability(&p, 500, None, None);
+        assert_eq!(r.durable_pos, 500);
+        assert!(r.degraded);
+    }
+
+    // --- 2 replicas connected ---
 
     #[test]
     fn quorum_both_replicas_ahead_of_journal() {
-        // Both replicas acked past journal → durable = repl_min.
-        // Journal hasn't fsynced yet but both replicas have the data.
-        let pos = durable_pos(50, 100, 120, true);
-        assert_eq!(pos, 100);
+        // Both replicas persisted past journal. `persisted>=2` returns
+        // the 2nd-largest persisted across {primary, slot0, slot1}.
+        let p = parse("persisted>=2").unwrap();
+        let m = metrics((100, 100), (120, 120));
+        let a = both_active();
+        assert_eq!(
+            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            100
+        );
     }
 
     #[test]
     fn quorum_journal_ahead_of_both_replicas() {
-        // Journal fsynced past both replicas → durable = repl_min.
-        // min(journal=500, repl_max=120) = 120, max(repl_min=100, 120) = 120.
-        let pos = durable_pos(500, 100, 120, true);
-        assert_eq!(pos, 120);
+        // Journal at 500, replicas at 100/120. 2nd-largest persisted = 120.
+        let p = parse("persisted>=2").unwrap();
+        let m = metrics((100, 100), (120, 120));
+        let a = both_active();
+        assert_eq!(
+            evaluate_durability(&p, 500, Some(&m), Some(&a)).durable_pos,
+            120
+        );
     }
 
     #[test]
     fn quorum_journal_between_slow_and_fast_replica() {
-        // Fast replica at 200, slow at 50, journal at 150.
-        // min(journal=150, repl_max=200) = 150, max(repl_min=50, 150) = 150.
-        // Durable = 150: journal + fast replica both have it.
-        let pos = durable_pos(150, 50, 200, true);
-        assert_eq!(pos, 150);
+        // {primary=150, slot0_persisted=50, slot1_persisted=200}.
+        // 2nd-largest = 150 (primary itself).
+        let p = parse("persisted>=2").unwrap();
+        let m = metrics((50, 50), (200, 200));
+        let a = both_active();
+        assert_eq!(
+            evaluate_durability(&p, 150, Some(&m), Some(&a)).durable_pos,
+            150
+        );
+    }
+
+    // --- Single replica connected ---
+
+    #[test]
+    fn single_replica_strict_persisted_two_requires_both_survivors() {
+        // Slot 0 connected, slot 1 disconnected. View = {primary, slot0}.
+        // Strict `persisted>=2`: 2nd-largest of the 2-row view =
+        // min(primary, slot0). Strictly stronger than legacy auto-
+        // degrade-to-1-node in the same shape.
+        let p = parse("persisted>=2").unwrap();
+        let m = metrics((100, 100), (999, 999)); // slot 1 cursors ignored
+        let a = flags(true, false);
+        assert_eq!(
+            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            50
+        );
+        assert_eq!(
+            evaluate_durability(&p, 200, Some(&m), Some(&a)).durable_pos,
+            100
+        );
     }
 
     #[test]
-    fn quorum_both_replicas_equal() {
-        // Both replicas at same position, journal ahead.
-        // min(500, 100) = 100, max(100, 100) = 100.
-        let pos = durable_pos(500, 100, 100, true);
-        assert_eq!(pos, 100);
+    fn single_replica_degrade_persisted_two_still_requires_both_survivors() {
+        // Same shape with `!`. `effective_count = min(2, view.len()=2)
+        // = 2`, so the clamp is a no-op when 2 nodes are connected.
+        let p = parse("persisted>=2!").unwrap();
+        let m = metrics((100, 100), (999, 999));
+        let a = flags(true, false);
+        assert_eq!(
+            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            50
+        );
     }
 
-    // --- Non-quorum mode, replicas connected ---
-
     #[test]
-    fn non_quorum_takes_min_of_journal_and_replication() {
-        // Non-quorum always returns min(journal, repl_min).
-        let pos = durable_pos(500, 100, 200, false);
-        assert_eq!(pos, 100);
-
-        let pos = durable_pos(50, 100, 200, false);
-        assert_eq!(pos, 50);
+    fn both_replicas_disconnected_strict_stalls() {
+        // View has only the primary. Strict `persisted>=2` cannot be
+        // satisfied — operator opted out of degrade.
+        let p = parse("persisted>=2").unwrap();
+        let m = metrics((999, 999), (999, 999));
+        let a = flags(false, false);
+        assert_eq!(
+            evaluate_durability(&p, 500, Some(&m), Some(&a)).durable_pos,
+            0
+        );
     }
 
-    // --- Single replica (repl_min == repl_max, but not u64::MAX) ---
+    #[test]
+    fn both_replicas_disconnected_degrade_opens_at_primary() {
+        // Same shape with `!` clamps to view.len()=1 and gate opens
+        // at the primary alone. Note the matching stage's separate
+        // halt at `replicas_connected==0` rejects new orders before
+        // they reach the gate; this verifies the gate semantics in
+        // isolation.
+        let p = parse("persisted>=2!").unwrap();
+        let m = metrics((999, 999), (999, 999));
+        let a = flags(false, false);
+        assert_eq!(
+            evaluate_durability(&p, 500, Some(&m), Some(&a)).durable_pos,
+            500
+        );
+    }
+
+    // --- Mixed-level policies ---
 
     #[test]
-    fn single_replica_falls_back_to_non_quorum() {
-        // One replica at 100, other idle (u64::MAX). Quorum requires
-        // both slots active — with repl_max = u64::MAX, falls back to
-        // min(journal, repl_min) to gate on both journal and replica.
-        let pos = durable_pos(50, 100, u64::MAX, true);
-        assert_eq!(pos, 50);
-
-        // Replica ahead of journal: gates on journal.
-        let pos = durable_pos(50, 200, u64::MAX, true);
-        assert_eq!(pos, 50);
-
-        // Journal ahead of replica: gates on replica.
-        let pos = durable_pos(200, 100, u64::MAX, true);
-        assert_eq!(pos, 100);
+    fn persisted_one_and_in_memory_two() {
+        // "Leader persists, plus one other node has it in memory" —
+        // the cheap-but-non-zero durability target. Slot 0 has it in
+        // memory, slot 1 disconnected.
+        let p = parse("persisted>=1 && in_memory>=2").unwrap();
+        // primary persisted=50, slot0 in_mem=80 / persisted=20.
+        // persisted>=1: max(50, 20, 0) = 50.
+        // in_memory>=2: primary in_mem=u64::MAX (always), slot0_eff=max(80, 20)=80,
+        //               slot1=0. 2nd-largest = 80.
+        // min(50, 80) = 50.
+        let m = metrics((80, 20), (999, 999));
+        let a = flags(true, false);
+        assert_eq!(
+            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            50
+        );
     }
 
     // --- Edge: journal at 0 ---
 
     #[test]
-    fn quorum_journal_at_zero() {
-        // Journal hasn't fsynced anything yet, replicas acked.
-        // min(0, 200) = 0, max(100, 0) = 100.
-        let pos = durable_pos(0, 100, 200, true);
-        assert_eq!(pos, 100);
-    }
-
-    #[test]
-    fn standalone_journal_at_zero() {
-        let pos = durable_pos(0, u64::MAX, u64::MAX, true);
-        assert_eq!(pos, 0);
-    }
-
-    // --- Gate bottleneck attribution ---
-    //
-    // The response stage increments gate_journal when journal_pos <= repl_min
-    // at the moment the gate opens, and gate_replication otherwise. These
-    // tests verify the attribution logic matches the durable_pos formula.
-
-    use melin_transport_core::pipeline::StageUtilization;
-    use std::sync::Arc;
-
-    /// Simulate the attribution logic at the moment the gate opens.
-    /// Passes cursor values that make durable_pos >= needed, then
-    /// checks which counter (journal or replication) was incremented.
-    fn simulate_gate(
-        journal_pos: u64,
-        repl_min: u64,
-        repl_max: u64,
-        quorum: bool,
-        needed: u64,
-    ) -> (&'static str, Arc<StageUtilization>) {
-        let util = Arc::new(StageUtilization::new());
-        let durable = durable_pos(journal_pos, repl_min, repl_max, quorum);
-        assert!(
-            durable >= needed,
-            "test setup error: durable_pos ({durable}) < needed ({needed})"
+    fn journal_at_zero_with_replicas_persisted_one() {
+        // Journal hasn't fsynced anything; both replicas have. With
+        // `persisted>=1` the gate opens at the fastest replica.
+        let p = parse("persisted>=1").unwrap();
+        let m = metrics((100, 100), (200, 200));
+        let a = both_active();
+        assert_eq!(
+            evaluate_durability(&p, 0, Some(&m), Some(&a)).durable_pos,
+            200
         );
-        // Same attribution logic as the response stage spin loop.
-        {
-            if journal_pos <= repl_min {
-                util.gate_journal
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                util.gate_replication
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        let j = util.gate_journal.load(std::sync::atomic::Ordering::Relaxed);
-        let r = util
-            .gate_replication
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let label = if j > 0 && r == 0 {
-            "journal"
-        } else if r > 0 && j == 0 {
-            "replication"
-        } else {
-            "none"
-        };
-        (label, util)
+    }
+
+    // --- connected_persisted_min — used for gate-bottleneck attribution ---
+
+    #[test]
+    fn attribution_min_skips_disconnected_slots() {
+        // Slot 1 disconnected via active flag.
+        let m = metrics((150, 100), (999, 999));
+        let a = flags(true, false);
+        assert_eq!(connected_persisted_min(Some(&m), Some(&a)), 100);
     }
 
     #[test]
-    fn gate_bottleneck_standalone_journal() {
-        // Standalone mode: repl_min = u64::MAX, journal is the only path.
-        // journal_pos (50) <= repl_min (MAX) → attributed to journal.
-        let (label, _) = simulate_gate(50, u64::MAX, u64::MAX, false, 50);
-        assert_eq!(label, "journal");
+    fn attribution_min_returns_max_when_standalone() {
+        // No metrics wired → u64::MAX, which makes attribution always
+        // credit the journal. Correct for a standalone deployment.
+        assert_eq!(connected_persisted_min(None, None), u64::MAX);
     }
 
     #[test]
-    fn gate_bottleneck_journal_slower_than_replication() {
-        // Both connected, journal behind replication.
-        // journal_pos (50) <= repl_min (100) → journal was the bottleneck.
-        let (label, _) = simulate_gate(50, 100, 120, false, 50);
-        assert_eq!(label, "journal");
-    }
-
-    #[test]
-    fn gate_bottleneck_replication_slower_than_journal() {
-        // Journal ahead, replication behind.
-        // journal_pos (200) > repl_min (50) → replication was the bottleneck.
-        let (label, _) = simulate_gate(200, 50, 80, false, 50);
-        assert_eq!(label, "replication");
-    }
-
-    #[test]
-    fn gate_bottleneck_both_equal() {
-        // Both cursors at the same position. journal_pos (100) <= repl_min
-        // (100), so attributed to journal (tie-break favors journal).
-        let (label, _) = simulate_gate(100, 100, 100, false, 100);
-        assert_eq!(label, "journal");
-    }
-
-    #[test]
-    fn gate_bottleneck_quorum_journal_slower() {
-        // Quorum mode: both replicas at 100+, journal at 50.
-        // durable = max(100, min(50, 120)) = 100. Journal is slower.
-        let (label, _) = simulate_gate(50, 100, 120, true, 100);
-        assert_eq!(label, "journal");
-    }
-
-    #[test]
-    fn gate_bottleneck_quorum_replication_slower() {
-        // Quorum mode: journal at 200, slow replica at 50, fast at 80.
-        // durable = max(50, min(200, 80)) = max(50, 80) = 80.
-        // journal_pos (200) > repl_min (50) → replication.
-        let (label, _) = simulate_gate(200, 50, 80, true, 80);
-        assert_eq!(label, "replication");
+    fn attribution_min_takes_smaller_when_both_connected() {
+        let m = metrics((150, 100), (180, 80));
+        let a = both_active();
+        assert_eq!(connected_persisted_min(Some(&m), Some(&a)), 80);
     }
 
     // ------------------------------------------------------------------

@@ -54,6 +54,12 @@ pub struct StageUtilization {
     /// last to reach the needed position (replica ack was the bottleneck).
     /// Only used by the response stage; always 0 for journal/matching.
     pub gate_replication: AtomicU64,
+    /// Whether the most recent durability-gate evaluation actively
+    /// clamped a degrade-friendly clause below its target count — i.e.
+    /// the cluster is currently running with reduced redundancy.
+    /// Surfaced on `/healthz` so dashboards and alerting can fire on
+    /// it. Only used by the response stage.
+    pub policy_degraded: AtomicBool,
 }
 
 impl StageUtilization {
@@ -63,6 +69,7 @@ impl StageUtilization {
             idle: AtomicU64::new(0),
             gate_journal: AtomicU64::new(0),
             gate_replication: AtomicU64::new(0),
+            policy_degraded: AtomicBool::new(false),
         }
     }
 }

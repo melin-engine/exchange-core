@@ -99,9 +99,9 @@ pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
-    quorum_durability: bool,
+    policy: crate::durability_policy::Policy,
+    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    replica_active: Option<[Arc<AtomicBool>; 2]>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
@@ -250,19 +250,27 @@ pub fn run(
             if cached_durable_pos < needed {
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                    let repl_min = replication_cursor.load(Ordering::Acquire);
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    let repl_min =
+                        crate::response::connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
 
-                    cached_durable_pos = crate::response::durable_pos(
+                    let status = crate::response::evaluate_durability(
+                        &policy,
                         journal_pos,
-                        repl_min,
-                        fastest_replica_cursor.load(Ordering::Acquire),
-                        quorum_durability,
+                        metrics_ref,
+                        active_ref,
                     );
+                    cached_durable_pos = status.durable_pos;
+                    utilization
+                        .policy_degraded
+                        .store(status.degraded, Ordering::Relaxed);
                     if cached_durable_pos >= needed {
-                        // Which cursor was slower — see response.rs comment.
+                        // Attribution: which subsystem was slowest. See
+                        // response.rs for the rationale.
                         if journal_pos <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {

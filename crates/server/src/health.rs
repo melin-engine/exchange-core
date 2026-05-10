@@ -137,6 +137,12 @@ struct HealthSnapshot {
     response_gate_journal: u64,
     /// Response gate-wait events where the replication cursor was the bottleneck.
     response_gate_replication: u64,
+    /// Whether the durability policy was last evaluated as degraded —
+    /// at least one degrade-friendly clause was clamped below its
+    /// target node count. Trips when a replica disconnects from a
+    /// 2-of-3 cluster running `persisted>=2!`, etc. Operator alerting
+    /// should fire on this transitioning to `true`.
+    response_policy_degraded: bool,
 }
 
 impl HealthSnapshot {
@@ -279,6 +285,10 @@ impl HealthSnapshot {
                 .response_utilization
                 .gate_replication
                 .load(Ordering::Relaxed),
+            response_policy_degraded: state
+                .response_utilization
+                .policy_degraded
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -382,7 +392,10 @@ impl HealthSnapshot {
              # HELP melin_response_gate_total Gate-wait events by bottleneck (journal fsync vs replica ack).\n\
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
-             melin_response_gate_total{{blocker=\"replication\"}} {}\n",
+             melin_response_gate_total{{blocker=\"replication\"}} {}\n\
+             # HELP melin_durability_policy_degraded Durability policy currently clamped below its target node count (1 = degraded, 0 = healthy).\n\
+             # TYPE melin_durability_policy_degraded gauge\n\
+             melin_durability_policy_degraded {}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -414,6 +427,7 @@ impl HealthSnapshot {
             self.response_idle,
             self.response_gate_journal,
             self.response_gate_replication,
+            if self.response_policy_degraded { 1 } else { 0 },
         );
         c.position() as usize
     }

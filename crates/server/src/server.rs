@@ -1002,12 +1002,46 @@ fn run_as_primary<L: BlockingTransportListener>(
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
+    // ReplicationMetrics must be constructed before the response thread
+    // spawns so the gate can read per-slot cursors at every poll.
+    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+        if replication_consumers.is_some() {
+            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+        } else {
+            None
+        };
+
+    // Bridge the legacy `--no-quorum-durability` flag to a durability
+    // policy. The default uses the degrade-friendly form `persisted>=2!`:
+    // strict 2-node quorum when 2 replicas are connected, clamped to
+    // however many remain when one drops. Strictly stronger than the
+    // pre-policy auto-degrade (which dropped to 1-node durability) yet
+    // preserves availability through single-replica failures.
+    // Removed in task #5 once `--durability-policy` lands.
+    let policy_str = if config.no_quorum_durability {
+        "persisted>=1"
+    } else {
+        "persisted>=2!"
+    };
+    let policy = crate::durability_policy::parse(policy_str)
+        .map_err(|e| format!("internal: failed to parse default policy: {e}"))?;
+
+    // Per-slot active flags exposed by the journal stage's replication
+    // ring; the response gate filters disconnected slots out of the
+    // policy's cursor view via these.
+    let replica_active: Option<[Arc<AtomicBool>; 2]> =
+        replication_ring_progress.as_ref().map(|rp| {
+            [
+                Arc::clone(&rp.active_flags[0]),
+                Arc::clone(&rp.active_flags[1]),
+            ]
+        });
+
     // Clone cursors for the response thread — the originals are needed
     // later for seed drain gating.
     let journal_cursor_response = Arc::clone(&journal_cursor);
-    let replication_cursor_response = Arc::clone(&replication_cursor);
-    let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
-    let quorum_durability = !config.no_quorum_durability;
+    let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
+    let replica_active_response = replica_active.clone();
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
@@ -1021,9 +1055,9 @@ fn run_as_primary<L: BlockingTransportListener>(
                 control_rx,
                 crate::response::Response {
                     journal_cursor: journal_cursor_response,
-                    replication_cursor: replication_cursor_response,
-                    fastest_replica_cursor: fastest_replica_cursor_response,
-                    quorum_durability,
+                    policy,
+                    replication_metrics: replication_metrics_response,
+                    replica_active: replica_active_response,
                     heartbeat_interval,
                     busy_spin,
                     utilization: response_utilization_thread,
@@ -1044,12 +1078,6 @@ fn run_as_primary<L: BlockingTransportListener>(
     // `replica_ready` is set when the first replica connects — seeding waits
     // on this to ensure seed events aren't drained before the replica arrives.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
-        if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-        } else {
-            None
-        };
     // Ring depth monitoring: the producer cursors are in ReplicationRingProgress
     // (owned by this function), so we compute depth via ring_progress rather
     // than storing Box<dyn QueueCursor> in ReplicationMetrics. The health
@@ -1908,12 +1936,39 @@ pub fn run_dpdk(
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
+    // ReplicationMetrics must be constructed before the response thread
+    // spawns so the gate can read per-slot cursors at every poll.
+    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+        if replication_consumers.is_some() {
+            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+        } else {
+            None
+        };
+
+    // Bridge the legacy `--no-quorum-durability` flag to a durability
+    // policy. See the TCP path for the rationale; same defaults.
+    // Removed in the follow-up task #5.
+    let policy_str = if config.no_quorum_durability {
+        "persisted>=1"
+    } else {
+        "persisted>=2!"
+    };
+    let policy = crate::durability_policy::parse(policy_str)
+        .map_err(|e| format!("internal: failed to parse default policy: {e}"))?;
+
+    let replica_active: Option<[Arc<AtomicBool>; 2]> =
+        replication_ring_progress.as_ref().map(|rp| {
+            [
+                Arc::clone(&rp.active_flags[0]),
+                Arc::clone(&rp.active_flags[1]),
+            ]
+        });
+
     // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
     let output_consumer = output_consumers.remove(0);
     let journal_cursor_response = Arc::clone(&journal_cursor);
-    let replication_cursor_response = Arc::clone(&replication_cursor);
-    let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
-    let quorum_durability = !config.no_quorum_durability;
+    let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
+    let replica_active_response = replica_active.clone();
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -1926,9 +1981,9 @@ pub fn run_dpdk(
                 output_consumer,
                 control_rx,
                 journal_cursor_response,
-                replication_cursor_response,
-                fastest_replica_cursor_response,
-                quorum_durability,
+                policy,
+                replication_metrics_response,
+                replica_active_response,
                 &s3,
                 heartbeat_interval,
                 active_connections_response,
@@ -1976,13 +2031,9 @@ pub fn run_dpdk(
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
     // and smoltcp stack so the replication channel goes through kernel bypass.
+    // `replication_metrics` was constructed above so the response gate can
+    // read per-slot cursors; the sender thread shares the same instance.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
-        if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-        } else {
-            None
-        };
     // Replication, if enabled: build a `DpdkReplicationDriver` for the
     // single client poll thread to drive. The driver's accept dispatch
     // hangs off the second listener we added on the client transport
