@@ -494,6 +494,22 @@ impl AccountManager {
             // amount, not the requested fee.
             let fee_u64 = fee as u64;
             let actual_fee = fee_u64.min(gross);
+            if actual_fee < fee_u64 {
+                // Fee exceeded the trader's receipt and was clamped. This
+                // is the agreed policy, but if it fires it's almost
+                // always a fee-schedule misconfiguration (e.g. bps set
+                // to 10000 = 100%) — surface it so operators notice
+                // before the revenue gap is large.
+                tracing::warn!(
+                    op = op_prefix,
+                    account = trader.0,
+                    currency = currency.0,
+                    requested_fee = fee_u64,
+                    gross,
+                    capped_to = actual_fee,
+                    "fee exceeded trader's receipt and was capped — likely a fee schedule misconfiguration"
+                );
+            }
             let credit = gross - actual_fee;
             if credit > 0 {
                 let bal = self.balances.entry((trader, currency)).or_default();

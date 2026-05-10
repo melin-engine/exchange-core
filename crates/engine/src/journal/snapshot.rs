@@ -13,7 +13,7 @@
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 15               |
+//! | format_version | u16     | 2     | Current version = 17               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state            |
