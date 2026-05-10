@@ -39,74 +39,83 @@ Each replica slot has its own independent ring buffer (configurable via `--repli
 
 **Fault isolation**: a slow replica only stalls its own ring, not the other replica's. If a ring is full for longer than 500ms (replica not keeping up), the primary automatically disconnects that replica and frees the ring. The slot becomes available for a new connection. The surviving replica and client trading are unaffected.
 
-### Ack-after-replicate and quorum durability
+### Durability policy
 
-The response stage enforces durability before sending client responses. An event is durable when it exists on at least two nodes:
+The response stage gates client responses on a configurable
+durability policy expressed against per-node, per-level cursors.
+Two levels are tracked on each node:
 
-```
-durable = max(both_replicas_acked, min(journal_synced, fastest_replica_acked))
-```
+- **`persisted`** — event written to NVMe via `O_DIRECT` `pwrite`. With
+  power-loss-protection (PLP) capacitors on the device, the bytes
+  survive power loss without an explicit fsync round-trip.
+- **`in_memory`** — event accepted into the node's pipeline. Survives
+  process crashes only as long as the kernel page cache survives —
+  i.e. process death loses it. Useful as a "received this far"
+  signal in cross-node policies.
 
-This gives the best of both paths:
+A policy is one or more `<level>>=<n>[!]` clauses joined with `&&`.
+A trailing `!` marks the clause as **best-effort**: when fewer than
+`n` nodes are connected the count clamps to the connected cluster
+shape rather than failing closed. Strict clauses (no `!`) leave the
+gate stalled when the target can't be met — appropriate for
+fail-closed compliance scenarios.
 
-- If **both replicas ack before fsync** completes → respond immediately (NVMe off the critical path)
-- If **one replica is slow but fsync is fast** → respond as soon as fsync + fast replica confirms (two durable copies via different routes)
-- If **0-1 replicas connected** → fall back to `min(journal, replication)` (local fsync required)
-- **`--no-quorum-durability`**: forces `min(journal, replication)` unconditionally, useful for debugging
+#### Policy examples
 
-In all modes, a client never receives a response for an event that isn't durably stored. On failover, the replica has every event the client was told about. Same guarantee as Raft commit.
-
-**Latency impact**: quorum mode removes NVMe fsync tail variance (1-5ms GC spikes) from the critical path when both replicas are healthy. When one replica lags, fsync + the fast replica still provides two durable copies without waiting for the slow one. Throughput is unaffected — batching amortizes the round-trip across many events.
-
-### Async replica ack (`--async-replica-ack`)
-
-By default, each replica fsyncs an incoming batch to its local NVMe before sending the corresponding `Ack` to the primary. The replica's contribution to the durability gate (`replicas_acked`) therefore means "two physical disks confirm the data" — the strongest tier.
-
-Setting `--async-replica-ack` on a replica makes it ack as soon as the batch is queued for its local journal stage, before fsync completes. This removes one NVMe write (~50–80µs on enterprise NVMe) from the replication round-trip. The local fsync still happens — just in parallel with the primary's response release rather than gating it.
-
-**What changes for the durability gate:**
-
-Pre-`--async-replica-ack` — `replicas_acked` means *both replicas have the data fsynced on disk*.
-
-With `--async-replica-ack` — `replicas_acked` means *both replicas have the data in RAM and are committed to fsyncing it*. The primary's own journal fsync is still synchronous, so when the primary tells a client "your trade is filled" the data is durable on:
-
-1. The primary's local NVMe (fsynced) — synchronously verified
-2. Replica1's RAM, fsync in flight
-3. Replica2's RAM, fsync in flight
-
-**Failure modes:**
-
-| Scenario | Sync ack (default) | `--async-replica-ack` |
+| Policy string | Meaning | When to use |
 |---|---|---|
-| Primary crashes (recoverable) | Recovers from local journal. ✓ | Same. ✓ |
-| One replica crashes alone | Catches up from primary on reconnect via the catch-up protocol. ✓ | Same — the in-flight (acked-but-not-fsynced) entries are missing from the dead replica's disk, but the primary still has them on disk and re-streams them via catch-up. ✓ |
-| Both replicas crash simultaneously | Trading halts; replicas catch up on restart. ✓ | Same. ✓ |
-| Primary disk fails, promote a replica | The promoted replica has every fill the client was told about. ✓ | The promoted replica may be missing the last ~50–80µs of fills, because those were "acked" without fsync and the primary's disk (the only other copy) is now gone. **Data loss window: ~50–80µs of recent fills.** |
-| Primary AND a replica crash within ~80µs of a fill confirmation | Survivable: the surviving replica has every confirmed fill on disk. ✓ | Same surviving-replica caveat as the row above — there's a ~80µs window where the surviving replica may be missing the most recent fills. |
+| `persisted>=1` | At least one node persisted (effectively single-node durability). | Standalone or single-replica deployments. |
+| `persisted>=2` | Strict two-node quorum; gate stalls if a replica disconnects. | Compliance-driven venues that prefer halt-on-degrade over availability. |
+| `persisted>=2!` (default) | Two-node quorum when healthy; clamps to surviving cluster on a partial failure. | Typical exchange deployments wanting strong durability with availability through single-replica failures. |
+| `in_memory>=2` | Confirm receipt on a second node; weaker durability, removes fsync latency from the critical path. | Co-location latency-sensitive paths where the primary's PLP NVMe is the load-bearing durability and the replica is a hot standby for failover. |
+| `persisted>=1 && in_memory>=2` | Local commit + cross-node receipt — primary persisted plus one other node has the event in RAM. | Cheap-but-non-zero cross-node durability target. |
 
-**When to use it:**
+Counts include the primary plus every connected replica. The
+primary's `in_memory` cursor is treated as always satisfied — by
+construction, the response stage only gates events past matching, so
+the primary trivially has them in memory.
 
-`--async-replica-ack` is appropriate when the primary's local disk write is *already redundant* (capacitor-backed enterprise NVMe with power-loss protection, or RAID-1/10 underneath the journal), so the replica's fsync is a defense-in-depth backup rather than the load-bearing durability mechanism. Under those conditions, the ~50–80µs latency improvement comes essentially free — the only failure mode it weakens (primary disk dies within 80µs of a fill) is already mitigated by the hardware.
+#### Strict vs degrade-friendly behaviour by cluster shape
 
-Conversely, on commodity NVMe with no power-loss protection or RAID, the replica's fsync is genuinely the second copy of the data and removing it from the critical path is reckless. Leave the flag off.
+| Cluster | Health | `persisted>=2` (strict) | `persisted>=2!` (degrade) |
+|---|---|---|---|
+| 1 primary + 2 replicas | All up | Need 2-of-3 persisted | Same: 2-of-3 persisted |
+| 1 primary + 2 replicas | 1 replica down | Stalls (only 2 nodes connected, clause unsatisfiable except by both) — actually still satisfiable as 2-of-2; gate runs requiring **both** survivors to persist | Same: requires both survivors to persist — strictly stronger than the legacy auto-degrade-to-1-node behaviour in the same shape |
+| 1 primary + 2 replicas | Both replicas down | Gate stalls; matching stage halts independently when `replicas_connected==0` so client orders are rejected with `ReplicaDisconnected` before reaching the gate | Same matching-stage halt; gate would clamp to 1-of-1 if any traffic reached it |
+| 1 primary + 1 replica | All up | Need 2-of-2 persisted | Same: 2-of-2 persisted |
+| 1 primary + 1 replica | Replica down | Same matching-stage halt as above | Clamps to 1-of-1 — gate opens at primary alone (matches legacy behaviour exactly in this shape) |
+| Standalone (no replication wired) | n/a | Stalls (1 node, clause requires 2) | Clamps to 1-of-1 — primary alone |
 
-The flag is set per-replica, not on the primary. Mixing modes across replicas is supported: one replica can run sync, the other async, and the response gate will use whichever ack arrives first via the `fastest_replica_acked` term.
+The matching stage's halt at `replicas_connected==0` is independent
+of the durability gate — it rejects new orders with `ReplicaDisconnected`
+regardless of policy. Standalone deployments (no replication
+configured) skip this halt entirely.
+
+#### Observability
+
+When a degrade-friendly clause is actively clamping below its target
+count, two signals are emitted:
+
+- A `warn!` log on transition into the degraded state and every 5
+  seconds while it persists, plus an `info!` on return to target.
+  The log line includes the active policy.
+- The `melin_durability_policy_degraded` Prometheus gauge on the
+  health endpoint flips to `1`. Operators should alert on this
+  transitioning to `1` for sustained periods.
+
+On-the-wire, every replica → primary `Ack` carries both cursors
+(`acked_sequence` and `in_memory_sequence`), so the primary can
+evaluate any combination of levels without separate ack streams.
+See [Wire Protocol](#wire-protocol) below.
 
 ### Replication cursor behavior
 
-| Scenario | `replication_cursor` (min) | `fastest_replica_cursor` (max) | Response gate |
-|---|---|---|---|
-| `--standalone` | `u64::MAX` | `u64::MAX` | `min(journal, MAX) = journal` |
-| No replicas connected | `u64::MAX` | `u64::MAX` | Same as standalone |
-| 1 replica connected | Acked seq | `u64::MAX` (idle slot) | `min(journal, repl)` |
-| 2 replicas, quorum mode | `min(slot0, slot1)` | `max(slot0, slot1)` | `max(min_repl, min(journal, max_repl))` |
-| One replica disconnects (other still connected) | Maintained by surviving replica | Trading continues normally |
-| All replicas disconnect | `u64::MAX` | Degrades to local-only, trading halted, operator alerted |
-| Replica reconnects | Resumes from ack | Gate re-engages |
-
-The cursor is **always initialized to `u64::MAX`**, even when replication is enabled. This ensures the server starts immediately and serves clients without waiting for a replica. The cursor only engages when a replica connects and starts sending acks. On all-disconnect, it resets to `u64::MAX`.
-
-Each handler thread maintains a per-slot acked position and recomputes the shared cursors as `min`/`max` of both slots on every ack. This allows the cursors to decrease when a slower replica connects or a faster one disconnects.
+The legacy global `replication_cursor` (min) and `fastest_replica_cursor`
+(max) atomics are still computed for the health endpoint's
+backwards-compatibility surface, but the durability gate reads the
+per-slot cursors out of `ReplicationMetrics` directly via the policy
+view. Disconnected slots are filtered out via per-slot active flags
+rather than being represented as `u64::MAX` sentinel values.
 
 ## Wire Protocol
 
@@ -147,7 +156,7 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of the reader thread.
 - The journal stage encodes events independently using the primary's pre-assigned sequences and timestamps (carried in each `InputSlot`). Each node produces its own journal — logically identical to the primary's but independently encoded.
 - The matching stage processes events through its own `Exchange` independently, maintaining warm state for promotion.
-- Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives. With `--async-replica-ack`, acks are sent the moment a batch is queued for the journal stage rather than after fsync — see the durability tradeoff section above.
+- Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives. Each ack carries both `acked_sequence` (highest seq persisted on this replica) and `in_memory_sequence` (highest seq received pre-journal), so the primary's policy can gate on either level without a separate ack stream.
 - Both the primary sender and replica receiver use io_uring for TCP I/O (async RECV/SEND), eliminating poll/read/write syscalls from the streaming hot path.
 - The replica pipeline threads (journal, matching, drain, shadow) are pinned to the same cores as the primary, matching the `--cores` layout.
 - If the primary disconnects or evicts the replica, the receiver automatically reconnects with exponential backoff (1s → 30s cap), recovers state from the pipeline shutdown, and resumes from its last durable sequence.
@@ -186,7 +195,7 @@ The pipelined ack queue (8 entries) decouples the receiver's TCP loop from NVMe 
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE\n` (replica → primary, replica only) and `ROTATE\n` (archive the live journal segment). |
-| `--async-replica-ack` | Replica | `false` | Ack incoming batches as soon as they are queued for the local journal stage instead of waiting for fsync. Removes ~50–80µs from the replication round-trip; documented durability tradeoff above. |
+| `--durability-policy <STRING>` | Primary | `persisted>=2!` | Policy that gates client responses. See [Durability policy](#durability-policy) above. |
 
 `--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
 
@@ -244,12 +253,17 @@ After a cluster-wide outage, each node restarts with its own journal. The three 
 Most failures don't require the full recovery procedure:
 
 - **Primary crashes, both replicas alive**: promote either replica (both have all acked events). The one with the longer journal avoids catch-up, but either is safe. The old primary reconnects as a replica and catches up.
-- **One replica crashes, primary + other replica alive**: the cluster continues in degraded mode (`min(journal, repl)` gating). The crashed replica reconnects and catches up automatically. No operator action needed.
+- **One replica crashes, primary + other replica alive**: under the default `persisted>=2!` policy the cluster continues in degraded mode — the gate clamps to "primary + surviving replica both persist" (still 2 nodes, just out of 2 instead of 3). The crashed replica reconnects and catches up automatically. No operator action needed. Under a strict `persisted>=2` policy the gate stalls until the replica returns; pick the policy that matches your availability/compliance preference.
 - **Middle node crashes** (regardless of role): the shortest node already has the missing entries in its replication pipeline — they are in-flight or being fsynced. The system continues with the two surviving nodes. No data loss, no operator action.
 
-### Non-quorum mode
+### Single-node-durability mode
 
-With `--no-quorum-durability`, every acked event is both locally fsynced and replicated. The primary's journal is always the longest or tied. Recovery is simpler: promote any replica, reconnect the old primary as a replica. No journal comparison needed.
+With `--durability-policy "persisted>=1"`, every acked event is locally
+durable on at least one node — typically the primary. The primary's
+journal is always the longest or tied. Recovery is simpler: promote
+any replica, reconnect the old primary as a replica. No journal
+comparison needed. This corresponds to the legacy
+`--no-quorum-durability` semantic.
 
 ## Current Limitations (v1)
 
@@ -294,5 +308,15 @@ Dual replication is now supported — the primary accepts up to 2 concurrent rep
 
 - **Chain hash verification** — see limitation above
 - **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain. Manual promotion via the `--admin-bind` endpoint (`PROMOTE\n`) is implemented.
-- **Fully async replication**: Optional mode where the primary's response stage does not gate on the replication cursor at all — only on local fsync. Larger data-loss window than `--async-replica-ack` (which still gates on the replica having the data in RAM). Useful for venues that treat replication purely as a hot standby and accept any post-crash divergence.
+- **Ack-on-receive**: re-introduce the legacy `--async-replica-ack`
+  optimisation as the default by sending acks the moment a batch
+  lands in the receiver's input ring (carrying the current
+  `in_memory_sequence` plus whatever the journal cursor has
+  reached for `acked_sequence`). With this in place, an
+  `in_memory>=2` policy actually saves the ~50–80µs of NVMe
+  latency the legacy flag did, without an operator-visible knob.
+  Currently the receiver still gates ack send on the local
+  journal cursor, so `in_memory>=N` policies parse correctly but
+  produce the same end-to-end latency as `persisted>=N`.
+- **Fully async replication**: Optional policy where the gate does not require any replica acknowledgement — equivalent to `persisted>=1` running on the primary alone. Useful for venues that treat replication purely as a hot standby and accept any post-crash divergence.
 - **Split-brain fencing**: After manual promotion, the old primary must be stopped manually. Automatic fencing (STONITH, epoch-based fencing) is not yet implemented.

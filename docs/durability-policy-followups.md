@@ -1,83 +1,21 @@
 # Durability policy — review follow-ups
 
 Punch list from the post-implementation review of the `feat/durability-policy`
-branch (commits `329bbdf`..`bf36083`). The branch itself implements the
-configurable durability ack policy (roadmap item #4) and is functionally
-correct for the failover suite, but the review surfaced two real bugs and
-a handful of production / commercial gaps that should be addressed before
-the work is held up as a finished feature for an exchange-operator demo.
+branch. The branch implements the configurable durability ack policy
+(roadmap item #4) and is functionally correct for the failover suite,
+but the review surfaced production / commercial gaps that should be
+addressed before the work is held up as a finished feature for an
+exchange-operator demo.
 
-Items are tagged P0–P3:
+Items are tagged P1–P3:
 
-- **P0** — block ship. Real bugs.
 - **P1** — fix before any operator demo or perf re-publish.
 - **P2** — fix before public release.
 - **P3** — commercial polish; can land on a follow-up branch.
 
----
-
-## P0 — Bugs
-
-### Just-connected replica freezes the gate
-
-Symptom: a 1+1 cluster running degraded (replica disconnected, gate
-clamped to primary alone) momentarily freezes when the replica
-reconnects. `cached_durable_pos` collapses to `0` until the first live
-ack from the new slot arrives.
-
-Root cause: the sender flips `active_flag` to `true` *after*
-catch-up completes, but `ReplicationMetrics::{acked,in_memory}_sequence[i]`
-were reset to `0` on the prior disconnect and stay at `0` until the
-first live ack lands. The gate at `crates/server/src/response.rs:702`
-reads `active=true`, then loads `cursor=0`, includes a `[0, 0]` row in
-the view. With the default `persisted>=2!` and primary at e.g. seq 500,
-the 2nd-largest persisted across `{primary=500, slot=0}` is `0` and the
-gate stalls.
-
-Affects:
-
-- `crates/server/src/replication/tcp_sender.rs:580` — `active_flag.store(true, Release)`
-- `crates/server/src/replication/dpdk.rs:426` — same shape
-- `crates/server/src/replication/rumcast_sender.rs:969` — same shape
-
-Fix: seed `metrics.{acked,in_memory}_sequence[i]` to a sane value (e.g.
-the handshake's `last_sequence`, or a sentinel handled in
-`evaluate_durability`) **before** the `active_flag` Release. Add a
-regression test that exercises the connect-after-degrade transition and
-asserts the gate does not regress below the previous `cached_durable_pos`.
-
-### Disconnect-side ordering race
-
-Symptom: on weak-memory architectures (ARM/AArch64) the gate can
-observe `active=true` (stale) paired with `cursor=0` (fresh) during a
-disconnect. x86 TSO accidentally hides this — the bug is latent on
-current production hardware but ships waiting for the first ARM
-deployment.
-
-Root cause: the disconnect cleanup writes `active_flag=false`
-(`Release`) **before** the cursor resets, which use `Relaxed`. The
-cursor stores can be reordered around the Release from the reader's
-POV under a relaxed memory model.
-
-Affects:
-
-- `crates/server/src/replication/tcp_sender.rs:185-188`
-- `crates/server/src/replication/dpdk.rs:227-229, 524-527, 594-597, 626-628`
-
-Fix: zero the cursor metrics **before** the `active_flag` Release, or
-promote the cursor resets to `Release`. Pair with a regression test
-covering the disconnect window.
-
-### Wire-format byte-pattern test missing
-
-Only `size_of::<AckFrame>() == 17` is asserted. A future `repr(C)`
-field reorder or `little_endian::U64` wrapper change would silently
-break wire compatibility without the const assert noticing.
-
-Fix: add a byte-pattern test in `crates/server/src/replication/mod.rs`'s
-`tests` module that encodes `Ack { acked_sequence: 0xDEAD_BEEF_CAFE_F00D,
-in_memory_sequence: 0x1122_3344_5566_7788 }` and asserts the exact 21
-bytes (`[len:u32 = 17][tag:u8 = MSG_ACK][acked_sequence:u64 LE][in_memory_sequence:u64 LE]`).
+The original P0 entries (just-connected gate freeze, disconnect-side
+memory-model race, missing wire byte-pattern test) landed in commits
+`a84540a`, `8888732`, and `40f9c76`.
 
 ---
 
@@ -300,7 +238,8 @@ extended.
 
 ## Sequencing
 
-1. P0 (B1, B2, wire byte-pattern test) on this branch before merge.
+1. ~~P0 (B1, B2, wire byte-pattern test)~~ — landed in `a84540a`,
+   `8888732`, `40f9c76`.
 2. P1 (idle staleness, doc updates, bench script, doc claim, async-ack
    regression note) on this branch before merge — operator-facing
    surface needs to match what shipped.

@@ -90,10 +90,21 @@ pub struct Clause {
     /// are connected.
     ///
     /// Importantly, "degrade" preserves the *count* semantic against the
-    /// reduced cluster — a 1-replica-remaining cluster with
-    /// `persisted>=2!` still requires both surviving nodes (primary +
-    /// survivor) to persist, not just any one. The legacy auto-degrade
-    /// quietly dropped to 1-node durability; this is strictly stronger.
+    /// reduced cluster: a 1-replica-remaining cluster with `persisted>=2!`
+    /// still requires both surviving nodes (primary + survivor) to
+    /// persist, not just any one.
+    ///
+    /// Comparison to the legacy auto-degrade behaviour depends on cluster
+    /// shape:
+    ///
+    /// - 1+2 deployments (primary + 2 replicas): when one replica dies,
+    ///   the new code requires the primary AND the surviving replica to
+    ///   persist (2-of-2). The legacy formula dropped to 1-node
+    ///   durability in the same shape — the new code is **strictly
+    ///   stronger** here.
+    /// - 1+1 deployments (primary + 1 replica): when the replica dies,
+    ///   the new code clamps to 1-of-1 (primary alone). The legacy
+    ///   formula did the same. **Equivalent**, not stronger.
     pub degrade: bool,
 }
 
