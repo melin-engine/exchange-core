@@ -2417,9 +2417,21 @@ pub(crate) fn init_engine(
 
     let needs_seeding = !journal_exists;
 
-    // Apply runtime config that the snapshot doesn't carry. The cap is
-    // operator policy, not journaled state, so a recovered engine starts
-    // at `DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT` and we override here.
+    // Apply runtime config knobs that the snapshot doesn't carry. The
+    // SEC-03 cap and the SEC-04 rate-limit `(rate, burst)` pair are
+    // operator policy — replica and primary converge on them via
+    // `ServerConfig`, not replay. Two notes specific to SEC-04 (v18+):
+    //   * Per-account bucket *state* (`tokens` / `last_refill_ns`) IS
+    //     journaled in the snapshot and was already restored above; this
+    //     call only re-applies the *configuration*.
+    //   * `set_max_orders_per_second` clears buckets only when the new
+    //     `(rate, burst)` differs from the existing values. A snapshot
+    //     restore leaves the engine with whatever rate-limit config the
+    //     primary had at snapshot time, so reapplying the operator's
+    //     matching config here is a no-op for buckets — the freshly
+    //     restored state is preserved. An operator mis-set that differs
+    //     from the primary's config will silently clear those buckets;
+    //     primary and replica must run with matching values.
     apply_max_orders(
         engine.app_mut(),
         config.max_orders_per_account,
