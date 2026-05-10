@@ -1001,11 +1001,13 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
-    use super::{connected_persisted_min, evaluate_durability};
+    use super::{DegradationLogger, connected_persisted_min, evaluate_durability};
     use crate::durability_policy::parse;
     use crate::replication::ReplicationMetrics;
+    use melin_transport_core::pipeline::StageUtilization;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     /// Build a `ReplicationMetrics` with both slots populated. Tests
     /// that need to simulate a disconnected slot use [`flags`] to mark
@@ -1253,6 +1255,129 @@ mod tests {
         assert_eq!(connected_persisted_min(Some(&m), Some(&a)), 80);
     }
 
+    // -- Race-window regression tests --
+    //
+    // The replication senders fix two memory-ordering issues at the
+    // active-flag transition points:
+    //
+    //   B1 (`a84540a`): seed `metrics.{acked,in_memory}_sequence[i]`
+    //   to `handshake.last_sequence` BEFORE setting active_flag=true
+    //   on reconnect. Without this, the gate would observe (active=
+    //   true, cursor=0) for ~1 RTT after a replica catch-up completed,
+    //   freezing the gate on a degrade-friendly clause.
+    //
+    //   B2 (`8888732`): zero `metrics.{acked,in_memory}_sequence[i]`
+    //   BEFORE setting active_flag=false on disconnect. Without this,
+    //   a weak-memory reader could observe (active=true, cursor=0)
+    //   for one iteration during the disconnect window.
+    //
+    // Both fixes are in the senders, but the gate's *behaviour* under
+    // the race-window inputs is tested here. The intent is to lock in
+    // the invariant: even under a hypothetical (active=true,cursor=0)
+    // observation, the gate must not produce a spuriously-open answer
+    // that would cause a client to be told "your event is durable"
+    // when it isn't. Stalling-briefly is safe; opening-spuriously is
+    // not.
+
+    #[test]
+    fn race_b1_post_seed_gate_doesnt_freeze_on_reconnect() {
+        // Post-B1-fix state: replica reconnected, cursors seeded to
+        // `handshake.last_sequence` (480) before active flipped to
+        // true. Primary kept moving and is at 500. The gate's view
+        // is now [primary=500, slot=480]; the durable position dips
+        // from 500 (primary alone, degraded) to 480 (both nodes).
+        //
+        // The dip is correct, not a bug: once a 2nd node is
+        // connected, durability is bounded by the slower of the two.
+        // Events 481-500 were already served as durable on primary
+        // alone — they aren't unsent. New responses for seq>500 wait
+        // until slot acks; we just don't freeze at 0.
+        let p = parse("persisted>=2 best_effort").unwrap();
+        let m = metrics((480, 480), (999, 999));
+        let a = flags(true, false);
+        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        assert_eq!(
+            r.durable_pos, 480,
+            "post-seed reconnect should produce a coherent gate position equal to the slower node, not freeze at 0"
+        );
+    }
+
+    #[test]
+    fn race_b1_pre_seed_freeze_is_what_the_fix_avoids() {
+        // Pre-B1-fix state: cursors at 0, active=true. The gate sees
+        // [primary=500, slot=[0,0]] and 2nd-largest persisted = 0.
+        // The gate WOULD freeze at 0. This test documents the bug
+        // the seeding fix is designed to avoid; the senders ensure
+        // this state is never observed in production.
+        let p = parse("persisted>=2 best_effort").unwrap();
+        let m = metrics((0, 0), (999, 999));
+        let a = flags(true, false);
+        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        assert_eq!(
+            r.durable_pos, 0,
+            "the gate behaviour under (active=true, cursor=0) — if the senders ever fail to seed before flipping active, this is the freeze the operator would see"
+        );
+    }
+
+    #[test]
+    fn race_b2_disconnect_window_doesnt_open_gate_spuriously() {
+        // Simulates the B2 race window: a weak-memory reader observes
+        // (active=true, cursor=0) for one iteration during the
+        // disconnect transition. The slot legitimately has cursor=0
+        // because the disconnect handler just zeroed the metrics.
+        //
+        // Critical invariant: the gate must NOT produce a higher
+        // durable_pos than it would with the slot correctly excluded.
+        // Specifically: with primary at 500, slot stale-zero-included,
+        // the gate must not "see" the primary alone and open at 500
+        // — that would let a client be told a seq is durable when
+        // only the primary has it under a `persisted>=2 best_effort`
+        // policy that demands 2 nodes.
+        let p = parse("persisted>=2 best_effort").unwrap();
+        let m = metrics((0, 0), (999, 999));
+        let a = flags(true, false);
+        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        // 2nd-largest persisted across {primary=500, slot=0} = 0.
+        // Gate stalls. Compare: if the slot were correctly excluded
+        // (active=false), view shrinks to [primary], clamp 2→1,
+        // gate would open at 500 — that's the post-disconnect
+        // steady-state and is correct. The race-window observation
+        // is briefly stricter, never looser. ✓
+        assert_eq!(r.durable_pos, 0);
+
+        // Sanity check: the post-disconnect state (active=false)
+        // produces the looser, but still-correct, answer.
+        let a_disconnected = flags(false, false);
+        let r_after = evaluate_durability(&p, 500, Some(&m), Some(&a_disconnected));
+        assert_eq!(r_after.durable_pos, 500);
+        assert!(
+            r_after.degraded,
+            "post-disconnect view of size 1 should clamp from 2 to 1 and report degraded"
+        );
+    }
+
+    #[test]
+    fn race_invariant_zero_cursor_never_opens_gate_above_slower_node() {
+        // Property under both B1 and B2 race windows: for any slot
+        // observed at cursor=0 with active=true, the gate cannot
+        // produce a durable_pos that exceeds what an honest 2-node
+        // evaluation would give. Spot-check a handful of primary
+        // positions to lock the invariant.
+        let p = parse("persisted>=2 best_effort").unwrap();
+        let m = metrics((0, 0), (999, 999));
+        let a = flags(true, false);
+        for primary_pos in [0, 1, 100, 500, 1_000_000_000_u64] {
+            let r = evaluate_durability(&p, primary_pos, Some(&m), Some(&a));
+            // 2nd-largest of {primary_pos, 0} = 0 for any primary > 0.
+            // For primary_pos = 0, also 0. So always 0.
+            assert_eq!(
+                r.durable_pos, 0,
+                "race-window observation must not open the gate above 0 for any primary position (got {} for primary_pos={primary_pos})",
+                r.durable_pos
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // GateCrossTracker — per-cursor "first transition from below to
     // crossed" inside the gate loop, used by the journal-wait /
@@ -1335,5 +1460,149 @@ mod tests {
         t.observe(15, 100, 2_000); // first cross
         t.observe(25, 100, 3_000); // would otherwise re-record
         assert_eq!(t.journal_crossed(), Some(2_000));
+    }
+
+    // -- DegradationLogger flap-suppression --
+    //
+    // The logger gates transition logs on a sustained-state hold so a
+    // replica flapping at sub-second cadence doesn't spam the journal.
+    // These tests don't observe the logs themselves (tracing is
+    // process-global and brittle to capture in unit tests); they
+    // assert the underlying state machine via the `policy_degraded`
+    // gauge, which the logger updates on every tick regardless of
+    // log emission.
+
+    fn logger_test_policy() -> crate::durability_policy::Policy {
+        parse("persisted>=2 best_effort").unwrap()
+    }
+
+    /// Tick the logger N times at `step` intervals, alternating
+    /// `degraded` per call. Returns the gauge value after the last
+    /// tick — useful for asserting that flap cycles don't leak the
+    /// AtomicBool into a wrong terminal state.
+    fn drive_logger(
+        logger: &mut DegradationLogger,
+        utilization: &StageUtilization,
+        policy: &crate::durability_policy::Policy,
+        start: Instant,
+        states: &[bool],
+        step: Duration,
+    ) -> bool {
+        for (i, &state) in states.iter().enumerate() {
+            let now = start + step.checked_mul(i as u32).unwrap_or(Duration::ZERO);
+            logger.tick(policy, utilization, state, now, Duration::from_secs(5));
+        }
+        utilization.policy_degraded.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn logger_gauge_tracks_state_immediately() {
+        // The /healthz gauge reflects the *latest* state on every
+        // tick — this is what dashboards / alerts read. Sustained-
+        // state gating only affects the warn/info log emission.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let now = Instant::now();
+        let mut logger = DegradationLogger::new(now);
+
+        logger.tick(&p, &utilization, true, now, Duration::from_secs(5));
+        assert!(utilization.policy_degraded.load(Ordering::Relaxed));
+
+        logger.tick(
+            &p,
+            &utilization,
+            false,
+            now + Duration::from_millis(50),
+            Duration::from_secs(5),
+        );
+        assert!(!utilization.policy_degraded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn logger_starting_degraded_marks_initial_state_logged() {
+        // `new_starting_degraded` emits the startup warn and treats
+        // the state as already-logged so the next tick at the same
+        // cluster shape doesn't re-emit instantly. The gauge starts
+        // at 1.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let now = Instant::now();
+        let mut logger = DegradationLogger::new_starting_degraded(now, &p);
+        // The logger doesn't write the gauge from the constructor —
+        // first tick does. Tick at the same state to settle the
+        // gauge. No new log line should fire (state hasn't changed).
+        logger.tick(
+            &p,
+            &utilization,
+            true,
+            now + Duration::from_millis(10),
+            Duration::from_secs(5),
+        );
+        assert!(utilization.policy_degraded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn logger_handles_rapid_flap_without_panic() {
+        // Drive the logger through 100 alternating flips at 100ms
+        // each (faster than the 1s flap-hold). The state machine
+        // must remain coherent — no panics, gauge tracks final
+        // state, and `pending_logged` doesn't get stuck.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let now = Instant::now();
+        let mut logger = DegradationLogger::new(now);
+        let states: Vec<bool> = (0..100u32).map(|i| i.is_multiple_of(2)).collect();
+        let final_state = drive_logger(
+            &mut logger,
+            &utilization,
+            &p,
+            now,
+            &states,
+            Duration::from_millis(100),
+        );
+        // 100 states starting at i=0 → final state is i=99 → odd → false.
+        assert!(!final_state);
+    }
+
+    #[test]
+    fn logger_sustained_degraded_eventually_settles() {
+        // After a sustained-true state, the logger should be in the
+        // "logged the onset" mode. Drive 5 ticks of degraded=true at
+        // 500ms intervals — total 2s, well past the 1s flap-hold.
+        // Last tick should leave gauge=1 and the heartbeat re-emit
+        // window primed (last_log set).
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let now = Instant::now();
+        let mut logger = DegradationLogger::new(now);
+        let final_state = drive_logger(
+            &mut logger,
+            &utilization,
+            &p,
+            now,
+            &[true; 5],
+            Duration::from_millis(500),
+        );
+        assert!(final_state);
+    }
+
+    #[test]
+    fn logger_recovery_to_healthy_settles_gauge() {
+        // Sustained degraded → sustained healthy. Gauge should end at 0.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let now = Instant::now();
+        let mut logger = DegradationLogger::new_starting_degraded(now, &p);
+        let mut states = vec![true; 5]; // 2.5s degraded
+        states.extend(vec![false; 5]); // 2.5s healthy
+        let final_state = drive_logger(
+            &mut logger,
+            &utilization,
+            &p,
+            now,
+            &states,
+            Duration::from_millis(500),
+        );
+        assert!(!final_state);
     }
 }

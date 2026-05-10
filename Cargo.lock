@@ -1742,6 +1742,7 @@ dependencies = [
  "melin-rumcast",
  "melin-trading",
  "melin-transport-core",
+ "proptest",
  "rand 0.9.2",
  "rustc-hash",
  "serial_test",

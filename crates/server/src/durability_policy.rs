@@ -721,4 +721,110 @@ mod tests {
         let nodes = [[42, 30]];
         assert_eq!(p.evaluate(&view(&nodes)), 30);
     }
+
+    // -- Property-based tests --
+    //
+    // `--durability-policy` is operator-facing input; we want hard
+    // guarantees that no input can panic, overflow, or otherwise
+    // misbehave. proptest generates random strings (and structured
+    // canonical-form strings) and asserts:
+    //
+    //   1. `parse` never panics, regardless of input.
+    //   2. Successfully-parsed policies round-trip through Display.
+    //   3. `evaluate_with_status` is total — never panics for any
+    //      cursor view that meets the type-system invariants.
+
+    use proptest::prelude::*;
+
+    /// Strategy for valid level names. `prop_oneof!` over string
+    /// literals yields `String` values rather than `&'static str`.
+    fn valid_level() -> impl Strategy<Value = String> {
+        prop_oneof![Just("persisted".to_string()), Just("in_memory".to_string())]
+    }
+
+    /// Strategy for canonical-form policy strings — the kind a
+    /// well-behaved operator would write. Tests that round-tripping
+    /// through Display produces the same string.
+    fn canonical_clause() -> impl Strategy<Value = String> {
+        (valid_level(), 1u8..=MAX_CLUSTER_SIZE, any::<bool>()).prop_map(
+            |(lvl, count, best_effort)| {
+                if best_effort {
+                    format!("{lvl}>={count} best_effort")
+                } else {
+                    format!("{lvl}>={count}")
+                }
+            },
+        )
+    }
+
+    fn canonical_policy() -> impl Strategy<Value = String> {
+        proptest::collection::vec(canonical_clause(), 1..=4)
+            .prop_map(|clauses| clauses.join(" && "))
+    }
+
+    proptest! {
+        /// `parse` is total: any string in or out of the grammar
+        /// produces either a Policy or a PolicyError, never a panic.
+        #[test]
+        fn parse_never_panics(s in ".{0,200}") {
+            let _ = parse(&s);
+        }
+
+        /// Canonical-form strings parse successfully and round-trip.
+        #[test]
+        fn canonical_policy_round_trips(s in canonical_policy()) {
+            let p = parse(&s).expect("canonical policy parses");
+            prop_assert_eq!(format!("{p}"), s);
+        }
+
+        /// `evaluate_with_status` is total over arbitrary cursor
+        /// views (up to the typical cluster shape). No panics, no
+        /// arithmetic overflow.
+        #[test]
+        fn evaluate_never_panics(
+            policy_str in canonical_policy(),
+            nodes in proptest::collection::vec(any::<[u64; 2]>(), 0..=8),
+        ) {
+            let p = parse(&policy_str).unwrap();
+            let view = CursorView::new(&nodes);
+            let _ = p.evaluate_with_status(&view);
+        }
+
+        /// Strict clauses (no `best_effort`) never report
+        /// `degraded=true` — they either satisfy the count or
+        /// return 0. The `degraded` flag is reserved for clamps.
+        #[test]
+        fn strict_clause_never_reports_degraded(
+            level in valid_level(),
+            count in 1u8..=MAX_CLUSTER_SIZE,
+            nodes in proptest::collection::vec(any::<[u64; 2]>(), 0..=8),
+        ) {
+            let s = format!("{level}>={count}");
+            let p = parse(&s).unwrap();
+            let view = CursorView::new(&nodes);
+            let r = p.evaluate_with_status(&view);
+            prop_assert!(!r.degraded, "strict clause `{}` flagged degraded under view of len {}", s, view.len());
+        }
+
+        /// `best_effort` clauses report `degraded=true` iff the
+        /// effective count (clamped to `max(view_len, 1)` per the
+        /// evaluator's empty-view floor) is below the clause target.
+        /// In practice the response stage always includes the
+        /// primary as row 0, so the view is never empty in
+        /// production; the floor matters only here.
+        #[test]
+        fn best_effort_degraded_iff_view_smaller_than_target(
+            level in valid_level(),
+            count in 1u8..=MAX_CLUSTER_SIZE,
+            view_len in 0usize..=(MAX_CLUSTER_SIZE as usize + 2),
+        ) {
+            let s = format!("{level}>={count} best_effort");
+            let p = parse(&s).unwrap();
+            let nodes: Vec<[u64; 2]> = (0..view_len).map(|_| [100, 100]).collect();
+            let view = CursorView::new(&nodes);
+            let r = p.evaluate_with_status(&view);
+            let effective_view = view_len.max(1);
+            prop_assert_eq!(r.degraded, effective_view < count as usize);
+        }
+    }
 }
