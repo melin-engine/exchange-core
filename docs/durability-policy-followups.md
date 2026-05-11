@@ -27,91 +27,39 @@ Fix path (decide after bench):
 - Otherwise document the per-iteration behaviour as acceptable and
   correct the overstated comment at `tcp_receiver.rs:262`.
 
-### Stale roadmap framing after the ack-on-receive landing
+---
 
-- `docs/roadmap.md:16` (item #5) is still phrased as future work. The receiver-side dual-track flush has landed on `feat/ack-on-receive`; the CLI-flag swap (3-variant `DurabilityMode`, next section) is what remains.
+## Re-frame `docs/replication.md` around the three-tier menu
+
+The replication design doc still describes the legacy
+`--quorum-durability` surface (default 2 replicas, "quorum mode",
+journal-min fallback). Rewrite around the `DurabilityMode` enum:
+`Local` / `Hybrid` / `DurablyReplicated`, with the strict
+fail-closed contract, the halt-on-replica-loss behaviour, and the
+halt-state rejection bypass surfaced explicitly so operators
+understand what clients see during an outage. Audience is exchange
+operators and customers, so describe behaviour and guarantees,
+not struct names.
 
 ---
 
-## Refactor: extract `try_flush_dual_track` helper — done
+## Runtime durability mode switch via admin command
 
-Landed on `feat/ack-on-receive`: shared helper in
-`crates/server/src/replication/mod.rs` (`try_flush_dual_track`) now
-backs all three receivers (`tcp_receiver`, `dpdk`, `rumcast_receiver`).
-Carries the load-bearing namespace-translation comment and the
-`debug_assert!` for cursor monotonicity in one place.
+The `DurabilityMode` enum swap landed strict fail-closed semantics:
+under `Hybrid`, a primary halts when no replica is connected, and a
+freshly-promoted replica running standalone can't satisfy `in_memory>=2`
+either. The failover integration tests work around this by passing
+`--durability-mode local` to replicas (with a `TODO(durability-admin)`
+marker at each override site).
 
----
-
-## Tests to add on `feat/ack-on-receive`
-
-- **Backpressure-drain → flush duplicate-ack sequence**: simulate a queue-full event, drive a follow-up batch, assert the next ack does not regress `acked_sequence` on the primary. Hard to drive deterministically from integration tests (`PendingAckQueue` only fills when the journal stage is slower than the wire); easier as a unit test against `try_flush_dual_track` paired with a hand-driven `PendingAckQueue` sequence.
-
-### Done
-
-- ~~Regression for the namespace bug~~ — `in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic` in `crates/server/tests/failover.rs` exposes `melin_replica_in_memory_sequence` via `/metrics` and asserts in_memory never drops below acked across a 200-order burst with a concurrent sampler. The strict correctness guarantee is the `debug_assert!` inside `try_flush_dual_track`; the integration test pins the metric plumbing and provides a wire-level inversion check.
-- ~~Unit test for the dual-track coalescing rule~~ — five focused tests in `crates/server/src/replication/mod.rs::tests` (`dual_track_*`) cover idle, persisted-only, in-memory-only, coalesce-on-stale-tracker, and async-mode paths.
-
----
-
-## Next interface step: 3-variant `DurabilityMode` enum
-
-After ack-on-receive validates on the bench, swap the operator-
-facing surface from the DSL (`--durability-policy <STRING>`) to a
-single `--durability-mode <local|hybrid|durably-replicated>` flag.
-
-Target enum:
-
-```rust
-pub enum DurabilityMode {
-    /// `persisted>=1`. Single-node durability — the primary's
-    /// fsync is the only confirmation needed. Standalone / dev.
-    Local,
-
-    /// `persisted>=1 && in_memory>=2`. One durable copy on disk
-    /// plus an in-memory ack from another node. Single-failure-
-    /// safe; ~80 µs RAM-only window for the secondary copy. The
-    /// new default — typical exchange deployments on PLP-backed
-    /// NVMe. Saves ~50–80 µs per fill vs `DurablyReplicated`.
-    Hybrid,
-
-    /// `persisted>=2`. Two durable copies before client ack. Zero
-    /// RAM-only window; gate stalls if a replica is unreachable.
-    /// Compliance-driven venues.
-    DurablyReplicated,
-}
-```
-
-### What gets dropped
-
-- `--durability-policy <STRING>` flag.
-- The DSL parser (~150 LOC + ~30 unit tests).
-- The `best_effort` modifier syntax.
-- The floor pattern (`persisted>=3 best_effort && persisted>=2`) —
-  largely redundant with the matching-stage halt at
-  `replicas_connected==0` for new orders.
-
-### What stays
-
-- `Policy` / `Clause` / `Level` types as internal construction
-  helpers (each mode builds its clause list in code).
-- Wire protocol unchanged: `Ack { acked_sequence, in_memory_sequence }`
-  carries forward identically.
-- All cursor plumbing, observability (`policy_degraded` gauge,
-  periodic warn, `DegradationLogger`), and tests.
-
-### Why retire `async_ack` here too
-
-`async_ack` is hardcoded `false` at every call site in production
-since `--async-replica-ack` was removed. The receiver code still
-threads the boolean through the streaming loop and the
-`pop_all_async` branch in the flush block remains live. When the
-enum swap lands, drop the parameter from receiver signatures and
-remove the `pop_all_async` branch — the dual-track flush already
-delivers the latency the legacy flag was trying to enable.
-
-Net code reduction across both pieces: ~250 LOC plus the tests.
-Operator-facing surface shrinks to one flag with three values.
+The production answer is a signed admin command — same channel as
+`PROMOTE` / `ROTATE` — that swaps the active mode at runtime. Drives
+the failover playbook: promoted node resumes trading at reduced
+durability in seconds without a restart, then operators restore the
+target mode once peers reattach. Every mode change is audit-logged
+through the existing admin auth path. Drop the `TODO` overrides in
+`failover.rs` and convert at least one promote-path test to exercise
+the runtime swap end-to-end when this lands.
 
 ---
 

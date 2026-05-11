@@ -59,17 +59,13 @@ use super::{
 /// Uses `IORING_OP_RECV_MULTI` against a 16-buffer provided buffer pool
 /// for incoming `InputBatch` frames, so the kernel can deliver multiple
 /// completions while the receive thread is decoding the previous one.
-/// Acks are sent via single-shot SEND when the gating condition is
-/// satisfied:
-///
-/// - Sync mode (default): the local journal cursor must advance past
-///   the batch's target sequence — guarantees the data is fsynced on
-///   this replica's disk before the primary considers it durable.
-/// - Async mode (`async_ack = true`, set by `--async-replica-ack`):
-///   pop and ack as soon as the previous SEND completes; durability is
-///   asserted by "data is queued for the local journal stage" rather
-///   than "data is on disk." Removes ~50–80µs from the replication
-///   round-trip; see `docs/replication.md` for the failure-mode analysis.
+/// Acks are sent via single-shot SEND when the dual-track flush
+/// (`try_flush_dual_track`) reports an advance on either the persisted
+/// or in-memory track. The persisted side requires the local journal
+/// cursor to have caught up past the batch's target sequence; the
+/// in-memory side is advanced on batch receipt and lets `in_memory>=N`
+/// clauses on the primary fire without waiting on this replica's
+/// fsync.
 ///
 /// Frame parsing uses the same accumulate-and-extract pattern as the
 /// bench client and reader.
@@ -83,7 +79,6 @@ fn replica_stream_uring(
     accum_end_sequence: &mut u64,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
-    async_ack: bool,
     busy_spin: bool,
     slot_buf: &mut Vec<crate::InputSlot>,
 ) -> SessionExit {
@@ -266,7 +261,6 @@ fn replica_stream_uring(
                 *accum_end_sequence,
                 last_sent_acked_seq,
                 last_sent_in_memory_seq,
-                async_ack,
             )
         {
             ack_send_buf.clear();
@@ -296,6 +290,7 @@ fn replica_stream_uring(
         if pending_acks.is_full() {
             // Wait for any in-flight ack SEND to complete first.
             // Collect CQEs into stack buffer to avoid CQ/SQ borrow conflict.
+            let mut bp_idle_spins: u32 = 0;
             while ack_send_in_flight {
                 let _ = ring.submit();
                 let mut bp_cqes: [(u64, i32, u32); 16] = [(0, 0, 0); 16];
@@ -395,19 +390,27 @@ fn replica_stream_uring(
                         _ => {}
                     }
                 }
-                std::hint::spin_loop();
+                // Mirror the main-loop idle wait: with `busy_spin`, never
+                // yield (ack RTT sits on the primary's response-gate
+                // critical path); otherwise yield after a short spin so a
+                // wedged SEND CQE doesn't peg this core under `--yield-idle`
+                // (e.g. in CI / failover tests).
+                if bp_count == 0 {
+                    if busy_spin || bp_idle_spins < 1000 {
+                        bp_idle_spins = bp_idle_spins.wrapping_add(1);
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                } else {
+                    bp_idle_spins = 0;
+                }
             }
 
             // After draining the in-flight SEND, drop all pending acks at
-            // once. In sync mode, wait for the journal to catch up first;
-            // in async mode, ack immediately without waiting on fsync.
-            let seq = if async_ack {
-                pending_acks
-                    .pop_all_async()
-                    .expect("non-empty queue after backpressure drain")
-            } else {
-                pending_acks.pop_oldest_blocking(journal_cursor)
-            };
+            // once — waiting for the journal cursor to catch up to the
+            // oldest pending target before sending one cumulative ack.
+            let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
             let in_mem_now = *accum_end_sequence;
             ack_send_buf.clear();
             encode_ack(
@@ -752,7 +755,6 @@ pub fn run_receiver(
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
     receiver_core: usize,
-    async_ack: bool,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
@@ -1186,7 +1188,6 @@ pub fn run_receiver(
                             &mut accum_end_sequence,
                             shutdown,
                             promote,
-                            async_ack,
                             busy_spin,
                             &mut slot_buf,
                         )
@@ -1198,7 +1199,7 @@ pub fn run_receiver(
 
         // Wait for all pending batches to become durable, then ack.
         if let Some(p) = pipeline.as_ref()
-            && let Some(seq) = pending_acks.pop_all_blocking(p.journal_cursor.as_ref())
+            && let Some(seq) = pending_acks.pop_all_blocking(p.journal_cursor.as_ref(), busy_spin)
         {
             let _ = send_ack_tcp(seq, accum_end_sequence, &mut tcp_writer, &mut send_buf);
         }

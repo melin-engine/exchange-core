@@ -230,6 +230,28 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// `ResponseKind::BatchEnd` after the payload (skipped when the
     /// payload itself is `BatchEnd` — which is its own terminator).
     pub is_last_in_request: bool,
+    /// Exempt this slot from the response stage's durability gate.
+    ///
+    /// Set on every slot the matching stage emits while `halted` (all
+    /// replicas disconnected). Two kinds of slot reach the output ring
+    /// under halt: the explicit `Rejected{ReplicaDisconnected}` reports
+    /// produced for incoming client orders, and the empty `BatchEnd`
+    /// terminators emitted for transport-internal events (Tick /
+    /// GenesisHash / Checkpoint). Neither carries engine state worth
+    /// replicating before delivery — the rejection records no mutation,
+    /// and replicas deterministically reach the same halt decision when
+    /// they replay the same inputs. Gating either under a structurally
+    /// unsatisfiable policy (e.g. `Hybrid` with no replicas) would
+    /// stall the response gate forever, including for the rejection
+    /// itself, which is exactly what we want clients to see immediately.
+    /// The carve-out is therefore correctness-preserving and improves
+    /// operator visibility during outages.
+    ///
+    /// Every other output kind (Placed, Fill, Cancelled, non-halt
+    /// reject reasons, query responses) keeps the gate, since each
+    /// reflects engine state or a state-derived decision (rate-limiter
+    /// consumption, dedup) that must be durable before reply.
+    pub durability_bypass: bool,
 }
 
 /// Payload within an output slot.
@@ -267,6 +289,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
             match_complete_ts: trace_ts(),
             recv_ts: trace_ts(),
             is_last_in_request: true,
+            durability_bypass: false,
         }
     }
 }
@@ -1657,6 +1680,23 @@ impl<A: Application> MatchingStage<A> {
                 // the current snapshot during a halt is safe (and
                 // actually useful for operators monitoring the outage).
                 let is_query = slot.event.is_query();
+                // Every output slot emitted while `halted` is exempt from
+                // the response stage's durability gate. Two kinds reach
+                // the output ring during halt: the explicit halt-state
+                // rejection below (`Rejected{ReplicaDisconnected}` —
+                // operator-visible refusal, no engine state changed) and
+                // the empty `BatchEnd` terminator that transport variants
+                // (Tick / Checkpoint / GenesisHash) emit as their "I
+                // produced no client payload" marker. Neither carries
+                // engine state worth replicating before delivery; gating
+                // them under a structurally unsatisfiable policy
+                // (e.g. `Hybrid` with no replicas) would stall the gate
+                // forever — including for the rejection itself, which is
+                // exactly what we want clients to see immediately. See
+                // `OutputSlot::durability_bypass` for the correctness
+                // argument. Queries bypass halt entirely (they're
+                // read-only), so they keep the gate as usual.
+                let halt_bypass = halted && !is_query;
                 if !is_query && halted {
                     // Only app events produce client-facing rejections;
                     // transport variants (Tick, GenesisHash, Checkpoint)
@@ -1749,16 +1789,33 @@ impl<A: Application> MatchingStage<A> {
                 let report_count = reports.len();
                 let last_is_query = query_report.is_some();
                 if report_count == 0 && !last_is_query {
-                    out_batch.push_with(|s| {
-                        *s = OutputSlot {
-                            connection_id: slot.connection_id,
-                            input_seq,
-                            payload: OutputPayload::BatchEnd,
-                            match_complete_ts,
-                            recv_ts: slot.recv_ts,
-                            is_last_in_request: true,
-                        };
-                    });
+                    // Transport-internal events (Tick / GenesisHash /
+                    // Checkpoint published by the reader thread) carry
+                    // `connection_id == 0` and have no client to reply
+                    // to. They previously emitted a BatchEnd-payload
+                    // slot as a terminator; downstream consumers
+                    // (response, event publisher) just looked up
+                    // connection 0, didn't find it, and dropped the
+                    // slot. Skipping the publish is equivalent — and
+                    // critical during halt onset, where such a slot
+                    // would otherwise sit in the response ring with
+                    // `durability_bypass=false` (set pre-halt, before
+                    // the policy went unsatisfiable) and wedge the
+                    // response gate forever waiting for a replication
+                    // condition that can no longer be met.
+                    if slot.connection_id != 0 {
+                        out_batch.push_with(|s| {
+                            *s = OutputSlot {
+                                connection_id: slot.connection_id,
+                                input_seq,
+                                payload: OutputPayload::BatchEnd,
+                                match_complete_ts,
+                                recv_ts: slot.recv_ts,
+                                is_last_in_request: true,
+                                durability_bypass: halt_bypass,
+                            };
+                        });
+                    }
                 } else {
                     for (j, report) in reports.iter().enumerate() {
                         let is_last = j + 1 == report_count && !last_is_query;
@@ -1770,6 +1827,7 @@ impl<A: Application> MatchingStage<A> {
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
                                 is_last_in_request: is_last,
+                                durability_bypass: halt_bypass,
                             };
                         });
                     }
@@ -1782,6 +1840,12 @@ impl<A: Application> MatchingStage<A> {
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
                                 is_last_in_request: true,
+                                // Query responses are read-only snapshots
+                                // and already bypass the halt check (see
+                                // `is_query` above), but they still carry
+                                // state-derived data — keep the gate so
+                                // clients only observe replicated state.
+                                durability_bypass: false,
                             };
                         });
                     }
@@ -1843,7 +1907,8 @@ impl<A: Application> MatchingStage<A> {
             reports.clear();
 
             // Halt check first, then dedup (same order as the main run loop).
-            if self.is_halted() {
+            let halt_bypass = self.is_halted();
+            if halt_bypass {
                 if let melin_journal::JournalEvent::App(ref e) = slot.event {
                     reports.push(A::build_reject(e, RejectReason::ReplicaDisconnected));
                 }
@@ -1874,6 +1939,7 @@ impl<A: Application> MatchingStage<A> {
                     match_complete_ts,
                     recv_ts: slot.recv_ts,
                     is_last_in_request: true,
+                    durability_bypass: halt_bypass,
                 });
             } else {
                 for (j, report) in reports.iter().enumerate() {
@@ -1885,6 +1951,7 @@ impl<A: Application> MatchingStage<A> {
                         match_complete_ts,
                         recv_ts: slot.recv_ts,
                         is_last_in_request: is_last,
+                        durability_bypass: halt_bypass,
                     });
                 }
             }

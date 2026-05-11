@@ -621,6 +621,22 @@ fn spawn_replica_named_with_extra_env(
         "0,0,0,0,0,0,0,0".into(),
         "--reader-cores".into(),
         "0".into(),
+        // TODO(durability-admin): Replicas are pre-configured with
+        // `local` so the post-promotion path (single standalone node)
+        // can satisfy its own durability gate. With strict Hybrid this
+        // would be structurally unsatisfiable and the promoted node
+        // would halt forever, hanging every promote-path failover
+        // test. The proper long-term coverage is to (a) leave replicas
+        // on the default Hybrid mode and (b) have the test send a
+        // signed admin `DURABILITY local` command immediately after
+        // `promote()` — exercising the runtime-mode-swap admin path
+        // that ships in the next commit. When that lands, drop this
+        // override and convert at least one promote-path test
+        // (e.g. `dual_replication_survives_one_replica_failure`) to
+        // the admin-command flow so the Hybrid-on-promoted-node case
+        // is covered end-to-end.
+        "--durability-mode".into(),
+        "local".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -1006,6 +1022,8 @@ fn crashed_primary_recovers_from_journal() {
                 "--health-bind",
                 &format!("127.0.0.1:{recovered_health_port}"),
                 "--standalone",
+                "--durability-mode",
+                "local",
                 "--journal",
                 primary_journal.to_str().expect("valid path"),
                 "--authorized-keys",
@@ -1766,13 +1784,6 @@ fn dual_replication_with_fills_then_failover() {
     );
 }
 
-// `async_ack_dual_replication_with_failover` was removed alongside the
-// `--async-replica-ack` flag. The new ack-on-receive plumbing for
-// fast-cursor policies (e.g. `in_memory>=2`) is a separate piece of
-// work; until then, sync-mode acks are the only path. The
-// `dual_replication_with_fills_then_failover` test above covers the
-// same failover-preserves-fills assertion under the default policy.
-
 /// Journal catch-up: kill a replica, submit more orders, copy the dead
 /// replica's journal to a replacement, start the replacement. The primary
 /// streams the gap (orders the replacement missed) via journal catch-up.
@@ -1856,6 +1867,15 @@ fn replacement_replica_catches_up_from_journal() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
+                // TODO(durability-admin): see the matching note in
+                // `spawn_replica_named_with_extra_env`. This replacement
+                // replica spawns through a direct Command (not the
+                // helper), so it needs the same `--durability-mode local`
+                // override for the post-promotion standalone path. Drop
+                // this once the admin `DURABILITY` command lands and the
+                // test sends it after promotion.
+                "--durability-mode",
+                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1984,6 +2004,10 @@ fn catchup_with_fills_during_gap() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
+                // TODO(durability-admin): see the matching note in
+                // `spawn_replica_named_with_extra_env`.
+                "--durability-mode",
+                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2102,6 +2126,10 @@ fn catchup_then_immediate_failover() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
+                // TODO(durability-admin): see the matching note in
+                // `spawn_replica_named_with_extra_env`.
+                "--durability-mode",
+                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2227,6 +2255,10 @@ fn fresh_replica_full_catchup() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
+                // TODO(durability-admin): see the matching note in
+                // `spawn_replica_named_with_extra_env`.
+                "--durability-mode",
+                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2341,6 +2373,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "--reader-cores",
                 "0",
                 "--standalone",
+                "--durability-mode",
+                "local",
                 "--snapshot-interval-ms",
                 "100",
             ])
@@ -2811,10 +2845,7 @@ fn policy_degraded_gauge_transitions_with_cluster_shape() {
 #[test]
 #[serial]
 fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
-    let cluster = DualCluster::start_with_primary_args(&[
-        "--durability-policy",
-        "persisted>=1 && in_memory>=2",
-    ]);
+    let cluster = DualCluster::start_with_primary_args(&["--durability-mode", "hybrid"]);
     let primary_health = cluster.primary.health_addr;
     let mut client = cluster.connect_primary();
 

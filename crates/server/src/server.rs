@@ -186,30 +186,26 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
-    /// Durability policy that gates client responses. Expressed as one
-    /// or more `<level>>=<n>[ best_effort]` clauses joined with `&&`.
-    /// Levels are `persisted` (event written to NVMe via `O_DIRECT`,
-    /// durable behind PLP) and `in_memory` (event accepted into the
-    /// node's pipeline). The optional `best_effort` keyword marks the
-    /// clause as degrade-friendly: it clamps to the connected cluster
-    /// shape rather than failing closed.
+    /// Durability mode that gates client responses. One of:
     ///
-    /// Examples:
-    /// - `persisted>=1`   standalone or single-node durability
-    /// - `persisted>=2`   strict 2-of-3 quorum; gate stalls if a replica
-    ///   disconnects
-    /// - `persisted>=2 best_effort`  (default) 2-of-3 when healthy, falls
-    ///   back to all surviving nodes when one drops — strictly stronger
-    ///   than legacy auto-degrade-to-1-node in 1+2 deployments
-    /// - `in_memory>=2`   confirm receipt on a second node; weaker
-    ///   durability, removes fsync latency from the critical path
+    /// - `local`              `persisted>=1`. Single-node durability;
+    ///   required with `--standalone`. Dev/staging deployments.
+    /// - `hybrid` (default)   `persisted>=1 && in_memory>=2`. Primary's
+    ///   disk plus an in-memory ack from a second node. Single-failure-
+    ///   safe with a brief RAM-only window on the secondary copy. The
+    ///   default — typical live trading deployments. Saves ~50–80 µs
+    ///   per fill vs `durably-replicated`.
+    /// - `durably-replicated` `persisted>=2`. Two durable copies before
+    ///   client ack. Zero RAM-only window; the gate stalls when no
+    ///   replica is connected. Compliance-driven venues.
     ///
-    /// See `crate::durability_policy` for the full grammar and
-    /// evaluation semantics. Active degradation (a `best_effort`
-    /// clause clamping below its target count) surfaces on `/healthz`
-    /// as `melin_durability_policy_degraded` and emits a periodic warn.
-    #[arg(long, default_value = "persisted>=2 best_effort")]
-    pub durability_policy: String,
+    /// `--standalone` requires `local`. With `hybrid` or
+    /// `durably-replicated` and no connected replica the gate stalls —
+    /// the correct behaviour for a serious deployment that has lost
+    /// its replicas. See `docs/replication.md` for the operational
+    /// menu.
+    #[arg(long, value_enum, default_value_t = crate::durability_policy::DurabilityMode::Hybrid)]
+    pub durability_mode: crate::durability_policy::DurabilityMode,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
@@ -399,7 +395,7 @@ impl Default for ServerConfig {
             replication_heartbeat_secs: 5,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
-            durability_policy: "persisted>=2 best_effort".to_string(),
+            durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
             yield_idle: false,
             rumcast_client_addr: None,
             rumcast_busy_poll_us: 0,
@@ -652,12 +648,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
-            // async_ack: hardcoded false now that `--async-replica-ack`
-            // is gone. The receiver's dual-track flush already publishes
-            // the in-memory cursor on receive (separate from the durable
-            // cursor), so an `in_memory>=N` clause in `--durability-policy`
-            // reaches fast-path semantics without flipping this branch.
-            false,
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -851,6 +841,18 @@ fn run_as_primary<L: BlockingTransportListener>(
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
+    // `--standalone` declares "no replicas ever" — only `local` can be
+    // satisfied. `hybrid` and `durably-replicated` would stall the gate
+    // forever; reject loudly at startup with the fix in the message.
+    if config.standalone
+        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+    {
+        return Err(format!(
+            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
+            config.durability_mode,
+        )
+        .into());
+    }
     // Read the raw genesis entry bytes from the journal file before
     // moving the writer into the pipeline. Sent to the replica during
     // handshake so it can write a byte-identical genesis, ensuring the
@@ -1015,12 +1017,11 @@ fn run_as_primary<L: BlockingTransportListener>(
             None
         };
 
-    // Parse the configured durability policy. Bad input fails the
-    // server bootstrap rather than silently falling back, so an
-    // operator typo doesn't ship a different policy than they think.
-    let policy = crate::durability_policy::parse(&config.durability_policy)
-        .map_err(|e| format!("--durability-policy: {e}"))?;
-    info!(policy = %policy, "durability policy active");
+    // Build the durability policy from the operator-facing mode. Each
+    // mode constructs its own clause set directly — no parse step
+    // means no operator-typo failure mode.
+    let policy = config.durability_mode.to_policy();
+    info!(mode = %config.durability_mode, policy = %policy, "durability mode active");
 
     // Per-slot active flags exposed by the journal stage's replication
     // ring; the response gate filters disconnected slots out of the
@@ -1729,8 +1730,6 @@ pub fn run_dpdk(
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            // async_ack: see comment in `run_as_replica` (TCP path).
-            false,
             rotation,
             config.max_orders_per_account,
             config.max_orders_per_second,
@@ -1809,6 +1808,18 @@ pub fn run_dpdk(
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+    // `--standalone` declares "no replicas ever" — only `local` can be
+    // satisfied. `hybrid` and `durably-replicated` would stall the gate
+    // forever; reject loudly at startup with the fix in the message.
+    if config.standalone
+        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+    {
+        return Err(format!(
+            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
+            config.durability_mode,
+        )
+        .into());
     }
 
     let genesis_entry = if enable_replication {
@@ -1942,9 +1953,8 @@ pub fn run_dpdk(
             None
         };
 
-    let policy = crate::durability_policy::parse(&config.durability_policy)
-        .map_err(|e| format!("--durability-policy: {e}"))?;
-    info!(policy = %policy, "durability policy active");
+    let policy = config.durability_mode.to_policy();
+    info!(mode = %config.durability_mode, policy = %policy, "durability mode active");
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {

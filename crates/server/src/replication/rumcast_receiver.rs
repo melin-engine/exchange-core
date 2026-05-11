@@ -85,7 +85,6 @@ pub fn run_receiver_rumcast(
     snapshot_interval_secs: u64,
     snapshot_path: PathBuf,
     cores: crate::server::PipelineCores,
-    async_ack: bool,
     busy_spin: bool,
     rotation: Option<(u64, Arc<AtomicBool>)>,
     // SEC-03: must equal the primary's --max-orders-per-account.
@@ -351,12 +350,11 @@ pub fn run_receiver_rumcast(
             &mut accum_end_sequence,
             shutdown,
             promote,
-            async_ack,
             busy_spin,
         );
 
         // ---- Common teardown ----
-        if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+        if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor, busy_spin) {
             let _ = session_state.send_ack(seq, accum_end_sequence);
         }
 
@@ -909,7 +907,6 @@ enum SessionExit {
     Fatal(Box<dyn std::error::Error>),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn streaming_loop(
     session: &SessionState,
     input_producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,
@@ -919,7 +916,6 @@ fn streaming_loop(
     accum_end_sequence: &mut u64,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
-    async_ack: bool,
     busy_spin: bool,
 ) -> SessionExit {
     let mut last_publisher_seen = Instant::now();
@@ -1046,7 +1042,6 @@ fn streaming_loop(
             *accum_end_sequence,
             last_sent_ack_seq,
             last_sent_in_memory_seq,
-            async_ack,
         ) {
             if let Err(e) =
                 session.send_ack_with(ack.acked_sequence, ack.in_memory_sequence, shutdown)
@@ -1064,13 +1059,7 @@ fn streaming_loop(
 
         // ---- Backpressure: drain blocking acks if pending is full ----
         if pending_acks.is_full() {
-            let seq = if async_ack {
-                pending_acks
-                    .pop_all_async()
-                    .expect("non-empty queue after full check")
-            } else {
-                pending_acks.pop_oldest_blocking(journal_cursor)
-            };
+            let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
             let in_mem_now = *accum_end_sequence;
             if let Err(e) = session.send_ack_with(seq, in_mem_now, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {

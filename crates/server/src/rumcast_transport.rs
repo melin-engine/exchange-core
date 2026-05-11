@@ -376,6 +376,15 @@ fn run_rumcast_primary_with_state(
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
+    if config.standalone
+        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+    {
+        return Err(format!(
+            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
+            config.durability_mode,
+        )
+        .into());
+    }
 
     // Read raw genesis entry bytes before the writer is consumed by
     // the pipeline. Sent to the replica via StreamStart so the BLAKE3
@@ -443,9 +452,8 @@ fn run_rumcast_primary_with_state(
     // (built below) instead.
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
 
-    let policy = crate::durability_policy::parse(&config.durability_policy)
-        .map_err(|e| format!("--durability-policy: {e}"))?;
-    info!(policy = %policy, "durability policy active");
+    let policy = config.durability_mode.to_policy();
+    info!(mode = %config.durability_mode, policy = %policy, "durability mode active");
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {
@@ -2149,11 +2157,6 @@ fn run_rumcast_replica(
         config.snapshot_interval_ms,
         config.shadow_snapshot_path(),
         config.cores,
-        // async_ack: legacy `--async-replica-ack` flag is retired. The
-        // ack-on-receive dual-track flush (in-memory cursor advances
-        // before durable cursor) supersedes it; passing false keeps the
-        // documented `PendingAckQueue::pop_ready` branch.
-        false,
         !config.yield_idle,
         rotation,
         config.max_orders_per_account,

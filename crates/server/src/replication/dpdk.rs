@@ -923,7 +923,6 @@ pub fn run_receiver_dpdk(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
-    async_ack: bool,
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     // SEC-03: must equal the primary's --max-orders-per-account.
     max_orders_per_account: u32,
@@ -1390,7 +1389,7 @@ pub fn run_receiver_dpdk(
         let session_exit = 'streaming: loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("replica shutting down (DPDK)");
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
                     send_ack_dpdk!(Ack {
                         acked_sequence: seq,
                         in_memory_sequence: accum_end_sequence,
@@ -1436,7 +1435,7 @@ pub fn run_receiver_dpdk(
                         pending_acks.push(drain_last_target, accum_end_sequence);
                     }
                 }
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
                     send_ack_dpdk!(Ack {
                         acked_sequence: seq,
                         in_memory_sequence: accum_end_sequence,
@@ -1458,7 +1457,6 @@ pub fn run_receiver_dpdk(
                 accum_end_sequence,
                 last_sent_acked_seq,
                 last_sent_in_memory_seq,
-                async_ack,
             ) {
                 send_ack_dpdk!(ack);
                 last_sent_acked_seq = ack.acked_sequence;
@@ -1468,13 +1466,7 @@ pub fn run_receiver_dpdk(
             // Backpressure: if pipeline is saturated, block until the oldest
             // batch is durable.
             if pending_acks.is_full() {
-                let seq = if async_ack {
-                    pending_acks
-                        .pop_all_async()
-                        .expect("non-empty queue after full check")
-                } else {
-                    pending_acks.pop_oldest_blocking(journal_cursor)
-                };
+                let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
                 let in_mem_now = accum_end_sequence;
                 send_ack_dpdk!(Ack {
                     acked_sequence: seq,
@@ -1492,7 +1484,7 @@ pub fn run_receiver_dpdk(
 
             // Check for disconnect.
             if !transport.is_active(handle) && recv_buf.is_empty() {
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
                     send_ack_dpdk!(Ack {
                         acked_sequence: seq,
                         in_memory_sequence: accum_end_sequence,

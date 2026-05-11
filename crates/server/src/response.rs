@@ -64,9 +64,10 @@ pub struct Response {
     /// primary alone.
     pub replication_metrics: Option<Arc<ReplicationMetrics>>,
     /// Per-slot replica active flags. Only "true" slots are included in
-    /// the cursor view fed to `Policy::evaluate`, so degrade-friendly
-    /// clauses (`persisted>=2 best_effort`) clamp against the *connected* count
-    /// rather than counting disconnected slots as zero-cursor nodes.
+    /// the cursor view fed to `Policy::evaluate`, so disconnected slots
+    /// don't pollute the view with stale zero cursors. When the
+    /// resulting view is too small to satisfy a clause, the policy
+    /// reports degraded and the gate stalls.
     /// Mirrors `replication_metrics` — `None` in standalone.
     pub replica_active: Option<[Arc<AtomicBool>; 2]>,
     pub heartbeat_interval: Option<Duration>,
@@ -131,10 +132,10 @@ pub fn run(
     // Degradation logger. Tracks transitions, suppresses sub-second
     // flap noise, and drives the `/healthz` `policy_degraded` gauge.
     // See `DegradationLogger` for the full state machine. Initialised
-    // below from the policy's startup evaluation so a degraded
-    // standalone deployment (default `persisted>=2 best_effort` →
-    // view.len()=1 → clamps to 1, marks `degraded=true`) is visible
-    // immediately on `/healthz` and in the journal.
+    // below from the policy's startup evaluation so an unsatisfiable
+    // policy (e.g. a primary that just lost both replicas while
+    // running `hybrid` or `durably-replicated`) is visible immediately
+    // on `/healthz` and in the journal.
     let startup_now = Instant::now();
     let mut last_policy_check = startup_now;
     /// Re-emit interval for the "still degraded" reminder.
@@ -407,7 +408,21 @@ pub fn run(
             {
                 gate_tracker = GateCrossTracker::new(needed);
             }
-            if cached_durable_pos < needed {
+            // Durability-gate carve-out for halt-state output. Slots
+            // tagged `durability_bypass = true` at emission carry no
+            // engine state worth replicating before delivery — see
+            // `OutputSlot::durability_bypass` for the correctness
+            // argument. When every slot in the batch carries the flag
+            // the gate is skipped entirely, so clients receive the halt
+            // reason immediately rather than blocking on a structurally
+            // unsatisfiable policy (e.g. `Hybrid` with all replicas
+            // disconnected, which would otherwise stall the gate until
+            // peers return). If even one normal slot is present, gate
+            // the whole batch as usual — the bypass slots ride along
+            // behind the gated one, which is safe (no ordering
+            // inversion vs. a strict-gate world).
+            let needs_gate = batch[..count].iter().any(|s| !s.durability_bypass);
+            if needs_gate && cached_durable_pos < needed {
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
@@ -728,9 +743,9 @@ fn retry_send(
 /// in-memory on the primary by construction.
 ///
 /// Disconnected slots are *omitted from the view* rather than included
-/// with zero cursors. This is what gives degrade-friendly clauses
-/// (`persisted>=2 best_effort`) the correct "clamp to connected count" semantics
-/// — the view's `len()` reflects how many nodes are actually available.
+/// with zero cursors. The view's `len()` reflects how many nodes are
+/// actually available; if it's too small to satisfy a clause, the
+/// policy reports degraded and the gate stalls.
 #[inline]
 pub(crate) fn evaluate_durability(
     policy: &Policy,
@@ -807,8 +822,8 @@ impl DegradationLogger {
     }
 
     /// Use when the policy is known to start in a degraded state
-    /// (e.g. standalone deployments running `persisted>=2 best_effort`
-    /// from t=0). Logs a startup warn immediately and treats the
+    /// (e.g. a primary in `hybrid` mode with no replica yet
+    /// connected). Logs a startup warn immediately and treats the
     /// state as already-logged so the next tick doesn't re-emit.
     pub(crate) fn new_starting_degraded(now: Instant, policy: &Policy) -> Self {
         tracing::warn!(
@@ -1002,8 +1017,30 @@ mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
     use super::{DegradationLogger, connected_persisted_min, evaluate_durability};
-    use crate::durability_policy::parse;
+    use crate::durability_policy::{Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
+
+    /// Build a [`Policy`] from a mini DSL: one or more
+    /// `"<level>>=<count>"` clauses joined with `&&`. Test-only
+    /// ergonomics — production builds policies via
+    /// [`DurabilityMode::to_policy`].
+    fn parse(s: &str) -> Result<Policy, String> {
+        let mut clauses = Vec::new();
+        for raw in s.split("&&") {
+            let token = raw.trim();
+            let (lvl, rhs) = token
+                .split_once(">=")
+                .ok_or_else(|| format!("clause `{token}` missing `>=`"))?;
+            let level = match lvl.trim() {
+                "persisted" => Level::Persisted,
+                "in_memory" => Level::InMemory,
+                other => return Err(format!("unknown level `{other}`")),
+            };
+            let count: u8 = rhs.trim().parse().map_err(|e| format!("bad count: {e}"))?;
+            clauses.push(Clause { count, level });
+        }
+        Policy::new(clauses).map_err(|e| e.to_string())
+    }
     use melin_transport_core::pipeline::StageUtilization;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1046,26 +1083,17 @@ mod tests {
 
     #[test]
     fn standalone_strict_persisted_two_never_opens() {
-        // Strict `persisted>=2` on a standalone primary stays at 0:
-        // the operator asked for two copies and there is only one.
+        // `persisted>=2` on a standalone primary stays at 0: the
+        // operator asked for two copies and there is only one. The
+        // policy surfaces as degraded so the operator sees the gate
+        // is stalled because the cluster can't meet the policy.
         let p = parse("persisted>=2").unwrap();
         let r = evaluate_durability(&p, 500, None, None);
         assert_eq!(r.durable_pos, 0);
-        // Strict clauses don't surface as "degraded" — the operator
-        // chose fail-closed and got it. Degraded is reserved for
-        // clauses with `!` that actively clamped.
-        assert!(!r.degraded);
-    }
-
-    #[test]
-    fn standalone_degrade_persisted_two_opens_at_primary() {
-        // Same shape with `!`: clamp to the connected count (=1) and
-        // gate opens at journal_pos. The clamp from 2 → 1 is exactly
-        // what `degraded` reports.
-        let p = parse("persisted>=2 best_effort").unwrap();
-        let r = evaluate_durability(&p, 500, None, None);
-        assert_eq!(r.durable_pos, 500);
-        assert!(r.degraded);
+        assert!(
+            r.degraded,
+            "policy structurally unsatisfiable on this shape → degraded",
+        );
     }
 
     // --- 2 replicas connected ---
@@ -1130,16 +1158,16 @@ mod tests {
     }
 
     #[test]
-    fn single_replica_degrade_persisted_two_still_requires_both_survivors() {
-        // Same shape with `!`. `effective_count = min(2, view.len()=2)
-        // = 2`, so the clamp is a no-op when 2 nodes are connected.
-        let p = parse("persisted>=2 best_effort").unwrap();
+    fn single_replica_persisted_two_requires_both_survivors() {
+        // 2-node view (primary + surviving replica). `persisted>=2` is
+        // satisfiable; the gate opens at the slower of the two and the
+        // policy is not degraded.
+        let p = parse("persisted>=2").unwrap();
         let m = metrics((100, 100), (999, 999));
         let a = flags(true, false);
-        assert_eq!(
-            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
-            50
-        );
+        let r = evaluate_durability(&p, 50, Some(&m), Some(&a));
+        assert_eq!(r.durable_pos, 50);
+        assert!(!r.degraded);
     }
 
     #[test]
@@ -1156,19 +1184,19 @@ mod tests {
     }
 
     #[test]
-    fn both_replicas_disconnected_degrade_opens_at_primary() {
-        // Same shape with `!` clamps to view.len()=1 and gate opens
-        // at the primary alone. Note the matching stage's separate
-        // halt at `replicas_connected==0` rejects new orders before
-        // they reach the gate; this verifies the gate semantics in
-        // isolation.
-        let p = parse("persisted>=2 best_effort").unwrap();
+    fn both_replicas_disconnected_strict_stalls_and_flags_degraded() {
+        // With `persisted>=2` and both replicas down, the cursor view
+        // collapses to {primary}: the clause's count (=2) exceeds the
+        // view size, so the gate stays at 0 and the policy flags
+        // degraded. Note the matching stage's separate halt at
+        // `replicas_connected==0` rejects new orders before they reach
+        // the gate; this verifies the gate semantics in isolation.
+        let p = parse("persisted>=2").unwrap();
         let m = metrics((999, 999), (999, 999));
         let a = flags(false, false);
-        assert_eq!(
-            evaluate_durability(&p, 500, Some(&m), Some(&a)).durable_pos,
-            500
-        );
+        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        assert_eq!(r.durable_pos, 0);
+        assert!(r.degraded);
     }
 
     // --- Mixed-level policies ---
@@ -1234,17 +1262,18 @@ mod tests {
     /// case under normal cluster lifecycles.
     #[test]
     fn fresh_cluster_zero_cursors_included_in_view() {
-        let p = parse("persisted>=2 best_effort").unwrap();
+        let p = parse("persisted>=2").unwrap();
         // Both replicas just handshook at seq 0, primary also at 0
-        // (fresh cluster, no events yet). View = 3 nodes; clamp from
-        // target=2 to 2 is a no-op; 2nd-largest persisted = 0.
+        // (fresh cluster, no events yet). View = 3 nodes; the clause's
+        // count (=2) is met by the view size, so the policy is not
+        // degraded and the gate sits at the 2nd-largest persisted = 0.
         let m = metrics((0, 0), (0, 0));
         let a = both_active();
         let r = evaluate_durability(&p, 0, Some(&m), Some(&a));
         assert_eq!(r.durable_pos, 0);
         assert!(
             !r.degraded,
-            "all 3 nodes present, no clamp — should not flag degraded"
+            "all 3 nodes present, view meets clause target — should not flag degraded"
         );
     }
 
@@ -1292,7 +1321,7 @@ mod tests {
         // Events 481-500 were already served as durable on primary
         // alone — they aren't unsent. New responses for seq>500 wait
         // until slot acks; we just don't freeze at 0.
-        let p = parse("persisted>=2 best_effort").unwrap();
+        let p = parse("persisted>=2").unwrap();
         let m = metrics((480, 480), (999, 999));
         let a = flags(true, false);
         let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
@@ -1309,7 +1338,7 @@ mod tests {
         // The gate WOULD freeze at 0. This test documents the bug
         // the seeding fix is designed to avoid; the senders ensure
         // this state is never observed in production.
-        let p = parse("persisted>=2 best_effort").unwrap();
+        let p = parse("persisted>=2").unwrap();
         let m = metrics((0, 0), (999, 999));
         let a = flags(true, false);
         let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
@@ -1331,28 +1360,28 @@ mod tests {
         // Specifically: with primary at 500, slot stale-zero-included,
         // the gate must not "see" the primary alone and open at 500
         // — that would let a client be told a seq is durable when
-        // only the primary has it under a `persisted>=2 best_effort`
-        // policy that demands 2 nodes.
-        let p = parse("persisted>=2 best_effort").unwrap();
+        // only the primary has it under a `persisted>=2` policy that
+        // demands 2 nodes.
+        let p = parse("persisted>=2").unwrap();
         let m = metrics((0, 0), (999, 999));
         let a = flags(true, false);
         let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
         // 2nd-largest persisted across {primary=500, slot=0} = 0.
-        // Gate stalls. Compare: if the slot were correctly excluded
-        // (active=false), view shrinks to [primary], clamp 2→1,
-        // gate would open at 500 — that's the post-disconnect
-        // steady-state and is correct. The race-window observation
-        // is briefly stricter, never looser. ✓
+        // Gate stalls. ✓
         assert_eq!(r.durable_pos, 0);
 
-        // Sanity check: the post-disconnect state (active=false)
-        // produces the looser, but still-correct, answer.
+        // Post-disconnect (active=false): view shrinks to {primary}.
+        // `persisted>=2` is structurally unsatisfiable on a 1-node
+        // view, so the gate stays at 0 AND surfaces degraded. The
+        // matching stage's `replicas_connected==0` halt is what stops
+        // accepting new orders; the gate side's job is just to keep
+        // the existing in-flight orders stalled and the alert lit.
         let a_disconnected = flags(false, false);
         let r_after = evaluate_durability(&p, 500, Some(&m), Some(&a_disconnected));
-        assert_eq!(r_after.durable_pos, 500);
+        assert_eq!(r_after.durable_pos, 0);
         assert!(
             r_after.degraded,
-            "post-disconnect view of size 1 should clamp from 2 to 1 and report degraded"
+            "post-disconnect view of size 1 cannot meet persisted>=2 → degraded"
         );
     }
 
@@ -1363,7 +1392,7 @@ mod tests {
         // produce a durable_pos that exceeds what an honest 2-node
         // evaluation would give. Spot-check a handful of primary
         // positions to lock the invariant.
-        let p = parse("persisted>=2 best_effort").unwrap();
+        let p = parse("persisted>=2").unwrap();
         let m = metrics((0, 0), (999, 999));
         let a = flags(true, false);
         for primary_pos in [0, 1, 100, 500, 1_000_000_000_u64] {
@@ -1473,7 +1502,7 @@ mod tests {
     // log emission.
 
     fn logger_test_policy() -> crate::durability_policy::Policy {
-        parse("persisted>=2 best_effort").unwrap()
+        parse("persisted>=2").unwrap()
     }
 
     /// Tick the logger N times at `step` intervals, alternating
