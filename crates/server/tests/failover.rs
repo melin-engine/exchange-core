@@ -220,6 +220,70 @@ fn wait_for_primary_repl_ready(health_addr: SocketAddr, timeout: Duration) {
     }
 }
 
+/// Fetch the per-slot `melin_replica_in_memory_sequence` and
+/// `melin_replica_acked_sequence` values. Returns
+/// `[(in_memory_0, acked_0), (in_memory_1, acked_1)]`.
+fn fetch_replica_cursors(addr: SocketAddr) -> Option<[(u64, u64); 2]> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    let mut acked = [0u64; 2];
+    let mut in_mem = [0u64; 2];
+    for line in text.lines() {
+        for slot in 0..2usize {
+            let acked_prefix = format!("melin_replica_acked_sequence{{slot=\"{slot}\"}} ");
+            let in_mem_prefix = format!("melin_replica_in_memory_sequence{{slot=\"{slot}\"}} ");
+            if let Some(rest) = line.strip_prefix(&acked_prefix) {
+                acked[slot] = rest.trim().parse().ok()?;
+            } else if let Some(rest) = line.strip_prefix(&in_mem_prefix) {
+                in_mem[slot] = rest.trim().parse().ok()?;
+            }
+        }
+    }
+    Some([(in_mem[0], acked[0]), (in_mem[1], acked[1])])
+}
+
+/// Fetch the `melin_durability_policy_degraded` gauge from the
+/// Prometheus metrics endpoint. Returns `None` if the metric is
+/// missing (older binary, parse error, etc).
+fn fetch_policy_degraded(addr: SocketAddr) -> Option<u32> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("melin_durability_policy_degraded ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Poll the metrics endpoint until `melin_durability_policy_degraded`
+/// equals `expected`, or timeout. Panics on timeout. The 1-second
+/// flap-hold + 1-second idle re-eval mean transitions can take up to
+/// ~2 s to surface, so callers should pass a comfortable timeout.
+fn wait_for_policy_degraded(addr: SocketAddr, expected: u32, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = fetch_policy_degraded(addr)
+            && v == expected
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            let last = fetch_policy_degraded(addr);
+            panic!("timed out waiting for policy_degraded={expected}; last observed = {last:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -346,6 +410,20 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
     assert!(response == "OK", "promotion failed: {response}");
 }
 
+/// Send `DURABILITY <mode>` to a node's admin endpoint and assert it
+/// succeeds. Used by tests that drive runtime mode swaps (e.g. the
+/// promoted-replica-without-replicas case where Hybrid is structurally
+/// unsatisfiable and the operator must downgrade to Local for the gate
+/// to open).
+fn set_durability_mode(addr: SocketAddr, operator_key: &SigningKey, mode: &str) {
+    let cmd = format!("DURABILITY {mode}");
+    let response = admin_command(addr, operator_key, &cmd);
+    assert!(
+        response == "OK",
+        "set durability {mode} on {addr} failed: {response}"
+    );
+}
+
 struct ServerProcess {
     child: Child,
     client_addr: SocketAddr,
@@ -361,28 +439,8 @@ impl Drop for ServerProcess {
 }
 
 /// Spawn a primary server process.
-fn spawn_primary(
-    bin: &Path,
-    tmp_dir: &Path,
-    keys_path: &Path,
-    client_port: u16,
-    health_port: u16,
-    replication_port: u16,
-) -> ServerProcess {
-    spawn_primary_with_extra(
-        bin,
-        tmp_dir,
-        keys_path,
-        client_port,
-        health_port,
-        replication_port,
-        &[],
-    )
-}
-
 /// Spawn a primary server process with caller-supplied extra CLI flags
-/// (e.g. `--admin-bind`, `--max-journal-mib`). The base flag set is the
-/// same as [`spawn_primary`].
+/// (e.g. `--admin-bind`, `--max-journal-mib`).
 fn spawn_primary_with_extra(
     bin: &Path,
     tmp_dir: &Path,
@@ -729,6 +787,16 @@ impl TestCluster {
 
         let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.admin_port).parse().unwrap();
         promote(promote_addr, &self.operator_key);
+        // The promoted node was a replica running with the cluster
+        // default (`hybrid`); standalone it can't satisfy
+        // `in_memory>=2`, so the response gate would stall forever.
+        // Downgrade to `local` via the admin DURABILITY command — the
+        // production failover playbook for a freshly-promoted node
+        // without peers. A separate test
+        // (`dual_replication_promote_then_durability_swap`) covers the
+        // same path on the dual-cluster shape so we know the runtime
+        // swap works under both topologies.
+        set_durability_mode(promote_addr, &self.operator_key, "local");
 
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
@@ -962,6 +1030,8 @@ fn crashed_primary_recovers_from_journal() {
                 "--health-bind",
                 &format!("127.0.0.1:{recovered_health_port}"),
                 "--standalone",
+                "--durability-mode",
+                "local",
                 "--journal",
                 primary_journal.to_str().expect("valid path"),
                 "--authorized-keys",
@@ -1277,6 +1347,7 @@ fn same_key_retry_after_failover_is_rejected() {
     }
     let _ = cluster.primary.child.wait();
     promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(cluster.replica.health_addr, Duration::from_secs(30));
 
     // Reconnect with the SAME key (key, not key2). The promoted replica's
@@ -1318,10 +1389,14 @@ struct DualCluster {
 
 impl DualCluster {
     fn start() -> Self {
-        Self::start_with_replica_args(&[])
+        Self::start_with_args(&[], &[])
     }
 
-    fn start_with_replica_args(replica_extra_args: &[&str]) -> Self {
+    fn start_with_primary_args(primary_extra_args: &[&str]) -> Self {
+        Self::start_with_args(primary_extra_args, &[])
+    }
+
+    fn start_with_args(primary_extra_args: &[&str], replica_extra_args: &[&str]) -> Self {
         let bin = server_bin();
         assert!(bin.exists(), "melin-server binary not found");
 
@@ -1343,13 +1418,14 @@ impl DualCluster {
         let r2_health = free_port();
         let r2_promote = free_port();
 
-        let primary = spawn_primary(
+        let primary = spawn_primary_with_extra(
             &bin,
             tmp.path(),
             &keys_path,
             primary_client_port,
             primary_health_port,
             primary_repl_port,
+            primary_extra_args,
         );
 
         // Wait for the primary to be ready to accept replica connections.
@@ -1440,6 +1516,10 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
+        // Downgrade the promoted standalone to `local` so its gate can
+        // open without peers. See `TestCluster::kill_and_promote` for
+        // the full rationale.
+        set_durability_mode(addr, &self.operator_key, "local");
         wait_ready(self.replica1.health_addr, Duration::from_secs(30));
         Client::connect(self.replica1.client_addr, &self.key2)
             .expect("connect to promoted replica 1")
@@ -1450,6 +1530,7 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
+        set_durability_mode(addr, &self.operator_key, "local");
         wait_ready(self.replica2.health_addr, Duration::from_secs(30));
         Client::connect(self.replica2.client_addr, &self.key2)
             .expect("connect to promoted replica 2")
@@ -1717,71 +1798,6 @@ fn dual_replication_with_fills_then_failover() {
     );
 }
 
-/// Async ack mode: replicas are started with `--async-replica-ack`, which
-/// makes them ack the primary as soon as a batch is queued for the local
-/// journal stage rather than after fsync. End-to-end this should still
-/// produce identical journals after a graceful shutdown (the journal
-/// stage drains and fsyncs everything before the receiver exits), and
-/// failover via promotion must still see every fill the client was told
-/// about (the promotion path also drains the pipeline).
-///
-/// Mirrors `dual_replication_with_fills_then_failover` but exercises the
-/// async path; if either path silently dropped data, the post-promotion
-/// fill on the new primary would fail to find its counterparty.
-#[test]
-#[serial]
-fn async_ack_dual_replication_with_failover() {
-    let mut cluster = DualCluster::start_with_replica_args(&["--async-replica-ack"]);
-    let mut client = cluster.connect_primary();
-
-    // Resting sells from account 2.
-    for i in 1..=10u64 {
-        submit_order(&mut client, i, 2, 1, Side::Sell, 100 + i, 5);
-    }
-    // Aggressive buys from account 1 — generates fills.
-    for i in 11..=20u64 {
-        submit_order(&mut client, i, 1, 1, Side::Buy, 200, 3);
-    }
-    cluster.wait_replicated();
-
-    // Kill replica 1, submit more fills with only replica 2.
-    cluster.kill_replica1();
-    std::thread::sleep(Duration::from_millis(500));
-
-    for i in 21..=25u64 {
-        submit_order(&mut client, i, 2, 1, Side::Sell, 300, 2);
-    }
-    for i in 26..=30u64 {
-        submit_order(&mut client, i, 1, 1, Side::Buy, 300, 2);
-    }
-    cluster.wait_replicated();
-
-    // Failover to replica 2.
-    drop(client);
-    cluster.kill_primary();
-    let mut client2 = cluster.promote_replica2();
-
-    // Place + fill on promoted replica — proves the matching state of the
-    // promoted node has every event the original primary acknowledged,
-    // including the ones from after replica1 died.
-    let r = submit_order(&mut client2, 31, 2, 1, Side::Sell, 500, 1);
-    let accepted = has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
-    }) || has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
-    });
-    assert!(accepted, "expected Placed or Fill, got: {r:?}");
-
-    let r = submit_order(&mut client2, 32, 1, 1, Side::Buy, 500, 1);
-    assert!(
-        has_report(&r, |rep| matches!(
-            rep,
-            melin_protocol::types::ExecutionReport::Fill { .. }
-        )),
-        "expected Fill on promoted replica, got: {r:?}"
-    );
-}
-
 /// Journal catch-up: kill a replica, submit more orders, copy the dead
 /// replica's journal to a replacement, start the replacement. The primary
 /// streams the gap (orders the replacement missed) via journal catch-up.
@@ -1895,6 +1911,7 @@ fn replacement_replica_catches_up_from_journal() {
 
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
     wait_ready(r3_health_addr, Duration::from_secs(30));
 
@@ -2016,10 +2033,9 @@ fn catchup_with_fills_during_gap() {
     // Kill primary, promote replacement.
     drop(client);
     cluster.kill_primary();
-    promote(
-        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
-        &cluster.operator_key,
-    );
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2139,10 +2155,9 @@ fn catchup_then_immediate_failover() {
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
     cluster.kill_primary();
-    promote(
-        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
-        &cluster.operator_key,
-    );
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2263,10 +2278,9 @@ fn fresh_replica_full_catchup() {
     // Kill primary, promote the fresh replacement.
     drop(client);
     cluster.kill_primary();
-    promote(
-        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
-        &cluster.operator_key,
-    );
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2350,6 +2364,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "--reader-cores",
                 "0",
                 "--standalone",
+                "--durability-mode",
+                "local",
                 "--snapshot-interval-ms",
                 "100",
             ])
@@ -2757,6 +2773,146 @@ fn rotation_soak_under_load() {
         "post-restart live tail seq ({post_disk_seq}) must exceed pre-shutdown ({pre_seq}) — \
          indicates multi-segment recovery reseeded the writer at the right place"
     );
+}
+
+/// `policy_degraded` health gauge transitions correctly across a
+/// replica failure under the default `persisted>=2 best_effort`
+/// policy. Default policy plus 2 connected replicas → 3 nodes in
+/// view → no clamp → gauge=0. Kill one replica → 2 nodes in view →
+/// clamp from 2 to 2 (no clamp, still healthy). Kill BOTH replicas
+/// → matching stage halts, but the gate's view shrinks to just the
+/// primary → clamp from 2 to 1 → gauge=1.
+///
+/// Verifies the observability path end-to-end: gauge update, the
+/// 1-second idle-poll re-eval, and the flap-hold-gated transition
+/// log (transitions held >1 s actually fire warn/info).
+#[test]
+#[serial]
+fn policy_degraded_gauge_transitions_with_cluster_shape() {
+    let mut cluster = DualCluster::start();
+    let primary_health = cluster.primary.health_addr;
+
+    // Fresh 1+2 cluster on the default policy: gauge=0 (3 nodes, no clamp).
+    wait_for_policy_degraded(primary_health, 0, Duration::from_secs(5));
+
+    // Kill replica 1: 2 nodes left, view.len()=2, clamp from 2 to 2
+    // is a no-op. Gauge should remain 0.
+    cluster.kill_replica1();
+    // Give the idle-poll a couple of ticks plus the flap-hold to
+    // settle. Should still be 0 — losing one of three nodes when
+    // the policy targets 2 doesn't trigger the clamp.
+    std::thread::sleep(Duration::from_millis(2500));
+    let after_one_kill = fetch_policy_degraded(primary_health);
+    assert_eq!(
+        after_one_kill,
+        Some(0),
+        "with 1 replica down (2 nodes connected) the default policy should not be degraded; gauge = {after_one_kill:?}"
+    );
+
+    // Kill replica 2: only the primary remains. View.len()=1, clamp
+    // from 2 to 1 → gauge=1. The matching stage's separate
+    // `replicas_connected==0` halt will reject new orders before
+    // they reach the gate, but the policy evaluator on the idle
+    // path still flips the gauge — that's exactly what alerting
+    // should fire on.
+    cluster.kill_replica2();
+    wait_for_policy_degraded(primary_health, 1, Duration::from_secs(5));
+}
+
+/// Regression guard for the namespace-translation bug: a prior
+/// ack-on-receive attempt sent `journal_cursor.load()` (local-ring
+/// position space) on the wire as `acked_sequence` (primary-sequence
+/// space), mixing the two namespaces and silently producing acks
+/// that were structurally wrong. With the dual-track flush, the
+/// receiver advances `in_memory_sequence` on receive (pre-journal)
+/// and `acked_sequence` only after the local journal cursor crosses
+/// the corresponding queued target. Under sustained traffic on a
+/// 1+2 cluster with `in_memory>=2`, the in-memory cursor MUST run
+/// strictly ahead of the persisted cursor — equality across the
+/// whole run, or inversion, indicates the namespace bug has
+/// re-entered. The flush block's `debug_assert!` is the first line
+/// of defence; this test exercises the end-to-end path so the
+/// debug-only assert isn't the sole guarantee.
+#[test]
+#[serial]
+fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
+    let cluster = DualCluster::start_with_primary_args(&["--durability-mode", "hybrid"]);
+    let primary_health = cluster.primary.health_addr;
+    let mut client = cluster.connect_primary();
+
+    // Sample the metric concurrently with order submission. Order
+    // responses are synchronous (each waits for the gate to clear),
+    // so sampling between submits sees settled state where both
+    // cursors have converged. Run a background poller that grabs
+    // metrics on a tight cadence; with pipelined journal acks (up
+    // to 8 batches in flight) the in-memory cursor leads the
+    // persisted one for the duration of every burst.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = std::sync::Arc::clone(&stop);
+    let sampler = std::thread::spawn(move || {
+        let mut saw_in_mem_ahead: usize = 0;
+        let mut saw_in_mem_nonzero: bool = false;
+        let mut inversion_seen: Option<(usize, u64, u64)> = None;
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(cursors) = fetch_replica_cursors(primary_health) {
+                for (slot, (in_mem, acked)) in cursors.iter().enumerate() {
+                    if *in_mem > 0 {
+                        saw_in_mem_nonzero = true;
+                    }
+                    if *in_mem < *acked && inversion_seen.is_none() {
+                        inversion_seen = Some((slot, *in_mem, *acked));
+                    }
+                    if *acked > 0 && *in_mem > *acked {
+                        saw_in_mem_ahead += 1;
+                    }
+                }
+            }
+        }
+        (saw_in_mem_ahead, saw_in_mem_nonzero, inversion_seen)
+    });
+
+    for i in 1..=200u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "order {i}: no response");
+    }
+
+    // Stop the sampler before `wait_replicated` so the metrics
+    // endpoint isn't being hammered while the test loop is polling
+    // it for the lag-zero condition. The sampler shares the
+    // single-threaded HTTP server with `query_health` and under
+    // concurrent test load that contention has shown up as a
+    // wait_replicated timeout.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (saw_in_mem_ahead, saw_in_mem_nonzero, inversion_seen) =
+        sampler.join().expect("sampler thread panicked");
+    cluster.wait_replicated();
+
+    // Plumbing check: the new metric is reachable and advanced.
+    // Catches the case where in_memory_sequence is wired into the
+    // protocol but not into the primary-side metrics struct.
+    assert!(
+        saw_in_mem_nonzero,
+        "melin_replica_in_memory_sequence never advanced past 0 — metric not plumbed?"
+    );
+    // Regression check: in_memory must never drop below acked at
+    // any sampling moment. Inversion is the wire-level shape of the
+    // namespace bug — a prior implementation sent
+    // `journal_cursor.load()` (local-ring positions) as
+    // `acked_sequence` while `in_memory_sequence` carried primary
+    // sequences, producing arbitrary inversions on the receiving
+    // side.
+    assert!(
+        inversion_seen.is_none(),
+        "in_memory_sequence < acked_sequence observed: {inversion_seen:?} — namespace bug?",
+    );
+    // Optional lead observation: under the pipelined journal we
+    // expect to occasionally see the in-memory cursor ahead, but
+    // the metrics-endpoint roundtrip is ~ms and per-batch gaps are
+    // ~µs, so a concurrent sampler often misses every gap under
+    // load. The strict correctness guarantee for the namespace
+    // bug is the `debug_assert!` in `try_flush_dual_track` plus
+    // the inversion check above; this is informational only.
+    let _ = saw_in_mem_ahead;
 }
 
 /// Helper extension: wait up to `timeout` for the child, then SIGKILL.

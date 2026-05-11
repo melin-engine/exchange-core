@@ -99,9 +99,9 @@ pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
-    quorum_durability: bool,
+    durability_mode: Arc<std::sync::atomic::AtomicU8>,
+    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    replica_active: Option<[Arc<AtomicBool>; 2]>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
@@ -109,6 +109,18 @@ pub fn run(
     utilization: Arc<StageUtilization>,
     busy_spin: bool,
 ) {
+    // Mirrors `response::run`: derive the local Policy from the shared
+    // mode atomic and observe runtime swaps from the admin
+    // `DURABILITY` command.
+    use crate::durability_policy::DurabilityMode;
+    let mut active_mode =
+        DurabilityMode::from_u8(durability_mode.load(Ordering::Relaxed)).unwrap_or_else(|| {
+            tracing::error!(
+                "durability_mode atomic held a corrupted byte at startup; defaulting to hybrid (DPDK)"
+            );
+            DurabilityMode::Hybrid
+        });
+    let mut policy = active_mode.to_policy();
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
 
@@ -116,7 +128,35 @@ pub fn run(
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position (see response.rs for full explanation).
-    let mut cached_durable_pos: u64 = 0;
+    // Initialised below from the policy's startup evaluation.
+    let mut cached_durable_pos: u64;
+
+    // Degradation logger — same scheme as the TCP response stage
+    // (see `response::run`). Initialised below from an explicit
+    // policy evaluation so a degraded startup state shows up on
+    // `/healthz` and in the journal even before the first batch.
+    let startup_now = Instant::now();
+    let mut last_policy_check = startup_now;
+    const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
+    const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+    let mut degraded_logger;
+    {
+        let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+        let metrics_ref = replication_metrics.as_deref();
+        let active_ref = replica_active.as_ref();
+        let status =
+            crate::response::evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
+        cached_durable_pos = status.durable_pos;
+        utilization
+            .policy_degraded
+            .store(status.degraded, Ordering::Relaxed);
+        degraded_logger = if status.degraded {
+            crate::response::DegradationLogger::new_starting_degraded(startup_now, &policy)
+        } else {
+            crate::response::DegradationLogger::new(startup_now)
+        };
+    }
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
@@ -157,6 +197,31 @@ pub fn run(
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
 
     loop {
+        // Observe runtime mode swaps from the admin `DURABILITY`
+        // command. See `response::run` for the design rationale.
+        let observed_byte = durability_mode.load(Ordering::Relaxed);
+        if observed_byte != active_mode.as_u8() {
+            match DurabilityMode::from_u8(observed_byte) {
+                Some(next) => {
+                    tracing::info!(
+                        prev = active_mode.as_str(),
+                        next = next.as_str(),
+                        "durability mode swapped at runtime (DPDK)"
+                    );
+                    active_mode = next;
+                    policy = active_mode.to_policy();
+                    cached_durable_pos = 0;
+                    degraded_logger = crate::response::DegradationLogger::new(Instant::now());
+                }
+                None => {
+                    tracing::error!(
+                        byte = observed_byte,
+                        "durability_mode atomic held a corrupted byte; retaining prior mode (DPDK)"
+                    );
+                }
+            }
+        }
+
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
@@ -215,6 +280,35 @@ pub fn run(
                     active_connections.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+
+            // Re-evaluate the policy on a slow timer so the
+            // `policy_degraded` flag and warn-log track the cluster
+            // state even when no batches are flowing. See response.rs
+            // for the rationale.
+            {
+                let now_ts = Instant::now();
+                if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
+                    last_policy_check = now_ts;
+                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    let status = crate::response::evaluate_durability(
+                        &policy,
+                        journal_pos,
+                        metrics_ref,
+                        active_ref,
+                    );
+                    degraded_logger.tick(
+                        &policy,
+                        &utilization,
+                        status.degraded,
+                        now_ts,
+                        DEGRADED_LOG_INTERVAL,
+                    );
+                    cached_durable_pos = status.durable_pos;
+                }
+            }
+
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
@@ -242,27 +336,54 @@ pub fn run(
                 .map(|s| s.input_seq)
                 .max()
                 .expect("non-empty batch");
-            let needed = max_seq + 1;
+            // Saturating add — see response.rs for the rationale.
+            let needed = max_seq.saturating_add(1);
             #[cfg(feature = "tick-to-trade")]
             {
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
             }
             if cached_durable_pos < needed {
                 loop {
+                    // Observe a mode swap mid-gate-wait so a stuck
+                    // batch can be unblocked by an operator
+                    // `DURABILITY <mode>` command. See `response.rs`
+                    // for the rationale and ordering choice.
+                    let observed_byte = durability_mode.load(Ordering::Relaxed);
+                    if observed_byte != active_mode.as_u8()
+                        && let Some(next) = DurabilityMode::from_u8(observed_byte)
+                    {
+                        tracing::info!(
+                            prev = active_mode.as_str(),
+                            next = next.as_str(),
+                            "durability mode swapped during gate wait (DPDK)"
+                        );
+                        active_mode = next;
+                        policy = active_mode.to_policy();
+                        degraded_logger = crate::response::DegradationLogger::new(Instant::now());
+                    }
+
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                    let repl_min = replication_cursor.load(Ordering::Acquire);
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    let repl_min =
+                        crate::response::connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
 
-                    cached_durable_pos = crate::response::durable_pos(
+                    let status = crate::response::evaluate_durability(
+                        &policy,
                         journal_pos,
-                        repl_min,
-                        fastest_replica_cursor.load(Ordering::Acquire),
-                        quorum_durability,
+                        metrics_ref,
+                        active_ref,
                     );
+                    cached_durable_pos = status.durable_pos;
+                    utilization
+                        .policy_degraded
+                        .store(status.degraded, Ordering::Relaxed);
                     if cached_durable_pos >= needed {
-                        // Which cursor was slower — see response.rs comment.
+                        // Attribution: which subsystem was slowest. See
+                        // response.rs for the rationale.
                         if journal_pos <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {
@@ -278,6 +399,18 @@ pub fn run(
         // One Instant::now() per batch for heartbeat tracking instead of
         // per response — heartbeat interval is 10s, sub-ms precision is plenty.
         let batch_now = Instant::now();
+
+        // Log degradation transitions / heartbeat after the gate
+        // opens. Same scheme as the TCP response stage.
+        let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
+        degraded_logger.tick(
+            &policy,
+            &utilization,
+            degraded_now,
+            batch_now,
+            DEGRADED_LOG_INTERVAL,
+        );
+        last_policy_check = batch_now;
 
         // Encode and queue responses. Each slot expands to at most two
         // wire frames: the payload (Report / QueryResponse / EngineError)

@@ -67,7 +67,7 @@ use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -269,10 +269,20 @@ pub fn run_rumcast(
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // One shared mode atomic per process — see the kernel-TCP
+    // `run_with_shutdown` for the rationale (pre-staging the
+    // post-promotion mode via admin `DURABILITY` before `PROMOTE`).
+    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
     if let Some(primary_addr) = config.replica_of {
-        return run_rumcast_replica(config, rumcast_config, primary_addr, shutdown);
+        return run_rumcast_replica(
+            config,
+            rumcast_config,
+            primary_addr,
+            shutdown,
+            durability_mode_atomic,
+        );
     }
-    run_rumcast_primary(config, rumcast_config, shutdown)
+    run_rumcast_primary(config, rumcast_config, shutdown, durability_mode_atomic)
 }
 
 /// Primary path. With `--replication-bind` set, also spawns the
@@ -281,6 +291,7 @@ fn run_rumcast_primary(
     config: ServerConfig,
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         bind = %rumcast_config.bind,
@@ -328,6 +339,7 @@ fn run_rumcast_primary(
             addr,
             None,
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -343,6 +355,7 @@ fn run_rumcast_primary(
         needs_seeding,
         Some(orders),
         rotate_flag,
+        durability_mode_atomic,
     )
 }
 
@@ -371,10 +384,22 @@ fn run_rumcast_primary_with_state(
     // replica's journal stage observed; the new primary's stage picks
     // up where it left off.
     rotate_flag: Option<Arc<AtomicBool>>,
+    // Shared durability mode atomic — see the kernel-TCP
+    // `run_with_shutdown` for the design.
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+    if config.standalone
+        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+    {
+        return Err(format!(
+            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
+            config.durability_mode,
+        )
+        .into());
     }
 
     // Read raw genesis entry bytes before the writer is consumed by
@@ -437,13 +462,29 @@ fn run_rumcast_primary_with_state(
     } = pipeline;
 
     // Fastest-replica cursor: max(slot0_acked, slot1_acked). Mirrors the
-    // TCP path's allocation in `server::run_as_primary`. Read by the
-    // response-gate `durable_pos` call in `session_translator`; written
-    // by the rumcast replication sender when present (None in the
-    // standalone case keeps it at u64::MAX so the gate degrades to the
-    // journal-only path).
+    // TCP path's allocation in `server::run_as_primary`. Written by the
+    // rumcast replication sender; consumed by the health endpoint. The
+    // response gate now reads per-slot cursors from `replication_metrics`
+    // (built below) instead.
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
-    let quorum_durability = !config.no_quorum_durability;
+
+    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config.durability_mode);
+    info!(
+        mode = %active_mode_at_start,
+        policy = %active_mode_at_start.to_policy(),
+        "durability mode active"
+    );
+
+    let replica_active: Option<[Arc<AtomicBool>; 2]> =
+        replication_ring_progress.as_ref().map(|rp| {
+            [
+                Arc::clone(&rp.active_flags[0]),
+                Arc::clone(&rp.active_flags[1]),
+            ]
+        });
 
     // Wire runtime journal rotation: size threshold + the shared
     // admin flag so `ROTATE` keeps working across a replica → primary
@@ -671,8 +712,9 @@ fn run_rumcast_primary_with_state(
     // enabled; left None in standalone. Mirrors the TCP path's
     // shape so the `/healthz` endpoint reports the same fields
     // regardless of transport.
-    let mut replication_metrics_for_health: Option<Arc<crate::replication::ReplicationMetrics>> =
-        None;
+    // Per-slot replica cursor metrics. Populated when replication is
+    // enabled; used by both the health endpoint and the response gate.
+    let mut replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> = None;
     let mut replication_ring_producer_cursors: Option<
         [Arc<dyn melin_disruptor::ring::QueueCursor>; 2],
     > = None;
@@ -690,7 +732,7 @@ fn run_rumcast_primary_with_state(
             .clone()
             .ok_or("replicas_connected must be Some when replication is enabled")?;
         let metrics = Arc::new(crate::replication::ReplicationMetrics::default());
-        replication_metrics_for_health = Some(Arc::clone(&metrics));
+        replication_metrics = Some(Arc::clone(&metrics));
         replication_ring_producer_cursors = Some([
             Arc::clone(&progress.producer_cursors[0]),
             Arc::clone(&progress.producer_cursors[1]),
@@ -784,7 +826,7 @@ fn run_rumcast_primary_with_state(
                 replication_cursor: Arc::clone(&replication_cursor),
                 pipeline_healthy: Arc::clone(&pipeline_healthy),
                 replicas_connected: replicas_connected.clone(),
-                replication_metrics: replication_metrics_for_health,
+                replication_metrics: replication_metrics.as_ref().map(Arc::clone),
                 replication_ring_producer_cursors,
                 replication_ring_consumer_cursors,
                 fastest_replica_cursor: fastest_replica_cursor_for_health,
@@ -841,8 +883,9 @@ fn run_rumcast_primary_with_state(
     {
         let shutdown = Arc::clone(&shutdown);
         let cursor = Arc::clone(&journal_cursor);
-        let repl_cursor = Arc::clone(&replication_cursor);
-        let fastest_cursor = Arc::clone(&fastest_replica_cursor);
+        let replication_metrics = replication_metrics.as_ref().map(Arc::clone);
+        let replica_active = replica_active.clone();
+        let durability_mode_session = Arc::clone(&durability_mode_atomic);
         let authorized_keys = Arc::clone(&authorized_keys);
         let mut muxed_receiver = muxed_receiver;
         let mut muxed_sender = muxed_sender;
@@ -864,9 +907,9 @@ fn run_rumcast_primary_with_state(
                         &mut input_producer,
                         response_consumer,
                         cursor,
-                        repl_cursor,
-                        fastest_cursor,
-                        quorum_durability,
+                        durability_mode_session,
+                        replication_metrics,
+                        replica_active,
                         authorized_keys,
                         &shutdown,
                         yield_idle,
@@ -976,15 +1019,17 @@ fn session_translator<S, R>(
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
-    // Replication-cursor inputs for the response gate. `replication_cursor`
-    // = min(slot0_acked, slot1_acked) — both replicas have confirmed up to
-    // here. `fastest_replica_cursor` = max(slot0, slot1). Both stay at
-    // u64::MAX in standalone mode, which makes `durable_pos` collapse to
-    // the journal-only path. See `crate::response::durable_pos` for the
-    // formula.
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
-    quorum_durability: bool,
+    // Durability gate inputs. The mode atomic is the single source of
+    // truth — the gate derives its `Policy` from it and re-derives on
+    // change (via the admin `DURABILITY` command). The cursor view is
+    // built from the primary's journal cursor + per-slot replica
+    // cursors (in-memory and persisted) read from `replication_metrics`,
+    // filtered to only currently-connected slots via `replica_active`.
+    // Both `None` in standalone mode, in which case the view contains
+    // only the primary.
+    durability_mode: Arc<AtomicU8>,
+    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    replica_active: Option<[Arc<AtomicBool>; 2]>,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
     yield_idle: bool,
@@ -992,6 +1037,15 @@ fn session_translator<S, R>(
     S: UdpTransport,
     R: UdpTransport,
 {
+    use crate::durability_policy::DurabilityMode;
+    let mut active_mode =
+        DurabilityMode::from_u8(durability_mode.load(Ordering::Relaxed)).unwrap_or_else(|| {
+            tracing::error!(
+                "durability_mode atomic held a corrupted byte at startup; defaulting to hybrid (rumcast)"
+            );
+            DurabilityMode::Hybrid
+        });
+    let mut policy = active_mode.to_policy();
     let mut sessions: HashMap<u32, AuthStage> = HashMap::new();
     // In-flight per-slot progress: a slot expands to up to two wire
     // kinds (payload + trailing BatchEnd via `is_last_in_request`),
@@ -1034,6 +1088,29 @@ fn session_translator<S, R>(
     let mut last_sweep_at = Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
+        // Observe runtime mode swaps from the admin `DURABILITY`
+        // command. See `response::run` for the design rationale.
+        let observed_byte = durability_mode.load(Ordering::Relaxed);
+        if observed_byte != active_mode.as_u8() {
+            match DurabilityMode::from_u8(observed_byte) {
+                Some(next) => {
+                    tracing::info!(
+                        prev = active_mode.as_str(),
+                        next = next.as_str(),
+                        "durability mode swapped at runtime (rumcast)"
+                    );
+                    active_mode = next;
+                    policy = active_mode.to_policy();
+                }
+                None => {
+                    tracing::error!(
+                        byte = observed_byte,
+                        "durability_mode atomic held a corrupted byte; retaining prior mode (rumcast)"
+                    );
+                }
+            }
+        }
+
         let mut did_work = false;
         diag.iters += 1;
 
@@ -1293,12 +1370,15 @@ fn session_translator<S, R>(
             if !prog.durable {
                 let needed = prog.slot.input_seq + 1;
                 if cached_durable_pos < needed {
-                    cached_durable_pos = crate::response::durable_pos(
+                    let metrics_ref = replication_metrics.as_deref();
+                    let active_ref = replica_active.as_ref();
+                    cached_durable_pos = crate::response::evaluate_durability(
+                        &policy,
                         journal_cursor.get().load(Ordering::Acquire),
-                        replication_cursor.load(Ordering::Acquire),
-                        fastest_replica_cursor.load(Ordering::Acquire),
-                        quorum_durability,
-                    );
+                        metrics_ref,
+                        active_ref,
+                    )
+                    .durable_pos;
                     if cached_durable_pos < needed {
                         // Bounded spin. Matching publishes outputs in
                         // parallel with the journal, so the journal often
@@ -1314,12 +1394,13 @@ fn session_translator<S, R>(
                             for _ in 0..PAUSES_PER_RECHECK {
                                 std::hint::spin_loop();
                             }
-                            cached_durable_pos = crate::response::durable_pos(
+                            cached_durable_pos = crate::response::evaluate_durability(
+                                &policy,
                                 journal_cursor.get().load(Ordering::Acquire),
-                                replication_cursor.load(Ordering::Acquire),
-                                fastest_replica_cursor.load(Ordering::Acquire),
-                                quorum_durability,
-                            );
+                                metrics_ref,
+                                active_ref,
+                            )
+                            .durable_pos;
                             if cached_durable_pos >= needed {
                                 still_blocked = false;
                                 break 'spin;
@@ -2051,6 +2132,7 @@ fn run_rumcast_replica(
     rumcast_config: RumcastConfig,
     primary_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         primary = %primary_addr,
@@ -2105,6 +2187,7 @@ fn run_rumcast_replica(
             addr,
             Some(Arc::clone(&promote_flag)),
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -2133,7 +2216,6 @@ fn run_rumcast_replica(
         config.snapshot_interval_ms,
         config.shadow_snapshot_path(),
         config.cores,
-        config.async_replica_ack,
         !config.yield_idle,
         rotation,
         config.max_orders_per_account,
@@ -2158,6 +2240,7 @@ fn run_rumcast_replica(
                 false, // no seeding — state already replayed from primary
                 None,  // bind inside — promotion has no startup-race risk
                 rotate_flag,
+                durability_mode_atomic,
             )
         }
     }

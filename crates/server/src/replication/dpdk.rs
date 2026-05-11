@@ -24,7 +24,7 @@ use super::protocol::{
 use super::{
     PendingAckQueue, ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
-    update_dual_replication_cursor,
+    try_flush_dual_track, update_dual_replication_cursor,
 };
 
 enum FrameResult {
@@ -222,10 +222,14 @@ impl DpdkReplicationDriver {
             if let SlotState::Streaming(h) | SlotState::Handshaking(h) = slot.state {
                 transport.close(h);
             }
+            // Zero per-slot metrics BEFORE the active_flag Release so
+            // a reader cannot observe `active=true` paired with `cursor=0`
+            // on weak-memory architectures (see B2 in the follow-ups doc).
+            metrics.acked_sequence[i].store(0, Ordering::Relaxed);
+            metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
+            metrics.catching_up[i].store(false, Ordering::Relaxed);
             slot.active_flag.store(false, Ordering::Release);
             slot.evict_flag.store(false, Ordering::Release);
-            metrics.acked_sequence[i].store(0, Ordering::Relaxed);
-            metrics.catching_up[i].store(false, Ordering::Relaxed);
             slot.acked_cursor = u64::MAX;
             slot.recv_buf.clear();
             // Drop any unread ring entries so a reconnecting replica
@@ -420,6 +424,18 @@ impl DpdkReplicationDriver {
                                         slot.consumer.commit();
                                     }
 
+                                    // Seed the per-slot metrics cursors before flipping
+                                    // active so a reader that observes active=true also
+                                    // observes a non-zero cursor pair. Without this, a
+                                    // degraded gate freezes after a replica rejoins —
+                                    // see tcp_sender for the full rationale. Relaxed is
+                                    // fine because the active_flag Release below
+                                    // publishes these stores in program order.
+                                    metrics.acked_sequence[slot_idx]
+                                        .store(h.last_sequence, Ordering::Relaxed);
+                                    metrics.in_memory_sequence[slot_idx]
+                                        .store(h.last_sequence, Ordering::Relaxed);
+
                                     // Mark ring active before signaling readiness
                                     // so the journal stage publishes when seeds flow.
                                     slot.active_flag.store(true, Ordering::Release);
@@ -495,6 +511,8 @@ impl DpdkReplicationDriver {
                                     slot.acked_cursor = ack.acked_sequence + 1;
                                     metrics.acked_sequence[slot_idx]
                                         .store(ack.acked_sequence, Ordering::Relaxed);
+                                    metrics.in_memory_sequence[slot_idx]
+                                        .store(ack.in_memory_sequence, Ordering::Relaxed);
                                     update_dual_replication_cursor(
                                         slot.acked_cursor,
                                         other_acked,
@@ -518,9 +536,11 @@ impl DpdkReplicationDriver {
                     compact_recv_buf(&mut slot.recv_buf, consumed);
                     if ack_error {
                         transport.close(handle);
+                        // Zero metrics before active_flag Release — see B2.
+                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.active_flag.store(false, Ordering::Release);
                         slot.acked_cursor = u64::MAX;
-                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
@@ -587,9 +607,11 @@ impl DpdkReplicationDriver {
                                 "TX overflow on replica socket — disconnecting"
                             );
                             transport.close(handle);
+                            // Zero metrics before active_flag Release — see B2.
+                            metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                            metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
                             slot.active_flag.store(false, Ordering::Release);
                             slot.acked_cursor = u64::MAX;
-                            metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                             slot.recv_buf.clear();
                             slot.state = SlotState::Idle;
                             replicas_connected.fetch_sub(1, Ordering::Release);
@@ -618,9 +640,11 @@ impl DpdkReplicationDriver {
                     // 4. Check for disconnect.
                     if !transport.is_active(handle) {
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
+                        // Zero metrics before active_flag Release — see B2.
+                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.active_flag.store(false, Ordering::Release);
                         slot.acked_cursor = u64::MAX;
-                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
@@ -899,7 +923,6 @@ pub fn run_receiver_dpdk(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
-    async_ack: bool,
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     // SEC-03: must equal the primary's --max-orders-per-account.
     max_orders_per_account: u32,
@@ -1297,6 +1320,11 @@ pub fn run_receiver_dpdk(
         let mut pending_acks = PendingAckQueue::new(pipeline_depth);
         let mut received_data = false;
         let mut accum_end_sequence: u64 = 0;
+        // Last cursor pair sent on the wire. Coalesces dual-track ack
+        // triggers (see the `// --- Flush acks ---` block below for the
+        // full rationale; mirrors `tcp_receiver`'s scheme).
+        let mut last_sent_acked_seq: u64 = 0;
+        let mut last_sent_in_memory_seq: u64 = 0;
 
         // Encode an ack into send_buf and queue it on the DPDK transport.
         //
@@ -1317,14 +1345,9 @@ pub fn run_receiver_dpdk(
         // with an updated cursor.
         const ACK_RETRY_CAP: u32 = 32;
         macro_rules! send_ack_dpdk {
-            ($seq:expr) => {{
+            ($ack:expr) => {{
                 send_buf.clear();
-                encode_ack(
-                    &Ack {
-                        acked_sequence: $seq,
-                    },
-                    &mut send_buf,
-                );
+                encode_ack(&$ack, &mut send_buf);
                 let mut attempts: u32 = 0;
                 loop {
                     if transport.queue_send(handle, &send_buf) {
@@ -1366,8 +1389,11 @@ pub fn run_receiver_dpdk(
         let session_exit = 'streaming: loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("replica shutting down (DPDK)");
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
-                    send_ack_dpdk!(seq);
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
+                    send_ack_dpdk!(Ack {
+                        acked_sequence: seq,
+                        in_memory_sequence: accum_end_sequence,
+                    });
                     transport.poll();
                 }
                 break 'streaming SessionExit::Shutdown;
@@ -1409,34 +1435,47 @@ pub fn run_receiver_dpdk(
                         pending_acks.push(drain_last_target, accum_end_sequence);
                     }
                 }
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
-                    send_ack_dpdk!(seq);
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
+                    send_ack_dpdk!(Ack {
+                        acked_sequence: seq,
+                        in_memory_sequence: accum_end_sequence,
+                    });
                     transport.poll();
                 }
                 break 'streaming SessionExit::Promote;
             }
 
-            // Flush any acks that have become durable since last iteration.
-            let ready_seq = if async_ack {
-                pending_acks.pop_all_async()
-            } else {
-                pending_acks.pop_ready(journal_cursor)
-            };
-            if let Some(seq) = ready_seq {
-                send_ack_dpdk!(seq);
+            // --- Flush acks (dual-track) ---
+            //
+            // See `try_flush_dual_track` in `replication/mod.rs` for the
+            // model. The helper centralises the persisted-vs-in-memory
+            // logic and the namespace translation between local-ring
+            // positions and primary sequences across all three receivers.
+            if let Some(ack) = try_flush_dual_track(
+                &mut pending_acks,
+                journal_cursor,
+                accum_end_sequence,
+                last_sent_acked_seq,
+                last_sent_in_memory_seq,
+            ) {
+                send_ack_dpdk!(ack);
+                last_sent_acked_seq = ack.acked_sequence;
+                last_sent_in_memory_seq = ack.in_memory_sequence;
             }
 
             // Backpressure: if pipeline is saturated, block until the oldest
             // batch is durable.
             if pending_acks.is_full() {
-                let seq = if async_ack {
-                    pending_acks
-                        .pop_all_async()
-                        .expect("non-empty queue after full check")
-                } else {
-                    pending_acks.pop_oldest_blocking(journal_cursor)
-                };
-                send_ack_dpdk!(seq);
+                let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
+                let in_mem_now = accum_end_sequence;
+                send_ack_dpdk!(Ack {
+                    acked_sequence: seq,
+                    in_memory_sequence: in_mem_now,
+                });
+                // Sync trackers so the flush block doesn't refire — see
+                // tcp_receiver for the full rationale.
+                last_sent_acked_seq = seq;
+                last_sent_in_memory_seq = in_mem_now;
             }
 
             // Poll smoltcp and receive data.
@@ -1445,8 +1484,11 @@ pub fn run_receiver_dpdk(
 
             // Check for disconnect.
             if !transport.is_active(handle) && recv_buf.is_empty() {
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
-                    send_ack_dpdk!(seq);
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
+                    send_ack_dpdk!(Ack {
+                        acked_sequence: seq,
+                        in_memory_sequence: accum_end_sequence,
+                    });
                     transport.poll();
                 }
                 break 'streaming SessionExit::Disconnected;

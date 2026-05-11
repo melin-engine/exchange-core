@@ -31,7 +31,7 @@ use super::protocol::{
     decode_primary_message, encode_ack, encode_challenge_response, encode_handshake,
     try_decode_input_batch,
 };
-use super::{PendingAckQueue, shutdown_pipeline, sleep_checking_flags};
+use super::{PendingAckQueue, shutdown_pipeline, sleep_checking_flags, try_flush_dual_track};
 
 // ---------------------------------------------------------------------------
 // Wire-format constants — must match `replication/rumcast_sender.rs`.
@@ -85,7 +85,6 @@ pub fn run_receiver_rumcast(
     snapshot_interval_secs: u64,
     snapshot_path: PathBuf,
     cores: crate::server::PipelineCores,
-    async_ack: bool,
     busy_spin: bool,
     rotation: Option<(u64, Arc<AtomicBool>)>,
     // SEC-03: must equal the primary's --max-orders-per-account.
@@ -351,13 +350,12 @@ pub fn run_receiver_rumcast(
             &mut accum_end_sequence,
             shutdown,
             promote,
-            async_ack,
             busy_spin,
         );
 
         // ---- Common teardown ----
-        if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
-            let _ = session_state.send_ack(seq);
+        if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor, busy_spin) {
+            let _ = session_state.send_ack(seq, accum_end_sequence);
         }
 
         let pipeline_state = shutdown_pipeline(
@@ -584,9 +582,15 @@ impl SessionState {
     /// emits the `[len:u32][type][payload]` framing — we publish the
     /// whole encoded buffer so the primary's `strip_length_prefix`
     /// finds what it expects.
-    fn send_ack(&self, acked_sequence: u64) -> io::Result<()> {
+    fn send_ack(&self, acked_sequence: u64, in_memory_sequence: u64) -> io::Result<()> {
         let mut buf = Vec::with_capacity(16);
-        encode_ack(&Ack { acked_sequence }, &mut buf);
+        encode_ack(
+            &Ack {
+                acked_sequence,
+                in_memory_sequence,
+            },
+            &mut buf,
+        );
         let dummy_shutdown = AtomicBool::new(false);
         self.publish(&buf, &dummy_shutdown)
     }
@@ -594,9 +598,20 @@ impl SessionState {
     /// Same as `send_ack` but observes the supplied shutdown flag —
     /// the streaming loop uses this so a shutdown during a backpressure
     /// spin-wait short-circuits.
-    fn send_ack_with(&self, acked_sequence: u64, shutdown: &AtomicBool) -> io::Result<()> {
+    fn send_ack_with(
+        &self,
+        acked_sequence: u64,
+        in_memory_sequence: u64,
+        shutdown: &AtomicBool,
+    ) -> io::Result<()> {
         let mut buf = Vec::with_capacity(16);
-        encode_ack(&Ack { acked_sequence }, &mut buf);
+        encode_ack(
+            &Ack {
+                acked_sequence,
+                in_memory_sequence,
+            },
+            &mut buf,
+        );
         self.publish(&buf, shutdown)
     }
 }
@@ -892,7 +907,6 @@ enum SessionExit {
     Fatal(Box<dyn std::error::Error>),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn streaming_loop(
     session: &SessionState,
     input_producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,
@@ -902,7 +916,6 @@ fn streaming_loop(
     accum_end_sequence: &mut u64,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
-    async_ack: bool,
     busy_spin: bool,
 ) -> SessionExit {
     let mut last_publisher_seen = Instant::now();
@@ -911,6 +924,10 @@ fn streaming_loop(
     // from a dead one. Without this, a quiescent stream produces no acks
     // and the primary would incorrectly evict the slot.
     let mut last_sent_ack_seq: u64 = 0;
+    // Last in-memory cursor sent on the wire. Together with
+    // `last_sent_ack_seq` this drives the dual-track ack coalescing
+    // — see the flush block below; mirrors `tcp_receiver`.
+    let mut last_sent_in_memory_seq: u64 = 0;
     let mut last_keepalive = Instant::now();
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1014,40 +1031,46 @@ fn streaming_loop(
         }
 
         // ---- Flush acks ----
-        let ready_seq = if async_ack {
-            pending_acks.pop_all_async()
-        } else {
-            pending_acks.pop_ready(journal_cursor)
-        };
-        if let Some(seq) = ready_seq {
-            if let Err(e) = session.send_ack_with(seq, shutdown) {
+        //
+        // Two-track model (see `try_flush_dual_track` for the full
+        // rationale): pop the queue for the persisted-cursor track,
+        // sample `accum_end_sequence` for the in-memory track, fire one
+        // ack iff either has advanced past the last value sent.
+        if let Some(ack) = try_flush_dual_track(
+            pending_acks,
+            journal_cursor,
+            *accum_end_sequence,
+            last_sent_ack_seq,
+            last_sent_in_memory_seq,
+        ) {
+            if let Err(e) =
+                session.send_ack_with(ack.acked_sequence, ack.in_memory_sequence, shutdown)
+            {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "ack send failed");
                 return SessionExit::Disconnected;
             }
-            last_sent_ack_seq = seq;
+            last_sent_ack_seq = ack.acked_sequence;
+            last_sent_in_memory_seq = ack.in_memory_sequence;
             last_keepalive = Instant::now();
         }
 
         // ---- Backpressure: drain blocking acks if pending is full ----
         if pending_acks.is_full() {
-            let seq = if async_ack {
-                pending_acks
-                    .pop_all_async()
-                    .expect("non-empty queue after full check")
-            } else {
-                pending_acks.pop_oldest_blocking(journal_cursor)
-            };
-            if let Err(e) = session.send_ack_with(seq, shutdown) {
+            let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
+            let in_mem_now = *accum_end_sequence;
+            if let Err(e) = session.send_ack_with(seq, in_mem_now, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "ack send failed during backpressure drain");
                 return SessionExit::Disconnected;
             }
+            // Sync both trackers so the flush block doesn't refire.
             last_sent_ack_seq = seq;
+            last_sent_in_memory_seq = in_mem_now;
             last_keepalive = Instant::now();
         }
 
@@ -1058,13 +1081,18 @@ fn streaming_loop(
         // one. Without this, no new orders → no new acks → the primary's
         // ack-timeout evicts a perfectly healthy replica.
         if last_sent_ack_seq > 0 && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
-            if let Err(e) = session.send_ack_with(last_sent_ack_seq, shutdown) {
+            let in_mem_now = *accum_end_sequence;
+            if let Err(e) = session.send_ack_with(last_sent_ack_seq, in_mem_now, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "keepalive ack send failed");
                 return SessionExit::Disconnected;
             }
+            // Keepalive may advance the in-memory track even if the
+            // persisted track is idle; keep the tracker in sync so the
+            // flush block doesn't refire on a stale comparison.
+            last_sent_in_memory_seq = in_mem_now;
             last_keepalive = Instant::now();
         }
 

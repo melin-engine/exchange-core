@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use std::hash::{Hash, Hasher};
 
@@ -172,21 +172,6 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub replication_heartbeat_secs: u64,
 
-    /// Acknowledge replicated batches as soon as they are received and
-    /// queued for the local journal stage, instead of waiting for the
-    /// local fsync to complete. Removes ~50–80µs of fsync latency from
-    /// the replication round-trip, lifting steady-state throughput.
-    ///
-    /// Durability tradeoff: a replica crash before its local fsync can
-    /// lose recently-acked batches from that replica's journal. The
-    /// primary still has them on disk and re-syncs the replica via the
-    /// catch-up protocol on reconnect, so end-to-end no data is lost
-    /// unless the primary's disk also fails simultaneously. Acceptable
-    /// for venues where dual-disk-failure is mitigated by separate means
-    /// (RAID, three-way replication, off-site journaling).
-    #[arg(long, default_value_t = false)]
-    pub async_replica_ack: bool,
-
     /// Number of receive batches the replica can have awaiting local
     /// journal fsync before the receiver applies backpressure. Must be a
     /// power of two. Higher values allow the primary to stay further ahead
@@ -201,15 +186,26 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
-    /// Disable quorum-based durability. By default, when 2 replicas have
-    /// acked an event the response stage sends without waiting for the local
-    /// journal fsync — removing NVMe tail latency from the critical path.
-    /// The journal still writes (for local crash recovery) but does not gate
-    /// client responses. Falls back to fsync-gated mode automatically when
-    /// fewer than 2 replicas are connected. This flag forces fsync-gated
-    /// mode unconditionally (useful for debugging).
-    #[arg(long, default_value_t = false)]
-    pub no_quorum_durability: bool,
+    /// Durability mode that gates client responses. One of:
+    ///
+    /// - `local`              `persisted>=1`. Single-node durability;
+    ///   required with `--standalone`. Dev/staging deployments.
+    /// - `hybrid` (default)   `persisted>=1 && in_memory>=2`. Primary's
+    ///   disk plus an in-memory ack from a second node. Single-failure-
+    ///   safe with a brief RAM-only window on the secondary copy. The
+    ///   default — typical live trading deployments. Saves ~50–80 µs
+    ///   per fill vs `durably-replicated`.
+    /// - `durably-replicated` `persisted>=2`. Two durable copies before
+    ///   client ack. Zero RAM-only window; the gate stalls when no
+    ///   replica is connected. Compliance-driven venues.
+    ///
+    /// `--standalone` requires `local`. With `hybrid` or
+    /// `durably-replicated` and no connected replica the gate stalls —
+    /// the correct behaviour for a serious deployment that has lost
+    /// its replicas. See `docs/replication.md` for the operational
+    /// menu.
+    #[arg(long, value_enum, default_value_t = crate::durability_policy::DurabilityMode::Hybrid)]
+    pub durability_mode: crate::durability_policy::DurabilityMode,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
@@ -397,10 +393,9 @@ impl Default for ServerConfig {
             replication_batch_size: 128,
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
-            async_replica_ack: false,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
-            no_quorum_durability: false,
+            durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
             yield_idle: false,
             rumcast_client_addr: None,
             rumcast_busy_poll_us: 0,
@@ -575,6 +570,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Shared durability-mode atomic, constructed once per process and
+    // threaded through both modes. Wiring it on the replica path
+    // (where the live node has no response stage) lets an operator
+    // pre-stage the post-promotion mode with `DURABILITY <mode>`
+    // before issuing `PROMOTE`; the same `Arc` becomes the response
+    // stage's source of truth after the replica → primary transition.
+    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
+
     // Replica mode: connect to primary, receive journal stream, replay.
     // Must run before init_engine — the replica's journal is created from
     // the primary's genesis during the replication handshake.
@@ -626,6 +629,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 addr,
                 Some(Arc::clone(&promote_flag)),
                 rotate_flag.clone(),
+                Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -653,7 +657,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
-            config.async_replica_ack,
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -677,6 +680,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
                     rotate_flag,
+                    durability_mode_atomic,
                 );
             }
         }
@@ -699,6 +703,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             addr,
             None,
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -722,6 +727,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         authorized_keys,
         needs_seeding,
         rotate_flag,
+        durability_mode_atomic,
     )
 }
 
@@ -824,6 +830,7 @@ fn shutdown_pipeline_stages(
 /// primary stage is built here; passing the flag through means the
 /// admin endpoint, which was spawned once at process start, keeps
 /// driving the new stage's rotation.
+#[allow(clippy::too_many_arguments)]
 fn run_as_primary<L: BlockingTransportListener>(
     exchange: App,
     writer: JournalWriter,
@@ -833,6 +840,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
     rotate_flag: Option<Arc<AtomicBool>>,
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
@@ -846,6 +854,18 @@ fn run_as_primary<L: BlockingTransportListener>(
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+    // `--standalone` declares "no replicas ever" — only `local` can be
+    // satisfied. `hybrid` and `durably-replicated` would stall the gate
+    // forever; reject loudly at startup with the fix in the message.
+    if config.standalone
+        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+    {
+        return Err(format!(
+            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
+            config.durability_mode,
+        )
+        .into());
     }
     // Read the raw genesis entry bytes from the journal file before
     // moving the writer into the pipeline. Sent to the replica during
@@ -1002,12 +1022,51 @@ fn run_as_primary<L: BlockingTransportListener>(
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
+    // ReplicationMetrics must be constructed before the response thread
+    // spawns so the gate can read per-slot cursors at every poll.
+    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+        if replication_consumers.is_some() {
+            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+        } else {
+            None
+        };
+
+    // The operator-selected durability mode is published through a
+    // shared `AtomicU8` constructed by the caller (so the admin
+    // listener can hold a clone before this function runs). The
+    // response stage reads it once per gate iteration and rebuilds its
+    // local `Policy` when the byte changes; the admin `DURABILITY`
+    // command writes it. Re-derive the active mode here for the
+    // startup log so what we log matches what's actually live (an
+    // operator may have stored a different mode via `DURABILITY`
+    // between `run_with_shutdown` and this point).
+    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config.durability_mode);
+    info!(
+        mode = %active_mode_at_start,
+        policy = %active_mode_at_start.to_policy(),
+        "durability mode active"
+    );
+
+    // Per-slot active flags exposed by the journal stage's replication
+    // ring; the response gate filters disconnected slots out of the
+    // policy's cursor view via these.
+    let replica_active: Option<[Arc<AtomicBool>; 2]> =
+        replication_ring_progress.as_ref().map(|rp| {
+            [
+                Arc::clone(&rp.active_flags[0]),
+                Arc::clone(&rp.active_flags[1]),
+            ]
+        });
+
     // Clone cursors for the response thread — the originals are needed
     // later for seed drain gating.
     let journal_cursor_response = Arc::clone(&journal_cursor);
-    let replication_cursor_response = Arc::clone(&replication_cursor);
-    let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
-    let quorum_durability = !config.no_quorum_durability;
+    let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
+    let replica_active_response = replica_active.clone();
+    let durability_mode_response = Arc::clone(&durability_mode_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
@@ -1021,9 +1080,9 @@ fn run_as_primary<L: BlockingTransportListener>(
                 control_rx,
                 crate::response::Response {
                     journal_cursor: journal_cursor_response,
-                    replication_cursor: replication_cursor_response,
-                    fastest_replica_cursor: fastest_replica_cursor_response,
-                    quorum_durability,
+                    durability_mode: durability_mode_response,
+                    replication_metrics: replication_metrics_response,
+                    replica_active: replica_active_response,
                     heartbeat_interval,
                     busy_spin,
                     utilization: response_utilization_thread,
@@ -1044,12 +1103,6 @@ fn run_as_primary<L: BlockingTransportListener>(
     // `replica_ready` is set when the first replica connects — seeding waits
     // on this to ensure seed events aren't drained before the replica arrives.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
-        if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-        } else {
-            None
-        };
     // Ring depth monitoring: the producer cursors are in ReplicationRingProgress
     // (owned by this function), so we compute depth via ring_progress rather
     // than storing Box<dyn QueueCursor> in ReplicationMetrics. The health
@@ -1628,6 +1681,10 @@ pub fn run_dpdk(
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Mirrors the kernel-TCP `run_with_shutdown` path: one atomic per
+    // process, threaded into both replica (pre-staging for promotion)
+    // and primary admin listeners.
+    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
     // Actual queue count may be less than requested (TAP only supports 1).
@@ -1658,6 +1715,7 @@ pub fn run_dpdk(
                 addr,
                 Some(Arc::clone(&promote_flag)),
                 rotate_flag.clone(),
+                Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1705,7 +1763,6 @@ pub fn run_dpdk(
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            config.async_replica_ack,
             rotation,
             config.max_orders_per_account,
             config.max_orders_per_second,
@@ -1730,6 +1787,7 @@ pub fn run_dpdk(
                     authorized_keys,
                     false,
                     rotate_flag,
+                    durability_mode_atomic,
                 );
             }
         }
@@ -1784,6 +1842,18 @@ pub fn run_dpdk(
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+    // `--standalone` declares "no replicas ever" — only `local` can be
+    // satisfied. `hybrid` and `durably-replicated` would stall the gate
+    // forever; reject loudly at startup with the fix in the message.
+    if config.standalone
+        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+    {
+        return Err(format!(
+            "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
+            config.durability_mode,
+        )
+        .into());
     }
 
     let genesis_entry = if enable_replication {
@@ -1872,6 +1942,7 @@ pub fn run_dpdk(
             addr,
             None,
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -1908,12 +1979,39 @@ pub fn run_dpdk(
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
+    // ReplicationMetrics must be constructed before the response thread
+    // spawns so the gate can read per-slot cursors at every poll.
+    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+        if replication_consumers.is_some() {
+            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+        } else {
+            None
+        };
+
+    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config.durability_mode);
+    info!(
+        mode = %active_mode_at_start,
+        policy = %active_mode_at_start.to_policy(),
+        "durability mode active"
+    );
+
+    let replica_active: Option<[Arc<AtomicBool>; 2]> =
+        replication_ring_progress.as_ref().map(|rp| {
+            [
+                Arc::clone(&rp.active_flags[0]),
+                Arc::clone(&rp.active_flags[1]),
+            ]
+        });
+
     // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
     let output_consumer = output_consumers.remove(0);
     let journal_cursor_response = Arc::clone(&journal_cursor);
-    let replication_cursor_response = Arc::clone(&replication_cursor);
-    let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
-    let quorum_durability = !config.no_quorum_durability;
+    let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
+    let replica_active_response = replica_active.clone();
+    let durability_mode_response = Arc::clone(&durability_mode_atomic);
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -1926,9 +2024,9 @@ pub fn run_dpdk(
                 output_consumer,
                 control_rx,
                 journal_cursor_response,
-                replication_cursor_response,
-                fastest_replica_cursor_response,
-                quorum_durability,
+                durability_mode_response,
+                replication_metrics_response,
+                replica_active_response,
                 &s3,
                 heartbeat_interval,
                 active_connections_response,
@@ -1976,13 +2074,9 @@ pub fn run_dpdk(
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
     // and smoltcp stack so the replication channel goes through kernel bypass.
+    // `replication_metrics` was constructed above so the response gate can
+    // read per-slot cursors; the sender thread shares the same instance.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
-        if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-        } else {
-            None
-        };
     // Replication, if enabled: build a `DpdkReplicationDriver` for the
     // single client poll thread to drive. The driver's accept dispatch
     // hangs off the second listener we added on the client transport

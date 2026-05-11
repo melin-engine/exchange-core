@@ -170,11 +170,14 @@ RUN_PLOTS="${RUN_PLOTS:-0}"
 # Primary server args.
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS-}"
 
-# Replica args. Default enables --async-replica-ack (replicas ack as soon as
-# the batch is queued for their local journal, before fsync completes — removes
-# ~50-80µs of NVMe latency from the replication round-trip).
-# Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks.
-REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack}"
+# Replica args. The legacy `--async-replica-ack` default was removed
+# alongside the durability-policy refactor — it has no equivalent on
+# the current code path until the ack-on-receive plumbing lands (see
+# P1 in `docs/durability-policy-followups.md`). Bench numbers run
+# under this script will be ~50-80µs higher per replication round-
+# trip than figures previously published with `--async-replica-ack`
+# enabled, until that follow-up ships.
+REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS-}"
 
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
