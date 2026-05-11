@@ -1486,16 +1486,18 @@ impl Exchange {
         // it through `restore_state` instead of silently dropping it on
         // recovery.
         // `order_sides` is derived state — `Exchange::snapshot_order_sides`
-        // reads it from each book's active order/stop slots, so the live
-        // books we rebuild below regenerate it identically. We still
-        // capture it in the snapshot for proptests and recovery
-        // verification, but `restore_state` itself has nothing to do
-        // with the value.
+        // regenerates it from each book's active order/stop slots, so the
+        // rebuilt books below produce it identically. We don't *use* the
+        // snapshot's copy to construct anything, but we do verify it
+        // matches the regenerated value after restore as a corruption
+        // detector (catches torn writes or encoder bugs where books and
+        // order_sides disagree). See the assertion at the end of this
+        // function.
         let ExchangeSnapshot {
             instruments: instrument_specs,
             balances,
             reservations,
-            order_sides: _order_sides,
+            order_sides: snapshot_order_sides,
             books,
             risk_limits,
             circuit_breakers,
@@ -1548,6 +1550,31 @@ impl Exchange {
         // wiring; the bucket state restored here will only be observed
         // by the limiter once those knobs are non-zero.
         exchange.restore_order_buckets(order_buckets);
+
+        // Snapshot-corruption detector: the rebuilt books must produce the
+        // same `order_sides` set the snapshot serialized. A mismatch means
+        // the snapshot is internally inconsistent (e.g., torn write, encoder
+        // bug, or a books-but-not-order_sides drift in some future change)
+        // and continuing would silently restore wrong state. Sort both
+        // sides before comparing — HashMap iteration order in
+        // `order_index` is non-deterministic, but the set of entries must
+        // be identical. This runs once at restore (not the hot path).
+        let mut regenerated = exchange.snapshot_order_sides();
+        let mut from_snapshot = snapshot_order_sides;
+        // Sort by (AccountId, OrderId) key — keys are unique per entry, so
+        // post-sort the vectors are canonical and structural equality
+        // detects any side or key disagreement. `Side` itself isn't `Ord`,
+        // so we can't fall back to a derived total order on the full tuple.
+        regenerated.sort_unstable_by_key(|(k, _)| *k);
+        from_snapshot.sort_unstable_by_key(|(k, _)| *k);
+        assert!(
+            regenerated == from_snapshot,
+            "snapshot corruption: order_sides mismatch on restore — \
+             snapshot serialized {} entries, rebuilt books produced {}",
+            from_snapshot.len(),
+            regenerated.len(),
+        );
+
         exchange
     }
 
@@ -2056,6 +2083,34 @@ mod tests {
             &mut clone_reports,
         );
         assert!(matches!(clone_reports[0], ExecutionReport::Fill { .. }));
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot corruption: order_sides mismatch")]
+    fn restore_detects_order_sides_mismatch() {
+        // Build an exchange with one resting order so `order_sides` is
+        // non-empty and the mismatch is observable.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_B, BTC, 500);
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 50),
+            &mut reports,
+        );
+
+        // Mutate the snapshot's `order_sides` so it disagrees with what
+        // the rebuilt books will regenerate. Flipping the recorded side
+        // is enough — the entry count still matches, but the value set
+        // doesn't.
+        let mut state = exchange.snapshot_state();
+        assert!(!state.order_sides.is_empty(), "test prerequisite");
+        state.order_sides[0].1 = Side::Buy;
+
+        // `restore_state` must panic on the inconsistency rather than
+        // silently restore wrong state.
+        let _ = Exchange::restore_state(state);
     }
 
     #[test]
