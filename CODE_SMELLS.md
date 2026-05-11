@@ -11,9 +11,11 @@ Tackle items one by one. Mark `[x]` when done and reference the commit.
   Done: 12 per-section helpers + `decode_opt_nz_u64` + `read_section_len`;
   `decode_exchange_state` is now a ~75-line orchestrator. 364 engine tests pass, clippy clean.
 
-- [ ] **`engine/src/journal/snapshot.rs:1309–1380` — split `restore_state()`**
-  68 lines mixing symbol-indexed instrument assembly (1324–1346) with
-  reservation slot injection. Extract to named helpers.
+- [x] **`engine/src/journal/snapshot.rs:1309–1380` — split `restore_state()`**
+  Done: extracted `build_indexed_instruments` (map-building + sparse-Vec
+  assembly, ~45 lines) and `inject_reservation_slots_into_instruments`.
+  `restore_state` shrunk from 82 to ~30 lines and reads as a linear
+  orchestrator. 364 engine tests pass, clippy clean.
 
 - [ ] **`engine/src/orderbook.rs:1686, 1704, 1770` — three `.expect("front existed")` in `match_against()` hot loop**
   Safe under protocol invariants, but a corruption/index bug would panic
@@ -39,9 +41,10 @@ Tackle items one by one. Mark `[x]` when done and reference the commit.
   Per CLAUDE.md, swallowed results need a justifying comment. Add: "Missing
   account/currency returns zero Balance; replay-safe since deposit initializes accounts."
 
-- [ ] **`engine/src/journal/snapshot.rs:1330` — `Vec::resize_with(max_sym + 1, || None)` sparse symbol table**
-  CLAUDE.md requires comments justifying data-structure choices. Add one
-  noting sparse Vec over HashMap for cache locality + O(1) access via `symbol.0` as index.
+- [x] **`engine/src/journal/snapshot.rs:1330` — `Vec::resize_with(max_sym + 1, || None)` sparse symbol table**
+  Done as part of the `restore_state` split: rationale now lives in the
+  `build_indexed_instruments` doc comment (sparse Vec vs HashMap, cache
+  locality, branch-light indexing).
 
 - [ ] **`engine/src/journal/snapshot.rs:327` — split `encode_exchange_state()` (~120 lines)**
   Dual of `decode_exchange_state`. After the decode split, encode is the

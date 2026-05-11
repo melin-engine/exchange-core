@@ -1336,6 +1336,69 @@ fn rebuild_scheduler_heap(
     heap
 }
 
+/// Assemble the symbol-indexed `InstrumentState` Vec from the flat snapshot
+/// Vecs. The output is the storage shape the live Exchange uses: a sparse
+/// `Vec<Option<Box<InstrumentState>>>` where `Symbol.0` is the index. We
+/// pick sparse Vec over `HashMap<Symbol, InstrumentState>` because
+/// instrument lookup happens on every order — a Vec indexing op is
+/// cache-friendly and branch-light, whereas HashMap probing pays a hash +
+/// possible collision chase per access. Wasted slots for sparse symbol
+/// allocations are acceptable (32 bytes per gap; symbol space is small).
+fn build_indexed_instruments(
+    specs: Vec<InstrumentSpec>,
+    books: Vec<(Symbol, BookSnapshot)>,
+    risk_limits: Vec<(Symbol, RiskLimits)>,
+    circuit_breakers: Vec<(Symbol, CircuitBreakerConfig)>,
+    fee_schedules: Vec<(Symbol, FeeSchedule)>,
+    disabled_instruments: Vec<Symbol>,
+) -> Vec<Option<Box<crate::exchange::InstrumentState>>> {
+    use crate::exchange::InstrumentState;
+
+    let mut books_map: StdHashMap<Symbol, OrderBook> = StdHashMap::new();
+    for (symbol, book_snap) in books {
+        books_map.insert(symbol, OrderBook::restore(symbol, book_snap));
+    }
+    let risk_map: StdHashMap<Symbol, RiskLimits> = risk_limits.into_iter().collect();
+    let cb_map: StdHashMap<Symbol, CircuitBreakerConfig> = circuit_breakers.into_iter().collect();
+    let fee_map: StdHashMap<Symbol, FeeSchedule> = fee_schedules.into_iter().collect();
+    let disabled_set: std::collections::HashSet<Symbol> =
+        disabled_instruments.into_iter().collect();
+
+    let max_sym = specs.iter().map(|s| s.symbol.0 as usize).max().unwrap_or(0);
+    let mut instruments: Vec<Option<Box<InstrumentState>>> = Vec::new();
+    instruments.resize_with(max_sym + 1, || None);
+    for spec in &specs {
+        let idx = spec.symbol.0 as usize;
+        let book = books_map
+            .remove(&spec.symbol)
+            .unwrap_or_else(|| OrderBook::new(spec.symbol));
+        instruments[idx] = Some(Box::new(InstrumentState {
+            spec: *spec,
+            book,
+            risk_limits: risk_map.get(&spec.symbol).copied().unwrap_or_default(),
+            circuit_breaker: cb_map.get(&spec.symbol).copied().unwrap_or_default(),
+            fee_schedule: fee_map.get(&spec.symbol).copied().unwrap_or_default(),
+            disabled: disabled_set.contains(&spec.symbol),
+        }));
+    }
+    instruments
+}
+
+/// Patch each instrument's `OrderBook` with the real reservation slots
+/// produced by `AccountManager::from_parts`. Books are restored with
+/// `ReservationSlot::DUMMY` placeholders; this step replaces them with the
+/// live slab handles so settlements can release the reserved balance.
+fn inject_reservation_slots_into_instruments(
+    instruments: &mut [Option<Box<crate::exchange::InstrumentState>>],
+    slot_assignments: &[((AccountId, OrderId), ReservationSlot)],
+) {
+    for inst in instruments {
+        if let Some(inst) = inst.as_deref_mut() {
+            inst.book.inject_reservation_slots(slot_assignments);
+        }
+    }
+}
+
 impl Exchange {
     /// Create a snapshot of all internal state for serialization.
     pub(crate) fn snapshot_state(&self) -> ExchangeSnapshot {
@@ -1375,60 +1438,26 @@ impl Exchange {
 
     /// Reconstruct an Exchange from a snapshot.
     pub(crate) fn restore_state(state: ExchangeSnapshot) -> Self {
-        use crate::exchange::InstrumentState;
-
-        // Build per-symbol lookup tables from the flat snapshot Vecs.
-        let mut books_map: StdHashMap<Symbol, OrderBook> = StdHashMap::new();
-        for (symbol, book_snap) in state.books {
-            books_map.insert(symbol, OrderBook::restore(symbol, book_snap));
-        }
-        let risk_map: StdHashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
-        let cb_map: StdHashMap<Symbol, CircuitBreakerConfig> =
-            state.circuit_breakers.into_iter().collect();
-        let fee_map: StdHashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
-        let disabled_set: std::collections::HashSet<Symbol> =
-            state.disabled_instruments.into_iter().collect();
-
-        // Assemble consolidated InstrumentState Vec indexed by Symbol.0.
-        let max_sym = state
-            .instruments
-            .iter()
-            .map(|s| s.symbol.0 as usize)
-            .max()
-            .unwrap_or(0);
-        let mut instruments: Vec<Option<Box<InstrumentState>>> = Vec::new();
-        instruments.resize_with(max_sym + 1, || None);
-        for spec in &state.instruments {
-            let idx = spec.symbol.0 as usize;
-            let book = books_map
-                .remove(&spec.symbol)
-                .unwrap_or_else(|| OrderBook::new(spec.symbol));
-            instruments[idx] = Some(Box::new(InstrumentState {
-                spec: *spec,
-                book,
-                risk_limits: risk_map.get(&spec.symbol).copied().unwrap_or_default(),
-                circuit_breaker: cb_map.get(&spec.symbol).copied().unwrap_or_default(),
-                fee_schedule: fee_map.get(&spec.symbol).copied().unwrap_or_default(),
-                disabled: disabled_set.contains(&spec.symbol),
-            }));
-        }
+        let mut instruments = build_indexed_instruments(
+            state.instruments,
+            state.books,
+            state.risk_limits,
+            state.circuit_breakers,
+            state.fee_schedules,
+            state.disabled_instruments,
+        );
 
         let (accounts, slot_assignments) = AccountManager::from_parts(
             state.balances,
             state.reservations,
             state.fee_account_deficits,
         );
+        inject_reservation_slots_into_instruments(&mut instruments, &slot_assignments);
 
-        // Inject reservation slots into each instrument's order book.
-        // The books were restored with DUMMY slots; now patch them with
-        // the real slots from the account manager's slab.
-        for inst in &mut instruments {
-            if let Some(inst) = inst.as_deref_mut() {
-                inst.book.inject_reservation_slots(&slot_assignments);
-            }
-        }
-
-        // Build per-key request sequence HWM map from snapshot entries (v9+).
+        // Per-key request sequence HWM map (v9+). Uses the same custom
+        // hasher as the live map so lookup behavior matches the running
+        // engine; capacity sized to the snapshot to avoid mid-restore
+        // rehashes.
         let mut key_hwm: crate::types::HashMap<u64, u64> =
             crate::types::HashMap::with_capacity_and_hasher(
                 state.key_hwm.len(),
