@@ -976,10 +976,16 @@ impl OrderBook {
             stop_sells: StopSide::default(),
             stop_index: HashMap4::default(),
             last_trade_price: None,
-            trigger_price_buf: Vec::new(),
-            triggered_buf: Vec::new(),
-            match_price_buf: Vec::new(),
-            consumed_slots: Vec::new(),
+            // Hot-path scratch buffers reused across orders (cleared at
+            // the top of each match). 64 capacity covers the typical
+            // sweep width — an aggressive order that crosses more than
+            // 64 levels (or fills more than 64 makers) is rare. Pre-sizing
+            // here means a fresh book never reallocates during its first
+            // burst of activity.
+            trigger_price_buf: Vec::with_capacity(64),
+            triggered_buf: Vec::with_capacity(64),
+            match_price_buf: Vec::with_capacity(64),
+            consumed_slots: Vec::with_capacity(64),
         }
     }
 
@@ -1080,10 +1086,13 @@ impl OrderBook {
             stop_sells,
             stop_index,
             last_trade_price,
-            trigger_price_buf: Vec::new(),
-            triggered_buf: Vec::new(),
-            match_price_buf: Vec::new(),
-            consumed_slots: Vec::new(),
+            // Same hot-path scratch buffers as `new()`; pre-sized so the
+            // first match after snapshot restore doesn't realloc. See
+            // `new()` for the capacity rationale.
+            trigger_price_buf: Vec::with_capacity(64),
+            triggered_buf: Vec::with_capacity(64),
+            match_price_buf: Vec::with_capacity(64),
+            consumed_slots: Vec::with_capacity(64),
         }
     }
 

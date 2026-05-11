@@ -29,29 +29,43 @@ Tackle items one by one. Mark `[x]` when done and reference the commit.
 
 ## Medium
 
-- [ ] **`engine/src/application_impl.rs:240` — `Vec::new()` in `restore()` snapshot deserialization**
-  Pre-allocate with `Vec::with_capacity()` from payload hint / max snapshot size to avoid realloc during `read_to_end()`.
+- [~] **`engine/src/application_impl.rs:240` — `Vec::new()` in `restore()` snapshot deserialization** — **won't-do.**
+  The `App::restore<R: Read>` trait has no size hint, so any pre-allocation
+  is a guess. `read_to_end` already grows exponentially, and for the
+  `Cursor<Vec<u8>>` path used by `clone_via_snapshot` the std impl
+  specializes to a single `extend_from_slice` (zero reallocs). Real-recovery
+  cost is sub-millisecond even for a 10 MB snapshot. A real fix would plumb
+  size through the trait — out of scope for a Medium item.
 
-- [ ] **`engine/src/orderbook.rs:979–982, 1083–1086` — `Vec::new()` for hot-path scratch buffers in `new()`**
-  `trigger_price_buf`, `triggered_buf`, `match_price_buf`, `consumed_slots`
-  get `with_capacity` in `with_capacity()` but not in `new()`. Add a comment
-  explaining why capacity hints matter (cleared and reused per order).
+- [x] **`engine/src/orderbook.rs:979–982, 1083–1086` — `Vec::new()` for hot-path scratch buffers in `new()`**
+  Done: `new()` and `from_parts` now use `Vec::with_capacity(64)` for all
+  four scratch buffers, matching `with_capacity()`. Comments explain the
+  cleared-and-reused-per-order rationale.
 
-- [ ] **`engine/src/account.rs:397` — `.unwrap_or_default()` on balance lookup**
-  Per CLAUDE.md, swallowed results need a justifying comment. Add: "Missing
-  account/currency returns zero Balance; replay-safe since deposit initializes accounts."
+- [x] **`engine/src/account.rs:397` — `.unwrap_or_default()` on balance lookup**
+  Done: added comment explaining the missing-key → zero-Balance contract
+  and why it is replay-safe (accounts come into existence via `deposit`).
 
 - [x] **`engine/src/journal/snapshot.rs:1330` — `Vec::resize_with(max_sym + 1, || None)` sparse symbol table**
   Done as part of the `restore_state` split: rationale now lives in the
   `build_indexed_instruments` doc comment (sparse Vec vs HashMap, cache
   locality, branch-light indexing).
 
-- [ ] **`engine/src/journal/snapshot.rs:327` — split `encode_exchange_state()` (~120 lines)**
-  Dual of `decode_exchange_state`. After the decode split, encode is the
-  only side still written as a single linear function. Splitting it into
-  per-section encoders makes the wire format auditable from both directions
-  in one glance. Lower urgency than decode (the recovery path is the higher
-  blast-radius side).
+- [x] **`engine/src/journal/snapshot.rs:327` — split `encode_exchange_state()` (~120 lines)**
+  Done: 12 per-section encoders + `encode_opt_nz_u64` mirror the decode
+  helpers. Orchestrator destructures `ExchangeSnapshot` exhaustively so
+  the compiler errors if a new field is ever added without an encoder
+  call. Same exhaustive-destructure trick applied to `restore_state`,
+  which also documents that `order_sides` is derived state (not consumed
+  on restore — see follow-up below).
+
+- [ ] **`engine/src/journal/snapshot.rs` — `order_sides` is redundant snapshot field**
+  Discovered while applying exhaustive destructuring: `restore_state`
+  never reads `order_sides`, because the value is regenerated from the
+  restored books via `Exchange::snapshot_order_sides` (which queries
+  each book's `active_order_slots` / `active_stop_slots`). Worth a
+  follow-up to either drop the field from the wire format (saves bytes
+  on every snapshot) or wire it into a restore-time consistency check.
 
 ## Low
 

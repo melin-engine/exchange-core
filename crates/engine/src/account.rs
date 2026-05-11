@@ -391,6 +391,11 @@ impl AccountManager {
 
     /// Get the balance for an account/currency pair.
     pub fn balance(&self, account: AccountId, currency: CurrencyId) -> Balance {
+        // Missing key returns the default Balance (zero available, zero
+        // reserved). This is deterministic and replay-safe: accounts come
+        // into existence via `deposit`, which inserts the row; any prior
+        // query against an unknown (account, currency) pair would observe
+        // the same all-zeros outcome on both primary and replica.
         self.balances
             .get(&(account, currency))
             .copied()
