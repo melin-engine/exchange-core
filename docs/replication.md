@@ -248,13 +248,17 @@ normal-case post-recovery state.
 
 ### No chain-hash validation at handshake
 
-The primary does not validate the replica's `chain_hash` against its
-own journal at the replica's reported `last_sequence`. A replica with
-divergent history (e.g. previously connected to a different primary,
-or with a corrupted journal) is accepted without warning. The
-`HashMismatch` response type is reserved in the protocol but never
-sent. Validation requires either a sequence → chain-hash side index
-or a journal re-read; deferred until a customer asks.
+The replica reports its `chain_hash` at `last_sequence` in the
+`Handshake` frame and the `HashMismatch` response type is reserved in
+the wire protocol, but neither side compares the two against the
+primary's own journal at the same sequence. A replica with divergent
+history (e.g. previously connected to a different primary, or with a
+corrupted journal) is accepted without warning. After failover the
+promoted node would hold a journal that doesn't match the events
+clients were told about. Tracked as a roadmap item — two
+implementation shapes are scoped (tip-only check, ~half a day; full
+arbitrary-N check, 1–2 days against the journal-crate hashing
+arithmetic).
 
 ### No automatic split-brain fencing
 
