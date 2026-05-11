@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::JournalError;
+use melin_journal::preparer::SegmentPreparer;
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 use melin_journal::trace::{TraceTimestamp, trace_ts};
 
@@ -356,6 +357,27 @@ pub struct JournalStage<E: AppEvent> {
     /// requests bypass this window — operators get a fresh attempt and
     /// a fresh error log on each command.
     rotation_backoff_until: Option<Instant>,
+    /// Background preparer that pre-stages the next segment off the
+    /// rotation hot path. `Some` when `max_journal_bytes > 0`; `None`
+    /// when size-driven rotation is disabled (no point spending disk +
+    /// a thread on speculation that may never pay off). Spawned by
+    /// `set_rotation`. Survives every rotation — only the writer's file
+    /// is swapped, the preparer keeps preparing the same live-path
+    /// sidecar across the rotation boundary.
+    preparer: Option<SegmentPreparer>,
+    /// Number of rotations that consumed a pre-staged segment (the
+    /// fast path). Logged at info on rotation; tail-latency
+    /// validation in the bench should see this growing in lockstep
+    /// with rotation count.
+    rotations_fast_path: u64,
+    /// Number of rotations that fell back to synchronous
+    /// `posix_fallocate + zero_range + prefault + sync_all` because
+    /// no prepared segment was available (preparer error,
+    /// manual-rotate before the preparer caught up, or rotation
+    /// disabled). Steady-state under size-driven rotation should be
+    /// zero — non-zero indicates the preparer can't keep up and the
+    /// 38 ms tail will be visible again.
+    rotations_sync_fallback: u64,
 }
 
 /// How long to suppress size-driven rotation attempts after a failure.
@@ -435,6 +457,9 @@ impl<E: AppEvent> JournalStage<E> {
             max_journal_bytes: 0,
             rotate_requested: None,
             rotation_backoff_until: None,
+            preparer: None,
+            rotations_fast_path: 0,
+            rotations_sync_fallback: 0,
         }
     }
 
@@ -449,6 +474,21 @@ impl<E: AppEvent> JournalStage<E> {
     pub fn set_rotation(&mut self, max_journal_bytes: u64, rotate_flag: Option<Arc<AtomicBool>>) {
         self.max_journal_bytes = max_journal_bytes;
         self.rotate_requested = rotate_flag;
+        // Spin up the background preparer iff size-driven rotation is
+        // enabled. Without it, we'd be allocating a sidecar segment
+        // that may never be consumed.
+        //
+        // The preparer is also useful for manual-only rotation (a
+        // long-running ROTATE admin command), but the cadence is
+        // unpredictable and the speculative cost is harder to justify
+        // — operators that want fast manual rotation can bump
+        // `max_journal_mib` to something huge to enable the preparer
+        // without triggering size-driven rotation in practice.
+        if max_journal_bytes > 0 && self.preparer.is_none() {
+            let live_path = self.writer.path().to_path_buf();
+            let sector_size = self.writer.sector_size();
+            self.preparer = Some(SegmentPreparer::spawn(live_path, sector_size));
+        }
     }
 
     /// Shared utilization counters for health endpoint monitoring.
@@ -916,16 +956,41 @@ impl<E: AppEvent> JournalStage<E> {
             return false;
         }
         let pre_size = self.writer.valid_end();
-        match self.writer.rotate_segment() {
+
+        // Prefer the fast (pre-staged) path. If `take()` returns `None`
+        // — preparer disabled, manual rotation arrived before the
+        // worker caught up, or the worker is currently in backoff
+        // after a prior failure — fall back to the synchronous path.
+        let prepared = self.preparer.as_ref().and_then(|p| p.take());
+        let used_fast_path = prepared.is_some();
+        let rotate_result = match prepared {
+            Some(p) => self.writer.rotate_segment_with_prepared(p),
+            None => self.writer.rotate_segment(),
+        };
+
+        match rotate_result {
             Ok(archived) => {
+                if used_fast_path {
+                    self.rotations_fast_path += 1;
+                } else {
+                    self.rotations_sync_fallback += 1;
+                }
                 tracing::info!(
                     archive = %archived.display(),
                     pre_rotate_bytes = pre_size,
                     next_sequence = self.writer.next_sequence(),
                     trigger = if manual { "manual" } else { "size" },
+                    fast_path = used_fast_path,
+                    rotations_fast_path = self.rotations_fast_path,
+                    rotations_sync_fallback = self.rotations_sync_fallback,
                     "journal segment rotated"
                 );
                 self.rotation_backoff_until = None;
+                // Kick the preparer to start staging the *next*
+                // segment ahead of the next rotation.
+                if let Some(p) = self.preparer.as_ref() {
+                    p.arm();
+                }
                 // The new segment's GenesisHash advanced the chain;
                 // republish so shadow + cursor observers see it.
                 self.publish_chain_hash();
@@ -935,10 +1000,17 @@ impl<E: AppEvent> JournalStage<E> {
                 tracing::error!(
                     error = %e,
                     trigger = if manual { "manual" } else { "size" },
+                    fast_path = used_fast_path,
                     backoff_secs = ROTATION_FAILURE_BACKOFF.as_secs(),
                     "journal segment rotation failed; continuing with current segment"
                 );
                 self.rotation_backoff_until = Some(Instant::now() + ROTATION_FAILURE_BACKOFF);
+                // Re-arm the preparer so the next attempt also has a
+                // chance at the fast path, even after a transient
+                // failure of the writer's rotate path.
+                if let Some(p) = self.preparer.as_ref() {
+                    p.arm();
+                }
                 false
             }
         }
