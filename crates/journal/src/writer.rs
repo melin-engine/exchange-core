@@ -1324,6 +1324,10 @@ fn prefault_pages(file: &File, start: u64, end: u64) {
     let Ok(mmap) = mmap else {
         return;
     };
+    // Best-effort kernel hint: `PopulateRead` faults pages in eagerly so the
+    // next read avoids a synchronous page fault on the hot path. If the
+    // kernel rejects the advice (older kernel, unusual mapping) we silently
+    // proceed — the read will simply fault pages in lazily as before.
     let _ = mmap.advise(memmap2::Advice::PopulateRead);
 }
 

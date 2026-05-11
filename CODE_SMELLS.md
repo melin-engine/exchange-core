@@ -69,20 +69,30 @@ Tackle items one by one. Mark `[x]` when done and reference the commit.
 
 ## Low
 
-- [ ] **`crates/journal/src/trace.rs:435` — `writer.join().unwrap()`**
-  Dev/bench only, but replace with proper error: `.map_err(|_| "thread panicked during trace flush")`.
+- [~] **`crates/journal/src/trace.rs:435` — `writer.join().unwrap()`** — **won't-do.**
+  Inside `mod tests`. CLAUDE.md: ".unwrap() is fine in tests."
 
-- [ ] **`engine/src/scheduler.rs:148, 150, 154` — `.unwrap()` on `pop_due()` in unit tests**
-  Replace with `assert_eq!(heap.pop_due(150), Some(expected))` for clarity.
+- [~] **`engine/src/scheduler.rs:148, 150, 154` — `.unwrap()` on `pop_due()` in unit tests** — **won't-do.**
+  Test code; CLAUDE.md allows `.unwrap()` in tests. The current
+  "pop then assert on a field" pattern is more readable than
+  constructing a full `ScheduledTask` for `Some(expected)` equality.
 
-- [ ] **`engine/src/application_impl.rs:308, 311` — `NonZeroU64::new(p).unwrap()` in test helpers**
-  Test-only; consider const helpers / `const fn` to signal compile-time guarantee.
+- [~] **`engine/src/application_impl.rs:308, 311` — `NonZeroU64::new(p).unwrap()` in test helpers** — **won't-do.**
+  Test helpers; `.unwrap()` is fine per CLAUDE.md. `NonZeroU64::new`
+  is not `const`, so a `const fn` helper isn't possible without
+  `NonZeroU64::new_unchecked` (unsafe for marginal test-only gain).
 
-- [ ] **`journal/src/writer.rs:244, 1327` — `let _ = ...` discards**
-  Add a one-line comment above each explaining why the result is safe to drop.
+- [x] **`journal/src/writer.rs:1327` — `let _ = mmap.advise(...)` discard**
+  Done: added a comment explaining the best-effort kernel hint and
+  why falling back to lazy faulting is safe. (`writer.rs:244` is
+  `let _ = genesis_hash;` under `cfg(not(feature = "hash-chain"))`
+  — silencing an unused param, not a Result drop; no change needed.)
 
-- [ ] **`engine/src/exchange.rs:898` — `let _ = reports` in a test**
-  Replace with comment if intentional, or assert on it.
+- [~] **`engine/src/exchange.rs:898` — `let _ = reports`** — **won't-do.**
+  Already has a 4-line comment above explaining why `reports` is
+  unused under the received-asset fee model but kept in the signature
+  for caller/replay uniformity. Not in a test (production
+  `set_fee_schedule`); the survey entry mislabeled it.
 
 ---
 
