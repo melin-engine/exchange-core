@@ -213,6 +213,12 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
+        // Clear any orphan `<path>.next-staging` from a prior crash
+        // before the SegmentPreparer (if rotation is later enabled)
+        // tries to open the same path with `create_new`. Safe here
+        // because this entry point runs only at startup, before any
+        // preparer is spawned.
+        crate::preparer::cleanup_staging_orphan(path);
         #[cfg(feature = "hash-chain")]
         {
             let mut genesis = [0u8; 32];
@@ -493,6 +499,10 @@ impl<E: AppEvent> JournalWriter<E> {
         #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
         events_since_checkpoint: u64,
     ) -> Result<Self, JournalError> {
+        // Clear any orphan `<path>.next-staging` from a prior crash
+        // before recovery proceeds; matches the cleanup in `create`.
+        // Safe at this point — no preparer has been spawned yet.
+        crate::preparer::cleanup_staging_orphan(path);
         // Open with O_DIRECT for all writes. Read permission is required for
         // prefault_pages (mmap MAP_SHARED) and for partial-tail reconstruction.
         let mut opts = OpenOptions::new();
@@ -1978,6 +1988,73 @@ mod tests {
         assert_eq!(entries.len(), 3);
     }
 
+    /// Recovery-time cleanup: an orphan staging file from a prior crash
+    /// is removed by `open_append`, and the live segment opens normally.
+    /// Models the realistic scenario where a process crashes mid-rotate
+    /// (live + staging both on disk) and the operator restarts.
+    #[test]
+    fn open_append_cleans_orphan_staging_file() {
+        use crate::preparer::staging_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let staging = staging_path(&path);
+
+        let (last_seq, valid_end, events_since_checkpoint) = {
+            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&sample_event()).unwrap();
+            (
+                writer.next_sequence() - 1,
+                writer.valid_end(),
+                writer.events_since_checkpoint(),
+            )
+        };
+
+        // Simulate a crash that left a staging file on disk.
+        std::fs::write(&staging, b"orphan from prior crash").unwrap();
+        assert!(staging.exists());
+
+        let writer = JournalWriter::<TestEvent>::open_append(
+            &path,
+            last_seq,
+            valid_end,
+            None,
+            events_since_checkpoint,
+        )
+        .unwrap();
+        drop(writer);
+
+        assert!(
+            !staging.exists(),
+            "open_append should have removed the orphan staging file"
+        );
+    }
+
+    /// `JournalWriter::create` reclaims an orphan `<path>.next-staging`
+    /// file left behind by a prior crash, so the SegmentPreparer (which
+    /// may or may not be spawned later) doesn't trip over a stale file
+    /// on `create_new`. The same cleanup runs in `open_append` — that
+    /// path is exercised transitively by the rotation tests.
+    #[test]
+    fn create_cleans_orphan_staging_file() {
+        use crate::preparer::staging_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let staging = staging_path(&path);
+
+        std::fs::write(&staging, b"orphan from prior crash").unwrap();
+        assert!(staging.exists());
+
+        let writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        drop(writer);
+
+        assert!(
+            !staging.exists(),
+            "create should have removed the orphan staging file"
+        );
+    }
+
     /// End-to-end exercise of the rotation fast path: spawn a preparer,
     /// drain a [`PreparedSegment`] from it, hand the segment to
     /// `rotate_segment_with_prepared`, then verify that
@@ -2043,14 +2120,22 @@ mod tests {
         // Reading the live (new) segment should surface only the
         // post-rotation user entries — the genesis is transparent.
         let live_entries = read_all(&path);
-        assert_eq!(live_entries.len(), 2, "live segment should have 2 user entries");
+        assert_eq!(
+            live_entries.len(),
+            2,
+            "live segment should have 2 user entries"
+        );
         assert_eq!(live_entries[0].event, JournalEvent::App(TestEvent(3)));
         assert_eq!(live_entries[1].event, JournalEvent::App(TestEvent(4)));
 
         // Reading the archived segment should surface the pre-rotation
         // user entries with their original sequences.
         let archived_entries = read_all(&archived);
-        assert_eq!(archived_entries.len(), 2, "archive should have 2 user entries");
+        assert_eq!(
+            archived_entries.len(),
+            2,
+            "archive should have 2 user entries"
+        );
         assert_eq!(archived_entries[0].event, JournalEvent::App(TestEvent(1)));
         assert_eq!(archived_entries[1].event, JournalEvent::App(TestEvent(2)));
 
@@ -2062,12 +2147,14 @@ mod tests {
         let first_live_seq = live_entries.first().unwrap().sequence;
         #[cfg(feature = "hash-chain")]
         assert_eq!(
-            first_live_seq, last_archived_seq + 2,
+            first_live_seq,
+            last_archived_seq + 2,
             "expected one genesis slot between last archived and first live"
         );
         #[cfg(not(feature = "hash-chain"))]
         assert_eq!(
-            first_live_seq, last_archived_seq + 1,
+            first_live_seq,
+            last_archived_seq + 1,
             "expected contiguous sequence across rotation boundary"
         );
     }

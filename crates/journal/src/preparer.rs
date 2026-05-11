@@ -111,26 +111,7 @@ impl SegmentPreparer {
     /// recognised by `segment::list_archives`, but leaving them on disk
     /// would cause `create_new` to fail at the next prepare.
     pub fn spawn(live_path: PathBuf, sector_size: usize) -> Self {
-        // Best-effort cleanup of any prior crash artefact. If this fails
-        // for a reason other than NotFound the next `prepare_one` call
-        // surfaces the real error via `create_new`.
-        let staging = staging_path(&live_path);
-        match std::fs::remove_file(&staging) {
-            Ok(()) => {
-                tracing::info!(
-                    path = %staging.display(),
-                    "removed orphan journal staging file from a prior run"
-                );
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %staging.display(),
-                    "could not remove orphan journal staging file; prepare may fail"
-                );
-            }
-        }
+        cleanup_staging_orphan(&live_path);
 
         let state = Arc::new(State {
             live_path,
@@ -245,11 +226,7 @@ fn worker_loop(state: Arc<State>) {
 
         // If a previous preparation is still waiting to be adopted, skip
         // this cycle — the slot has capacity for one.
-        let occupied = state
-            .slot
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
+        let occupied = state.slot.lock().map(|g| g.is_some()).unwrap_or(false);
         if occupied {
             continue;
         }
@@ -320,6 +297,45 @@ fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, 
         allocated_end,
         sector_size,
     })
+}
+
+/// Remove a stale `<live>.next-staging` file left behind by a prior
+/// process that crashed mid-prepare or rotated without consuming the
+/// staged segment.
+///
+/// Called from two places:
+///   - [`SegmentPreparer::spawn`] when rotation is enabled (the
+///     preparer would otherwise fail at `create_new` on the same path).
+///   - [`crate::writer::JournalWriter::create`] and `::open_append` so
+///     the orphan is reclaimed even when rotation is disabled (no
+///     preparer ever runs).
+///
+/// Must NOT be called once the preparer is alive — the worker may have
+/// an in-flight staging file whose fd is still valid even after
+/// unlink. The two startup entry points above are guaranteed to run
+/// before any preparer can be spawned.
+///
+/// Best-effort: NotFound is the common case (no prior crash). Other
+/// errors are logged but not propagated — the next `create_new` will
+/// surface the real fault if cleanup truly failed.
+pub(crate) fn cleanup_staging_orphan(live_path: &Path) {
+    let staging = staging_path(live_path);
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {
+            tracing::info!(
+                path = %staging.display(),
+                "removed orphan journal staging file from a prior run"
+            );
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %staging.display(),
+                "could not remove orphan journal staging file"
+            );
+        }
+    }
 }
 
 /// `<live>.next-staging` — sibling of the live segment, same directory.
@@ -402,7 +418,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(prepared.is_some(), "worker should produce a fresh segment after orphan cleanup");
+        assert!(
+            prepared.is_some(),
+            "worker should produce a fresh segment after orphan cleanup"
+        );
 
         preparer.shutdown();
     }
@@ -440,7 +459,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(second.is_some(), "preparer should produce a second segment after rearm");
+        assert!(
+            second.is_some(),
+            "preparer should produce a second segment after rearm"
+        );
 
         preparer.shutdown();
     }
