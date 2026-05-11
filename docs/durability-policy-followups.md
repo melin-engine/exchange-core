@@ -29,25 +29,12 @@ Fix path (decide after bench):
 
 ---
 
-## Re-frame `docs/replication.md` around the three-tier menu
-
-The replication design doc still describes the legacy
-`--quorum-durability` surface (default 2 replicas, "quorum mode",
-journal-min fallback). Rewrite around the `DurabilityMode` enum:
-`Local` / `Hybrid` / `DurablyReplicated`, with the strict
-fail-closed contract, the halt-on-replica-loss behaviour, and the
-halt-state rejection bypass surfaced explicitly so operators
-understand what clients see during an outage. Audience is exchange
-operators and customers, so describe behaviour and guarantees,
-not struct names.
-
----
-
 ## Commercial polish (buyer-driven)
 
 These are real features but only worth building when a specific
 buyer asks:
 
+- **4th durability tier: `memory-quorum`** — gate on `in_memory>=2` alone, no `persisted>=1` clause. Two RAM acks before client reply, no fsync on either node. Saves the primary's ~35 µs PLP-NVMe write per fill on top of what `hybrid` already saves over `durably-replicated`. The tradeoff is real: a correlated RAM loss within ~80 µs of the ack (simultaneous power event, double OS panic, double VM-host failure) destroys an acked fill with nothing in either journal to reconstruct from. Target market: HFT-style crypto venues and OTC desks where the latency win is worth the correlated-failure risk; explicitly **not** appropriate for regulated equities/derivatives venues (MiFID II / RegNMS trade-reconstruction requirements assume disk durability). Industry analogs: MongoDB `w: "majority", j: false`, Kafka `acks=all` without `log.flush.*`, Redis `WAIT N 0`. Implementation is a ~5-line enum variant plus docs; the policy clause is already expressible. Naming candidates: `memory-quorum` (descriptive, recommended), `unjournaled-quorum` (Mongo-flavored), `volatile-quorum`. Hold until a customer asks — shipping it speculatively risks operators selecting it without understanding the failure mode.
 - **Degraded-duration counter on `/healthz`** — turn `melin_durability_policy_degraded` from a 0/1 gauge into a paired counter (`melin_durability_policy_degraded_seconds_total`) so SLO dashboards can compute time-in-degraded over arbitrary windows.
 - **Multi-region awareness** — operators with replicas across availability zones want "≥1 ack from each zone" (Cassandra `EACH_QUORUM`). Needs node-tagging at handshake plus a richer policy clause shape. Would justify a 4th `DurabilityMode` variant.
 - **Per-request policy override** — let the client specify a stronger consistency level per high-stakes order (Cassandra `w=` / MongoDB pattern). The wire protocol already carries a per-request envelope that could be extended. Composes cleanly with the enum: operator's `--durability-mode` becomes a default, per-request overrides scoped to the same named-mode set.
