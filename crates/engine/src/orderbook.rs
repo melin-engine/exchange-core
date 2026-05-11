@@ -976,10 +976,16 @@ impl OrderBook {
             stop_sells: StopSide::default(),
             stop_index: HashMap4::default(),
             last_trade_price: None,
-            trigger_price_buf: Vec::new(),
-            triggered_buf: Vec::new(),
-            match_price_buf: Vec::new(),
-            consumed_slots: Vec::new(),
+            // Hot-path scratch buffers reused across orders (cleared at
+            // the top of each match). 64 capacity covers the typical
+            // sweep width — an aggressive order that crosses more than
+            // 64 levels (or fills more than 64 makers) is rare. Pre-sizing
+            // here means a fresh book never reallocates during its first
+            // burst of activity.
+            trigger_price_buf: Vec::with_capacity(64),
+            triggered_buf: Vec::with_capacity(64),
+            match_price_buf: Vec::with_capacity(64),
+            consumed_slots: Vec::with_capacity(64),
         }
     }
 
@@ -1080,10 +1086,13 @@ impl OrderBook {
             stop_sells,
             stop_index,
             last_trade_price,
-            trigger_price_buf: Vec::new(),
-            triggered_buf: Vec::new(),
-            match_price_buf: Vec::new(),
-            consumed_slots: Vec::new(),
+            // Same hot-path scratch buffers as `new()`; pre-sized so the
+            // first match after snapshot restore doesn't realloc. See
+            // `new()` for the capacity rationale.
+            trigger_price_buf: Vec::with_capacity(64),
+            triggered_buf: Vec::with_capacity(64),
+            match_price_buf: Vec::with_capacity(64),
+            consumed_slots: Vec::with_capacity(64),
         }
     }
 
@@ -1683,6 +1692,13 @@ impl OrderBook {
                         }
                         SelfTradeProtection::CancelOldest => {
                             // Cancel the maker, continue matching the taker.
+                            // Safe: this iteration was entered via the
+                            // `while let Some(_) = opposite.front_node_idx(price)`
+                            // guard above and `opposite` has not been mutated
+                            // since (we only read maker fields). An empty pop
+                            // here would indicate a serious bookkeeping bug —
+                            // a panic surfaces it instead of silently dropping
+                            // a fill, which would corrupt balances.
                             opposite.pop_front(price).expect("front existed");
                             self.order_index.remove(&(maker_account, maker_id));
                             self.consumed_slots.push((
@@ -1701,6 +1717,11 @@ impl OrderBook {
                         }
                         SelfTradeProtection::CancelBoth => {
                             // Cancel the maker and the taker.
+                            // Same invariant as the CancelOldest arm above:
+                            // front was just read via `front_node_idx`, no
+                            // intervening mutation. A panic here would catch
+                            // a slab/level desync rather than silently leaking
+                            // a reservation.
                             opposite.pop_front(price).expect("front existed");
                             self.order_index.remove(&(maker_account, maker_id));
                             self.consumed_slots.push((
@@ -1767,6 +1788,12 @@ impl OrderBook {
                     None => {
                         // Maker fully filled — remove from book and record
                         // the slot so the Exchange can release the reservation.
+                        // Safe: same invariant as the STP arms above — we
+                        // entered this iteration via `front_node_idx(price)`
+                        // and `opposite` has not been mutated since (we only
+                        // read maker fields and computed the fill locally;
+                        // the `Some` arm that calls `node_mut` is a sibling,
+                        // not a predecessor, of this branch).
                         opposite.pop_front(price).expect("front existed");
                         self.order_index.remove(&(maker_account, maker_id));
                         self.consumed_slots.push((
