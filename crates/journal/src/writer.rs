@@ -42,6 +42,7 @@ use melin_app::AppEvent;
 use super::codec::{self, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
+use super::preparer::PreparedSegment;
 #[cfg(feature = "hash-chain")]
 use super::reader::JournalReader;
 
@@ -212,6 +213,12 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
+        // Clear any orphan `<path>.next-staging` from a prior crash
+        // before the SegmentPreparer (if rotation is later enabled)
+        // tries to open the same path with `create_new`. Safe here
+        // because this entry point runs only at startup, before any
+        // preparer is spawned.
+        crate::preparer::cleanup_staging_orphan(path);
         #[cfg(feature = "hash-chain")]
         {
             let mut genesis = [0u8; 32];
@@ -254,29 +261,39 @@ impl<E: AppEvent> JournalWriter<E> {
         genesis: [u8; 32],
     ) -> Result<Self, JournalError> {
         let mut writer = Self::create_bare(path, starting_sequence)?;
+        writer.emit_genesis_and_init_chain(genesis)?;
+        Ok(writer)
+    }
 
-        // Write genesis hash as the first entry and initialize the chain.
+    /// Write the `GenesisHash` entry, seed the BLAKE3 chain from it, and
+    /// flush. Extracted so `create_with_genesis` and `adopt_prepared` (the
+    /// pre-staged segment fast path used by rotation) share the same
+    /// initialisation sequence.
+    ///
+    /// Preconditions: the writer was just constructed (empty batch buffer,
+    /// `hash_chain` is `None`, `next_sequence` is the starting sequence
+    /// for the new segment).
+    #[cfg(feature = "hash-chain")]
+    fn emit_genesis_and_init_chain(&mut self, genesis: [u8; 32]) -> Result<(), JournalError> {
         let genesis_event: JournalEvent<E> = JournalEvent::GenesisHash { hash: genesis };
-        let seq = writer.next_sequence;
+        let seq = self.next_sequence;
         let timestamp_ns = wall_clock_nanos();
-        let written = codec::encode(seq, timestamp_ns, 0, 0, &genesis_event, &mut writer.buffer)?;
+        let written = codec::encode(seq, timestamp_ns, 0, 0, &genesis_event, &mut self.buffer)?;
 
         // Initialize chain: hash the genesis entry bytes (excluding CRC).
-        let entry_bytes = &writer.buffer[..written - 4]; // exclude CRC
+        let entry_bytes = &self.buffer[..written - 4]; // exclude CRC
         let hash = blake3::hash(entry_bytes);
-        writer.hash_chain = Some(HashChain {
+        self.hash_chain = Some(HashChain {
             current_hash: *hash.as_bytes(),
             batch_hasher: blake3::Hasher::new(),
             events_since_checkpoint: 0,
         });
 
-        writer.batch_buf[0..written].copy_from_slice(&writer.buffer[..written]);
-        writer.last_user_entry_len = written; // FIX: Update last_user_entry_len
-        writer.batch_len += written; // FIX: Track total batch length
-        writer.next_sequence += 1;
-        writer.flush_batch_sync()?;
-
-        Ok(writer)
+        self.batch_buf[0..written].copy_from_slice(&self.buffer[..written]);
+        self.last_user_entry_len = written;
+        self.batch_len += written;
+        self.next_sequence += 1;
+        self.flush_batch_sync()
     }
 
     /// Internal: create a new journal without a hash chain.
@@ -332,6 +349,34 @@ impl<E: AppEvent> JournalWriter<E> {
         // handlers and can stall for hundreds of milliseconds under load.
         prefault_pages(&file, sector_size as u64, allocated_end);
 
+        let writer = Self::build_from_owned_parts(
+            file,
+            path,
+            starting_sequence,
+            sector_size,
+            allocated_end,
+        )?;
+        writer.file.sync_all()?;
+        Ok(writer)
+    }
+
+    /// Assemble a `JournalWriter` from an already-open file whose
+    /// `[sector_size, allocated_end)` range is already prepared
+    /// (allocated, zeroed, prefaulted). Writes the file header sector
+    /// and locks the in-memory buffers. Does not call `sync_all` — the
+    /// caller decides whether to issue one (e.g. fresh-create wants to
+    /// durably commit the header alone; the rotation/adopt path
+    /// piggybacks on the immediately-following `flush_batch_sync`).
+    ///
+    /// Shared by `create_bare_inner` (full first-time setup) and
+    /// `adopt_prepared` (the rotation fast path).
+    fn build_from_owned_parts(
+        file: File,
+        path: &Path,
+        starting_sequence: u64,
+        sector_size: usize,
+        allocated_end: u64,
+    ) -> Result<Self, JournalError> {
         // Allocated once at startup; reused for the entire journal lifetime.
         let (batch_buf, spare_buf) = Self::alloc_batch_bufs();
         let mut tail_sector = Self::alloc_tail_sector();
@@ -346,8 +391,6 @@ impl<E: AppEvent> JournalWriter<E> {
         Self::lock_buffer(batch_buf.as_ptr(), BATCH_BUF_CAPACITY);
         Self::lock_buffer(spare_buf.as_ptr(), BATCH_BUF_CAPACITY);
         Self::lock_buffer(tail_sector.as_ptr(), sector_size);
-
-        file.sync_all()?;
 
         Ok(Self {
             _marker: PhantomData,
@@ -372,6 +415,69 @@ impl<E: AppEvent> JournalWriter<E> {
         })
     }
 
+    /// Adopt a [`PreparedSegment`] produced by [`SegmentPreparer`].
+    ///
+    /// Mirrors `create_continuing` but reuses the already-allocated /
+    /// zero-ranged / prefaulted staging file instead of doing that work
+    /// synchronously. On a successful return the new live segment is at
+    /// `live_path`, the file header is written, and (for `hash-chain`
+    /// builds) the `GenesisHash` entry has been emitted and durably
+    /// flushed.
+    ///
+    /// Failure mode contract for [`Self::rotate_segment_inner`]: this
+    /// method may or may not have renamed the staging file before
+    /// failing. On any error the caller falls back to its rename-back
+    /// rollback path — Linux `rename(2)` atomically replaces, so a
+    /// partially-installed live file is overwritten by the restored
+    /// archive without extra cleanup. The staging file is either gone
+    /// (rename succeeded) or still on disk (rename failed); in the
+    /// latter case the next preparer cycle removes it via the
+    /// `create_new`-then-cleanup pattern.
+    pub(crate) fn adopt_prepared(
+        prepared: PreparedSegment,
+        live_path: &Path,
+        starting_sequence: u64,
+        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))] genesis_hash: [u8; 32],
+    ) -> Result<Self, JournalError> {
+        let PreparedSegment {
+            file,
+            path: staging_path,
+            allocated_end,
+            sector_size,
+        } = prepared;
+
+        // Rename staging onto the live path. `archive_live` has already
+        // moved the previous live segment aside, so the destination is
+        // free. Done before any further writes so that, if it fails, the
+        // staging file is still findable for cleanup.
+        std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
+
+        #[cfg_attr(not(feature = "hash-chain"), allow(unused_mut))]
+        let mut writer = Self::build_from_owned_parts(
+            file,
+            live_path,
+            starting_sequence,
+            sector_size,
+            allocated_end,
+        )?;
+
+        #[cfg(feature = "hash-chain")]
+        {
+            // `flush_batch_sync` inside this call also commits the file
+            // header sector we just pwrote, so no separate sync_all here.
+            writer.emit_genesis_and_init_chain(genesis_hash)?;
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        {
+            // Without hash-chain there is no GenesisHash entry to flush —
+            // commit the header sector explicitly so a crash before the
+            // next user write doesn't leave a header-less live segment.
+            writer.file.sync_all()?;
+        }
+
+        Ok(writer)
+    }
+
     /// Open an existing journal file for appending after recovery.
     ///
     /// `last_seq` is the sequence number of the last valid entry read during
@@ -393,6 +499,10 @@ impl<E: AppEvent> JournalWriter<E> {
         #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
         events_since_checkpoint: u64,
     ) -> Result<Self, JournalError> {
+        // Clear any orphan `<path>.next-staging` from a prior crash
+        // before recovery proceeds; matches the cleanup in `create`.
+        // Safe at this point — no preparer has been spawned yet.
+        crate::preparer::cleanup_staging_orphan(path);
         // Open with O_DIRECT for all writes. Read permission is required for
         // prefault_pages (mmap MAP_SHARED) and for partial-tail reconstruction.
         let mut opts = OpenOptions::new();
@@ -955,6 +1065,34 @@ impl<E: AppEvent> JournalWriter<E> {
     /// "snapshot-only post-rotation crash" case (see
     /// [`crate::segment::list_archives`]).
     pub fn rotate_segment(&mut self) -> Result<std::path::PathBuf, JournalError> {
+        self.rotate_segment_inner(None)
+    }
+
+    /// Rotate, adopting a pre-staged segment produced by [`SegmentPreparer`].
+    ///
+    /// Same contract as [`Self::rotate_segment`] but skips the
+    /// `posix_fallocate + FALLOC_FL_ZERO_RANGE + prefault + sync_all`
+    /// ceremony for the new segment — that work was already done off the
+    /// hot path. The remaining on-rotation cost is a `flush_batch_sync`
+    /// of the outgoing segment, two renames, and a parent-directory
+    /// fsync.
+    ///
+    /// On error the prepared file is consumed (renamed onto the live
+    /// path then rolled back, or left as staging — see
+    /// `adopt_prepared`'s docs). Callers should re-arm the preparer
+    /// after a successful return so the next rotation can also be fast.
+    pub fn rotate_segment_with_prepared(
+        &mut self,
+        prepared: PreparedSegment,
+    ) -> Result<std::path::PathBuf, JournalError> {
+        self.rotate_segment_inner(Some(prepared))
+    }
+
+    /// Shared rotation body. `prepared.is_some()` takes the fast path.
+    fn rotate_segment_inner(
+        &mut self,
+        prepared: Option<PreparedSegment>,
+    ) -> Result<std::path::PathBuf, JournalError> {
         self.flush_batch_sync()?;
 
         let path = self.path.clone();
@@ -991,7 +1129,12 @@ impl<E: AppEvent> JournalWriter<E> {
 
         let archived = crate::segment::archive_live(&path).map_err(JournalError::Io)?;
 
-        match Self::create_continuing(&path, next_seq, genesis) {
+        let new_writer_result = match prepared {
+            Some(p) => Self::adopt_prepared(p, &path, next_seq, genesis),
+            None => Self::create_continuing(&path, next_seq, genesis),
+        };
+
+        match new_writer_result {
             Ok(new_writer) => {
                 *self = new_writer;
                 // Durably commit both the rename (archive_live) and the
@@ -1302,7 +1445,7 @@ fn alloc_aligned<const N: usize>() -> Box<AlignedBuf<N>> {
 ///
 /// Best-effort: silently skips on failure (e.g. insufficient VA space).
 /// Not called on the O_DIRECT path — O_DIRECT bypasses the page cache.
-fn prefault_pages(file: &File, start: u64, end: u64) {
+pub(crate) fn prefault_pages(file: &File, start: u64, end: u64) {
     if end <= start {
         return;
     }
@@ -1337,7 +1480,7 @@ fn prefault_pages(file: &File, start: u64, end: u64) {
 /// filesystem guarantees zero-fill on read for unwritten blocks. On the
 /// supported deployment targets (ext4, xfs, btrfs) this always succeeds;
 /// failure means an unsupported filesystem and is surfaced as an error.
-fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
+pub(crate) fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
     let chunk = prealloc_chunk_bytes();
     let target = current_end + chunk;
 
@@ -1370,7 +1513,7 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
 ///
 /// Best-effort: failures are logged at warn level and ignored. The fallback
 /// is periodic 1-2ms tail latency spikes, not data loss.
-fn zero_range_extents(file: &File, start: u64, end: u64) {
+pub(crate) fn zero_range_extents(file: &File, start: u64, end: u64) {
     if start >= end {
         return;
     }
@@ -1843,5 +1986,176 @@ mod tests {
         // events.
         let entries = read_all(&path);
         assert_eq!(entries.len(), 3);
+    }
+
+    /// Recovery-time cleanup: an orphan staging file from a prior crash
+    /// is removed by `open_append`, and the live segment opens normally.
+    /// Models the realistic scenario where a process crashes mid-rotate
+    /// (live + staging both on disk) and the operator restarts.
+    #[test]
+    fn open_append_cleans_orphan_staging_file() {
+        use crate::preparer::staging_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let staging = staging_path(&path);
+
+        let (last_seq, valid_end, events_since_checkpoint) = {
+            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&sample_event()).unwrap();
+            (
+                writer.next_sequence() - 1,
+                writer.valid_end(),
+                writer.events_since_checkpoint(),
+            )
+        };
+
+        // Simulate a crash that left a staging file on disk.
+        std::fs::write(&staging, b"orphan from prior crash").unwrap();
+        assert!(staging.exists());
+
+        let writer = JournalWriter::<TestEvent>::open_append(
+            &path,
+            last_seq,
+            valid_end,
+            None,
+            events_since_checkpoint,
+        )
+        .unwrap();
+        drop(writer);
+
+        assert!(
+            !staging.exists(),
+            "open_append should have removed the orphan staging file"
+        );
+    }
+
+    /// `JournalWriter::create` reclaims an orphan `<path>.next-staging`
+    /// file left behind by a prior crash, so the SegmentPreparer (which
+    /// may or may not be spawned later) doesn't trip over a stale file
+    /// on `create_new`. The same cleanup runs in `open_append` — that
+    /// path is exercised transitively by the rotation tests.
+    #[test]
+    fn create_cleans_orphan_staging_file() {
+        use crate::preparer::staging_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let staging = staging_path(&path);
+
+        std::fs::write(&staging, b"orphan from prior crash").unwrap();
+        assert!(staging.exists());
+
+        let writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        drop(writer);
+
+        assert!(
+            !staging.exists(),
+            "create should have removed the orphan staging file"
+        );
+    }
+
+    /// End-to-end exercise of the rotation fast path: spawn a preparer,
+    /// drain a [`PreparedSegment`] from it, hand the segment to
+    /// `rotate_segment_with_prepared`, then verify that
+    ///   - the outgoing segment is archived,
+    ///   - the new live segment is at the original path,
+    ///   - sequence numbers continue without gaps across the boundary,
+    ///   - entries from both segments are recoverable on read.
+    ///
+    /// This is the test that gives the fast path its own coverage; the
+    /// existing rotate_segment tests cover the sync (no-prepared) path
+    /// transitively.
+    #[test]
+    fn rotate_with_prepared_round_trip() {
+        use crate::preparer::SegmentPreparer;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        // Two entries on the outgoing segment.
+        writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+        writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        let next_seq_before_rotate = writer.next_sequence();
+
+        // Spawn a preparer and wait for it to publish a prepared segment.
+        let preparer = SegmentPreparer::spawn(path.clone(), writer.sector_size);
+        let mut prepared = None;
+        for _ in 0..500 {
+            if let Some(p) = preparer.take() {
+                prepared = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prepared = prepared.expect("preparer should publish a segment within 5 s");
+
+        // Take the fast path.
+        let archived = writer
+            .rotate_segment_with_prepared(prepared)
+            .expect("rotate_with_prepared should succeed");
+        assert!(archived.exists(), "archive should be on disk");
+        assert!(path.exists(), "new live segment should be at original path");
+        assert!(
+            !path.with_extension("journal.next-staging").exists(),
+            "staging file should have been renamed onto live path"
+        );
+
+        // The new segment's next_sequence must advance past the rotation
+        // boundary by exactly one (the GenesisHash takes that slot when
+        // hash-chain is on) or zero (no genesis without hash-chain).
+        #[cfg(feature = "hash-chain")]
+        assert_eq!(writer.next_sequence(), next_seq_before_rotate + 1);
+        #[cfg(not(feature = "hash-chain"))]
+        assert_eq!(writer.next_sequence(), next_seq_before_rotate);
+
+        // Two more entries on the new segment.
+        writer.append(&JournalEvent::App(TestEvent(3))).unwrap();
+        writer.append(&JournalEvent::App(TestEvent(4))).unwrap();
+        drop(writer);
+        preparer.shutdown();
+
+        // Reading the live (new) segment should surface only the
+        // post-rotation user entries — the genesis is transparent.
+        let live_entries = read_all(&path);
+        assert_eq!(
+            live_entries.len(),
+            2,
+            "live segment should have 2 user entries"
+        );
+        assert_eq!(live_entries[0].event, JournalEvent::App(TestEvent(3)));
+        assert_eq!(live_entries[1].event, JournalEvent::App(TestEvent(4)));
+
+        // Reading the archived segment should surface the pre-rotation
+        // user entries with their original sequences.
+        let archived_entries = read_all(&archived);
+        assert_eq!(
+            archived_entries.len(),
+            2,
+            "archive should have 2 user entries"
+        );
+        assert_eq!(archived_entries[0].event, JournalEvent::App(TestEvent(1)));
+        assert_eq!(archived_entries[1].event, JournalEvent::App(TestEvent(2)));
+
+        // Sequence continuity across the boundary: last archived user
+        // entry + 1 == first live user entry (with the genesis filling
+        // the gap when hash-chain is on, transparent to the reader's
+        // user-entry view).
+        let last_archived_seq = archived_entries.last().unwrap().sequence;
+        let first_live_seq = live_entries.first().unwrap().sequence;
+        #[cfg(feature = "hash-chain")]
+        assert_eq!(
+            first_live_seq,
+            last_archived_seq + 2,
+            "expected one genesis slot between last archived and first live"
+        );
+        #[cfg(not(feature = "hash-chain"))]
+        assert_eq!(
+            first_live_seq,
+            last_archived_seq + 1,
+            "expected contiguous sequence across rotation boundary"
+        );
     }
 }
