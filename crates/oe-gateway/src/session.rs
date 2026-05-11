@@ -881,7 +881,12 @@ impl Session {
                         // Maker side.
                         if self.id_map.get_clord_id(*maker_order_id).is_some() {
                             let info = self.order_symbols.get(maker_order_id);
-                            let (sym, ti, li, side) = sym_info_or_default(info);
+                            let OrderSymbolView {
+                                fix_symbol: sym,
+                                tick_inverse: ti,
+                                lot_inverse: li,
+                                side,
+                            } = sym_info_or_default(info);
                             let ctx = translate::FixCtx {
                                 id_map: &self.id_map,
                                 symbol_str: sym,
@@ -915,7 +920,12 @@ impl Session {
                         // Taker side.
                         if self.id_map.get_clord_id(*taker_order_id).is_some() {
                             let info = self.order_symbols.get(taker_order_id);
-                            let (sym, ti, li, side) = sym_info_or_default(info);
+                            let OrderSymbolView {
+                                fix_symbol: sym,
+                                tick_inverse: ti,
+                                lot_inverse: li,
+                                side,
+                            } = sym_info_or_default(info);
                             let ctx = translate::FixCtx {
                                 id_map: &self.id_map,
                                 symbol_str: sym,
@@ -975,7 +985,12 @@ impl Session {
                         } else {
                             // Regular order rejection.
                             let info = self.order_symbols.get(order_id);
-                            let (sym, ti, li, side) = sym_info_or_default(info);
+                            let OrderSymbolView {
+                                fix_symbol: sym,
+                                tick_inverse: ti,
+                                lot_inverse: li,
+                                side,
+                            } = sym_info_or_default(info);
                             let ctx = translate::FixCtx {
                                 id_map: &self.id_map,
                                 symbol_str: sym,
@@ -1007,7 +1022,12 @@ impl Session {
                         }
 
                         let info = order_id.and_then(|id| self.order_symbols.get(&id));
-                        let (sym, ti, li, side) = sym_info_or_default(info);
+                        let OrderSymbolView {
+                            fix_symbol: sym,
+                            tick_inverse: ti,
+                            lot_inverse: li,
+                            side,
+                        } = sym_info_or_default(info);
                         // Clone sym so the borrow on order_symbols ends
                         // before the mutable borrow in update_ledger_from_report.
                         let sym_owned = sym.to_owned();
@@ -1067,10 +1087,10 @@ impl Session {
                 let n = std::cmp::min(count as usize, balances.len());
                 let bal_entries: Vec<translate::BalanceEntry> = balances[..n]
                     .iter()
-                    .map(|&(currency, free, reserved)| translate::BalanceEntry {
-                        currency: currency.0.to_string(),
-                        free,
-                        reserved,
+                    .map(|b| translate::BalanceEntry {
+                        currency: b.currency.0.to_string(),
+                        free: b.free,
+                        reserved: b.reserved,
                     })
                     .collect();
 
@@ -1706,11 +1726,31 @@ impl Drop for Session {
 
 use melin_trading::types::ExecutionReport;
 
+/// Borrowed view over an `OrderSymbolInfo` with sensible fallbacks when no
+/// info was recorded for the order. Returned by [`sym_info_or_default`] so
+/// call sites get named fields instead of an opaque tuple.
+struct OrderSymbolView<'a> {
+    fix_symbol: &'a str,
+    tick_inverse: u64,
+    lot_inverse: u64,
+    side: Side,
+}
+
 /// Extract symbol info from an OrderSymbolInfo, or return defaults.
-fn sym_info_or_default(info: Option<&OrderSymbolInfo>) -> (&str, u64, u64, Side) {
+fn sym_info_or_default(info: Option<&OrderSymbolInfo>) -> OrderSymbolView<'_> {
     match info {
-        Some(i) => (i.fix_symbol.as_str(), i.tick_inverse, i.lot_inverse, i.side),
-        None => ("UNKNOWN", 1, 1, Side::Buy),
+        Some(i) => OrderSymbolView {
+            fix_symbol: i.fix_symbol.as_str(),
+            tick_inverse: i.tick_inverse,
+            lot_inverse: i.lot_inverse,
+            side: i.side,
+        },
+        None => OrderSymbolView {
+            fix_symbol: "UNKNOWN",
+            tick_inverse: 1,
+            lot_inverse: 1,
+            side: Side::Buy,
+        },
     }
 }
 

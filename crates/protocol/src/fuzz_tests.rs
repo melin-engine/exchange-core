@@ -363,14 +363,14 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             if data.len() < 6 + (count as usize) * 20 {
                 return None;
             }
-            let mut balances = [(CurrencyId(0), 0u64, 0u64); 16];
+            let mut balances = [AccountBalance::ZERO; 16];
             for (i, entry) in balances.iter_mut().enumerate().take(count as usize) {
                 let off = 6 + i * 20;
-                *entry = (
-                    CurrencyId(u32_at(data, off)?),
-                    u64_at(data, off + 4)?,
-                    u64_at(data, off + 12)?,
-                );
+                *entry = AccountBalance {
+                    currency: CurrencyId(u32_at(data, off)?),
+                    free: u64_at(data, off + 4)?,
+                    reserved: u64_at(data, off + 12)?,
+                };
             }
             Some(ResponseKind::PositionSnapshot {
                 account,

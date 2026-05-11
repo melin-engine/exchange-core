@@ -667,17 +667,28 @@ fn sweep_x_label(filename: &str) -> &'static str {
     }
 }
 
+/// One parameter-sweep data point: the swept parameter value paired with the
+/// throughput and p99 latency the engine achieved at that value.
+struct SweepPoint {
+    x: f64,
+    throughput: f64,
+    p99_latency: f64,
+}
+
 fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
-    // Build (parameter_value, throughput, p99_latency) points.
-    let mut points: Vec<(f64, f64, f64)> = results
+    let mut points: Vec<SweepPoint> = results
         .iter()
         .filter_map(|r| {
-            let val = extract_sweep_value(&r.filename)?;
-            let p99 = r.result.latency.get("p99_us").copied().unwrap_or(0.0);
-            Some((val, r.result.throughput_ops, p99))
+            let x = extract_sweep_value(&r.filename)?;
+            let p99_latency = r.result.latency.get("p99_us").copied().unwrap_or(0.0);
+            Some(SweepPoint {
+                x,
+                throughput: r.result.throughput_ops,
+                p99_latency,
+            })
         })
         .collect();
-    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    points.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
 
     if points.is_empty() {
         eprintln!("error: no valid sweep data (could not extract numeric values from filenames)");
@@ -685,9 +696,9 @@ fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
     }
 
     let x_label = sweep_x_label(&results[0].filename);
-    let max_x = points.last().map(|p| p.0).unwrap_or(1.0) * 1.15;
-    let max_throughput = points.iter().map(|p| p.1).fold(0.0f64, f64::max) * 1.15;
-    let max_latency = points.iter().map(|p| p.2).fold(0.0f64, f64::max) * 1.3;
+    let max_x = points.last().map(|p| p.x).unwrap_or(1.0) * 1.15;
+    let max_throughput = points.iter().map(|p| p.throughput).fold(0.0f64, f64::max) * 1.15;
+    let max_latency = points.iter().map(|p| p.p99_latency).fold(0.0f64, f64::max) * 1.3;
 
     render_both!(output, (900, 500), |root| {
         root.fill(&WHITE).unwrap();
@@ -745,7 +756,7 @@ fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
             .unwrap();
 
         // Throughput line (primary Y-axis).
-        let tp_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.1)).collect();
+        let tp_points: Vec<(f64, f64)> = points.iter().map(|p| (p.x, p.throughput)).collect();
         chart
             .draw_series(LineSeries::new(
                 tp_points.clone(),
@@ -765,7 +776,7 @@ fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
             .unwrap();
 
         // p99 latency line (secondary Y-axis).
-        let lat_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.2)).collect();
+        let lat_points: Vec<(f64, f64)> = points.iter().map(|p| (p.x, p.p99_latency)).collect();
         chart
             .draw_secondary_series(LineSeries::new(
                 lat_points.clone(),

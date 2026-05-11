@@ -909,29 +909,46 @@ fn park_on_eventfd(consumer: &Mutex<Consumer<Frame>>, wake_fd: RawFd, timeout: D
     drain_eventfd(wake_fd);
 }
 
-/// Counters for diagnostics: `(recv_pushed, send_pushed, recv_dropped,
-/// send_dropped, parse_dropped, cqe_errors)`.
+/// Diagnostic snapshot of the endpoint's monotonic counters. Returned by
+/// [`EndpointSend::counters`] / [`EndpointRecv::counters`]; named fields
+/// keep callers from positional decoding of a six-tuple.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CounterSnapshot {
+    /// Frames classified as recv-bound and pushed onto the recv ring.
+    pub recv_pushed: u64,
+    /// Frames classified as send-bound and pushed onto the send ring.
+    pub send_pushed: u64,
+    /// Frames dropped because the recv ring was full.
+    pub recv_dropped: u64,
+    /// Frames dropped because the send ring was full.
+    pub send_dropped: u64,
+    /// Frames the wire parser rejected.
+    pub parse_dropped: u64,
+    /// CQEs that came back with a kernel error (e.g. ENOBUFS).
+    pub cqe_errors: u64,
+}
+
 impl EndpointSend {
-    pub fn counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub fn counters(&self) -> CounterSnapshot {
         snapshot_counters(&self.poller.counters)
     }
 }
 
 impl EndpointRecv {
-    pub fn counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub fn counters(&self) -> CounterSnapshot {
         snapshot_counters(&self.poller.counters)
     }
 }
 
-fn snapshot_counters(c: &EndpointCounters) -> (u64, u64, u64, u64, u64, u64) {
-    (
-        c.recv_pushed.load(Ordering::Relaxed),
-        c.send_pushed.load(Ordering::Relaxed),
-        c.recv_dropped.load(Ordering::Relaxed),
-        c.send_dropped.load(Ordering::Relaxed),
-        c.parse_dropped.load(Ordering::Relaxed),
-        c.cqe_errors.load(Ordering::Relaxed),
-    )
+fn snapshot_counters(c: &EndpointCounters) -> CounterSnapshot {
+    CounterSnapshot {
+        recv_pushed: c.recv_pushed.load(Ordering::Relaxed),
+        send_pushed: c.send_pushed.load(Ordering::Relaxed),
+        recv_dropped: c.recv_dropped.load(Ordering::Relaxed),
+        send_dropped: c.send_dropped.load(Ordering::Relaxed),
+        parse_dropped: c.parse_dropped.load(Ordering::Relaxed),
+        cqe_errors: c.cqe_errors.load(Ordering::Relaxed),
+    }
 }
 
 #[inline]
@@ -1178,8 +1195,7 @@ mod tests {
         // Wait for parse_dropped to tick.
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let (_, _, _, _, parse_dropped, _) = send_half.counters();
-            if parse_dropped >= 1 {
+            if send_half.counters().parse_dropped >= 1 {
                 break;
             }
             assert!(Instant::now() < deadline, "parse_dropped never incremented");
@@ -1294,7 +1310,11 @@ mod tests {
         // and observed the ring-full condition).
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let (recv_pushed, _, recv_dropped, _, _, _) = send_half.counters();
+            let CounterSnapshot {
+                recv_pushed,
+                recv_dropped,
+                ..
+            } = send_half.counters();
             // Once the poller has classified all frames, pushed +
             // dropped should equal FIRE; recv_dropped must be > 0
             // because spsc_capacity=4 < FIRE=64.

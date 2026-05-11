@@ -30,9 +30,9 @@ use std::num::NonZeroU64;
 
 use melin_trading::le;
 use melin_trading::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
-    TimeInForce,
+    AccountBalance, AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule,
+    InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    RiskLimits, Symbol, TimeInForce,
 };
 use zerocopy::little_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -807,12 +807,12 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             pos += 1;
             // Each entry: currency(4) + free(8) + reserved(8) = 20 bytes.
             let n = std::cmp::min(*count as usize, balances.len());
-            for &(currency, free, reserved) in &balances[..n] {
-                le::put_u32(&mut buf[pos..], currency.0);
+            for entry in &balances[..n] {
+                le::put_u32(&mut buf[pos..], entry.currency.0);
                 pos += 4;
-                le::put_u64(&mut buf[pos..], free);
+                le::put_u64(&mut buf[pos..], entry.free);
                 pos += 8;
-                le::put_u64(&mut buf[pos..], reserved);
+                le::put_u64(&mut buf[pos..], entry.reserved);
                 pos += 8;
             }
         }
@@ -942,14 +942,14 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
             if payload.len() < needed {
                 return Err(ProtocolError::Truncated);
             }
-            let mut balances = [(CurrencyId(0), 0u64, 0u64); 16];
+            let mut balances = [AccountBalance::ZERO; 16];
             for (i, entry) in balances.iter_mut().enumerate().take(count as usize) {
                 let off = 5 + i * 20;
-                *entry = (
-                    CurrencyId(le::get_u32(&payload[off..])),
-                    le::get_u64(&payload[off + 4..]),
-                    le::get_u64(&payload[off + 12..]),
-                );
+                *entry = AccountBalance {
+                    currency: CurrencyId(le::get_u32(&payload[off..])),
+                    free: le::get_u64(&payload[off + 4..]),
+                    reserved: le::get_u64(&payload[off + 12..]),
+                };
             }
             Ok(ResponseKind::PositionSnapshot {
                 account,
@@ -1908,9 +1908,17 @@ mod tests {
             ResponseKind::PositionSnapshot {
                 account: AccountId(42),
                 balances: {
-                    let mut b = [(CurrencyId(0), 0, 0); 16];
-                    b[0] = (CurrencyId(1), 100_000, 25_000);
-                    b[1] = (CurrencyId(2), 50_000, 10_000);
+                    let mut b = [AccountBalance::ZERO; 16];
+                    b[0] = AccountBalance {
+                        currency: CurrencyId(1),
+                        free: 100_000,
+                        reserved: 25_000,
+                    };
+                    b[1] = AccountBalance {
+                        currency: CurrencyId(2),
+                        free: 50_000,
+                        reserved: 10_000,
+                    };
                     b
                 },
                 count: 2,
@@ -2116,7 +2124,7 @@ mod tests {
     fn position_snapshot_empty_roundtrip() {
         let response = ResponseKind::PositionSnapshot {
             account: AccountId(99),
-            balances: [(CurrencyId(0), 0, 0); 16],
+            balances: [AccountBalance::ZERO; 16],
             count: 0,
         };
         let mut buf = [0u8; 512];
@@ -2133,13 +2141,13 @@ mod tests {
     #[test]
     fn position_snapshot_max_currencies_roundtrip() {
         // Fill all 16 slots with distinct values.
-        let mut balances = [(CurrencyId(0), 0u64, 0u64); 16];
+        let mut balances = [AccountBalance::ZERO; 16];
         for (i, entry) in balances.iter_mut().enumerate() {
-            *entry = (
-                CurrencyId((i + 1) as u32),
-                (i as u64 + 1) * 1000,
-                (i as u64 + 1) * 100,
-            );
+            *entry = AccountBalance {
+                currency: CurrencyId((i + 1) as u32),
+                free: (i as u64 + 1) * 1000,
+                reserved: (i as u64 + 1) * 100,
+            };
         }
         let response = ResponseKind::PositionSnapshot {
             account: AccountId(7),
@@ -2158,9 +2166,7 @@ mod tests {
             assert_eq!(account, AccountId(7));
             assert_eq!(count, 16);
             for i in 0..16 {
-                assert_eq!(dec_bal[i].0, balances[i].0, "currency mismatch at {i}");
-                assert_eq!(dec_bal[i].1, balances[i].1, "free mismatch at {i}");
-                assert_eq!(dec_bal[i].2, balances[i].2, "reserved mismatch at {i}");
+                assert_eq!(dec_bal[i], balances[i], "balance mismatch at {i}");
             }
         } else {
             panic!("expected PositionSnapshot, got {decoded:?}");

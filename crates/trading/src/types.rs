@@ -42,6 +42,31 @@ pub struct AccountId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CurrencyId(pub u32);
 
+/// One currency slot of an account's balance snapshot.
+///
+/// `Copy` so the fixed-size `[AccountBalance; 16]` array used in position
+/// queries stays trivially clonable; the struct replaces an earlier
+/// `(CurrencyId, u64, u64)` tuple so call sites read with named fields
+/// instead of opaque positional access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountBalance {
+    pub currency: CurrencyId,
+    /// Spendable balance (not reserved by any open order).
+    pub free: u64,
+    /// Balance reserved by open orders. `free + reserved` is the total holding.
+    pub reserved: u64,
+}
+
+impl AccountBalance {
+    /// Zero-valued placeholder used to pad the fixed-size balance array
+    /// up to its declared length when an account holds fewer currencies.
+    pub const ZERO: Self = Self {
+        currency: CurrencyId(0),
+        free: 0,
+        reserved: 0,
+    };
+}
+
 /// Maps an instrument to its base and quote currencies.
 ///
 /// Example: BTC/USD → base = BTC (what you buy/sell), quote = USD (what you pay with).
@@ -339,7 +364,7 @@ pub enum QueryResponse {
     /// account; `count` reports how many entries are populated.
     Position {
         account: AccountId,
-        balances: [(CurrencyId, u64, u64); 16],
+        balances: [AccountBalance; 16],
         count: u8,
     },
     /// Per-key request_seq HWM snapshot emitted in response to

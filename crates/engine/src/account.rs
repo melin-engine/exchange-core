@@ -17,8 +17,8 @@
 //! commercial tradeoff.
 
 use crate::types::{
-    AccountId, CurrencyId, HashMap4, InstrumentSpec, Order, OrderId, OrderType, Price, Quantity,
-    RejectReason, Side,
+    AccountBalance, AccountId, CurrencyId, HashMap4, InstrumentSpec, Order, OrderId, OrderType,
+    Price, Quantity, RejectReason, Side,
 };
 
 /// Saturating fallback for a checked subtraction in a balance path.
@@ -947,19 +947,21 @@ impl AccountManager {
         }
     }
 
-    /// Check if an account has any non-zero balances.
-    ///
     /// Collect all non-zero balances for an account into a fixed-size array.
     ///
     /// Returns `(balances, count)` where `count` is the number of valid entries
     /// (capped at 16). O(n) scan of the sparse balance map — acceptable for
     /// query operations that flow through the pipeline (not on the order hot path).
-    pub fn balances_for(&self, account: AccountId) -> ([(CurrencyId, u64, u64); 16], u8) {
-        let mut result = [(CurrencyId(0), 0u64, 0u64); 16];
+    pub fn balances_for(&self, account: AccountId) -> ([AccountBalance; 16], u8) {
+        let mut result = [AccountBalance::ZERO; 16];
         let mut count: u8 = 0;
         for (&(acct, currency), balance) in self.balances.iter() {
             if acct == account && !balance.is_zero() && (count as usize) < 16 {
-                result[count as usize] = (currency, balance.available, balance.reserved);
+                result[count as usize] = AccountBalance {
+                    currency,
+                    free: balance.available,
+                    reserved: balance.reserved,
+                };
                 count += 1;
             }
         }
