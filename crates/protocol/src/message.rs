@@ -5,8 +5,8 @@
 //! commands require `Permission::Operator` and are gated on the reader thread.
 
 use melin_trading::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
+    AccountBalance, AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule,
+    InstrumentSpec, Order, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
 };
 
 /// Connection identifier assigned by the server.
@@ -255,9 +255,9 @@ pub enum ResponseKind {
     /// Account balance snapshot in response to `QueryPosition`.
     PositionSnapshot {
         account: AccountId,
-        /// (currency_id, free_balance, reserved_balance) tuples.
-        /// Fixed-size array avoids heap allocation. Max 16 currencies per account.
-        balances: [(CurrencyId, u64, u64); 16],
+        /// Per-currency snapshot. Fixed-size array avoids heap allocation;
+        /// max 16 currencies per account. Slots past `count` are zeroed.
+        balances: [AccountBalance; 16],
         /// Number of valid entries in `balances`. Remaining slots are zeroed.
         count: u8,
     },
