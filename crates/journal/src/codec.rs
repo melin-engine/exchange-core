@@ -62,7 +62,15 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v11 → v12: `JournalEvent` made generic over `AppEvent`; transport
 /// variants renumbered to the `TAG_*` constants below, app payloads
 /// delegated to `AppEvent::encode` under `TAG_APP = 0x80`.
-pub const FORMAT_VERSION: u16 = 12;
+///
+/// v12 → v13: entry offset fixed at [`ENTRY_OFFSET`] (= [`MAX_SECTOR_SIZE`]
+/// = 4096) regardless of the device's logical sector size, so journals
+/// can be opened under either [`crate::SectorWriter`] (O_DIRECT) or
+/// [`crate::BufferedWriter`] (page cache + fdatasync) without
+/// recreation. The header's `sector_size` field is now always 4096 in
+/// newly-written files; SectorWriter derives its O_DIRECT alignment
+/// from the device (`detect_sector_size`) rather than the header.
+pub const FORMAT_VERSION: u16 = 13;
 
 /// Entry magic bytes for corruption/misalignment detection.
 const ENTRY_MAGIC: u16 = 0x4A45;
@@ -126,6 +134,13 @@ pub const FILE_HEADER_SIZE: usize = 512;
 /// this value so O_DIRECT writes are valid on both 512-byte and 4096-byte
 /// (4Kn) NVMe drives without re-opening the file.
 pub const MAX_SECTOR_SIZE: usize = 4096;
+
+/// Fixed on-disk offset of the first journal entry. Both writers reserve
+/// this many bytes for the file header (most of which is zero padding)
+/// so journals are interchangeable between writer modes regardless of
+/// the device's logical sector size. Equal to [`MAX_SECTOR_SIZE`] so
+/// O_DIRECT writes on a 4Kn drive start at exactly one sector.
+pub const ENTRY_OFFSET: u64 = MAX_SECTOR_SIZE as u64;
 
 /// Size of the meaningful `FileHeader` fields (the rest of the on-disk
 /// reservation is zero-padded).

@@ -37,6 +37,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::JournalError;
+use crate::codec::ENTRY_OFFSET;
 use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 
 /// A fully-prepared journal segment file ready to be adopted by a
@@ -286,9 +287,12 @@ fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, 
     opts.custom_flags(libc::O_DIRECT);
     let file = opts.open(&staging)?;
 
-    let allocated_end = preallocate(&file, sector_size as u64)?;
-    zero_range_extents(&file, sector_size as u64, allocated_end);
-    prefault_pages(&file, sector_size as u64, allocated_end);
+    // Reserve `ENTRY_OFFSET` for the file header (written later by
+    // `adopt_prepared`) — matches `create_bare_inner` so adoption is a
+    // simple header pwrite, not a re-allocate.
+    let allocated_end = preallocate(&file, ENTRY_OFFSET)?;
+    zero_range_extents(&file, ENTRY_OFFSET, allocated_end);
+    prefault_pages(&file, ENTRY_OFFSET, allocated_end);
     file.sync_all()?;
 
     Ok(PreparedSegment {

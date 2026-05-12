@@ -14,6 +14,8 @@ use melin_app::AppEvent;
 use zerocopy::FromBytes;
 
 use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_SIZE};
+#[cfg(test)]
+use super::codec::ENTRY_OFFSET;
 use super::error::JournalError;
 use super::event::JournalEvent;
 
@@ -763,7 +765,7 @@ mod tests {
 
         // Flip a byte inside the (already-synced) entry region to force
         // a CRC mismatch.
-        let entry_offset = FILE_HEADER_SIZE + 4; // magic+length then a data byte
+        let entry_offset = ENTRY_OFFSET as usize + 4; // magic+length then a data byte
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -805,7 +807,7 @@ mod tests {
         #[cfg(not(feature = "hash-chain"))]
         {
             const FIRST_ENTRY_SIZE: u64 = 20 + 25 + 4;
-            let second_seq_offset = FILE_HEADER_SIZE as u64 + FIRST_ENTRY_SIZE + 4;
+            let second_seq_offset = ENTRY_OFFSET + FIRST_ENTRY_SIZE + 4;
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)

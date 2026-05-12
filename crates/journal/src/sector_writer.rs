@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use melin_app::AppEvent;
 
-use super::codec::{self, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
+use super::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
 use super::preparer::PreparedSegment;
@@ -339,15 +339,18 @@ impl<E: AppEvent> SectorWriter<E> {
         starting_sequence: u64,
         sector_size: usize,
     ) -> Result<Self, JournalError> {
-        let allocated_end = preallocate(&file, sector_size as u64)?;
-        zero_range_extents(&file, sector_size as u64, allocated_end);
+        // Reserve `ENTRY_OFFSET` bytes for the file header regardless of
+        // device sector size — the layout invariant that lets BufferedWriter
+        // and SectorWriter open each other's journals.
+        let allocated_end = preallocate(&file, ENTRY_OFFSET)?;
+        zero_range_extents(&file, ENTRY_OFFSET, allocated_end);
 
         // Pre-fault all pages in the preallocated region so the first write
         // to each 4 KB page doesn't trigger a page cache miss during an
         // io_uring write. Without this, each miss is handled by an io-wq
         // worker on core 0 (IRQ core), which competes with TCP interrupt
         // handlers and can stall for hundreds of milliseconds under load.
-        prefault_pages(&file, sector_size as u64, allocated_end);
+        prefault_pages(&file, ENTRY_OFFSET, allocated_end);
 
         let writer = Self::build_from_owned_parts(
             file,
@@ -381,11 +384,14 @@ impl<E: AppEvent> SectorWriter<E> {
         let (batch_buf, spare_buf) = Self::alloc_batch_bufs();
         let mut tail_sector = Self::alloc_tail_sector();
 
-        // Encode the file header into the sector-aligned tail_sector scratch
-        // buffer and write it as one O_DIRECT pwrite. Reset the buffer
-        // afterwards — at construction the partial tail is empty.
-        codec::encode_file_header(&mut tail_sector[..sector_size], sector_size);
-        pwrite_aligned_sector(file.as_fd(), &tail_sector[..sector_size], 0)?;
+        // Encode the file header at offset 0 as one O_DIRECT pwrite of
+        // `MAX_SECTOR_SIZE` bytes. The header reservation is fixed at
+        // `ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096` for both writer modes
+        // — on a 4Kn drive this is one device sector, on a 512n drive
+        // it's eight (still aligned). The tail_sector scratch buffer
+        // is `MAX_SECTOR_SIZE`-sized so this always fits.
+        codec::encode_file_header(&mut tail_sector[..MAX_SECTOR_SIZE], MAX_SECTOR_SIZE);
+        pwrite_aligned_sector(file.as_fd(), &tail_sector[..MAX_SECTOR_SIZE], 0)?;
         tail_sector.fill(0);
 
         Self::lock_buffer(batch_buf.as_ptr(), BATCH_BUF_CAPACITY);
@@ -400,7 +406,7 @@ impl<E: AppEvent> SectorWriter<E> {
             spare_buf: Some(spare_buf),
             next_sequence: starting_sequence,
             path: path.to_path_buf(),
-            write_pos: sector_size as u64,
+            write_pos: ENTRY_OFFSET,
             allocated_end,
             #[cfg(feature = "hash-chain")]
             hash_chain: None,
@@ -511,10 +517,10 @@ impl<E: AppEvent> SectorWriter<E> {
         opts.custom_flags(libc::O_DIRECT);
         let file = opts.open(path)?;
 
-        // Read the file header to recover the journal's sector_size. Use a
-        // MAX_SECTOR_SIZE-aligned scratch buffer so O_DIRECT is satisfied on
-        // both 512-byte and 4096-byte drives — the meaningful header fields
-        // are in the first 8 bytes regardless of sector size. The buffer is
+        // Read the file header to validate magic + version. Use a
+        // MAX_SECTOR_SIZE-aligned scratch buffer so O_DIRECT is satisfied
+        // on both 512-byte and 4096-byte drives — the meaningful header
+        // fields are in the first 8 bytes regardless. The buffer is
         // reused as tail_sector below after being zeroed.
         let mut tail_sector = Self::alloc_tail_sector();
         let n = file.read_at(&mut tail_sector[..], 0)?;
@@ -524,19 +530,17 @@ impl<E: AppEvent> SectorWriter<E> {
                 "journal file too short to read file header",
             )));
         }
-        let (_, sector_size) = codec::decode_file_header(&tail_sector[..FILE_HEADER_SIZE])?;
+        // Decoded sector_size is informational — under v13 it always
+        // equals ENTRY_OFFSET (= 4096). The device's actual O_DIRECT
+        // alignment is detected separately below.
+        codec::decode_file_header(&tail_sector[..FILE_HEADER_SIZE])?;
         tail_sector.fill(0);
 
-        // Validate that the device's physical sector size is compatible.
-        // A journal created on a 512e drive cannot be opened on a 4Kn drive —
-        // the recorded sector_size would be 512 but O_DIRECT requires 4096.
-        let device_sector_size = detect_sector_size(file.as_fd());
-        if device_sector_size > sector_size {
-            return Err(JournalError::SectorSizeMismatch {
-                journal: sector_size,
-                device: device_sector_size,
-            });
-        }
+        // SectorWriter's O_DIRECT writes must align to the device's
+        // logical sector size. Detect it directly from the fd — the
+        // on-disk header records the fixed ENTRY_OFFSET (4096) for
+        // layout, not the alignment requirement.
+        let sector_size = detect_sector_size(file.as_fd());
 
         let file_len = file.metadata()?.len();
         let allocated_end = if file_len >= valid_end {
@@ -1014,7 +1018,7 @@ impl<E: AppEvent> SectorWriter<E> {
     /// operation — the extra open is acceptable.
     pub fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
         let file = std::fs::File::open(&self.path)?;
-        let offset = self.sector_size as u64;
+        let offset = ENTRY_OFFSET;
         // Read the first 4 bytes to get magic(2) + length(2).
         let mut hdr4 = [0u8; 4];
         let n = file.read_at(&mut hdr4, offset)?;
@@ -1942,11 +1946,16 @@ mod tests {
         assert_eq!(e2.event, JournalEvent::App(TestEvent(0xbeef)));
     }
 
-    /// open_append with a 4096-byte sector journal resumes correctly.
+    /// open_append on a journal resumes correctly. Under the v13 layout
+    /// the on-disk entry offset is fixed (`ENTRY_OFFSET = 4096`) and the
+    /// reopened writer's `sector_size()` is the *device's* logical
+    /// sector size — not whatever was recorded in the header. Test
+    /// verifies round-trip without asserting on the device-specific
+    /// sector_size value.
     #[test]
-    fn sector_size_4096_open_append_round_trip() {
+    fn open_append_round_trip_appends_continue() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("4k-append.journal");
+        let path = dir.path().join("append.journal");
 
         let (last_seq, valid_end) = {
             let mut writer =
@@ -1957,7 +1966,6 @@ mod tests {
 
         let mut writer =
             SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
-        assert_eq!(writer.sector_size(), 4096);
         let seq = writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         assert_eq!(seq, last_seq + 1);
         drop(writer);

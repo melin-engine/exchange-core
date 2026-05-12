@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use melin_app::AppEvent;
 
-use crate::codec::{self, FILE_HEADER_SIZE};
+use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 #[cfg(feature = "hash-chain")]
@@ -50,14 +50,10 @@ const MAX_ENTRY_SIZE: usize = 144;
 /// here unchanged.
 const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
-/// Header-sector size recorded in the on-disk file header.
-///
-/// The file header occupies the first `HEADER_OFFSET` bytes; entries
-/// begin at exactly this offset. Using the codec's `FILE_HEADER_SIZE`
-/// (512) matches what the O_DIRECT writer records for a 512-byte-sector
-/// drive, so [`crate::reader::JournalReader`] reads the buffered
-/// journal byte-for-byte the same way it reads an O_DIRECT one.
-const HEADER_OFFSET: u64 = FILE_HEADER_SIZE as u64;
+/// Fixed on-disk offset of the first journal entry. Defined in the codec
+/// (`ENTRY_OFFSET = MAX_SECTOR_SIZE = 4096`) so both writer variants
+/// produce interchangeable layouts. Renamed locally for legibility.
+const HEADER_OFFSET: u64 = ENTRY_OFFSET;
 
 /// Pre-allocation chunk size (256 MiB), overridable via
 /// `MELIN_JOURNAL_PREALLOC_MIB` for tests. Mirrors the O_DIRECT writer's
@@ -183,12 +179,14 @@ impl<E: AppEvent> BufferedWriter<E> {
         // unwritten extents (no zero-fill cost) on the supported targets.
         let allocated_end = fallocate_chunk(&file, 0)?;
 
-        // Write the file header sector at offset 0. We record 512 in
-        // the header (same as the O_DIRECT writer on a 512-byte-sector
-        // drive) so JournalReader treats the file identically — entries
-        // begin at FILE_HEADER_SIZE.
-        let mut header_buf = [0u8; FILE_HEADER_SIZE];
-        codec::encode_file_header(&mut header_buf, 512);
+        // Write the file header at offset 0. The codec reserves the
+        // first `MAX_SECTOR_SIZE` (= 4096) bytes for the header
+        // regardless of writer mode or device sector size, so a
+        // journal created here is layout-compatible with SectorWriter.
+        // The meaningful fields occupy only the first ~8 bytes; the
+        // rest is zero padding.
+        let mut header_buf = [0u8; MAX_SECTOR_SIZE];
+        codec::encode_file_header(&mut header_buf, MAX_SECTOR_SIZE);
         write_all_at(&file, &header_buf, 0)?;
 
         // Flush the header durably before returning. Subsequent batch
