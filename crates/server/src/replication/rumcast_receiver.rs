@@ -95,10 +95,12 @@ pub fn run_receiver_rumcast(
     // Bound on in-flight unacked batches before backpressure. Mirrors the
     // TCP receiver knob (`config.replication_pipeline_depth`).
     pipeline_depth: usize,
+    // Selected journal writer — applied uniformly to the recover,
+    // snapshot-resume, and fresh-bootstrap paths.
+    journal_writer_mode: melin_journal::JournalWriterMode,
 ) -> super::ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
-    use crate::SectorWriter;
     use melin_transport_core::JournaledApp;
 
     // ---- Recover local state from journal (if any) ----
@@ -109,13 +111,13 @@ pub fn run_receiver_rumcast(
                 JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
-                    melin_journal::JournalWriterMode::default(),
+                    journal_writer_mode,
                 )?
             } else {
                 JournaledApp::<App>::recover(
                     crate::server::empty_app(),
                     journal_path,
-                    melin_journal::JournalWriterMode::default(),
+                    journal_writer_mode,
                 )?
             };
             let next = engine.next_sequence();
@@ -205,14 +207,13 @@ pub fn run_receiver_rumcast(
                     let (snap_exchange, snap_seq, snap_hash) =
                         melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                     exchange = Some(snap_exchange);
-                    // Sector-only path: the fresh-replica branch below
-                    // manually writes a sector-sized header and opens via
-                    // SectorWriter::open_append, so the writer must match.
-                    // Threading a Buffered-mode flag through the replica
-                    // is future work.
-                    let writer =
-                        SectorWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
-                    journal_writer = Some(JournalWriter::Sector(writer));
+                    let writer = JournalWriter::create_continuing(
+                        journal_writer_mode,
+                        journal_path,
+                        snap_seq + 1,
+                        snap_hash,
+                    )?;
+                    journal_writer = Some(writer);
                     last_sequence = snap_seq;
                     chain_hash = snap_hash;
                     info!(start_sequence, "rumcast replica: snapshot loaded");
@@ -220,7 +221,11 @@ pub fn run_receiver_rumcast(
 
                 // ---- Create journal for fresh replica (no snapshot, no prior journal) ----
                 if journal_writer.is_none() {
-                    let writer = create_fresh_replica_journal(journal_path, &primary_genesis)?;
+                    let writer = JournalWriter::create_fresh_replica(
+                        journal_writer_mode,
+                        journal_path,
+                        &primary_genesis,
+                    )?;
                     let mut fresh = crate::server::empty_app();
                     crate::server::apply_max_orders(
                         &mut fresh,
@@ -229,7 +234,7 @@ pub fn run_receiver_rumcast(
                         max_orders_burst,
                     );
                     exchange = Some(fresh);
-                    journal_writer = Some(JournalWriter::Sector(writer));
+                    journal_writer = Some(writer);
                 }
                 Some((primary_genesis, start_sequence))
             }
@@ -1290,39 +1295,3 @@ fn generate_session_id() -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-/// Create a fresh replica journal seeded with the primary's genesis
-/// entry. Same logic as `tcp_receiver.rs::run_receiver`'s "create
-/// journal for fresh replica" block, factored out so the rumcast
-/// receiver doesn't duplicate it inline.
-fn create_fresh_replica_journal(
-    journal_path: &Path,
-    primary_genesis_entry: &[u8],
-) -> io::Result<crate::SectorWriter> {
-    use melin_journal::codec as journal_codec;
-    use melin_journal::detect_sector_size;
-    use std::fs::OpenOptions;
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::FileExt;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(journal_path)?;
-    let sector_size = detect_sector_size(file.as_fd());
-    let mut header = vec![0u8; sector_size];
-    journal_codec::encode_file_header(&mut header, sector_size);
-    file.write_all_at(&header, 0)?;
-    file.write_all_at(primary_genesis_entry, sector_size as u64)?;
-    file.sync_all()?;
-
-    let genesis_chain_hash = {
-        let entry_len = primary_genesis_entry.len();
-        let hash = blake3::hash(&primary_genesis_entry[..entry_len - 4]);
-        *hash.as_bytes()
-    };
-
-    let valid_end = sector_size as u64 + primary_genesis_entry.len() as u64;
-    crate::SectorWriter::open_append(journal_path, 1, valid_end, Some(genesis_chain_hash), 0)
-        .map_err(|e| io::Error::other(format!("open_append: {e}")))
-}

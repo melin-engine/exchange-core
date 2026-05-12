@@ -2222,6 +2222,7 @@ fn run_rumcast_replica(
         config.max_orders_per_second,
         config.max_orders_burst,
         config.replication_pipeline_depth,
+        config.journal_writer,
     )? {
         None => Ok(()), // clean shutdown
         Some((mut exchange, writer)) => {

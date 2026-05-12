@@ -245,6 +245,7 @@ fn main() {
                 10_000, // max_orders_per_account: bench uses default
                 0,      // max_orders_per_second: rate limit disabled in bench
                 0,      // max_orders_burst: rate limit disabled in bench
+                melin_journal::JournalWriterMode::default(), // bench uses default writer
             );
         })
         .expect("spawn run_receiver");

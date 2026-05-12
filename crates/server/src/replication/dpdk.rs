@@ -929,14 +929,16 @@ pub fn run_receiver_dpdk(
     // SEC-04: must equal the primary's --max-orders-per-second / --max-orders-burst.
     max_orders_per_second: u32,
     max_orders_burst: u32,
+    // Selected journal writer — applied uniformly to the recover,
+    // snapshot-resume, and fresh-bootstrap paths.
+    journal_writer_mode: melin_journal::JournalWriterMode,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
-    use crate::SectorWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
-    // shutdown returns the App + SectorWriter directly.
+    // shutdown returns the App + writer directly.
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
@@ -944,13 +946,13 @@ pub fn run_receiver_dpdk(
                 melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
-                    melin_journal::JournalWriterMode::default(),
+                    journal_writer_mode,
                 )?
             } else {
                 melin_transport_core::JournaledApp::<App>::recover(
                     crate::server::empty_app(),
                     journal_path,
-                    melin_journal::JournalWriterMode::default(),
+                    journal_writer_mode,
                 )?
             };
             let next = engine.next_sequence();
@@ -1181,12 +1183,13 @@ pub fn run_receiver_dpdk(
                             ) {
                                 Ok((snap_exchange, snap_seq, snap_hash)) => {
                                     exchange = Some(snap_exchange);
-                                    let writer = SectorWriter::create_continuing(
+                                    let writer = JournalWriter::create_continuing(
+                                        journal_writer_mode,
                                         journal_path,
                                         snap_seq + 1,
                                         snap_hash,
                                     )?;
-                                    journal_writer = Some(JournalWriter::Sector(writer));
+                                    journal_writer = Some(writer);
                                     last_sequence = snap_seq;
                                     chain_hash = snap_hash;
 
@@ -1236,37 +1239,10 @@ pub fn run_receiver_dpdk(
 
         // Create journal for fresh replica using the primary's raw genesis entry.
         if journal_writer.is_none() && !primary_genesis_entry.is_empty() {
-            use melin_journal::codec as journal_codec;
-            use melin_journal::detect_sector_size;
-            use std::fs::OpenOptions;
-            use std::os::fd::AsFd;
-            use std::os::unix::fs::FileExt;
-
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(journal_path)?;
-            let sector_size = detect_sector_size(file.as_fd());
-            let mut header = vec![0u8; sector_size];
-            journal_codec::encode_file_header(&mut header, sector_size);
-            file.write_all_at(&header, 0)?;
-            file.write_all_at(&primary_genesis_entry, sector_size as u64)?;
-            file.sync_all()?;
-
-            let genesis_chain_hash = {
-                let entry_len = primary_genesis_entry.len();
-                let hash = blake3::hash(&primary_genesis_entry[..entry_len - 4]);
-                *hash.as_bytes()
-            };
-
-            let valid_end = sector_size as u64 + primary_genesis_entry.len() as u64;
-            let writer = SectorWriter::open_append(
+            let writer = JournalWriter::create_fresh_replica(
+                journal_writer_mode,
                 journal_path,
-                1,
-                valid_end,
-                Some(genesis_chain_hash),
-                0,
+                &primary_genesis_entry,
             )?;
             let mut fresh = crate::server::empty_app();
             crate::server::apply_max_orders(
@@ -1276,7 +1252,7 @@ pub fn run_receiver_dpdk(
                 max_orders_burst,
             );
             exchange = Some(fresh);
-            journal_writer = Some(JournalWriter::Sector(writer));
+            journal_writer = Some(writer);
         }
 
         // --- Build pipeline if absent ---

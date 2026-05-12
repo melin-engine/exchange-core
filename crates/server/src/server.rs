@@ -679,6 +679,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.max_orders_per_account,
             config.max_orders_per_second,
             config.max_orders_burst,
+            config.journal_writer,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1782,6 +1783,7 @@ pub fn run_dpdk(
             config.max_orders_per_account,
             config.max_orders_per_second,
             config.max_orders_burst,
+            config.journal_writer,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
