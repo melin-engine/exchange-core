@@ -30,13 +30,18 @@ use crate::sector_writer::SectorWriter;
 /// creates a journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JournalWriterMode {
-    /// `O_DIRECT` writes, sector-aligned, durability dependent on
-    /// capacitor-backed PLP. Lowest-latency on enterprise NVMe with
-    /// `VWC=0`; not durable on volatile-write-cache drives.
+    /// **Experimental.** `O_DIRECT` writes, sector-aligned, durability
+    /// dependent on capacitor-backed PLP. Lowest-latency on enterprise
+    /// NVMe with `VWC=0`; **silently loses acknowledged writes on power
+    /// loss without PLP.** Under investigation for periodic ~1 Hz tail
+    /// latency spikes on some NVMe firmware. Not recommended for
+    /// production until both the durability guarantee is verified on
+    /// the target drives and the spike root cause is identified.
     Sector,
     /// Page-cache writes with explicit `fdatasync` per batch. Honest
     /// durability on any drive at the cost of one device flush per
-    /// flush boundary on `VWC=1` drives. Default.
+    /// flush boundary on `VWC=1` drives. Default and recommended for
+    /// production.
     #[default]
     Buffered,
 }

@@ -240,8 +240,9 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
-    /// Journal writer mode (`buffered` | `sector`). Defaults to the
-    /// project-wide default (currently `buffered`).
+    /// Journal writer mode (`buffered` | `sector`). Defaults to
+    /// `buffered`. `sector` is experimental — see
+    /// docs/journal-writer-modes.md before benchmarking with it.
     #[arg(
         long,
         default_value_t = melin_engine::journal::JournalWriterMode::default(),

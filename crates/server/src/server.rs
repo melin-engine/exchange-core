@@ -101,10 +101,12 @@ pub struct ServerConfig {
     pub max_journal_mib: u64,
     /// Journal writer mode. `buffered` (default) writes through the page
     /// cache and calls `fdatasync` per batch — honest durability on any
-    /// drive. `sector` uses `O_DIRECT` with sector-aligned writes —
-    /// lowest latency on enterprise NVMe with capacitor-backed PLP
-    /// (VWC=0), but NOT durable on drives with a volatile write cache.
-    /// Use `sector` only when the deployed drives advertise PLP.
+    /// drive. `sector` (EXPERIMENTAL) uses `O_DIRECT` with sector-
+    /// aligned writes — lowest latency on enterprise NVMe with
+    /// capacitor-backed PLP (VWC=0), but silently loses acknowledged
+    /// writes on power loss without PLP, and shows unresolved ~1 Hz
+    /// tail latency spikes on some NVMe firmware. Not recommended for
+    /// production. See docs/journal-writer-modes.md.
     #[arg(
         long,
         default_value_t = melin_journal::JournalWriterMode::default(),
