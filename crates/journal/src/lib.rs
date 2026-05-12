@@ -19,17 +19,19 @@ pub mod buffered_writer;
 pub mod codec;
 pub mod error;
 pub mod event;
+pub mod journal_writer;
 pub(crate) mod le;
 pub mod preparer;
 pub mod reader;
 pub mod replication;
+pub mod sector_writer;
 pub mod segment;
 pub mod trace;
-pub mod sector_writer;
 
 pub use buffered_writer::BufferedWriter;
 pub use error::JournalError;
 pub use event::JournalEvent;
+pub use journal_writer::{JournalWriter, JournalWriterMode};
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
 pub use sector_writer::{
     AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
