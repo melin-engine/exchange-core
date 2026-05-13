@@ -17,10 +17,10 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 - BLAKE3 hash chain for tamper evidence
 - Dual-replication to survive and recover from major outage scenarios
 
-**Efficient** — 4.0M orders/sec with synchronous dual replication on regular datacenter hardware.
+**Efficient** — 1.09M orders/sec at sub-400 µs p99 with synchronous dual replication on regular datacenter hardware.
 - Single-threaded matching engine on a lock-free disruptor pipeline
 - Journal, matching, and replication run in parallel via io_uring
-- Sub-50 µs p99 single-order latency with quorum durability (dual replication)
+- 24 µs p99 single-order latency with quorum durability (dual replication)
 
 **Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity — internal crossing, a new instrument, a parallel-run alongside an existing engine — in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
@@ -33,31 +33,32 @@ All numbers are **full round-trip**:
 3. Matching engine executes
 4. Response arrives at client
 
-Measured over LAN using four AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal, 10Gb/s NIC, 1 benchmark, 1 primary, 2 replicas). Commit [`46441eb`](../../commit/46441eb). [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+Measured over LAN using four AMD EPYC 9255 servers (24C Zen 5, SMT off, 192 GB DDR5-6400, dedicated Micron 7400 PRO PLP NVMe for the journal, Intel E810-XXV 25 Gb/s NIC; 1 benchmark, 1 primary, 2 replicas). Commit [`b184e90`](../../commit/b184e90). [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
-### Peak throughput (16 clients, window 256)
+### Throughput under load (16 clients, window 5)
 
-Kernel TCP over 10 Gbps private VLAN. 
+Kernel TCP over 25 Gb/s private VLAN, `--durability-mode hybrid` (default) with 2 replicas.
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 | max |
 |------------|-----------|-----|-----|-------|--------|-----|
-| **Standalone persistence** | **6.7M/s** | 583 µs | 715 µs | 769 µs | 812 µs | 1,076 µs |
-| **Synchronous replication** (1 replica) | **4.0M/s** | 916 µs | 1,141 µs | 1,236 µs | 1,672 µs | 4,702 µs |
-| **Dual synchronous replication** (2 replicas) | **4.0M/s** | 985 µs | 1,346 µs | 1,488 µs | 1,680 µs | 1,843 µs |
+| **Hybrid** (1 persisted + 2 in-memory, 2 replicas) | **1.09M/s** | 49 µs | 388 µs | 526 µs | 618 µs | 3,596 µs |
 
-Dual replication is the typical production setup for the strongest durability guarantees. With quorum durability (default), the primary only needs 2 of 3 durable copies (journal + 2 replicas) before responding — removing NVMe fsync tail variance from the critical path when both replicas are healthy. Single replication always requires both local fsync and the replica ack.
+**Hybrid** is the typical live-trading deployment. The gate releases an order once **(a)** *any* node has the event durable on PLP-backed NVMe **and** **(b)** at least two nodes hold it in RAM. With one primary plus two replicas this means:
+
+- **`persisted ≥ 1`** — the *fastest* of `{primary fsync, replica 1 fsync, replica 2 fsync}`. The primary usually wins because no network RTT is involved, but when its disk is in a slow window (firmware GC, fsync tail spike, kworker contention) a replica with a healthy disk wins instead — its `network RTT + fsync` beats the primary's stalled local write. This is hybrid's most useful property: **any single node's bad-fsync window is masked as long as one other node has a healthy disk**.
+- **`in_memory ≥ 2`** — primary (always +1 on receipt) plus the *fastest* of `{replica 1 RAM ack, replica 2 RAM ack}`. Pure network RTT, no replica-side disk on the critical path.
+
+The replicas' own fsyncs run *off* the critical path in the common case where the primary wins the persistence race — they trail the ack by ~80 µs. PLP-protected power loss is fully handled; residual exposure is a correlated RAM loss on the acking replica combined with primary-disk hardware failure in that ~80 µs window before the secondary's fsync completes. For stricter compliance regimes that require two on-disk copies before client ack, `--durability-mode durably-replicated` adds the replica fsync back into the gate at a cost of ~50–80 µs per order.
 
 ### Single-order latency (1 client, window 1)
 
-The latency floor — one order at a time, no pipelining, no queuing.
+The latency floor — one order at a time, no pipelining, no queueing.
 
-| Durability | p50 | p90 | p99 | p99.9 | p99.99 | max |
-|-----------|-----|-----|-----|-------|--------|-----|
-| Standalone persistence | 58 µs | 60 µs | 71 µs | 73 µs | 126 µs | 192 µs |
-| **Synchronous replication** (1 replica) | 57 µs | 61 µs | 68 µs | 77 µs | 95 µs | 167 µs |
-| **Dual synchronous replication** (2 replicas) | **35 µs** | **39 µs** | **46 µs** | **54 µs** | **74 µs** | 293 µs |
+| Durability | p50 | p99 | p99.9 | p99.99 | max |
+|-----------|-----|-----|-------|--------|-----|
+| **Hybrid** (1 persisted + 2 in-memory, 2 replicas) | **18 µs** | **24 µs** | **28 µs** | **31 µs** | 67 µs |
 
-Note that **adding a second replica makes the engine faster, not slower**. With quorum durability, the response stage releases an order as soon as the *fastest* of `{local fsync, replica 1 ack, replica 2 ack}` confirms — replicas race the local NVMe rather than serialize behind it. Two replicas turn that into the minimum of three independent durability paths, which collapses the tail and pulls the median below the standalone (no-replica) configuration. Stronger durability and lower latency are usually a tradeoff; here they reinforce each other.
+Same hybrid gate as above, just at window=1 so queueing drops out entirely. The critical path is the *fastest* persistence (primary or replica, whoever wins) plus one replica's RAM-ack RTT in parallel. See [docs/replication.md](docs/replication.md) for the full durability-mode menu and trade-offs.
 
 **Latency CDF** — peak-load modes on the same axes:
 
