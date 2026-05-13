@@ -8,20 +8,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use melin_journal::JournalWriter;
+use melin_journal::BufferedWriter;
 use melin_journal::trace::trace_ts;
 use melin_noop::NoopApp;
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};
-use melin_transport_core::pipeline::{InputSlot, OutputPayload, build_pipeline_with_replication};
+use melin_transport_core::pipeline::{
+    InputSlot, JournalStageRun, OutputPayload, build_pipeline_with_replication,
+};
 
 #[test]
 fn pipeline_with_noop_app_runs_events_to_output() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("noop.journal");
-    let writer: JournalWriter<TradingEvent> = JournalWriter::create(&path).unwrap();
+    let writer: BufferedWriter<TradingEvent> = BufferedWriter::create(&path).unwrap();
 
-    let mut pipeline = build_pipeline_with_replication::<NoopApp>(
+    let mut pipeline = build_pipeline_with_replication::<NoopApp, BufferedWriter<TradingEvent>>(
         NoopApp::new(),
         writer,
         Duration::ZERO,

@@ -22,20 +22,24 @@ pub use engine::{JournaledExchange, JournaledExchangeError};
 pub type JournalEvent = melin_journal::JournalEvent<crate::trading_event::TradingEvent>;
 pub type JournalEntry = melin_journal::JournalEntry<crate::trading_event::TradingEvent>;
 pub type JournalReader = melin_journal::JournalReader<crate::trading_event::TradingEvent>;
-pub type JournalWriter = melin_journal::JournalWriter<crate::trading_event::TradingEvent>;
+pub type SectorWriter = melin_journal::SectorWriter<crate::trading_event::TradingEvent>;
+pub type BufferedWriter = melin_journal::BufferedWriter<crate::trading_event::TradingEvent>;
+pub use melin_journal::{JournalWriterMode, create_fresh_replica};
 
 /// Trading-bound aliases for the generic pipeline types (now living in
 /// `melin-transport-core`). Server/bench callers use these so they
 /// never have to spell `<Exchange>` or `<TradingEvent>` explicitly.
+/// `W` is the concrete journal writer the caller dispatched on (sector
+/// vs buffered) — picked once at boot.
 pub type InputSlot = pipeline::InputSlot<crate::trading_event::TradingEvent>;
 pub type OutputSlot =
     pipeline::OutputSlot<crate::types::ExecutionReport, crate::types::QueryResponse>;
 pub type OutputPayload =
     pipeline::OutputPayload<crate::types::ExecutionReport, crate::types::QueryResponse>;
-pub type Pipeline = pipeline::Pipeline<crate::exchange::Exchange>;
-pub type ReplicaPipeline = pipeline::ReplicaPipeline<crate::exchange::Exchange>;
+pub type Pipeline<W> = pipeline::Pipeline<crate::exchange::Exchange, W>;
+pub type ReplicaPipeline<W> = pipeline::ReplicaPipeline<crate::exchange::Exchange, W>;
 pub type MatchingStage = pipeline::MatchingStage<crate::exchange::Exchange>;
-pub type JournalStage = pipeline::JournalStage<crate::trading_event::TradingEvent>;
+pub type JournalStage<W> = pipeline::JournalStage<crate::trading_event::TradingEvent, W>;
 
 /// Re-export the generic pipeline module so callers reaching for raw
 /// generic types (`pipeline::build_pipeline_with_replication::<A>`,
@@ -43,6 +47,6 @@ pub type JournalStage = pipeline::JournalStage<crate::trading_event::TradingEven
 pub use melin_transport_core::pipeline;
 
 pub use melin_journal::{
-    AsyncWriteBatch, JournalError, RawJournalScanner, checkpoint_interval, codec, replication,
-    trace, wall_clock_nanos,
+    AsyncWriteBatch, JournalError, JournalWrite, RawJournalScanner, checkpoint_interval, codec,
+    replication, trace, wall_clock_nanos,
 };

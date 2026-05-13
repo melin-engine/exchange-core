@@ -15,20 +15,28 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod buffered_writer;
 pub mod codec;
 pub mod error;
 pub mod event;
+pub mod fresh_replica;
 pub(crate) mod le;
+pub mod mode;
 pub mod preparer;
 pub mod reader;
 pub mod replication;
+pub mod sector_writer;
 pub mod segment;
 pub mod trace;
-pub mod writer;
+pub mod write;
 
+pub use buffered_writer::BufferedWriter;
 pub use error::JournalError;
 pub use event::JournalEvent;
+pub use fresh_replica::create_fresh_replica;
+pub use mode::JournalWriterMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
-pub use writer::{
-    AsyncWriteBatch, JournalWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
+pub use sector_writer::{
+    AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
 };
+pub use write::JournalWrite;

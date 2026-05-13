@@ -233,6 +233,10 @@ Recovery time is proportional to the number of journal entries replayed. With sn
 
 ## Journal Management
 
+### Writer Mode
+
+The `--journal-writer` flag picks how the journal stage writes batches to disk. The default `buffered` mode (`pwrite + fdatasync` per batch) is the production-ready writer and is safe on any drive. The `sector` mode (`O_DIRECT`, no `fdatasync`) is **experimental** — it's faster on enterprise NVMe with capacitor-backed PLP but **silently loses acknowledged writes on power loss without PLP**, and has an unresolved ~1 Hz tail-latency spike on some NVMe firmware. Do not run `sector` in production. See [Journal Writer Modes](journal-writer-modes.md) for the full status, decision guide, verification commands, and migration procedure.
+
 ### How Rotation Works
 
 Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (default: 256 MiB). The process:
@@ -799,7 +803,7 @@ The journal uses CRC32C checksums on every entry. If the server crashes during a
 
 - The partially written entry will fail CRC validation on recovery.
 - The `JournalReader` detects the truncated/corrupt entry and stops replaying at the last valid entry.
-- The `JournalWriter` reopens the file for appending at the valid data boundary, effectively truncating the garbage.
+- The `SectorWriter` reopens the file for appending at the valid data boundary, effectively truncating the garbage.
 - **One event may be lost** (the one being written at crash time). All prior events are intact.
 
 This is handled automatically. No manual intervention required.

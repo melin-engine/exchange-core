@@ -26,6 +26,8 @@ use base64::Engine as _;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 
+#[allow(unused_imports)] // used by some feature combinations only
+use melin_journal::JournalWrite;
 use melin_journal::trace::trace_ts;
 use melin_journal::wall_clock_nanos;
 use melin_protocol::auth::AuthorizedKeys;
@@ -35,7 +37,7 @@ use melin_server::{InputSlot, JournalEvent, OutputSlot};
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
-use melin_transport_core::pipeline::build_pipeline_with_replication;
+use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
 
 #[derive(Parser)]
 struct Args {
@@ -92,8 +94,14 @@ fn main() {
     let replica_snapshot: PathBuf = tmp_root.join("replica.snapshot");
 
     // --- Build primary pipeline ---
-    let engine = JournaledApp::create(melin_noop::NoopApp::new(), &primary_journal)
-        .expect("create primary journal");
+    // Bench runs the buffered writer end-to-end; the sector path is
+    // exercised separately in pipeline tests until the boot-site
+    // dispatch refactor lands.
+    let engine = JournaledApp::<melin_noop::NoopApp, melin_journal::BufferedWriter<_>>::create(
+        melin_noop::NoopApp::new(),
+        &primary_journal,
+    )
+    .expect("create primary journal");
     let (exchange, writer) = engine.into_parts();
 
     // Read genesis before moving writer into the pipeline.
@@ -224,7 +232,7 @@ fn main() {
     let receiver_handle = std::thread::Builder::new()
         .name("bench-repl-receiver".into())
         .spawn(move || {
-            let _ = run_receiver(
+            let _ = run_receiver::<melin_journal::BufferedWriter<_>>(
                 bind_addr,
                 &replica_journal,
                 &replica_key,

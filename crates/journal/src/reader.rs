@@ -13,6 +13,8 @@ use melin_app::AppEvent;
 
 use zerocopy::FromBytes;
 
+#[cfg(test)]
+use super::codec::ENTRY_OFFSET;
 use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
@@ -639,7 +641,8 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::writer::JournalWriter;
+    use crate::sector_writer::SectorWriter;
+    use crate::write::JournalWrite;
     use melin_app::CodecError;
 
     /// Minimal `AppEvent` for reader round-trip tests.
@@ -677,7 +680,7 @@ mod tests {
 
     fn write_sample(path: &Path) -> Vec<JournalEvent<TestEvent>> {
         let events = sample_events();
-        let mut writer = JournalWriter::<TestEvent>::create(path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(path).unwrap();
         for event in &events {
             writer.append(event).unwrap();
         }
@@ -688,7 +691,7 @@ mod tests {
     fn open_validates_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         let _reader = JournalReader::<TestEvent>::open(&path).unwrap();
     }
 
@@ -714,7 +717,7 @@ mod tests {
     fn no_entries_empty_journal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
         #[cfg(feature = "hash-chain")]
@@ -734,7 +737,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(7))).unwrap();
         }
 
@@ -757,13 +760,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 
         // Flip a byte inside the (already-synced) entry region to force
         // a CRC mismatch.
-        let entry_offset = FILE_HEADER_SIZE + 4; // magic+length then a data byte
+        let entry_offset = ENTRY_OFFSET as usize + 4; // magic+length then a data byte
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -789,7 +792,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }
@@ -805,7 +808,7 @@ mod tests {
         #[cfg(not(feature = "hash-chain"))]
         {
             const FIRST_ENTRY_SIZE: u64 = 20 + 25 + 4;
-            let second_seq_offset = FILE_HEADER_SIZE as u64 + FIRST_ENTRY_SIZE + 4;
+            let second_seq_offset = ENTRY_OFFSET + FIRST_ENTRY_SIZE + 4;
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)

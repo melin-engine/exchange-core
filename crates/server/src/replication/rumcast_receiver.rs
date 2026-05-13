@@ -18,6 +18,12 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::Signer;
 use tracing::{debug, error, info, warn};
 
+#[allow(unused_imports)] // used by some feature combinations only
+use melin_journal::JournalWrite;
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+
+use crate::TradingEvent;
+
 use melin_rumcast::pub_log::{ClaimError, PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
 use melin_rumcast::sender::{SenderConfig, SenderLoop};
@@ -73,9 +79,9 @@ const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(60);
 ///
 /// Blocks until the connection drops or shutdown is signaled.
 /// `Some` return value = promotion triggered with the fully-replayed
-/// `App` and positioned `JournalWriter`; `None` = clean shutdown.
+/// `App` and positioned `SectorWriter`; `None` = clean shutdown.
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver_rumcast(
+pub fn run_receiver_rumcast<W>(
     primary_addr: SocketAddr,
     bind_addr: SocketAddr,
     journal_path: &Path,
@@ -92,9 +98,15 @@ pub fn run_receiver_rumcast(
     // SEC-04: must equal the primary's --max-orders-per-second / --max-orders-burst.
     max_orders_per_second: u32,
     max_orders_burst: u32,
-) -> super::ReceiverResult {
+    // Bound on in-flight unacked batches before backpressure. Mirrors the
+    // TCP receiver knob (`config.replication_pipeline_depth`).
+    pipeline_depth: usize,
+) -> super::ReceiverResult<W>
+where
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+{
     use crate::App;
-    use crate::JournalWriter;
     use melin_transport_core::JournaledApp;
 
     // ---- Recover local state from journal (if any) ----
@@ -102,9 +114,9 @@ pub fn run_receiver_rumcast(
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                JournaledApp::<App>::recover_from_snapshot(&snapshot_path, journal_path)?
+                JournaledApp::<App, W>::recover_from_snapshot(&snapshot_path, journal_path)?
             } else {
-                JournaledApp::<App>::recover(crate::server::empty_app(), journal_path)?
+                JournaledApp::<App, W>::recover(crate::server::empty_app(), journal_path)?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
@@ -193,8 +205,7 @@ pub fn run_receiver_rumcast(
                     let (snap_exchange, snap_seq, snap_hash) =
                         melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                     exchange = Some(snap_exchange);
-                    let writer =
-                        JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
+                    let writer = W::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                     journal_writer = Some(writer);
                     last_sequence = snap_seq;
                     chain_hash = snap_hash;
@@ -203,7 +214,10 @@ pub fn run_receiver_rumcast(
 
                 // ---- Create journal for fresh replica (no snapshot, no prior journal) ----
                 if journal_writer.is_none() {
-                    let writer = create_fresh_replica_journal(journal_path, &primary_genesis)?;
+                    let writer = melin_journal::create_fresh_replica::<_, W>(
+                        journal_path,
+                        &primary_genesis,
+                    )?;
                     let mut fresh = crate::server::empty_app();
                     crate::server::apply_max_orders(
                         &mut fresh,
@@ -251,6 +265,7 @@ pub fn run_receiver_rumcast(
             cur_exchange,
             cur_writer,
             4096,
+            Duration::ZERO,
             busy_spin,
             enable_shadow,
         );
@@ -338,7 +353,7 @@ pub fn run_receiver_rumcast(
         };
 
         // ---- Inner streaming loop ----
-        let mut pending_acks = PendingAckQueue::new();
+        let mut pending_acks = PendingAckQueue::new(pipeline_depth);
         let mut received_data = false;
 
         let exit_reason = streaming_loop(
@@ -386,7 +401,7 @@ pub fn run_receiver_rumcast(
                     None => {
                         error!("pipeline thread panicked during disconnect recovery");
                         if journal_path.exists() {
-                            let engine = JournaledApp::<App>::recover(
+                            let engine = JournaledApp::<App, W>::recover(
                                 crate::server::empty_app(),
                                 journal_path,
                             )?;
@@ -1269,41 +1284,4 @@ fn generate_session_id() -> u32 {
     let mut bytes = [0u8; 4];
     getrandom::fill(&mut bytes).expect("getrandom for session_id");
     u32::from_le_bytes(bytes)
-}
-
-/// Create a fresh replica journal seeded with the primary's genesis
-/// entry. Same logic as `tcp_receiver.rs::run_receiver`'s "create
-/// journal for fresh replica" block, factored out so the rumcast
-/// receiver doesn't duplicate it inline.
-fn create_fresh_replica_journal(
-    journal_path: &Path,
-    primary_genesis_entry: &[u8],
-) -> io::Result<crate::JournalWriter> {
-    use melin_journal::codec as journal_codec;
-    use melin_journal::detect_sector_size;
-    use std::fs::OpenOptions;
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::FileExt;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(journal_path)?;
-    let sector_size = detect_sector_size(file.as_fd());
-    let mut header = vec![0u8; sector_size];
-    journal_codec::encode_file_header(&mut header, sector_size);
-    file.write_all_at(&header, 0)?;
-    file.write_all_at(primary_genesis_entry, sector_size as u64)?;
-    file.sync_all()?;
-
-    let genesis_chain_hash = {
-        let entry_len = primary_genesis_entry.len();
-        let hash = blake3::hash(&primary_genesis_entry[..entry_len - 4]);
-        *hash.as_bytes()
-    };
-
-    let valid_end = sector_size as u64 + primary_genesis_entry.len() as u64;
-    crate::JournalWriter::open_append(journal_path, 1, valid_end, Some(genesis_chain_hash), 0)
-        .map_err(|e| io::Error::other(format!("open_append: {e}")))
 }
