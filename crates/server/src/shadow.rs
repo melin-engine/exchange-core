@@ -71,7 +71,7 @@ pub fn run(
     // 50 min (default `snapshot_interval_ms=3_000_000`). `AmortizedTimer`
     // defers the clock read to roughly 1 Hz, collapsing the overhead
     // to a single `AND` + predictable branch per iteration.
-    let mut snapshot_timer = AmortizedTimer::new(busy_spin);
+    let mut snapshot_timer = AmortizedTimer::new();
     let mut idle_spins: u32 = 0;
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
@@ -91,7 +91,11 @@ pub fn run(
             // Check snapshot timer even when idle — events may have been
             // consumed before the interval elapsed, and no more events
             // will arrive to trigger the post-consume check.
-            if has_events && snapshot_timer.tick(snapshot_interval).is_some() {
+            if has_events
+                && snapshot_timer
+                    .tick(snapshot_interval, busy_spin || idle_spins < 1000)
+                    .is_some()
+            {
                 let last_seq = consumer.next_read().saturating_sub(1);
                 save_snapshot(&exchange, last_seq, &chain_hash_lock, &snapshot_path);
             }
@@ -117,7 +121,7 @@ pub fn run(
         }
 
         // Check if a snapshot is due.
-        if snapshot_timer.tick(snapshot_interval).is_some() {
+        if snapshot_timer.tick(snapshot_interval, true).is_some() {
             let last_seq = consumer.next_read() - 1;
             save_snapshot(&exchange, last_seq, &chain_hash_lock, &snapshot_path);
         }

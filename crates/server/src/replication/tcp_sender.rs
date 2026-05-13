@@ -692,14 +692,13 @@ fn live_stream_uring(
     let mut send_in_flight = false;
     let mut send_offset: usize = 0;
     let mut idle_spins: u32 = 0;
-    // Separate spin counter for the heartbeat check so sending data resets it.
-    let mut heartbeat_idle_spins: u64 = 0;
+    let mut heartbeat_timer = crate::amortized_timer::AmortizedTimer::new();
 
     // Diagnostic (RUST_LOG=debug): per-slot TCP_INFO snapshot once a
     // second, slow-SEND detection (CQE elapsed >= threshold), and a
     // TCP_INFO capture at the evict-exit point. Amortized so the
     // per-iteration cost is a single `AND` + predictable branch.
-    let mut info_log_timer = crate::amortized_timer::AmortizedTimer::new(busy_spin);
+    let mut info_log_timer = crate::amortized_timer::AmortizedTimer::new();
     let mut send_submit_ts: Option<std::time::Instant> = None;
     const SLOW_SEND_THRESHOLD_MS: u128 = 5;
 
@@ -758,20 +757,14 @@ fn live_stream_uring(
                 *last_send = std::time::Instant::now();
                 send_submit_ts = Some(*last_send);
                 idle_spins = 0;
-                heartbeat_idle_spins = 0;
+                heartbeat_timer = crate::amortized_timer::AmortizedTimer::new();
             } else {
-                // Heartbeat check: amortized to avoid a per-iteration vDSO
-                // clock_gettime call. Each call is ~25 ns; the idle loop runs
-                // at millions of iterations/sec, so an unconditional
-                // `elapsed()` check showed up as ~2.5 % of total CPU in
-                // profiles. CHECK_MASK = 2^20 - 1 bounds the check rate to
-                // ~10/s at 10 M iter/s — well within a 5 s heartbeat interval.
-                heartbeat_idle_spins = heartbeat_idle_spins.wrapping_add(1);
-                let needs_heartbeat = heartbeat_idle_spins & ((1u64 << 20) - 1) == 0
-                    && last_send.elapsed() >= heartbeat_interval;
-                if needs_heartbeat {
-                    // No data — send heartbeat if idle.
-                    heartbeat_idle_spins = 0;
+                // Heartbeat check: amortized when spinning (mask keeps the
+                // clock read at ~10/s at 10M iter/s). In yield mode the loop
+                // already pays a syscall per iteration, so the clock read is
+                // free and must not be skipped — see AmortizedTimer docs.
+                let spinning = busy_spin || idle_spins < 1000;
+                if heartbeat_timer.tick(heartbeat_interval, spinning).is_some() {
                     encode_heartbeat(*last_sequence, send_buf);
                     let sqe = opcode::Send::new(
                         types::Fixed(0),
@@ -792,7 +785,10 @@ fn live_stream_uring(
         // Periodic TCP_INFO dump — debug level. Amortized so the
         // per-iteration cost is a single `AND` + predictable branch.
         if info_log_timer
-            .tick(std::time::Duration::from_secs(1))
+            .tick(
+                std::time::Duration::from_secs(1),
+                busy_spin || idle_spins < 1000,
+            )
             .is_some()
         {
             super::log_tcp_info(tcp_fd, "live_stream", slot_idx);

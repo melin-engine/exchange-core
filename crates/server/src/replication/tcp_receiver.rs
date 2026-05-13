@@ -200,7 +200,7 @@ fn replica_stream_uring(
     // entry, ack_send_in_flight is 0–1. Deviations tell us where data
     // is piling up during a slowdown. `AmortizedTimer` keeps the
     // per-iteration cost to a single `AND` + predictable branch.
-    let mut info_log_timer = AmortizedTimer::new(busy_spin);
+    let mut info_log_timer = AmortizedTimer::new();
     let mut bytes_received_since_log: u64 = 0;
     let mut acks_sent_since_log: u64 = 0;
 
@@ -449,7 +449,10 @@ fn replica_stream_uring(
         // rate, parse_buf accumulation (user-space queue from RECV to
         // push), pending_acks depth (journal fsync wait queue,
         // typically ~1), and in-flight SEND state.
-        if let Some(elapsed) = info_log_timer.tick(std::time::Duration::from_secs(1)) {
+        if let Some(elapsed) = info_log_timer.tick(
+            std::time::Duration::from_secs(1),
+            busy_spin || idle_spins < 1000,
+        ) {
             let secs = elapsed.as_secs_f64();
             tracing::debug!(
                 bytes_per_sec = (bytes_received_since_log as f64 / secs) as u64,

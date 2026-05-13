@@ -12,11 +12,13 @@
 //! before this timer was adopted).
 //!
 //! [`AmortizedTimer::tick`] reads the clock only once every
-//! [`Self::CHECK_MASK`] + 1 iterations (~1 M), so the common path is a
-//! single `AND` + predictable branch. Under sustained busy-spin the
-//! timer still fires with well under 100 ms of jitter versus the
-//! requested `period`, which is tight enough for ~1 Hz diagnostic
-//! logging or snapshot-interval checks.
+//! [`Self::CHECK_MASK`] + 1 iterations (~1 M) **while spinning**. When
+//! the caller has fallen back to `yield_now()` the loop rate drops to
+//! scheduler timeslice frequency (typically hundreds of iterations per
+//! second), so the mask would delay a 5 s heartbeat by 2^20 × yield_latency
+//! ≈ 17 minutes. Passing `spinning = false` bypasses the mask and reads
+//! the clock every iteration; the yield syscall already paid orders of
+//! magnitude more than a vDSO clock read.
 //!
 //! Not a general-purpose rate limiter: it is tuned for
 //! once-per-second-ish checks called from loops that execute millions
@@ -25,13 +27,8 @@
 
 pub(crate) struct AmortizedTimer {
     last: std::time::Instant,
-    /// Iteration counter used in amortized mode; unused when `amortize = false`.
+    // Iteration counter used only when `spinning = true` in `tick`.
     iter: u64,
-    /// When `true`, reads the clock only every `CHECK_MASK + 1` iterations.
-    /// When `false`, reads the clock on every call — suitable for yield-idle
-    /// loops where the iteration rate is too low (~250 iters/s under load)
-    /// for amortization to be effective.
-    amortize: bool,
 }
 
 impl AmortizedTimer {
@@ -39,13 +36,10 @@ impl AmortizedTimer {
     /// At ~10 M loop iters/s this yields ~10 clock reads per second.
     const CHECK_MASK: u64 = (1 << 20) - 1;
 
-    /// `amortize = true`: busy-spin mode — clock read every ~1 M iterations.
-    /// `amortize = false`: yield-idle mode — clock read on every call.
-    pub(crate) fn new(amortize: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             last: std::time::Instant::now(),
             iter: 0,
-            amortize,
         }
     }
 
@@ -53,12 +47,20 @@ impl AmortizedTimer {
     /// has passed since the last successful tick (and the internal
     /// timestamp is advanced); otherwise `None`.
     ///
+    /// `spinning` must be `true` while the caller's loop is in its busy-spin
+    /// phase (no syscall per iteration). When `false` — i.e. the loop has
+    /// fallen back to `yield_now()` — the clock is read every call because
+    /// the yield syscall already costs far more than a vDSO read.
+    ///
     /// The returned `elapsed` is the real time since the previous tick,
-    /// suitable for computing per-interval rates without a second
-    /// clock read.
+    /// suitable for computing per-interval rates without a second clock read.
     #[inline]
-    pub(crate) fn tick(&mut self, period: std::time::Duration) -> Option<std::time::Duration> {
-        if self.amortize {
+    pub(crate) fn tick(
+        &mut self,
+        period: std::time::Duration,
+        spinning: bool,
+    ) -> Option<std::time::Duration> {
+        if spinning {
             self.iter = self.iter.wrapping_add(1);
             if self.iter & Self::CHECK_MASK != 0 {
                 return None;

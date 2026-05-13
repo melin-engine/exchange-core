@@ -168,7 +168,7 @@ pub fn run(
     // spend the response thread's CPU on `__vdso_clock_gettime`. Reads
     // the clock every ~1 M idle iterations under busy_spin; heartbeat
     // interval is seconds, so this is plenty.
-    let mut heartbeat_timer = AmortizedTimer::new(busy_spin);
+    let mut heartbeat_timer = AmortizedTimer::new();
     let mut idle_spins: u32 = 0;
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
@@ -252,7 +252,7 @@ pub fn run(
             // spin path off `clock_gettime`. Without this, perf-annotate
             // showed ~22 % of the response thread's CPU on the vDSO.
             if let Some(interval) = heartbeat_interval
-                && heartbeat_timer.tick(Duration::from_secs(1)).is_some()
+                && heartbeat_timer.tick(Duration::from_secs(1), busy_spin || idle_spins < 1000).is_some()
             {
                 let now = Instant::now();
                 last_heartbeat_scan = now;
