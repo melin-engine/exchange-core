@@ -13,7 +13,9 @@ use melin_journal::trace::trace_ts;
 use melin_noop::NoopApp;
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};
-use melin_transport_core::pipeline::{InputSlot, OutputPayload, build_pipeline_with_replication};
+use melin_transport_core::pipeline::{
+    InputSlot, JournalStageRun, OutputPayload, build_pipeline_with_replication,
+};
 
 #[test]
 fn pipeline_with_noop_app_runs_events_to_output() {

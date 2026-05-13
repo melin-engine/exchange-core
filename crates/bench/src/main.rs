@@ -751,7 +751,7 @@ fn run_pipeline_bench(
 ) {
     use melin_engine::journal::InputSlot;
     use melin_engine::journal::JournalEvent;
-    use melin_engine::journal::pipeline::build_pipeline_with_replication;
+    use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
     use melin_engine::journal::trace::trace_ts;
     use melin_engine::journal::wall_clock_nanos;
     type JournalWriter = melin_engine::journal::BufferedWriter;

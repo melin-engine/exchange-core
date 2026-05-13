@@ -37,7 +37,7 @@ use melin_server::{InputSlot, JournalEvent, OutputSlot};
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
-use melin_transport_core::pipeline::build_pipeline_with_replication;
+use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
 
 #[derive(Parser)]
 struct Args {

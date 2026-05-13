@@ -2,7 +2,7 @@
 //!
 //! On startup:
 //! 1. Recovers or creates the `JournaledApp<A>`.
-//! 2. Decomposes it into `(App, SectorWriter)` via `into_parts()`.
+//! 2. Decomposes it into `(App, W)` via `into_parts()`, where `W` is the writer selected by `--journal-writer`.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the io_uring reader.
@@ -565,7 +565,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// Run the trading server.
 ///
 /// 1. Initializes (or recovers) the `JournaledApp<A>`, then decomposes
-///    it into `App` and `SectorWriter` for the pipeline.
+///    it into `App` and `W` (the operator-selected writer) for the pipeline.
 /// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.

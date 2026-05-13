@@ -19,7 +19,9 @@ mod tests {
     use melin_journal::trace::trace_ts;
 
     // Generic pipeline items the tests reach for by their raw form.
-    use crate::journal::pipeline::{MAX_JOURNAL_BATCH, build_pipeline_with_replication};
+    use crate::journal::pipeline::{
+        JournalStageRun, MAX_JOURNAL_BATCH, build_pipeline_with_replication,
+    };
     // Replica wiring is only exercised by hash-chain replication tests.
     #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
     use crate::journal::pipeline::build_replica_pipeline;

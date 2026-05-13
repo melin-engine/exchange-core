@@ -1,8 +1,9 @@
 //! Pipeline stages for the LMAX disruptor architecture.
 //!
 //! Two hot-path stages consume from an input disruptor in **parallel**:
-//! 1. **Journal stage**: batch-encodes events, then writes in a single `pwrite` + `O_DIRECT`.
-//!    Advances its cursor only after the write completes. When replication is enabled,
+//! 1. **Journal stage**: batch-encodes events, then writes and syncs via the active writer
+//!    (`SectorWriter`: `O_DIRECT`; `BufferedWriter`: `pwrite` + `fdatasync`).
+//!    Advances its cursor only after the durable write completes. When replication is enabled,
 //!    sends a copy of each encoded batch to the replication sender thread via a bounded
 //!    channel. The bytes are identical to what was written to disk — same sequences,
 //!    timestamps, CRC checksums, and checkpoint entries.
@@ -297,7 +298,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 }
 
 /// Journal stage: consumes from the input disruptor, batch-encodes events,
-/// and writes in a single `pwrite` + `O_DIRECT`.
+/// and writes durably via the active writer (`SectorWriter` or `BufferedWriter`).
 ///
 /// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
 /// cursor only advances **after** the durable write. The response stage
@@ -1094,21 +1095,6 @@ pub trait JournalStageRun<E: AppEvent>: Sized {
     fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> Result<Self::Writer, JournalError>;
 }
 
-/// Convenience wrapper on the buffered writer specialization. The
-/// buffered path has no overlapped variant, so `run` always means
-/// `run_sync`. Lets call sites that work generically over the writer
-/// type drive the stage with a single `stage.run(shutdown)` regardless
-/// of which writer was picked at boot.
-impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
-    #[inline]
-    pub fn run(
-        self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::BufferedWriter<E>, JournalError> {
-        self.run_sync(shutdown)
-    }
-}
-
 impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::BufferedWriter<E>> {
     type Writer = melin_journal::BufferedWriter<E>;
     #[inline]
@@ -1124,27 +1110,6 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
 /// and the preparer fast-path rotation. Only meaningful for
 /// `SectorWriter` because the io_uring submit/complete path operates on
 /// its `O_DIRECT` fd and its aligned batch buffer.
-impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
-    /// Pick the right loop for the current build: `run_uring` for
-    /// production, `run_sync` under the `no-persist` feature (which
-    /// stubs out the durable write and short-circuits the io_uring
-    /// submit path).
-    #[inline]
-    pub fn run(
-        self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
-        #[cfg(feature = "no-persist")]
-        {
-            self.run_sync(shutdown)
-        }
-        #[cfg(not(feature = "no-persist"))]
-        {
-            self.run_uring(shutdown)
-        }
-    }
-}
-
 impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::SectorWriter<E>> {
     type Writer = melin_journal::SectorWriter<E>;
     #[inline]
