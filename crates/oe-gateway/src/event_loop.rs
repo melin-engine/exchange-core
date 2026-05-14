@@ -1409,7 +1409,7 @@ lot_size_inverse = 1
     fn new_order_single_round_trip_to_execution_report() {
         use crate::test_stub::MelinStub;
         use melin_protocol::message::{Request, ResponseKind};
-        use melin_trading::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
+        use melin_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
         use std::num::NonZeroU64;
 
         let stub = MelinStub::start();
@@ -1480,7 +1480,7 @@ lot_size_inverse = 1
     fn resend_request_replays_through_real_io_uring() {
         use crate::test_stub::MelinStub;
         use melin_protocol::message::{Request, ResponseKind};
-        use melin_trading::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
+        use melin_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
         use std::num::NonZeroU64;
 
         let stub = MelinStub::start();
@@ -1567,7 +1567,7 @@ lot_size_inverse = 1
     fn cancel_rejected_by_engine_yields_order_cancel_reject() {
         use crate::test_stub::MelinStub;
         use melin_protocol::message::{Request, ResponseKind};
-        use melin_trading::types::{AccountId, ExecutionReport, RejectReason, Symbol};
+        use melin_types::types::{AccountId, ExecutionReport, RejectReason, Symbol};
 
         let stub = MelinStub::start();
         let config = make_config_with_port("FIRM_A", "MELIN", stub.port());

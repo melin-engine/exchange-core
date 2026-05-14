@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
-use melin_trading::types::{AccountId, OrderId, Side};
+use melin_types::types::{AccountId, OrderId, Side};
 
 use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
@@ -1176,8 +1176,8 @@ impl Session {
     fn update_fill_ledger(
         &mut self,
         order_id: OrderId,
-        fill_price: melin_trading::types::Price,
-        fill_quantity: melin_trading::types::Quantity,
+        fill_price: melin_types::types::Price,
+        fill_quantity: melin_types::types::Quantity,
         lot_inverse: u64,
         side: Side,
     ) {
@@ -1724,7 +1724,7 @@ impl Drop for Session {
 // Helpers
 // ---------------------------------------------------------------------------
 
-use melin_trading::types::ExecutionReport;
+use melin_types::types::ExecutionReport;
 
 /// Borrowed view over an `OrderSymbolInfo` with sensible fallbacks when no
 /// info was recorded for the order. Returned by [`sym_info_or_default`] so
@@ -1851,7 +1851,7 @@ mod tests {
     use super::*;
     use melin_gateway_core::fix::serialize::FixMessageBuilder;
     use melin_protocol::message::ResponseKind;
-    use melin_trading::types::{
+    use melin_types::types::{
         ExecutionReport, InstrumentStatus, Price, Quantity, RejectReason, Side, Symbol,
     };
     use std::num::NonZeroU64;

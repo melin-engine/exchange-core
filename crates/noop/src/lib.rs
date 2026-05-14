@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 
 use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
 use melin_trading::trading_event::TradingEvent;
-use melin_trading::types::{
+use melin_types::types::{
     AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
 };
 
@@ -144,7 +144,7 @@ fn rejected_from_event(event: &TradingEvent, reason: EngineRejectReason) -> Exec
         | TradingEvent::EnableInstrument { symbol }
         | TradingEvent::RemoveInstrument { symbol }
         | TradingEvent::AddInstrument {
-            spec: melin_trading::types::InstrumentSpec { symbol, .. },
+            spec: melin_types::types::InstrumentSpec { symbol, .. },
         } => (OrderId(0), *symbol, AccountId(0)),
         TradingEvent::EndOfDay | TradingEvent::QueryStats | TradingEvent::QueryRequestSeq => {
             (OrderId(0), Symbol(0), AccountId(0))
@@ -161,7 +161,7 @@ fn rejected_from_event(event: &TradingEvent, reason: EngineRejectReason) -> Exec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_trading::types::{
+    use melin_types::types::{
         Order, OrderType, Price, Quantity, SelfTradeProtection, Side, TimeInForce,
     };
     use std::io::Cursor;

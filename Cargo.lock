@@ -1639,7 +1639,7 @@ dependencies = [
  "ed25519-dalek",
  "melin-engine",
  "melin-protocol",
- "melin-trading",
+ "melin-types",
  "proptest",
  "tracing",
 ]
@@ -1655,7 +1655,7 @@ dependencies = [
  "melin-gateway-core",
  "melin-market-data",
  "melin-protocol",
- "melin-trading",
+ "melin-types",
  "serde",
  "toml",
  "tracing",
@@ -1671,6 +1671,7 @@ dependencies = [
  "melin-journal",
  "melin-trading",
  "melin-transport-core",
+ "melin-types",
  "tempfile",
 ]
 
@@ -1684,7 +1685,7 @@ dependencies = [
  "melin-engine",
  "melin-gateway-core",
  "melin-protocol",
- "melin-trading",
+ "melin-types",
  "proptest",
  "serde",
  "toml",
@@ -1700,7 +1701,7 @@ dependencies = [
  "blake3",
  "bolero",
  "ed25519-dalek",
- "melin-trading",
+ "melin-types",
  "subtle",
  "tempfile",
  "x25519-dalek",

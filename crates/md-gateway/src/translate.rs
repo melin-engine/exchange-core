@@ -6,7 +6,7 @@
 use melin_gateway_core::fix::serialize::FixMessageBuilder;
 use melin_gateway_core::fix::tags;
 use melin_market_data::mirror::Level;
-use melin_trading::types::Price;
+use melin_types::types::Price;
 
 /// Build a `MarketDataSnapshotFullRefresh` (35=W) message for a single symbol.
 ///

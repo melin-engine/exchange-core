@@ -14,7 +14,7 @@ ed25519-dalek = { workspace = true }
 # replaces hand-rolled le::put / le::get pairs. derive feature for
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-trading = { path = "../trading" }
+melin-types = { path = "../types" }
 subtle = { workspace = true }
 x25519-dalek = { workspace = true }
 

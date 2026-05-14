@@ -11,7 +11,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use melin_trading::types::{
+    use melin_types::types::{
         AccountId, ExecutionReport, OrderId, Price, Quantity, Side, Symbol,
     };
 
