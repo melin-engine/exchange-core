@@ -66,12 +66,5 @@ pub struct StatsSnapshot {
     pub journal_sequence: u64,
 }
 
-#[cfg(not(feature = "rumcast"))]
 mod tcp;
-#[cfg(not(feature = "rumcast"))]
 pub use tcp::Client;
-
-#[cfg(feature = "rumcast")]
-mod rumcast;
-#[cfg(feature = "rumcast")]
-pub use rumcast::Client;
