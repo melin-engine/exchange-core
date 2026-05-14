@@ -50,7 +50,12 @@ dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
 ## bench all over rumcast). Implies `hash-chain` because rumcast
 ## replication needs the chain hash for divergence detection — same
 ## reason `noop` pulls it in.
-rumcast = ["dep:melin-rumcast", "melin-rumcast/io-uring", "hash-chain"]
+## The `melin-client/rumcast` activation is a no-op for non-test
+## consumers (melin-client is a dev-dep only), but lets
+## `cargo test --features rumcast` build a matching rumcast client for
+## the failover integration suite. Without it the test binary links a
+## TCP client and times out against a rumcast server.
+rumcast = ["dep:melin-rumcast", "melin-rumcast/io-uring", "hash-chain", "melin-client/rumcast"]
 pipeline-stats = ["melin-engine?/pipeline-stats", "melin-transport-core/pipeline-stats"]
 hash-chain = [
     "melin-engine?/hash-chain",
@@ -115,7 +120,12 @@ x25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-melin-client = { path = "../client", features = ["rumcast"] }
+## No `features = ["rumcast"]` here — the failover suite runs in both
+## modes. The TCP build (default features) uses the TCP client; the
+## rumcast build activates `melin-client/rumcast` via the server's
+## rumcast feature passthrough, so the client matches the server's
+## transport without forcing rumcast on the default test path.
+melin-client = { path = "../client" }
 melin-protocol = { path = "../protocol" }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
