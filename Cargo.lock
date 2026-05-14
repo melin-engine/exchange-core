@@ -1540,7 +1540,6 @@ dependencies = [
  "melin-dpdk",
  "melin-engine",
  "melin-protocol",
- "melin-rumcast",
  "melin-server",
  "melin-trading",
  "melin-transport-core",
@@ -1562,9 +1561,7 @@ name = "melin-client"
 version = "0.7.0"
 dependencies = [
  "ed25519-dalek",
- "getrandom 0.3.4",
  "melin-protocol",
- "melin-rumcast",
 ]
 
 [[package]]
@@ -1741,7 +1738,6 @@ dependencies = [
  "melin-market-data",
  "melin-noop",
  "melin-protocol",
- "melin-rumcast",
  "melin-trading",
  "melin-transport-core",
  "melin-types",
@@ -1753,7 +1749,6 @@ dependencies = [
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
- "x25519-dalek",
  "zerocopy",
 ]
 
