@@ -31,12 +31,12 @@ pub type JournalEvent = melin_journal::JournalEvent<melin_trading::trading_event
 pub type InputSlot =
     melin_transport_core::pipeline::InputSlot<melin_trading::trading_event::TradingEvent>;
 pub type OutputSlot = melin_transport_core::pipeline::OutputSlot<
-    melin_trading::types::ExecutionReport,
-    melin_trading::types::QueryResponse,
+    melin_types::types::ExecutionReport,
+    melin_types::types::QueryResponse,
 >;
 pub type OutputPayload = melin_transport_core::pipeline::OutputPayload<
-    melin_trading::types::ExecutionReport,
-    melin_trading::types::QueryResponse,
+    melin_types::types::ExecutionReport,
+    melin_types::types::QueryResponse,
 >;
 pub type SectorWriter = melin_journal::SectorWriter<melin_trading::trading_event::TradingEvent>;
 pub type BufferedWriter = melin_journal::BufferedWriter<melin_trading::trading_event::TradingEvent>;

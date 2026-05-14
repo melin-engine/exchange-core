@@ -7,7 +7,7 @@
 //! (reservation slab handles, the `astenn`-backed HashMap aliases) stay
 //! here.
 
-pub use melin_trading::types::*;
+pub use melin_types::types::*;
 
 /// HashMap with FxHash and extendible hashing (via `astenn`).
 ///

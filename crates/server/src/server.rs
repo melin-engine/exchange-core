@@ -1374,7 +1374,7 @@ where
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
-        use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
         use melin_transport_core::trace::mono_trace_ns;
 
         let seed_start = std::time::Instant::now();
@@ -2258,7 +2258,7 @@ where
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
-        use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
         use melin_transport_core::trace::mono_trace_ns;
 
         // `sequence: 0` — the journal stage allocates sequences in

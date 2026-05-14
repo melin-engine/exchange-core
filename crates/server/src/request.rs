@@ -144,7 +144,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use melin_trading::types::*;
+    use melin_types::types::*;
 
     #[test]
     fn filter_heartbeat() {

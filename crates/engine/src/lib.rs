@@ -13,7 +13,7 @@ pub mod types;
 /// protocol without linking the matching engine; engine-internal code
 /// (and downstream consumers still on the old import paths) continue to
 /// reach them here.
-pub use melin_trading::le;
+pub use melin_types::le;
 pub use melin_trading::trading_event;
 
 #[cfg(test)]

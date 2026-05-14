@@ -20,8 +20,8 @@ use std::num::NonZeroU64;
 
 use melin_app::{AppEvent, CodecError};
 
-use crate::le;
-use crate::types::{
+use melin_types::le;
+use melin_types::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, Order, OrderId,
     OrderType, Price, Quantity, RiskLimits, SelfTradeProtection, Side, Symbol, TimeInForce,
 };

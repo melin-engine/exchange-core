@@ -85,6 +85,7 @@ melin-noop = { path = "../noop", optional = true }
 melin-journal = { path = "../journal" }
 melin-trading = { path = "../trading" }
 melin-transport-core = { path = "../transport-core" }
+melin-types = { path = "../types" }
 melin-disruptor = { path = "../disruptor" }
 melin-market-data = { path = "../market-data", optional = true }
 melin-protocol = { path = "../protocol" }
