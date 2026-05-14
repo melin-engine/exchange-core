@@ -173,16 +173,12 @@ impl AuthorizedKeys {
 /// verifies) during the Ed25519 challenge-response handshake.
 ///
 /// The signature covers the nonce **and** the two X25519 ephemeral
-/// public keys. Binding the ephemerals into the signature blocks an
-/// active downgrade where an MITM substitutes its own X25519 keys to
-/// reveal the derived session token.
-///
-/// On the TCP path the ephemerals are typically zero (the rumcast
-/// session-token MAC is not used over a TCP byte stream — TCP gives
-/// stream-level integrity directly), so the effective payload is
-/// `nonce ‖ [0u8; 64]`. On the rumcast path both ephemerals are
-/// fresh per-handshake values. Either way both sides compute the
-/// same buffer and the signature verifies.
+/// public keys. The ephemerals are unused on the current TCP/DPDK
+/// transports (TCP gives stream-level integrity directly) and are
+/// sent as zeros, so the effective payload is `nonce ‖ [0u8; 64]`.
+/// Keeping them in the signed payload preserves the wire layout for
+/// a future per-message MAC scheme without changing the signing
+/// convention.
 #[inline]
 pub fn auth_signing_payload(
     nonce: &[u8; 32],
@@ -409,8 +405,8 @@ readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= second
     fn auth_signing_payload_round_trip_with_ed25519() {
         // End-to-end: sign with one party's key, verify on the
         // other side using the same helper. This is the property
-        // that makes the cross-transport (TCP / DPDK / rumcast)
-        // signing scheme actually work.
+        // that makes the cross-transport (TCP / DPDK) signing
+        // scheme actually work.
         use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
         // Deterministic key from a fixed seed — the rest of the

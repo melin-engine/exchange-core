@@ -115,11 +115,9 @@ pub enum Request {
         /// Client's long-term Ed25519 public key (32 bytes).
         public_key: [u8; 32],
         /// Client's per-handshake ephemeral X25519 public key (32
-        /// bytes). Combined with the server's ephemeral via ECDH to
-        /// derive the per-session MAC token. TCP path may set this to
-        /// zeros when symmetric integrity isn't needed (TCP gives
-        /// stream-level integrity for free); the rumcast path always
-        /// uses it.
+        /// bytes). Reserved for a future per-message MAC scheme;
+        /// unused on the current TCP/DPDK transports and sent as
+        /// zeros — TCP gives stream-level integrity for free.
         client_x25519_eph: [u8; 32],
     },
 
@@ -197,11 +195,10 @@ pub enum ResponseKind {
     ServerReady,
     /// Keepalive heartbeat sent during idle periods. Tag-only, no payload.
     Heartbeat,
-    /// Challenge sent by the server after accepting a connection
-    /// (TCP) or after seeing a `Heartbeat` from a new (src_addr,
-    /// session_id) pair (rumcast). Carries a fresh nonce for the
-    /// client to sign and the server's ephemeral X25519 public key
-    /// for forward-secret session-token derivation.
+    /// Challenge sent by the server after accepting a connection.
+    /// Carries a fresh nonce for the client to sign and the server's
+    /// ephemeral X25519 public key (reserved for a future per-message
+    /// MAC scheme; currently sent as zeros).
     Challenge {
         /// Random nonce (32 bytes) that the client must sign with its
         /// Ed25519 private key. Sign payload: `nonce ‖
