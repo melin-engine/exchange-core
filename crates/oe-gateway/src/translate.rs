@@ -6,7 +6,7 @@
 use std::num::NonZeroU64;
 
 use melin_protocol::message::Request;
-use melin_trading::types::{
+use melin_types::types::{
     AccountId, ExecutionReport, OrderId, OrderType, Price, Quantity, RejectReason,
     SelfTradeProtection, Side, Symbol, TimeInForce,
 };
@@ -226,7 +226,7 @@ pub fn new_order_single(
 
     Ok(Request::SubmitOrder {
         symbol,
-        order: melin_trading::types::Order {
+        order: melin_types::types::Order {
             id: order_id,
             account,
             side,
@@ -786,7 +786,7 @@ mod tests {
     use super::*;
     use melin_gateway_core::fix::parse::FixMessage;
     use melin_gateway_core::fix::serialize::FixMessageBuilder;
-    use melin_trading::types::OrderId;
+    use melin_types::types::OrderId;
     use std::collections::HashMap;
 
     /// Build a `FixCtx` for tests using the standard MELIN/FIRM pair.
@@ -1498,7 +1498,7 @@ mod tests {
 
         let report = ExecutionReport::InstrumentStatusChanged {
             symbol: Symbol(1),
-            status: melin_trading::types::InstrumentStatus::Enabled,
+            status: melin_types::types::InstrumentStatus::Enabled,
         };
 
         let fix_bytes = execution_report_to_fix(&report, &ctx(&id_map, 100, 1), None, 1, 1);

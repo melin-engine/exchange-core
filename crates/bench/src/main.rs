@@ -69,7 +69,7 @@ use melin_protocol::message::ResponseKind;
 use melin_protocol::transport::BlockingTransportListener;
 #[cfg(not(feature = "dpdk"))]
 use melin_server::server::ServerConfig;
-use melin_trading::types::*;
+use melin_types::types::*;
 
 /// Number of completed orders between latency time-series samples.
 /// Each sample captures interval p99/p99.9 (reset after each sample),

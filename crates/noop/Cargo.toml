@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 melin-app = { path = "../app" }
 melin-trading = { path = "../trading" }
+melin-types = { path = "../types" }
 
 [dev-dependencies]
 melin-disruptor = { path = "../disruptor" }

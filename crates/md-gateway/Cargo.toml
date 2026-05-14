@@ -12,7 +12,7 @@ melin-gateway-core = { path = "../gateway-core" }
 melin-market-data = { path = "../market-data" }
 melin-protocol = { path = "../protocol" }
 melin-engine = { path = "../engine" }
-melin-trading = { path = "../trading" }
+melin-types = { path = "../types" }
 ed25519-dalek = { workspace = true }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

@@ -4,7 +4,7 @@
 //! commands (add instrument, deposit, set risk limits). Administrative
 //! commands require `Permission::Operator` and are gated on the reader thread.
 
-use melin_trading::types::{
+use melin_types::types::{
     AccountBalance, AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule,
     InstrumentSpec, Order, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
 };

@@ -47,7 +47,7 @@ fn fast_powf(base: f64, exp: f64) -> f64 {
 
 use melin_protocol::codec;
 use melin_protocol::message::Request;
-use melin_trading::types::{
+use melin_types::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
     TimeInForce,
 };
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn aggressive_orders_produce_fills() {
         use melin_engine::exchange::Exchange;
-        use melin_trading::types::{CurrencyId, ExecutionReport, InstrumentSpec};
+        use melin_types::types::{CurrencyId, ExecutionReport, InstrumentSpec};
 
         let config = GeneratorConfig {
             num_accounts: 2,

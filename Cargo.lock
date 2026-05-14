@@ -1544,6 +1544,7 @@ dependencies = [
  "melin-server",
  "melin-trading",
  "melin-transport-core",
+ "melin-types",
  "plotters",
  "rand 0.9.2",
  "ratatui 0.29.0",
@@ -1600,6 +1601,7 @@ dependencies = [
  "melin-journal",
  "melin-trading",
  "melin-transport-core",
+ "melin-types",
  "proptest",
  "rustc-hash",
  "tempfile",
@@ -1639,7 +1641,7 @@ dependencies = [
  "ed25519-dalek",
  "melin-engine",
  "melin-protocol",
- "melin-trading",
+ "melin-types",
  "proptest",
  "tracing",
 ]
@@ -1655,7 +1657,7 @@ dependencies = [
  "melin-gateway-core",
  "melin-market-data",
  "melin-protocol",
- "melin-trading",
+ "melin-types",
  "serde",
  "toml",
  "tracing",
@@ -1671,6 +1673,7 @@ dependencies = [
  "melin-journal",
  "melin-trading",
  "melin-transport-core",
+ "melin-types",
  "tempfile",
 ]
 
@@ -1684,7 +1687,7 @@ dependencies = [
  "melin-engine",
  "melin-gateway-core",
  "melin-protocol",
- "melin-trading",
+ "melin-types",
  "proptest",
  "serde",
  "toml",
@@ -1700,7 +1703,7 @@ dependencies = [
  "blake3",
  "bolero",
  "ed25519-dalek",
- "melin-trading",
+ "melin-types",
  "subtle",
  "tempfile",
  "x25519-dalek",
@@ -1741,6 +1744,7 @@ dependencies = [
  "melin-rumcast",
  "melin-trading",
  "melin-transport-core",
+ "melin-types",
  "proptest",
  "rand 0.9.2",
  "rustc-hash",
@@ -1758,6 +1762,7 @@ name = "melin-trading"
 version = "0.7.0"
 dependencies = [
  "melin-app",
+ "melin-types",
 ]
 
 [[package]]
@@ -1796,6 +1801,10 @@ dependencies = [
  "melin-gateway-core",
  "ratatui 0.30.0",
 ]
+
+[[package]]
+name = "melin-types"
+version = "0.7.0"
 
 [[package]]
 name = "memchr"

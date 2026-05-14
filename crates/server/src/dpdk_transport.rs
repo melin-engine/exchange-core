@@ -912,7 +912,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use crate::JournalEvent;
-    use melin_trading::types::*;
+    use melin_types::types::*;
 
     // --- try_extract_frame tests ---
 

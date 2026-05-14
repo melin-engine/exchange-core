@@ -4,7 +4,7 @@
 //! produces updates) and the md-gateway sessions (which consume them
 //! and translate to FIX).
 
-use melin_trading::types::{Price, Side, Symbol};
+use melin_types::types::{Price, Side, Symbol};
 
 use crate::mirror::Level;
 

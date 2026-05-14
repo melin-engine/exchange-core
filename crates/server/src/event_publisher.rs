@@ -36,7 +36,7 @@ use melin_market_data::mirror::BookMirror;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
-use melin_trading::types::{ExecutionReport, QueryResponse, Symbol};
+use melin_types::types::{ExecutionReport, QueryResponse, Symbol};
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
@@ -386,7 +386,7 @@ fn send_snapshot(
     mirrors: &rustc_hash::FxHashMap<Symbol, BookMirror>,
     last_seq: u64,
 ) -> io::Result<()> {
-    use melin_trading::types::Side;
+    use melin_types::types::Side;
 
     let mut buf = [0u8; MAX_FRAME_BUF];
 
@@ -593,7 +593,7 @@ fn send_auth_failed(writer: &mut dyn Write) {
 mod tests {
     use super::*;
     use crate::OutputSlot;
-    use melin_trading::types::*;
+    use melin_types::types::*;
 
     /// Helper to create a Streaming subscriber for tests that bypass
     /// the auth + subscribe handshake.
@@ -1069,7 +1069,7 @@ mod tests {
                 order_id: OrderId(1),
                 symbol: sym,
                 account: AccountId(1),
-                reason: melin_trading::types::RejectReason::NoLiquidity,
+                reason: melin_types::types::RejectReason::NoLiquidity,
             }),
             sym
         );

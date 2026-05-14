@@ -238,7 +238,7 @@ fn dispatch_event(
 mod tests {
     use super::*;
     use crate::JournalEvent;
-    use melin_trading::types::*;
+    use melin_types::types::*;
     use std::num::NonZeroU64;
     use std::time::Instant;
 

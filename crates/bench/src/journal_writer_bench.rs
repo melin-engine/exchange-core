@@ -110,25 +110,25 @@ fn main() {
 /// generated stream is not trivially compressible.
 fn make_event(i: usize) -> JournalEvent {
     let nz = |v: u64| NonZero::new(v).expect("non-zero");
-    let order_id = melin_trading::OrderId((i as u64) + 1);
+    let order_id = melin_types::types::OrderId((i as u64) + 1);
     let side = if i.is_multiple_of(2) {
-        melin_trading::Side::Buy
+        melin_types::types::Side::Buy
     } else {
-        melin_trading::Side::Sell
+        melin_types::types::Side::Sell
     };
     JournalEvent::App(TradingEvent::SubmitOrder {
-        symbol: melin_trading::Symbol(1),
-        order: melin_trading::Order {
+        symbol: melin_types::types::Symbol(1),
+        order: melin_types::types::Order {
             id: order_id,
-            account: melin_trading::AccountId(1),
+            account: melin_types::types::AccountId(1),
             side,
-            order_type: melin_trading::OrderType::Limit {
-                price: melin_trading::Price(nz(100)),
+            order_type: melin_types::types::OrderType::Limit {
+                price: melin_types::types::Price(nz(100)),
                 post_only: false,
             },
-            time_in_force: melin_trading::TimeInForce::GTC,
-            quantity: melin_trading::Quantity(nz(1)),
-            stp: melin_trading::SelfTradeProtection::Allow,
+            time_in_force: melin_types::types::TimeInForce::GTC,
+            quantity: melin_types::types::Quantity(nz(1)),
+            stp: melin_types::types::SelfTradeProtection::Allow,
             expiry_ns: 0,
         },
     })

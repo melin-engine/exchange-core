@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
-use melin_trading::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
+use melin_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 
 use crate::index::RestingOrder;
 use crate::mirror::{BookMirror, Level};

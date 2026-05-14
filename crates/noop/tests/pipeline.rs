@@ -11,7 +11,7 @@ use std::time::Duration;
 use melin_journal::BufferedWriter;
 use melin_noop::NoopApp;
 use melin_trading::trading_event::TradingEvent;
-use melin_trading::types::{AccountId, CurrencyId};
+use melin_types::types::{AccountId, CurrencyId};
 use melin_transport_core::pipeline::{
     InputSlot, JournalStageRun, OutputPayload, build_pipeline_with_replication,
 };

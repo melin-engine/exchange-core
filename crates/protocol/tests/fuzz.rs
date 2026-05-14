@@ -4,7 +4,7 @@
 //! A malicious client or corrupted network data must never crash the
 //! server or client — decoders must return Err gracefully.
 
-use crate::codec;
+use melin_protocol::codec;
 
 /// Wire request decoder must never panic on arbitrary input.
 #[test]
@@ -69,8 +69,8 @@ fn fuzz_wire_response_roundtrip() {
 // Helpers: construct valid protocol types from raw bytes
 // ---------------------------------------------------------------------------
 
-use crate::message::{Request, ResponseKind};
-use melin_trading::types::*;
+use melin_protocol::message::{Request, ResponseKind};
+use melin_types::types::*;
 use std::num::NonZeroU64;
 
 fn nz64(data: &[u8], offset: usize) -> Option<NonZeroU64> {
