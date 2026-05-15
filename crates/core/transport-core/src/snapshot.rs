@@ -324,15 +324,22 @@ mod tests {
     #[test]
     fn save_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("snap");
         let app = populated_app();
-        let chain = [0xCDu8; 32];
-        save::<TestApp>(&app, 999, chain, &path).unwrap();
 
-        let (restored, seq, ch) = load::<TestApp>(&path).unwrap();
-        assert_eq!(seq, 999);
-        assert_eq!(ch, chain);
-        assert_eq!(restored, app);
+        // [0u8; 32] is `JournaledApp`'s documented "hash chain disabled /
+        // not yet initialized" sentinel — see `journaled_app.rs`
+        // `unwrap_or([0u8; 32])`. Cover it alongside a populated hash so
+        // the sentinel can't silently regress (no special-casing in
+        // save/load today, just an intent guard).
+        for (label, chain) in [("populated", [0xCDu8; 32]), ("zero sentinel", [0u8; 32])] {
+            let path = dir.path().join(format!("snap.{label}"));
+            save::<TestApp>(&app, 999, chain, &path).unwrap();
+
+            let (restored, seq, ch) = load::<TestApp>(&path).unwrap();
+            assert_eq!(seq, 999, "{label}");
+            assert_eq!(ch, chain, "{label}");
+            assert_eq!(restored, app, "{label}");
+        }
     }
 
     #[test]
