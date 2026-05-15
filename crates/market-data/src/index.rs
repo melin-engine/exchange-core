@@ -3,6 +3,10 @@
 
 use melin_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 
+/// FxHash + extendible hashing: avoids rehash spikes by growing one bucket
+/// at a time instead of rehashing the entire table at once.
+type HashMap<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
 /// Metadata for a single resting order, stored in the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestingOrder {
@@ -16,12 +20,9 @@ pub struct RestingOrder {
 /// Maps `OrderId → RestingOrder` for all orders currently on the book.
 ///
 /// HashMap (not BTreeMap): order lookups are by ID only, never range-scanned.
-/// Uses the engine's HashMap (FxHash + extendible hashing) to avoid
-/// rehash spikes — extendible hashing grows one bucket at a time instead
-/// of rehashing the entire table at once.
 pub struct OrderIndex {
     /// Maps order_id to its resting state. One entry per resting order.
-    map: melin_engine::types::HashMap<OrderId, RestingOrder>,
+    map: HashMap<OrderId, RestingOrder>,
 }
 
 impl Default for OrderIndex {
@@ -33,7 +34,7 @@ impl Default for OrderIndex {
 impl OrderIndex {
     pub fn new() -> Self {
         Self {
-            map: melin_engine::types::HashMap::default(),
+            map: HashMap::default(),
         }
     }
 
