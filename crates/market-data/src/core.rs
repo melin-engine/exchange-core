@@ -106,11 +106,8 @@ fn run_session(
 
     // Read Challenge from publisher.
     let challenge = read_response(&mut stream)?;
-    let (nonce, server_eph) = match challenge {
-        ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        } => (nonce, server_x25519_eph),
+    let nonce = match challenge {
+        ResponseKind::Challenge { nonce } => nonce,
         other => {
             return Err(format!(
                 "expected Challenge, got {:?}",
@@ -120,16 +117,11 @@ fn run_session(
         }
     };
 
-    // Sign the nonce + ephemerals (TCP uses zero ephs) — see
-    // [`melin_protocol::auth::auth_signing_payload`].
-    let client_x25519_eph = [0u8; 32];
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     let signature = signing_key.sign(&signing_payload);
     let auth_request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: public_key.to_bytes(),
-        client_x25519_eph,
     };
     send_request(&mut stream, &auth_request, 0)?;
 

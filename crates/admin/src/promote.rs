@@ -84,11 +84,8 @@ fn main() {
         eprintln!("error: failed to read challenge payload: {e}");
         std::process::exit(1);
     }
-    let (nonce, server_eph) = match codec::decode_response(&frame_buf) {
-        Ok(ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        }) => (nonce, server_x25519_eph),
+    let nonce = match codec::decode_response(&frame_buf) {
+        Ok(ResponseKind::Challenge { nonce }) => nonce,
         Ok(other) => {
             eprintln!("error: expected Challenge, got {other:?}");
             std::process::exit(1);
@@ -99,16 +96,12 @@ fn main() {
         }
     };
 
-    // Step 2: Sign nonce + ephemerals (admin TCP uses zero ephs) —
-    // see `melin_protocol::auth::auth_signing_payload`.
-    let client_x25519_eph = [0u8; 32];
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+    // Step 2: Sign the nonce.
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     let signature = signing_key.sign(&signing_payload);
     let request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: signing_key.verifying_key().to_bytes(),
-        client_x25519_eph,
     };
     let mut encode_buf = [0u8; 256];
     let written = match codec::encode_request(&request, 0, &mut encode_buf) {

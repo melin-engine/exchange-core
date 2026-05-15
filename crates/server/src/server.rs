@@ -2714,16 +2714,9 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     // but kept in the wire layout for forward compatibility — the
     // signature payload still covers it so server + client share a
     // single signing scheme. See `melin_protocol::auth::auth_signing_payload`.
-    let server_x25519_eph = [0u8; 32];
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(
-        &ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        },
-        &mut buf,
-    )
-    .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
+        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     writer.write_all(&buf[..written])?;
     writer.flush()?;
 
@@ -2754,12 +2747,11 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
+    let (signature_bytes, public_key_bytes) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-            client_x25519_eph,
-        } => (signature, public_key, client_x25519_eph),
+        } => (signature, public_key),
         other => {
             send_auth_failed(writer);
             return Err(format!(
@@ -2786,8 +2778,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     verifying_key
         .verify(&signing_payload, &signature)
         .map_err(|e| {
@@ -3016,22 +3007,16 @@ mod tests {
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let (nonce, server_eph) = match resp {
-            ResponseKind::Challenge {
-                nonce,
-                server_x25519_eph,
-            } => (nonce, server_x25519_eph),
+        let nonce = match resp {
+            ResponseKind::Challenge { nonce } => nonce,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let client_x25519_eph = [0u8; 32];
-        let signing_payload =
-            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
         let sig = key.sign(&signing_payload);
         let request = Request::ChallengeResponse {
             signature: sig.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
-            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();
@@ -3048,24 +3033,18 @@ mod tests {
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let (nonce, server_eph) = match resp {
-            ResponseKind::Challenge {
-                nonce,
-                server_x25519_eph,
-            } => (nonce, server_x25519_eph),
+        let nonce = match resp {
+            ResponseKind::Challenge { nonce } => nonce,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let client_x25519_eph = [0u8; 32];
-        let signing_payload =
-            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
         let mut sig_bytes = key.sign(&signing_payload).to_bytes();
         sig_bytes[0] ^= 0xFF;
 
         let request = Request::ChallengeResponse {
             signature: sig_bytes,
             public_key: key.verifying_key().to_bytes(),
-            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();

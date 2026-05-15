@@ -496,16 +496,9 @@ fn authenticate_subscriber(
 
     // Send Challenge. X25519 ephemerals are unused on TCP; send zeros
     // — see [`melin_protocol::auth::auth_signing_payload`].
-    let server_x25519_eph = [0u8; 32];
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(
-        &ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        },
-        &mut buf,
-    )
-    .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
+        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     write_stream.write_all(&buf[..written])?;
     write_stream.flush()?;
 
@@ -528,12 +521,11 @@ fn authenticate_subscriber(
         }
     };
 
-    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
+    let (signature_bytes, public_key_bytes) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-            client_x25519_eph,
-        } => (signature, public_key, client_x25519_eph),
+        } => (signature, public_key),
         other => {
             send_auth_failed(&mut write_stream);
             return Err(format!(
@@ -560,8 +552,7 @@ fn authenticate_subscriber(
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     verifying_key
         .verify(&signing_payload, &signature)
         .map_err(|e| {

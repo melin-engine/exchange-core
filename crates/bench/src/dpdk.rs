@@ -839,27 +839,18 @@ fn dpdk_auth_all(
                 AuthPhase::WaitChallenge => {
                     let response = codec::decode_response(&conn.parse_buf[4..consumed])
                         .expect("decode Challenge");
-                    let (nonce, server_eph) = match response {
-                        ResponseKind::Challenge {
-                            nonce,
-                            server_x25519_eph,
-                        } => (nonce, server_x25519_eph),
+                    let nonce = match response {
+                        ResponseKind::Challenge { nonce } => nonce,
                         other => panic!("client {i}: expected Challenge, got {other:?}"),
                     };
 
                     // Sign nonce + ephemerals (DPDK TCP uses zero ephs)
                     // — see `melin_protocol::auth::auth_signing_payload`.
-                    let client_x25519_eph = [0u8; 32];
-                    let signing_payload = melin_protocol::auth::auth_signing_payload(
-                        &nonce,
-                        &server_eph,
-                        &client_x25519_eph,
-                    );
+                    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
                     let signature = key.sign(&signing_payload);
                     let request = Request::ChallengeResponse {
                         signature: signature.to_bytes(),
                         public_key: key.verifying_key().to_bytes(),
-                        client_x25519_eph,
                     };
                     let mut buf = [0u8; 256];
                     let written = codec::encode_request(&request, 0, &mut buf)
