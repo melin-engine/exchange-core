@@ -1,48 +1,59 @@
-//! Engine-side journal recovery tests (formerly contained the
-//! `JournaledExchange` synchronous wrapper, now deleted in favour of
-//! `melin_transport_core::JournaledApp<Exchange, _>`). The wrapper's
-//! API survives only as a test harness inside the `tests` module so
-//! the long-standing recovery / snapshot / crash tests don't have to
-//! open-code the journal-then-apply dance.
+//! Engine-side journal recovery tests.
+//!
+//! Exercise `JournaledApp<Exchange, _>` (transport-core) end-to-end:
+//! create, write, snapshot, rotate, recover, replay, crash-and-recover
+//! across every byte offset. The `TestExchange` harness below mirrors
+//! the shape of the deleted `JournaledExchange` wrapper so the tests
+//! don't have to open-code the journal-then-apply dance per call.
 
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
-
-    use crate::journal::{BufferedWriter, SectorWriter};
-    use crate::types::*;
-
     use std::path::Path;
 
     use melin_journal::{JournalError, JournalEvent, JournalWrite};
     use melin_transport_core::journaled_app::{JournaledApp, JournaledAppError};
-
-    use crate::exchange::Exchange;
-    use crate::trading_event::TradingEvent;
     use melin_transport_core::snapshot;
 
-    /// Synchronous journal-then-apply harness. Wraps
-    /// `JournaledApp<Exchange, BufferedWriter>` and re-exposes the
-    /// per-event methods (`execute`, `deposit`, …) the recovery tests
-    /// below need, so they read close to their pre-deletion shape.
-    /// Production never journals-then-applies on the same thread; it
+    use crate::exchange::Exchange;
+    use crate::journal::{BufferedWriter, SectorWriter};
+    use crate::trading_event::TradingEvent;
+    use crate::types::*;
+
+    /// Synchronous journal-then-apply harness mirroring the deleted
+    /// `JournaledExchange` API. Wraps `JournaledApp<Exchange,
+    /// BufferedWriter>` and re-exposes per-event methods so the recovery
+    /// tests below read close to their pre-deletion shape.
+    ///
+    /// Production never journals-then-applies on the same thread — it
     /// runs the journal stage and matching stage on separate disruptor
-    /// rings. This harness exists only because every test would
-    /// otherwise open-code the same `writer.append` + `exchange.apply`
-    /// dance.
+    /// rings. The harness exists only so individual tests don't open-
+    /// code the `writer.append` + `exchange.apply` dance.
+    ///
+    /// **Caveat**: the per-event methods construct an `ApplyCtx` with
+    /// `active_connections`, `events_processed`, and `key_hash` all
+    /// zeroed (see `apply_journaled` in transport-core). Tests that
+    /// drive `TradingEvent::QueryStats` or similar query variants would
+    /// see those zeros — fine for the recovery tests here, all of which
+    /// are state-mutation only.
     struct TestExchange {
         inner: JournaledApp<Exchange, BufferedWriter>,
     }
 
     impl TestExchange {
+        /// Fresh exchange + fresh journal at `path`.
         fn create(path: &Path) -> Result<Self, JournaledAppError> {
             JournaledApp::create(Exchange::with_capacity(), path).map(|inner| Self { inner })
         }
 
+        /// Walk every archived segment then the live segment, replaying
+        /// every event into a fresh `Exchange`.
         fn recover(path: &Path) -> Result<Self, JournaledAppError> {
             JournaledApp::recover(Exchange::with_capacity(), path).map(|inner| Self { inner })
         }
 
+        /// Load `Exchange` state from a snapshot, then replay the
+        /// post-snapshot delta from the journal.
         fn recover_from_snapshot(
             snapshot_path: &Path,
             journal_path: &Path,
@@ -51,36 +62,49 @@ mod tests {
                 .map(|inner| Self { inner })
         }
 
+        /// Compose a harness from pre-built parts. Used by the
+        /// snapshot-only recovery test (journal missing after a
+        /// rotation crash).
         fn from_parts(exchange: Exchange, writer: BufferedWriter) -> Self {
             Self {
                 inner: JournaledApp::from_parts(exchange, writer),
             }
         }
 
+        /// Write a snapshot of the current `Exchange` state — same
+        /// framing the production shadow stage uses.
         fn save_snapshot(&self, path: &Path) -> Result<(), JournaledAppError> {
             self.inner.save_snapshot(path)
         }
 
+        /// Archive the live segment and start a fresh one continuing
+        /// the sequence + chain hash.
         fn rotate_segment(&mut self) -> Result<(), JournaledAppError> {
             self.inner.rotate_segment()
         }
 
+        /// Read-only access for state assertions (balances, order book).
         fn exchange(&self) -> &Exchange {
             self.inner.app()
         }
 
+        /// Next sequence the writer will assign.
         fn next_sequence(&self) -> u64 {
             self.inner.next_sequence()
         }
 
+        /// Current BLAKE3 chain-hash tip (or `None` if hash-chain is off).
         fn writer_chain_hash(&self) -> Option<[u8; 32]> {
             self.inner.chain_hash()
         }
 
+        /// Size of the live journal file in bytes (valid data only,
+        /// excludes the pre-allocated tail).
         fn journal_size(&self) -> u64 {
             self.inner.journal_size()
         }
 
+        /// Journal + apply `TradingEvent::AddInstrument`.
         fn add_instrument(&mut self, spec: InstrumentSpec) -> Result<(), JournalError> {
             let mut reports = Vec::new();
             self.inner
@@ -88,6 +112,7 @@ mod tests {
             Ok(())
         }
 
+        /// Journal + apply `TradingEvent::Deposit`.
         fn deposit(
             &mut self,
             account: AccountId,
@@ -106,6 +131,8 @@ mod tests {
             Ok(())
         }
 
+        /// Journal + apply `TradingEvent::CancelAll`. Returned reports
+        /// are appended to the caller's buffer.
         fn cancel_all(
             &mut self,
             account: AccountId,
@@ -118,9 +145,13 @@ mod tests {
 
         /// Journal the withdraw event unconditionally (so replay re-
         /// fires the same rejection), then call `Exchange::withdraw`
-        /// directly to capture its rejection. The pipeline's
-        /// `TradingEvent::Withdraw` arm discards this error today;
-        /// `Exchange::withdraw` is the only API that surfaces it.
+        /// directly to capture the rejection.
+        ///
+        /// Bypasses `apply_journaled` because the pipeline's
+        /// `TradingEvent::Withdraw` arm discards rejections today
+        /// (`let _ = self.withdraw(...)` in `application_impl.rs`).
+        /// `Exchange::withdraw` is the only API that surfaces them —
+        /// flagged on the roadmap as item #15.
         fn withdraw(
             &mut self,
             account: AccountId,
@@ -138,6 +169,7 @@ mod tests {
             self.inner.app_mut().withdraw(account, currency, amount)
         }
 
+        /// Journal + apply `TradingEvent::SetRiskLimits`.
         fn set_risk_limits(
             &mut self,
             symbol: Symbol,
@@ -149,6 +181,7 @@ mod tests {
             Ok(())
         }
 
+        /// Journal + apply `TradingEvent::SetCircuitBreaker`.
         fn set_circuit_breaker(
             &mut self,
             symbol: Symbol,
@@ -162,6 +195,9 @@ mod tests {
             Ok(())
         }
 
+        /// Journal + apply `TradingEvent::SetFeeSchedule`. The new
+        /// schedule may cancel orders that can't afford the cushion;
+        /// those rejections flow into `reports`.
         fn set_fee_schedule(
             &mut self,
             symbol: Symbol,
@@ -173,6 +209,8 @@ mod tests {
             Ok(())
         }
 
+        /// Journal + apply `TradingEvent::SubmitOrder`. Fills + the
+        /// `Placed`/`Rejected` outcome flow into `reports`.
         fn execute(
             &mut self,
             symbol: Symbol,
@@ -184,6 +222,7 @@ mod tests {
             Ok(())
         }
 
+        /// Journal + apply `TradingEvent::CancelOrder`.
         fn cancel(
             &mut self,
             symbol: Symbol,
@@ -202,6 +241,8 @@ mod tests {
             Ok(())
         }
 
+        /// Journal a `Tick` and drain any scheduled tasks due at
+        /// `now_ns` (GTD expiries, circuit-breaker windows, …).
         fn tick(
             &mut self,
             now_ns: u64,

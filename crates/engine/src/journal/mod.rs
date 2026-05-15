@@ -8,12 +8,13 @@
 //! spelling the generic every time. The Exchange-aware snapshot framing
 //! lives here too, since it's entangled with `Exchange` internals.
 
-#[cfg(test)]
-mod engine;
 pub mod snapshot;
 
 #[cfg(test)]
-pub mod halt_tests;
+mod halt_tests;
+
+#[cfg(test)]
+mod recovery_tests;
 
 /// The `TradingEvent`-parameterised journal types — aliased here so
 /// engine/server code doesn't have to spell the generic every time.
