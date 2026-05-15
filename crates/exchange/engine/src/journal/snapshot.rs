@@ -1734,7 +1734,8 @@ mod tests {
         save(&Exchange::new(), 0, [0u8; 32], &path).unwrap();
 
         // Flip one byte inside the payload region so the CRC fails.
-        // 48-byte transport header + 1 lands squarely in payload bytes.
+        // The transport header is 48 bytes, so index 48 is the first
+        // payload byte; flipping index 49 lands one byte into the payload.
         let mut data = std::fs::read(&path).unwrap();
         data[49] ^= 0xFF;
         std::fs::write(&path, &data).unwrap();

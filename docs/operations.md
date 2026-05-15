@@ -330,7 +330,22 @@ If the latest snapshot is corrupt or contains undesired state (e.g., bad market 
 mv melin.snapshot.prev melin.snapshot
 ```
 
-The rotation is best-effort: if the `.prev` rename fails (e.g., permission error), the save proceeds anyway — losing the rollback point is preferable to failing the snapshot entirely. On first save after startup, there is no previous snapshot to rotate, so no `.prev` file is created.
+The rotation is best-effort: if the `.prev` rename fails (e.g., permission error), the save proceeds anyway — losing the rollback point is preferable to failing the snapshot entirely. The server logs a warning when this happens. On first save after startup, there is no previous snapshot to rotate, so no `.prev` file is created.
+
+#### Recovery from a Crash Mid-Save
+
+If the server crashes between the `.prev` rotation and the final `.tmp → .snapshot` rename, the snapshot directory can be left with `melin.snapshot.prev` present, `melin.snapshot.tmp` present, and `melin.snapshot` missing. On the next startup, recovery from a fixed `<path>` fails because the path does not exist. Two manual recovery paths are available, depending on which copy you trust:
+
+```sh
+# Promote the rotated rollback target (loses the most recent save).
+mv melin.snapshot.prev melin.snapshot
+
+# Or accept the in-progress write (it was fully written and fsynced
+# before the rotation; the rename is what didn't complete).
+mv melin.snapshot.tmp melin.snapshot
+```
+
+Both files are complete, CRC-checked snapshots and will load normally. Pick whichever matches the journal state you intend to resume from.
 
 ### Catch-Up Behavior
 

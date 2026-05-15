@@ -22,6 +22,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use melin_app::Application;
+use tracing::warn;
 
 const SNAP_MAGIC: u32 = 0x534E_4150;
 const TRANSPORT_VERSION: u16 = 1;
@@ -171,11 +172,24 @@ fn save_with_limit<A: Application>(
     // Operators rely on this as a one-deep rollback target — see
     // `docs/operations.md` "Snapshot rotation". On first save the source
     // doesn't exist (NotFound) and the rename does nothing. Other errors
-    // (e.g. EACCES) are dropped on purpose: per the documented best-effort
-    // contract, losing the rollback point is preferable to failing the
-    // snapshot entirely.
+    // (e.g. EACCES, ENOSPC) are non-fatal — per the documented best-effort
+    // contract we proceed with the save rather than fail it — but the
+    // operator loses their rollback point, so surface it as a warning
+    // rather than swallowing it.
     let prev_path = with_suffix(path, PREV_SUFFIX);
-    let rotated = std::fs::rename(path, &prev_path).is_ok();
+    let rotated = match std::fs::rename(path, &prev_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                prev = %prev_path.display(),
+                "snapshot rotation to .prev failed; rollback point lost for this save",
+            );
+            false
+        }
+    };
 
     // Fsync the parent dir between the two renames so the rotation is
     // durable before the publish overwrites `path`. Without this, a crash
