@@ -494,8 +494,6 @@ fn authenticate_subscriber(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge. X25519 ephemerals are unused on TCP; send zeros
-    // — see [`melin_protocol::auth::auth_signing_payload`].
     let mut buf = [0u8; 128];
     let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
         .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;

@@ -2710,10 +2710,6 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge. The X25519 ephemeral is unused on the TCP path
-    // but kept in the wire layout for forward compatibility — the
-    // signature payload still covers it so server + client share a
-    // single signing scheme. See `melin_protocol::auth::auth_signing_payload`.
     let mut buf = [0u8; 128];
     let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
         .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;

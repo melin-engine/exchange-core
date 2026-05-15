@@ -123,10 +123,10 @@ pub struct Session {
     pub melin_inflight: Vec<u8>,
     /// Melin request sequence number (per-key monotonic).
     melin_seq: u64,
-    /// Reusable encode buffer for Melin requests. 168 bytes is the
+    /// Reusable encode buffer for Melin requests. 128 bytes is the
     /// upper bound (set by ChallengeResponse: 4 prefix + 8 seq + 1
-    /// tag + 64 sig + 32 pubkey + 32 X25519 eph + slack).
-    melin_encode_buf: [u8; 168],
+    /// tag + 64 sig + 32 pubkey + slack).
+    melin_encode_buf: [u8; 128],
     pub melin_multishot_active: bool,
 
     // ── Outbound message store (FIX 4.4 §4.6/4.7 ResendRequest) ──
@@ -218,7 +218,7 @@ impl Session {
             melin_send_buf: Vec::with_capacity(256),
             melin_inflight: Vec::with_capacity(256),
             melin_seq: 0,
-            melin_encode_buf: [0u8; 168],
+            melin_encode_buf: [0u8; 128],
             melin_multishot_active: false,
 
             outbound_store: VecDeque::with_capacity(64),

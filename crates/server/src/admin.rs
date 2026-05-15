@@ -155,8 +155,6 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| format!("getrandom failed: {e}"))?;
 
-    // X25519 ephemerals are unused on the admin TCP path; send zeros
-    // — see [`melin_protocol::auth::auth_signing_payload`].
     let mut buf = [0u8; 128];
     let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
         .map_err(|e| format!("encode Challenge: {e}"))?;

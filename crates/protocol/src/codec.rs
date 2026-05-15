@@ -153,9 +153,9 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
-/// The caller must ensure `buf` is large enough (168 bytes is always sufficient
-/// — bound is set by `ChallengeResponse` after the X25519 ephemeral was added:
-/// 4 prefix + 8 seq + 1 tag + 64 sig + 32 pubkey + 32 eph + 27 slack).
+/// The caller must ensure `buf` is large enough (128 bytes is always sufficient
+/// — bound is set by `ChallengeResponse`: 4 prefix + 8 seq + 1 tag + 64 sig +
+/// 32 pubkey + 19 slack).
 /// `seq` is the per-key monotonic request sequence for idempotency dedup.
 /// Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
