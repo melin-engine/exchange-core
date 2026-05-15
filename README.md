@@ -33,7 +33,7 @@ All numbers are **full round-trip**:
 3. Matching engine executes
 4. Response arrives at client
 
-Measured over LAN using four AMD EPYC 9255 servers (24C Zen 5, SMT off, 192 GB DDR5-6400, dedicated Micron 7400 PRO PLP NVMe for the journal, Intel E810-XXV 25 Gb/s NIC; 1 benchmark, 1 primary, 2 replicas). Commit [`b184e90`](../../commit/b184e90). [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+Measured over LAN using four AMD EPYC 9255 servers (24C Zen 5, SMT off, 192 GB DDR5-6400, dedicated Micron 7400 PRO PLP NVMe for the journal, Intel E810-XXV 25 Gb/s NIC; 1 benchmark, 1 primary, 2 replicas). Commit [`b184e90`](../../commit/b184e90). [Realistic order flow](crates/exchange/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
 ### Throughput under load (16 clients, window 5)
 

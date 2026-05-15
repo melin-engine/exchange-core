@@ -1,6 +1,6 @@
 # Benchmarking Guide
 
-This document covers the benchmark suite in `crates/bench/`, including benchmark modes, order generation, CLI parameters, measurement methodology, hardware tuning, and how to reproduce the published performance numbers.
+This document covers the benchmark suite in `crates/exchange/bench/`, including benchmark modes, order generation, CLI parameters, measurement methodology, hardware tuning, and how to reproduce the published performance numbers.
 
 ## Benchmark Modes
 
@@ -44,7 +44,7 @@ Why numbers differ from pipeline: there is no journal fsync, no ring buffer sync
 
 ## Order Generation
 
-All modes use the same realistic order flow generator (`crates/bench/src/generator.rs`), which produces synthetic order streams that mimic real exchange order flow patterns. Events are pre-generated into memory before the timed run begins, so RNG overhead and allocation do not pollute per-order timing.
+All modes use the same realistic order flow generator (`crates/exchange/bench/src/generator.rs`), which produces synthetic order streams that mimic real exchange order flow patterns. Events are pre-generated into memory before the timed run begins, so RNG overhead and allocation do not pollute per-order timing.
 
 ### Flow composition
 
@@ -180,7 +180,7 @@ The instrumentation is split across two opt-in flags, both off by default:
 | `response: dispatch (consume → socket write)` | Whole-batch dispatch time, kept as an overall sanity check |
 | `server e2e (reader recv → response flush)` | Reader-to-egress server-side full path, kept as a sanity check |
 
-Per-cursor wait samples (journal-wait / replica-wait) are recorded only when the cursor was strictly below `needed` at the gate loop's first iteration — so a cursor already past at entry doesn't get attributed wait time it didn't cause. See the `GateCrossTracker` doc-comment in `crates/server/src/response.rs` for the rationale and the per-slot caveat (cross timestamp is captured for the *batch's* `needed`, slightly overestimating wait for non-last slots).
+Per-cursor wait samples (journal-wait / replica-wait) are recorded only when the cursor was strictly below `needed` at the gate loop's first iteration — so a cursor already past at entry doesn't get attributed wait time it didn't cause. See the `GateCrossTracker` doc-comment in `crates/exchange/server/src/response.rs` for the rationale and the per-slot caveat (cross timestamp is captured for the *batch's* `needed`, slightly overestimating wait for non-last slots).
 
 ### Measurement window
 

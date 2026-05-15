@@ -5,7 +5,7 @@
 //! "tick-to-trade decomposition" that complements the bench-side full
 //! round-trip percentiles in `print_results`.
 //!
-//! Wire format produced by the server (see `crates/server/src/health.rs`):
+//! Wire format produced by the server (see `crates/exchange/server/src/health.rs`):
 //!
 //! ```text
 //! stage\t<name>\t<samples>\t<min_ns>\t<p50_ns>\t<p90_ns>\t<p99_ns>\t<p99_9_ns>\t<max_ns>

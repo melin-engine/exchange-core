@@ -54,11 +54,11 @@ hdrhistogram = { version = "7", optional = true }
 io-uring = "0.7"
 libc = { workspace = true }
 tracing = { workspace = true }
-melin-app = { path = "../app" }
-melin-disruptor = { path = "../disruptor" }
-melin-journal = { path = "../journal" }
+melin-app = { path = "../../core/app" }
+melin-disruptor = { path = "../../core/disruptor" }
+melin-journal = { path = "../../core/journal" }
 melin-trading = { path = "../trading" }
-melin-transport-core = { path = "../transport-core" }
+melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }
 astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 
@@ -69,10 +69,10 @@ bolero = "0.13"
 # tests to skip the 256 MiB per-iter fallocate). Cargo unifies the
 # feature set with the regular `[dependencies]` entry above during
 # test builds only — production builds don't see `test-utils`.
-melin-journal = { path = "../journal", features = ["test-utils"] }
+melin-journal = { path = "../../core/journal", features = ["test-utils"] }
 # Same trick for transport-core: enable `test-utils` only in test
 # builds so engine recovery tests can use `apply_journaled` (the
 # successor to the deleted `JournaledExchange` wrapper).
-melin-transport-core = { path = "../transport-core", features = ["test-utils"] }
+melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }
 proptest = "1"
 tempfile = "3"

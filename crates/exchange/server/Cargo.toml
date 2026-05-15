@@ -70,13 +70,13 @@ path = "src/bin/replication-bench.rs"
 required-features = ["skip-order-exec"]
 
 [dependencies]
-melin-app = { path = "../app" }
+melin-app = { path = "../../core/app" }
 melin-engine = { path = "../engine" }
-melin-journal = { path = "../journal" }
+melin-journal = { path = "../../core/journal" }
 melin-trading = { path = "../trading" }
-melin-transport-core = { path = "../transport-core" }
+melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }
-melin-disruptor = { path = "../disruptor" }
+melin-disruptor = { path = "../../core/disruptor" }
 melin-market-data = { path = "../market-data", optional = true }
 melin-protocol = { path = "../protocol" }
 blake3 = "1"
@@ -96,7 +96,7 @@ io-uring = "0.7"
 # replaces hand-rolled extend_from_slice / try_into chains. derive
 # feature for `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-dpdk = { path = "../dpdk", optional = true }
+melin-dpdk = { path = "../../core/dpdk", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

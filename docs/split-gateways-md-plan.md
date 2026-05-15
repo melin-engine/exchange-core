@@ -2,16 +2,16 @@
 
 ## Context
 
-Melin needs a TUI trading client that shows an order book, price candles, active orders, and balances, and lets a trader place/cancel orders. Order entry is already solved — `crates/tui/` connects via `crates/client/` and places orders today, and `crates/fix-gateway/` translates FIX 4.2 `NewOrderSingle`/`OrderCancelRequest`/`OrderCancelReplace` to melin requests. Everything else is missing:
+Melin needs a TUI trading client that shows an order book, price candles, active orders, and balances, and lets a trader place/cancel orders. Order entry is already solved — `crates/exchange/tui/` connects via `crates/exchange/client/` and places orders today, and `crates/exchange/fix-gateway/` translates FIX 4.2 `NewOrderSingle`/`OrderCancelRequest`/`OrderCancelReplace` to melin requests. Everything else is missing:
 
 - No protocol message for "give me the current order book"
 - No protocol message for "give me active orders for this account"
 - No protocol message for "give me balances for this account"
 - No persistent trade history or candles
-- No market-data subscription in the FIX gateway (`MarketDataRequest (V)` rejected by the catch-all at `crates/fix-gateway/src/session.rs:640`)
+- No market-data subscription in the FIX gateway (`MarketDataRequest (V)` rejected by the catch-all at `crates/exchange/fix-gateway/src/session.rs:640`)
 - No cross-session shared state in the gateway — each FIX session has its own melin TCP connection, no book mirror, no firehose subscription
 
-The architecturally correct place for book mirrors, position queries, and market-data fan-out is **not** the matching engine (whose hot path must stay at ~100 ns/order for the 10M orders/sec target) but a gateway layer that consumes the existing `event_publisher` firehose (`crates/server/src/event_publisher.rs`) and serves queries from cache. FIX 4.4 covers every feature we need as standard application messages (`V`/`W`/`X`/`Y`/`H`/`AF`/`AN`/`AP`/`x`/`y`), so no custom protocol work is needed on the client-facing side.
+The architecturally correct place for book mirrors, position queries, and market-data fan-out is **not** the matching engine (whose hot path must stay at ~100 ns/order for the 10M orders/sec target) but a gateway layer that consumes the existing `event_publisher` firehose (`crates/exchange/server/src/event_publisher.rs`) and serves queries from cache. FIX 4.4 covers every feature we need as standard application messages (`V`/`W`/`X`/`Y`/`H`/`AF`/`AN`/`AP`/`x`/`y`), so no custom protocol work is needed on the client-facing side.
 
 **Scope decisions already made with the user**:
 - **Full design, executed in slices with review gates between phases.**
@@ -79,7 +79,7 @@ crates/
 │  engine pipeline                                            │
 │  ├─ Phase 0: ExecutionReport gains symbol + account on      │
 │  │   every per-order variant (clean break, no wrapper).     │
-│  └─ event_publisher (crates/server/src/event_publisher.rs)  │
+│  └─ event_publisher (crates/exchange/server/src/event_publisher.rs)  │
 │      Phase 3 adds a post-ServerReady SubscribeWithSnapshot  │
 │      handshake: server streams book snapshot + trade rings, │
 │      then resumes firehose. Server seeds its own authoritative│
@@ -137,9 +137,9 @@ FIX clients needing both roles open **two sessions** (one per gateway), with dis
 
 ## Phase 0 — ExecutionReport normalization (symbol + account)
 
-`ExecutionReport` variants (`crates/engine/src/types.rs:264-318`) are missing context inconsistently: `Placed`/`Triggered`/`Replaced` carry neither symbol nor account; `Fill` has accounts but no symbol; `Cancelled`/`Rejected` have account but no symbol. An out-of-process book mirror can't apply events without the symbol, and per-account query features (Phase 7) need the account on every event that could belong to a trader's ledger.
+`ExecutionReport` variants (`crates/exchange/engine/src/types.rs:264-318`) are missing context inconsistently: `Placed`/`Triggered`/`Replaced` carry neither symbol nor account; `Fill` has accounts but no symbol; `Cancelled`/`Rejected` have account but no symbol. An out-of-process book mirror can't apply events without the symbol, and per-account query features (Phase 7) need the account on every event that could belong to a trader's ledger.
 
-**Clean break, no retrocompatibility.** Every per-order variant gains `symbol: Symbol`; `Placed`/`Triggered`/`Replaced` gain `account: AccountId`. `Fill` already has `maker_account`/`taker_account`, just add symbol. `InstrumentStatusChanged` already has symbol, no account applicable. The matching stage has both values in scope at every emit site (~10 call sites in `crates/engine/src/journal/pipeline.rs` around lines 1765-1834).
+**Clean break, no retrocompatibility.** Every per-order variant gains `symbol: Symbol`; `Placed`/`Triggered`/`Replaced` gain `account: AccountId`. `Fill` already has `maker_account`/`taker_account`, just add symbol. `InstrumentStatusChanged` already has symbol, no account applicable. The matching stage has both values in scope at every emit site (~10 call sites in `crates/exchange/engine/src/journal/pipeline.rs` around lines 1765-1834).
 
 Final shape:
 
@@ -155,17 +155,17 @@ Replaced          { order_id, symbol, account, side, old_price, new_price,
 InstrumentStatusChanged { symbol, status }
 ```
 
-**Files**: `crates/engine/src/types.rs`, `crates/engine/src/journal/pipeline.rs`, `crates/engine/src/exchange.rs` + `crates/engine/src/orderbook.rs` (any helpers building reports), `crates/protocol/src/message.rs`, `crates/protocol/src/codec.rs`, `crates/server/src/event_publisher.rs:46` (`payload_to_response`), `crates/fix-gateway/src/session.rs:757+` (soon-to-be-renamed — still a consumer here), `crates/client/src/lib.rs`, `crates/bench/`, `crates/tui/`, `crates/admin/`.
+**Files**: `crates/exchange/engine/src/types.rs`, `crates/exchange/engine/src/journal/pipeline.rs`, `crates/exchange/engine/src/exchange.rs` + `crates/exchange/engine/src/orderbook.rs` (any helpers building reports), `crates/exchange/protocol/src/message.rs`, `crates/exchange/protocol/src/codec.rs`, `crates/exchange/server/src/event_publisher.rs:46` (`payload_to_response`), `crates/exchange/fix-gateway/src/session.rs:757+` (soon-to-be-renamed — still a consumer here), `crates/exchange/client/src/lib.rs`, `crates/exchange/bench/`, `crates/exchange/tui/`, `crates/exchange/admin/`.
 
 **Verification**: `cargo check` across the whole workspace (all `ExecutionReport` consumers must compile). `cargo test -p melin-engine -p melin-protocol -p melin-fix-gateway`. A fixture test that records a sequence of engine events and asserts each emitted report carries the symbol and account the matcher was working on at emission.
 
-## Phase 1 — `crates/gateway-core/` + rename fix-gateway → oe-gateway
+## Phase 1 — `crates/exchange/gateway-core/` + rename fix-gateway → oe-gateway
 
 Structural refactor with no behavior change. Two mechanical steps, one commit each:
 
-### 1a. Rename `crates/fix-gateway/` → `crates/oe-gateway/`
+### 1a. Rename `crates/exchange/fix-gateway/` → `crates/exchange/oe-gateway/`
 
-- `git mv crates/fix-gateway crates/oe-gateway`
+- `git mv crates/exchange/fix-gateway crates/exchange/oe-gateway`
 - Update `Cargo.toml` package name `melin-fix-gateway` → `melin-oe-gateway`
 - Update workspace `Cargo.toml` member list
 - Update any `-p melin-fix-gateway` in scripts / CI / docs
@@ -173,14 +173,14 @@ Structural refactor with no behavior change. Two mechanical steps, one commit ea
 
 **Verification**: `cargo check -p melin-oe-gateway`, `cargo test -p melin-oe-gateway`, `cargo check --workspace`.
 
-### 1b. Extract `crates/gateway-core/`
+### 1b. Extract `crates/exchange/gateway-core/`
 
 Move to `gateway-core`:
-- `crates/oe-gateway/src/fix/parse.rs` → `crates/gateway-core/src/fix/parse.rs`
-- `crates/oe-gateway/src/fix/serialize.rs` → `crates/gateway-core/src/fix/serialize.rs`
-- `crates/oe-gateway/src/fix/tags.rs` → `crates/gateway-core/src/fix/tags.rs`
-- Session-layer message handling from `crates/oe-gateway/src/session.rs` (Logon at 258-358, Heartbeat at 587, TestRequest at 589-595, SequenceReset at 539-548, Logout at 597-600, ResendRequest at 602-617, sequence numbers at 550-580, replay buffer at 124-143) → a new `SessionCore` struct in `crates/gateway-core/src/session/core.rs`
-- Ed25519 auth helpers → `crates/gateway-core/src/auth.rs`
+- `crates/exchange/oe-gateway/src/fix/parse.rs` → `crates/exchange/gateway-core/src/fix/parse.rs`
+- `crates/exchange/oe-gateway/src/fix/serialize.rs` → `crates/exchange/gateway-core/src/fix/serialize.rs`
+- `crates/exchange/oe-gateway/src/fix/tags.rs` → `crates/exchange/gateway-core/src/fix/tags.rs`
+- Session-layer message handling from `crates/exchange/oe-gateway/src/session.rs` (Logon at 258-358, Heartbeat at 587, TestRequest at 589-595, SequenceReset at 539-548, Logout at 597-600, ResendRequest at 602-617, sequence numbers at 550-580, replay buffer at 124-143) → a new `SessionCore` struct in `crates/exchange/gateway-core/src/session/core.rs`
+- Ed25519 auth helpers → `crates/exchange/gateway-core/src/auth.rs`
 
 Define in `gateway-core`:
 ```rust
@@ -212,7 +212,7 @@ impl SessionCore {
 
 No io_uring primitives in `gateway-core` — the two gateways have different I/O shapes and will each own their own `event_loop.rs`.
 
-**Files**: new crate `crates/gateway-core/`, oe-gateway imports updated, workspace `Cargo.toml` updated.
+**Files**: new crate `crates/exchange/gateway-core/`, oe-gateway imports updated, workspace `Cargo.toml` updated.
 
 **Verification**: `cargo check -p melin-gateway-core -p melin-oe-gateway`, all existing oe-gateway tests still green. No runtime behavior change — this is a pure refactor.
 
@@ -220,7 +220,7 @@ No io_uring primitives in `gateway-core` — the two gateways have different I/O
 
 Do the version bump **now**, before any new FIX message handlers are written. This way all new code (Phases 3-8) is authored against FIX 4.4 from the start — no porting, no version-conditional logic.
 
-Touches `crates/gateway-core/src/fix/`:
+Touches `crates/exchange/gateway-core/src/fix/`:
 - `BeginString` changes from `FIX.4.2` to `FIX.4.4` (`serialize.rs`, `parse.rs` header validation)
 - Tag set audit — FIX 4.4 makes a few tags optional that were required in 4.2 (`HandlInst (21)`) and vice versa. Mostly compatible at the code we care about.
 - MsgType constants remain the same bytes (`D`, `F`, `G`, `8`, `0`, `A`, etc.)
@@ -231,12 +231,12 @@ Single commit. Both `oe-gateway` and any future `md-gateway` inherit 4.4 via `ga
 
 **Verification**: `cargo test -p melin-gateway-core -p melin-oe-gateway`. Optional interop test with quickfix-python using a standard FIX 4.4 DataDictionary against the oe-gateway for existing order-entry messages.
 
-## Phase 3 — `crates/market-data/` crate (library only)
+## Phase 3 — `crates/exchange/market-data/` crate (library only)
 
 Pure library crate, no I/O, no server, no gateway. Defines the data types and unit-tested update logic that both the server-side mirror (Phase 3) and the client-side `MarketDataCore` (Phase 4) will reuse.
 
 ```
-crates/market-data/
+crates/exchange/market-data/
 ├── Cargo.toml                 (depends on melin-engine for types, no tokio, no nix)
 └── src/
     ├── lib.rs
@@ -268,13 +268,13 @@ crates/market-data/
 
 **No threading, no channels, no I/O** at this phase — just data + pure functions. `MarketDataCore` (the stateful consumer + fan-out loop) is introduced in Phase 4.
 
-**Verification**: `crates/market-data/tests/` unit tests — replay a recorded fixture of `ExecutionReport` sequences against the mirror, assert book state matches an expected reference. Property test via `proptest` — generate random event sequences, apply to both a naive reference book and `BookMirror`, assert equivalence after each event. This is the single most important test in the plan; mirror divergence bugs would otherwise only surface at integration time.
+**Verification**: `crates/exchange/market-data/tests/` unit tests — replay a recorded fixture of `ExecutionReport` sequences against the mirror, assert book state matches an expected reference. Property test via `proptest` — generate random event sequences, apply to both a naive reference book and `BookMirror`, assert equivalence after each event. This is the single most important test in the plan; mirror divergence bugs would otherwise only surface at integration time.
 
 ## Phase 4 — Server-side event_publisher uses BookMirror + SubscribeWithSnapshot
 
-With `market-data::BookMirror` in place, the server-side event publisher seeds an authoritative mirror at boot from `Exchange::snapshot_state()` (`crates/engine/src/journal/snapshot.rs:1130`, read-only, boot-only — never touches the matching thread post-boot), then applies every `OutputPayload::Report` (now carrying symbol per Phase 0) on its way to subscribers.
+With `market-data::BookMirror` in place, the server-side event publisher seeds an authoritative mirror at boot from `Exchange::snapshot_state()` (`crates/exchange/engine/src/journal/snapshot.rs:1130`, read-only, boot-only — never touches the matching thread post-boot), then applies every `OutputPayload::Report` (now carrying symbol per Phase 0) on its way to subscribers.
 
-**New subscription handshake** in `crates/server/src/event_publisher.rs`: after `ServerReady`, the subscriber sends a `SubscribeRequest { symbols: Vec<Symbol>, include_trades: bool }` frame. No legacy mode — every subscriber goes through this handshake. Existing subscribers (tests, analytics) are updated to send it. The publisher serializes the matching book mirror state as:
+**New subscription handshake** in `crates/exchange/server/src/event_publisher.rs`: after `ServerReady`, the subscriber sends a `SubscribeRequest { symbols: Vec<Symbol>, include_trades: bool }` frame. No legacy mode — every subscriber goes through this handshake. Existing subscribers (tests, analytics) are updated to send it. The publisher serializes the matching book mirror state as:
 
 ```
 0x82 BookSnapshotBegin { symbol, last_applied_seq }
@@ -290,15 +290,15 @@ Then resume the firehose, frame sequence = `last_applied_seq + 1`, no gaps (guar
 
 **Background reconciliation**: every 60s the publisher diffs its live mirror against a fresh `Exchange::snapshot_state()` capture; any divergence increments `book_mirror_divergence_total` and logs the offending symbol. Early-warning signal for mirror bugs.
 
-**Files**: `crates/server/src/event_publisher.rs` (+300 LOC), `crates/engine/src/exchange.rs` (expose a lighter `snapshot_books_only()` if the full snapshot is too heavy at boot).
+**Files**: `crates/exchange/server/src/event_publisher.rs` (+300 LOC), `crates/exchange/engine/src/exchange.rs` (expose a lighter `snapshot_books_only()` if the full snapshot is too heavy at boot).
 
-**Verification**: new integration test `crates/server/tests/subscribe_with_snapshot.rs` — boots engine + publisher with seeded resting orders, connects in subscribe mode, asserts returned snapshot frames match an expected reference. Feeds one new fill via a test client, asserts the follow-up `Report { symbol, report }` frame arrives and the mirror's state reflects the fill.
+**Verification**: new integration test `crates/exchange/server/tests/subscribe_with_snapshot.rs` — boots engine + publisher with seeded resting orders, connects in subscribe mode, asserts returned snapshot frames match an expected reference. Feeds one new fill via a test client, asserts the follow-up `Report { symbol, report }` frame arrives and the mirror's state reflects the fill.
 
 ## Phase 5 — MarketDataCore consumer loop + fan-out
 
-Extends `crates/market-data/` with the stateful client-side consumer: the component `md-gateway` instantiates to connect to the server's event publisher, drive the subscribe handshake, maintain its own `BookMirror` from snapshot frames + firehose events, and fan out to downstream subscribers.
+Extends `crates/exchange/market-data/` with the stateful client-side consumer: the component `md-gateway` instantiates to connect to the server's event publisher, drive the subscribe handshake, maintain its own `BookMirror` from snapshot frames + firehose events, and fan out to downstream subscribers.
 
-New files in `crates/market-data/src/`:
+New files in `crates/exchange/market-data/src/`:
 
 ```
 ├── core.rs                (MarketDataCore::run — consumer loop + fan-out)
@@ -315,19 +315,19 @@ New files in `crates/market-data/src/`:
 6. Apply every inbound firehose `Report { symbol, report }` frame to the mirror, collect dirty levels per symbol, fan out to subscribing sessions
 7. Drain command channel for `MdCommand::{Subscribe, Unsubscribe, Reject}`
 
-**Threading**: `MarketDataCore` runs on its **own dedicated OS thread**. Justifications: the firehose is bursty and independent of consumer I/O; fan-out shouldn't share a critical path with it; a second thread with a wakeup eventfd is strictly simpler than multiplexing two upstream protocols on one ring. This thread lives inside `md-gateway`, but the code is reusable from any binary that links `crates/market-data/`.
+**Threading**: `MarketDataCore` runs on its **own dedicated OS thread**. Justifications: the firehose is bursty and independent of consumer I/O; fan-out shouldn't share a critical path with it; a second thread with a wakeup eventfd is strictly simpler than multiplexing two upstream protocols on one ring. This thread lives inside `md-gateway`, but the code is reusable from any binary that links `crates/exchange/market-data/`.
 
 **Fan-out**: per-subscriber `Arc<ArrayQueue<MdOutput, 1024>>`. On push failure the subscription is dropped — the core sends `MdCommand::Reject` and removes it from its fan-out table. The consumer of the queue (md-gateway session in Phase 5) translates the reject to `MarketDataRequestReject` with `MDReqRejReason=0`. The core itself never blocks on fan-out.
 
 **Reconnect**: on firehose disconnect the core drops its mirror, reconnects, re-handshakes, re-snapshots. All active subscriptions get re-emitted `MdOutput::Snapshot` after sync completes; downstream consumers translate to fresh `MarketDataSnapshotFullRefresh` without needing a FIX-level session disconnect.
 
-**Verification**: `crates/market-data/tests/core_test.rs` — stub the event-publisher endpoint with a scripted fixture stream, subscribe via `MarketDataCore`, replay N events, assert the emitted `MdOutput` sequence matches expected. Integration test against a real Phase 3 server+publisher: boot both, subscribe, drive order flow, verify mirror consistency.
+**Verification**: `crates/exchange/market-data/tests/core_test.rs` — stub the event-publisher endpoint with a scripted fixture stream, subscribe via `MarketDataCore`, replay N events, assert the emitted `MdOutput` sequence matches expected. Integration test against a real Phase 3 server+publisher: boot both, subscribe, drive order flow, verify mirror consistency.
 
-## Phase 6 — `crates/md-gateway/` binary: V / W / Y
+## Phase 6 — `crates/exchange/md-gateway/` binary: V / W / Y
 
 New binary. Starts as a minimal FIX 4.4 listener that delegates session-layer messages to `gateway-core::SessionCore`, spawns a `MarketDataCore` thread on startup, and implements `MessageDispatcher` for `MarketDataRequest`, `MarketDataSnapshotFullRefresh` output, and `MarketDataRequestReject`. No incremental refresh yet (Phase 6), no query messages yet (oe-gateway Phase 7).
 
-**Files (new)**: `crates/md-gateway/Cargo.toml`, `src/main.rs`, `src/event_loop.rs`, `src/session.rs` (`MdSession`), `src/translate.rs`, `src/config.rs`.
+**Files (new)**: `crates/exchange/md-gateway/Cargo.toml`, `src/main.rs`, `src/event_loop.rs`, `src/session.rs` (`MdSession`), `src/translate.rs`, `src/config.rs`.
 
 **Event loop**: registers a TCP listener for FIX 4.4 connections. On accept, runs Logon via `SessionCore`, creates an `MdSession`. Registers the `MarketDataCore` wakeup eventfd with io_uring using multishot `OP_READ`. On eventfd wakeup, iterates active MdSessions, drains each session's `ArrayQueue<MdOutput>`, dispatches to `MdSession::handle_md_output`.
 
@@ -343,9 +343,9 @@ New binary. Starts as a minimal FIX 4.4 listener that delegates session-layer me
 
 **`handle_market_data_request`** (~60 LOC): parses `MDReqID (262)`, `SubscriptionRequestType (263)` ∈ {0=snapshot, 1=subscribe, 2=unsubscribe}, `MarketDepth (264)`, `MDUpdateType (265)` ∈ {0,1}, iterates the `NoRelatedSym (146)` group collecting `Symbol (55)`. Validates symbols, unknown → `MarketDataRequestReject` with `MDReqRejReason=1`. On success, pushes `MdCommand::Subscribe { session_slot, mdreq_id, symbols, depth, incremental, include_trades }` via the crossbeam channel.
 
-**New tags** in `crates/gateway-core/src/fix/tags.rs`: `MDReqID (262)`, `SubscriptionRequestType (263)`, `MarketDepth (264)`, `MDUpdateType (265)`, `MDEntryType (269)`, `MDEntryPx (270)`, `MDEntrySize (271)`, `NoMDEntries (268)`, `NoRelatedSym (146)`, `MDUpdateAction (279)`, `NumberOfOrders (346)`. MsgType constants `MSG_MARKET_DATA_REQUEST = b"V"`, `MSG_MD_SNAPSHOT = b"W"`, `MSG_MD_INCREMENTAL = b"X"`, `MSG_MD_REQUEST_REJECT = b"Y"`. Shared with oe-gateway even though oe-gateway doesn't emit them — keeps tag table single-source.
+**New tags** in `crates/exchange/gateway-core/src/fix/tags.rs`: `MDReqID (262)`, `SubscriptionRequestType (263)`, `MarketDepth (264)`, `MDUpdateType (265)`, `MDEntryType (269)`, `MDEntryPx (270)`, `MDEntrySize (271)`, `NoMDEntries (268)`, `NoRelatedSym (146)`, `MDUpdateAction (279)`, `NumberOfOrders (346)`. MsgType constants `MSG_MARKET_DATA_REQUEST = b"V"`, `MSG_MD_SNAPSHOT = b"W"`, `MSG_MD_INCREMENTAL = b"X"`, `MSG_MD_REQUEST_REJECT = b"Y"`. Shared with oe-gateway even though oe-gateway doesn't emit them — keeps tag table single-source.
 
-**New helpers** in `crates/md-gateway/src/translate.rs`: `md_snapshot_to_fix` (~80 LOC), `md_request_reject` (~20 LOC).
+**New helpers** in `crates/exchange/md-gateway/src/translate.rs`: `md_snapshot_to_fix` (~80 LOC), `md_request_reject` (~20 LOC).
 
 **Verification**: end-to-end manual test. A scripted FIX client sends `Logon` + `MarketDataRequest` for BTCUSD, asserts it receives a `W` message with the expected top-10 levels within 100 ms of the gateway's firehose receiving the snapshot frames. Also a first integration test covering Phase 3+4+5 end-to-end: bench running, md-gateway serving, test client asserts monotonic book state as fills arrive.
 
@@ -367,12 +367,12 @@ New binary. Starts as a minimal FIX 4.4 listener that delegates session-layer me
 
 ## Phase 8 — oe-gateway: H, AF, AN, AP + Request::QueryPosition
 
-### New protocol message in `crates/protocol/`
+### New protocol message in `crates/exchange/protocol/`
 
 - `Request::QueryPosition { account: AccountId }`
 - `Response::PositionSnapshot { account, balances: SmallVec<[(Currency, u64 /*free*/, u64 /*reserved*/); 8]> }`
-- Codec additions in `crates/protocol/src/codec.rs`
-- Server handler in `crates/server/src/request.rs` routing to the engine via the existing input disruptor path, mirroring how `Request::QueryStats` is handled today
+- Codec additions in `crates/exchange/protocol/src/codec.rs`
+- Server handler in `crates/exchange/server/src/request.rs` routing to the engine via the existing input disruptor path, mirroring how `Request::QueryStats` is handled today
 - Matching-stage handler reads `Exchange::accounts[account].balances` (read-only, one-shot, O(currencies)); serializes into `OutputPayload::PositionSnapshot` and returns. Cap at 64 currencies per response to keep the hot-path cost bounded.
 
 ### OrderStatusRequest (H) and OrderMassStatusRequest (AF)
@@ -393,9 +393,9 @@ Dispatch case in `oe-gateway/src/session.rs` (~30 LOC): parse `PosReqID (710)`, 
 
 ## Phase 9 — TUI as FIX 4.4 client (two sessions)
 
-**New crate** `crates/tui-fix-client/` — distinct from the existing `crates/tui/` (which talks to melin directly via `melin-client`). The old `crates/tui/` can be retired once feature parity is reached, or kept as a developer smoke-test client.
+**New crate** `crates/exchange/tui-fix-client/` — distinct from the existing `crates/exchange/tui/` (which talks to melin directly via `melin-client`). The old `crates/exchange/tui/` can be retired once feature parity is reached, or kept as a developer smoke-test client.
 
-Stack: `crossterm` + `ratatui`. Uses `crates/gateway-core/src/fix/{parse,serialize}.rs` for Tag=Value codec. Wraps them in a simple blocking TCP client.
+Stack: `crossterm` + `ratatui`. Uses `crates/exchange/gateway-core/src/fix/{parse,serialize}.rs` for Tag=Value codec. Wraps them in a simple blocking TCP client.
 
 **Two FIX sessions**:
 - **MD session** to `md-gateway` — sends `MarketDataRequest`, `SecurityListRequest`; consumes `SecurityList`, `MarketDataSnapshotFullRefresh`, `MarketDataIncrementalRefresh`
@@ -418,22 +418,22 @@ Stack: `crossterm` + `ratatui`. Uses `crates/gateway-core/src/fix/{parse,seriali
 
 | Path | Role | Phase |
 |---|---|---|
-| `crates/engine/src/types.rs:264` | `ExecutionReport` enum — gains `symbol` + `account` | 0 |
-| `crates/engine/src/journal/pipeline.rs` | ~10 emit sites updated | 0 |
-| `crates/protocol/src/message.rs` | Updated destructure shape; later `QueryPosition`/`PositionSnapshot` | 0, 8 |
-| `crates/protocol/src/codec.rs` | Wire encoding updates | 0, 8 |
-| `crates/server/src/event_publisher.rs` | Phase 0: `payload_to_response`; Phase 4: SubscribeWithSnapshot, BookMirror, reconciliation | 0, 4 |
-| `crates/fix-gateway/` → `crates/oe-gateway/` | Rename + imports | 1 |
-| `crates/gateway-core/` (new) | FIX parse/serialize/tags, `SessionCore`, `MessageDispatcher`, auth | 1 |
-| `crates/gateway-core/src/fix/{serialize,parse}.rs` | FIX 4.4 BeginString | 2 |
-| `crates/market-data/` (new) | `BookMirror`, `OrderIndex`, `TradeRing` (Phase 3); `MarketDataCore`, `cold_start` (Phase 5) | 3, 5 |
-| `crates/engine/src/journal/snapshot.rs:1130` | `Exchange::snapshot_state()` — mirror boot seeding | 4 |
-| `crates/md-gateway/` (new) | MD-role binary, `MdSession`, V/W/Y handlers (Phase 6), X/x/y handlers (Phase 7) | 6, 7 |
-| `crates/oe-gateway/src/session.rs` | `OeSession`: `order_ledger`, `pending_positions`, H/AF/AN handlers | 8 |
-| `crates/oe-gateway/src/translate.rs` | `order_status_report`, `order_mass_status`, `position_report_to_fix` | 8 |
-| `crates/server/src/request.rs` | `QueryPosition` server-side handler | 8 |
-| `crates/gateway-core/src/fix/tags.rs` | New FIX 4.4 tag constants (shared) | 6, 7, 8 |
-| `crates/tui-fix-client/` (new) | TUI speaking FIX 4.4 to both gateways | 9 |
+| `crates/exchange/engine/src/types.rs:264` | `ExecutionReport` enum — gains `symbol` + `account` | 0 |
+| `crates/exchange/engine/src/journal/pipeline.rs` | ~10 emit sites updated | 0 |
+| `crates/exchange/protocol/src/message.rs` | Updated destructure shape; later `QueryPosition`/`PositionSnapshot` | 0, 8 |
+| `crates/exchange/protocol/src/codec.rs` | Wire encoding updates | 0, 8 |
+| `crates/exchange/server/src/event_publisher.rs` | Phase 0: `payload_to_response`; Phase 4: SubscribeWithSnapshot, BookMirror, reconciliation | 0, 4 |
+| `crates/exchange/fix-gateway/` → `crates/exchange/oe-gateway/` | Rename + imports | 1 |
+| `crates/exchange/gateway-core/` (new) | FIX parse/serialize/tags, `SessionCore`, `MessageDispatcher`, auth | 1 |
+| `crates/exchange/gateway-core/src/fix/{serialize,parse}.rs` | FIX 4.4 BeginString | 2 |
+| `crates/exchange/market-data/` (new) | `BookMirror`, `OrderIndex`, `TradeRing` (Phase 3); `MarketDataCore`, `cold_start` (Phase 5) | 3, 5 |
+| `crates/exchange/engine/src/journal/snapshot.rs:1130` | `Exchange::snapshot_state()` — mirror boot seeding | 4 |
+| `crates/exchange/md-gateway/` (new) | MD-role binary, `MdSession`, V/W/Y handlers (Phase 6), X/x/y handlers (Phase 7) | 6, 7 |
+| `crates/exchange/oe-gateway/src/session.rs` | `OeSession`: `order_ledger`, `pending_positions`, H/AF/AN handlers | 8 |
+| `crates/exchange/oe-gateway/src/translate.rs` | `order_status_report`, `order_mass_status`, `position_report_to_fix` | 8 |
+| `crates/exchange/server/src/request.rs` | `QueryPosition` server-side handler | 8 |
+| `crates/exchange/gateway-core/src/fix/tags.rs` | New FIX 4.4 tag constants (shared) | 6, 7, 8 |
+| `crates/exchange/tui-fix-client/` (new) | TUI speaking FIX 4.4 to both gateways | 9 |
 
 ## Verification strategy
 

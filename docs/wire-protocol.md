@@ -731,9 +731,9 @@ Frame (37 bytes total):
 
 ## Source Files
 
-- `crates/protocol/src/codec.rs` -- encode/decode functions, tag constants, field layouts
-- `crates/protocol/src/message.rs` -- `Request` and `ResponseKind` enum definitions
-- `crates/protocol/src/blocking.rs` -- `BlockingFrameReader`/`BlockingFrameWriter`, length-prefixed framing
-- `crates/protocol/src/auth.rs` -- `Permission` enum, `AuthorizedKeys` file loader
-- `crates/server/src/server.rs` -- authentication handshake implementation (`authenticate_connection`)
-- `crates/engine/src/le.rs` -- shared little-endian helpers and enum encoding (Side, TimeInForce, SelfTradeProtection)
+- `crates/exchange/protocol/src/codec.rs` -- encode/decode functions, tag constants, field layouts
+- `crates/exchange/protocol/src/message.rs` -- `Request` and `ResponseKind` enum definitions
+- `crates/exchange/protocol/src/blocking.rs` -- `BlockingFrameReader`/`BlockingFrameWriter`, length-prefixed framing
+- `crates/exchange/protocol/src/auth.rs` -- `Permission` enum, `AuthorizedKeys` file loader
+- `crates/exchange/server/src/server.rs` -- authentication handshake implementation (`authenticate_connection`)
+- `crates/exchange/engine/src/le.rs` -- shared little-endian helpers and enum encoding (Side, TimeInForce, SelfTradeProtection)

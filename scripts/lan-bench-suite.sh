@@ -1699,7 +1699,7 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
     echo "============================================================"
     echo ""
 
-    if command -v cargo &>/dev/null && [[ -f "${SCRIPT_DIR}/../crates/bench/src/plot.rs" ]]; then
+    if command -v cargo &>/dev/null && [[ -f "${SCRIPT_DIR}/../crates/exchange/bench/src/plot.rs" ]]; then
         # Plots land alongside the run's JSON files first so each results
         # directory is self-contained — two runs kept in /tmp can be
         # compared visually without the in-tree copies overwriting each

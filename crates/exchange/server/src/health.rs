@@ -1328,7 +1328,7 @@ mod tests {
         // The global registry is shared across tests; we use a unique
         // stage name to avoid collisions with concurrent test runs.
         // Recorder dropped before the snapshot fetch — see the
-        // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
+        // SyncHistogram caveat in `crates/core/journal/src/trace.rs` tests.
         {
             let mut rec =
                 melin_transport_core::trace::register_stage("test::stats_dump_emit_marker");
@@ -1358,7 +1358,7 @@ mod tests {
         // on: every non-comment body line is exactly 9 tab-separated
         // fields — `stage`, name, then 7 numeric percentile fields.
         // Recorder dropped before the snapshot fetch — see the
-        // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
+        // SyncHistogram caveat in `crates/core/journal/src/trace.rs` tests.
         {
             let mut rec =
                 melin_transport_core::trace::register_stage("test::stats_dump_line_format_marker");

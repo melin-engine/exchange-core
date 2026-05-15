@@ -1,6 +1,6 @@
 # Matching Engine
 
-This document describes the matching engine's order types, matching algorithm, and execution semantics. All types referenced below are defined in `crates/engine/src/types.rs`, with matching logic in `crates/engine/src/orderbook.rs` and multi-instrument dispatch in `crates/engine/src/exchange.rs`.
+This document describes the matching engine's order types, matching algorithm, and execution semantics. All types referenced below are defined in `crates/exchange/engine/src/types.rs`, with matching logic in `crates/exchange/engine/src/orderbook.rs` and multi-instrument dispatch in `crates/exchange/engine/src/exchange.rs`.
 
 ---
 

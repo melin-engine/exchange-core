@@ -176,7 +176,7 @@ The matching stage maintains a per-instance `last_drain_ns` watermark. At the he
 
 ## Input Disruptor
 
-The input disruptor is a multi-producer, multi-consumer ring buffer defined in `crates/disruptor/src/ring.rs`.
+The input disruptor is a multi-producer, multi-consumer ring buffer defined in `crates/core/disruptor/src/ring.rs`.
 
 **Capacity**: `INPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). At approximately 72 bytes per `InputSlot`, this is roughly 72 MiB -- sized to fit in L3 cache on modern server CPUs. Provides approximately 100 ms of buffering at 10M orders/sec, enough headroom for fsync stalls without backpressure reaching the readers.
 
@@ -207,7 +207,7 @@ Because the journal and matching consumers are gated only on the producer, they 
 
 ## Journal Stage
 
-Defined in `crates/engine/src/journal/pipeline.rs` as `JournalStage`.
+Defined in `crates/exchange/engine/src/journal/pipeline.rs` as `JournalStage`.
 
 The journal stage runs on a dedicated OS thread and is responsible for making every event durable before it can be acknowledged to clients. It uses `read_batch` + `commit` (not `consume_batch`) to decouple reading from cursor advancement -- the cursor is advanced only **after** the durable write completes.
 
@@ -241,7 +241,7 @@ On shutdown, the journal stage flushes any pending data, then drains all remaini
 
 ## Matching Stage
 
-Defined in `crates/engine/src/journal/pipeline.rs` as `MatchingStage`.
+Defined in `crates/exchange/engine/src/journal/pipeline.rs` as `MatchingStage`.
 
 The matching stage runs on a dedicated OS thread and is the only thread that mutates the `Exchange` state. This single-writer design eliminates all locks on the hot path.
 
@@ -270,7 +270,7 @@ Same adaptive spinning as the journal stage: 1,000 spin loops, then `yield_now()
 
 ## Response Stage
 
-Defined in `crates/server/src/response.rs` (io_uring-based SEND).
+Defined in `crates/exchange/server/src/response.rs` (io_uring-based SEND).
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
@@ -314,7 +314,7 @@ When the SPSC is empty (idle period), the response stage scans connections for h
 
 ## Output SPSC
 
-The output SPSC queue connects the matching stage to the response stage. Defined in `crates/disruptor/src/spsc.rs`.
+The output SPSC queue connects the matching stage to the response stage. Defined in `crates/core/disruptor/src/spsc.rs`.
 
 **Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce multiple output messages (e.g., a market order sweeping many price levels produces one `Fill` per level plus a `BatchEnd`).
 
@@ -406,9 +406,9 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/engine/src/journal/pipeline.rs` |
-| `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/engine/src/journal/pipeline.rs` |
-| `MAX_JOURNAL_BATCH` | `1024` | `crates/engine/src/journal/pipeline.rs` |
-| `MAX_BATCH` (response) | `1024` | `crates/server/src/response.rs` |
-| `MAX_RESPONSE_BUF` | `128` bytes | `crates/server/src/response.rs` |
-| `NUM_BUFFERS` | `2048` | `crates/server/src/reader.rs` (io_uring provided buffer pool) |
+| `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/exchange/engine/src/journal/pipeline.rs` |
+| `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/exchange/engine/src/journal/pipeline.rs` |
+| `MAX_JOURNAL_BATCH` | `1024` | `crates/exchange/engine/src/journal/pipeline.rs` |
+| `MAX_BATCH` (response) | `1024` | `crates/exchange/server/src/response.rs` |
+| `MAX_RESPONSE_BUF` | `128` bytes | `crates/exchange/server/src/response.rs` |
+| `NUM_BUFFERS` | `2048` | `crates/exchange/server/src/reader.rs` (io_uring provided buffer pool) |

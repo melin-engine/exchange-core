@@ -3,7 +3,7 @@
 //! Atomic counters incremented on the io_uring hot path; the
 //! `/metrics` endpoint thread reads them with relaxed ordering. Mirrors
 //! the hand-rolled, allocation-free pattern in
-//! `crates/server/src/replication/mod.rs::ReplicationMetrics` so the
+//! `crates/exchange/server/src/replication/mod.rs::ReplicationMetrics` so the
 //! gateway can expose itself in the same Prometheus text format
 //! without pulling in an external metrics crate.
 
@@ -111,7 +111,7 @@ impl GatewayMetrics {
 
 /// Spawn the `/metrics` endpoint thread. Returns the join handle.
 ///
-/// Mirrors the simpler subset of `crates/server/src/health.rs::spawn`:
+/// Mirrors the simpler subset of `crates/exchange/server/src/health.rs::spawn`:
 /// non-blocking accept loop, short read timeout to detect the GET
 /// request, single Prometheus body response, drop the connection.
 /// `shutdown` allows graceful exit.

@@ -17,7 +17,7 @@ The primary risks are:
 
 ### SEC-02: No connection limits or rate limiting (HIGH)
 
-**File**: `crates/server/src/server.rs:270-369`
+**File**: `crates/exchange/server/src/server.rs:270-369`
 
 The accept loop has no limit on concurrent connections, no per-IP rate limiting, and no backoff on repeated connection attempts. Authentication runs on the accept thread with a 5-second timeout per connection.
 
@@ -29,7 +29,7 @@ The accept loop has no limit on concurrent connections, no per-IP rate limiting,
 
 ### SEC-03: Unbounded order book growth (HIGH)
 
-**Files**: `crates/engine/src/orderbook.rs:225,233`, `crates/engine/src/account.rs:100`
+**Files**: `crates/exchange/engine/src/orderbook.rs:225,233`, `crates/exchange/engine/src/account.rs:100`
 
 No limit on resting orders, pending stops, or price levels per instrument. An attacker can place millions of limit orders at different prices, causing unbounded HashMap and BTreeMap growth.
 
@@ -46,7 +46,7 @@ No limit on resting orders, pending stops, or price levels per instrument. An at
 
 ### SEC-04: No order throttling (MEDIUM)
 
-**File**: `crates/engine/src/exchange.rs`
+**File**: `crates/exchange/engine/src/exchange.rs`
 
 No per-account or per-connection rate limiting on order submissions. A single client can flood the disruptor with orders at wire speed, starving other clients.
 
@@ -60,7 +60,7 @@ No per-account or per-connection rate limiting on order submissions. A single cl
 
 ### SEC-05: Journal disk exhaustion hangs the server (MEDIUM)
 
-**File**: `crates/engine/src/journal/writer.rs:265-275`
+**File**: `crates/exchange/engine/src/journal/writer.rs:265-275`
 
 When the journal disk fills, `posix_fallocate` returns ENOSPC. The error propagates to the journal stage, but there is no graceful degradation — the journal stage stops advancing its cursor, the response stage stops sending, and the server effectively hangs.
 
@@ -72,7 +72,7 @@ When the journal disk fills, `posix_fallocate` returns ENOSPC. The error propaga
 
 ### SEC-06: Disruptor backpressure spins at 100% CPU (MEDIUM)
 
-**File**: `crates/disruptor/src/ring.rs:216-223`
+**File**: `crates/core/disruptor/src/ring.rs:216-223`
 
 When the input ring buffer is full, `publish()` spins in a tight loop calling `std::hint::spin_loop()`. If the matching stage falls behind (e.g., processing a large stop cascade), the reader thread burns 100% CPU spinning.
 
@@ -84,7 +84,7 @@ When the input ring buffer is full, `publish()` spins in a tight loop calling `s
 
 ### SEC-07: Saturating arithmetic masks balance errors (MEDIUM)
 
-**File**: `crates/engine/src/account.rs:294,306-328,342-343`
+**File**: `crates/exchange/engine/src/account.rs:294,306-328,342-343`
 
 All balance operations use `saturating_add`/`saturating_sub`. While this prevents panics, it silently masks bugs that could create or destroy money. If a fill cost overflows u64 (clamped via `u64::try_from(cost).unwrap_or(u64::MAX)`), the subsequent `saturating_sub` silently zeros the balance.
 
@@ -96,7 +96,7 @@ All balance operations use `saturating_add`/`saturating_sub`. While this prevent
 
 ### SEC-08: No TLS — wire protocol in plaintext (MEDIUM)
 
-**Files**: `crates/protocol/src/tcp.rs`, `crates/protocol/src/blocking.rs`
+**Files**: `crates/exchange/protocol/src/tcp.rs`, `crates/exchange/protocol/src/blocking.rs`
 
 All traffic including auth signatures, order data, and fill reports is sent unencrypted over TCP. An attacker with network position can observe and tamper with traffic.
 
@@ -108,7 +108,7 @@ All traffic including auth signatures, order data, and fill reports is sent unen
 
 ### SEC-09: Snapshot file tampering — cross-invariant validation (MEDIUM)
 
-**Files**: `crates/engine/src/journal/snapshot.rs:418-571`
+**Files**: `crates/exchange/engine/src/journal/snapshot.rs:418-571`
 
 The OOM-via-large-count vector was closed (counts are now bounded against remaining buffer before `Vec::with_capacity`). Remaining issues:
 

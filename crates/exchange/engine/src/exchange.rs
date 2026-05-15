@@ -323,7 +323,7 @@ pub const DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT: u32 = 10_000;
 /// Default per-account sustained order rate (orders/sec) when no operator
 /// override is set. `0` = limiter disabled — engine library users not going
 /// through the `melin-server` CLI start unthrottled. The CLI applies its
-/// own non-zero default (see `--max-orders-per-second` in `crates/server`),
+/// own non-zero default (see `--max-orders-per-second` in `crates/exchange/server`),
 /// keeping production deployments protected while leaving in-process tests
 /// and embedded users unaffected. Same opt-out shape as the open-orders
 /// cap (which was switched to be on-by-default in SEC-03 because it has

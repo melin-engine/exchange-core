@@ -174,4 +174,4 @@ The journal stage's runtime path is determined by the variant:
 - `buffered` mode runs the synchronous write loop (pwrite + fdatasync).
 - `sector` mode runs the io_uring overlapped loop (async pwrite via `io_uring`, no fdatasync).
 
-If you're auditing whether durability is being enforced correctly, grep for `flush_batch_sync` in `crates/journal/src/buffered_writer.rs` (buffered) and `confirm_async_write` in `crates/journal/src/sector_writer.rs` (sector).
+If you're auditing whether durability is being enforced correctly, grep for `flush_batch_sync` in `crates/core/journal/src/buffered_writer.rs` (buffered) and `confirm_async_write` in `crates/core/journal/src/sector_writer.rs` (sector).

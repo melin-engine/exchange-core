@@ -11,7 +11,7 @@
 //! ```
 //! The sequence number is the output ring's monotonic sequence for gap
 //! detection by subscribers. The rest is the standard response codec
-//! from `crates/protocol/src/codec.rs`.
+//! from `crates/exchange/protocol/src/codec.rs`.
 //!
 //! Subscription protocol (after Ed25519 auth + ServerReady):
 //! 1. Client sends `Subscribe { symbols, count }` (count=0 → all symbols)

@@ -113,7 +113,7 @@ DPDK migrated alongside since both senders share the ring).**
 
 What's in it:
 
-- New `crates/transport-core/src/replication_wire.rs` module owns the
+- New `crates/core/transport-core/src/replication_wire.rs` module owns the
   `InputBatch` wire format: constants (`MSG_INPUT_BATCH = 0x21`,
   `SLOT_TAG_*`), one-shot `encode_input_batch` / `try_decode_input_batch`
   (used by catch-up paths), and a streaming triplet
