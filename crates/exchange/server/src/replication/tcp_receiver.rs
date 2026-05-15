@@ -190,6 +190,14 @@ fn replica_stream_uring(
     // next iteration after SEND completes.
     let mut last_sent_acked_seq: u64 = 0;
     let mut last_sent_in_memory_seq: u64 = 0;
+    // Highest primary_seq for which the corresponding slot has been
+    // committed to the local input ring (i.e. the producer cursor has
+    // advanced past it). The in-memory ack track must never report a
+    // value above this — doing so would expose a slot to the primary's
+    // response gate before it is visible to local consumers, breaking
+    // the durability guarantee the gate sells. Updated *after* every
+    // `batch.commit()`; asserted before every ack-send site below.
+    let mut last_committed_primary_seq: u64 = 0;
     let mut idle_spins: u32 = 0;
     // Submit initial multishot RECV. The kernel will produce CQEs
     // continuously until EOF, error, or buffer pool exhaustion.
@@ -234,13 +242,23 @@ fn replica_stream_uring(
                 let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                 if let Ok(slots) = try_decode_input_batch(payload) {
                     let mut batch = input_producer.batch();
+                    // Track the highest primary_seq pushed in this batch
+                    // locally; only publish to `*accum_end_sequence` after
+                    // `batch.commit()` so the in_memory ack track can
+                    // never name a slot that isn't yet visible to
+                    // consumers. The previous mid-batch write to
+                    // `*accum_end_sequence` was structurally unsound: an
+                    // early return between push and commit would leak a
+                    // forward-dated ack to the primary's response gate.
+                    let mut pending_accum = *accum_end_sequence;
                     for slot in slots {
                         let primary_seq = slot.sequence;
                         last_target = batch.push_with(|s| *s = slot);
-                        *accum_end_sequence = primary_seq;
+                        pending_accum = primary_seq;
                         any_published = true;
                     }
                     batch.commit();
+                    *accum_end_sequence = pending_accum;
                 }
                 cursor += 4 + frame_len;
             }
@@ -268,6 +286,12 @@ fn replica_stream_uring(
                 last_sent_in_memory_seq,
             )
         {
+            debug_assert!(
+                ack.in_memory_sequence <= last_committed_primary_seq,
+                "in_memory ack ahead of committed cursor: in_memory={}, last_committed={}",
+                ack.in_memory_sequence,
+                last_committed_primary_seq,
+            );
             ack_send_buf.clear();
             encode_ack(&ack, &mut ack_send_buf);
             let sqe = opcode::Send::new(
@@ -417,6 +441,12 @@ fn replica_stream_uring(
             // oldest pending target before sending one cumulative ack.
             let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
             let in_mem_now = *accum_end_sequence;
+            debug_assert!(
+                in_mem_now <= last_committed_primary_seq,
+                "backpressure in_memory ack ahead of committed cursor: in_memory={}, last_committed={}",
+                in_mem_now,
+                last_committed_primary_seq,
+            );
             ack_send_buf.clear();
             encode_ack(
                 &Ack {
@@ -572,6 +602,23 @@ fn replica_stream_uring(
                     // per recv, not once per InputSlot. A 100KB recv carries 100+
                     // slots; this collapses 100+ Release stores into one.
                     let mut batch = input_producer.batch();
+                    // Track the highest primary_seq pushed in this CQE's
+                    // batch *locally*. Only published to
+                    // `*accum_end_sequence` after `batch.commit()` so the
+                    // in_memory ack track can never name a slot that
+                    // hasn't been made visible to consumers. The previous
+                    // mid-loop write to `*accum_end_sequence` was
+                    // structurally unsound: the early returns below
+                    // (`SessionExit::Fatal` on NeedSnapshot /
+                    // HashMismatch, `SessionExit::Disconnected` on decode
+                    // error or invalid frame length) skip the
+                    // `batch.commit()` at the bottom of this block but
+                    // would have already updated `*accum_end_sequence` —
+                    // leaking a forward-dated value into the post-exit
+                    // ack at `run_receiver:send_ack_tcp(seq,
+                    // accum_end_sequence, ...)` and into the next
+                    // session's flushes after a reconnect.
+                    let mut pending_accum = *accum_end_sequence;
                     while cursor + 4 <= parse_buf.len() {
                         let frame_len =
                             u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
@@ -596,7 +643,7 @@ fn replica_stream_uring(
                                     for slot in slot_buf.drain(..) {
                                         let primary_seq = slot.sequence;
                                         burst_last_target = batch.push_with(|s| *s = slot);
-                                        *accum_end_sequence = primary_seq;
+                                        pending_accum = primary_seq;
                                         burst_any_published = true;
                                     }
                                 }
@@ -635,6 +682,14 @@ fn replica_stream_uring(
                     // Single Release store on the producer cursor, making every
                     // slot written above visible to the apply consumer at once.
                     batch.commit();
+                    // Publish the new `accum_end_sequence` only after the
+                    // commit so any subsequent ack-flush sees a value
+                    // bounded by the committed cursor. The early-return
+                    // paths above leave `*accum_end_sequence` at its
+                    // pre-CQE value, which is itself the previous commit
+                    // — also safe.
+                    *accum_end_sequence = pending_accum;
+                    last_committed_primary_seq = *accum_end_sequence;
 
                     // Compact parse_buf.
                     if cursor > 0 {

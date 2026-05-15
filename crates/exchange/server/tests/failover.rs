@@ -677,6 +677,11 @@ struct TestCluster {
     primary: ServerProcess,
     replica: ServerProcess,
     admin_port: u16,
+    /// Primary's replication-listen port. Stored so tests that restart
+    /// the primary in place (after a SIGKILL, to exercise journal-recovery
+    /// paths with a live replica) can bind the new process to the same
+    /// port the replica is already trying to reconnect to.
+    primary_repl_port: u16,
     key: SigningKey,
     key2: SigningKey,
     operator_key: SigningKey,
@@ -751,6 +756,7 @@ impl TestCluster {
             primary,
             replica,
             admin_port: replica_admin_port,
+            primary_repl_port,
             key,
             key2,
             operator_key,
@@ -988,6 +994,145 @@ fn kill_without_waiting_for_replication() {
             }
         )),
         "expected DuplicateOrderId for id={last_acked_id}, got: {r:?}"
+    );
+}
+
+/// Exercise the `hybrid` durability gate on a primary that has been
+/// restarted (i.e. recovered from its journal). The recovered primary's
+/// wire-sequence allocator starts at `last_seq + 1` — much larger than
+/// the fresh-primary case (which starts at 2 with the hash-chain feature)
+/// — so any code path that conflates wire-sequence space with the local
+/// input-consumer space will silently open the response gate before the
+/// replica has actually replicated the event.
+///
+/// The expected behavior of `hybrid` (`persisted>=1 && in_memory>=2`) is
+/// that every acked response is on at least one other node's in-memory
+/// state. We pre-populate the primary's journal with `PREFILL` events to
+/// push `starting_sequence` well above 2, then submit a small `BURST` of
+/// new orders, immediately SIGKILL the primary without waiting for
+/// replication lag to reach 0, and assert the promoted replica has all
+/// `BURST` acked orders in its dedup state.
+///
+/// If the gate is correctly enforced, the replica must have every acked
+/// order — the test tolerates 0 lost orders. The existing
+/// `kill_without_waiting_for_replication` test already documents a
+/// fresh-primary off-by-one in this path; if the bug generalises to a
+/// `starting_sequence`-scaled loss, this test will surface it as
+/// multiple missing orders (up to `BURST`), making the issue
+/// quantitatively distinct from the fresh-primary version.
+#[test]
+#[serial]
+fn recovered_primary_durability_gate_holds() {
+    const PREFILL: u64 = 50;
+    const BURST: u64 = 10;
+
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Phase 1: pre-populate journal to drive `starting_sequence` high on
+    // the next recovery.
+    for i in 1..=PREFILL {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "phase-1 order {i} no response");
+    }
+    cluster.wait_replicated();
+    drop(client);
+
+    // SIGKILL both nodes. We restart the primary from its journal (the
+    // recovery path is what bumps `starting_sequence` for the test);
+    // restarting the replica with a wiped journal avoids an unrelated
+    // bug in the same-process reconnect path that surfaces "File exists"
+    // when a long-lived replica reconnects after primary restart.
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
+        libc::kill(cluster.replica.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.primary.child.wait();
+    let _ = cluster.replica.child.wait();
+    let _ = std::fs::remove_file(cluster._tmp.path().join("replica.journal"));
+    let _ = std::fs::remove_file(cluster._tmp.path().join("replica.snapshot"));
+
+    // Restart the primary on the same ports + same journal — recovery
+    // through the journal pushes `starting_sequence` past 2.
+    let restarted_primary = spawn_primary_with_extra(
+        &cluster.bin,
+        cluster._tmp.path(),
+        &cluster.keys_path,
+        cluster.primary.client_addr.port(),
+        cluster.primary.health_addr.port(),
+        cluster.primary_repl_port,
+        &[],
+    );
+    cluster.primary = restarted_primary;
+    wait_for_primary_repl_ready(cluster.primary.health_addr, Duration::from_secs(10));
+
+    // Restart the replica as a fresh process (no prior journal).
+    let restarted_replica = spawn_replica_named_with_extra(
+        &cluster.bin,
+        cluster._tmp.path(),
+        &cluster.keys_path,
+        &cluster.repl_key_path,
+        cluster.primary_repl_port,
+        cluster.replica.client_addr.port(),
+        cluster.replica.health_addr.port(),
+        cluster.admin_port,
+        "replica",
+        &[],
+    );
+    cluster.replica = restarted_replica;
+
+    wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
+    cluster.wait_replicated();
+
+    // Phase 2: submit BURST new orders. Each response is gated on the
+    // hybrid policy; if the gate is sound every acked response is on the
+    // replica.
+    let mut client = cluster.connect_primary();
+    let mut acked: Vec<u64> = Vec::with_capacity(BURST as usize);
+    for i in 0..BURST {
+        let id = PREFILL + 1 + i;
+        let r = submit_order(&mut client, id, 1, 1, Side::Buy, 100, 10);
+        if !r.is_empty() {
+            acked.push(id);
+        }
+    }
+    assert!(!acked.is_empty(), "no burst orders were acked");
+    drop(client);
+
+    // Promote the replica WITHOUT waiting for replication lag — the
+    // hybrid gate's contract is "every acked response is already on the
+    // replica," so a wait would mask the bug.
+    let mut client2 = cluster.kill_and_promote();
+
+    // For each acked burst order, try to submit it again on the promoted
+    // node and assert it comes back as a duplicate (proving the original
+    // is in `live_order_ids`). Anything that comes back Placed instead is
+    // a durability violation.
+    let mut missing: Vec<u64> = Vec::new();
+    for id in &acked {
+        let r = submit_order(&mut client2, *id, 1, 1, Side::Buy, 100, 10);
+        if !has_report(&r, |rep| {
+            matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Rejected {
+                    reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                    ..
+                }
+            )
+        }) {
+            missing.push(*id);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "hybrid gate broken on recovered primary: {} of {} acked burst orders \
+         were not on the promoted replica (missing ids: {:?}). \
+         Acked: {:?}",
+        missing.len(),
+        acked.len(),
+        missing,
+        acked,
     );
 }
 
