@@ -211,15 +211,10 @@ fn wait_halted(addr: SocketAddr, timeout: Duration) {
 
 /// Wait for the primary's replication endpoint to be ready to accept
 /// inbound connections from replicas. Polls the *health* endpoint
-/// rather than the replication port directly so the same helper works
-/// regardless of replication transport — TCP (default features) and
-/// rumcast (UDP) both bind their replication socket during the same
-/// startup phase as the health endpoint, so a responsive `/healthz`
-/// is a reliable proxy for "replica may now connect".
-///
-/// Replaces older per-call `TcpStream::connect_timeout` probes that
-/// silently failed under `--features rumcast` because rumcast
-/// replication binds UDP, not TCP.
+/// rather than the replication port directly — a responsive
+/// `/healthz` is a reliable proxy for "replica may now connect"
+/// because the replication socket binds during the same startup phase
+/// as the health endpoint.
 fn wait_for_primary_repl_ready(health_addr: SocketAddr, timeout: Duration) {
     let start = Instant::now();
     loop {
@@ -366,23 +361,17 @@ fn admin_command(addr: SocketAddr, operator_key: &SigningKey, command: &str) -> 
     stream
         .read_exact(&mut frame_buf)
         .expect("read challenge payload");
-    let (nonce, server_eph) = match codec::decode_response(&frame_buf).expect("decode challenge") {
-        ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        } => (nonce, server_x25519_eph),
+    let nonce = match codec::decode_response(&frame_buf).expect("decode challenge") {
+        ResponseKind::Challenge { nonce } => nonce,
         other => panic!("expected Challenge, got {other:?}"),
     };
 
     // Step 2: Sign nonce + ephemerals (TCP path uses zero ephs).
-    let client_x25519_eph = [0u8; 32];
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     let signature = operator_key.sign(&signing_payload);
     let request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: operator_key.verifying_key().to_bytes(),
-        client_x25519_eph,
     };
     let mut encode_buf = [0u8; 256];
     let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");
@@ -1223,11 +1212,6 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
     if profile_dir == "release" {
         build.arg("--release");
     }
-    // Mirror the server's transport feature so bench speaks the same
-    // wire protocol. Under `--features rumcast` the server binds UDP;
-    // the bench must also be built with rumcast to connect.
-    #[cfg(feature = "rumcast")]
-    build.args(["--features", "rumcast", "--no-default-features"]);
     let build_status = build.status().expect("spawn cargo build melin-bench");
     assert!(
         build_status.success(),
@@ -1275,12 +1259,6 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
         "2",
         "250",
     ]);
-    // Under rumcast the bench must bind a local UDP socket so the server
-    // can send response frames back. Port 0 lets the OS assign an
-    // ephemeral port; the server learns the real address from the Setup
-    // packet source.
-    #[cfg(feature = "rumcast")]
-    bench_cmd.args(["--rumcast-bind", "127.0.0.1:0"]);
     let bench_status = bench_cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

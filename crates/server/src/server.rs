@@ -231,34 +231,6 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
-    /// Client address that rumcast responses are unicast to. Required
-    /// when the server is built with `--features rumcast`. Phase 1 of
-    /// the rumcast wire-up is single-client only; this is the bench
-    /// client's bind address.
-    #[arg(long)]
-    pub rumcast_client_addr: Option<std::net::SocketAddr>,
-
-    /// NAPI busy-poll budget in microseconds for rumcast orders +
-    /// response sockets. `0` (default) leaves the kernel on its
-    /// normal interrupt-driven recv path. Non-zero enables
-    /// `SO_BUSY_POLL` + `SO_PREFER_BUSY_POLL` so the kernel polls the
-    /// NIC ring inside `recvmsg` instead of waiting for an interrupt
-    /// — trades CPU for tighter recv tail latency. Typical real-NIC
-    /// values are 50–100 µs. No-op on loopback (no NAPI ring).
-    /// Requires `CAP_NET_ADMIN` or a non-zero `net.core.busy_read`
-    /// sysctl floor; the call falls back to a `warn!` and continues
-    /// on `EPERM`.
-    #[arg(long, default_value_t = 0)]
-    pub rumcast_busy_poll_us: u32,
-
-    /// Enable kernel `UDP_GRO` on the rumcast orders socket. Pairs
-    /// with `UDP_SEGMENT` (UDP-GSO) on the sender side so the
-    /// kernel can re-coalesce incoming wire packets and the rumcast
-    /// recv path can fan out segments via the cmsg `seg_size` hint.
-    /// Off by default. No-op on loopback (no NAPI/GRO path).
-    #[arg(long, default_value_t = false)]
-    pub rumcast_udp_gro: bool,
-
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -415,9 +387,6 @@ impl Default for ServerConfig {
             replication_ring_size: 256,
             durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
             yield_idle: false,
-            rumcast_client_addr: None,
-            rumcast_busy_poll_us: 0,
-            rumcast_udp_gro: false,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
@@ -2562,9 +2531,7 @@ pub(crate) fn empty_app_for_seed(_config: &ServerConfig) -> App {
 /// through the pipeline. The recovery paths (snapshot+journal, snapshot
 /// only, journal only, fresh) are transport-level concerns and work
 /// uniformly for any `A: Application` via `JournaledApp<A>`.
-/// Same engine initialization the TCP / DPDK paths use; exposed at
-/// `pub(crate)` so the rumcast transport (Phase 1) can call it without
-/// duplicating the recovery / snapshot / rotation logic.
+/// Same engine initialization the TCP / DPDK paths use.
 pub(crate) fn init_engine<W>(
     config: &ServerConfig,
 ) -> Result<(App, W, bool), Box<dyn std::error::Error>>
@@ -2743,21 +2710,9 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge. X25519 ephemerals are only meaningful on the
-    // rumcast path (where they seed the per-session MAC token). TCP
-    // sends zeros for the ephemerals; the signature payload still
-    // covers them so server + client share a single signing scheme
-    // — see [`melin_protocol::auth::auth_signing_payload`].
-    let server_x25519_eph = [0u8; 32];
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(
-        &ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        },
-        &mut buf,
-    )
-    .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
+        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     writer.write_all(&buf[..written])?;
     writer.flush()?;
 
@@ -2788,12 +2743,11 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
+    let (signature_bytes, public_key_bytes) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-            client_x25519_eph,
-        } => (signature, public_key, client_x25519_eph),
+        } => (signature, public_key),
         other => {
             send_auth_failed(writer);
             return Err(format!(
@@ -2820,8 +2774,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     verifying_key
         .verify(&signing_payload, &signature)
         .map_err(|e| {
@@ -3050,22 +3003,16 @@ mod tests {
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let (nonce, server_eph) = match resp {
-            ResponseKind::Challenge {
-                nonce,
-                server_x25519_eph,
-            } => (nonce, server_x25519_eph),
+        let nonce = match resp {
+            ResponseKind::Challenge { nonce } => nonce,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let client_x25519_eph = [0u8; 32];
-        let signing_payload =
-            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
         let sig = key.sign(&signing_payload);
         let request = Request::ChallengeResponse {
             signature: sig.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
-            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();
@@ -3082,24 +3029,18 @@ mod tests {
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let (nonce, server_eph) = match resp {
-            ResponseKind::Challenge {
-                nonce,
-                server_x25519_eph,
-            } => (nonce, server_x25519_eph),
+        let nonce = match resp {
+            ResponseKind::Challenge { nonce } => nonce,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let client_x25519_eph = [0u8; 32];
-        let signing_payload =
-            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
         let mut sig_bytes = key.sign(&signing_payload).to_bytes();
         sig_bytes[0] ^= 0xFF;
 
         let request = Request::ChallengeResponse {
             signature: sig_bytes,
             public_key: key.verifying_key().to_bytes(),
-            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();

@@ -1,11 +1,8 @@
 //! Client library for connecting to the trading server.
 //!
 //! Provides a typed API over the binary wire protocol. The public
-//! `Client` type is transport-agnostic at the source level: by default
-//! it speaks TCP via blocking I/O; built with `--features rumcast` it
-//! speaks rumcast (reliable UDP) instead. Mirrors the server's
-//! `--features rumcast` build so integration tests can exercise either
-//! transport without rewriting test code.
+//! `Client` type speaks TCP via blocking I/O against the server's
+//! TCP listener.
 
 use std::io;
 
@@ -25,10 +22,6 @@ pub enum ClientError {
     AuthFailed,
     /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,
-    /// Operation didn't complete within the implementation's deadline
-    /// (rumcast handshake / response wait). TCP path uses blocking I/O
-    /// and surfaces timeouts as `Io` instead.
-    Timeout,
 }
 
 impl std::fmt::Display for ClientError {
@@ -39,7 +32,6 @@ impl std::fmt::Display for ClientError {
             Self::Disconnected => write!(f, "disconnected from server"),
             Self::AuthFailed => write!(f, "authentication failed"),
             Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
-            Self::Timeout => write!(f, "operation timed out"),
         }
     }
 }
@@ -66,12 +58,5 @@ pub struct StatsSnapshot {
     pub journal_sequence: u64,
 }
 
-#[cfg(not(feature = "rumcast"))]
 mod tcp;
-#[cfg(not(feature = "rumcast"))]
 pub use tcp::Client;
-
-#[cfg(feature = "rumcast")]
-mod rumcast;
-#[cfg(feature = "rumcast")]
-pub use rumcast::Client;

@@ -155,18 +155,9 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| format!("getrandom failed: {e}"))?;
 
-    // X25519 ephemerals are rumcast-only; admin uses TCP and sends zeros
-    // here — see [`melin_protocol::auth::auth_signing_payload`].
-    let server_x25519_eph = [0u8; 32];
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(
-        &ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        },
-        &mut buf,
-    )
-    .map_err(|e| format!("encode Challenge: {e}"))?;
+    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
+        .map_err(|e| format!("encode Challenge: {e}"))?;
     stream
         .write_all(&buf[..written])
         .map_err(|e| format!("send Challenge: {e}"))?;
@@ -194,12 +185,11 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         }
     };
 
-    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
+    let (signature_bytes, public_key_bytes) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-            client_x25519_eph,
-        } => (signature, public_key, client_x25519_eph),
+        } => (signature, public_key),
         _ => {
             send_auth_failed(stream);
             return Err("expected ChallengeResponse".into());
@@ -225,8 +215,7 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         format!("invalid public key: {e}")
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     verifying_key
         .verify(&signing_payload, &signature)
         .map_err(|e| {
@@ -450,22 +439,16 @@ mod tests {
             .read_exact(&mut frame_buf)
             .expect("read challenge payload");
         let response = codec::decode_response(&frame_buf).expect("decode challenge");
-        let (nonce, server_eph) = match response {
-            ResponseKind::Challenge {
-                nonce,
-                server_x25519_eph,
-            } => (nonce, server_x25519_eph),
+        let nonce = match response {
+            ResponseKind::Challenge { nonce } => nonce,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let client_x25519_eph = [0u8; 32];
-        let signing_payload =
-            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
         let signature = key.sign(&signing_payload);
         let request = Request::ChallengeResponse {
             signature: signature.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
-            client_x25519_eph,
         };
         let mut encode_buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");

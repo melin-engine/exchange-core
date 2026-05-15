@@ -153,9 +153,9 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
-/// The caller must ensure `buf` is large enough (168 bytes is always sufficient
-/// — bound is set by `ChallengeResponse` after the X25519 ephemeral was added:
-/// 4 prefix + 8 seq + 1 tag + 64 sig + 32 pubkey + 32 eph + 27 slack).
+/// The caller must ensure `buf` is large enough (128 bytes is always sufficient
+/// — bound is set by `ChallengeResponse`: 4 prefix + 8 seq + 1 tag + 64 sig +
+/// 32 pubkey + 19 slack).
 /// `seq` is the per-key monotonic request sequence for idempotency dedup.
 /// Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
@@ -197,15 +197,12 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
         Request::ChallengeResponse {
             signature,
             public_key,
-            client_x25519_eph,
         } => {
             buf[pos] = TAG_CHALLENGE_RESPONSE;
             pos += 1;
             buf[pos..pos + 64].copy_from_slice(signature);
             pos += 64;
             buf[pos..pos + 32].copy_from_slice(public_key);
-            pos += 32;
-            buf[pos..pos + 32].copy_from_slice(client_x25519_eph);
             pos += 32;
         }
         Request::AddInstrument { spec } => {
@@ -425,21 +422,18 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
         }
         TAG_REQUEST_HEARTBEAT => Ok((seq, Request::Heartbeat)),
         TAG_CHALLENGE_RESPONSE => {
-            if payload.len() < 128 {
+            if payload.len() < 96 {
                 return Err(ProtocolError::Truncated);
             }
             let mut signature = [0u8; 64];
             signature.copy_from_slice(&payload[..64]);
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(&payload[64..96]);
-            let mut client_x25519_eph = [0u8; 32];
-            client_x25519_eph.copy_from_slice(&payload[96..128]);
             Ok((
                 seq,
                 Request::ChallengeResponse {
                     signature,
                     public_key,
-                    client_x25519_eph,
                 },
             ))
         }
@@ -713,15 +707,10 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = TAG_RESPONSE_HEARTBEAT;
             pos += 1;
         }
-        ResponseKind::Challenge {
-            nonce,
-            server_x25519_eph,
-        } => {
+        ResponseKind::Challenge { nonce } => {
             buf[pos] = TAG_CHALLENGE;
             pos += 1;
             buf[pos..pos + 32].copy_from_slice(nonce);
-            pos += 32;
-            buf[pos..pos + 32].copy_from_slice(server_x25519_eph);
             pos += 32;
         }
         ResponseKind::AuthFailed => {
@@ -845,17 +834,12 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
         TAG_SERVER_READY => Ok(ResponseKind::ServerReady),
         TAG_RESPONSE_HEARTBEAT => Ok(ResponseKind::Heartbeat),
         TAG_CHALLENGE => {
-            if payload.len() < 64 {
+            if payload.len() < 32 {
                 return Err(ProtocolError::Truncated);
             }
             let mut nonce = [0u8; 32];
             nonce.copy_from_slice(&payload[..32]);
-            let mut server_x25519_eph = [0u8; 32];
-            server_x25519_eph.copy_from_slice(&payload[32..64]);
-            Ok(ResponseKind::Challenge {
-                nonce,
-                server_x25519_eph,
-            })
+            Ok(ResponseKind::Challenge { nonce })
         }
         TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
         TAG_SERVER_BUSY => Ok(ResponseKind::ServerBusy),
@@ -1584,7 +1568,6 @@ mod tests {
             Request::ChallengeResponse {
                 signature: [0xAA; 64],
                 public_key: [0xBB; 32],
-                client_x25519_eph: [0xDD; 32],
             },
             Request::AddInstrument {
                 spec: InstrumentSpec {
@@ -1876,10 +1859,7 @@ mod tests {
             ResponseKind::BatchEnd,
             ResponseKind::ServerReady,
             ResponseKind::Heartbeat,
-            ResponseKind::Challenge {
-                nonce: [0xCC; 32],
-                server_x25519_eph: [0xEE; 32],
-            },
+            ResponseKind::Challenge { nonce: [0xCC; 32] },
             ResponseKind::AuthFailed,
             ResponseKind::ServerBusy,
             ResponseKind::StatsHeader {
@@ -1973,16 +1953,14 @@ mod tests {
         let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // ChallengeResponse needs sig(64) + pubkey(32) + eph(32) =
-        // 128 bytes after the tag. 127 bytes after the tag must be
-        // rejected — this guards against a stale `< 96` check that
-        // would crash `payload[96..128]` on slice OOB.
-        let mut short = [0u8; 9 + 127];
+        // ChallengeResponse needs sig(64) + pubkey(32) = 96 bytes
+        // after the tag. 95 bytes after the tag must be rejected.
+        let mut short = [0u8; 9 + 95];
         short[8] = TAG_CHALLENGE_RESPONSE;
         let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
-        // Exactly 128 bytes after the tag is the boundary — must succeed.
-        let mut ok_buf = [0u8; 9 + 128];
+        // Exactly 96 bytes after the tag is the boundary — must succeed.
+        let mut ok_buf = [0u8; 9 + 96];
         ok_buf[8] = TAG_CHALLENGE_RESPONSE;
         assert!(decode_request(&ok_buf).is_ok());
     }
@@ -2001,15 +1979,14 @@ mod tests {
         let result = decode_response(&[]);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // Challenge needs nonce(32) + server_eph(32) = 64 bytes
-        // after the tag. 63 bytes must be rejected — guards against
-        // a stale `< 32` check that would crash `payload[32..64]`.
-        let mut short = [0u8; 1 + 63];
+        // Challenge needs nonce(32) bytes after the tag. 31 bytes
+        // must be rejected.
+        let mut short = [0u8; 1 + 31];
         short[0] = TAG_CHALLENGE;
         let result = decode_response(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
-        // Exactly 64 bytes after the tag is the boundary — must succeed.
-        let mut ok_buf = [0u8; 1 + 64];
+        // Exactly 32 bytes after the tag is the boundary — must succeed.
+        let mut ok_buf = [0u8; 1 + 32];
         ok_buf[0] = TAG_CHALLENGE;
         assert!(decode_response(&ok_buf).is_ok());
     }

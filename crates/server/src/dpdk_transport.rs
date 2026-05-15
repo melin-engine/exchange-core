@@ -72,12 +72,6 @@ enum AuthState {
     WaitingForResponse {
         /// The nonce sent in the Challenge. Needed to verify the signature.
         nonce: [u8; 32],
-        /// The server-side X25519 ephemeral public key sent in the
-        /// Challenge. Stored so the verify side feeds it back into the
-        /// signing payload — matches whatever the encode side put on
-        /// the wire even if the value changes (DPDK is TCP today, so
-        /// it's all-zeros).
-        server_x25519_eph: [u8; 32],
         /// When the connection was accepted. Used for timeout.
         accepted_at: Instant,
     },
@@ -312,19 +306,11 @@ pub fn run_dpdk_poll(
             // kernel entropy.
             let nonce: [u8; 32] = rng.random();
 
-            // Send the Challenge frame immediately. X25519 ephemerals
-            // are rumcast-only; DPDK TCP path uses zeros — see
-            // [`melin_protocol::auth::auth_signing_payload`].
-            let server_x25519_eph = [0u8; 32];
+            // Send the Challenge frame immediately.
             let mut challenge_buf = [0u8; 128];
-            let written = codec::encode_response(
-                &ResponseKind::Challenge {
-                    nonce,
-                    server_x25519_eph,
-                },
-                &mut challenge_buf,
-            )
-            .expect("challenge encodes");
+            let written =
+                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut challenge_buf)
+                    .expect("challenge encodes");
             transport.queue_send(accepted.handle, &challenge_buf[..written]);
 
             let accepted_idx = accepted.handle.index();
@@ -337,7 +323,6 @@ pub fn run_dpdk_poll(
                 handle: accepted.handle,
                 auth: AuthState::WaitingForResponse {
                     nonce,
-                    server_x25519_eph,
                     accepted_at: Instant::now(),
                 },
                 key_hash: 0,
@@ -655,12 +640,11 @@ fn process_auth_frame(
     conn.parse_buf.copy_within(consumed.., 0);
     conn.parse_buf.truncate(remaining);
 
-    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
+    let (signature_bytes, public_key_bytes) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-            client_x25519_eph,
-        } => (signature, public_key, client_x25519_eph),
+        } => (signature, public_key),
         _ => {
             debug!(
                 connection_id = conn.connection_id.0,
@@ -684,20 +668,14 @@ fn process_auth_frame(
         }
     };
 
-    // Extract nonce + server eph from the current auth state — they
-    // were captured at Challenge-send time and feed back into the
-    // signing payload now.
-    let (nonce, server_x25519_eph) = match &conn.auth {
-        AuthState::WaitingForResponse {
-            nonce,
-            server_x25519_eph,
-            ..
-        } => (*nonce, *server_x25519_eph),
+    // Extract the nonce captured at Challenge-send time and feed it
+    // back into the signing payload now.
+    let nonce = match &conn.auth {
+        AuthState::WaitingForResponse { nonce, .. } => *nonce,
         _ => unreachable!("process_auth_frame called in wrong state"),
     };
 
-    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
-    // client_eph` (DPDK TCP path's ephs are zeros — see Challenge above).
+    // Verify the Ed25519 signature over the nonce.
     let verifying_key = match VerifyingKey::from_bytes(&public_key_bytes) {
         Ok(k) => k,
         Err(_) => {
@@ -710,8 +688,7 @@ fn process_auth_frame(
         }
     };
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload =
-        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
     if verifying_key.verify(&signing_payload, &signature).is_err() {
         debug!(
             connection_id = conn.connection_id.0,
@@ -1147,7 +1124,6 @@ mod tests {
         shared_request::to_event(&Request::ChallengeResponse {
             signature: [0u8; 64],
             public_key: [0u8; 32],
-            client_x25519_eph: [0u8; 32],
         });
     }
 

@@ -5,8 +5,8 @@
 //! on-disk journal and returns a writer ready to append. Encapsulates
 //! the codec-internal details (header layout at [`crate::codec::ENTRY_OFFSET`],
 //! genesis-derived chain anchor, initial `valid_end`, durable `sync_all`
-//! before reopening) so transport-layer code (TCP / rumcast / DPDK
-//! receivers) doesn't have to import the codec or compute hashes itself.
+//! before reopening) so transport-layer code (TCP / DPDK receivers)
+//! doesn't have to import the codec or compute hashes itself.
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
