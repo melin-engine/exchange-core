@@ -22,11 +22,6 @@ pub enum ClientError {
     AuthFailed,
     /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,
-    /// Operation didn't complete within the implementation's deadline.
-    /// The TCP path uses blocking I/O and surfaces socket-level
-    /// timeouts as `Io`, so this variant is currently unreachable —
-    /// kept in the API for forward compatibility.
-    Timeout,
 }
 
 impl std::fmt::Display for ClientError {
@@ -37,7 +32,6 @@ impl std::fmt::Display for ClientError {
             Self::Disconnected => write!(f, "disconnected from server"),
             Self::AuthFailed => write!(f, "authentication failed"),
             Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
-            Self::Timeout => write!(f, "operation timed out"),
         }
     }
 }
