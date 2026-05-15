@@ -4,3 +4,4 @@
 //! anything declared here.
 
 pub mod calibration;
+pub mod generator;

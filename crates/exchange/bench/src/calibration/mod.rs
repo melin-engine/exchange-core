@@ -3,12 +3,18 @@
 //! of [`crate::generator::OrderFlowGenerator`] to verify the generator
 //! is representative of real venue load.
 //!
+//! Both sides — the ITCH parser and the [`generator_adapter`] — emit
+//! [`itch::ItchEvent`] so a single [`stats::StatsAggregator`] scores
+//! real-venue and synthetic-generator streams apples-to-apples.
+//!
 //! Temporal and joint-structure metrics are out of scope on this branch
 //! (the generator has no inter-arrival or joint sampling model yet);
 //! see the audit in the generator-calibration branch description for
 //! the deferred items.
 
 pub mod book;
+pub mod fixture;
+pub mod generator_adapter;
 pub mod itch;
 pub mod stats;
 

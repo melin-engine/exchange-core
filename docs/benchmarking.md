@@ -68,6 +68,43 @@ The generator maintains a circular buffer of 100,000 recently submitted GTC limi
 
 Each client connection gets its own generator instance with a partitioned order ID range to avoid collisions across connections.
 
+### Calibration tooling
+
+The bench ships a calibration pipeline so operators can verify the synthetic generator's output against an ITCH 5.0 reference of their own — the question "is the bench's load representative of the venue I care about?" can be answered against the operator's own data, locally.
+
+The pipeline is built from three composable pieces:
+
+- A streaming **ITCH 5.0 decoder** (`crates/exchange/bench/src/calibration/itch.rs`) that accepts raw or gzipped dumps and yields one event per recognized message.
+- A **per-symbol partial book tracker** (`book.rs`) that resolves executes to resting price/side and maintains best-bid/best-ask so distance-from-mid can be reported at each order's submit time.
+- A **stats aggregator** (`stats.rs`) that accumulates the marginal distributions — workload mix, side balance, add-order size, signed distance-from-mid per side, partial-cancel share fraction, and replace price/size deltas — into HDR histograms.
+
+The same aggregator scores the synthetic generator's stream via the [`GeneratorAdapter`](../crates/exchange/bench/src/calibration/generator_adapter.rs), which re-emits `OrderFlowGenerator` output as ITCH events, so comparison is apples-to-apples.
+
+Temporal structure (inter-arrival times, burstiness) and joint structure (e.g. size given distance-from-mid) are explicitly **not** calibrated. The generator samples each marginal independently; modeling those dimensions is deferred.
+
+#### Producing a reference fixture
+
+Bring your own ITCH 5.0 dump and:
+
+```
+cargo run --release --example extract_itch_stats -- <itch-path> <out.json> <date> <ticker1> [ticker2 ...]
+```
+
+The output JSON carries only aggregated derivatives — quantiles, summary scalars, and event counts. Drop your dump in `bench-data/` (gitignored) and the fixture wherever is convenient.
+
+#### Running the calibration
+
+```
+cargo test -p melin-bench --test calibration -- --nocapture
+```
+
+A small reference fixture is committed at `crates/exchange/bench/tests/fixtures/reference-stats.json` so the test runs out of the box. To compare against a different reference, set `MELIN_CALIBRATION_FIXTURE` to a JSON path and `MELIN_CALIBRATION_SYMBOL` to a ticker present in that file.
+
+Two tests:
+
+- `calibration_report` — diagnostic, always passes. Prints a quantile-by-quantile comparison between the generator and the reference.
+- `calibration_basics_within_tolerance` — asserts the small set of marginals the generator's current design intends to match (side balance, removes-per-add ratio, no book-tracker errors). Distribution-shape assertions are deliberately deferred.
+
 ## CLI Parameters
 
 ```
