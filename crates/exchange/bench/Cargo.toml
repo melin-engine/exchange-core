@@ -52,6 +52,10 @@ dpdk = [
 pipeline-stats = ["melin-server/pipeline-stats"]
 plot = ["dep:plotters"]
 
+[lib]
+name = "melin_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "melin-bench"
 path = "src/main.rs"
@@ -93,3 +97,8 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# Streaming gzip decode for ITCH 5.0 dumps. flate2 with the default
+# `miniz_oxide` backend keeps the dep tree pure-Rust; we don't need
+# zlib-ng-level throughput because the bottleneck is the parser, not
+# decompression.
+flate2 = "1"

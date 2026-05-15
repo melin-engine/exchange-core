@@ -15,6 +15,8 @@ scripts/dpdk/.cache/
 # scripts/lan-bench-suite.sh; one timestamped subdir per run.
 /bench-results/
 
+/bench-data/
+
 # Bench plots — only README-referenced PNGs are versioned.
 # Everything else can be regenerated via melin-plot.
 docs/plots/*

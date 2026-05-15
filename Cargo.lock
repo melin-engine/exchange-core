@@ -1517,6 +1517,7 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "ed25519-dalek",
+ "flate2",
  "getrandom 0.3.4",
  "hdrhistogram",
  "io-uring",
