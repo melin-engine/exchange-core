@@ -11,7 +11,6 @@ path = "src/main.rs"
 melin-gateway-core = { path = "../gateway-core" }
 melin-market-data = { path = "../market-data" }
 melin-protocol = { path = "../protocol" }
-melin-engine = { path = "../engine" }
 melin-types = { path = "../types" }
 ed25519-dalek = { workspace = true }
 toml = "0.8"

@@ -1621,11 +1621,12 @@ dependencies = [
 name = "melin-market-data"
 version = "0.7.0"
 dependencies = [
+ "astenn",
  "ed25519-dalek",
- "melin-engine",
  "melin-protocol",
  "melin-types",
  "proptest",
+ "rustc-hash",
  "tracing",
 ]
 
@@ -1636,7 +1637,6 @@ dependencies = [
  "ed25519-dalek",
  "io-uring",
  "libc",
- "melin-engine",
  "melin-gateway-core",
  "melin-market-data",
  "melin-protocol",

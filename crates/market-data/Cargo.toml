@@ -4,11 +4,12 @@ version = "0.7.0"
 edition = "2024"
 
 [dependencies]
-melin-engine = { path = "../engine" }
 melin-types = { path = "../types" }
 melin-protocol = { path = "../protocol" }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
+astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
+rustc-hash = "2"
 
 [dev-dependencies]
 proptest = "1"
