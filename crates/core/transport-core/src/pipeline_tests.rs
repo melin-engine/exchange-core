@@ -206,6 +206,147 @@ fn matching_stage_processes_events() {
     let _app = handle.join().unwrap();
 }
 
+/// Pin the matching stage's `wire_seq` stamping rule against future
+/// drift. The response stage's durability gate depends on
+/// `OutputSlot.wire_seq` being in lockstep with what the journal stage's
+/// allocator would assign — same starting value, same per-event rule
+/// (advance for App-non-query / Tick / GenesisHash, hold flat for
+/// `Query` and `Checkpoint`). The lockstep is the load-bearing piece
+/// behind `fix(durability): gate on wire-seq`; this test fails fast if
+/// either side's rule changes without the other tracking it.
+#[test]
+fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
+    let app = TestApp::new();
+
+    // Big enough to hold the 6 input events + a `Shutdown` sentinel
+    // without backpressure stalling the producer mid-publish.
+    let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<TestOutput>::new(64)
+        .add_consumer()
+        .build();
+    let mut output_consumer = output_consumers.pop().unwrap();
+
+    let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+    let events_counter = Arc::new(AtomicU64::new(0));
+    let active_conns = Arc::new(AtomicU64::new(0));
+    // Pick a non-1 starting value (10) so an off-by-`starting-1` regression
+    // — the exact bug this fix addresses — would visibly miss every
+    // assertion below rather than coincidentally satisfy them when
+    // `starting == 1` makes input-seq and wire-seq numerically agree.
+    const STARTING_WIRE_SEQ: u64 = 10;
+    let stage = MatchingStage::new(
+        app,
+        consumer,
+        output_producer,
+        events_counter,
+        dummy_cursor,
+        active_conns,
+        None,
+        false,
+        STARTING_WIRE_SEQ,
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown2 = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+    // Input sequence mixes every event class the rule cares about. The
+    // expected wire_seq column is what the journal stage's allocator
+    // would assign under the same rule (allocate for App / Tick /
+    // GenesisHash, `continue` past Query and Checkpoint); the matching
+    // stage must produce the same values into `OutputSlot.wire_seq`.
+    //
+    //   #  | event                | journal allocates | wire_seq stamped
+    //   ---+----------------------+-------------------+-------------------
+    //   1  | App(Add 1)           | yes → 10          | 10
+    //   2  | Query                | no                | 10  (= 11 - 1)
+    //   3  | App(Add 2)           | yes → 11          | 11
+    //   4  | Checkpoint           | no                | 11  (= 12 - 1)
+    //   5  | App(Add 3)           | yes → 12          | 12
+    //   6  | Tick                 | yes → 13          | 13
+    //
+    // All slots carry `connection_id = 1` so events that produce no
+    // application reports (Checkpoint, Tick) still emit a `BatchEnd`
+    // terminator on the output ring; that way every input event
+    // appears exactly once in the assertions below regardless of
+    // payload shape.
+    let conn_id = 1u64;
+    let mut publish = |event: JournalEvent<TestEvent>| {
+        input_producer.publish(InputSlot {
+            connection_id: conn_id,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    };
+    publish(JournalEvent::App(TestEvent::Add(1)));
+    publish(JournalEvent::App(TestEvent::Query));
+    publish(JournalEvent::App(TestEvent::Add(2)));
+    publish(JournalEvent::Checkpoint {
+        chain_hash: [0; 32],
+        events_since_checkpoint: 0,
+    });
+    publish(JournalEvent::App(TestEvent::Add(3)));
+    publish(JournalEvent::Tick { now_ns: 1 });
+
+    // Drain six output slots — one per input event under the
+    // connection-id-1 invariant above.
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
+    let mut spins = 0u64;
+    while outputs.len() < 6 {
+        if let Some((_, slot)) = output_consumer.try_consume() {
+            outputs.push(slot);
+        } else {
+            spins += 1;
+            assert!(spins < 10_000_000, "timeout draining outputs");
+            std::hint::spin_loop();
+        }
+    }
+
+    let actual: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
+    assert_eq!(
+        actual,
+        vec![10, 10, 11, 11, 12, 13],
+        "wire_seq stamping diverged from the journal allocator's per-event rule"
+    );
+
+    // Sanity-check the output payload shape so a future change that
+    // accidentally drops one event without us noticing (and shifts the
+    // wire_seq sequence by one) gets caught here rather than in the
+    // integration suite.
+    let payload_kinds: Vec<&'static str> = outputs
+        .iter()
+        .map(|s| match &s.payload {
+            OutputPayload::Report(_) => "Report",
+            OutputPayload::QueryResponse(_) => "QueryResponse",
+            OutputPayload::BatchEnd => "BatchEnd",
+            OutputPayload::EngineError => "EngineError",
+        })
+        .collect();
+    assert_eq!(
+        payload_kinds,
+        vec![
+            "Report",
+            "QueryResponse",
+            "Report",
+            "BatchEnd",
+            "Report",
+            "BatchEnd"
+        ],
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _app = handle.join().unwrap();
+}
+
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
 /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
 /// entries must carry the primary's sequence numbers, not locally

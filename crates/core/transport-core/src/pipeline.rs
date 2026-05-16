@@ -2140,6 +2140,16 @@ impl<A: Application> MatchingStage<A> {
             // events the journal would still allocate, so advance the
             // counter. Checkpoint-without-allocation matches the main
             // loop's `saturating_sub` behavior.
+            //
+            // The `Checkpoint` arm is defensive on the primary
+            // (`Checkpoint` events are auto-emitted inside the journal
+            // stage and never enter the input ring), but load-bearing on
+            // the replica: catch-up replays the primary's journal
+            // verbatim, including its `Checkpoint` entries, which do
+            // reach matching via the input ring. Keeping the rule
+            // symmetric here (rather than gating on a primary/replica
+            // role flag) means the lockstep with the journal allocator
+            // holds regardless of which side this code runs on.
             let is_query_event = slot.event.is_query();
             let is_checkpoint =
                 matches!(slot.event, melin_journal::JournalEvent::Checkpoint { .. });
@@ -2697,8 +2707,13 @@ where
     // Last-journaled-sequence atomic — always populated for replicas. The
     // orchestrator reads it for reconnect handshakes without owning the
     // writer (the writer lives inside `journal_stage` for the lifetime of
-    // the pipeline).
-    let last_seq = Arc::new(AtomicU64::new(0));
+    // the pipeline). Initialise from the writer's pre-pipeline state
+    // (mirrors the primary builder) so the handshake reflects what's
+    // already on disk even before the first fsync nudges the atomic —
+    // a fresh writer here returns `starting_wire_seq == 1` (no genesis
+    // yet) or `>= 2` (post-genesis), so `saturating_sub(1)` yields the
+    // correct "highest wire seq durable" reading at boot.
+    let last_seq = Arc::new(AtomicU64::new(starting_wire_seq.saturating_sub(1)));
     journal_stage.set_last_seq_publisher(Arc::clone(&last_seq));
 
     // Matching stage: same as primary but with no replicas_connected check
