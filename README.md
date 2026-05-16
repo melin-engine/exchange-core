@@ -13,14 +13,15 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 - Verified by property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — more than 700 scenarios in total
 
 **Durable** — every order is persisted and replicated before acknowledgement.
+- configurable durability, with the default hybrid durability 1 node has persisted the record, another has it in memory and is about to persist it as well
 - Crash recovery via journal replay with CRC32C integrity checks
 - BLAKE3 hash chain for tamper evidence
 - Dual-replication to survive and recover from major outage scenarios
 
-**Efficient** — 1.09M orders/sec at sub-400 µs p99 with synchronous dual replication on regular datacenter hardware.
+**Efficient** — 1.06M orders/sec at p99 ≈ 520 µs on regular datacenter hardware.
 - Single-threaded matching engine on a lock-free disruptor pipeline
 - Journal, matching, and replication run in parallel via io_uring
-- 24 µs p99 single-order latency with quorum durability (dual replication)
+- 27 µs p99 single-order latency
 
 **Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity — internal crossing, a new instrument, a parallel-run alongside an existing engine — in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
@@ -33,15 +34,15 @@ All numbers are **full round-trip**:
 3. Matching engine executes
 4. Response arrives at client
 
-Measured over LAN using four AMD EPYC 9255 servers (24C Zen 5, SMT off, 192 GB DDR5-6400, dedicated Micron 7400 PRO PLP NVMe for the journal, Intel E810-XXV 25 Gb/s NIC; 1 benchmark, 1 primary, 2 replicas). Commit [`b184e90`](../../commit/b184e90). [Realistic order flow](crates/exchange/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+Measured over LAN using four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, dedicated Micron 7450 PRO PLP NVMe for the journal, Intel E810-XXV 25 Gb/s NIC; 1 benchmark, 1 primary, 2 replicas). Commit [`271863b9`](../../commit/271863b9). [Realistic order flow](crates/exchange/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
-### Throughput under load (16 clients, window 5)
+### Throughput under load (16 clients, window 11)
 
 Kernel TCP over 25 Gb/s private VLAN, `--durability-mode hybrid` (default) with 2 replicas.
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 | max |
 |------------|-----------|-----|-----|-------|--------|-----|
-| **Hybrid** (1 persisted + 2 in-memory, 2 replicas) | **1.09M/s** | 49 µs | 388 µs | 526 µs | 618 µs | 3,596 µs |
+| **Hybrid** (1 persisted + 2 in-memory, 2 replicas) | **1.06M/s** | 103 µs | 522 µs | 597 µs | 667 µs | 913 µs |
 
 **Hybrid** is the typical live-trading deployment. The gate releases an order once **(a)** *any* node has the event durable on PLP-backed NVMe **and** **(b)** at least two nodes hold it in RAM. With one primary plus two replicas this means:
 
@@ -54,9 +55,9 @@ The replicas' own fsyncs run *off* the critical path in the common case where th
 
 The latency floor — one order at a time, no pipelining, no queueing.
 
-| Durability | p50 | p99 | p99.9 | p99.99 | max |
-|-----------|-----|-----|-------|--------|-----|
-| **Hybrid** (1 persisted + 2 in-memory, 2 replicas) | **18 µs** | **24 µs** | **28 µs** | **31 µs** | 67 µs |
+| Durability | Throughput | p50 | p99 | p99.9 | p99.99 | max |
+|-----------|-----------|-----|-----|-------|--------|-----|
+| **Hybrid** (1 persisted + 2 in-memory, 2 replicas) | 45K/s | **22 µs** | **27 µs** | **30 µs** | **36 µs** | 69 µs |
 
 Same hybrid gate as above, just at window=1 so queueing drops out entirely. The critical path is the *fastest* persistence (primary or replica, whoever wins) plus one replica's RAM-ack RTT in parallel. See [docs/replication.md](docs/replication.md) for the full durability-mode menu and trade-offs.
 
