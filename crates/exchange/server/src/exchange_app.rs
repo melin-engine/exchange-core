@@ -178,11 +178,13 @@ impl Application for ServerApp {
                 currency,
                 amount,
             } => {
-                // Replay-deterministic rejections: `Exchange::withdraw`
-                // already handles insufficient-balance and unknown-account
-                // the same way the replay stage does. Errors are the live
-                // outcome recorded for the client; discarding here matches
-                // current pipeline behaviour (see pipeline.rs withdraw arm).
+                // Withdraw rejections (insufficient balance, unknown
+                // account, has resting orders) are deliberately dropped
+                // today — the engine still applies any state changes
+                // deterministically on both primary and replica, but the
+                // client receives no `Rejected` report. Tracked on the
+                // roadmap as "Withdraw rejections silently dropped in
+                // the pipeline".
                 let _ = self.0.withdraw(account, currency, amount);
                 None
             }

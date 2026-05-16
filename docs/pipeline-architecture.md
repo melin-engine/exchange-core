@@ -207,7 +207,7 @@ Because the journal and matching consumers are gated only on the producer, they 
 
 ## Journal Stage
 
-Defined in `crates/exchange/engine/src/journal/pipeline.rs` as `JournalStage`.
+Defined in `crates/core/transport-core/src/pipeline.rs` as `JournalStage`.
 
 The journal stage runs on a dedicated OS thread and is responsible for making every event durable before it can be acknowledged to clients. It uses `read_batch` + `commit` (not `consume_batch`) to decouple reading from cursor advancement -- the cursor is advanced only **after** the durable write completes.
 
@@ -241,7 +241,7 @@ On shutdown, the journal stage flushes any pending data, then drains all remaini
 
 ## Matching Stage
 
-Defined in `crates/exchange/engine/src/journal/pipeline.rs` as `MatchingStage`.
+Defined in `crates/core/transport-core/src/pipeline.rs` as `MatchingStage`.
 
 The matching stage runs on a dedicated OS thread and is the only thread that mutates the `Exchange` state. This single-writer design eliminates all locks on the hot path.
 
@@ -406,9 +406,9 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/exchange/engine/src/journal/pipeline.rs` |
-| `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/exchange/engine/src/journal/pipeline.rs` |
-| `MAX_JOURNAL_BATCH` | `1024` | `crates/exchange/engine/src/journal/pipeline.rs` |
+| `INPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
+| `OUTPUT_RING_CAPACITY` | `1 << 20` (1,048,576) | `crates/core/transport-core/src/pipeline.rs` |
+| `MAX_JOURNAL_BATCH` | `1024` | `crates/core/transport-core/src/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/exchange/server/src/response.rs` |
 | `MAX_RESPONSE_BUF` | `128` bytes | `crates/exchange/server/src/response.rs` |
 | `NUM_BUFFERS` | `2048` | `crates/exchange/server/src/reader.rs` (io_uring provided buffer pool) |

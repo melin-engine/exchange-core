@@ -14,7 +14,7 @@ compile_error!(
      `skip-order-exec` features enabled"
 );
 
-/// The concrete [`Application`] this server is built against.
+/// The concrete [`melin_app::Application`] this server is built against.
 ///
 /// `ServerApp` is a transparent newtype around `melin_engine::exchange::Exchange`
 /// that carries the `Application` impl. Wrapping is required by the

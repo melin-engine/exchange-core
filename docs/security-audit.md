@@ -60,7 +60,7 @@ No per-account or per-connection rate limiting on order submissions. A single cl
 
 ### SEC-05: Journal disk exhaustion hangs the server (MEDIUM)
 
-**File**: `crates/exchange/engine/src/journal/writer.rs:265-275`
+**File**: `crates/core/journal/src/{sector_writer.rs, buffered_writer.rs}` (posix_fallocate call sites)
 
 When the journal disk fills, `posix_fallocate` returns ENOSPC. The error propagates to the journal stage, but there is no graceful degradation — the journal stage stops advancing its cursor, the response stage stops sending, and the server effectively hangs.
 
@@ -108,7 +108,7 @@ All traffic including auth signatures, order data, and fill reports is sent unen
 
 ### SEC-09: Snapshot file tampering — cross-invariant validation (MEDIUM)
 
-**Files**: `crates/exchange/engine/src/journal/snapshot.rs:418-571`
+**Files**: `crates/exchange/engine/src/snapshot.rs` (decode_book_snapshot, decode_resting_side_levels, decode_balances, decode_reservations)
 
 The OOM-via-large-count vector was closed (counts are now bounded against remaining buffer before `Vec::with_capacity`). Remaining issues:
 
