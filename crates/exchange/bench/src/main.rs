@@ -138,19 +138,93 @@ pub(crate) fn rdtscp() -> u64 {
 /// against `Instant::now()`. Returns the conversion factor (ticks / ns).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn calibrate_tsc() -> f64 {
+    calibrate_tsc_clock().ticks_per_ns
+}
+
+/// Anchored TSC clock: ticks-per-ns plus a `(tsc, unix_ns)` pair captured at
+/// calibration time. Lets the hot path turn any later `rdtscp()` reading
+/// into a UNIX-nanos timestamp without a `clock_gettime()` vDSO call —
+/// previously `~25 ns` per event and visible in flamegraphs as ~6 % of
+/// the bench's `pipeline-pub` thread.
+///
+/// Two sources of error to be aware of when reading derived timestamps:
+///
+/// - **Anchor-capture offset** (~30–50 ns, constant): the calibration
+///   loop reads `unix_ns` first and the TSC second, so derived values
+///   undershoot truth by the time it takes one `clock_gettime` call to
+///   complete (plus a few cycles of bookkeeping). Choosing
+///   undershoot is deliberate — a "did we pass deadline X?" check
+///   downstream falsing earlier is safer than falsing later.
+/// - **Linear drift** from the calibration's `ticks_per_ns` measurement
+///   error. On a 10 ms sleep against `Instant::now()`, that's typically
+///   bounded by sleep jitter (single-digit µs) plus the host's TSC
+///   stability vs the kernel's `CLOCK_MONOTONIC`. Empirically ~100 ppm
+///   on this fleet, so a 60 s bench drifts up to ~6 ms — well below
+///   anything `Exchange`'s GTD scheduler or SEC-04 rate limiter
+///   exercises at the flows we publish, but a bench that toggles
+///   either would need a fresher anchor.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct TscClock {
+    pub(crate) ticks_per_ns: f64,
+    /// Inverse of `ticks_per_ns`, precomputed so the hot path uses
+    /// multiplication instead of division (a few cycles per event).
+    pub(crate) ns_per_tick: f64,
+    /// TSC reading at calibration time. Pairs with `anchor_unix_ns`.
+    pub(crate) anchor_tsc: u64,
+    /// UNIX nanos at calibration time. Pairs with `anchor_tsc`.
+    pub(crate) anchor_unix_ns: u64,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl TscClock {
+    /// Convert a TSC reading taken later in this process to UNIX
+    /// nanoseconds. Saturates at the anchor if `ts < anchor_tsc`
+    /// (shouldn't happen on any monotonic counter, but defensive
+    /// against unexpected CPU migrations on cores with un-synchronised
+    /// TSCs). See the struct docs for the small constant offset and the
+    /// linear drift bound.
+    #[inline(always)]
+    pub(crate) fn unix_ns(&self, ts: u64) -> u64 {
+        let delta_ticks = ts.saturating_sub(self.anchor_tsc);
+        self.anchor_unix_ns + (delta_ticks as f64 * self.ns_per_tick) as u64
+    }
+}
+
+/// Calibrate TSC and capture an anchor pair (`tsc`, `unix_ns`) so the hot
+/// path can derive wall-clock timestamps from `rdtscp()` alone.
+///
+/// `anchor_unix_ns` is sampled *before* `anchor_tsc` so the natural
+/// inter-call delay (one vDSO `clock_gettime`, ~25–50 ns) pushes the
+/// recorded UNIX-nanos slightly into the past relative to the TSC
+/// anchor. The result: `TscClock::unix_ns(ts)` always returns a value
+/// no later than what `clock_gettime` would have returned at the same
+/// `ts`. See `TscClock` docs for the full error model.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn calibrate_tsc_clock() -> TscClock {
     // Warm up the counter path.
     for _ in 0..100 {
         let _ = rdtscp();
     }
 
     let duration = Duration::from_millis(10);
-    let t0_tsc = rdtscp();
+    // Order matters: capture `anchor_unix_ns` *before* `anchor_tsc` so
+    // any inter-call slippage rounds derived timestamps earlier rather
+    // than later (see fn docs).
+    let anchor_unix_ns = melin_app::unix_epoch_nanos();
+    let anchor_tsc = rdtscp();
     let t0_wall = Instant::now();
     std::thread::sleep(duration);
     let t1_tsc = rdtscp();
     let elapsed_ns = t0_wall.elapsed().as_nanos() as f64;
-    let elapsed_tsc = (t1_tsc - t0_tsc) as f64;
-    elapsed_tsc / elapsed_ns
+    let elapsed_tsc = (t1_tsc - anchor_tsc) as f64;
+    let ticks_per_ns = elapsed_tsc / elapsed_ns;
+    TscClock {
+        ticks_per_ns,
+        ns_per_tick: 1.0 / ticks_per_ns,
+        anchor_tsc,
+        anchor_unix_ns,
+    }
 }
 
 /// Convert counter tick delta to nanoseconds using a pre-calibrated factor.
@@ -738,7 +812,6 @@ fn run_pipeline_inner<W>(
             Writer = W,
         >,
 {
-    use melin_app::unix_epoch_nanos;
     use melin_engine::journal::InputSlot;
     use melin_engine::journal::JournalEvent;
     use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
@@ -812,9 +885,15 @@ fn run_pipeline_inner<W>(
     // Using melin_disruptor::spsc instead of std::sync::mpsc::sync_channel
     // eliminates the mutex overhead per order (~2-5µs tail reduction).
     let inflight = Arc::new(AtomicU64::new(0));
-    // TSC ticks instead of Instant::now() — ~4ns vs ~15-25ns per timestamp,
-    // reducing measurement overhead from ~15% to ~1% of total CPU.
-    let ticks_per_ns = calibrate_tsc();
+    // TSC ticks instead of Instant::now() for the latency measurement
+    // (~4 ns vs ~15-25 ns per timestamp). The clock also carries an
+    // epoch pair so we derive the engine-facing `timestamp_ns` from the
+    // same `rdtscp()` reading the latency histogram already uses,
+    // removing the per-event `clock_gettime()` that previously
+    // dominated the publisher thread's profile (~9 B cycles / 6 % of
+    // its samples on a 30 s capture).
+    let tsc_clock = calibrate_tsc_clock();
+    let ticks_per_ns = tsc_clock.ticks_per_ns;
     // SPSC channel requires capacity >= 2; clamp so `--window=1` (useful
     // for isolating pure pipeline latency without queueing) doesn't panic.
     let ts_capacity = window.next_power_of_two().max(2);
@@ -846,7 +925,7 @@ fn run_pipeline_inner<W>(
                     key_hash: 0,
                     request_seq: 0,
                     sequence: 0,
-                    timestamp_ns: unix_epoch_nanos(),
+                    timestamp_ns: tsc_clock.unix_ns(ts),
                     event: JournalEvent::App(
                         melin_trading::trading_event::TradingEvent::SubmitOrder {
                             symbol: Symbol(1),
@@ -2107,4 +2186,40 @@ fn tempdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("melin-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+#[cfg(test)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod tsc_clock_tests {
+    use super::*;
+
+    /// A freshly calibrated `TscClock`, queried immediately, must agree
+    /// with `melin_app::unix_epoch_nanos()` to within a millisecond.
+    /// That window catches both flipped-sign anchor regressions
+    /// (derived value diverges by anchor_unix_ns) and a units mix-up in
+    /// `ns_per_tick` (the elapsed delta is small immediately after
+    /// calibration, so any factor error would still surface as a few-µs
+    /// drift before the kernel clock advances by the same amount).
+    #[test]
+    fn freshly_calibrated_clock_matches_wall_clock_within_1ms() {
+        let clock = calibrate_tsc_clock();
+        let derived = clock.unix_ns(rdtscp());
+        let now_unix = melin_app::unix_epoch_nanos();
+        let diff = derived.abs_diff(now_unix);
+        assert!(
+            diff < 1_000_000,
+            "derived {derived} vs wall {now_unix}, |Δ| = {diff} ns"
+        );
+    }
+
+    /// `unix_ns` must not underflow when the supplied TSC reading is
+    /// older than the anchor (which can happen if a thread migrated to
+    /// a core with an out-of-sync TSC, or simply if a TSC reading
+    /// captured pre-calibration is fed in by mistake).
+    #[test]
+    fn unix_ns_saturates_on_pre_anchor_tsc() {
+        let clock = calibrate_tsc_clock();
+        let value = clock.unix_ns(clock.anchor_tsc.saturating_sub(1_000));
+        assert_eq!(value, clock.anchor_unix_ns);
+    }
 }
