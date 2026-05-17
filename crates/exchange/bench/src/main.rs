@@ -549,9 +549,10 @@ fn run_engine_bench(
     let measure_end = total_events.saturating_sub(cooldown);
 
     // Orders are generated on-the-fly so memory stays bounded for long runs.
-    // RNG cost per event (~tens of ns) is folded into the measured latency,
-    // which matches the production hot path where the engine sees fresh
-    // requests rather than a pre-materialised batch.
+    // `next_event()` is called *before* `t0 = rdtscp()` in the hot loop, so
+    // RNG cost is excluded from the per-order measurement — same window as
+    // the pre-refactor pre-generated path. Latency numbers remain
+    // comparable to historical engine-bench baselines.
     let mut flow = OrderFlowGenerator::new(config);
 
     let mut reports = Vec::with_capacity(256);

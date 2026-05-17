@@ -605,8 +605,10 @@ pub fn run_dpdk_roundtrip(
                     }
                     Err(e) => {
                         // Client-side TCP error — debug! per project log-level
-                        // convention. Park the frame for retry.
-                        eprintln!("debug: dpdk send_slice error: {e:?}");
+                        // convention (silent at default RUST_LOG level so a
+                        // noisy network doesn't spam stderr). Park the frame
+                        // for retry.
+                        tracing::debug!("dpdk send_slice error: {e:?}");
                         conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
                         break;
                     }
