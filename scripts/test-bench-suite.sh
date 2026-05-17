@@ -52,8 +52,8 @@ cleanup() {
     else
         echo ""
         echo "Containers left running (--no-cleanup). Re-run the suite with:"
-        echo "  JOURNAL_PATH=/tmp/journal/bench.journal THROUGHPUT_ORDERS=1000 THROUGHPUT_CLIENTS=2 \\"
-        echo "  THROUGHPUT_WINDOW=4 WARMUP_ORDERS=10 SINGLE_ORDERS=100 RUN_PLOTS=0 \\"
+        echo "  JOURNAL_PATH=/tmp/journal/bench.journal THROUGHPUT_DURATION=2s THROUGHPUT_CLIENTS=2 \\"
+        echo "  THROUGHPUT_WINDOW=4 WARMUP_DURATION=500ms SINGLE_DURATION=1s RUN_PLOTS=0 \\"
         echo "  TRANSPORTS=tcp-dual-repl WORKLOADS=throughput,single \\"
         echo "    ./scripts/lan-bench-suite.sh $SERVER_IP $BENCH_IP $SERVER_IP root \\"
         echo "      $REPLICA_IP $REPLICA_IP $REPLICA2_IP $REPLICA2_IP"
@@ -85,13 +85,14 @@ declare -A DEFAULTS=(
     [JOURNAL_PATH]=/tmp/journal/bench.journal
     [TRANSPORTS]=tcp-dual-repl
     [WORKLOADS]=throughput,single
-    [THROUGHPUT_ORDERS]=1000
+    [THROUGHPUT_DURATION]=2s
     [THROUGHPUT_CLIENTS]=2
     [THROUGHPUT_WINDOW]=4
-    [WARMUP_ORDERS]=10
-    [SINGLE_ORDERS]=100
-    [ORDERS_PER_SWEEP]=1000
-    [LOCAL_ORDERS]=1000
+    [WARMUP_DURATION]=500ms
+    [COOLDOWN_DURATION]=0s
+    [SINGLE_DURATION]=1s
+    [SWEEP_DURATION]=2s
+    [LOCAL_DURATION]=2s
     [RUN_PLOTS]=0
 )
 

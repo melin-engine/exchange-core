@@ -27,7 +27,7 @@ use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 
 use crate::generator;
-use crate::{TimeSeries, maybe_sample, print_results, spawn_progress_reporter};
+use crate::{BenchPhases, TimeSeries, maybe_sample, print_results, spawn_progress_reporter};
 
 /// TCP socket buffer size. 64KB gives plenty of headroom for pipelined
 /// frames in flight.
@@ -45,8 +45,8 @@ struct DpdkBenchConn {
     handle: SocketHandle,
     /// Accumulated received bytes for frame parsing.
     parse_buf: Vec<u8>,
-    /// Order generator — produces frames on-the-fly so memory stays bounded
-    /// regardless of `total_orders`.
+    /// Order generator — produces frames on-the-fly. No pre-allocated cap:
+    /// the bench runs until the wall-clock cooldown deadline expires.
     flow: generator::OrderFlowGenerator,
     /// Reusable scratch buffer holding the current wire frame
     /// (`[u32 LE len][payload]`) until it's fully sent. Sized for the
@@ -57,22 +57,14 @@ struct DpdkBenchConn {
     /// the next poll iteration can retry without re-generating — the
     /// generator is stateful and cannot be rewound. Distinct from
     /// `send_pending`, which holds *partial-send remainders* of frames
-    /// that have already been counted in `inflight_ts` / `send_cursor`.
+    /// that have already started hitting the wire.
     pending_unsent: Option<Vec<u8>>,
-    /// Number of frames produced so far (also drives the send window check).
-    send_cursor: usize,
     /// Pending send bytes (partial frame that didn't fit in smoltcp TX buffer).
     send_pending: Vec<u8>,
     /// FIFO of send timestamps (TSC ticks) for in-flight orders.
     /// `u64` instead of `Instant` to avoid ~15-25ns vDSO overhead per
     /// timestamp on the hot path.
     inflight_ts: VecDeque<u64>,
-    /// Number of BatchEnd responses received (including warmup).
-    batch_count: usize,
-    /// Total orders this connection must process.
-    total_orders: usize,
-    /// True when all responses received.
-    done: bool,
 }
 
 /// DPDK benchmark configuration.
@@ -95,10 +87,9 @@ pub struct DpdkBenchConfig {
 #[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_roundtrip(
     config: DpdkBenchConfig,
-    total_pairs: usize,
+    phases: BenchPhases,
     window: usize,
     num_clients: usize,
-    warmup: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
@@ -312,36 +303,22 @@ pub fn run_dpdk_roundtrip(
     // time. smoltcp's connect() sends the SYN on the next poll — if we
     // create all sockets upfront, all SYNs go out simultaneously and the
     // server may accept them in arbitrary order, causing auth deadlocks.
-    let pairs_per_client = total_pairs / num_clients;
-    let remainder = total_pairs % num_clients;
-
-    // Build a generator per client. Orders are produced on-the-fly during
-    // the bench loop so memory stays bounded regardless of run length.
-    let per_client: Vec<(generator::OrderFlowGenerator, usize)> = (0..num_clients)
+    // Build a generator per client. Phases are driven by wall-clock
+    // deadlines on the shared `start` instant, so there is no
+    // per-client total to compute — generators run indefinitely.
+    //
+    // ORDER_ID_STRIDE matches the io_uring path: 2^48 ids per client,
+    // more than three orders of magnitude beyond any realistic run at
+    // 10 M/s.
+    const ORDER_ID_STRIDE: u64 = 1u64 << 48;
+    let per_client: Vec<generator::OrderFlowGenerator> = (0..num_clients)
         .map(|client_id| {
-            let client_pairs = if client_id == num_clients - 1 {
-                pairs_per_client + remainder
-            } else {
-                pairs_per_client
-            };
-            let total_orders = warmup + client_pairs * 2;
-            let order_id_offset: u64 = (0..client_id)
-                .map(|c| {
-                    let p = if c == num_clients - 1 {
-                        pairs_per_client + remainder
-                    } else {
-                        pairs_per_client
-                    };
-                    (warmup + p * 2) as u64
-                })
-                .sum();
-            let flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+            generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
-                start_order_id: order_id_offset + 1,
+                start_order_id: ORDER_ID_STRIDE * (client_id as u64) + 1,
                 ..Default::default()
-            });
-            (flow, total_orders)
+            })
         })
         .collect();
     eprintln!("  per-client generators initialised for {num_clients} clients");
@@ -353,7 +330,7 @@ pub fn run_dpdk_roundtrip(
     let mut connections: Vec<DpdkBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
     eprintln!("  connecting {num_clients} clients via DPDK...");
-    for (client_id, (flow, total_orders)) in per_client.into_iter().enumerate() {
+    for (client_id, flow) in per_client.into_iter().enumerate() {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -383,12 +360,8 @@ pub fn run_dpdk_roundtrip(
             flow,
             scratch_frame: Vec::with_capacity(generator::MAX_REQUEST_FRAME_BYTES),
             pending_unsent: None,
-            send_cursor: 0,
             send_pending: Vec::new(),
             inflight_ts: VecDeque::with_capacity(window),
-            batch_count: 0,
-            total_orders,
-            done: false,
         });
 
         // Wait for TCP handshake to complete.
@@ -428,12 +401,11 @@ pub fn run_dpdk_roundtrip(
     );
 
     // --- Main benchmark loop ---
-    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = spawn_progress_reporter(
         Arc::clone(&progress),
-        total_all_orders,
+        phases,
         Arc::clone(&progress_shutdown),
     );
 
@@ -441,6 +413,7 @@ pub fn run_dpdk_roundtrip(
 
     let ticks_per_ns = crate::calibrate_tsc();
     let start = Instant::now();
+    let deadlines = phases.deadlines(start);
     let mut measured_start: Option<Instant> = None;
 
     let mut histogram =
@@ -528,7 +501,24 @@ pub fn run_dpdk_roundtrip(
                 .ok();
         }
 
-        let mut all_done = true;
+        // Sample the wall clock once per outer iter and reuse it for
+        // both the cooldown break and the per-completion phase
+        // classifier below. Saves one vDSO call (~15-25 ns) per
+        // BatchEnd; at multi-M ops/s the per-completion `Instant::now()`
+        // was visible in profiles. Phase boundaries are coarse (5 s
+        // warmup, 60 s measured) so the reused timestamp misclassifies
+        // at most a handful of samples on a boundary — orders of
+        // magnitude below run-to-run noise.
+        //
+        // Wall-clock-driven termination: stop once cooldown ends. The
+        // histogram is sealed at `measured_end` so any responses that
+        // would arrive in the cooldown tail are already discarded by
+        // the phase classifier; abandoning them doesn't change the
+        // reported latencies.
+        let now = Instant::now();
+        if now >= deadlines.cooldown_end {
+            break;
+        }
 
         for (i, conn) in connections.iter_mut().enumerate() {
             // Mid-iteration poll to flush TX and receive new data.
@@ -541,11 +531,6 @@ pub fn run_dpdk_roundtrip(
                     &mut cached_ts,
                 );
             }
-
-            if conn.done {
-                continue;
-            }
-            all_done = false;
 
             let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
 
@@ -566,14 +551,12 @@ pub fn run_dpdk_roundtrip(
 
             // Send new frames while window has room. Each frame is generated
             // on-the-fly into `scratch_frame` as [u32 LE len][payload]. When
-            // the socket can't accept any bytes, the unsent frame is parked in
-            // `pending_unsent` and `inflight_ts` / `send_cursor` are *not*
-            // advanced — so the recorded send timestamp reflects the moment
-            // bytes actually start hitting the wire, matching pre-refactor
-            // semantics.
+            // the socket can't accept any bytes, the unsent frame is parked
+            // in `pending_unsent` and `inflight_ts` is *not* advanced — so
+            // the recorded send timestamp reflects the moment bytes actually
+            // start hitting the wire, not the moment generation completed.
             while conn.send_pending.is_empty()
                 && conn.inflight_ts.len() < window
-                && conn.send_cursor < conn.total_orders
                 && socket.can_send()
             {
                 // Reuse a previously-generated-but-never-sent frame if there
@@ -588,14 +571,12 @@ pub fn run_dpdk_roundtrip(
                 match socket.send_slice(wire_frame) {
                     Ok(n) if n == wire_frame.len() => {
                         conn.inflight_ts.push_back(crate::rdtscp());
-                        conn.send_cursor += 1;
                     }
                     Ok(n) if n > 0 => {
                         // Partial send — remainder goes to send_pending; the
                         // frame has started hitting the wire so it counts.
                         conn.send_pending.extend_from_slice(&wire_frame[n..]);
                         conn.inflight_ts.push_back(crate::rdtscp());
-                        conn.send_cursor += 1;
                     }
                     Ok(_) => {
                         // Zero bytes sent — socket transiently full. Park the
@@ -644,36 +625,29 @@ pub fn run_dpdk_roundtrip(
                 if let Ok(response) = codec::decode_response(payload)
                     && matches!(response, ResponseKind::BatchEnd)
                 {
-                    conn.batch_count += 1;
-                    progress.fetch_add(1, Ordering::Relaxed);
-
-                    if conn.batch_count > warmup {
+                    // Always pop the inflight entry to keep the FIFO
+                    // aligned with sends — without this, cooldown
+                    // completions would leak the queue.  Phase
+                    // classification by *receive* time, reusing the
+                    // outer-iter `now`: past `measured_end` we discard
+                    // the sample, before `warmup_end` we discard too.
+                    if let Some(sent_tsc) = conn.inflight_ts.pop_front()
+                        && now >= deadlines.warmup_end
+                        && now < deadlines.measured_end
+                    {
                         if measured_start.is_none() {
-                            measured_start = Some(Instant::now());
+                            measured_start = Some(now);
                         }
-                        if let Some(sent_tsc) = conn.inflight_ts.pop_front() {
-                            let latency_ns =
-                                crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
-                            histogram.record(latency_ns).ok();
-                            interval_hist.record(latency_ns).ok();
-                            interval_count += 1;
-                            maybe_sample(
-                                &mut interval_hist,
-                                &mut interval_count,
-                                &mut series,
-                                start,
-                            );
-                            #[cfg(feature = "latency-trace")]
-                            {
-                                work_done_this_iter = true;
-                            }
+                        let latency_ns = crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
+                        histogram.record(latency_ns).ok();
+                        interval_hist.record(latency_ns).ok();
+                        interval_count += 1;
+                        maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
+                        progress.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "latency-trace")]
+                        {
+                            work_done_this_iter = true;
                         }
-                    } else {
-                        conn.inflight_ts.pop_front();
-                    }
-
-                    if conn.batch_count >= conn.total_orders {
-                        conn.done = true;
                     }
                 }
 
@@ -696,10 +670,6 @@ pub fn run_dpdk_roundtrip(
             let elapsed_ns = crate::tsc_to_ns(crate::rdtscp() - iter_start_tsc, ticks_per_ns);
             poll_iter_hist.record(elapsed_ns).ok();
         }
-
-        if all_done {
-            break;
-        }
     }
 
     // Snapshot end time BEFORE joining the progress thread: that thread
@@ -713,7 +683,7 @@ pub fn run_dpdk_roundtrip(
     let _ = progress_handle.join();
 
     let measured_wall = measured_start
-        .map(|s| end.duration_since(s))
+        .map(|s| end.duration_since(s).min(phases.measured))
         .unwrap_or_else(|| start.elapsed());
 
     series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
@@ -770,8 +740,8 @@ pub fn run_dpdk_roundtrip(
 
     print_results(
         "Roundtrip",
-        total_pairs * 2,
-        warmup * num_clients,
+        histogram.len() as usize,
+        phases,
         &histogram,
         measured_wall,
         &extra_lines,

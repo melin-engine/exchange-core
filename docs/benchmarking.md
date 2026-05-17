@@ -108,27 +108,29 @@ Two tests:
 ## CLI Parameters
 
 ```
-cargo run --release --bin melin-bench [-- [OPTIONS] [PAIRS]]
+cargo run --release --bin melin-bench [-- [OPTIONS]]
 ```
 
-### Positional arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `PAIRS` | 1,000,000 | Number of order pairs (each pair = 1 buy + 1 sell = 2 orders measured). Total measured orders = `PAIRS * 2`. |
+Run length is wall-clock-driven. The three phases (warmup, measured,
+cooldown) are configured as durations; the bench loop runs until each
+phase's deadline elapses. Completions are classified by receive time
+against shared phase cutoffs, so all bench threads agree on which
+samples count without further coordination.
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--mode` | `roundtrip` | Benchmark mode: `roundtrip`, `pipeline`, or `engine`. |
+| `--duration` | `60s` | Measured-phase duration. Latencies recorded in this window populate the histogram. Accepts humantime values (`500ms`, `30s`, `2m`). |
+| `--warmup-duration` | `5s` | Pre-measurement priming. Caches, branch predictors, and allocator arenas settle here. Samples discarded. |
+| `--cooldown-duration` | `5s` | Post-measurement drain. The journal's final non-amortised fsync would otherwise inflate the histogram's max with a drain-tail artefact. Samples discarded. |
 | `--addr <IP:PORT>` | (none) | Connect to a remote engine instead of spawning an embedded server. Enables LAN benchmarking. Mutually exclusive with `--uds`. Requires `--key`. |
 | `--uds` | false | Use Unix domain sockets instead of TCP (roundtrip mode only, local embedded server). |
 | `--clients` | 16 | Number of concurrent client connections (roundtrip mode). |
 | `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. |
 | `--bench-threads` | 4 | Number of bench client threads. Each runs its own io_uring ring and manages a subset of connections. |
 | `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see [roadmap deferred section](roadmap.md#deferred)). |
-| `--warmup` | 100,000 | Warmup orders per client (not included in measurements). Primes caches, branch predictors, and allocator state. |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
 | `--accounts` | 10,000 | Number of trading accounts in the generator. |
 | `--instruments` | 100 | Number of instruments. |
@@ -159,7 +161,7 @@ On x86_64, per-order latency is measured with `rdtscp` for minimal overhead. TSC
 
 Latency samples are recorded into an HDR Histogram with 3 significant digits of precision, providing sub-percent-accurate percentile reporting across the full dynamic range.
 
-Warmup orders (default 100,000 per client) are excluded from the histogram. Only the measured portion contributes to reported percentiles.
+Only completions that arrive during the measured phase populate the histogram. Warmup and cooldown completions are timestamped and acknowledged the same way as measured ones, but their samples are discarded — they keep the pipeline saturated without contaminating the percentiles.
 
 ### Percentile depth
 
@@ -246,9 +248,10 @@ cargo build --release -p melin-server --features tick-to-trade
 cargo build --release -p melin-bench  --features tick-to-trade
 
 # Roundtrip benchmark — decomposition appears under the latency table.
-# Use 1M+ orders so warmup phase doesn't dominate the percentiles
-# (see "Measurement window" below).
-./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 1000000
+# A 60 s measured phase comfortably saturates server-side histograms;
+# server-side stages also accumulate seed-drain noise (see
+# "Measurement window" below).
+./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 --duration=60s
 
 # Or fetch the dump directly without running the bench.
 curl http://127.0.0.1:9878/stats-dump
@@ -338,7 +341,7 @@ cat /sys/devices/system/cpu/nohz_full     # should print: 1-5
 
 ### Throughput
 
-Reported as orders/sec, computed as `(measured_orders + warmup_orders) / wall_time`. The wall time covers the entire run including warmup, since warmup orders still consume server resources. The throughput number represents the sustained rate the server processes under load, not just the measured portion.
+Reported as orders/sec, computed as `measured_orders / measured_duration`. Wall time equals `--duration` (the measured-phase length); warmup and cooldown work is excluded from both numerator and denominator, so the number represents steady-state throughput once caches have settled, not an average that includes the cold start.
 
 ### Latency percentiles
 
@@ -438,6 +441,6 @@ The binary is at `target/release/melin-bench`.
 
 7. **No market data consumers**: the benchmark does not simulate market data subscribers reading order book updates. In production, market data dissemination adds load to the output path.
 
-8. **Warmup sensitivity**: the default 100,000 warmup orders per client is sufficient for cache and branch predictor priming, but very short runs (e.g., 1,000 pairs) may not reach steady state. Use at least 100,000 pairs for meaningful results.
+8. **Warmup sensitivity**: the default 5 s warmup is enough for caches, branch predictors, and the allocator arena on a quiet machine, but very short measured phases (e.g., `--duration=500ms`) leave too few samples for meaningful tail percentiles. Use `--duration=30s` or longer for headline numbers; shorter runs are fine for iteration.
 
 9. **TSC reliability**: the TSC-based timing assumes an invariant TSC (constant rate regardless of frequency scaling). This is true on modern x86_64 CPUs, but the calibration sleep may introduce a few percent of systematic error in the ticks-to-nanoseconds conversion.

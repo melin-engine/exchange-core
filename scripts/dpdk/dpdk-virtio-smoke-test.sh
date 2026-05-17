@@ -403,15 +403,16 @@ chmod 600 "$TMPDIR/bench.key"
 echo ""
 
 echo "=== Running smoke benchmark ==="
-echo "  1000 order pairs, 1 client, window 1 (single-order latency)"
+echo "  short timed run, 1 client, window 1 (single-order latency)"
 
 "$PROJECT_DIR/target/release/melin-bench" \
     --addr "$DPDK_IP:$DPDK_PORT" \
     --key "$TMPDIR/bench.key" \
     --clients 1 \
     --window 1 \
-    --warmup 100 \
-    1000 \
+    --warmup-duration 1s \
+    --duration 3s \
+    --cooldown-duration 0s \
     2>&1 | tee "$TMPDIR/bench.log"
 
 BENCH_EXIT=$?
