@@ -617,12 +617,14 @@ struct BenchArgs {
     #[arg(long, default_value_t = 4096)]
     max_journal_batch: usize,
     /// Fail the run (exit code 2) if more than this percent of acknowledged
-    /// requests were rejected (roundtrip mode only). Default 1.0%. Set to
-    /// 100.0 to disable. A high rejection ratio almost always indicates a
-    /// configuration error — e.g. accounts underfunded, symbols unknown,
-    /// risk limits too tight — which the latency histogram alone cannot
-    /// surface.
-    #[arg(long, default_value_t = 1.0)]
+    /// requests were rejected. Default 50.0% — the realistic-flow
+    /// generator naturally produces a few percent of rejections (FOK
+    /// can't fill, market orders on cold books, cancels of consumed
+    /// orders), so the threshold is set to catch catastrophic misconfig
+    /// ("most orders rejected") rather than noise. Set to 100.0 to
+    /// disable; lower it for production-flow runs where rejections
+    /// should be near-zero.
+    #[arg(long, default_value_t = 50.0)]
     max_reject_pct: f64,
 }
 
@@ -657,6 +659,7 @@ fn main() {
                 args.instruments,
                 json_path,
                 args.target_rate,
+                args.max_reject_pct,
             );
         }
         "pipeline" => {
@@ -669,6 +672,7 @@ fn main() {
                 args.max_journal_batch,
                 args.journal_writer,
                 args.target_rate,
+                args.max_reject_pct,
             );
         }
         "roundtrip" => {
@@ -762,6 +766,7 @@ fn run_engine_bench(
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
     target_rate: u64,
+    max_reject_pct: f64,
 ) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
@@ -896,6 +901,11 @@ fn run_engine_bench(
     let mut slowest: std::collections::BinaryHeap<std::cmp::Reverse<SlowEntry>> =
         std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
 
+    // Outcome counters span both measured and cooldown loops below so a
+    // misconfiguration where every order is rejected fails the run loud
+    // — see [`OutcomeReport`] doc.
+    let mut outcomes = OutcomeReport::default();
+
     // Measured phase: record latencies until `measured_end` passes. We
     // poll `Instant::now()` only once per ~DEADLINE_POLL_INTERVAL
     // iterations because every per-order `Instant::now()` (~15-25 ns
@@ -1021,6 +1031,15 @@ fn run_engine_bench(
                 offset_us,
             }));
         }
+
+        // Outcome tally runs *after* `elapsed_ns` was computed above, so
+        // walking the reports vec is not billed to the engine-call
+        // measurement. One BatchEnd per input event mirrors the
+        // network-bench accounting (one BatchEnd per request).
+        outcomes.batch_ends += 1;
+        for r in reports.iter() {
+            outcomes.record_execution_report(r);
+        }
     }
     // Clamp to `phases.measured` so the reported throughput divisor
     // matches the configured measured-phase length even when the
@@ -1062,6 +1081,12 @@ fn run_engine_bench(
                     &mut reports,
                 );
             }
+        }
+        // Tally cooldown outcomes too — `OutcomeReport` covers the whole
+        // run, mirroring the network bench's cross-phase accounting.
+        outcomes.batch_ends += 1;
+        for r in reports.iter() {
+            outcomes.record_execution_report(r);
         }
     }
 
@@ -1122,10 +1147,7 @@ fn run_engine_bench(
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
         pacing_report.as_ref(),
-        // Engine mode invokes the matcher directly and the bench loop
-        // doesn't aggregate report variants. Skip the outcome block
-        // rather than emit zeros that misrepresent the run.
-        None,
+        Some(&outcomes),
     );
 
     // Print the slowest orders for tail latency diagnosis.
@@ -1139,6 +1161,8 @@ fn run_engine_bench(
         let num_reports = entry.num_reports;
         println!("    {latency_us:>7.2}µs  @{offset_ms:>7.1}ms  reports={num_reports}  {event:?}");
     }
+
+    enforce_rejection_threshold(&outcomes, max_reject_pct);
 }
 
 // ===========================================================================
@@ -1159,6 +1183,7 @@ fn run_pipeline_bench(
     max_journal_batch: usize,
     journal_writer_mode: melin_server::JournalWriterMode,
     target_rate: u64,
+    max_reject_pct: f64,
 ) {
     use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
 
@@ -1184,6 +1209,7 @@ fn run_pipeline_bench(
         window,
         json_path,
         target_rate,
+        max_reject_pct,
     };
 
     // The two arms are forced by monomorphisation — each writer has
@@ -1215,6 +1241,7 @@ struct PipelineInnerCfg<'a> {
     window: usize,
     json_path: Option<&'a std::path::Path>,
     target_rate: u64,
+    max_reject_pct: f64,
 }
 
 /// Pipeline-mode body, generic over the journal writer so we get a
@@ -1231,6 +1258,7 @@ where
     use melin_server::JournalEvent;
     use melin_server::pipeline::{JournalStageRun, build_pipeline_with_replication};
     use melin_server::trace::mono_trace_ns;
+    use melin_transport_core::pipeline::OutputPayload;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -1239,6 +1267,7 @@ where
         window,
         json_path,
         target_rate,
+        max_reject_pct,
     } = cfg;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
@@ -1432,6 +1461,7 @@ where
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut measured_orders: u64 = 0;
     let mut measured_start: Option<Instant> = None;
+    let mut outcomes = OutcomeReport::default();
     let start = phase_start;
 
     // Drain until cooldown ends. Classify each completion by *receive*
@@ -1460,6 +1490,9 @@ where
                 std::hint::spin_loop();
             };
             inflight.fetch_sub(1, Ordering::Release);
+            // Capture `rdtscp()` BEFORE the outcome tally below so the
+            // histogram reflects only the pipeline roundtrip, not the
+            // bench's post-processing cost.
             let latency_ns = tsc_to_ns(rdtscp() - sent_at, ticks_per_ns);
             if now >= deadlines.warmup_end && now < deadlines.measured_end {
                 if measured_start.is_none() {
@@ -1468,6 +1501,18 @@ where
                 histogram.record(latency_ns).expect("record");
                 measured_orders += 1;
             }
+            // One request boundary per `is_last_in_request` flag — the
+            // in-process equivalent of one wire `BatchEnd` frame.
+            outcomes.batch_ends += 1;
+        }
+        // Tally the payload variant *after* the latency capture above.
+        // Report payloads count as their inner execution-report variant;
+        // EngineError payloads are tracked separately. BatchEnd /
+        // QueryResponse payloads carry no order-acceptance signal.
+        match slot.payload {
+            OutputPayload::Report(report) => outcomes.record_execution_report(&report),
+            OutputPayload::EngineError => outcomes.engine_errors += 1,
+            OutputPayload::BatchEnd | OutputPayload::QueryResponse(_) => {}
         }
     }
 
@@ -1532,10 +1577,10 @@ where
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
         pacing_report.as_ref(),
-        // Pipeline mode drains OutputSlots directly and doesn't tally
-        // report variants. See engine-mode comment.
-        None,
+        Some(&outcomes),
     );
+
+    enforce_rejection_threshold(&outcomes, max_reject_pct);
 
     println!();
     println!("=== Pipeline Latency Trace ===");
@@ -2801,24 +2846,33 @@ impl OutcomeReport {
     pub fn record(&mut self, response: &ResponseKind) {
         match response {
             ResponseKind::BatchEnd => self.batch_ends += 1,
-            ResponseKind::Report(report) => match report {
-                ExecutionReport::Placed { .. } => self.placed += 1,
-                ExecutionReport::Fill { .. } => self.fills += 1,
-                ExecutionReport::Cancelled { .. } => self.cancelled += 1,
-                ExecutionReport::Triggered { .. } => self.triggered += 1,
-                ExecutionReport::Replaced { .. } => self.replaced += 1,
-                ExecutionReport::InstrumentStatusChanged { .. } => self.instrument_status += 1,
-                ExecutionReport::Rejected { reason, .. } => {
-                    self.rejected += 1;
-                    self.reject_reasons[reject_reason_index(*reason)] += 1;
-                }
-            },
+            ResponseKind::Report(report) => self.record_execution_report(report),
             ResponseKind::EngineError => self.engine_errors += 1,
             ResponseKind::ServerBusy => self.server_busy += 1,
             // Non-trading frames (Challenge, ServerReady, Heartbeat,
             // AuthFailed, stats/market-data snapshots) — not part of the
             // request/ack accounting.
             _ => {}
+        }
+    }
+
+    /// Increment the counter for a single execution-report variant.
+    /// Used by in-process bench modes (engine, pipeline) which observe
+    /// the matching stage's reports directly without going through the
+    /// wire `ResponseKind::Report` wrapper.
+    #[inline]
+    pub fn record_execution_report(&mut self, report: &ExecutionReport) {
+        match report {
+            ExecutionReport::Placed { .. } => self.placed += 1,
+            ExecutionReport::Fill { .. } => self.fills += 1,
+            ExecutionReport::Cancelled { .. } => self.cancelled += 1,
+            ExecutionReport::Triggered { .. } => self.triggered += 1,
+            ExecutionReport::Replaced { .. } => self.replaced += 1,
+            ExecutionReport::InstrumentStatusChanged { .. } => self.instrument_status += 1,
+            ExecutionReport::Rejected { reason, .. } => {
+                self.rejected += 1;
+                self.reject_reasons[reject_reason_index(*reason)] += 1;
+            }
         }
     }
 
@@ -2857,10 +2911,11 @@ impl OutcomeReport {
 }
 
 /// Fail the run with a non-zero exit if more than `max_pct` percent of
-/// acknowledged requests were rejected. Default threshold is 1% — a
-/// well-configured run produces near-zero rejections, so anything above
-/// noise is a configuration error that the latency histogram would
-/// otherwise hide. Set `max_pct` very high (e.g. 100.0) to disable.
+/// acknowledged requests were rejected. The CLI default is 50% — the
+/// generator naturally produces a few percent of rejections, so the
+/// gate targets catastrophic misconfig ("most orders rejected") rather
+/// than noise. Lower `max_pct` for production-flow runs where rejections
+/// should be near-zero; set it to 100.0 to disable.
 pub(crate) fn enforce_rejection_threshold(outcomes: &OutcomeReport, max_pct: f64) {
     let pct = outcomes.rejection_ratio() * 100.0;
     if pct > max_pct {
@@ -3297,6 +3352,30 @@ mod outcome_report_tests {
             ..OutcomeReport::default()
         };
         assert!((r.rejection_ratio() - 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_execution_report_and_record_agree_on_report_variants() {
+        // Engine and pipeline modes call `record_execution_report`
+        // directly; the network bench reaches it via `record` ->
+        // `ResponseKind::Report(_)`. Both paths must produce identical
+        // counter state for the same input.
+        let (oid, sym, acc) = dummy_order();
+        let rep = ExecutionReport::Rejected {
+            order_id: oid,
+            symbol: sym,
+            account: acc,
+            reason: RejectReason::ExceedsMaxOrderQty,
+        };
+
+        let mut via_direct = OutcomeReport::default();
+        via_direct.record_execution_report(&rep);
+
+        let mut via_wire = OutcomeReport::default();
+        via_wire.record(&ResponseKind::Report(rep));
+
+        assert_eq!(via_direct.rejected, via_wire.rejected);
+        assert_eq!(via_direct.reject_reasons, via_wire.reject_reasons);
     }
 
     #[test]

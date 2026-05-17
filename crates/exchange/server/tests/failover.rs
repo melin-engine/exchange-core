@@ -1339,6 +1339,7 @@ fn journals_contiguous_across_checkpoint_boundary() {
     );
 }
 
+// TODO If this test has value then it should be moved somewhere else: this crate can't depend on the bench, cycle. If no value, delete it.
 /// Same invariant as above (`journals_contiguous_across_checkpoint_boundary`),
 /// but drives load through the real `melin-bench` binary instead of a
 /// synchronous in-test client. This matches the LAN bench's publisher
