@@ -295,6 +295,143 @@ pub(crate) fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
     (ticks as f64 / ticks_per_ns) as u64
 }
 
+// ---------------------------------------------------------------------------
+// Open-loop pacing
+// ---------------------------------------------------------------------------
+
+/// Slack tolerance for late sends. Any send issued more than this far past
+/// its scheduled time counts toward `late_sends`. Set wider than the
+/// natural event-loop fill granularity (one `submit_and_wait` cycle, on
+/// the order of one RTT for kernel transports) so submit-cycle jitter
+/// does not inflate the count. A non-zero value here means the bench is
+/// structurally behind its schedule — back-pressure from the server or
+/// the inflight cap — not that individual sends are a few microseconds
+/// late.
+pub(crate) const PACE_LATE_SLACK_NS: u64 = 1_000_000;
+
+/// Per-connection open-loop scheduler. Each connection advances on its own
+/// schedule (rate is split across connections at construction time), which
+/// avoids cross-thread atomic contention on a shared cursor without
+/// changing the aggregate target rate.
+///
+/// All arithmetic is in TSC ticks: the uring/dpdk hot paths already keep
+/// per-frame timing in ticks, so reusing the same unit lets the scheduled
+/// timestamp flow directly into `inflight_ts` (no per-send conversion).
+#[derive(Clone, Copy)]
+pub(crate) struct PaceClock {
+    /// Ticks between consecutive scheduled sends on this connection.
+    period_ticks: u64,
+    /// TSC tick of the next scheduled send.
+    next_due_ticks: u64,
+}
+
+impl PaceClock {
+    /// Build a pacer for one connection given the *aggregate* target rate
+    /// (orders/sec across all connections), the connection count it is
+    /// shared with, the TSC calibration factor, the bench-start TSC, and
+    /// the connection's index within the run. `conn_index` is used to
+    /// stagger the first send by a fraction of one period — this avoids a
+    /// thundering herd at `start_tsc` while preserving the aggregate rate.
+    pub(crate) fn new(
+        target_rate: u64,
+        clients: u64,
+        ticks_per_ns: f64,
+        start_tsc: u64,
+        conn_index: u64,
+    ) -> Self {
+        debug_assert!(target_rate > 0, "PaceClock::new requires target_rate > 0");
+        debug_assert!(clients > 0, "PaceClock::new requires clients > 0");
+        let rate_per_conn = target_rate as f64 / clients as f64;
+        let period_ns = 1_000_000_000.0 / rate_per_conn;
+        // u64 ticks: a period of ~10 ns at 3 GHz is ~30 ticks; rounding to
+        // the nearest tick is well below clock skew across the run.
+        let period_ticks = (period_ns * ticks_per_ns).round().max(1.0) as u64;
+        // Stagger first send by conn_index * (period / clients). For
+        // single-thread runs this leaves a uniform offset; for multi-thread
+        // runs threads stay slightly out of phase, which is closer to real
+        // client behavior.
+        let stagger = period_ticks
+            .saturating_mul(conn_index)
+            .checked_div(clients)
+            .unwrap_or(0);
+        Self {
+            period_ticks,
+            next_due_ticks: start_tsc.saturating_add(stagger),
+        }
+    }
+
+    /// If the next scheduled send is due at `now_ticks`, return its
+    /// scheduled TSC and advance the cursor; otherwise return `None`. The
+    /// returned tick is the *scheduled* time, not `now_ticks` — pushing
+    /// the scheduled time into the latency record is the standard fix for
+    /// coordinated omission.
+    #[inline]
+    pub(crate) fn pop_due(&mut self, now_ticks: u64) -> Option<u64> {
+        if now_ticks >= self.next_due_ticks {
+            let scheduled = self.next_due_ticks;
+            self.next_due_ticks = self.next_due_ticks.saturating_add(self.period_ticks);
+            Some(scheduled)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn period_ticks(&self) -> u64 {
+        self.period_ticks
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_due_ticks(&self) -> u64 {
+        self.next_due_ticks
+    }
+}
+
+/// Aggregate pacing telemetry shared across bench threads. Updated lock-free.
+#[derive(Default)]
+pub(crate) struct PaceStats {
+    /// Sends whose actual submission time exceeded `scheduled + slack`.
+    /// A non-zero value indicates back-pressure from the server or
+    /// inflight cap.
+    pub late_sends: AtomicU64,
+    /// Maximum observed `actual_send_tsc - scheduled_tsc` in ticks. Read
+    /// once at end-of-run and converted to µs for reporting.
+    pub max_send_delay_ticks: AtomicU64,
+    /// Total scheduled sends (issued or skipped). Useful for the progress
+    /// reporter when target-rate is set.
+    pub scheduled: AtomicU64,
+}
+
+impl PaceStats {
+    /// Record a paced send. `now_ticks` is the actual submission time;
+    /// `scheduled_ticks` is what `PaceClock::pop_due` returned. If the
+    /// delay exceeds `PACE_LATE_SLACK_NS`, `late_sends` is incremented.
+    #[inline]
+    pub(crate) fn record_send(&self, now_ticks: u64, scheduled_ticks: u64, ticks_per_ns: f64) {
+        let delay_ticks = now_ticks.saturating_sub(scheduled_ticks);
+        // Lazy max via CAS loop. Contention is essentially nil — only one
+        // writer per bench thread, and at multi-M ops/s the value moves
+        // monotonically toward the run max.
+        let mut prev = self.max_send_delay_ticks.load(Ordering::Relaxed);
+        while delay_ticks > prev {
+            match self.max_send_delay_ticks.compare_exchange_weak(
+                prev,
+                delay_ticks,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+        let slack_ticks = (PACE_LATE_SLACK_NS as f64 * ticks_per_ns) as u64;
+        if delay_ticks > slack_ticks {
+            self.late_sends.fetch_add(1, Ordering::Relaxed);
+        }
+        self.scheduled.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// One latency time-series sample: interval percentiles at a point in time.
 /// Captured every `SAMPLE_INTERVAL` completed orders using an interval
 /// histogram (snapshot + reset), so each sample reflects recent behavior
@@ -364,6 +501,16 @@ struct BenchArgs {
     /// Group commit coalescing delay in microseconds.
     #[arg(long, default_value_t = 0)]
     group_commit_us: u64,
+    /// Target send rate in orders/sec (open-loop pacing). `0` (default)
+    /// disables pacing and falls back to closed-loop window-filling.
+    /// When set, each client thread schedules sends at fixed intervals
+    /// and pushes the *scheduled* timestamp into the latency histogram —
+    /// the standard fix for coordinated omission. `--window` still acts
+    /// as a hard inflight cap; if the server stalls and the cap engages
+    /// the bench reports `late_sends` rather than silently absorbing the
+    /// back-pressure.
+    #[arg(long, default_value_t = 0)]
+    target_rate: u64,
     /// Warmup duration before measurement starts. Lets caches, branch
     /// predictors, and allocator arenas settle. Accepts humantime values.
     #[arg(long, default_value_t = humantime::Duration::from(DEFAULT_WARMUP), value_parser = parse_duration)]
@@ -462,6 +609,14 @@ fn main() {
         cooldown: args.cooldown_duration.into(),
     };
 
+    // --target-rate requires a non-zero --window: with window=0 the bench
+    // cannot keep any inflight sends, so paced sends would never reach the
+    // server. Fail loud rather than silently producing a 0-throughput run.
+    if args.target_rate > 0 && args.window == 0 {
+        eprintln!("error: --target-rate requires --window > 0 (current: 0)");
+        std::process::exit(1);
+    }
+
     match args.mode.as_str() {
         "engine" => {
             run_engine_bench(phases, args.accounts, args.instruments, json_path);
@@ -537,6 +692,7 @@ fn main() {
                     args.key.as_deref(),
                     args.bench_cores,
                     args.health_addr,
+                    args.target_rate,
                 );
             }
         }
@@ -857,6 +1013,7 @@ fn run_engine_bench(
         // Engine mode runs the matching engine in-process with no
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
+        None,
     );
 
     // Print the slowest orders for tail latency diagnosis.
@@ -1191,6 +1348,7 @@ where
         // Pipeline mode runs the disruptor stages in-process with no
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
+        None,
     );
 
     println!();
@@ -1228,6 +1386,7 @@ fn run_roundtrip_bench(
     key_path: Option<&std::path::Path>,
     bench_core_start: Option<usize>,
     health_addr: Option<std::net::SocketAddr>,
+    target_rate: u64,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -1265,6 +1424,7 @@ fn run_roundtrip_bench(
             num_instruments,
             bench_core_start,
             health_addr,
+            target_rate,
         );
         return;
     }
@@ -1335,6 +1495,7 @@ fn run_roundtrip_bench(
             num_instruments,
             bench_core_start,
             effective_health_addr,
+            target_rate,
         );
     } else {
         use melin_protocol::tcp::BlockingTcpListener;
@@ -1366,6 +1527,7 @@ fn run_roundtrip_bench(
             num_instruments,
             bench_core_start,
             effective_health_addr,
+            target_rate,
         );
     }
 
@@ -1537,6 +1699,7 @@ fn run_roundtrip_inner<R, W, F>(
     num_instruments: u32,
     bench_core_start: Option<usize>,
     health_addr: Option<std::net::SocketAddr>,
+    target_rate: u64,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1557,6 +1720,7 @@ fn run_roundtrip_inner<R, W, F>(
         num_instruments,
         bench_core_start,
         health_addr,
+        target_rate,
     );
 }
 
@@ -1574,6 +1738,8 @@ pub(crate) fn spawn_progress_reporter(
     completed: Arc<AtomicU64>,
     phases: BenchPhases,
     shutdown: Arc<AtomicBool>,
+    target_rate: u64,
+    pace_stats: Arc<PaceStats>,
 ) -> std::thread::JoinHandle<()> {
     let total_duration = phases.warmup + phases.measured + phases.cooldown;
     std::thread::Builder::new()
@@ -1625,13 +1791,23 @@ pub(crate) fn spawn_progress_reporter(
                 // Avoids the stderr mutex that eprintln! holds, which can
                 // block bench threads doing eprintln! on error paths.
                 use std::io::Write as _;
-                let mut buf = [0u8; 192];
+                let mut buf = [0u8; 256];
                 let mut cursor = std::io::Cursor::new(&mut buf[..]);
-                let _ = writeln!(
-                    cursor,
-                    "  [{elapsed:.1}s/{total_secs:.0}s {pct:.0}% {phase}] {current} measured orders  {:.0}K/s",
-                    rate / 1000.0,
-                );
+                if target_rate > 0 {
+                    let scheduled = pace_stats.scheduled.load(Ordering::Relaxed);
+                    let late = pace_stats.late_sends.load(Ordering::Relaxed);
+                    let _ = writeln!(
+                        cursor,
+                        "  [{elapsed:.1}s/{total_secs:.0}s {pct:.0}% {phase}] scheduled {scheduled} / done {current} / late {late}  {:.0}K/s",
+                        rate / 1000.0,
+                    );
+                } else {
+                    let _ = writeln!(
+                        cursor,
+                        "  [{elapsed:.1}s/{total_secs:.0}s {pct:.0}% {phase}] {current} measured orders  {:.0}K/s",
+                        rate / 1000.0,
+                    );
+                }
                 let len = cursor.position() as usize;
                 // Best-effort write — progress display is non-critical.
                 unsafe {
@@ -1668,6 +1844,7 @@ fn run_uring_roundtrip<R, W, F>(
     num_instruments: u32,
     bench_core_start: Option<usize>,
     health_addr: Option<std::net::SocketAddr>,
+    target_rate: u64,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1734,15 +1911,19 @@ fn run_uring_roundtrip<R, W, F>(
             send_pending: false,
             flow,
             inflight_ts: VecDeque::with_capacity(window),
+            pacer: None,
         });
     }
 
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
+    let pace_stats = Arc::new(PaceStats::default());
     let progress_handle = spawn_progress_reporter(
         Arc::clone(&progress),
         phases,
         Arc::clone(&progress_shutdown),
+        target_rate,
+        Arc::clone(&pace_stats),
     );
 
     // Start health poller before bench threads.
@@ -1761,6 +1942,7 @@ fn run_uring_roundtrip<R, W, F>(
             let pin_core = bench_core_start.map(|s| s + i);
             let bench_start = start;
             let thread_progress = Arc::clone(&progress);
+            let thread_pace_stats = Arc::clone(&pace_stats);
             std::thread::Builder::new()
                 .name(format!("bench-{i}"))
                 .spawn(move || {
@@ -1769,7 +1951,16 @@ fn run_uring_roundtrip<R, W, F>(
                     {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
-                    run_uring_loop(conns, window, bench_start, deadlines, thread_progress)
+                    run_uring_loop(
+                        conns,
+                        window,
+                        bench_start,
+                        deadlines,
+                        thread_progress,
+                        target_rate,
+                        num_clients,
+                        thread_pace_stats,
+                    )
                 })
                 .expect("spawn bench thread")
         })
@@ -1830,6 +2021,19 @@ fn run_uring_roundtrip<R, W, F>(
         format!("  Bench threads: {num_threads} (io_uring, unpinned)")
     });
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
+    if target_rate > 0 {
+        let scheduled = pace_stats.scheduled.load(Ordering::Relaxed);
+        let late = pace_stats.late_sends.load(Ordering::Relaxed);
+        let max_delay_ticks = pace_stats.max_send_delay_ticks.load(Ordering::Relaxed);
+        // Use one thread's calibration for the report. TSC drift between
+        // bench threads on the same socket is well below µs and the value
+        // is for human consumption, not measurement.
+        let ticks_per_ns = calibrate_tsc();
+        let max_delay_us = tsc_to_ns(max_delay_ticks, ticks_per_ns) as f64 / 1_000.0;
+        extra_lines.push(format!(
+            "  Target rate: {target_rate} ops/s (scheduled {scheduled}, late {late}, max send delay {max_delay_us:.1} µs)"
+        ));
+    }
 
     // Sort time-series by elapsed time for stable plot output.
     all_series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
@@ -1843,6 +2047,22 @@ fn run_uring_roundtrip<R, W, F>(
         None => stats_client::Body::Empty,
     };
 
+    let pacing_report = if target_rate > 0 {
+        let ticks_per_ns = calibrate_tsc();
+        let max_delay_ns = tsc_to_ns(
+            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            ticks_per_ns,
+        );
+        Some(PacingReport {
+            target_rate,
+            scheduled: pace_stats.scheduled.load(Ordering::Relaxed),
+            late_sends: pace_stats.late_sends.load(Ordering::Relaxed),
+            max_send_delay_us: max_delay_ns as f64 / 1_000.0,
+        })
+    } else {
+        None
+    };
+
     print_results(
         "Roundtrip",
         histogram.len() as usize,
@@ -1854,6 +2074,7 @@ fn run_uring_roundtrip<R, W, F>(
         &all_series,
         &health_samples,
         &server_stages,
+        pacing_report.as_ref(),
     );
 
     println!();
@@ -1896,8 +2117,15 @@ struct UringBenchConn {
     // deadline expires.
     flow: generator::OrderFlowGenerator,
     /// TSC tick at send time. `u64` instead of `Instant` to avoid
-    /// ~15-25ns vDSO overhead per timestamp on the hot path.
+    /// ~15-25ns vDSO overhead per timestamp on the hot path. With
+    /// open-loop pacing enabled this stores the *scheduled* TSC instead
+    /// of the actual submission TSC — the standard coordinated-omission
+    /// fix.
     inflight_ts: VecDeque<u64>,
+    /// Open-loop scheduler (when `--target-rate > 0`). Materialised
+    /// inside the per-thread bench loop where TSC calibration runs;
+    /// constructed `None` initially.
+    pacer: Option<PaceClock>,
 }
 
 /// io_uring event loop for all benchmark connections. Single-threaded:
@@ -1905,16 +2133,38 @@ struct UringBenchConn {
 /// Returns the cumulative histogram and (when `chart` feature is enabled)
 /// a time-series of interval latency percentiles for visualization.
 #[cfg(not(feature = "dpdk"))]
+#[allow(clippy::too_many_arguments)]
 fn run_uring_loop(
     mut connections: Vec<UringBenchConn>,
     window: usize,
     bench_start: Instant,
     deadlines: PhaseDeadlines,
     progress: Arc<AtomicU64>,
+    target_rate: u64,
+    total_clients: usize,
+    pace_stats: Arc<PaceStats>,
 ) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
     use io_uring::{IoUring, opcode, types};
 
     let ticks_per_ns = calibrate_tsc();
+
+    // Materialise pacers now that we have a calibration factor and a
+    // local TSC reading. Each connection gets its own scheduler keyed off
+    // the same `start_tsc`; the `conn_index` parameter staggers the
+    // first send across connections.
+    if target_rate > 0 {
+        let start_tsc = rdtscp();
+        let clients = total_clients.max(1) as u64;
+        for (idx, conn) in connections.iter_mut().enumerate() {
+            conn.pacer = Some(PaceClock::new(
+                target_rate,
+                clients,
+                ticks_per_ns,
+                start_tsc,
+                idx as u64,
+            ));
+        }
+    }
     // 4096 entries: supports up to 1024 connections per thread (RECV +
     // SEND per connection, plus headroom for partial-send resubmissions).
     let mut ring = IoUring::new(4096).expect("create io_uring for bench");
@@ -1950,7 +2200,14 @@ fn run_uring_loop(
     }
 
     // Fill initial send windows.
-    uring_fill_windows(&mut ring, &mut connections, window, &deadlines);
+    uring_fill_windows(
+        &mut ring,
+        &mut connections,
+        window,
+        &deadlines,
+        &pace_stats,
+        ticks_per_ns,
+    );
 
     loop {
         // Wall-clock-driven termination. The histogram is sealed at
@@ -2082,7 +2339,14 @@ fn run_uring_loop(
         }
 
         // Refill send windows for connections with capacity.
-        uring_fill_windows(&mut ring, &mut connections, window, &deadlines);
+        uring_fill_windows(
+            &mut ring,
+            &mut connections,
+            window,
+            &deadlines,
+            &pace_stats,
+            ticks_per_ns,
+        );
     }
 
     (histogram, series, measured_start)
@@ -2099,6 +2363,8 @@ fn uring_fill_windows(
     connections: &mut [UringBenchConn],
     window: usize,
     deadlines: &PhaseDeadlines,
+    pace_stats: &PaceStats,
+    ticks_per_ns: f64,
 ) {
     use io_uring::{opcode, types};
 
@@ -2115,9 +2381,24 @@ fn uring_fill_windows(
 
         // Fill the send buffer with as many frames as the window allows.
         // Each frame is encoded directly into `send_buf` as `[u32 LE len][payload]`.
+        // When pacing is active, `pop_due` gates each push by the
+        // schedule; the recorded timestamp is the *scheduled* TSC, which
+        // is what closes the coordinated-omission loophole.
         while conn.inflight_ts.len() < window {
+            let send_tsc = if let Some(pacer) = conn.pacer.as_mut() {
+                let now_tsc = rdtscp();
+                match pacer.pop_due(now_tsc) {
+                    Some(scheduled) => {
+                        pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
+                        scheduled
+                    }
+                    None => break,
+                }
+            } else {
+                rdtscp()
+            };
             conn.flow.next_wire_frame(&mut conn.send_buf);
-            conn.inflight_ts.push_back(rdtscp());
+            conn.inflight_ts.push_back(send_tsc);
         }
 
         if !conn.send_buf.is_empty() {
@@ -2170,6 +2451,16 @@ pub(crate) fn print_latency_histogram(hist: &Histogram<u64>, sample_count: usize
     println!("    max:     {:>8.2} µs", hist.max() as f64 / 1_000.0);
 }
 
+/// End-of-run pacing report. `None` when `--target-rate` is unset (the
+/// closed-loop case); rendered into the JSON output and the console
+/// summary lines otherwise.
+pub(crate) struct PacingReport {
+    pub target_rate: u64,
+    pub scheduled: u64,
+    pub late_sends: u64,
+    pub max_send_delay_us: f64,
+}
+
 /// Print benchmark results: header, throughput, latency histogram.
 /// Optionally writes results to a JSON file for post-processing.
 #[allow(clippy::too_many_arguments)]
@@ -2184,6 +2475,7 @@ pub(crate) fn print_results(
     series: &[LatencySample],
     health_samples: &[health_poller::HealthSample],
     server_stages: &stats_client::Body,
+    pacing: Option<&PacingReport>,
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
@@ -2346,8 +2638,18 @@ pub(crate) fn print_results(
 
         let stages_json = stats_client::render_json(server_stages);
 
+        // Pacing fragment: emitted only when target-rate was set, so the
+        // schema for closed-loop runs is unchanged.
+        let pacing_json = match pacing {
+            Some(p) => format!(
+                ",\"pacing\":{{\"target_rate\":{},\"scheduled\":{},\"achieved_rate\":{:.0},\"late_sends\":{},\"max_send_delay_us\":{:.2}}}",
+                p.target_rate, p.scheduled, throughput, p.late_sends, p.max_send_delay_us,
+            ),
+            None => String::new(),
+        };
+
         let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_ms\":{:.2},\"measured_ms\":{:.2},\"cooldown_ms\":{:.2},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}}}",
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_ms\":{:.2},\"measured_ms\":{:.2},\"cooldown_ms\":{:.2},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}{pacing_json}}}",
             phases.warmup.as_secs_f64() * 1000.0,
             phases.measured.as_secs_f64() * 1000.0,
             phases.cooldown.as_secs_f64() * 1000.0,
@@ -2402,5 +2704,72 @@ mod tsc_clock_tests {
         let clock = calibrate_tsc_clock();
         let value = clock.unix_ns(clock.anchor_tsc.saturating_sub(1_000));
         assert_eq!(value, clock.anchor_unix_ns);
+    }
+}
+
+#[cfg(test)]
+mod pace_clock_tests {
+    use super::*;
+
+    // 1 tick = 1 ns for predictable arithmetic in these tests.
+    const TICKS_PER_NS: f64 = 1.0;
+
+    #[test]
+    fn period_matches_aggregate_rate_split_across_clients() {
+        // 1 M orders/sec / 4 clients = 250 k/sec per client = 4 µs period.
+        let p = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 0, 0);
+        assert_eq!(p.period_ticks(), 4_000);
+    }
+
+    #[test]
+    fn pop_due_is_monotonic_and_paced() {
+        let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 0, 0);
+        // 1 µs period at 1 M/s; first 3 sends due at 0, 1000, 2000.
+        assert_eq!(p.pop_due(0), Some(0));
+        assert_eq!(p.pop_due(999), None);
+        assert_eq!(p.pop_due(1_000), Some(1_000));
+        assert_eq!(p.pop_due(2_500), Some(2_000));
+        // After popping at 2_500, next due is 3_000.
+        assert_eq!(p.next_due_ticks(), 3_000);
+    }
+
+    #[test]
+    fn stagger_offsets_conns_within_one_period() {
+        let p0 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 0);
+        let p1 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 1);
+        let p2 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 2);
+        let p3 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 3);
+        // period = 4 µs / 4 conns = 1 µs offsets.
+        assert_eq!(p0.next_due_ticks(), 10_000);
+        assert_eq!(p1.next_due_ticks(), 11_000);
+        assert_eq!(p2.next_due_ticks(), 12_000);
+        assert_eq!(p3.next_due_ticks(), 13_000);
+    }
+
+    #[test]
+    fn period_clamps_to_at_least_one_tick() {
+        // Absurdly high rate would round period_ns to 0; clamp prevents
+        // an infinite loop in `pop_due` (which would otherwise see every
+        // `now` as due forever).
+        let p = PaceClock::new(u64::MAX / 2, 1, TICKS_PER_NS, 0, 0);
+        assert!(p.period_ticks() >= 1);
+    }
+
+    #[test]
+    fn record_send_increments_late_when_past_slack() {
+        let stats = PaceStats::default();
+        // delay just over slack → late.
+        stats.record_send(PACE_LATE_SLACK_NS + 1, 0, TICKS_PER_NS);
+        // delay just under slack → not late.
+        stats.record_send(PACE_LATE_SLACK_NS - 1, 0, TICKS_PER_NS);
+        // delay = 0 → not late.
+        stats.record_send(0, 0, TICKS_PER_NS);
+        assert_eq!(stats.late_sends.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.scheduled.load(Ordering::Relaxed), 3);
+        // Max should track the largest delay observed.
+        assert_eq!(
+            stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            PACE_LATE_SLACK_NS + 1
+        );
     }
 }

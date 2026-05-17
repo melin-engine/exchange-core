@@ -403,10 +403,15 @@ pub fn run_dpdk_roundtrip(
     // --- Main benchmark loop ---
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
+    // DPDK pacing is not wired in this commit — pass target_rate=0 so the
+    // progress reporter renders the closed-loop format.
+    let pace_stats = Arc::new(crate::PaceStats::default());
     let progress_handle = spawn_progress_reporter(
         Arc::clone(&progress),
         phases,
         Arc::clone(&progress_shutdown),
+        0,
+        pace_stats,
     );
 
     let health_poller = health_addr.map(crate::health_poller::HealthPoller::start);
@@ -749,6 +754,8 @@ pub fn run_dpdk_roundtrip(
         &series,
         &health_poller.map(|p| p.stop()).unwrap_or_default(),
         &server_stages,
+        // DPDK pacing not wired in this commit.
+        None,
     );
 }
 
