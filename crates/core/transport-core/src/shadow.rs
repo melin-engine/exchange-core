@@ -160,7 +160,7 @@ fn save_snapshot<A: Application>(
 /// empty and a restore would let previously-rejected duplicate
 /// `request_seq` values through. `last_drain_ns` is caller-tracked
 /// across the consume loop so the drain stays monotonic.
-pub fn dispatch_event<A: Application>(
+fn dispatch_event<A: Application>(
     app: &mut A,
     event: &JournalEvent<A::Event>,
     timestamp_ns: u64,
