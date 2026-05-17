@@ -1160,6 +1160,11 @@ fn run_roundtrip_bench(
         // can take longer than the default 30s for large runs.
         connection_timeout_secs: 0,
         authorized_keys: keys_path,
+        // Single-node durability for the embedded bench server: ack on
+        // local persistence alone. The default `Hybrid` mode waits for
+        // `in_memory>=2` replica acks that never arrive when nothing else
+        // is connected, which would stall every response.
+        durability_mode: melin_server::durability_policy::DurabilityMode::Local,
         ..ServerConfig::default()
     };
 
