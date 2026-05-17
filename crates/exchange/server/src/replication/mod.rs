@@ -421,7 +421,7 @@ where
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            crate::affinity::pin_thread("journal", journal_core);
+            melin_app::affinity::pin_thread("journal", journal_core);
             journal_stage.run(&ps)
         })
         .expect("spawn journal thread");
@@ -432,7 +432,7 @@ where
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            crate::affinity::pin_thread("matching", matching_core);
+            melin_app::affinity::pin_thread("matching", matching_core);
             matching_stage.run(&ps)
         })
         .expect("spawn matching thread");
@@ -445,7 +445,7 @@ where
     let drain_handle = std::thread::Builder::new()
         .name("drain".into())
         .spawn(move || {
-            crate::affinity::pin_thread("drain", drain_core);
+            melin_app::affinity::pin_thread("drain", drain_core);
             let mut consumer = drain_consumer;
             let mut batch = vec![crate::OutputSlot::default(); 256];
             loop {
@@ -477,7 +477,7 @@ where
             std::thread::Builder::new()
                 .name("replica-shadow".into())
                 .spawn(move || {
-                    crate::affinity::pin_thread("replica-shadow", shadow_core);
+                    melin_app::affinity::pin_thread("replica-shadow", shadow_core);
                     crate::shadow::run(
                         shadow_cons,
                         shadow_exchange,

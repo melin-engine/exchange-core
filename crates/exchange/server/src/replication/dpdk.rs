@@ -1272,7 +1272,7 @@ where
             // children would inherit `{receiver_core}` + FIFO and never
             // preempt the busy-spinning receiver to reach their own
             // self-pin.
-            if let Err(e) = crate::affinity::clear_affinity() {
+            if let Err(e) = melin_app::affinity::clear_affinity() {
                 tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
             }
 
@@ -1291,7 +1291,7 @@ where
             // pin the receive thread — mirrors the primary's reader pin
             // so the thread producing input-ring entries from the network
             // isn't migrated across L3s mid-batch.
-            crate::affinity::pin_thread("receiver", receiver_core);
+            melin_app::affinity::pin_thread("receiver", receiver_core);
         }
 
         let mut pending_acks = PendingAckQueue::new(pipeline_depth);

@@ -849,7 +849,7 @@ where
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            if let Err(e) = melin_server::affinity::pin_to_core(1) {
+            if let Err(e) = melin_app::affinity::pin_to_core(1) {
                 eprintln!("warning: could not pin journal to core 1: {e}");
             }
             journal_stage.run(&shutdown_j)
@@ -861,7 +861,7 @@ where
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            if let Err(e) = melin_server::affinity::pin_to_core(2) {
+            if let Err(e) = melin_app::affinity::pin_to_core(2) {
                 eprintln!("warning: could not pin matching to core 2: {e}");
             }
             matching_stage.run(&shutdown_m)
@@ -903,7 +903,7 @@ where
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
         .spawn(move || {
-            if let Err(e) = melin_server::affinity::pin_to_core(3) {
+            if let Err(e) = melin_app::affinity::pin_to_core(3) {
                 eprintln!("warning: could not pin pipeline-pub to core 3: {e}");
             }
             for i in 0..total_orders {
@@ -1410,7 +1410,7 @@ pub(crate) fn spawn_progress_reporter(
         .spawn(move || {
             // Pin to core 0 so the progress thread never lands on a bench
             // core and causes involuntary preemption or TLB shootdowns.
-            let _ = melin_server::affinity::pin_to_core(0);
+            let _ = melin_app::affinity::pin_to_core(0);
 
             let start = Instant::now();
             let mut last_completed: u64 = 0;
@@ -1598,7 +1598,7 @@ fn run_uring_roundtrip<R, W, F>(
                 .name(format!("bench-{i}"))
                 .spawn(move || {
                     if let Some(core_id) = pin_core
-                        && let Err(e) = melin_server::affinity::pin_to_core(core_id)
+                        && let Err(e) = melin_app::affinity::pin_to_core(core_id)
                     {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
