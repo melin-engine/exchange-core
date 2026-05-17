@@ -1322,10 +1322,15 @@ where
             // with the publisher's pinned-core clock. Pipeline mode has
             // one publisher, so `clients=1` keeps the period == the
             // aggregate target.
-            let mut pacer = if target_rate > 0 {
-                Some(PaceClock::new(target_rate, 1, ticks_per_ns, rdtscp(), 0))
+            let (mut pacer, warmup_end_tsc) = if target_rate > 0 {
+                let start_tsc = rdtscp();
+                let warmup_ticks = (phases.warmup.as_nanos() as f64 * ticks_per_ns) as u64;
+                (
+                    Some(PaceClock::new(target_rate, 1, ticks_per_ns, start_tsc, 0)),
+                    start_tsc.saturating_add(warmup_ticks),
+                )
             } else {
-                None
+                (None, 0)
             };
             // Publish until the drain thread signals stop (set once the
             // cooldown deadline passes and the inflight queue is drained).
@@ -1355,20 +1360,24 @@ where
                 // scheduled tick (coordinated-omission fix). Without
                 // pacing, fall back to the actual send tick.
                 let ts = if let Some(p) = pacer.as_mut() {
-                    let now_tsc = rdtscp();
-                    match p.pop_due(now_tsc) {
-                        Some(scheduled) => {
-                            pace_stats_pub.record_send(now_tsc, scheduled, ticks_per_ns);
-                            scheduled
+                    // Spin until the next scheduled slot is due. Done
+                    // here rather than re-entering the outer loop to
+                    // avoid mutating the outer order-id counter on
+                    // every retry.
+                    let (now_tsc, scheduled) = loop {
+                        if pub_stop_p.load(Ordering::Relaxed) {
+                            return;
                         }
-                        None => {
-                            // Not yet due — yield and retry without
-                            // burning the inflight window.
-                            std::hint::spin_loop();
-                            i -= 1;
-                            continue;
+                        let now_tsc = rdtscp();
+                        if let Some(scheduled) = p.pop_due(now_tsc) {
+                            break (now_tsc, scheduled);
                         }
+                        std::hint::spin_loop();
+                    };
+                    if now_tsc >= warmup_end_tsc {
+                        pace_stats_pub.record_send(now_tsc, scheduled, ticks_per_ns);
                     }
+                    scheduled
                 } else {
                     rdtscp()
                 };
@@ -2104,6 +2113,14 @@ fn run_uring_roundtrip<R, W, F>(
             let bench_start = start;
             let thread_progress = Arc::clone(&progress);
             let thread_pace_stats = Arc::clone(&pace_stats);
+            // Global-conn-index mapping mirrors the round-robin
+            // distribution above (`thread_conns[i % num_threads]`):
+            // this thread's local conn `k` is global conn
+            // `thread_idx + k * num_threads`. Passed in so the pacer
+            // stagger spreads first sends across *all* connections, not
+            // just within each thread.
+            let thread_idx = i;
+            let total_threads = num_threads;
             std::thread::Builder::new()
                 .name(format!("bench-{i}"))
                 .spawn(move || {
@@ -2120,6 +2137,9 @@ fn run_uring_roundtrip<R, W, F>(
                         thread_progress,
                         target_rate,
                         num_clients,
+                        thread_idx,
+                        total_threads,
+                        phases,
                         thread_pace_stats,
                     )
                 })
@@ -2182,19 +2202,32 @@ fn run_uring_roundtrip<R, W, F>(
         format!("  Bench threads: {num_threads} (io_uring, unpinned)")
     });
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
-    if target_rate > 0 {
+
+    // Calibrate once for both the human-readable line and the JSON
+    // report; calibration sleeps ~50 ms so calling it twice is wasteful.
+    // TSC drift between bench threads on the same socket is well below
+    // µs, so a single calibration here is fine for the report.
+    let pacing_report = if target_rate > 0 {
+        let ticks_per_ns = calibrate_tsc();
         let scheduled = pace_stats.scheduled.load(Ordering::Relaxed);
         let late = pace_stats.late_sends.load(Ordering::Relaxed);
-        let max_delay_ticks = pace_stats.max_send_delay_ticks.load(Ordering::Relaxed);
-        // Use one thread's calibration for the report. TSC drift between
-        // bench threads on the same socket is well below µs and the value
-        // is for human consumption, not measurement.
-        let ticks_per_ns = calibrate_tsc();
-        let max_delay_us = tsc_to_ns(max_delay_ticks, ticks_per_ns) as f64 / 1_000.0;
+        let max_delay_us = tsc_to_ns(
+            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            ticks_per_ns,
+        ) as f64
+            / 1_000.0;
         extra_lines.push(format!(
             "  Target rate: {target_rate} ops/s (scheduled {scheduled}, late {late}, max send delay {max_delay_us:.1} µs)"
         ));
-    }
+        Some(PacingReport {
+            target_rate,
+            scheduled,
+            late_sends: late,
+            max_send_delay_us: max_delay_us,
+        })
+    } else {
+        None
+    };
 
     // Sort time-series by elapsed time for stable plot output.
     all_series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
@@ -2206,22 +2239,6 @@ fn run_uring_roundtrip<R, W, F>(
     let server_stages = match health_addr {
         Some(addr) => stats_client::fetch(addr),
         None => stats_client::Body::Empty,
-    };
-
-    let pacing_report = if target_rate > 0 {
-        let ticks_per_ns = calibrate_tsc();
-        let max_delay_ns = tsc_to_ns(
-            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
-            ticks_per_ns,
-        );
-        Some(PacingReport {
-            target_rate,
-            scheduled: pace_stats.scheduled.load(Ordering::Relaxed),
-            late_sends: pace_stats.late_sends.load(Ordering::Relaxed),
-            max_send_delay_us: max_delay_ns as f64 / 1_000.0,
-        })
-    } else {
-        None
     };
 
     print_results(
@@ -2303,26 +2320,45 @@ fn run_uring_loop(
     progress: Arc<AtomicU64>,
     target_rate: u64,
     total_clients: usize,
+    thread_idx: usize,
+    total_threads: usize,
+    phases: BenchPhases,
     pace_stats: Arc<PaceStats>,
 ) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
     use io_uring::{IoUring, opcode, types};
 
     let ticks_per_ns = calibrate_tsc();
 
+    // `warmup_end_tsc` lets pace_stats.record_send skip telemetry for
+    // sends scheduled during warmup. Without this gate, `scheduled` and
+    // `late_sends` cover all phases while `achieved_rate` covers
+    // measured-only — dividing one by the other in the JSON would
+    // overestimate the effective load by the warmup ratio.
+    let warmup_end_tsc = if target_rate > 0 {
+        let warmup_ticks = (phases.warmup.as_nanos() as f64 * ticks_per_ns) as u64;
+        rdtscp().saturating_add(warmup_ticks)
+    } else {
+        0
+    };
+
     // Materialise pacers now that we have a calibration factor and a
     // local TSC reading. Each connection gets its own scheduler keyed off
-    // the same `start_tsc`; the `conn_index` parameter staggers the
-    // first send across connections.
+    // the same `start_tsc`; the global conn index (which spans threads)
+    // staggers the first send across the whole run, not just within one
+    // thread.
     if target_rate > 0 {
         let start_tsc = rdtscp();
         let clients = total_clients.max(1) as u64;
-        for (idx, conn) in connections.iter_mut().enumerate() {
+        for (local_idx, conn) in connections.iter_mut().enumerate() {
+            // Round-robin distribution: this thread's local conn `k` is
+            // global conn `thread_idx + k * total_threads`.
+            let global_idx = (thread_idx + local_idx * total_threads) as u64;
             conn.pacer = Some(PaceClock::new(
                 target_rate,
                 clients,
                 ticks_per_ns,
                 start_tsc,
-                idx as u64,
+                global_idx,
             ));
         }
     }
@@ -2368,6 +2404,7 @@ fn run_uring_loop(
         &deadlines,
         &pace_stats,
         ticks_per_ns,
+        warmup_end_tsc,
     );
 
     loop {
@@ -2507,6 +2544,7 @@ fn run_uring_loop(
             &deadlines,
             &pace_stats,
             ticks_per_ns,
+            warmup_end_tsc,
         );
     }
 
@@ -2519,6 +2557,7 @@ fn run_uring_loop(
 /// then terminate as soon as `submit_and_wait` returns (or immediately if
 /// the queue is empty).
 #[cfg(not(feature = "dpdk"))]
+#[allow(clippy::too_many_arguments)]
 fn uring_fill_windows(
     ring: &mut io_uring::IoUring,
     connections: &mut [UringBenchConn],
@@ -2526,6 +2565,7 @@ fn uring_fill_windows(
     deadlines: &PhaseDeadlines,
     pace_stats: &PaceStats,
     ticks_per_ns: f64,
+    warmup_end_tsc: u64,
 ) {
     use io_uring::{opcode, types};
 
@@ -2550,7 +2590,12 @@ fn uring_fill_windows(
                 let now_tsc = rdtscp();
                 match pacer.pop_due(now_tsc) {
                     Some(scheduled) => {
-                        pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
+                        // Gate telemetry on warmup-end so `scheduled` /
+                        // `late_sends` reflect the same phase as the
+                        // throughput divisor (`achieved_rate`).
+                        if now_tsc >= warmup_end_tsc {
+                            pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
+                        }
                         scheduled
                     }
                     None => break,
@@ -2924,6 +2969,43 @@ mod pace_clock_tests {
         assert_eq!(p1.next_due_ticks(), 11_000);
         assert_eq!(p2.next_due_ticks(), 12_000);
         assert_eq!(p3.next_due_ticks(), 13_000);
+    }
+
+    /// Regression pin for the multi-thread stagger bug: when bench
+    /// threads each constructed pacers using their *thread-local* conn
+    /// index instead of the global one, every thread's conn-0 fired at
+    /// the same offset, collapsing the herd. Modelling that here: four
+    /// conns distributed round-robin across two threads use global
+    /// indices 0..3; using local indices 0..1 on each thread would
+    /// produce two pacers at the 10_000 anchor and two at the 12_000
+    /// stagger — never covering the full period.
+    #[test]
+    fn stagger_uses_global_index_across_threads() {
+        // 1 M aggregate, 4 clients → 4 µs period, 1 µs stagger.
+        // Round-robin distribution across 2 threads: thread 0 owns
+        // global conns {0, 2}, thread 1 owns {1, 3}.
+        let global_indices = [0u64, 2, 1, 3];
+        let dues: Vec<u64> = global_indices
+            .iter()
+            .map(|&i| PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, i).next_due_ticks())
+            .collect();
+        let mut sorted = dues.clone();
+        sorted.sort();
+        // First sends cover the whole period at 1 µs spacing.
+        assert_eq!(sorted, vec![10_000, 11_000, 12_000, 13_000]);
+
+        // Bug sibling: using the thread-local index (0, 1, 0, 1)
+        // collapses two pairs onto the same tick.
+        let local_indices = [0u64, 1, 0, 1];
+        let buggy: Vec<u64> = local_indices
+            .iter()
+            .map(|&i| PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, i).next_due_ticks())
+            .collect();
+        // Two pacers at 10_000 and two at 11_000 — herd flattened only
+        // within each thread, not across them.
+        let mut buggy_sorted = buggy.clone();
+        buggy_sorted.sort();
+        assert_eq!(buggy_sorted, vec![10_000, 10_000, 11_000, 11_000]);
     }
 
     #[test]

@@ -429,7 +429,9 @@ pub fn run_dpdk_roundtrip(
     // the DPDK loop running single-threaded over all connections, a
     // shared anchor is sufficient; staggered first sends via
     // `conn_index` keep the connections out of phase within one period.
-    if target_rate > 0 {
+    // `warmup_end_tsc` gates pace_stats telemetry so `scheduled` /
+    // `late_sends` cover the same phase as `achieved_rate`.
+    let warmup_end_tsc: u64 = if target_rate > 0 {
         let start_tsc = crate::rdtscp();
         let clients = num_clients.max(1) as u64;
         for (idx, conn) in connections.iter_mut().enumerate() {
@@ -441,7 +443,11 @@ pub fn run_dpdk_roundtrip(
                 idx as u64,
             ));
         }
-    }
+        let warmup_ticks = (phases.warmup.as_nanos() as f64 * ticks_per_ns) as u64;
+        start_tsc.saturating_add(warmup_ticks)
+    } else {
+        0
+    };
 
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
@@ -596,7 +602,12 @@ pub fn run_dpdk_roundtrip(
                     let now_tsc = crate::rdtscp();
                     match p.pop_due(now_tsc) {
                         Some(scheduled) => {
-                            pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
+                            // Gate telemetry on warmup-end so `scheduled` /
+                            // `late_sends` align with the
+                            // measured-phase `achieved_rate` divisor.
+                            if now_tsc >= warmup_end_tsc {
+                                pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
+                            }
                             Some(scheduled)
                         }
                         None => break,
