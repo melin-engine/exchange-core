@@ -501,19 +501,14 @@ pub fn run_dpdk_roundtrip(
                 .ok();
         }
 
-        // Wall-clock-driven termination: stop once cooldown ends. We
-        // don't drain residual responses past `cooldown_end` — the
-        // histogram is sealed at `measured_end` so anything that would
-        // arrive in the cooldown tail is already discarded by the
-        // phase classifier below.
-        let now = Instant::now();
-        if now >= deadlines.cooldown_end {
+        // Wall-clock-driven termination: stop once cooldown ends. The
+        // histogram is sealed at `measured_end` so any responses that
+        // would arrive in the cooldown tail are already discarded by
+        // the phase classifier below; abandoning them at `cooldown_end`
+        // doesn't change reported latencies.
+        if Instant::now() >= deadlines.cooldown_end {
             break;
         }
-        // Stop issuing new sends after cooldown begins; the existing
-        // partial-send / pending state still drains inside the per-conn
-        // body below.
-        let in_send_phase = now < deadlines.cooldown_end;
 
         for (i, conn) in connections.iter_mut().enumerate() {
             // Mid-iteration poll to flush TX and receive new data.
@@ -546,13 +541,11 @@ pub fn run_dpdk_roundtrip(
 
             // Send new frames while window has room. Each frame is generated
             // on-the-fly into `scratch_frame` as [u32 LE len][payload]. When
-            // the socket can't accept any bytes, the unsent frame is parked in
-            // `pending_unsent` and `inflight_ts` / `send_cursor` are *not*
-            // advanced — so the recorded send timestamp reflects the moment
-            // bytes actually start hitting the wire, matching pre-refactor
-            // semantics.
-            while in_send_phase
-                && conn.send_pending.is_empty()
+            // the socket can't accept any bytes, the unsent frame is parked
+            // in `pending_unsent` and `inflight_ts` is *not* advanced — so
+            // the recorded send timestamp reflects the moment bytes actually
+            // start hitting the wire, not the moment generation completed.
+            while conn.send_pending.is_empty()
                 && conn.inflight_ts.len() < window
                 && socket.can_send()
             {

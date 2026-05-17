@@ -15,14 +15,30 @@
 //! in a tight loop — no disruptor, no journal, no I/O. Measures pure matching
 //! engine throughput and latency.
 //!
-//! All modes use the realistic order flow generator: a mix of limit orders and
-//! cancels with power-law price/size distributions, multiple accounts, and
-//! resting book depth. Events are pre-generated before the measured run.
+//! All modes use the realistic order flow generator: a mix of limit orders
+//! and cancels with power-law price/size distributions, multiple accounts,
+//! and resting book depth. Orders are generated on-the-fly inside the hot
+//! loop so memory stays bounded regardless of run length.
+//!
+//! Run length is wall-clock-driven. Each phase is a duration:
+//!
+//! * `--warmup-duration` (default 5s) — primes caches; samples discarded.
+//! * `--duration`        (default 60s) — measured into the histogram.
+//! * `--cooldown-duration` (default 5s) — drains the journal/network tail;
+//!   samples discarded.
+//!
+//! Completions are classified by *receive time* against shared phase
+//! deadlines, so all bench threads agree on which phase a sample belongs
+//! to without further coordination.
 //!
 //! Usage:
-//!     cargo run --release --bin melin-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--health-addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
+//!     cargo run --release --bin melin-bench -- \
+//!         [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] \
+//!         [--health-addr=<ip:port>] [--clients=N] [--window=N] \
+//!         [--bench-threads=N] [--warmup-duration=5s] [--duration=60s] \
+//!         [--cooldown-duration=5s] [--group-commit-us=N]
 //!
-//! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
+//! Default: roundtrip mode, TCP transport, 60 s measured.
 
 // Under `--features dpdk`, the entire TCP-path code in this file is
 // unreachable from the dispatch in `main`. Suppress the resulting
@@ -1709,7 +1725,6 @@ fn run_uring_roundtrip<R, W, F>(
             send_pending: false,
             flow,
             inflight_ts: VecDeque::with_capacity(window),
-            done: false,
         });
     }
 
@@ -1874,7 +1889,6 @@ struct UringBenchConn {
     /// TSC tick at send time. `u64` instead of `Instant` to avoid
     /// ~15-25ns vDSO overhead per timestamp on the hot path.
     inflight_ts: VecDeque<u64>,
-    done: bool,
 }
 
 /// io_uring event loop for all benchmark connections. Single-threaded:
@@ -1892,7 +1906,6 @@ fn run_uring_loop(
     use io_uring::{IoUring, opcode, types};
 
     let ticks_per_ns = calibrate_tsc();
-    let _n = connections.len();
     // 4096 entries: supports up to 1024 connections per thread (RECV +
     // SEND per connection, plus headroom for partial-send resubmissions).
     let mut ring = IoUring::new(4096).expect("create io_uring for bench");
@@ -2033,20 +2046,20 @@ fn run_uring_loop(
                     conn.parse_buf.truncate(remaining);
                 }
 
-                // Resubmit RECV if connection is still active.
-                if !conn.done {
-                    let sqe = opcode::Recv::new(
-                        types::Fd(conn.read_fd),
-                        conn.recv_buf.as_mut_ptr(),
-                        URING_RECV_BUF_SIZE as u32,
-                    )
-                    .build()
-                    .user_data(idx as u64);
-                    unsafe {
-                        ring.submission().push(&sqe).expect("SQ full");
-                    }
-                    conn.recv_pending = true;
+                // Re-arm RECV. The outer loop's wall-clock check is the
+                // only exit; pending CQEs after cooldown are drained
+                // implicitly when the io_uring drops at function exit.
+                let sqe = opcode::Recv::new(
+                    types::Fd(conn.read_fd),
+                    conn.recv_buf.as_mut_ptr(),
+                    URING_RECV_BUF_SIZE as u32,
+                )
+                .build()
+                .user_data(idx as u64);
+                unsafe {
+                    ring.submission().push(&sqe).expect("SQ full");
                 }
+                conn.recv_pending = true;
             }
         }
 
@@ -2078,7 +2091,7 @@ fn uring_fill_windows(
     }
 
     for (i, conn) in connections.iter_mut().enumerate() {
-        if conn.done || conn.send_pending {
+        if conn.send_pending {
             continue;
         }
 
