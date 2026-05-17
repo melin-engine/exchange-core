@@ -163,8 +163,48 @@ pub struct SectorWriter<E: AppEvent> {
     /// every flush; `write_pos` advances only when this sector is full.
     /// Allocated as MAX_SECTOR_SIZE bytes so it works for both 512 and 4096;
     /// only `sector_size` bytes are used at runtime.
+    ///
+    /// **Load-bearing invariant for new code — do not break:** while
+    /// `tail_sector_len > 0`, the bytes `tail_sector[..tail_sector_len]`
+    /// MUST equal what's on disk at `[write_pos, write_pos + tail_sector_len)`.
+    /// Any subsequent write at `write_pos` MUST therefore include this
+    /// prefix; otherwise the next pwrite truncates the previously-written
+    /// tail bytes (O_DIRECT overwrites the whole sector — there is no
+    /// "append only" mode at the device level).
+    ///
+    /// Today this is maintained because *every* write to `write_pos` is
+    /// sourced from `tail_sector` itself — `flush_to_sectors`
+    /// reconstructs the full sector by prepending the tail to the new
+    /// batch (see `copy_from_slice` of `tail_sector[..tail_sector_len]`
+    /// into `batch_buf[..tail_sector_len]`), and
+    /// `take_batch_for_async_write` keeps appending into `tail_sector`
+    /// and sync-pwrites it as-is. Only `open_append` constructs the
+    /// initial tail content, and it does so by reading the on-disk sector
+    /// back into the buffer.
+    ///
+    /// Things that would silently corrupt the journal if added carelessly:
+    /// 1. A code path that resets `tail_sector_len = 0` without first
+    ///    advancing `write_pos` past the partial sector (or without first
+    ///    issuing a flush that absorbs the bytes).
+    /// 2. A pwrite at `write_pos` sourced from a buffer that doesn't
+    ///    include the existing `tail_sector[..tail_sector_len]` as its
+    ///    prefix.
+    /// 3. Rotation / writer hand-off that takes ownership of `self`
+    ///    without first calling `flush_batch_sync` to commit the tail
+    ///    state (the rotated segment would then start with stale tail
+    ///    content from `tail_sector`).
+    ///
+    /// This is a state-machine invariant, not a range-bounds invariant,
+    /// so it can't be reduced to a single API surface the way
+    /// `zero_unwritten_through` did for the prealloc-zero bug. The
+    /// principled fix would be phantom-typed writer states; the surface
+    /// is small enough today that the load-bearing-comment approach is
+    /// the pragmatic call. Revisit if a third "looks-correct, silently
+    /// truncates" bug shows up in this area.
     tail_sector: Box<AlignedBuf<MAX_SECTOR_SIZE>>,
     /// Bytes of real data in `tail_sector`. Always < sector_size.
+    /// See `tail_sector`'s docstring for the on-disk-equality invariant
+    /// that ties `tail_sector_len` to the writer's `write_pos`.
     tail_sector_len: usize,
 }
 
