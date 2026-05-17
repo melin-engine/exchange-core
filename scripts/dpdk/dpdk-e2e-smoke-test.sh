@@ -193,7 +193,7 @@ echo ""
 
 # --- 6. Run bench ---
 echo "=== Running DPDK bench ==="
-echo "  1000 order pairs, 16 client, window 256"
+echo "  short timed run, 2 clients, window 32"
 echo ""
 
 "$PROJECT_DIR/target/release/melin-bench" \
@@ -201,12 +201,13 @@ echo ""
     --key "$TMPDIR/bench.key" \
     --clients 2 \
     --window 32 \
-    --warmup 1000 \
+    --warmup-duration 2s \
+    --duration 5s \
+    --cooldown-duration 0s \
     --dpdk-eal-args="--vdev=net_af_packet1,iface=$VETH_BENCH --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=bench" \
     --dpdk-ip "$BENCH_IP" \
     --dpdk-prefix-len "$PREFIX" \
     --dpdk-core 5 \
-    30000 \
     2>&1 | tee "$TMPDIR/bench.log"
 
 BENCH_EXIT=$?

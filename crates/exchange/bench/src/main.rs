@@ -72,11 +72,17 @@ use melin_types::types::*;
 /// giving temporal variation rather than cumulative smoothing.
 const SAMPLE_INTERVAL: usize = 1_000;
 
-/// Number of order pairs (buy + sell) per benchmark run.
-const DEFAULT_PAIRS: usize = 1_000_000;
+/// Default measured-phase duration.
+const DEFAULT_DURATION: Duration = Duration::from_secs(60);
 
-/// Default warmup orders (not measured) per client to prime the pipeline and caches.
-const WARMUP_ORDERS: usize = 100_000;
+/// Default warmup duration — primes caches, branch predictors, allocator
+/// arenas, and the disruptor ring before measurement starts.
+const DEFAULT_WARMUP: Duration = Duration::from_secs(5);
+
+/// Default cooldown duration — drains the final fsync-tail batches whose
+/// per-event cost isn't amortised across a full window. The samples
+/// recorded during cooldown are discarded.
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Default number of orders in flight simultaneously per client. Controls the
 /// level of pipelining — enough to keep the server pipeline saturated (journal +
@@ -96,6 +102,45 @@ const DEFAULT_BENCH_THREADS: usize = 4;
 /// Maximum frame payload size (matches protocol).
 #[cfg(not(feature = "dpdk"))]
 const MAX_FRAME_SIZE: usize = 1024;
+
+/// Clap value parser: accept any humantime-recognised duration (`30s`,
+/// `2m`, `500ms`, …). Surfaces parse errors as clap-friendly strings.
+fn parse_duration(s: &str) -> Result<humantime::Duration, String> {
+    s.parse::<humantime::Duration>()
+        .map_err(|e| format!("invalid duration `{s}`: {e}"))
+}
+
+/// `BenchPhases` carries the three wall-clock durations that drive every
+/// bench loop: warmup (priming), measured (recorded into the histogram),
+/// and cooldown (final drain whose samples are discarded).
+#[derive(Clone, Copy)]
+pub(crate) struct BenchPhases {
+    pub warmup: Duration,
+    pub measured: Duration,
+    pub cooldown: Duration,
+}
+
+impl BenchPhases {
+    /// Deadlines relative to a shared `start` instant.
+    pub(crate) fn deadlines(self, start: Instant) -> PhaseDeadlines {
+        let warmup_end = start + self.warmup;
+        let measured_end = warmup_end + self.measured;
+        let cooldown_end = measured_end + self.cooldown;
+        PhaseDeadlines {
+            warmup_end,
+            measured_end,
+            cooldown_end,
+        }
+    }
+}
+
+/// Wall-clock cutoffs for the three phases.
+#[derive(Clone, Copy)]
+pub(crate) struct PhaseDeadlines {
+    pub warmup_end: Instant,
+    pub measured_end: Instant,
+    pub cooldown_end: Instant,
+}
 
 // ---------------------------------------------------------------------------
 // TSC (Time Stamp Counter) utilities for low-overhead per-order timing
@@ -287,9 +332,10 @@ struct BenchArgs {
     /// Connect to a remote engine instead of spawning an embedded server (roundtrip mode only).
     #[arg(long)]
     addr: Option<std::net::SocketAddr>,
-    /// Number of order pairs (buy + sell) to benchmark.
-    #[arg(default_value_t = DEFAULT_PAIRS)]
-    pairs: usize,
+    /// Length of the measured phase. Accepts humantime values
+    /// (e.g. `30s`, `2m`, `500ms`).
+    #[arg(long, default_value_t = humantime::Duration::from(DEFAULT_DURATION), value_parser = parse_duration)]
+    duration: humantime::Duration,
     /// Orders in flight per client (pipelining depth).
     #[arg(long, default_value_t = DEFAULT_WINDOW)]
     window: usize,
@@ -302,18 +348,17 @@ struct BenchArgs {
     /// Group commit coalescing delay in microseconds.
     #[arg(long, default_value_t = 0)]
     group_commit_us: u64,
-    /// Warmup orders per client (not measured). Higher values let caches,
-    /// branch predictors, and allocator settle before measurement starts.
-    #[arg(long, default_value_t = WARMUP_ORDERS)]
-    warmup: usize,
-    /// Cooldown orders per client (not measured). The bench's final batch
+    /// Warmup duration before measurement starts. Lets caches, branch
+    /// predictors, and allocator arenas settle. Accepts humantime values.
+    #[arg(long, default_value_t = humantime::Duration::from(DEFAULT_WARMUP), value_parser = parse_duration)]
+    warmup_duration: humantime::Duration,
+    /// Cooldown duration after measurement ends. The bench's final batch
     /// flushes a small number of events whose `fdatasync` cost isn't
     /// amortised across a full batch, inflating the run-max with a
     /// drain-tail artefact that doesn't reflect steady-state behaviour.
-    /// Set non-zero to exclude the last N orders from the histogram.
-    /// Defaults to 0 (no cooldown).
-    #[arg(long, default_value_t = 0)]
-    cooldown: usize,
+    /// Samples recorded during cooldown are discarded.
+    #[arg(long, default_value_t = humantime::Duration::from(DEFAULT_COOLDOWN), value_parser = parse_duration)]
+    cooldown_duration: humantime::Duration,
     /// Path for the journal file. Defaults to a temporary directory.
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
@@ -395,25 +440,21 @@ fn main() {
 
     let args = <BenchArgs as clap::Parser>::parse();
     let json_path = args.json.as_deref();
+    let phases = BenchPhases {
+        warmup: args.warmup_duration.into(),
+        measured: args.duration.into(),
+        cooldown: args.cooldown_duration.into(),
+    };
 
     match args.mode.as_str() {
         "engine" => {
-            run_engine_bench(
-                args.pairs,
-                args.warmup,
-                args.cooldown,
-                args.accounts,
-                args.instruments,
-                json_path,
-            );
+            run_engine_bench(phases, args.accounts, args.instruments, json_path);
         }
         "pipeline" => {
             run_pipeline_bench(
-                args.pairs,
+                phases,
                 args.window,
                 args.group_commit_us,
-                args.warmup,
-                args.cooldown,
                 args.journal,
                 json_path,
                 args.max_journal_batch,
@@ -451,10 +492,9 @@ fn main() {
                         mtu: args.dpdk_mtu,
                         vlan_id: args.dpdk_vlan,
                     },
-                    args.pairs,
+                    phases,
                     args.window,
                     args.clients,
-                    args.warmup,
                     json_path,
                     &key,
                     args.accounts,
@@ -468,14 +508,12 @@ fn main() {
             {
                 run_roundtrip_bench(
                     args.uds,
-                    args.pairs,
+                    phases,
                     args.window,
                     args.clients,
                     args.bench_threads,
                     args.group_commit_us,
                     args.addr,
-                    args.warmup,
-                    args.cooldown,
                     args.journal,
                     args.accounts,
                     args.instruments,
@@ -501,12 +539,11 @@ fn main() {
 /// and `Exchange::cancel()` directly in a tight loop — no disruptor, no journal,
 /// no I/O. Uses the generator to produce a mix of limit orders and cancels with
 /// power-law price/size distributions, multiple accounts, and resting book depth.
-/// All events are pre-generated before the measured run so RNG overhead doesn't
-/// pollute per-order timing.
+/// Orders are generated on-the-fly inside the loop; `next_event()` is invoked
+/// *before* the per-order `rdtscp()` so RNG cost stays outside the measured
+/// window.
 fn run_engine_bench(
-    total_pairs: usize,
-    warmup: usize,
-    cooldown: usize,
+    phases: BenchPhases,
     num_accounts: u32,
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
@@ -545,22 +582,20 @@ fn run_engine_bench(
 
     exchange.prefault();
 
-    let total_events = warmup + total_pairs * 2;
-    let measure_end = total_events.saturating_sub(cooldown);
-
-    // Orders are generated on-the-fly so memory stays bounded for long runs.
-    // `next_event()` is called *before* `t0 = rdtscp()` in the hot loop, so
-    // RNG cost is excluded from the per-order measurement — same window as
-    // the pre-refactor pre-generated path. Latency numbers remain
-    // comparable to historical engine-bench baselines.
     let mut flow = OrderFlowGenerator::new(config);
 
     let mut reports = Vec::with_capacity(256);
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
 
-    // Warmup.
-    for _ in 0..warmup {
+    let phase_start = Instant::now();
+    let deadlines = phases.deadlines(phase_start);
+
+    // Warmup — drive the engine at full speed but discard timings. Polling
+    // `Instant::now()` every iteration is fine because the warmup body is
+    // already many hundreds of ns of work; the clock read is negligible
+    // and stops the loop precisely without burning extra cycles.
+    while Instant::now() < deadlines.warmup_end {
         reports.clear();
         let event = flow.next_event();
         match event {
@@ -635,9 +670,23 @@ fn run_engine_bench(
     let mut slowest: std::collections::BinaryHeap<std::cmp::Reverse<SlowEntry>> =
         std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
 
+    // Measured phase: record latencies until `measured_end` passes. We
+    // poll `Instant::now()` only once per ~SAMPLE_INTERVAL iterations
+    // because every per-order `Instant::now()` would inflate the busy
+    // loop. The interval already gates the latency-time-series sampler,
+    // so reuse its tick boundary as a cheap deadline check too.
     let start = Instant::now();
-    let measured = measure_end.saturating_sub(warmup);
-    for _ in 0..measured {
+    let mut iter_since_check: u32 = 0;
+    let deadline_poll_interval: u32 = 1024;
+    let mut measured_orders: u64 = 0;
+    loop {
+        if iter_since_check >= deadline_poll_interval {
+            if Instant::now() >= deadlines.measured_end {
+                break;
+            }
+            iter_since_check = 0;
+        }
+        iter_since_check += 1;
         reports.clear();
         let event = flow.next_event();
 
@@ -686,6 +735,7 @@ fn run_engine_bench(
         histogram.record(elapsed_ns).expect("record");
         interval_hist.record(elapsed_ns).expect("record interval");
         interval_count += 1;
+        measured_orders += 1;
         maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
 
         // Track top-N slowest using a min-heap capped at SLOWEST_N.
@@ -715,6 +765,43 @@ fn run_engine_bench(
     }
     let wall = start.elapsed();
 
+    // Cooldown — keep driving the engine to absorb any drain-tail
+    // artefacts (none here in engine mode, but symmetric with the other
+    // bench paths makes the phase model uniform). Samples are not
+    // recorded; the histogram is sealed at this point.
+    while Instant::now() < deadlines.cooldown_end {
+        reports.clear();
+        let event = flow.next_event();
+        match event {
+            GeneratedEvent::Submit { symbol, order } => {
+                exchange.execute(symbol, order, &mut reports);
+            }
+            GeneratedEvent::Cancel {
+                symbol,
+                account,
+                order_id,
+            } => {
+                exchange.cancel(symbol, account, order_id, &mut reports);
+            }
+            GeneratedEvent::CancelReplace {
+                symbol,
+                account,
+                order_id,
+                new_price,
+                new_quantity,
+            } => {
+                exchange.cancel_replace(
+                    symbol,
+                    account,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                    &mut reports,
+                );
+            }
+        }
+    }
+
     let total_events = submits + cancels + amends;
     let cancel_pct = if total_events > 0 {
         cancels as f64 / total_events as f64 * 100.0
@@ -729,8 +816,8 @@ fn run_engine_bench(
 
     print_results(
         "Realistic Order Flow",
-        measured,
-        warmup,
+        measured_orders as usize,
+        phases,
         &histogram,
         wall,
         &[
@@ -770,11 +857,9 @@ fn run_engine_bench(
 /// SPSC consumer. Measures pipeline latency without network overhead.
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline_bench(
-    total_pairs: usize,
+    phases: BenchPhases,
     window: usize,
     group_commit_us: u64,
-    warmup: usize,
-    cooldown: usize,
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
@@ -800,9 +885,7 @@ fn run_pipeline_bench(
     let cfg = PipelineInnerCfg {
         group_commit_us,
         max_journal_batch,
-        total_pairs,
-        warmup,
-        cooldown,
+        phases,
         window,
         json_path,
     };
@@ -832,9 +915,7 @@ fn run_pipeline_bench(
 struct PipelineInnerCfg<'a> {
     group_commit_us: u64,
     max_journal_batch: usize,
-    total_pairs: usize,
-    warmup: usize,
-    cooldown: usize,
+    phases: BenchPhases,
     window: usize,
     json_path: Option<&'a std::path::Path>,
 }
@@ -857,9 +938,7 @@ where
     let PipelineInnerCfg {
         group_commit_us,
         max_journal_batch,
-        total_pairs,
-        warmup,
-        cooldown,
+        phases,
         window,
         json_path,
     } = cfg;
@@ -909,8 +988,12 @@ where
         })
         .expect("spawn matching thread");
 
-    let total_orders = warmup + total_pairs * 2;
-    let measure_end = total_orders.saturating_sub(cooldown);
+    // Single shared start so both threads agree on warmup/measured/cooldown
+    // deadlines. Pinned threads compute their own `Instant::now()` against
+    // this clock without further coordination.
+    let phase_start = Instant::now();
+    let deadlines = phases.deadlines(phase_start);
+    let pub_stop = Arc::new(AtomicBool::new(false));
 
     // Split publish and drain into separate threads so the publisher
     // keeps the disruptor fed while the drainer processes BatchEnds.
@@ -941,18 +1024,34 @@ where
     // cursor order at encode time.
     let mut producer = out.input_producer;
     let inflight_pub = Arc::clone(&inflight);
+    let pub_stop_p = Arc::clone(&pub_stop);
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
         .spawn(move || {
             if let Err(e) = melin_app::affinity::pin_to_core(3) {
                 eprintln!("warning: could not pin pipeline-pub to core 3: {e}");
             }
-            for i in 0..total_orders {
-                let order_id = OrderId((i as u64) + 1);
-                let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+            // Publish until the drain thread signals stop (set once the
+            // cooldown deadline passes and the inflight queue is drained).
+            // OrderId is a free-running u64; no risk of overflow at any
+            // realistic bench duration.
+            let mut i: u64 = 0;
+            while !pub_stop_p.load(Ordering::Relaxed) {
+                let order_id = OrderId(i + 1);
+                let side = if i.is_multiple_of(2) {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                i += 1;
 
-                // Spin-wait for window capacity.
+                // Spin-wait for window capacity OR a stop signal — we
+                // must not block forever if the drain thread already
+                // told us to stop while the window is full.
                 while inflight_pub.load(Ordering::Acquire) >= window as u64 {
+                    if pub_stop_p.load(Ordering::Relaxed) {
+                        return;
+                    }
                     std::hint::spin_loop();
                 }
 
@@ -993,11 +1092,19 @@ where
     // Drain thread (this thread): consume output SPSC and record latency.
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut completed = 0usize;
+    let mut measured_orders: u64 = 0;
     let mut measured_start: Option<Instant> = None;
-    let start = Instant::now();
+    let start = phase_start;
 
-    while completed < total_orders {
+    // Drain until cooldown ends. Classify each completion by *receive*
+    // time against `deadlines`: anything within `[warmup_end, measured_end)`
+    // contributes to the histogram. We don't gate the queue read on the
+    // deadline — the inflight ring may still be draining when we exit.
+    loop {
+        let now = Instant::now();
+        if now >= deadlines.cooldown_end {
+            break;
+        }
         let Some((_seq, slot)) = output_consumer.try_consume() else {
             std::hint::spin_loop();
             continue;
@@ -1016,21 +1123,25 @@ where
             };
             inflight.fetch_sub(1, Ordering::Release);
             let latency_ns = tsc_to_ns(rdtscp() - sent_at, ticks_per_ns);
-            if completed >= warmup && completed < measure_end {
+            if now >= deadlines.warmup_end && now < deadlines.measured_end {
                 if measured_start.is_none() {
-                    measured_start = Some(Instant::now());
+                    measured_start = Some(now);
                 }
                 histogram.record(latency_ns).expect("record");
+                measured_orders += 1;
             }
-            completed += 1;
         }
     }
 
+    // Tell the publisher to stop and join it. The publisher checks the
+    // flag both at top-of-loop and inside its window-spin, so it cannot
+    // be stuck waiting forever even with a full inflight window.
+    pub_stop.store(true, Ordering::Relaxed);
     publish_handle.join().expect("publisher thread");
 
     let end = Instant::now();
     let measured_wall = measured_start
-        .map(|s| end.duration_since(s))
+        .map(|s| end.duration_since(s).min(phases.measured))
         .unwrap_or_else(|| start.elapsed());
 
     // Shutdown pipeline threads.
@@ -1044,8 +1155,8 @@ where
 
     print_results(
         "Pipeline (no network)",
-        total_pairs * 2,
-        warmup,
+        measured_orders as usize,
+        phases,
         &histogram,
         measured_wall,
         &extra_lines,
@@ -1079,14 +1190,12 @@ where
 #[cfg(not(feature = "dpdk"))]
 fn run_roundtrip_bench(
     use_uds: bool,
-    pairs: usize,
+    phases: BenchPhases,
     window: usize,
     num_clients: usize,
     bench_threads: usize,
     group_commit_us: u64,
     remote_addr: Option<std::net::SocketAddr>,
-    warmup: usize,
-    cooldown: usize,
     journal_path: Option<std::path::PathBuf>,
     num_accounts: u32,
     num_instruments: u32,
@@ -1119,14 +1228,12 @@ fn run_roundtrip_bench(
         run_roundtrip_inner(
             connect,
             &format!("TCP {addr}"),
-            pairs,
+            phases,
             window,
             num_clients,
             bench_threads,
             group_commit_us,
             shutdown,
-            warmup,
-            cooldown,
             json_path,
             &key,
             num_accounts,
@@ -1191,14 +1298,12 @@ fn run_roundtrip_bench(
         run_roundtrip_inner(
             connect,
             "Unix domain socket",
-            pairs,
+            phases,
             window,
             num_clients,
             bench_threads,
             group_commit_us,
             shutdown,
-            warmup,
-            cooldown,
             json_path,
             &bench_key,
             num_accounts,
@@ -1224,14 +1329,12 @@ fn run_roundtrip_bench(
         run_roundtrip_inner(
             connect,
             "TCP loopback",
-            pairs,
+            phases,
             window,
             num_clients,
             bench_threads,
             group_commit_us,
             shutdown,
-            warmup,
-            cooldown,
             json_path,
             &bench_key,
             num_accounts,
@@ -1397,14 +1500,12 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 fn run_roundtrip_inner<R, W, F>(
     connect: F,
     transport_name: &str,
-    total_pairs: usize,
+    phases: BenchPhases,
     window: usize,
     num_clients: usize,
     bench_threads: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
-    warmup: usize,
-    cooldown: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
@@ -1419,14 +1520,12 @@ fn run_roundtrip_inner<R, W, F>(
     run_uring_roundtrip(
         connect,
         transport_name,
-        total_pairs,
+        phases,
         window,
         num_clients,
         bench_threads,
         group_commit_us,
         shutdown,
-        warmup,
-        cooldown,
         json_path,
         key,
         num_accounts,
@@ -1448,9 +1547,10 @@ fn run_roundtrip_inner<R, W, F>(
 /// mutex, which can block bench threads that also write to stderr.
 pub(crate) fn spawn_progress_reporter(
     completed: Arc<AtomicU64>,
-    total_orders: u64,
+    phases: BenchPhases,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+    let total_duration = phases.warmup + phases.measured + phases.cooldown;
     std::thread::Builder::new()
         .name("progress".into())
         .spawn(move || {
@@ -1482,17 +1582,29 @@ pub(crate) fn spawn_progress_reporter(
                 let delta = current.saturating_sub(last_completed);
                 let rate = delta as f64 / dt;
                 let elapsed = now.duration_since(start).as_secs_f64();
-                let pct = current as f64 / total_orders as f64 * 100.0;
+                let total_secs = total_duration.as_secs_f64();
+                let pct = if total_secs > 0.0 {
+                    (elapsed / total_secs * 100.0).min(100.0)
+                } else {
+                    100.0
+                };
+                let phase = if elapsed < phases.warmup.as_secs_f64() {
+                    "warmup"
+                } else if elapsed < (phases.warmup + phases.measured).as_secs_f64() {
+                    "measured"
+                } else {
+                    "cooldown"
+                };
 
                 // Format into a stack buffer and write(2) directly to fd 2.
                 // Avoids the stderr mutex that eprintln! holds, which can
                 // block bench threads doing eprintln! on error paths.
                 use std::io::Write as _;
-                let mut buf = [0u8; 128];
+                let mut buf = [0u8; 192];
                 let mut cursor = std::io::Cursor::new(&mut buf[..]);
                 let _ = writeln!(
                     cursor,
-                    "  [{elapsed:.1}s] {current} / {total_orders} orders ({pct:.1}%)  {:.0}K/s",
+                    "  [{elapsed:.1}s/{total_secs:.0}s {pct:.0}% {phase}] {current} measured orders  {:.0}K/s",
                     rate / 1000.0,
                 );
                 let len = cursor.position() as usize;
@@ -1519,14 +1631,12 @@ pub(crate) fn spawn_progress_reporter(
 fn run_uring_roundtrip<R, W, F>(
     connect: F,
     transport_name: &str,
-    total_pairs: usize,
+    phases: BenchPhases,
     window: usize,
     num_clients: usize,
     bench_threads: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
-    warmup: usize,
-    cooldown: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
@@ -1538,36 +1648,24 @@ fn run_uring_roundtrip<R, W, F>(
     W: Write + AsRawFd + Send + 'static,
     F: Fn() -> (R, W) + Sync,
 {
-    let pairs_per_client = total_pairs / num_clients;
-    let remainder = total_pairs % num_clients;
-
-    // Build a generator per client. Orders are produced on-the-fly during the
-    // bench loop so memory stays bounded regardless of run length.
-    let per_client: Vec<(generator::OrderFlowGenerator, usize)> = (0..num_clients)
+    // Build a generator per client. With on-the-fly generation the loop
+    // is never starved by a pre-allocated cap; phases are driven entirely
+    // by the wall-clock deadlines defined by `phases`. Each generator
+    // gets a non-overlapping `start_order_id` slice from `OrderId` space.
+    //
+    // `ORDER_ID_STRIDE` reserves a generous block per client so a long
+    // bench at 10 M/s (≈ 6e11 orders/min) still fits a u64 slot without
+    // colliding across clients. 2^48 ≈ 2.8e14 ids — three orders of
+    // magnitude beyond any realistic run.
+    const ORDER_ID_STRIDE: u64 = 1u64 << 48;
+    let per_client: Vec<generator::OrderFlowGenerator> = (0..num_clients)
         .map(|client_id| {
-            let client_pairs = if client_id == num_clients - 1 {
-                pairs_per_client + remainder
-            } else {
-                pairs_per_client
-            };
-            let total_orders = warmup + client_pairs * 2;
-            let order_id_offset: u64 = (0..client_id)
-                .map(|c| {
-                    let p = if c == num_clients - 1 {
-                        pairs_per_client + remainder
-                    } else {
-                        pairs_per_client
-                    };
-                    (warmup + p * 2) as u64
-                })
-                .sum();
-            let flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+            generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
-                start_order_id: order_id_offset + 1,
+                start_order_id: ORDER_ID_STRIDE * (client_id as u64) + 1,
                 ..Default::default()
-            });
-            (flow, total_orders)
+            })
         })
         .collect();
     eprintln!("  per-client generators initialised for {num_clients} clients");
@@ -1593,7 +1691,7 @@ fn run_uring_roundtrip<R, W, F>(
 
     // Attach per-client generator and distribute round-robin across bench threads.
     let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
-    for (i, ((read_stream, write_stream), (flow, total_orders))) in
+    for (i, ((read_stream, write_stream), flow)) in
         connected.into_iter().zip(per_client).enumerate()
     {
         let read_fd = read_stream.as_raw_fd();
@@ -1610,28 +1708,26 @@ fn run_uring_roundtrip<R, W, F>(
             send_buf: Vec::with_capacity(4096),
             send_pending: false,
             flow,
-            send_cursor: 0,
             inflight_ts: VecDeque::with_capacity(window),
-            batch_count: 0,
-            total_orders,
             done: false,
         });
     }
 
-    // Total measured orders (excluding warmup) for progress reporting.
-    let total_all_orders: u64 = (total_pairs * 2) as u64;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = spawn_progress_reporter(
         Arc::clone(&progress),
-        total_all_orders,
+        phases,
         Arc::clone(&progress_shutdown),
     );
 
     // Start health poller before bench threads.
     let health_poller = health_addr.map(health_poller::HealthPoller::start);
 
+    // Shared start instant — every bench thread derives its phase
+    // deadlines from this so they classify completions consistently.
     let start = Instant::now();
+    let deadlines = phases.deadlines(start);
 
     // Spawn io_uring bench threads, each with its own ring and connection subset.
     let handles: Vec<_> = thread_conns
@@ -1649,14 +1745,7 @@ fn run_uring_roundtrip<R, W, F>(
                     {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
-                    run_uring_loop(
-                        conns,
-                        window,
-                        bench_start,
-                        warmup,
-                        cooldown,
-                        thread_progress,
-                    )
+                    run_uring_loop(conns, window, bench_start, deadlines, thread_progress)
                 })
                 .expect("spawn bench thread")
         })
@@ -1693,11 +1782,14 @@ fn run_uring_roundtrip<R, W, F>(
     // Collect health samples.
     let health_samples = health_poller.map(|p| p.stop()).unwrap_or_default();
 
-    // Measure throughput over the measured phase only — from when the first
-    // thread finished warmup until `end` (captured above, pre-join). This
-    // covers all measured orders from all threads without undercounting.
+    // Measure throughput over the measured phase only — from when the
+    // first thread finished warmup until either `end` (captured above,
+    // pre-join) or `start + warmup + measured`, whichever is sooner.
+    // `end` lands inside cooldown when threads exited via the wall-clock
+    // deadline, so capping at `phases.measured` keeps the divisor
+    // honest.
     let measured_wall = earliest_measured_start
-        .map(|s| end.duration_since(s))
+        .map(|s| end.duration_since(s).min(phases.measured))
         .unwrap_or_else(|| start.elapsed());
 
     let mut extra_lines = Vec::new();
@@ -1729,8 +1821,8 @@ fn run_uring_roundtrip<R, W, F>(
 
     print_results(
         "Roundtrip",
-        total_pairs * 2,
-        warmup * num_clients,
+        histogram.len() as usize,
+        phases,
         &histogram,
         measured_wall,
         &extra_lines,
@@ -1775,15 +1867,13 @@ struct UringBenchConn {
     send_buf: Vec<u8>,
     send_pending: bool,
 
-    // Pipelining state — orders are generated on-the-fly so the per-connection
-    // memory footprint stays constant regardless of `total_orders`.
+    // Pipelining state — orders are generated on-the-fly. There is no
+    // pre-allocated cap: the loop runs until the wall-clock cooldown
+    // deadline expires.
     flow: generator::OrderFlowGenerator,
-    send_cursor: usize,
     /// TSC tick at send time. `u64` instead of `Instant` to avoid
     /// ~15-25ns vDSO overhead per timestamp on the hot path.
     inflight_ts: VecDeque<u64>,
-    batch_count: usize,
-    total_orders: usize,
     done: bool,
 }
 
@@ -1796,20 +1886,18 @@ fn run_uring_loop(
     mut connections: Vec<UringBenchConn>,
     window: usize,
     bench_start: Instant,
-    warmup: usize,
-    cooldown: usize,
+    deadlines: PhaseDeadlines,
     progress: Arc<AtomicU64>,
 ) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
     use io_uring::{IoUring, opcode, types};
 
     let ticks_per_ns = calibrate_tsc();
-    let n = connections.len();
+    let _n = connections.len();
     // 4096 entries: supports up to 1024 connections per thread (RECV +
     // SEND per connection, plus headroom for partial-send resubmissions).
     let mut ring = IoUring::new(4096).expect("create io_uring for bench");
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut done_count: usize = 0;
     // Timestamp of the first measured (post-warmup) latency recording.
     // Used to compute throughput over the measured phase only.
     let mut measured_start: Option<Instant> = None;
@@ -1840,9 +1928,16 @@ fn run_uring_loop(
     }
 
     // Fill initial send windows.
-    uring_fill_windows(&mut ring, &mut connections, window);
+    uring_fill_windows(&mut ring, &mut connections, window, &deadlines);
 
-    while done_count < n {
+    loop {
+        // Wall-clock-driven termination: once cooldown ends, stop. Any
+        // inflight responses are discarded — the histogram has already
+        // been sealed at `measured_end`, so abandoning the tail does
+        // not change reported latencies.
+        if Instant::now() >= deadlines.cooldown_end {
+            break;
+        }
         match ring.submit_and_wait(1) {
             Ok(_) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
@@ -1908,11 +2003,13 @@ fn run_uring_loop(
                             "inflight timestamp desync: got BatchEnd without matching send",
                         );
                         let latency_ns = tsc_to_ns(rdtscp() - sent_tsc, ticks_per_ns);
-                        if conn.batch_count >= warmup
-                            && conn.batch_count < conn.total_orders.saturating_sub(cooldown)
-                        {
+                        // Phase classification by *receive* time. Once
+                        // `measured_end` passes the histogram is sealed,
+                        // any further completions fall through silently.
+                        let now = Instant::now();
+                        if now >= deadlines.warmup_end && now < deadlines.measured_end {
                             if measured_start.is_none() {
-                                measured_start = Some(Instant::now());
+                                measured_start = Some(now);
                             }
                             histogram.record(latency_ns).expect("record");
                             interval_hist.record(latency_ns).expect("record interval");
@@ -1924,11 +2021,6 @@ fn run_uring_loop(
                                 bench_start,
                             );
                             progress.fetch_add(1, Ordering::Relaxed);
-                        }
-                        conn.batch_count += 1;
-                        if conn.batch_count >= conn.total_orders {
-                            conn.done = true;
-                            done_count += 1;
                         }
                     }
                 }
@@ -1959,21 +2051,31 @@ fn run_uring_loop(
         }
 
         // Refill send windows for connections with capacity.
-        uring_fill_windows(&mut ring, &mut connections, window);
+        uring_fill_windows(&mut ring, &mut connections, window, &deadlines);
     }
 
     (histogram, series, measured_start)
 }
 
 /// Fill send windows for all connections that have capacity and no pending send.
-/// Builds a length-prefixed send buffer and submits SEND SQEs.
+/// Builds a length-prefixed send buffer and submits SEND SQEs. Stops issuing
+/// new frames once the cooldown deadline has passed — the loop above will
+/// then terminate as soon as `submit_and_wait` returns (or immediately if
+/// the queue is empty).
 #[cfg(not(feature = "dpdk"))]
 fn uring_fill_windows(
     ring: &mut io_uring::IoUring,
     connections: &mut [UringBenchConn],
     window: usize,
+    deadlines: &PhaseDeadlines,
 ) {
     use io_uring::{opcode, types};
+
+    // Past cooldown: do nothing. We want the loop to wind down, not to
+    // queue more sends that will arrive after the run is reported.
+    if Instant::now() >= deadlines.cooldown_end {
+        return;
+    }
 
     for (i, conn) in connections.iter_mut().enumerate() {
         if conn.done || conn.send_pending {
@@ -1982,10 +2084,9 @@ fn uring_fill_windows(
 
         // Fill the send buffer with as many frames as the window allows.
         // Each frame is encoded directly into `send_buf` as `[u32 LE len][payload]`.
-        while conn.inflight_ts.len() < window && conn.send_cursor < conn.total_orders {
+        while conn.inflight_ts.len() < window {
             conn.flow.next_wire_frame(&mut conn.send_buf);
             conn.inflight_ts.push_back(rdtscp());
-            conn.send_cursor += 1;
         }
 
         if !conn.send_buf.is_empty() {
@@ -2044,7 +2145,7 @@ pub(crate) fn print_latency_histogram(hist: &Histogram<u64>, sample_count: usize
 pub(crate) fn print_results(
     label: &str,
     measured_orders: usize,
-    warmup_orders: usize,
+    phases: BenchPhases,
     histogram: &Histogram<u64>,
     wall: Duration,
     extra_lines: &[String],
@@ -2056,7 +2157,12 @@ pub(crate) fn print_results(
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
 
-    println!("=== {label} Benchmark ({measured_orders} measured, {warmup_orders} warmup) ===");
+    println!(
+        "=== {label} Benchmark ({measured_orders} measured, warmup={} measured={} cooldown={}) ===",
+        humantime::format_duration(phases.warmup),
+        humantime::format_duration(phases.measured),
+        humantime::format_duration(phases.cooldown),
+    );
     for line in extra_lines {
         println!("{line}");
     }
@@ -2210,7 +2316,10 @@ pub(crate) fn print_results(
         let stages_json = stats_client::render_json(server_stages);
 
         let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}}}",
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_ms\":{:.2},\"measured_ms\":{:.2},\"cooldown_ms\":{:.2},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}}}",
+            phases.warmup.as_secs_f64() * 1000.0,
+            phases.measured.as_secs_f64() * 1000.0,
+            phases.cooldown.as_secs_f64() * 1000.0,
             wall.as_secs_f64() * 1000.0,
             throughput,
         );

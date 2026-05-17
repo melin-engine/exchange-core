@@ -40,20 +40,22 @@
 #   TRANSPORTS=<list>   Comma-separated transports (default: tcp-dual-repl)
 #   WORKLOADS=<list>    Comma-separated workloads (default: throughput)
 #   RUN_PLOTS=0|1       Generate plots from results (default: 0)
-#   THROUGHPUT_ORDERS=N     Orders for throughput workload (default: 100000000)
+#   THROUGHPUT_DURATION=T  Measured-phase duration for throughput workload
+#                          (humantime, default: 60s)
 #   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 16)
 #   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 128)
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
-#   SINGLE_ORDERS=N        Orders for single-order workload (default: 500000)
-#   WARMUP_ORDERS=N        Warmup orders per client (default: bench default 100000)
-#   COOLDOWN_ORDERS=N      Cooldown orders per client excluded from the histogram
-#                          (default: 0). Useful when the bench's final small
-#                          batch flushes a non-amortised fdatasync that inflates
-#                          run-max with a drain-tail artefact rather than
-#                          steady-state behaviour.
-#   ORDERS_PER_SWEEP=N     Orders per sweep data point (default: 10000000)
-#   LOCAL_ORDERS=N         Orders for local workloads (default: 100000000)
+#   SINGLE_DURATION=T      Measured-phase duration for single-order workload
+#                          (humantime, default: 30s)
+#   WARMUP_DURATION=T      Warmup duration (humantime, default: bench default 5s)
+#   COOLDOWN_DURATION=T    Cooldown duration excluded from the histogram
+#                          (humantime, default: bench default 5s). Useful when
+#                          the bench's final small batch flushes a non-amortised
+#                          fdatasync that inflates run-max with a drain-tail
+#                          artefact rather than steady-state behaviour.
+#   SWEEP_DURATION=T       Measured-phase duration per sweep point (default: 30s)
+#   LOCAL_DURATION=T       Measured-phase duration for local workloads (default: 60s)
 #   RESULTS_DIR=<path>  Reuse existing results directory (default:
 #                       <repo>/bench-results/lan-bench-suite-<timestamp>,
 #                       git-ignored).
@@ -193,14 +195,14 @@ REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS-}"
 BENCH_RUST_LOG="${RUST_LOG:-info}"
 
 # Order counts — override for quick smoke tests.
-THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
+THROUGHPUT_DURATION="${THROUGHPUT_DURATION:-60s}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
 THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-128}"
-SINGLE_ORDERS="${SINGLE_ORDERS:-500000}"
-WARMUP_ORDERS="${WARMUP_ORDERS:-}"  # empty = bench default (100000)
-COOLDOWN_ORDERS="${COOLDOWN_ORDERS:-}"  # empty = bench default (0, no cooldown)
-ORDERS_PER_SWEEP="${ORDERS_PER_SWEEP:-10000000}"
-LOCAL_ORDERS="${LOCAL_ORDERS:-100000000}"
+SINGLE_DURATION="${SINGLE_DURATION:-30s}"
+WARMUP_DURATION="${WARMUP_DURATION:-}"   # empty = bench default (5s)
+COOLDOWN_DURATION="${COOLDOWN_DURATION:-}"  # empty = bench default (5s)
+SWEEP_DURATION="${SWEEP_DURATION:-30s}"
+LOCAL_DURATION="${LOCAL_DURATION:-60s}"
 
 # Default results dir lives under the repo (git-ignored via
 # `/bench-results/`) instead of /tmp so past runs survive reboots and
@@ -679,17 +681,18 @@ stop_servers() {
 }
 
 # Run the bench client against an already-running server.
-# Usage: run_bench <server_addr> <health_addr> <orders> <extra_bench_args...>
+# Usage: run_bench <server_addr> <health_addr> <duration> <extra_bench_args...>
+# `duration` is the measured-phase duration (humantime, e.g. `30s`).
 run_bench() {
-    local server_addr="$1" health_addr="$2" orders="$3"
+    local server_addr="$1" health_addr="$2" duration="$3"
     shift 3
     local warmup_arg=""
-    if [[ -n "${WARMUP_ORDERS}" ]]; then
-        warmup_arg="--warmup ${WARMUP_ORDERS}"
+    if [[ -n "${WARMUP_DURATION}" ]]; then
+        warmup_arg="--warmup-duration ${WARMUP_DURATION}"
     fi
     local cooldown_arg=""
-    if [[ -n "${COOLDOWN_ORDERS}" ]]; then
-        cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"
+    if [[ -n "${COOLDOWN_DURATION}" ]]; then
+        cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"
     fi
     local threads_arg=""
     if [[ -n "${BENCH_THREADS:-}" ]]; then
@@ -702,8 +705,9 @@ run_bench() {
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
+            --duration ${duration} \
             ${warmup_arg} ${cooldown_arg} ${threads_arg} \
-            ${orders} $*"
+            $*"
 }
 
 collect_result() {
@@ -1422,14 +1426,14 @@ workload_throughput() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Peak throughput — full durability"
-    echo "  ${THROUGHPUT_ORDERS} pairs, ${THROUGHPUT_CLIENTS} clients, window ${THROUGHPUT_WINDOW}"
+    echo "  ${THROUGHPUT_DURATION} measured, ${THROUGHPUT_CLIENTS} clients, window ${THROUGHPUT_WINDOW}"
     echo "============================================================"
     echo ""
 
     local warmup_arg=""
-    if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
+    if [[ -n "${WARMUP_DURATION}" ]]; then warmup_arg="--warmup-duration ${WARMUP_DURATION}"; fi
     local cooldown_arg=""
-    if [[ -n "${COOLDOWN_ORDERS}" ]]; then cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"; fi
+    if [[ -n "${COOLDOWN_DURATION}" ]]; then cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"; fi
     local threads_arg=""
     if [[ -n "${BENCH_THREADS:-}" ]]; then threads_arg="--bench-threads ${BENCH_THREADS}"; fi
 
@@ -1440,10 +1444,11 @@ workload_throughput() {
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
+                --duration ${THROUGHPUT_DURATION} \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} \
-                ${THROUGHPUT_ORDERS} --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
+                --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     fi
     collect_result "${transport}-throughput"
 }
@@ -1453,14 +1458,14 @@ workload_single() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Single-order latency — full durability"
-    echo "  ${SINGLE_ORDERS} pairs, 1 client, window 1"
+    echo "  ${SINGLE_DURATION} measured, 1 client, window 1"
     echo "============================================================"
     echo ""
 
     local warmup_arg=""
-    if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
+    if [[ -n "${WARMUP_DURATION}" ]]; then warmup_arg="--warmup-duration ${WARMUP_DURATION}"; fi
     local cooldown_arg=""
-    if [[ -n "${COOLDOWN_ORDERS}" ]]; then cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"; fi
+    if [[ -n "${COOLDOWN_DURATION}" ]]; then cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
@@ -1469,10 +1474,11 @@ workload_single() {
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
+                --duration ${SINGLE_DURATION} \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} \
-                ${SINGLE_ORDERS} --clients 1 --window 1"
+                --clients 1 --window 1"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_ORDERS}" --clients 1 --window 1
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_DURATION}" --clients 1 --window 1
     fi
     collect_result "${transport}-single"
 }
@@ -1481,7 +1487,7 @@ workload_engine_only() {
     echo ""
     echo "============================================================"
     echo "  [local] Engine only — matching engine, no journal, no network"
-    echo "  ${LOCAL_ORDERS} pairs"
+    echo "  ${LOCAL_DURATION} measured"
     echo "============================================================"
     echo ""
 
@@ -1489,7 +1495,7 @@ workload_engine_only() {
         ./target/release/melin-bench \
             --mode engine \
             --json /tmp/bench-results.json \
-            ${LOCAL_ORDERS}"
+            --duration ${LOCAL_DURATION}"
 
     scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
         "${RESULTS_DIR}/local-engine-only.json" 2>/dev/null || true
@@ -1499,7 +1505,7 @@ workload_pipeline_only() {
     echo ""
     echo "============================================================"
     echo "  [local] Pipeline — journal + matching, no network"
-    echo "  ${LOCAL_ORDERS} pairs, window 256"
+    echo "  ${LOCAL_DURATION} measured, window 256"
     echo "============================================================"
     echo ""
 
@@ -1511,7 +1517,7 @@ workload_pipeline_only() {
             --window 256 \
             --journal ${JOURNAL_PATH} \
             --json /tmp/bench-results.json \
-            ${LOCAL_ORDERS}"
+            --duration ${LOCAL_DURATION}"
 
     scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
         "${RESULTS_DIR}/local-pipeline-only.json" 2>/dev/null || true
@@ -1531,7 +1537,7 @@ run_sweep() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Sweep: ${sweep_name}"
-    echo "  ${ORDERS_PER_SWEEP} orders per point"
+    echo "  ${SWEEP_DURATION} measured per point"
     echo "============================================================"
     echo ""
 
@@ -1555,7 +1561,7 @@ run_sweep() {
         SERVER_EXTRA_ARGS="${server_extra}"
         "${stop_fn}" 2>/dev/null || true
         "${start_fn}"
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" ${ORDERS_PER_SWEEP} ${bench_args}
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SWEEP_DURATION}" ${bench_args}
         collect_result "_sweep_tmp"
         cp "${RESULTS_DIR}/_sweep_tmp.json" "${sweep_dir}/${label}.json" 2>/dev/null || true
         rm -f "${RESULTS_DIR}/_sweep_tmp.json"

@@ -1389,14 +1389,15 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
     std::fs::write(&key_path, cluster.key.to_bytes()).expect("write bench key");
 
     // Run the bench against the primary. The spawned server uses
-    // CHECKPOINT_INTERVAL=100 (env var below), so a few hundred journaled
-    // orders is enough to cross several boundaries. 4 clients × window
-    // 128, 250 pairs = 500 journaled orders — crosses ~5 boundaries.
+    // CHECKPOINT_INTERVAL=100 (env var below), so a few seconds of
+    // measured load comfortably crosses several checkpoint boundaries
+    // at 4 clients × window 128.
     //
-    // --warmup 0: the default 100_000 warmup orders would dominate runtime.
-    // --accounts 10 / --instruments 2: match the server defaults used in
-    // `spawn_primary` so the generator doesn't send orders for symbols
-    // the server never created.
+    // Zero warmup/cooldown: the bench's own defaults add 10 s of
+    // non-measured work that would dominate this short journal-shape
+    // test. --accounts 10 / --instruments 2 match the server defaults
+    // used in `spawn_primary` so the generator doesn't send orders for
+    // symbols the server never created.
     let mut bench_cmd = Command::new(&bench_bin);
     bench_cmd.args([
         "--mode=roundtrip",
@@ -1410,13 +1411,16 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
         "4",
         "--window",
         "128",
-        "--warmup",
-        "0",
+        "--warmup-duration",
+        "0s",
+        "--duration",
+        "2s",
+        "--cooldown-duration",
+        "0s",
         "--accounts",
         "10",
         "--instruments",
         "2",
-        "250",
     ]);
     let bench_status = bench_cmd
         .stdout(Stdio::inherit())
