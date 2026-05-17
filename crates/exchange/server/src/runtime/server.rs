@@ -1095,10 +1095,10 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::domain::response::run(
+            crate::runtime::response::run(
                 output_consumer,
                 control_rx,
-                crate::domain::response::Response {
+                crate::runtime::response::Response {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
                     durability_mode: durability_mode_response,
                     replication_metrics: replication_metrics_response,
@@ -1968,7 +1968,7 @@ where
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
     for _ in 0..num_dpdk_threads {
         let (tx_out, tx_rx) =
-            melin_disruptor::spsc::channel::<crate::domain::dpdk_response::TxFrame>(4096);
+            melin_disruptor::spsc::channel::<crate::runtime::dpdk_response::TxFrame>(4096);
         tx_producers.push(tx_out);
         tx_consumers.push(tx_rx);
     }
@@ -2066,7 +2066,7 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::domain::dpdk_response::run(
+            crate::runtime::dpdk_response::run(
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,

@@ -55,7 +55,7 @@ use crate::domain::request as shared_request;
 use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
-use crate::domain::dpdk_response::{ControlEvent, TxFrame};
+use crate::runtime::dpdk_response::{ControlEvent, TxFrame};
 
 /// Maximum frame payload size (matches reader).
 const MAX_FRAME_SIZE: usize = 1024;

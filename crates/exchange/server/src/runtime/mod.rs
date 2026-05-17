@@ -16,7 +16,10 @@ pub mod admin;
 pub mod durability_policy;
 pub mod reader;
 pub mod replication;
+pub mod response;
 pub mod server;
 
+#[cfg(feature = "dpdk")]
+pub mod dpdk_response;
 #[cfg(feature = "dpdk")]
 pub mod dpdk_transport;
