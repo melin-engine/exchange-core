@@ -75,7 +75,6 @@ use hdrhistogram::Histogram;
 
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
-#[cfg(not(feature = "dpdk"))]
 use melin_protocol::message::ResponseKind;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::transport::BlockingTransportListener;
@@ -617,6 +616,16 @@ struct BenchArgs {
     /// real fsync. Default 4096. Try 256 for low-latency no-persist runs.
     #[arg(long, default_value_t = 4096)]
     max_journal_batch: usize,
+    /// Fail the run (exit code 2) if more than this percent of acknowledged
+    /// requests were rejected. Default 50.0% — the realistic-flow
+    /// generator naturally produces a few percent of rejections (FOK
+    /// can't fill, market orders on cold books, cancels of consumed
+    /// orders), so the threshold is set to catch catastrophic misconfig
+    /// ("most orders rejected") rather than noise. Set to 100.0 to
+    /// disable; lower it for production-flow runs where rejections
+    /// should be near-zero.
+    #[arg(long, default_value_t = 50.0)]
+    max_reject_pct: f64,
 }
 
 fn main() {
@@ -650,6 +659,7 @@ fn main() {
                 args.instruments,
                 json_path,
                 args.target_rate,
+                args.max_reject_pct,
             );
         }
         "pipeline" => {
@@ -662,6 +672,7 @@ fn main() {
                 args.max_journal_batch,
                 args.journal_writer,
                 args.target_rate,
+                args.max_reject_pct,
             );
         }
         "roundtrip" => {
@@ -678,6 +689,7 @@ fn main() {
                 let key = load_signing_key(key_path);
 
                 dpdk::run_dpdk_roundtrip(
+                    args.max_reject_pct,
                     dpdk::DpdkBenchConfig {
                         eal_args: args
                             .dpdk_eal_args
@@ -726,6 +738,7 @@ fn main() {
                     args.bench_cores,
                     args.health_addr,
                     args.target_rate,
+                    args.max_reject_pct,
                 );
             }
         }
@@ -753,6 +766,7 @@ fn run_engine_bench(
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
     target_rate: u64,
+    max_reject_pct: f64,
 ) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
@@ -887,6 +901,11 @@ fn run_engine_bench(
     let mut slowest: std::collections::BinaryHeap<std::cmp::Reverse<SlowEntry>> =
         std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
 
+    // Outcome counters span both measured and cooldown loops below so a
+    // misconfiguration where every order is rejected fails the run loud
+    // — see [`OutcomeReport`] doc.
+    let mut outcomes = OutcomeReport::default();
+
     // Measured phase: record latencies until `measured_end` passes. We
     // poll `Instant::now()` only once per ~DEADLINE_POLL_INTERVAL
     // iterations because every per-order `Instant::now()` (~15-25 ns
@@ -1012,6 +1031,15 @@ fn run_engine_bench(
                 offset_us,
             }));
         }
+
+        // Outcome tally runs *after* `elapsed_ns` was computed above, so
+        // walking the reports vec is not billed to the engine-call
+        // measurement. One BatchEnd per input event mirrors the
+        // network-bench accounting (one BatchEnd per request).
+        outcomes.batch_ends += 1;
+        for r in reports.iter() {
+            outcomes.record_execution_report(r);
+        }
     }
     // Clamp to `phases.measured` so the reported throughput divisor
     // matches the configured measured-phase length even when the
@@ -1053,6 +1081,12 @@ fn run_engine_bench(
                     &mut reports,
                 );
             }
+        }
+        // Tally cooldown outcomes too — `OutcomeReport` covers the whole
+        // run, mirroring the network bench's cross-phase accounting.
+        outcomes.batch_ends += 1;
+        for r in reports.iter() {
+            outcomes.record_execution_report(r);
         }
     }
 
@@ -1113,6 +1147,7 @@ fn run_engine_bench(
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
         pacing_report.as_ref(),
+        Some(&outcomes),
     );
 
     // Print the slowest orders for tail latency diagnosis.
@@ -1126,6 +1161,8 @@ fn run_engine_bench(
         let num_reports = entry.num_reports;
         println!("    {latency_us:>7.2}µs  @{offset_ms:>7.1}ms  reports={num_reports}  {event:?}");
     }
+
+    enforce_rejection_threshold(&outcomes, max_reject_pct);
 }
 
 // ===========================================================================
@@ -1146,6 +1183,7 @@ fn run_pipeline_bench(
     max_journal_batch: usize,
     journal_writer_mode: melin_server::JournalWriterMode,
     target_rate: u64,
+    max_reject_pct: f64,
 ) {
     use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
 
@@ -1171,6 +1209,7 @@ fn run_pipeline_bench(
         window,
         json_path,
         target_rate,
+        max_reject_pct,
     };
 
     // The two arms are forced by monomorphisation — each writer has
@@ -1202,6 +1241,7 @@ struct PipelineInnerCfg<'a> {
     window: usize,
     json_path: Option<&'a std::path::Path>,
     target_rate: u64,
+    max_reject_pct: f64,
 }
 
 /// Pipeline-mode body, generic over the journal writer so we get a
@@ -1218,6 +1258,7 @@ where
     use melin_server::JournalEvent;
     use melin_server::pipeline::{JournalStageRun, build_pipeline_with_replication};
     use melin_server::trace::mono_trace_ns;
+    use melin_transport_core::pipeline::OutputPayload;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -1226,6 +1267,7 @@ where
         window,
         json_path,
         target_rate,
+        max_reject_pct,
     } = cfg;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
@@ -1419,6 +1461,7 @@ where
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut measured_orders: u64 = 0;
     let mut measured_start: Option<Instant> = None;
+    let mut outcomes = OutcomeReport::default();
     let start = phase_start;
 
     // Drain until cooldown ends. Classify each completion by *receive*
@@ -1447,6 +1490,9 @@ where
                 std::hint::spin_loop();
             };
             inflight.fetch_sub(1, Ordering::Release);
+            // Capture `rdtscp()` BEFORE the outcome tally below so the
+            // histogram reflects only the pipeline roundtrip, not the
+            // bench's post-processing cost.
             let latency_ns = tsc_to_ns(rdtscp() - sent_at, ticks_per_ns);
             if now >= deadlines.warmup_end && now < deadlines.measured_end {
                 if measured_start.is_none() {
@@ -1455,6 +1501,18 @@ where
                 histogram.record(latency_ns).expect("record");
                 measured_orders += 1;
             }
+            // One request boundary per `is_last_in_request` flag — the
+            // in-process equivalent of one wire `BatchEnd` frame.
+            outcomes.batch_ends += 1;
+        }
+        // Tally the payload variant *after* the latency capture above.
+        // Report payloads count as their inner execution-report variant;
+        // EngineError payloads are tracked separately. BatchEnd /
+        // QueryResponse payloads carry no order-acceptance signal.
+        match slot.payload {
+            OutputPayload::Report(report) => outcomes.record_execution_report(&report),
+            OutputPayload::EngineError => outcomes.engine_errors += 1,
+            OutputPayload::BatchEnd | OutputPayload::QueryResponse(_) => {}
         }
     }
 
@@ -1519,7 +1577,10 @@ where
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
         pacing_report.as_ref(),
+        Some(&outcomes),
     );
+
+    enforce_rejection_threshold(&outcomes, max_reject_pct);
 
     println!();
     println!("=== Pipeline Latency Trace ===");
@@ -1557,6 +1618,7 @@ fn run_roundtrip_bench(
     bench_core_start: Option<usize>,
     health_addr: Option<std::net::SocketAddr>,
     target_rate: u64,
+    max_reject_pct: f64,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -1595,6 +1657,7 @@ fn run_roundtrip_bench(
             bench_core_start,
             health_addr,
             target_rate,
+            max_reject_pct,
         );
         return;
     }
@@ -1666,6 +1729,7 @@ fn run_roundtrip_bench(
             bench_core_start,
             effective_health_addr,
             target_rate,
+            max_reject_pct,
         );
     } else {
         use melin_protocol::tcp::BlockingTcpListener;
@@ -1698,6 +1762,7 @@ fn run_roundtrip_bench(
             bench_core_start,
             effective_health_addr,
             target_rate,
+            max_reject_pct,
         );
     }
 
@@ -1870,6 +1935,7 @@ fn run_roundtrip_inner<R, W, F>(
     bench_core_start: Option<usize>,
     health_addr: Option<std::net::SocketAddr>,
     target_rate: u64,
+    max_reject_pct: f64,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1891,6 +1957,7 @@ fn run_roundtrip_inner<R, W, F>(
         bench_core_start,
         health_addr,
         target_rate,
+        max_reject_pct,
     );
 }
 
@@ -2015,6 +2082,7 @@ fn run_uring_roundtrip<R, W, F>(
     bench_core_start: Option<usize>,
     health_addr: Option<std::net::SocketAddr>,
     target_rate: u64,
+    max_reject_pct: f64,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -2082,6 +2150,7 @@ fn run_uring_roundtrip<R, W, F>(
             flow,
             inflight_ts: VecDeque::with_capacity(window),
             pacer: None,
+            outcomes: OutcomeReport::default(),
         });
     }
 
@@ -2154,15 +2223,17 @@ fn run_uring_roundtrip<R, W, F>(
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut earliest_measured_start: Option<Instant> = None;
     let mut all_series: TimeSeries = Vec::new();
+    let mut outcomes = OutcomeReport::default();
 
     for handle in handles {
-        let (h, s, ms) = handle.join().expect("bench thread panicked");
+        let (h, s, ms, o) = handle.join().expect("bench thread panicked");
         histogram.add(&h).expect("merge histograms");
         if let Some(t) = ms {
             earliest_measured_start =
                 Some(earliest_measured_start.map_or(t, |prev: Instant| prev.min(t)));
         }
         all_series.extend(s);
+        outcomes.merge(&o);
     }
 
     // Snapshot end time BEFORE joining the progress thread: that thread
@@ -2253,6 +2324,7 @@ fn run_uring_roundtrip<R, W, F>(
         &health_samples,
         &server_stages,
         pacing_report.as_ref(),
+        Some(&outcomes),
     );
 
     println!();
@@ -2260,6 +2332,8 @@ fn run_uring_roundtrip<R, W, F>(
     println!();
     shutdown.store(true, Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(200));
+
+    enforce_rejection_threshold(&outcomes, max_reject_pct);
 }
 
 /// Size of per-connection recv buffer for io_uring RECV.
@@ -2304,6 +2378,11 @@ struct UringBenchConn {
     /// inside the per-thread bench loop where TSC calibration runs;
     /// constructed `None` initially.
     pacer: Option<PaceClock>,
+    /// Counts every execution-report variant received on this
+    /// connection. Merged into the run-wide [`OutcomeReport`] after the
+    /// thread joins. Kept per-conn (not per-thread) so the recv hot path
+    /// touches only this conn's cache lines.
+    outcomes: OutcomeReport,
 }
 
 /// io_uring event loop for all benchmark connections. Single-threaded:
@@ -2324,7 +2403,7 @@ fn run_uring_loop(
     total_threads: usize,
     phases: BenchPhases,
     pace_stats: Arc<PaceStats>,
-) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
+) -> (Histogram<u64>, TimeSeries, Option<Instant>, OutcomeReport) {
     use io_uring::{IoUring, opcode, types};
 
     let ticks_per_ns = calibrate_tsc();
@@ -2485,6 +2564,11 @@ fn run_uring_loop(
                     cursor += 4 + frame_len;
 
                     if matches!(response, ResponseKind::BatchEnd) {
+                        // `rdtscp()` is captured FIRST — before any
+                        // per-frame bookkeeping (outcome tally, parse
+                        // buffer compaction) — so the histogram reflects
+                        // only the wire roundtrip, not the bench's own
+                        // post-processing cost.
                         let sent_tsc = conn.inflight_ts.pop_front().expect(
                             "inflight timestamp desync: got BatchEnd without matching send",
                         );
@@ -2509,6 +2593,14 @@ fn run_uring_loop(
                             progress.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+
+                    // Tally outcomes across every phase (warmup,
+                    // measured, cooldown). Runs *after* the latency
+                    // capture above so the histogram measures the wire
+                    // roundtrip only — adding this counter increment
+                    // before `rdtscp()` would inflate every sample by
+                    // the cost of this match.
+                    conn.outcomes.record(&response);
                 }
                 if cursor > 0 {
                     // Shift remaining bytes to front without allocating.
@@ -2548,7 +2640,12 @@ fn run_uring_loop(
         );
     }
 
-    (histogram, series, measured_start)
+    let mut outcomes = OutcomeReport::default();
+    for conn in &connections {
+        outcomes.merge(&conn.outcomes);
+    }
+
+    (histogram, series, measured_start, outcomes)
 }
 
 /// Fill send windows for all connections that have capacity and no pending send.
@@ -2657,6 +2754,191 @@ pub(crate) fn print_latency_histogram(hist: &Histogram<u64>, sample_count: usize
     println!("    max:     {:>8.2} µs", hist.max() as f64 / 1_000.0);
 }
 
+/// Stable ordering of [`RejectReason`] variants used as the index space
+/// for [`OutcomeReport::reject_reasons`]. Adding a new reject variant is
+/// a compile error inside [`reject_reason_index`] until the entry is
+/// appended here too — keep the two in sync.
+pub(crate) const REJECT_REASONS: &[(RejectReason, &str)] = &[
+    (RejectReason::NoLiquidity, "NoLiquidity"),
+    (RejectReason::FOKCannotFill, "FOKCannotFill"),
+    (RejectReason::InsufficientBalance, "InsufficientBalance"),
+    (RejectReason::UnknownAccount, "UnknownAccount"),
+    (RejectReason::UnknownSymbol, "UnknownSymbol"),
+    (RejectReason::SelfTradePrevented, "SelfTradePrevented"),
+    (RejectReason::DuplicateOrderId, "DuplicateOrderId"),
+    (RejectReason::ExceedsMaxOrderQty, "ExceedsMaxOrderQty"),
+    (RejectReason::ExceedsMaxNotional, "ExceedsMaxNotional"),
+    (RejectReason::TradingHalted, "TradingHalted"),
+    (RejectReason::OutsidePriceBand, "OutsidePriceBand"),
+    (RejectReason::UnknownOrder, "UnknownOrder"),
+    (RejectReason::PriceWouldCross, "PriceWouldCross"),
+    (RejectReason::PostOnlyWouldCross, "PostOnlyWouldCross"),
+    (RejectReason::HasRestingOrders, "HasRestingOrders"),
+    (RejectReason::DuplicateRequest, "DuplicateRequest"),
+    (RejectReason::ReplicaDisconnected, "ReplicaDisconnected"),
+    (RejectReason::InvalidExpiry, "InvalidExpiry"),
+    (RejectReason::InstrumentDisabled, "InstrumentDisabled"),
+    (RejectReason::ExceedsMaxOpenOrders, "ExceedsMaxOpenOrders"),
+    (RejectReason::ExceedsOrderRate, "ExceedsOrderRate"),
+];
+
+fn reject_reason_index(reason: RejectReason) -> usize {
+    // `RejectReason` is not `#[repr(u8)]`, so the discriminant isn't a
+    // stable index. An exhaustive match makes adding a new variant a
+    // compile error until both this function and `REJECT_REASONS` above
+    // are updated.
+    let idx = match reason {
+        RejectReason::NoLiquidity => 0,
+        RejectReason::FOKCannotFill => 1,
+        RejectReason::InsufficientBalance => 2,
+        RejectReason::UnknownAccount => 3,
+        RejectReason::UnknownSymbol => 4,
+        RejectReason::SelfTradePrevented => 5,
+        RejectReason::DuplicateOrderId => 6,
+        RejectReason::ExceedsMaxOrderQty => 7,
+        RejectReason::ExceedsMaxNotional => 8,
+        RejectReason::TradingHalted => 9,
+        RejectReason::OutsidePriceBand => 10,
+        RejectReason::UnknownOrder => 11,
+        RejectReason::PriceWouldCross => 12,
+        RejectReason::PostOnlyWouldCross => 13,
+        RejectReason::HasRestingOrders => 14,
+        RejectReason::DuplicateRequest => 15,
+        RejectReason::ReplicaDisconnected => 16,
+        RejectReason::InvalidExpiry => 17,
+        RejectReason::InstrumentDisabled => 18,
+        RejectReason::ExceedsMaxOpenOrders => 19,
+        RejectReason::ExceedsOrderRate => 20,
+    };
+    // Catch silent label/index swaps: an exhaustive match would still
+    // type-check if two arms had their integers swapped, but the
+    // `REJECT_REASONS` table would then mislabel counts at print time.
+    // The existing `reject_reasons_indices_are_unique_and_match_table_length`
+    // test calls this for every variant, so a swap explodes there.
+    debug_assert_eq!(
+        REJECT_REASONS[idx].0, reason,
+        "REJECT_REASONS table and reject_reason_index match arms diverged at idx {idx}",
+    );
+    idx
+}
+
+/// Counts of execution-report variants observed by the bench client over
+/// the lifetime of a run. Folded across connections and bench threads to
+/// surface the rejection ratio in the run summary — without this, a
+/// misconfigured run where every order is rejected looks identical to a
+/// clean run in the latency histogram.
+///
+/// Plain `u64` fields (not atomics) because each connection is owned by
+/// a single bench thread; merging happens after thread join.
+#[derive(Default, Clone)]
+pub(crate) struct OutcomeReport {
+    /// `BatchEnd` frames received — one per acknowledged request, so
+    /// this is the denominator for the rejection ratio.
+    pub batch_ends: u64,
+    pub placed: u64,
+    pub fills: u64,
+    pub cancelled: u64,
+    pub triggered: u64,
+    pub replaced: u64,
+    pub instrument_status: u64,
+    pub rejected: u64,
+    pub engine_errors: u64,
+    pub server_busy: u64,
+    /// Per-reason rejection counts. Index space defined by
+    /// [`REJECT_REASONS`] / [`reject_reason_index`].
+    pub reject_reasons: [u64; REJECT_REASONS.len()],
+}
+
+impl OutcomeReport {
+    /// Increment the counter that matches `response`. Untracked variants
+    /// (handshake / market-data / stats frames) are ignored.
+    #[inline]
+    pub fn record(&mut self, response: &ResponseKind) {
+        match response {
+            ResponseKind::BatchEnd => self.batch_ends += 1,
+            ResponseKind::Report(report) => self.record_execution_report(report),
+            ResponseKind::EngineError => self.engine_errors += 1,
+            ResponseKind::ServerBusy => self.server_busy += 1,
+            // Non-trading frames (Challenge, ServerReady, Heartbeat,
+            // AuthFailed, stats/market-data snapshots) — not part of the
+            // request/ack accounting.
+            _ => {}
+        }
+    }
+
+    /// Increment the counter for a single execution-report variant.
+    /// Used by in-process bench modes (engine, pipeline) which observe
+    /// the matching stage's reports directly without going through the
+    /// wire `ResponseKind::Report` wrapper.
+    #[inline]
+    pub fn record_execution_report(&mut self, report: &ExecutionReport) {
+        match report {
+            ExecutionReport::Placed { .. } => self.placed += 1,
+            ExecutionReport::Fill { .. } => self.fills += 1,
+            ExecutionReport::Cancelled { .. } => self.cancelled += 1,
+            ExecutionReport::Triggered { .. } => self.triggered += 1,
+            ExecutionReport::Replaced { .. } => self.replaced += 1,
+            ExecutionReport::InstrumentStatusChanged { .. } => self.instrument_status += 1,
+            ExecutionReport::Rejected { reason, .. } => {
+                self.rejected += 1;
+                self.reject_reasons[reject_reason_index(*reason)] += 1;
+            }
+        }
+    }
+
+    pub fn merge(&mut self, other: &OutcomeReport) {
+        self.batch_ends += other.batch_ends;
+        self.placed += other.placed;
+        self.fills += other.fills;
+        self.cancelled += other.cancelled;
+        self.triggered += other.triggered;
+        self.replaced += other.replaced;
+        self.instrument_status += other.instrument_status;
+        self.rejected += other.rejected;
+        self.engine_errors += other.engine_errors;
+        self.server_busy += other.server_busy;
+        for (a, b) in self
+            .reject_reasons
+            .iter_mut()
+            .zip(other.reject_reasons.iter())
+        {
+            *a += *b;
+        }
+    }
+
+    /// Fraction of acknowledged requests that were rejected. Returns
+    /// `0.0` when no batches were observed, so callers comparing against
+    /// a threshold treat a zero-response run as "no rejections seen"
+    /// rather than 100% — a stalled run is a separate failure mode and
+    /// is already surfaced by the throughput line.
+    pub fn rejection_ratio(&self) -> f64 {
+        if self.batch_ends == 0 {
+            0.0
+        } else {
+            self.rejected as f64 / self.batch_ends as f64
+        }
+    }
+}
+
+/// Fail the run with a non-zero exit if more than `max_pct` percent of
+/// acknowledged requests were rejected. The CLI default is 50% — the
+/// generator naturally produces a few percent of rejections, so the
+/// gate targets catastrophic misconfig ("most orders rejected") rather
+/// than noise. Lower `max_pct` for production-flow runs where rejections
+/// should be near-zero; set it to 100.0 to disable.
+pub(crate) fn enforce_rejection_threshold(outcomes: &OutcomeReport, max_pct: f64) {
+    let pct = outcomes.rejection_ratio() * 100.0;
+    if pct > max_pct {
+        eprintln!(
+            "error: rejection ratio {pct:.2}% exceeds --max-reject-pct {max_pct:.2}% \
+             ({} rejected of {} acknowledged requests). Likely a misconfiguration — \
+             check account funding, instrument symbols, and risk limits.",
+            outcomes.rejected, outcomes.batch_ends,
+        );
+        std::process::exit(2);
+    }
+}
+
 /// End-of-run pacing report. `None` when `--target-rate` is unset (the
 /// closed-loop case); rendered into the JSON output and the console
 /// summary lines otherwise.
@@ -2665,6 +2947,69 @@ pub(crate) struct PacingReport {
     pub scheduled: u64,
     pub late_sends: u64,
     pub max_send_delay_us: f64,
+}
+
+/// Print the outcome summary: acknowledged request count, rejection
+/// ratio, and the top reject reasons. Surfaces misconfigured runs (e.g.
+/// every order rejected with `InsufficientBalance`) that the latency
+/// histogram would otherwise hide.
+pub(crate) fn print_outcome_summary(outcomes: &OutcomeReport) {
+    println!();
+    println!("  Outcomes ({} acknowledged requests)", outcomes.batch_ends);
+    if outcomes.batch_ends == 0 {
+        println!("    (no responses observed — bench may have stalled before any ack)");
+        return;
+    }
+    let total = outcomes.batch_ends as f64;
+    let pct = |n: u64| n as f64 / total * 100.0;
+    println!(
+        "    rejected:  {:>10} ({:.2}%)",
+        outcomes.rejected,
+        pct(outcomes.rejected)
+    );
+    println!("    placed:    {:>10}", outcomes.placed);
+    println!("    fills:     {:>10}", outcomes.fills);
+    println!("    cancelled: {:>10}", outcomes.cancelled);
+    if outcomes.triggered > 0 {
+        println!("    triggered: {:>10}", outcomes.triggered);
+    }
+    if outcomes.replaced > 0 {
+        println!("    replaced:  {:>10}", outcomes.replaced);
+    }
+    if outcomes.engine_errors > 0 {
+        println!(
+            "    engine errors: {} ({:.2}%)",
+            outcomes.engine_errors,
+            pct(outcomes.engine_errors)
+        );
+    }
+    if outcomes.server_busy > 0 {
+        println!(
+            "    server-busy:   {} ({:.2}%)",
+            outcomes.server_busy,
+            pct(outcomes.server_busy)
+        );
+    }
+    if outcomes.rejected > 0 {
+        let mut reasons: Vec<(&str, u64)> = REJECT_REASONS
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, name))| {
+                let count = outcomes.reject_reasons[i];
+                if count > 0 {
+                    Some((*name, count))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Descending by count so the dominant reason is on top.
+        reasons.sort_by_key(|r| std::cmp::Reverse(r.1));
+        println!("    reject reasons:");
+        for (name, count) in reasons.iter().take(5) {
+            println!("      {name}: {count} ({:.2}%)", pct(*count));
+        }
+    }
 }
 
 /// Print benchmark results: header, throughput, latency histogram.
@@ -2682,6 +3027,7 @@ pub(crate) fn print_results(
     health_samples: &[health_poller::HealthSample],
     server_stages: &stats_client::Body,
     pacing: Option<&PacingReport>,
+    outcomes: Option<&OutcomeReport>,
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
@@ -2705,6 +3051,11 @@ pub(crate) fn print_results(
     println!();
     println!("  Per-Order Latency");
     print_latency_histogram(histogram, measured_orders);
+
+    // Print outcome summary if we tracked responses.
+    if let Some(outcomes) = outcomes {
+        print_outcome_summary(outcomes);
+    }
 
     // Print health summary if we have samples.
     if !health_samples.is_empty() {
@@ -2844,6 +3195,41 @@ pub(crate) fn print_results(
 
         let stages_json = stats_client::render_json(server_stages);
 
+        // Outcome fragment: emitted only when response tracking was on,
+        // so the schema for in-process modes (engine, pipeline) that
+        // don't observe wire responses is unchanged.
+        let outcomes_json = match outcomes {
+            Some(o) => {
+                let mut reasons = String::from("{");
+                let mut first = true;
+                for (i, (_, name)) in REJECT_REASONS.iter().enumerate() {
+                    let count = o.reject_reasons[i];
+                    if count == 0 {
+                        continue;
+                    }
+                    if !first {
+                        reasons.push(',');
+                    }
+                    first = false;
+                    reasons.push_str(&format!("\"{name}\":{count}"));
+                }
+                reasons.push('}');
+                format!(
+                    ",\"outcomes\":{{\"batch_ends\":{},\"placed\":{},\"fills\":{},\"cancelled\":{},\"triggered\":{},\"replaced\":{},\"rejected\":{},\"engine_errors\":{},\"server_busy\":{},\"reject_reasons\":{reasons}}}",
+                    o.batch_ends,
+                    o.placed,
+                    o.fills,
+                    o.cancelled,
+                    o.triggered,
+                    o.replaced,
+                    o.rejected,
+                    o.engine_errors,
+                    o.server_busy,
+                )
+            }
+            None => String::new(),
+        };
+
         // Pacing fragment: emitted only when target-rate was set, so the
         // schema for closed-loop runs is unchanged.
         let pacing_json = match pacing {
@@ -2855,7 +3241,7 @@ pub(crate) fn print_results(
         };
 
         let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_ms\":{:.2},\"measured_ms\":{:.2},\"cooldown_ms\":{:.2},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}{pacing_json}}}",
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_ms\":{:.2},\"measured_ms\":{:.2},\"cooldown_ms\":{:.2},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}{pacing_json}{outcomes_json}}}",
             phases.warmup.as_secs_f64() * 1000.0,
             phases.measured.as_secs_f64() * 1000.0,
             phases.cooldown.as_secs_f64() * 1000.0,
@@ -2875,6 +3261,146 @@ fn tempdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("melin-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+#[cfg(test)]
+mod outcome_report_tests {
+    use super::*;
+
+    fn dummy_order() -> (OrderId, Symbol, AccountId) {
+        (OrderId(1), Symbol(0), AccountId(7))
+    }
+
+    fn one_qty() -> Quantity {
+        Quantity(NonZeroU64::new(1).unwrap())
+    }
+
+    fn one_price() -> Price {
+        Price(NonZeroU64::new(100).unwrap())
+    }
+
+    #[test]
+    fn records_each_variant_into_the_right_bucket() {
+        let (oid, sym, acc) = dummy_order();
+        let mut r = OutcomeReport::default();
+        r.record(&ResponseKind::BatchEnd);
+        r.record(&ResponseKind::Report(ExecutionReport::Placed {
+            order_id: oid,
+            symbol: sym,
+            account: acc,
+            side: Side::Buy,
+            price: one_price(),
+            quantity: one_qty(),
+        }));
+        r.record(&ResponseKind::Report(ExecutionReport::Rejected {
+            order_id: oid,
+            symbol: sym,
+            account: acc,
+            reason: RejectReason::InsufficientBalance,
+        }));
+        r.record(&ResponseKind::EngineError);
+        r.record(&ResponseKind::ServerBusy);
+        // Heartbeat is intentionally untracked.
+        r.record(&ResponseKind::Heartbeat);
+
+        assert_eq!(r.batch_ends, 1);
+        assert_eq!(r.placed, 1);
+        assert_eq!(r.rejected, 1);
+        assert_eq!(r.engine_errors, 1);
+        assert_eq!(r.server_busy, 1);
+        assert_eq!(
+            r.reject_reasons[reject_reason_index(RejectReason::InsufficientBalance)],
+            1
+        );
+    }
+
+    #[test]
+    fn merge_sums_all_fields_including_reason_buckets() {
+        let (oid, sym, acc) = dummy_order();
+        let mut a = OutcomeReport::default();
+        a.record(&ResponseKind::Report(ExecutionReport::Rejected {
+            order_id: oid,
+            symbol: sym,
+            account: acc,
+            reason: RejectReason::NoLiquidity,
+        }));
+        a.record(&ResponseKind::BatchEnd);
+
+        let mut b = OutcomeReport::default();
+        b.record(&ResponseKind::Report(ExecutionReport::Rejected {
+            order_id: oid,
+            symbol: sym,
+            account: acc,
+            reason: RejectReason::NoLiquidity,
+        }));
+        b.record(&ResponseKind::BatchEnd);
+        b.record(&ResponseKind::BatchEnd);
+
+        a.merge(&b);
+        assert_eq!(a.batch_ends, 3);
+        assert_eq!(a.rejected, 2);
+        assert_eq!(
+            a.reject_reasons[reject_reason_index(RejectReason::NoLiquidity)],
+            2
+        );
+    }
+
+    #[test]
+    fn rejection_ratio_is_zero_when_no_batches_observed() {
+        let r = OutcomeReport::default();
+        // A stalled run with zero responses returns 0.0 rather than NaN
+        // or 1.0 — distinct failure mode, surfaced by throughput, not by
+        // the threshold check.
+        assert_eq!(r.rejection_ratio(), 0.0);
+    }
+
+    #[test]
+    fn rejection_ratio_divides_rejected_by_batch_ends() {
+        let r = OutcomeReport {
+            batch_ends: 1000,
+            rejected: 25,
+            ..OutcomeReport::default()
+        };
+        assert!((r.rejection_ratio() - 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_execution_report_and_record_agree_on_report_variants() {
+        // Engine and pipeline modes call `record_execution_report`
+        // directly; the network bench reaches it via `record` ->
+        // `ResponseKind::Report(_)`. Both paths must produce identical
+        // counter state for the same input.
+        let (oid, sym, acc) = dummy_order();
+        let rep = ExecutionReport::Rejected {
+            order_id: oid,
+            symbol: sym,
+            account: acc,
+            reason: RejectReason::ExceedsMaxOrderQty,
+        };
+
+        let mut via_direct = OutcomeReport::default();
+        via_direct.record_execution_report(&rep);
+
+        let mut via_wire = OutcomeReport::default();
+        via_wire.record(&ResponseKind::Report(rep));
+
+        assert_eq!(via_direct.rejected, via_wire.rejected);
+        assert_eq!(via_direct.reject_reasons, via_wire.reject_reasons);
+    }
+
+    #[test]
+    fn reject_reasons_indices_are_unique_and_match_table_length() {
+        // Sanity check: REJECT_REASONS and reject_reason_index must stay
+        // in lockstep. Indices must cover [0, len) without collisions.
+        let mut seen = vec![false; REJECT_REASONS.len()];
+        for (reason, _) in REJECT_REASONS {
+            let idx = reject_reason_index(*reason);
+            assert!(idx < REJECT_REASONS.len(), "index {idx} out of range");
+            assert!(!seen[idx], "duplicate index {idx} for {reason:?}");
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|b| *b), "missing variant in REJECT_REASONS");
+    }
 }
 
 #[cfg(test)]
