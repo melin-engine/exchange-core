@@ -1540,6 +1540,7 @@ dependencies = [
  "smoltcp",
  "tempfile",
  "tikv-jemallocator",
+ "tracing",
  "tracing-subscriber",
 ]
 

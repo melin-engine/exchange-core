@@ -86,6 +86,7 @@ hdrhistogram = "7"
 rand = "0.9"
 libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
 melin-dpdk = { path = "../../core/dpdk", optional = true }
