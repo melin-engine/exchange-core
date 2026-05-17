@@ -1293,26 +1293,44 @@ impl<E: AppEvent> SectorWriter<E> {
     /// O_DIRECT writes are sector-aligned; we extend the prealloc as soon as
     /// the next sector would land past `allocated_end`.
     ///
-    /// **Data-loss guard**: the post-fallocate `FALLOC_FL_ZERO_RANGE` must
-    /// only touch bytes the writer has not yet written. Both write paths
-    /// — sync (`flush_to_sectors`) and async
-    /// (`take_batch_for_async_write`) — can issue a single multi-sector
-    /// `pwrite` that advances `write_pos` far past the previous
-    /// `allocated_end`; the kernel auto-extends the file to absorb the
-    /// write. If we then zeroed `[old_end, new_allocated_end)`, we'd
-    /// silently wipe every byte between `old_end` and the now-advanced
-    /// `write_pos`, punching a hole into the middle of the journal.
-    /// Start the zero-range at `max(old_end, write_pos)` so
-    /// already-written data is preserved.
+    /// Data-loss safety lives in [`Self::zero_unwritten_through`] rather
+    /// than here: this function only has to ask "extend the prealloc
+    /// past where we're about to write" and the helper takes care of
+    /// only zeroing bytes the writer hasn't placed yet.
     fn ensure_allocated(&mut self) -> Result<(), JournalError> {
         if self.write_pos + self.sector_size as u64 <= self.allocated_end {
             return Ok(());
         }
-        let old_end = self.allocated_end;
         self.allocated_end = preallocate(&self.file, self.write_pos)?;
-        let zero_start = old_end.max(self.write_pos);
-        zero_range_extents(&self.file, zero_start, self.allocated_end);
+        self.zero_unwritten_through(self.allocated_end);
         Ok(())
+    }
+
+    /// Zero the byte range strictly past the writer's frontier
+    /// (`write_pos`) up to `end`, via `FALLOC_FL_ZERO_RANGE`.
+    ///
+    /// **The invariant this API encodes**: the start of the zero range
+    /// is *always* the writer's frontier, computed internally. Callers
+    /// can only choose the *upper* bound, so they can't accidentally
+    /// re-zero bytes the writer has already placed past the previous
+    /// `allocated_end`. That class of bug (a stale `old_end` used as
+    /// the start) is unreachable through this method.
+    ///
+    /// Both write paths — sync (`flush_to_sectors`) and async
+    /// (`take_batch_for_async_write`) — can issue a single multi-sector
+    /// `pwrite` that the kernel auto-extends past `allocated_end`. By
+    /// the time we get here to extend the prealloc, `write_pos` may
+    /// already be past the old `allocated_end`; the `<=` guard ensures
+    /// we don't ask the kernel to zero a degenerate or backwards range.
+    ///
+    /// The raw [`zero_range_extents`] helper is retained for one-shot
+    /// initialisation sites (create-time, segment preparer) where the
+    /// start is a compile-time constant and no writer frontier exists
+    /// yet.
+    fn zero_unwritten_through(&self, end: u64) {
+        if self.write_pos < end {
+            zero_range_extents(&self.file, self.write_pos, end);
+        }
     }
 
     /// Allocate two zeroed sector-aligned batch buffers (batch_buf + spare_buf).
@@ -2154,8 +2172,8 @@ mod tests {
         // the condition the fix guards against. Pre-fix:
         // `zero_range_extents(file, old_end, new_end)` wipes the bytes
         // the previous batch wrote between `old_end` and `write_pos`.
-        // Post-fix: zero-range starts at `max(old_end, write_pos)` and
-        // only touches truly-new bytes.
+        // Post-fix: `zero_unwritten_through` derives the start from
+        // `write_pos` internally and only touches truly-new bytes.
         writer.append(&JournalEvent::App(TestEvent(9_999))).unwrap();
         drop(writer);
 
