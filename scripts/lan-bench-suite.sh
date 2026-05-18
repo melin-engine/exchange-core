@@ -1681,13 +1681,25 @@ for transport in "${ORDERED_TRANSPORTS[@]}"; do
         esac
     done
 
-    # Run regular workloads with a single start/stop cycle.
+    # Restart the server between each workload so per-key dedup HWM
+    # state from one workload (e.g. throughput's 16-client ramp-up to
+    # ~10M seq) does not reject every request from the next workload
+    # (e.g. single-client which restarts seq at 1 and would be 100%
+    # DuplicateRequest against the stale HWM).
     if [[ ${#REGULAR_WORKLOADS[@]} -gt 0 ]]; then
         echo ""
         echo ">>> Starting transport: ${transport}"
-        "$start_fn"
 
+        first=1
         for workload in "${REGULAR_WORKLOADS[@]}"; do
+            if [[ $first -eq 0 ]]; then
+                echo ""
+                echo ">>> Restarting servers between workloads (fresh dedup state)"
+                "$stop_fn"
+            fi
+            "$start_fn"
+            first=0
+
             fn="workload_${workload//-/_}"
             "$fn" "$transport"
         done
