@@ -183,8 +183,17 @@ RUN_PLOTS="${RUN_PLOTS:-0}"
 # unloaded-latency probe and pacing it would defeat the purpose.
 TARGET_RATE="${TARGET_RATE:-0}"
 
+# The server's per-account rate limiter (SEC-04) defaults to 1000 ops/s
+# with 5000 burst — a sensible production ceiling, but far below what
+# the bench's Zipf-distributed generator throws at head accounts (the
+# top account routinely sees >>1M ops/s at peak throughput). Without
+# raising these, ~46% of orders get rejected with `ExceedsOrderRate`
+# at the gate and never reach the matcher, hiding real engine
+# throughput. Bake high defaults in; operators can still override.
+BENCH_DEFAULT_RATE_ARGS="--max-orders-per-second 10000000 --max-orders-burst 50000000"
+
 # Primary server args.
-SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS-}"
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-${BENCH_DEFAULT_RATE_ARGS}}"
 
 # Replica args. The legacy `--async-replica-ack` default was removed
 # alongside the durability-policy refactor — it has no equivalent on
@@ -193,7 +202,7 @@ SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS-}"
 # under this script will be ~50-80µs higher per replication round-
 # trip than figures previously published with `--async-replica-ack`
 # enabled, until that follow-up ships.
-REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS-}"
+REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS:-${BENCH_DEFAULT_RATE_ARGS}}"
 
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
