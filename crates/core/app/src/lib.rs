@@ -22,6 +22,25 @@ pub mod affinity;
 /// replication sender, and replica receiver all hit this on the hot
 /// path. Pure timing utility — no transport coupling.
 pub mod amortized_timer;
+/// Application-construction + bulk-seed seam consumed by the server
+/// runtime to produce fresh `Application` instances for replication
+/// recovery and to publish the initial-state events a fresh primary
+/// journals at startup.
+pub mod app_factory;
+/// Connection-level permission model — application-shaped access
+/// control (operator / trader / custodian / read-only / replication).
+/// Consumed by the wire-side auth handshake in `melin-protocol::auth`.
+pub mod auth;
+/// Request-decoder seam: `RequestDecoder` + `Decoded<E>`. Lets the
+/// server runtime turn wire frames into application events without
+/// naming the concrete wire enum. See [`decoder`] for the trait shape
+/// and the four outcomes the runtime branches on.
+pub mod decoder;
+/// Response-encoder seam: `ResponseEncoder`. Mirror of [`decoder`]
+/// on the outbound path — application reports / query responses get
+/// encoded to wire bytes through this trait, while transport-shaped
+/// envelope variants (`BatchEnd`, `EngineError`) stay in runtime.
+pub mod encoder;
 
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};

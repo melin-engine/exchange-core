@@ -51,7 +51,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use melin_journal::JournalWrite;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
-use crate::TradingEvent;
+use melin_app::Application;
+use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 
 mod auth;
 #[cfg(feature = "dpdk")]
@@ -63,7 +64,7 @@ mod tcp_sender;
 // cursor management, and per-replica metrics now live in
 // `melin_transport_core::replication`. Re-export the public types
 // here so the module's public API surface (e.g.
-// `melin_server::replication::Ack` / `::ReplicationMetrics`) is
+// `melin_server::runtime::replication::Ack` / `::ReplicationMetrics`) is
 // unchanged for downstream consumers and tests.
 pub use melin_transport_core::replication::ReplicationMetrics;
 pub use melin_transport_core::replication::ack_queue::{
@@ -165,13 +166,13 @@ pub(super) fn sleep_checking_flags(
 /// `drain_handle` and `shadow_handle` still observe `shutdown_flag`
 /// because they don't process the input ring (no sentinel reaches
 /// them); set the flag for them only.
-pub(super) fn shutdown_pipeline<W: Send + 'static>(
+pub(super) fn shutdown_pipeline<A: Application + Send + 'static, W: Send + 'static>(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
-    matching_handle: std::thread::JoinHandle<crate::App>,
+    matching_handle: std::thread::JoinHandle<A>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
-) -> Option<(crate::App, W)> {
+) -> Option<(A, W)> {
     // Defense-in-depth: set the flag before joining. The sentinel was
     // already published by `tcp_receiver` before this call, so no further
     // events can arrive in the input ring — setting the flag here cannot
@@ -204,8 +205,8 @@ pub(super) fn shutdown_pipeline<W: Send + 'static>(
 /// with the same shape (journal / matching / drain / optional shadow), and
 /// both refresh handshake state from `last_seq` + `chain_hash_lock` at
 /// reconnect time.
-pub(super) struct ReplicaPipelineHandles<W: Send + 'static> {
-    pub(super) input_producer: melin_disruptor::ring::Producer<crate::InputSlot>,
+pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
+    pub(super) input_producer: melin_disruptor::ring::Producer<InputSlot<A::Event>>,
     pub(super) journal_cursor: Arc<melin_disruptor::padding::Sequence>,
     /// Highest journal sequence durably persisted, published by JournalStage
     /// after each fsync. Read by the orchestrator to fill in the reconnect
@@ -218,7 +219,7 @@ pub(super) struct ReplicaPipelineHandles<W: Send + 'static> {
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
     pub(super) journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
-    pub(super) matching_handle: std::thread::JoinHandle<crate::App>,
+    pub(super) matching_handle: std::thread::JoinHandle<A>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -226,8 +227,8 @@ pub(super) struct ReplicaPipelineHandles<W: Send + 'static> {
 /// Build the replica pipeline and spawn its stage threads on the configured
 /// cores. Returns the bundle of state the orchestrator keeps across
 /// `Disconnected` reconnects.
-pub(super) fn build_replica_pipeline_with_threads<W>(
-    exchange: crate::App,
+pub(super) fn build_replica_pipeline_with_threads<A, W>(
+    exchange: A,
     writer: W,
     cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
@@ -235,12 +236,16 @@ pub(super) fn build_replica_pipeline_with_threads<W>(
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
     rotation: Option<(u64, Arc<AtomicBool>)>,
-) -> Result<ReplicaPipelineHandles<W>, Box<dyn std::error::Error>>
+) -> Result<ReplicaPipelineHandles<A, W>, Box<dyn std::error::Error>>
 where
-    W: JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
+    let shadow_exchange = <A as Application>::clone_via_snapshot(&exchange)?;
 
     let enable_shadow = snapshot_interval_ms > 0;
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
@@ -289,7 +294,7 @@ where
         .spawn(move || {
             melin_app::affinity::pin_thread("drain", drain_core);
             let mut consumer = drain_consumer;
-            let mut batch = vec![crate::OutputSlot::default(); 256];
+            let mut batch = vec![OutputSlot::<A::Report, A::QueryResponse>::default(); 256];
             loop {
                 if ps.load(Ordering::Relaxed) {
                     return;
@@ -352,10 +357,10 @@ where
 /// Tear down the pipeline: signal shutdown, join all threads, return the
 /// recovered (App, SectorWriter) so the orchestrator can use them for the
 /// next pipeline build (e.g., post-snapshot) or pass them up on promotion.
-pub(super) fn teardown_replica_pipeline<W: Send + 'static>(
-    handles: ReplicaPipelineHandles<W>,
-) -> Option<(crate::App, W)> {
-    shutdown_pipeline(
+pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send + 'static>(
+    handles: ReplicaPipelineHandles<A, W>,
+) -> Option<(A, W)> {
+    shutdown_pipeline::<A, W>(
         &handles.pipeline_shutdown,
         handles.journal_handle,
         handles.matching_handle,
@@ -372,6 +377,8 @@ mod tests {
 
     use super::auth::{authenticate_replica, authenticate_with_primary};
     use super::*;
+    use melin_trading::trading_event::TradingEvent;
+    type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
     use melin_transport_core::replication::protocol::{
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
@@ -386,7 +393,7 @@ mod tests {
     /// slot at the given sequence — the protocol-level tests don't need
     /// real journal payloads, just something with a known max sequence.
     fn encode_input_batch_with_seq(end_sequence: u64, buf: &mut Vec<u8>) {
-        let slot = crate::InputSlot {
+        let slot = InputSlot {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
@@ -818,8 +825,7 @@ mod tests {
 
             // Read InputBatch.
             let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-            let slots: Vec<crate::InputSlot> =
-                try_decode_input_batch(&frame).expect("decode InputBatch");
+            let slots: Vec<InputSlot> = try_decode_input_batch(&frame).expect("decode InputBatch");
             let end_seq = slots
                 .last()
                 .map(|s| s.sequence)
@@ -959,7 +965,7 @@ mod tests {
             let mut acked_seqs = Vec::new();
             for _ in 0..3 {
                 let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-                let slots: Vec<crate::InputSlot> =
+                let slots: Vec<InputSlot> =
                     try_decode_input_batch(&frame).expect("decode InputBatch");
                 let end_seq = slots
                     .last()
@@ -1079,8 +1085,7 @@ mod tests {
 
             // Read an InputBatch — should be for events AFTER 100.
             let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-            let slots: Vec<crate::InputSlot> =
-                try_decode_input_batch(&frame).expect("decode InputBatch");
+            let slots: Vec<InputSlot> = try_decode_input_batch(&frame).expect("decode InputBatch");
             let end_sequence = slots
                 .last()
                 .map(|s| s.sequence)

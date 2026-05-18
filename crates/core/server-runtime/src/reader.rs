@@ -26,12 +26,21 @@ use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
 use crate::ControlEvent;
-use crate::InputSlot;
-use crate::JournalEvent;
+use melin_app::AppEvent;
+use melin_app::Application;
+use melin_app::auth::Permission;
+use melin_app::decoder::{Decoded, RequestDecoder};
+
+/// Decoder type alias: request decoder bound to the application's `Event`
+/// type. Mirrors [`crate::response::ResponseEncoderArc`]; hides
+/// the `dyn RequestDecoder<Event = …>` spelling at call sites that thread
+/// the decoder through several functions.
+pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;
 use melin_app::unix_epoch_nanos;
 use melin_disruptor::ring;
-use melin_protocol::auth::Permission;
+use melin_journal::JournalEvent;
 use melin_protocol::codec;
+use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
@@ -158,14 +167,18 @@ impl<R> UringReaderHandle<R> {
 /// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
 /// client requests. Pass `None` to disable the tick (useful for benchmarks
 /// that don't exercise time-driven features).
-pub fn spawn_reader<R: AsRawFd + Send + 'static>(
-    producer: ring::Producer<InputSlot>,
+pub fn spawn_reader<A: Application, R: AsRawFd + Send + 'static>(
+    producer: ring::Producer<InputSlot<A::Event>>,
+    decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
     control_tx: mpsc::Sender<ControlEvent>,
     core: usize,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
     shutdown: Arc<AtomicBool>,
-) -> UringReaderHandle<R> {
+) -> UringReaderHandle<R>
+where
+    A::Event: Send + Sync + 'static,
+{
     let (tx, rx) = mpsc::channel();
 
     let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
@@ -189,10 +202,11 @@ pub fn spawn_reader<R: AsRawFd + Send + 'static>(
                     Err(e) => tracing::warn!(thread = "uring-reader", core = core, error = %e, "failed to pin"),
                 }
             }
-            reader_loop(
+            reader_loop::<A, R>(
                 rx,
                 wakeup_fd,
                 producer,
+                &*decoder,
                 &control_tx,
                 connection_timeout,
                 tick_cadence,
@@ -292,10 +306,11 @@ impl<R> ConnectionSlab<R> {
 ///
 /// When `tick_cadence` is `Some`, the loop also generates the engine's
 /// scheduler ticks — see [`spawn_reader`] for the rationale.
-fn reader_loop<R: AsRawFd>(
+fn reader_loop<A: Application, R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
     wakeup_fd: RawFd,
-    mut producer: ring::Producer<InputSlot>,
+    mut producer: ring::Producer<InputSlot<A::Event>>,
+    decoder: &dyn RequestDecoder<Event = A::Event>,
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
@@ -586,9 +601,10 @@ fn reader_loop<R: AsRawFd>(
                     .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
 
                 // Extract and publish complete frames.
-                let drop_conn = process_frames(
+                let drop_conn = process_frames::<A, R>(
                     entry,
                     &mut producer,
+                    decoder,
                     &server_busy_frame,
                     batch_wall_ns,
                     #[cfg(feature = "latency-trace")]
@@ -770,9 +786,10 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 /// requests published in this call share it, sparing the reader a
 /// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns
 /// `true` if the connection should be dropped.
-fn process_frames<R>(
+fn process_frames<A: Application, R>(
     conn: &mut ConnectionEntry<R>,
-    producer: &mut ring::Producer<InputSlot>,
+    producer: &mut ring::Producer<InputSlot<A::Event>>,
+    decoder: &dyn RequestDecoder<Event = A::Event>,
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
@@ -805,50 +822,36 @@ fn process_frames<R>(
         let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
         cursor += 4 + frame_len;
 
-        let (seq, request) = match codec::decode_request(frame) {
-            Ok(pair) => pair,
-            Err(e) => {
+        let (seq, event) = match decoder.decode(frame, conn.permission) {
+            Decoded::Filter => continue,
+            Decoded::PermissionDenied(reason) => {
                 debug!(
                     connection_id = conn.connection_id,
-                    addr = %conn.addr,
-                    error = %e,
-                    "decode error"
+                    reason, "permission denied, dropping request"
                 );
                 continue;
             }
+            Decoded::DecodeError(reason) => {
+                debug!(
+                    connection_id = conn.connection_id,
+                    addr = %conn.addr,
+                    reason, "decode error"
+                );
+                continue;
+            }
+            Decoded::Permitted { request_seq, event } => (request_seq, event),
         };
-
-        if crate::request::should_filter(&request) {
-            continue;
-        }
-
-        if let Err(reason) = crate::request::check_permission(&request, conn.permission) {
-            debug!(
-                connection_id = conn.connection_id,
-                reason, "permission denied, dropping request"
-            );
-            continue;
-        }
 
         #[allow(clippy::let_unit_value)]
         let recv_ts = mono_trace_ns();
 
-        let event = crate::request::to_event(&request);
-
         // Sequence is allocated by the journal stage in disruptor cursor
-        // order — see `InputSlot::sequence`. QueryStats/QueryPosition are
-        // not journaled and skip even the timestamp.
-        let ts = if matches!(
-            event,
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
-                | JournalEvent::App(
-                    melin_trading::trading_event::TradingEvent::QueryPosition { .. }
-                )
-        ) {
-            0
-        } else {
-            batch_wall_ns
-        };
+        // order — see `InputSlot::sequence`. Read-only query events
+        // (`AppEvent::is_query`) bypass the journal and skip the
+        // wall-clock stamp; everything else inherits this batch's
+        // shared `batch_wall_ns`.
+        let ts = if event.is_query() { 0 } else { batch_wall_ns };
+        let event = JournalEvent::App(event);
 
         #[cfg(feature = "latency-trace")]
         let pre_publish = mono_trace_ns();

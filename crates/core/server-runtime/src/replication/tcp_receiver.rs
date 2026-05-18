@@ -12,10 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
+use melin_app::Application;
 use melin_journal::JournalWrite;
-use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
-
-use crate::TradingEvent;
+use melin_transport_core::pipeline::{InputSlot, JournalStage, JournalStageRun};
 
 /// Force the kernel to send a TCP ACK immediately rather than holding
 /// it in the delayed-ACK timer (~40 ms on Linux). Linux clears
@@ -75,9 +74,9 @@ use super::{
 /// Frame parsing uses the same accumulate-and-extract pattern as the
 /// bench client and reader.
 #[allow(clippy::too_many_arguments)]
-fn replica_stream_uring(
+fn replica_stream_uring<A: Application>(
     tcp_stream: &TcpStream,
-    input_producer: &mut melin_disruptor::ring::Producer<crate::InputSlot>,
+    input_producer: &mut melin_disruptor::ring::Producer<InputSlot<A::Event>>,
     journal_cursor: &melin_disruptor::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
@@ -85,7 +84,7 @@ fn replica_stream_uring(
     shutdown: &AtomicBool,
     promote: &AtomicBool,
     busy_spin: bool,
-    slot_buf: &mut Vec<crate::InputSlot>,
+    slot_buf: &mut Vec<InputSlot<A::Event>>,
 ) -> SessionExit {
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::AsRawFd;
@@ -800,10 +799,10 @@ enum SessionExit {
 /// Blocks until the connection drops or shutdown is signaled.
 /// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
 /// triggered with the fully-replayed App and positioned writer.
-pub type ReceiverResult<W> = Result<Option<(crate::App, W)>, Box<dyn std::error::Error>>;
+pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver<W>(
+pub fn run_receiver<A, W>(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
     signing_key: &ed25519_dalek::SigningKey,
@@ -821,21 +820,21 @@ pub fn run_receiver<W>(
     // max_journal_bytes == 0 disables size-driven rotation. None means
     // runtime rotation is off entirely on this replica.
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
-    // Per-account open-order cap (SEC-03). Must match the primary or
-    // replay diverges on Rejected reports. Forwarded to every
-    // freshly-constructed engine in this receiver.
-    max_orders_per_account: u32,
-    // Per-account order-rate limit (SEC-04). Same determinism caveat —
-    // primary and replicas must agree on rate + burst.
-    max_orders_per_second: u32,
-    max_orders_burst: u32,
-) -> ReceiverResult<W>
+    // Application factory: produces the empty `A` instances this
+    // receiver hands to fresh pipelines, and reapplies operator-
+    // controlled policy (e.g. SEC-03 cap, SEC-04 rate/burst on the
+    // trading app). The policy is NOT journaled — primary and replica
+    // must converge on it via matching factory configuration.
+    factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
+) -> ReceiverResult<A, W>
 where
-    W: JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    use crate::App;
-
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
     // shutdown returns the App + writer directly.
@@ -843,26 +842,18 @@ where
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                melin_transport_core::JournaledApp::<App, W>::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_transport_core::JournaledApp::<App, W>::recover(
-                    crate::server::empty_app(),
-                    journal_path,
-                )?
+                melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (mut exchange, writer) = engine.into_parts();
-            crate::server::apply_max_orders(
-                &mut exchange,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
+            factory.apply_operator_policy(&mut exchange);
             (Some(exchange), Some(writer), last, hash)
         } else {
             (None, None, 0u64, [0u8; 32])
@@ -877,7 +868,7 @@ where
     let mut send_buf = Vec::with_capacity(64);
     // Grows to the sender's batch size on the first batch, then never
     // reallocates — even across reconnects.
-    let mut slot_buf: Vec<crate::InputSlot> = Vec::new();
+    let mut slot_buf: Vec<InputSlot<A::Event>> = Vec::new();
     let mut accum_end_sequence: u64 = 0;
 
     // Live pipeline state — built once on first connect (or after a snapshot
@@ -886,7 +877,7 @@ where
     // None = no pipeline yet (first iteration, or just torn down for
     // snapshot transfer); Some = running pipeline with threads + atomics
     // we can read for the next reconnect handshake.
-    let mut pipeline: Option<ReplicaPipelineHandles<W>> = None;
+    let mut pipeline: Option<ReplicaPipelineHandles<A, W>> = None;
 
     // --- Outer reconnect loop ---
     //
@@ -912,8 +903,8 @@ where
         if shutdown.load(Ordering::Relaxed) {
             if let Some(mut p) = pipeline.take() {
                 p.input_producer
-                    .publish(crate::InputSlot::shutdown_sentinel());
-                let _ = teardown_replica_pipeline(p);
+                    .publish(InputSlot::<A::Event>::shutdown_sentinel());
+                let _ = teardown_replica_pipeline::<A, W>(p);
             }
             return Ok(None);
         }
@@ -921,8 +912,8 @@ where
             info!("promotion triggered while disconnected");
             if let Some(mut p) = pipeline.take() {
                 p.input_producer
-                    .publish(crate::InputSlot::shutdown_sentinel());
-                if let Some((e, w)) = teardown_replica_pipeline(p) {
+                    .publish(InputSlot::<A::Event>::shutdown_sentinel());
+                if let Some((e, w)) = teardown_replica_pipeline::<A, W>(p) {
                     exchange = Some(e);
                     journal_writer = Some(w);
                 }
@@ -953,8 +944,8 @@ where
                     info!("promotion triggered during reconnect backoff");
                     if let Some(mut p) = pipeline.take() {
                         p.input_producer
-                            .publish(crate::InputSlot::shutdown_sentinel());
-                        if let Some((e, w)) = teardown_replica_pipeline(p) {
+                            .publish(InputSlot::<A::Event>::shutdown_sentinel());
+                        if let Some((e, w)) = teardown_replica_pipeline::<A, W>(p) {
                             exchange = Some(e);
                             journal_writer = Some(w);
                         }
@@ -1045,8 +1036,8 @@ where
                 // and reassigns `exchange` / `journal_writer`.
                 if let Some(mut p) = pipeline.take() {
                     p.input_producer
-                        .publish(crate::InputSlot::shutdown_sentinel());
-                    let _ = teardown_replica_pipeline(p);
+                        .publish(InputSlot::<A::Event>::shutdown_sentinel());
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
 
                 let _ = std::fs::remove_file(journal_path);
@@ -1117,7 +1108,7 @@ where
                 }
 
                 let (snap_exchange, snap_seq, snap_hash) =
-                    melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
+                    melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
                 if snap_hash != snap_chain_hash {
                     return Err(format!(
                         "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
@@ -1159,13 +1150,8 @@ where
         if journal_writer.is_none() {
             let writer =
                 melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
-            let mut fresh = crate::server::empty_app();
-            crate::server::apply_max_orders(
-                &mut fresh,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
+            let mut fresh = factory.empty();
+            factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);
             journal_writer = Some(writer);
         }
@@ -1178,7 +1164,7 @@ where
         if pipeline.is_none() {
             let cur_exchange = exchange.take().expect("exchange initialized");
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
-            pipeline = Some(build_replica_pipeline_with_threads(
+            pipeline = Some(build_replica_pipeline_with_threads::<A, W>(
                 cur_exchange,
                 cur_writer,
                 cores,
@@ -1209,7 +1195,7 @@ where
                     .name("replica-receiver".into())
                     .spawn_scoped(s, || {
                         melin_app::affinity::pin_thread("replica-receiver", receiver_core);
-                        replica_stream_uring(
+                        replica_stream_uring::<A>(
                             &tcp_writer,
                             input_producer,
                             journal_cursor,
@@ -1245,20 +1231,20 @@ where
             && let Some(p) = pipeline.as_mut()
         {
             p.input_producer
-                .publish(crate::InputSlot::shutdown_sentinel());
+                .publish(InputSlot::<A::Event>::shutdown_sentinel());
         }
 
         match exit_reason {
             SessionExit::Shutdown => {
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Ok(None);
             }
 
             SessionExit::Promote => {
                 return match pipeline.take() {
-                    Some(p) => match teardown_replica_pipeline(p) {
+                    Some(p) => match teardown_replica_pipeline::<A, W>(p) {
                         Some((e, w)) => Ok(Some((e, w))),
                         None => Err("pipeline failed during promotion".into()),
                     },
@@ -1268,7 +1254,7 @@ where
 
             SessionExit::Fatal(e) => {
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Err(e);
             }

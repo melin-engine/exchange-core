@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use clap::Parser;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::tcp::BlockingTcpListener;
-use melin_server::server::ServerConfig;
+use melin_server::runtime::server::ServerConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -68,6 +68,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_shutdown_handler(&shutdown);
 
     let config = ServerConfig::parse();
+    // Wire the trading-side AppFactory the runtime needs for fresh-app
+    // construction (replication recovery, snapshot rebuild) and for
+    // the bulk-seed events a fresh primary journals at startup. The
+    // factory captures `accounts`/`instruments`/`max_orders_*` so the
+    // runtime never names trading concepts by their wire variants.
+    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>> =
+        Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
+            melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+                accounts: config.accounts,
+                instruments: config.instruments,
+                max_orders_per_account: config.max_orders_per_account,
+                max_orders_per_second: config.max_orders_per_second,
+                max_orders_burst: config.max_orders_burst,
+            },
+        ));
+    // Trading-side wire codecs. The runtime takes these as trait objects
+    // so non-trading applications plug in their own codecs without
+    // touching server.rs.
+    let decoder: melin_server::runtime::reader::RequestDecoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
+    let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
+    // Event publisher is trading-only: under `trading` the binary wires
+    // the market-data publisher fn; under `skip-order-exec` no publisher
+    // exists, so we pass `None` and the runtime never allocates the
+    // consumer slot.
+    let event_publisher: Option<
+        melin_server::runtime::server::EventPublisherFn<melin_server::App>,
+    > = {
+        #[cfg(feature = "trading")]
+        {
+            Some(melin_server::domain::event_publisher::run)
+        }
+        #[cfg(not(feature = "trading"))]
+        {
+            None
+        }
+    };
 
     if !config.no_mlock {
         try_lock_memory();
@@ -76,13 +114,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dpdk")]
     {
         let dpdk_config = dpdk_config_from(&config);
-        melin_server::server::run_dpdk(config, dpdk_config, shutdown)
+        melin_server::runtime::server::run_dpdk(
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            dpdk_config,
+            shutdown,
+        )
     }
 
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server::server::run_with_shutdown(listener, config, shutdown)
+        melin_server::runtime::server::run_with_shutdown(
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
+        )
     }
 }
 

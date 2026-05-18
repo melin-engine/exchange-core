@@ -12,11 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
+use melin_app::Application;
 use melin_journal::JournalWrite;
 use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
-
-use crate::TradingEvent;
 
 use super::{
     PendingAckQueue, ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
@@ -193,7 +192,7 @@ impl DpdkReplicationDriver {
     /// `true` if at least one slot is currently active (Handshaking or
     /// Streaming) — caller can use this to decide whether to busy-spin
     /// on idle.
-    pub fn tick(
+    pub fn tick<A: Application>(
         &mut self,
         transport: &mut melin_dpdk::DpdkTransport,
         shutdown: &AtomicBool,
@@ -362,7 +361,7 @@ impl DpdkReplicationDriver {
                                         slot.send_buf.clear();
 
                                         // Journal catch-up via DPDK transport.
-                                        if let Err(e) = catch_up_from_journal_dpdk(
+                                        if let Err(e) = catch_up_from_journal_dpdk::<A>(
                                             journal_path,
                                             h.last_sequence,
                                             handle,
@@ -386,7 +385,7 @@ impl DpdkReplicationDriver {
                                     } else {
                                         // Replica's state predates all journal archives.
                                         // Transfer a snapshot, then catch up.
-                                        if let Err(e) = snapshot_transfer_dpdk(
+                                        if let Err(e) = snapshot_transfer_dpdk::<A>(
                                             journal_path,
                                             genesis_entry,
                                             handle,
@@ -682,7 +681,7 @@ impl DpdkReplicationDriver {
 /// bytes), decodes them into `InputSlot` records, and sends them as
 /// `InputBatch` frames via the DPDK transport. Periodically polls the
 /// transport to flush TX and keep smoltcp's timers alive.
-fn catch_up_from_journal_dpdk(
+fn catch_up_from_journal_dpdk<A: Application>(
     journal_path: &std::path::Path,
     last_sequence: u64,
     handle: melin_dpdk::SocketHandle,
@@ -764,7 +763,7 @@ fn catch_up_from_journal_dpdk(
             // streaming path uses.
             let slots =
                 melin_transport_core::replication::protocol::decode_journal_to_input_slots::<
-                    crate::TradingEvent,
+                    A::Event,
                 >(&batch_buf)
                 .map_err(|e| {
                     io::Error::other(format!(
@@ -815,7 +814,7 @@ fn catch_up_from_journal_dpdk(
 /// Transfer a snapshot to a replica via DPDK, then catch up from journals.
 /// Sends: NeedSnapshot → SnapshotBegin → SnapshotChunk* → SnapshotEnd →
 /// StreamStart → InputBatch* (catch-up).
-fn snapshot_transfer_dpdk(
+fn snapshot_transfer_dpdk<A: Application>(
     journal_path: &std::path::Path,
     genesis_entry: &[u8],
     handle: melin_dpdk::SocketHandle,
@@ -899,7 +898,7 @@ fn snapshot_transfer_dpdk(
     transport.poll();
 
     // Catch up from the snapshot's sequence using the current journal.
-    catch_up_from_journal_dpdk(
+    catch_up_from_journal_dpdk::<A>(
         journal_path,
         snap_sequence,
         handle,
@@ -918,7 +917,7 @@ fn snapshot_transfer_dpdk(
 /// The protocol is identical to `run_receiver` — same wire format, same
 /// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver_dpdk<W>(
+pub fn run_receiver_dpdk<A, W>(
     mut transport: melin_dpdk::DpdkTransport,
     primary_ip: std::net::Ipv4Addr,
     primary_port: u16,
@@ -933,18 +932,19 @@ pub fn run_receiver_dpdk<W>(
     pipeline_depth: usize,
     busy_spin: bool,
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
-    // SEC-03: must equal the primary's --max-orders-per-account.
-    max_orders_per_account: u32,
-    // SEC-04: must equal the primary's --max-orders-per-second / --max-orders-burst.
-    max_orders_per_second: u32,
-    max_orders_burst: u32,
-) -> ReceiverResult<W>
+    // Application factory: see the kernel-TCP `run_receiver` for the
+    // shape and rationale. Carries operator policy (rate limits, caps,
+    // ...) alongside the empty-app constructor.
+    factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
+) -> ReceiverResult<A, W>
 where
-    W: JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    use crate::App;
-
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
     // shutdown returns the App + writer directly.
@@ -952,26 +952,18 @@ where
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal (DPDK)");
-                melin_transport_core::JournaledApp::<App, W>::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_transport_core::JournaledApp::<App, W>::recover(
-                    crate::server::empty_app(),
-                    journal_path,
-                )?
+                melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (mut exchange, writer) = engine.into_parts();
-            crate::server::apply_max_orders(
-                &mut exchange,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
+            factory.apply_operator_policy(&mut exchange);
             (Some(exchange), Some(writer), last, hash)
         } else {
             (None, None, 0u64, [0u8; 32])
@@ -995,7 +987,7 @@ where
     // None = no pipeline yet (first iteration, or just torn down for
     // snapshot transfer); Some = running pipeline with threads + atomics
     // we can read for the next reconnect handshake.
-    let mut pipeline: Option<ReplicaPipelineHandles<W>> = None;
+    let mut pipeline: Option<ReplicaPipelineHandles<A, W>> = None;
 
     // --- Outer reconnect loop ---
     //
@@ -1015,14 +1007,14 @@ where
 
         if shutdown.load(Ordering::Relaxed) {
             if let Some(p) = pipeline.take() {
-                let _ = teardown_replica_pipeline(p);
+                let _ = teardown_replica_pipeline::<A, W>(p);
             }
             return Ok(None);
         }
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered while disconnected (DPDK)");
             if let Some(p) = pipeline.take()
-                && let Some((e, w)) = teardown_replica_pipeline(p)
+                && let Some((e, w)) = teardown_replica_pipeline::<A, W>(p)
             {
                 exchange = Some(e);
                 journal_writer = Some(w);
@@ -1091,14 +1083,14 @@ where
             sleep_checking_flags(backoff, shutdown, promote);
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Ok(None);
             }
             if promote.load(Ordering::Acquire) {
                 info!("promotion triggered during reconnect backoff (DPDK)");
                 if let Some(p) = pipeline.take()
-                    && let Some((e, w)) = teardown_replica_pipeline(p)
+                    && let Some((e, w)) = teardown_replica_pipeline::<A, W>(p)
                 {
                     exchange = Some(e);
                     journal_writer = Some(w);
@@ -1130,7 +1122,7 @@ where
         macro_rules! fatal_err_dpdk {
             ($msg:expr) => {{
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Err($msg);
             }};
@@ -1139,7 +1131,7 @@ where
         let primary_genesis_entry = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Ok(None);
             }
@@ -1167,7 +1159,7 @@ where
                             // file open and the App lives on the matching
                             // thread; both must exit cleanly first.
                             if let Some(p) = pipeline.take() {
-                                let _ = teardown_replica_pipeline(p);
+                                let _ = teardown_replica_pipeline::<A, W>(p);
                             }
 
                             // Remove stale local state. Invalidate the in-memory
@@ -1181,7 +1173,7 @@ where
                             let _ = std::fs::remove_file(&snapshot_path);
 
                             // Receive snapshot via DPDK transport.
-                            match receive_snapshot_dpdk(
+                            match receive_snapshot_dpdk::<A>(
                                 handle,
                                 &mut transport,
                                 &mut recv_buf,
@@ -1247,13 +1239,8 @@ where
         if journal_writer.is_none() && !primary_genesis_entry.is_empty() {
             let writer =
                 melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
-            let mut fresh = crate::server::empty_app();
-            crate::server::apply_max_orders(
-                &mut fresh,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
+            let mut fresh = factory.empty();
+            factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);
             journal_writer = Some(writer);
         }
@@ -1281,7 +1268,7 @@ where
                 tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
             }
 
-            pipeline = Some(build_replica_pipeline_with_threads(
+            pipeline = Some(build_replica_pipeline_with_threads::<A, W>(
                 cur_exchange,
                 cur_writer,
                 cores,
@@ -1541,13 +1528,13 @@ where
         match session_exit {
             SessionExit::Shutdown => {
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Ok(None);
             }
             SessionExit::Promote => {
                 return match pipeline.take() {
-                    Some(p) => match teardown_replica_pipeline(p) {
+                    Some(p) => match teardown_replica_pipeline::<A, W>(p) {
                         Some((ex, wr)) => Ok(Some((ex, wr))),
                         None => Err("pipeline thread panicked during promotion (DPDK)".into()),
                     },
@@ -1556,7 +1543,7 @@ where
             }
             SessionExit::Fatal(e) => {
                 if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline(p);
+                    let _ = teardown_replica_pipeline::<A, W>(p);
                 }
                 return Err(e);
             }
@@ -1583,13 +1570,13 @@ where
 /// Receive a snapshot from the primary via DPDK transport.
 /// Expects: SnapshotBegin → SnapshotChunk* → SnapshotEnd.
 /// Returns the loaded App, snapshot sequence, and chain hash.
-fn receive_snapshot_dpdk(
+fn receive_snapshot_dpdk<A: Application>(
     handle: melin_dpdk::SocketHandle,
     transport: &mut melin_dpdk::DpdkTransport,
     recv_buf: &mut Vec<u8>,
     snapshot_path: &std::path::Path,
     shutdown: &AtomicBool,
-) -> Result<(crate::App, u64, [u8; 32]), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(A, u64, [u8; 32]), Box<dyn std::error::Error + Send + Sync>> {
     // Read SnapshotBegin.
     let (snap_len, snap_sequence, snap_chain_hash) = loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -1712,7 +1699,7 @@ fn receive_snapshot_dpdk(
 
     // Load and verify the snapshot.
     let (snap_exchange, _snap_seq, snap_hash) =
-        melin_transport_core::snapshot::load::<crate::App>(snapshot_path)?;
+        melin_transport_core::snapshot::load::<A>(snapshot_path)?;
     if snap_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \

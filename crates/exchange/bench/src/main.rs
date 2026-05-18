@@ -79,7 +79,7 @@ use melin_protocol::message::ResponseKind;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::transport::BlockingTransportListener;
 #[cfg(not(feature = "dpdk"))]
-use melin_server::server::ServerConfig;
+use melin_server::runtime::server::ServerConfig;
 use melin_types::types::*;
 
 /// Number of completed orders between latency time-series samples.
@@ -1185,11 +1185,13 @@ fn run_pipeline_bench(
     target_rate: u64,
     max_reject_pct: f64,
 ) {
-    use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
+    use melin_journal::{BufferedWriter, SectorWriter};
+    use melin_server::JournalWriterMode;
 
     // Set up exchange with one instrument and funded account.
-    let mut app =
-        melin_server::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity());
+    let mut app = melin_server::domain::exchange_app::ServerApp(
+        melin_engine::exchange::Exchange::with_capacity(),
+    );
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -1246,17 +1248,19 @@ struct PipelineInnerCfg<'a> {
 
 /// Pipeline-mode body, generic over the journal writer so we get a
 /// statically-dispatched `run_sync` or `run_uring` per writer.
+// Module-scope imports for `run_pipeline_inner`'s where clause —
+// the bound has to name `TradingEvent` / `JournalStage` /
+// `JournalStageRun` in the signature scope, not the body scope.
+use melin_server::pipeline::{JournalStage, JournalStageRun};
+use melin_trading::trading_event::TradingEvent;
+
 fn run_pipeline_inner<W>(app: melin_server::App, writer: W, cfg: PipelineInnerCfg<'_>)
 where
-    W: melin_server::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_server::JournalStage<W>: melin_server::pipeline::JournalStageRun<
-            melin_trading::trading_event::TradingEvent,
-            Writer = W,
-        >,
+    W: melin_server::JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
-    use melin_server::InputSlot;
-    use melin_server::JournalEvent;
-    use melin_server::pipeline::{JournalStageRun, build_pipeline_with_replication};
+    use melin_journal::JournalEvent;
+    use melin_server::pipeline::{InputSlot, build_pipeline_with_replication};
     use melin_server::trace::mono_trace_ns;
     use melin_transport_core::pipeline::OutputPayload;
 
@@ -1690,9 +1694,24 @@ fn run_roundtrip_bench(
         // local persistence alone. The default `Hybrid` mode waits for
         // `in_memory>=2` replica acks that never arrive when nothing else
         // is connected, which would stall every response.
-        durability_mode: melin_server::durability_policy::DurabilityMode::Local,
+        durability_mode: melin_server::runtime::durability_policy::DurabilityMode::Local,
         ..ServerConfig::default()
     };
+    // Wire the trading AppFactory: replication / seed paths take it
+    // as an argument to `run_with_shutdown`. The bench server runs
+    // standalone but still bulk-seeds via the same code path as the
+    // binary, so the factory must be constructed even for in-process
+    // benchmarks.
+    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>> =
+        Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
+            melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+                accounts: config.accounts,
+                instruments: config.instruments,
+                max_orders_per_account: config.max_orders_per_account,
+                max_orders_per_second: config.max_orders_per_second,
+                max_orders_burst: config.max_orders_burst,
+            },
+        ));
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1704,7 +1723,12 @@ fn run_roundtrip_bench(
 
         let sock_path = tmp_dir.join("bench.sock");
         let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
-        start_server(listener, config, Arc::clone(&shutdown));
+        start_server(
+            listener,
+            config,
+            Arc::clone(&factory),
+            Arc::clone(&shutdown),
+        );
 
         let sock_path_ref = &sock_path;
         let connect = || {
@@ -1737,7 +1761,12 @@ fn run_roundtrip_bench(
         let listener = BlockingTcpListener::bind("127.0.0.1:0".parse().expect("valid addr"))
             .expect("bind TCP");
         let addr = listener.local_addr().expect("local addr");
-        start_server(listener, config, Arc::clone(&shutdown));
+        start_server(
+            listener,
+            config,
+            Arc::clone(&factory),
+            Arc::clone(&shutdown),
+        );
 
         let connect = || {
             let stream = connect_tcp(addr);
@@ -1791,12 +1820,32 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
+    factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Trading-side codecs constructed at the call boundary, mirroring
+    // the binary in `crates/exchange/server/src/main.rs`.
+    let decoder: melin_server::runtime::reader::RequestDecoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
+    let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
+    // The bench has no event subscribers; pass `None` so the runtime
+    // never allocates the publisher consumer slot.
+    let event_publisher: Option<
+        melin_server::runtime::server::EventPublisherFn<melin_server::App>,
+    > = None;
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            if let Err(e) = melin_server::server::run_with_shutdown(listener, config, shutdown) {
+            if let Err(e) = melin_server::runtime::server::run_with_shutdown(
+                listener,
+                config,
+                factory,
+                decoder,
+                encoder,
+                event_publisher,
+                shutdown,
+            ) {
                 eprintln!("server error: {e}");
             }
         })

@@ -15,7 +15,7 @@ use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
 use super::{ReplicationMetrics, update_dual_replication_cursor};
-use crate::TradingEvent;
+use melin_app::Application;
 use melin_transport_core::replication::catchup::{
     CatchUpResult, can_catch_up_from_journal, catch_up_from_journal,
 };
@@ -53,7 +53,7 @@ pub struct Sender {
 /// replication cursor.
 ///
 /// Runs on a dedicated thread. Blocks until shutdown.
-pub fn run_sender(
+pub fn run_sender<A: Application>(
     config: Sender,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
@@ -319,7 +319,7 @@ pub fn run_sender(
                                 heartbeat_secs,
                                 busy_spin,
                             };
-                            run_replica_slot(stream, consumer, &ctx)
+                            run_replica_slot::<A>(stream, consumer, &ctx)
                         })
                         .expect("spawn replica handler thread");
                     slots[slot_idx].handle = Some(handle);
@@ -364,19 +364,19 @@ struct SlotContext<'a> {
 
 /// Handle a single replica connection on a dedicated thread.
 /// Returns the consumer when the connection ends (for slot reuse).
-fn run_replica_slot(
+fn run_replica_slot<A: Application>(
     stream: TcpStream,
     mut consumer: ReplicationConsumer,
     ctx: &SlotContext<'_>,
 ) -> ReplicationConsumer {
-    match handle_replica_connection(stream, &mut consumer, ctx) {
+    match handle_replica_connection::<A>(stream, &mut consumer, ctx) {
         Ok(()) => info!("replica disconnected cleanly"),
         Err(e) => warn!(error = %e, "replica connection error"),
     }
     consumer
 }
 
-fn handle_replica_connection(
+fn handle_replica_connection<A: Application>(
     stream: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
     ctx: &SlotContext<'_>,
@@ -443,7 +443,7 @@ fn handle_replica_connection(
         writer.flush()?;
         send_buf.clear();
 
-        let catchup_result = catch_up_from_journal::<TradingEvent>(
+        let catchup_result = catch_up_from_journal::<A::Event>(
             journal_path,
             handshake.last_sequence,
             &mut writer,
@@ -542,12 +542,8 @@ fn handle_replica_connection(
 
         // Catch up from the snapshot's sequence using the current journal.
         // The current journal starts at snap_sequence+1 (rotation boundary).
-        let post_snap_result = catch_up_from_journal::<TradingEvent>(
-            journal_path,
-            snap_sequence,
-            &mut writer,
-            shutdown,
-        )?;
+        let post_snap_result =
+            catch_up_from_journal::<A::Event>(journal_path, snap_sequence, &mut writer, shutdown)?;
         match post_snap_result {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {

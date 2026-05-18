@@ -19,10 +19,9 @@ use std::time::{Duration, Instant};
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
-use crate::{OutputPayload, OutputSlot};
+use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_transport_core::pipeline::StageUtilization;
-use melin_types::types::QueryResponse;
+use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -99,8 +98,8 @@ pub enum ControlEvent {
 // `response::Response::journal_persisted_wire_seq`. See that field's docs
 // for why the gate must use wire-seq space rather than the
 // journal-consumer cursor.
-pub fn run(
-    mut consumer: ring::Consumer<OutputSlot>,
+pub fn run<A: Application>(
+    mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: Arc<AtomicU64>,
     durability_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -112,6 +111,7 @@ pub fn run(
     mut tx_producers: Vec<spsc::Producer<TxFrame>>,
     utilization: Arc<StageUtilization>,
     busy_spin: bool,
+    encoder: crate::response::ResponseEncoderArc<A>,
 ) {
     // Mirrors `response::run`: derive the local Policy from the shared
     // mode atomic and observe runtime swaps from the admin
@@ -128,7 +128,7 @@ pub fn run(
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
 
-    let mut batch = [OutputSlot::default(); MAX_BATCH];
+    let mut batch = [OutputSlot::<A::Report, A::QueryResponse>::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position (see response.rs for full explanation).
@@ -441,54 +441,6 @@ pub fn run(
                 replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
 
-            let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
-            let mut kinds_len: usize = 0;
-            match slot.payload {
-                OutputPayload::QueryResponse(QueryResponse::Stats {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                }) => {
-                    kinds[kinds_len] = ResponseKind::StatsHeader {
-                        active_connections,
-                        events_processed,
-                        journal_sequence,
-                    };
-                    kinds_len += 1;
-                }
-                OutputPayload::QueryResponse(QueryResponse::Position {
-                    account,
-                    balances,
-                    count,
-                }) => {
-                    kinds[kinds_len] = ResponseKind::PositionSnapshot {
-                        account,
-                        balances,
-                        count,
-                    };
-                    kinds_len += 1;
-                }
-                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
-                    kinds[kinds_len] = ResponseKind::RequestSeqHwm { hwm };
-                    kinds_len += 1;
-                }
-                OutputPayload::Report(report) => {
-                    kinds[kinds_len] = ResponseKind::Report(report);
-                    kinds_len += 1;
-                }
-                OutputPayload::BatchEnd => {
-                    // No payload — terminator only via is_last_in_request.
-                }
-                OutputPayload::EngineError => {
-                    kinds[kinds_len] = ResponseKind::EngineError;
-                    kinds_len += 1;
-                }
-            }
-            if slot.is_last_in_request {
-                kinds[kinds_len] = ResponseKind::BatchEnd;
-                kinds_len += 1;
-            }
-
             if !connections.contains_key(&slot.connection_id) {
                 continue;
             }
@@ -505,29 +457,38 @@ pub fn run(
             let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
             let conn_id = slot.connection_id;
 
-            for kind in &kinds[..kinds_len] {
+            // Frame 1: application payload (Report / Query via encoder;
+            // EngineError via codec). BatchEnd payloads carry no body —
+            // the terminator below handles them via is_last_in_request.
+            let payload_result: Option<Result<usize, &'static str>> = match slot.payload {
+                OutputPayload::Report(ref report) => {
+                    Some(encoder.encode_report(report, &mut encode_buf))
+                }
+                OutputPayload::QueryResponse(ref q) => {
+                    Some(encoder.encode_query(q, &mut encode_buf))
+                }
+                OutputPayload::EngineError => Some(
+                    codec::encode_response(&ResponseKind::EngineError, &mut encode_buf)
+                        .map_err(|_| "encode error"),
+                ),
+                OutputPayload::BatchEnd => None,
+            };
+
+            if let Some(result) = payload_result {
                 #[cfg(feature = "tick-to-trade")]
                 let encode_start = trace::mono_trace_ns();
-                let written = match codec::encode_response(kind, &mut encode_buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!(
-                            connection_id = slot.connection_id,
-                            error = %e,
-                            "encode error"
-                        );
-                        continue;
-                    }
-                };
+                push_frame(result, conn_id, &mut tx_producers[tid], &encode_buf);
                 #[cfg(feature = "tick-to-trade")]
                 encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
+            }
 
-                let len = written as u16;
-                tx_producers[tid].push_with(|frame| {
-                    frame.connection_id = conn_id;
-                    frame.len = len;
-                    frame.data[..written].copy_from_slice(&encode_buf[..written]);
-                });
+            // Frame 2: BatchEnd terminator. Transport-shaped, encoded
+            // directly via codec — never reaches the application
+            // encoder trait.
+            if slot.is_last_in_request {
+                let result = codec::encode_response(&ResponseKind::BatchEnd, &mut encode_buf)
+                    .map_err(|_| "encode error");
+                push_frame(result, conn_id, &mut tx_producers[tid], &encode_buf);
             }
 
             // Release this slot's frames as a unit. `flush` is a no-op
@@ -550,6 +511,34 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
+}
+
+/// Push one encoded wire frame onto the DPDK tx ring. Logs encode
+/// failures at error level and silently drops the frame — same
+/// behaviour as the pre-refactor inline loop. Splitting the
+/// responsibility into a helper lets the slot-processing code call
+/// it uniformly for application payloads (via the `ResponseEncoder`
+/// trait) and transport-shaped frames (via `codec::encode_response`).
+#[inline]
+fn push_frame(
+    result: Result<usize, &'static str>,
+    conn_id: u64,
+    tx: &mut spsc::Producer<TxFrame>,
+    encode_buf: &[u8],
+) {
+    let written = match result {
+        Ok(n) => n,
+        Err(reason) => {
+            tracing::error!(connection_id = conn_id, reason, "encode error");
+            return;
+        }
+    };
+    let len = written as u16;
+    tx.push_with(|frame| {
+        frame.connection_id = conn_id;
+        frame.len = len;
+        frame.data[..written].copy_from_slice(&encode_buf[..written]);
+    });
 }
 
 /// Per-connection heartbeat state. No socket writer — the DPDK poll
