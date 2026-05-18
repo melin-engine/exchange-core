@@ -210,7 +210,7 @@ fn main() {
     let c = Arc::clone(&connected_counter);
     let sender_handle = std::thread::Builder::new()
         .name("bench-repl-sender".into())
-        .spawn(move || run_sender(sender_config, &s, &r, &c))
+        .spawn(move || run_sender::<melin_server::App>(sender_config, &s, &r, &c))
         .expect("spawn run_sender");
 
     // --- Spawn run_receiver ---

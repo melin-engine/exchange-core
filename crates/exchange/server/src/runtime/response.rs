@@ -22,11 +22,10 @@ use melin_disruptor::ring;
 
 use crate::runtime::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::runtime::replication::ReplicationMetrics;
-use crate::{OutputPayload, OutputSlot};
-use melin_transport_core::pipeline::StageUtilization;
+use melin_app::Application;
+use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
-use melin_types::types::{ExecutionReport, QueryResponse};
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -52,14 +51,18 @@ const MAX_SEND_BUF: usize = 64 * 1024;
 
 pub use crate::ControlEvent;
 
-/// Encoder type alias: trading wire encoder bound to the engine's
-/// `ExecutionReport` / `QueryResponse` types. Hides the long
+/// Encoder type alias: response encoder bound to the application's
+/// `Report` / `QueryResponse` types. Hides the long
 /// `dyn ResponseEncoder<Report = ..., Query = ...>` at call sites.
-pub type ResponseEncoderArc =
-    Arc<dyn melin_app::encoder::ResponseEncoder<Report = ExecutionReport, Query = QueryResponse>>;
+pub type ResponseEncoderArc<A> = Arc<
+    dyn melin_app::encoder::ResponseEncoder<
+            Report = <A as Application>::Report,
+            Query = <A as Application>::QueryResponse,
+        >,
+>;
 
 /// Configuration and shared state for the response stage.
-pub struct Response {
+pub struct Response<A: Application> {
     /// Highest wire seq durably persisted on the primary's journal.
     /// In the same sequence space as `OutputSlot.wire_seq` and the
     /// replica metrics (`metrics.in_memory_sequence` /
@@ -95,7 +98,7 @@ pub struct Response {
     /// Wire encoder for application-shaped payloads. Constructed
     /// once at boot (`Arc::new(ExchangeResponseEncoder)`) and shared
     /// with the DPDK response stage.
-    pub encoder: ResponseEncoderArc,
+    pub encoder: ResponseEncoderArc<A>,
 }
 
 /// Per-connection state for batched io_uring sends.
@@ -122,10 +125,10 @@ struct ConnectionEntry {
 /// (primary persisted) plus per-slot replica cursors (in-memory and
 /// persisted) from `replication_metrics` and feeds them through the
 /// configured [`Policy`]. See [`evaluate_durability`].
-pub fn run(
-    mut consumer: ring::Consumer<OutputSlot>,
+pub fn run<A: Application>(
+    mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
-    config: Response,
+    config: Response<A>,
     shutdown: &AtomicBool,
 ) {
     let Response {
@@ -162,7 +165,7 @@ pub fn run(
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
     let mut connections: HashMap<u64, ConnectionEntry> = HashMap::with_capacity(256);
 
-    let mut batch = [OutputSlot::default(); MAX_BATCH];
+    let mut batch = [OutputSlot::<A::Report, A::QueryResponse>::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position to avoid atomic reads on every slot.

@@ -39,22 +39,21 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
-use crate::InputSlot;
-use crate::JournalEvent;
 use ed25519_dalek::{Verifier, VerifyingKey};
-use melin_app::AppEvent;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_app::unix_epoch_nanos;
+use melin_app::{AppEvent, Application};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
+use melin_journal::JournalEvent;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
+use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
 use rand::Rng;
 
-use crate::TradingEvent;
 use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
@@ -122,10 +121,10 @@ struct ConnectionState {
 /// state owned elsewhere; bundling into a config struct adds indirection
 /// without simplifying.
 #[allow(clippy::too_many_arguments)]
-pub fn run_dpdk_poll(
+pub fn run_dpdk_poll<A: Application>(
     mut transport: DpdkTransport,
-    mut producer: ring::Producer<InputSlot>,
-    decoder: Arc<dyn RequestDecoder<Event = TradingEvent>>,
+    mut producer: ring::Producer<InputSlot<A::Event>>,
+    decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
     control_tx: mpsc::Sender<ControlEvent>,
     mut tx_rx: melin_disruptor::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
@@ -540,7 +539,7 @@ pub fn run_dpdk_poll(
                     // copy it out (Permission: Copy) so the call below
                     // can release the borrow on `conn.auth`.
                     let permission = *permission;
-                    process_trading_frames(
+                    process_trading_frames::<A>(
                         conn,
                         permission,
                         &mut transport,
@@ -766,12 +765,12 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 /// in this outer iteration advance the producer cursor with a single
 /// release store — amortising the ~9% ingress-core cost perf annotate
 /// pinned on the per-publish cursor write.
-fn process_trading_frames(
+fn process_trading_frames<A: Application>(
     conn: &mut ConnectionState,
     permission: Permission,
     transport: &mut DpdkTransport,
-    decoder: &dyn RequestDecoder<Event = TradingEvent>,
-    batch: &mut ring::Batch<'_, InputSlot>,
+    decoder: &dyn RequestDecoder<Event = A::Event>,
+    batch: &mut ring::Batch<'_, InputSlot<A::Event>>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,

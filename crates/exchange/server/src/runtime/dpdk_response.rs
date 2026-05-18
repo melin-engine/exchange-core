@@ -19,12 +19,9 @@ use std::time::{Duration, Instant};
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
-use crate::{OutputPayload, OutputSlot};
+use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_transport_core::pipeline::StageUtilization;
-// The `ResponseEncoderArc` from `crate::runtime::response` carries
-// the concrete `ExecutionReport` / `QueryResponse` type bindings;
-// this file references them only through the encoder trait.
+use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -101,8 +98,8 @@ pub enum ControlEvent {
 // `response::Response::journal_persisted_wire_seq`. See that field's docs
 // for why the gate must use wire-seq space rather than the
 // journal-consumer cursor.
-pub fn run(
-    mut consumer: ring::Consumer<OutputSlot>,
+pub fn run<A: Application>(
+    mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: Arc<AtomicU64>,
     durability_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -114,7 +111,7 @@ pub fn run(
     mut tx_producers: Vec<spsc::Producer<TxFrame>>,
     utilization: Arc<StageUtilization>,
     busy_spin: bool,
-    encoder: crate::runtime::response::ResponseEncoderArc,
+    encoder: crate::runtime::response::ResponseEncoderArc<A>,
 ) {
     // Mirrors `response::run`: derive the local Policy from the shared
     // mode atomic and observe runtime swaps from the admin
@@ -131,7 +128,7 @@ pub fn run(
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
 
-    let mut batch = [OutputSlot::default(); MAX_BATCH];
+    let mut batch = [OutputSlot::<A::Report, A::QueryResponse>::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position (see response.rs for full explanation).

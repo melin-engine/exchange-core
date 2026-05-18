@@ -1108,10 +1108,10 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::runtime::response::run(
+            crate::runtime::response::run::<App>(
                 output_consumer,
                 control_rx,
-                crate::runtime::response::Response {
+                crate::runtime::response::Response::<App> {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
                     durability_mode: durability_mode_response,
                     replication_metrics: replication_metrics_response,
@@ -1196,7 +1196,7 @@ where
             .name("repl-sender".into())
             .spawn(move || {
                 melin_app::affinity::pin_thread("repl-sender", cores.repl_sender);
-                crate::runtime::replication::run_sender(
+                crate::runtime::replication::run_sender::<App>(
                     crate::runtime::replication::Sender {
                         bind_addr: repl_bind,
                         repl_consumer_1,
@@ -1468,7 +1468,7 @@ where
     // If shutdown was requested while seed was draining we still spawn the
     // reader so the unified shutdown sequence below joins every thread.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = crate::runtime::reader::spawn_reader(
+    let mut reader_handle = crate::runtime::reader::spawn_reader::<App, _>(
         input_producer,
         Arc::new(crate::domain::request::ExchangeRequestDecoder),
         control_tx.clone(),
@@ -2056,7 +2056,7 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::runtime::dpdk_response::run(
+            crate::runtime::dpdk_response::run::<App>(
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,
@@ -2360,7 +2360,7 @@ where
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
     melin_app::affinity::pin_thread("dpdk-poll-0", reader_cores);
-    crate::runtime::dpdk_transport::run_dpdk_poll(
+    crate::runtime::dpdk_transport::run_dpdk_poll::<App>(
         transport_0,
         input_producer,
         Arc::new(crate::domain::request::ExchangeRequestDecoder),
