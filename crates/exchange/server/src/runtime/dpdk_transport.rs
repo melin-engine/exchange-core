@@ -410,7 +410,7 @@ pub fn run_dpdk_poll<A: Application>(
                 // drains the ring, and the journal evicts both replicas with
                 // "ring backpressure timeout".
                 if let Some(ref mut driver) = repl_driver {
-                    driver.tick(&mut transport, shutdown);
+                    driver.tick::<A>(&mut transport, shutdown);
                 }
             }
             active_idx += 1;
@@ -571,7 +571,7 @@ pub fn run_dpdk_poll<A: Application>(
         // dedicated repl-sender thread; transport.poll() above flushed
         // any TX the driver queued on the prior iteration.
         if let Some(ref mut driver) = repl_driver {
-            driver.tick(&mut transport, shutdown);
+            driver.tick::<A>(&mut transport, shutdown);
         }
 
         #[cfg(feature = "latency-trace")]

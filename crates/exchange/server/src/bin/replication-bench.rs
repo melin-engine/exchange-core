@@ -234,7 +234,7 @@ fn main() {
     let receiver_handle = std::thread::Builder::new()
         .name("bench-repl-receiver".into())
         .spawn(move || {
-            let _ = run_receiver::<melin_journal::BufferedWriter<_>>(
+            let _ = run_receiver::<melin_server::App, melin_journal::BufferedWriter<_>>(
                 bind_addr,
                 &replica_journal,
                 &replica_key,

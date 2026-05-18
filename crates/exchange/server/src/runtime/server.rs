@@ -671,7 +671,7 @@ where
             )),
         };
 
-        match crate::runtime::replication::run_receiver::<W>(
+        match crate::runtime::replication::run_receiver::<App, W>(
             primary_addr,
             &config.journal,
             &signing_key,
@@ -1782,7 +1782,7 @@ where
             }
         };
 
-        match crate::runtime::replication::run_receiver_dpdk::<W>(
+        match crate::runtime::replication::run_receiver_dpdk::<App, W>(
             repl_transport,
             primary_ipv4,
             primary_addr.port(),
