@@ -58,7 +58,7 @@ type OutputSlot<A> =
 /// `melin_trading_server::*` reference inside server.rs — without paying for a
 /// boxed closure.
 ///
-/// Threaded into [`run`] / [`run_dpdk`] as `Option<EventPublisherFn>`:
+/// Threaded into [`run`] (and `run_dpdk` under `feature = "dpdk"`) as `Option<EventPublisherFn>`:
 /// `None` disables the publisher unconditionally, `Some(_)` wires it up
 /// when `--event-bind` is also set.
 pub type EventPublisherFn<A> = fn(
