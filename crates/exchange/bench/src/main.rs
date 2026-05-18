@@ -1828,7 +1828,9 @@ fn start_server<L: BlockingTransportListener>(
         Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
     // The bench has no event subscribers; pass `None` so the runtime
     // never allocates the publisher consumer slot.
-    let event_publisher: Option<melin_server::runtime::server::EventPublisherFn> = None;
+    let event_publisher: Option<
+        melin_server::runtime::server::EventPublisherFn<melin_server::App>,
+    > = None;
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {

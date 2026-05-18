@@ -2,7 +2,7 @@
 //!
 //! On startup:
 //! 1. Recovers or creates the `JournaledApp<A>`.
-//! 2. Decomposes it into `(App, W)` via `into_parts()`, where `W` is the writer selected by `--journal-writer`.
+//! 2. Decomposes it into `(A, W)` via `into_parts()`, where `W` is the writer selected by `--journal-writer`.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the io_uring reader.
@@ -21,24 +21,30 @@ use std::hash::{Hash, Hasher};
 
 use tracing::{debug, error, info, warn};
 
-use crate::App;
-use crate::BufferedWriter;
-use crate::SectorWriter;
-use crate::TradingEvent;
+use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
+use melin_journal::SectorWriter;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
-    JournalStage, JournalStageRun, Pipeline as GenericPipeline, build_pipeline_with_replication,
+    InputSlot, JournalStage, JournalStageRun, OutputSlot as GenericOutputSlot,
+    Pipeline as GenericPipeline, build_pipeline_with_replication,
 };
-pub type Pipeline<W> = GenericPipeline<App, W>;
+pub type Pipeline<A, W> = GenericPipeline<A, W>;
 
 use crate::runtime::reader::RequestDecoderArc;
 use crate::runtime::response::ResponseEncoderArc;
+use melin_app::Application;
 use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
 use melin_disruptor::ring::Consumer;
 use melin_protocol::auth::AuthorizedKeys;
+
+/// Output-slot sugar parameterised on the application — saves spelling
+/// `<A::Report, A::QueryResponse>` at every pipeline-facing signature
+/// that doesn't already destructure them.
+type OutputSlot<A> =
+    GenericOutputSlot<<A as Application>::Report, <A as Application>::QueryResponse>;
 
 /// Body of the event-publisher thread: a free function with this exact
 /// signature (the trading binary supplies
@@ -51,8 +57,8 @@ use melin_protocol::auth::AuthorizedKeys;
 /// Threaded into [`run`] / [`run_dpdk`] as `Option<EventPublisherFn>`:
 /// `None` disables the publisher unconditionally, `Some(_)` wires it up
 /// when `--event-bind` is also set.
-pub type EventPublisherFn = fn(
-    consumer: Consumer<crate::OutputSlot>,
+pub type EventPublisherFn<A> = fn(
+    consumer: Consumer<OutputSlot<A>>,
     bind_addr: SocketAddr,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
@@ -319,7 +325,7 @@ pub struct ServerConfig {
     pub admin_bind: Option<SocketAddr>,
 
     /// Interval in milliseconds between automatic shadow snapshots. The
-    /// shadow stage replays journaled events on a cloned App and saves a
+    /// shadow stage replays journaled events on a cloned `A` and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
     /// to disable shadow snapshots entirely. Default: 3 000 000 ms (50 min).
     #[arg(long, default_value_t = 3_000_000)]
@@ -559,16 +565,16 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// Run the trading server.
 ///
 /// 1. Initializes (or recovers) the `JournaledApp<A>`, then decomposes
-///    it into `App` and `W` (the operator-selected writer) for the pipeline.
+///    it into `A` and `W` (the operator-selected writer) for the pipeline.
 /// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
 ///
-/// `factory` constructs fresh `App` instances for the recovery and
+/// `factory` constructs fresh `A` instances for the recovery and
 /// replication paths and yields the bulk-seed events a fresh primary
 /// journals at startup. `decoder` parses inbound client frames into
-/// `App::Event` values for the input ring; `encoder` serialises
-/// `App::Report` / `App::QueryResponse` values into wire frames on the
+/// `A::Event` values for the input ring; `encoder` serialises
+/// `A::Report` / `A::QueryResponse` values into wire frames on the
 /// response stage. The trading binary constructs the three trading-side
 /// impls
 /// ([`ExchangeAppFactory`](crate::domain::app_factory::ExchangeAppFactory),
@@ -578,14 +584,27 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// touching the runtime.
 ///
 /// Returns when the listener encounters a fatal error.
-pub fn run<L: BlockingTransportListener>(
+pub fn run<A, L>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = App>>,
-    decoder: RequestDecoderArc<App>,
-    encoder: ResponseEncoderArc<App>,
-    event_publisher: Option<EventPublisherFn>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    factory: Arc<dyn AppFactory<App = A>>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    L: BlockingTransportListener,
+    BufferedWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
+    SectorWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, BufferedWriter<A::Event>>:
+        JournalStageRun<A::Event, Writer = BufferedWriter<A::Event>>,
+    JournalStage<A::Event, SectorWriter<A::Event>>:
+        JournalStageRun<A::Event, Writer = SectorWriter<A::Event>>,
+{
     run_with_shutdown(
         listener,
         config,
@@ -602,55 +621,76 @@ pub fn run<L: BlockingTransportListener>(
 /// Same as [`run`], but the caller can set `shutdown` to `true` to trigger
 /// a clean shutdown of all pipeline threads (useful for benchmarks that need
 /// to collect latency trace reports).
-pub fn run_with_shutdown<L: BlockingTransportListener>(
+pub fn run_with_shutdown<A, L>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = App>>,
-    decoder: RequestDecoderArc<App>,
-    encoder: ResponseEncoderArc<App>,
-    event_publisher: Option<EventPublisherFn>,
+    factory: Arc<dyn AppFactory<App = A>>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
     shutdown: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    L: BlockingTransportListener,
+    BufferedWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
+    SectorWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, BufferedWriter<A::Event>>:
+        JournalStageRun<A::Event, Writer = BufferedWriter<A::Event>>,
+    JournalStage<A::Event, SectorWriter<A::Event>>:
+        JournalStageRun<A::Event, Writer = SectorWriter<A::Event>>,
+{
     // Dispatch on the operator-selected journal writer. Each branch
     // monomorphises the boot path against a concrete writer type; from
     // here down every function is generic over `W: JournalWrite<E>` and
     // takes the writer type as a parameter rather than reading the mode
     // at runtime.
     match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => run_with_shutdown_impl::<L, BufferedWriter>(
-            listener,
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            shutdown,
-        ),
-        melin_journal::JournalWriterMode::Sector => run_with_shutdown_impl::<L, SectorWriter>(
-            listener,
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            shutdown,
-        ),
+        melin_journal::JournalWriterMode::Buffered => {
+            run_with_shutdown_impl::<A, L, BufferedWriter<A::Event>>(
+                listener,
+                config,
+                factory,
+                decoder,
+                encoder,
+                event_publisher,
+                shutdown,
+            )
+        }
+        melin_journal::JournalWriterMode::Sector => {
+            run_with_shutdown_impl::<A, L, SectorWriter<A::Event>>(
+                listener,
+                config,
+                factory,
+                decoder,
+                encoder,
+                event_publisher,
+                shutdown,
+            )
+        }
     }
 }
 
-fn run_with_shutdown_impl<L, W>(
+fn run_with_shutdown_impl<A, L, W>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = App>>,
-    decoder: RequestDecoderArc<App>,
-    encoder: ResponseEncoderArc<App>,
-    event_publisher: Option<EventPublisherFn>,
+    factory: Arc<dyn AppFactory<App = A>>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
-    W: JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+    W: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Shared durability-mode atomic, constructed once per process and
     // threaded through both modes. Wiring it on the replica path
@@ -729,7 +769,7 @@ where
             )),
         };
 
-        match crate::runtime::replication::run_receiver::<App, W>(
+        match crate::runtime::replication::run_receiver::<A, W>(
             primary_addr,
             &config.journal,
             &signing_key,
@@ -749,9 +789,9 @@ where
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode.
                 info!("replica promoted — transitioning to primary");
-                <App as melin_app::Application>::prefault(&mut exchange);
+                <A as Application>::prefault(&mut exchange);
 
-                return run_as_primary::<L, W>(
+                return run_as_primary::<A, L, W>(
                     exchange,
                     writer,
                     listener,
@@ -795,14 +835,14 @@ where
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
-    let (mut exchange, writer, needs_seeding) = init_engine::<W>(&config, &*factory)?;
+    let (mut exchange, writer, needs_seeding) = init_engine::<A, W>(&config, &*factory)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
     // faults happen now, not on the hot path. Default trait impl is a
     // no-op; `Exchange` overrides.
-    <App as melin_app::Application>::prefault(&mut exchange);
+    <A as Application>::prefault(&mut exchange);
 
-    run_as_primary::<L, W>(
+    run_as_primary::<A, L, W>(
         exchange,
         writer,
         listener,
@@ -831,9 +871,9 @@ pub use crate::ControlEvent;
 /// Optional handles are `None` when their feature is disabled (e.g.,
 /// no replication, no health endpoint) or unsupported on a transport
 /// (e.g., DPDK runs without an event publisher or shadow snapshotter).
-struct PipelineHandles<W: Send + 'static> {
+struct PipelineHandles<A: Send + 'static, W: Send + 'static> {
     journal: std::thread::JoinHandle<Result<W, JournalError>>,
-    matching: std::thread::JoinHandle<App>,
+    matching: std::thread::JoinHandle<A>,
     response: std::thread::JoinHandle<()>,
     replication: Option<std::thread::JoinHandle<()>>,
     event_publisher: Option<std::thread::JoinHandle<()>>,
@@ -849,8 +889,8 @@ struct PipelineHandles<W: Send + 'static> {
 ///
 /// `extras` is a list of pre-joined results (used by the DPDK path,
 /// which joins its poll threads before draining the pipeline).
-fn shutdown_pipeline_stages<W: Send + 'static>(
-    handles: PipelineHandles<W>,
+fn shutdown_pipeline_stages<A: Send + 'static, W: Send + 'static>(
+    handles: PipelineHandles<A, W>,
     extras: Vec<(String, std::thread::Result<()>)>,
     pipeline_healthy: &AtomicBool,
     shutdown: &AtomicBool,
@@ -919,15 +959,15 @@ fn shutdown_pipeline_stages<W: Send + 'static>(
 /// admin endpoint, which was spawned once at process start, keeps
 /// driving the new stage's rotation.
 #[allow(clippy::too_many_arguments)]
-fn run_as_primary<L, W>(
-    exchange: App,
+fn run_as_primary<A, L, W>(
+    exchange: A,
     writer: W,
     mut listener: L,
     config: &ServerConfig,
-    factory: &dyn AppFactory<App = App>,
-    decoder: RequestDecoderArc<App>,
-    encoder: ResponseEncoderArc<App>,
-    event_publisher: Option<EventPublisherFn>,
+    factory: &dyn AppFactory<App = A>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
@@ -935,9 +975,13 @@ fn run_as_primary<L, W>(
     durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
-    W: JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+    W: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
@@ -979,12 +1023,10 @@ where
 
     // Clone the exchange for the shadow snapshot stage before the pipeline
     // consumes it. Uses snapshot_state() + restore_state() round-trip since
-    // App doesn't implement Clone (internal data structures are complex).
+    // `A` doesn't implement Clone (internal data structures are complex).
     let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_exchange = if enable_shadow {
-        Some(<App as melin_app::Application>::clone_via_snapshot(
-            &exchange,
-        )?)
+        Some(<A as Application>::clone_via_snapshot(&exchange)?)
     } else {
         None
     };
@@ -1178,10 +1220,10 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::runtime::response::run::<App>(
+            crate::runtime::response::run::<A>(
                 output_consumer,
                 control_rx,
-                crate::runtime::response::Response::<App> {
+                crate::runtime::response::Response::<A> {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
                     durability_mode: durability_mode_response,
                     replication_metrics: replication_metrics_response,
@@ -1266,7 +1308,7 @@ where
             .name("repl-sender".into())
             .spawn(move || {
                 melin_app::affinity::pin_thread("repl-sender", cores.repl_sender);
-                crate::runtime::replication::run_sender::<App>(
+                crate::runtime::replication::run_sender::<A>(
                     crate::runtime::replication::Sender {
                         bind_addr: repl_bind,
                         repl_consumer_1,
@@ -1305,7 +1347,7 @@ where
     // Caller-supplied (the trading binary wires
     // `domain::event_publisher::run`; the skip-order-exec binary passes
     // `None`), so the runtime carries no trading-specific reference.
-    let event_publisher_handle = spawn_event_publisher(
+    let event_publisher_handle = spawn_event_publisher::<A>(
         event_publisher_consumer,
         event_publisher,
         config,
@@ -1429,9 +1471,8 @@ where
         }
     }
     if needs_seeding {
-        use crate::InputSlot;
-        use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
+        use melin_journal::JournalEvent;
         use melin_transport_core::trace::mono_trace_ns;
 
         let seed_start = std::time::Instant::now();
@@ -1539,7 +1580,7 @@ where
     // If shutdown was requested while seed was draining we still spawn the
     // reader so the unified shutdown sequence below joins every thread.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = crate::runtime::reader::spawn_reader::<App, _>(
+    let mut reader_handle = crate::runtime::reader::spawn_reader::<A, _>(
         input_producer,
         decoder,
         control_tx.clone(),
@@ -1757,18 +1798,30 @@ where
 ///
 /// See [`run`] for the role of `factory`.
 #[cfg(feature = "dpdk")]
-pub fn run_dpdk(
+pub fn run_dpdk<A>(
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = App>>,
-    decoder: RequestDecoderArc<App>,
-    encoder: ResponseEncoderArc<App>,
-    event_publisher: Option<EventPublisherFn>,
+    factory: Arc<dyn AppFactory<App = A>>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    BufferedWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
+    SectorWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, BufferedWriter<A::Event>>:
+        JournalStageRun<A::Event, Writer = BufferedWriter<A::Event>>,
+    JournalStage<A::Event, SectorWriter<A::Event>>:
+        JournalStageRun<A::Event, Writer = SectorWriter<A::Event>>,
+{
     // Dispatch the DPDK boot path on the operator-selected journal writer.
     match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => run_dpdk_impl::<BufferedWriter>(
+        melin_journal::JournalWriterMode::Buffered => run_dpdk_impl::<A, BufferedWriter<A::Event>>(
             config,
             factory,
             decoder,
@@ -1777,7 +1830,7 @@ pub fn run_dpdk(
             dpdk_config,
             shutdown,
         ),
-        melin_journal::JournalWriterMode::Sector => run_dpdk_impl::<SectorWriter>(
+        melin_journal::JournalWriterMode::Sector => run_dpdk_impl::<A, SectorWriter<A::Event>>(
             config,
             factory,
             decoder,
@@ -1790,18 +1843,22 @@ pub fn run_dpdk(
 }
 
 #[cfg(feature = "dpdk")]
-fn run_dpdk_impl<W>(
+fn run_dpdk_impl<A, W>(
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = App>>,
-    decoder: RequestDecoderArc<App>,
-    encoder: ResponseEncoderArc<App>,
-    event_publisher: Option<EventPublisherFn>,
+    factory: Arc<dyn AppFactory<App = A>>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    W: JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+    JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
     // Mirrors the kernel-TCP `run_with_shutdown` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
@@ -1871,7 +1928,7 @@ where
             }
         };
 
-        match crate::runtime::replication::run_receiver_dpdk::<App, W>(
+        match crate::runtime::replication::run_receiver_dpdk::<A, W>(
             repl_transport,
             primary_ipv4,
             primary_addr.port(),
@@ -1892,13 +1949,13 @@ where
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
-                <App as melin_app::Application>::prefault(&mut exchange);
+                <A as Application>::prefault(&mut exchange);
 
                 // TODO: run_as_primary_dpdk — for now, fall back to
                 // kernel TCP primary after promotion.
                 warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
                 let listener = melin_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
-                return run_as_primary::<_, W>(
+                return run_as_primary::<A, _, W>(
                     exchange,
                     writer,
                     listener,
@@ -1946,16 +2003,14 @@ where
     );
 
     // Initialize or recover the exchange.
-    let (mut exchange, writer, needs_seeding) = init_engine::<W>(&config, &*factory)?;
-    <App as melin_app::Application>::prefault(&mut exchange);
+    let (mut exchange, writer, needs_seeding) = init_engine::<A, W>(&config, &*factory)?;
+    <A as Application>::prefault(&mut exchange);
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
     let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_exchange = if enable_shadow {
-        Some(<App as melin_app::Application>::clone_via_snapshot(
-            &exchange,
-        )?)
+        Some(<A as Application>::clone_via_snapshot(&exchange)?)
     } else {
         None
     };
@@ -2153,7 +2208,7 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::runtime::dpdk_response::run::<App>(
+            crate::runtime::dpdk_response::run::<A>(
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,
@@ -2320,9 +2375,8 @@ where
     // replicas independently of seeding; this only changes DPDK behavior.
     let _ = (&enable_replication, &replica_ready); // suppress unused warnings on non-DPDK paths
     if needs_seeding {
-        use crate::InputSlot;
-        use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
+        use melin_journal::JournalEvent;
         use melin_transport_core::trace::mono_trace_ns;
 
         let seed_events = factory.seed_events();
@@ -2457,7 +2511,7 @@ where
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
     melin_app::affinity::pin_thread("dpdk-poll-0", reader_cores);
-    crate::runtime::dpdk_transport::run_dpdk_poll::<App>(
+    crate::runtime::dpdk_transport::run_dpdk_poll::<A>(
         transport_0,
         input_producer,
         decoder,
@@ -2497,10 +2551,10 @@ where
 // The `apply_max_orders` / `empty_app` / `empty_app_for_seed` helpers
 // that used to live here have moved behind the `AppFactory` trait —
 // see `crate::domain::app_factory::ExchangeAppFactory`. The runtime
-// reaches them through the `factory: &dyn AppFactory<App = App>`
+// reaches them through the `factory: &dyn AppFactory<App = A>`
 // parameter threaded into [`init_engine`], [`run_as_primary`], and
 // the replication receivers; the binary passes a single
-// `Arc<dyn AppFactory<App = App>>` into [`run`] / [`run_dpdk`] at
+// `Arc<dyn AppFactory<App = A>>` into [`run`] / [`run_dpdk`] at
 // startup and the runtime clones it on each call.
 //
 // SEC-03 (per-account open-order cap) and SEC-04 (order-submission
@@ -2516,12 +2570,13 @@ where
 /// only, journal only, fresh) are transport-level concerns and work
 /// uniformly for any `A: Application` via `JournaledApp<A>`.
 /// Same engine initialization the TCP / DPDK paths use.
-pub(crate) fn init_engine<W>(
+pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
-    factory: &dyn AppFactory<App = App>,
-) -> Result<(App, W, bool), Box<dyn std::error::Error>>
+    factory: &dyn AppFactory<App = A>,
+) -> Result<(A, W, bool), Box<dyn std::error::Error>>
 where
-    W: JournalWrite<TradingEvent>,
+    A: Application,
+    W: JournalWrite<A::Event>,
 {
     // Check for a snapshot: either the explicit --snapshot path, or the
     // default derived path (used by auto-rotation when --snapshot is not set).
@@ -2536,12 +2591,12 @@ where
 
     let journal_exists = config.journal.exists();
     let writer_mode = config.journal_writer;
-    let mut engine: JournaledApp<App, W> = if let Some(snap_path) = snap_path
+    let mut engine: JournaledApp<A, W> = if let Some(snap_path) = snap_path
         && snap_path.exists()
         && journal_exists
     {
         info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
-        JournaledApp::<App, W>::recover_from_snapshot(snap_path, &config.journal)?
+        JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
     } else if let Some(snap_path) = snap_path
         && snap_path.exists()
         && !journal_exists
@@ -2555,15 +2610,15 @@ where
             "recovering from snapshot only (journal missing, post-rotation crash?)"
         );
         let (app, snap_sequence, snap_chain_hash) =
-            melin_transport_core::snapshot::load::<App>(snap_path)?;
+            melin_transport_core::snapshot::load::<A>(snap_path)?;
         let writer = W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-        JournaledApp::<App, W>::from_parts(app, writer)
+        JournaledApp::<A, W>::from_parts(app, writer)
     } else if journal_exists {
         info!(writer_mode = %writer_mode, "recovering from journal");
-        JournaledApp::<App, W>::recover(factory.empty_for_seed(), &config.journal)?
+        JournaledApp::<A, W>::recover(factory.empty_for_seed(), &config.journal)?
     } else {
         info!(writer_mode = %writer_mode, "creating new journal");
-        JournaledApp::<App, W>::create(factory.empty_for_seed(), &config.journal)?
+        JournaledApp::<A, W>::create(factory.empty_for_seed(), &config.journal)?
     };
 
     let needs_seeding = !journal_exists;
@@ -2615,15 +2670,19 @@ where
 /// `enable_event_publisher == false`) or the binary passed no
 /// publisher fn. The runtime owns thread lifecycle and CPU pinning so
 /// the caller's fn stays domain-only.
-fn spawn_event_publisher(
-    consumer: Option<Consumer<crate::OutputSlot>>,
-    run_fn: Option<EventPublisherFn>,
+fn spawn_event_publisher<A: Application>(
+    consumer: Option<Consumer<OutputSlot<A>>>,
+    run_fn: Option<EventPublisherFn<A>>,
     config: &ServerConfig,
     cores: &PipelineCores,
     authorized_keys: &Arc<AuthorizedKeys>,
     shutdown: &Arc<AtomicBool>,
     busy_spin: bool,
-) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
+) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
+where
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+{
     let (Some(event_consumer), Some(run_fn)) = (consumer, run_fn) else {
         return Ok(None);
     };

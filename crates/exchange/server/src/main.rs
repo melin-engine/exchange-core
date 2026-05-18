@@ -94,7 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the market-data publisher fn; under `skip-order-exec` no publisher
     // exists, so we pass `None` and the runtime never allocates the
     // consumer slot.
-    let event_publisher: Option<melin_server::runtime::server::EventPublisherFn> = {
+    let event_publisher: Option<
+        melin_server::runtime::server::EventPublisherFn<melin_server::App>,
+    > = {
         #[cfg(feature = "trading")]
         {
             Some(melin_server::domain::event_publisher::run)
