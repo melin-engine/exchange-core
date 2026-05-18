@@ -178,14 +178,22 @@ impl Application for ServerApp {
                 currency,
                 amount,
             } => {
-                // Withdraw rejections (insufficient balance, unknown
-                // account, has resting orders) are deliberately dropped
-                // today — the engine still applies any state changes
-                // deterministically on both primary and replica, but the
-                // client receives no `Rejected` report. Tracked on the
-                // roadmap as "Withdraw rejections silently dropped in
-                // the pipeline".
-                let _ = self.0.withdraw(account, currency, amount);
+                if let Err(reason) = self.0.withdraw(account, currency, amount) {
+                    // Withdraw carries no order id or symbol — mirror the
+                    // shape used by other non-order rejections (see
+                    // `extract_order_id` / `extract_symbol`, which both
+                    // return zero for `Withdraw`). Don't route this
+                    // through `Application::build_reject`: that path
+                    // only carries `TransportRejectReason` (dedup /
+                    // replica disconnect) and would lose the engine's
+                    // specific `RejectReason` we want to surface.
+                    out.push(ExecutionReport::Rejected {
+                        order_id: OrderId(0),
+                        symbol: Symbol(0),
+                        account,
+                        reason,
+                    });
+                }
                 None
             }
             TradingEvent::EndOfDay => {
@@ -540,6 +548,136 @@ mod tests {
             }
             other => panic!("expected Rejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_withdraw_emits_rejection_on_failure() {
+        let mut app = seeded_app();
+        let ctx = ApplyCtx {
+            now_ns: 0,
+            journal_sequence: 0,
+            active_connections: 0,
+            events_processed: 0,
+            key_hash: 0,
+        };
+
+        // 1. Insufficient balance: account has 1_000_000 in CurrencyId(2),
+        //    so a 2_000_000 withdrawal must reject.
+        let mut reports = Vec::new();
+        <ServerApp as Application>::apply(
+            &mut app,
+            TradingEvent::Withdraw {
+                account: AccountId(1),
+                currency: CurrencyId(2),
+                amount: 2_000_000,
+            },
+            &ctx,
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        match reports[0] {
+            ExecutionReport::Rejected {
+                order_id,
+                symbol,
+                account,
+                reason,
+            } => {
+                assert_eq!(order_id, OrderId(0));
+                assert_eq!(symbol, Symbol(0));
+                assert_eq!(account, AccountId(1));
+                assert_eq!(reason, EngineRejectReason::InsufficientBalance);
+            }
+            ref other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // 2. Unknown account: withdraw from an account that was never
+        //    provisioned/deposited.
+        let mut reports = Vec::new();
+        <ServerApp as Application>::apply(
+            &mut app,
+            TradingEvent::Withdraw {
+                account: AccountId(999),
+                currency: CurrencyId(2),
+                amount: 1,
+            },
+            &ctx,
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        match reports[0] {
+            ExecutionReport::Rejected {
+                reason, account, ..
+            } => {
+                assert_eq!(account, AccountId(999));
+                assert_eq!(reason, EngineRejectReason::UnknownAccount);
+            }
+            ref other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // 3. Has resting orders: place an order, then attempt to withdraw.
+        let mut placed = Vec::new();
+        <ServerApp as Application>::apply(
+            &mut app,
+            TradingEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(1),
+                    account: AccountId(1),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: price(100),
+                        post_only: false,
+                    },
+                    quantity: qty(10),
+                    time_in_force: TimeInForce::GTC,
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+            },
+            &ctx,
+            &mut placed,
+        );
+
+        let mut reports = Vec::new();
+        <ServerApp as Application>::apply(
+            &mut app,
+            TradingEvent::Withdraw {
+                account: AccountId(1),
+                currency: CurrencyId(2),
+                amount: 1,
+            },
+            &ctx,
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        match reports[0] {
+            ExecutionReport::Rejected {
+                reason, account, ..
+            } => {
+                assert_eq!(account, AccountId(1));
+                assert_eq!(reason, EngineRejectReason::HasRestingOrders);
+            }
+            ref other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // 4. Successful withdraw on a clean account emits nothing.
+        let mut reports = Vec::new();
+        let mut clean = ServerApp::new();
+        clean.0.deposit(AccountId(7), CurrencyId(2), 500);
+        <ServerApp as Application>::apply(
+            &mut clean,
+            TradingEvent::Withdraw {
+                account: AccountId(7),
+                currency: CurrencyId(2),
+                amount: 200,
+            },
+            &ctx,
+            &mut reports,
+        );
+        assert!(
+            reports.is_empty(),
+            "successful withdraw must not emit reports"
+        );
     }
 
     #[test]
