@@ -14,16 +14,8 @@ compile_error!(
      `skip-order-exec` features enabled"
 );
 
-/// The concrete [`melin_app::Application`] this server is built against.
-///
-/// `ServerApp` is a transparent newtype around `melin_engine::exchange::Exchange`
-/// that carries the `Application` impl. Wrapping is required by the
-/// orphan rule — the trait lives in `melin-app` and `Exchange` lives in
-/// `melin-engine`, so the impl can only attach via a type that's local
-/// here. Under `--features skip-order-exec` the engine short-circuits
-/// `Exchange::execute` to a single rejection per `SubmitOrder` so the
-/// matching hot path is bypassed, but the type stays uniform for
-/// downstream modules.
+/// The concrete [`melin_app::Application`] this server is built against
+/// — re-export of `melin_trading_server::exchange_app::ServerApp`.
 pub type App = domain::exchange_app::ServerApp;
 
 // Re-export the writer-selection enum + the generic pipeline / trace /
@@ -46,12 +38,14 @@ pub use melin_transport_core::{pipeline, trace};
 /// crate split.
 pub use melin_server_runtime::ControlEvent;
 
-/// Trading-specific server wiring — wire-`Request` decode,
-/// `OutputPayload` response encoding, the `ServerApp` newtype that
-/// carries the `Application` impl, and the market-data firehose.
-pub mod domain;
 /// Application-agnostic server runtime — re-exported from
 /// `melin-server-runtime`. Kept under the same `runtime` path so
 /// internal callers (`melin_server::runtime::server::*`) keep
 /// resolving without churn.
 pub use melin_server_runtime as runtime;
+/// Trading-specific server wiring — re-exported from
+/// `melin-trading-server`. Kept under the same `domain` path so
+/// internal callers (`melin_server::domain::exchange_app::*`,
+/// `melin_server::domain::request::*`, etc.) keep resolving without
+/// churn.
+pub use melin_trading_server as domain;

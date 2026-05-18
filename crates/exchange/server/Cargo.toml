@@ -18,8 +18,13 @@ release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-traci
 ## `melin-engine` — every `SubmitOrder` is bypassed by the engine's
 ## `skip-order-exec` feature so the matching hot path is never
 ## exercised.
-trading = ["dep:melin-market-data"]
-skip-order-exec = ["melin-engine/skip-order-exec", "hash-chain", "release-tracing"]
+trading = ["dep:melin-market-data", "melin-trading-server/trading"]
+skip-order-exec = [
+    "melin-engine/skip-order-exec",
+    "melin-trading-server/skip-order-exec",
+    "hash-chain",
+    "release-tracing",
+]
 no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persist"]
 ## Lightweight per-stage histograms for the original 4 stages
 ## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
@@ -31,6 +36,7 @@ latency-trace = [
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
     "melin-server-runtime/latency-trace",
+    "melin-trading-server/latency-trace",
 ]
 ## Full tick-to-trade decomposition: adds 5 commercial-grade stages
 ## on top of latency-trace (reader: ingest, response: journal-wait,
@@ -78,6 +84,7 @@ melin-engine = { path = "../engine" }
 melin-journal = { path = "../../core/journal" }
 melin-server-runtime = { path = "../../core/server-runtime" }
 melin-trading = { path = "../trading" }
+melin-trading-server = { path = "../trading-server", default-features = false }
 melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }
 melin-disruptor = { path = "../../core/disruptor" }

@@ -1,6 +1,6 @@
 //! Trading-side [`ResponseEncoder`] implementation.
 //!
-//! Mirror of [`crate::domain::request::ExchangeRequestDecoder`] on the
+//! Mirror of [`crate::request::ExchangeRequestDecoder`] on the
 //! outbound path: maps trading-shaped output payloads
 //! (`ExecutionReport`, `QueryResponse`) to wire frames. Transport-
 //! shaped variants (`BatchEnd`, `EngineError`) are handled by the

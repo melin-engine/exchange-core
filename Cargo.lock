@@ -1705,6 +1705,7 @@ dependencies = [
  "melin-protocol",
  "melin-server-runtime",
  "melin-trading",
+ "melin-trading-server",
  "melin-transport-core",
  "melin-types",
  "proptest",
@@ -1753,6 +1754,27 @@ version = "0.8.0"
 dependencies = [
  "melin-app",
  "melin-types",
+]
+
+[[package]]
+name = "melin-trading-server"
+version = "0.8.0"
+dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "libc",
+ "melin-app",
+ "melin-disruptor",
+ "melin-engine",
+ "melin-journal",
+ "melin-market-data",
+ "melin-protocol",
+ "melin-trading",
+ "melin-transport-core",
+ "melin-types",
+ "rustc-hash",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

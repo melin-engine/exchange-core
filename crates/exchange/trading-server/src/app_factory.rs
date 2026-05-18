@@ -10,7 +10,7 @@ use melin_app::app_factory::AppFactory;
 use melin_trading::trading_event::TradingEvent;
 use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
-use crate::domain::exchange_app::ServerApp;
+use crate::exchange_app::ServerApp;
 
 /// Construction config for [`ExchangeAppFactory`]. Mirrors the
 /// trading-shaped fields of `ServerConfig`; kept as its own struct
