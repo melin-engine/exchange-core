@@ -821,14 +821,12 @@ pub fn run_receiver<W>(
     // max_journal_bytes == 0 disables size-driven rotation. None means
     // runtime rotation is off entirely on this replica.
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
-    // Per-account open-order cap (SEC-03). Must match the primary or
-    // replay diverges on Rejected reports. Forwarded to every
-    // freshly-constructed engine in this receiver.
-    max_orders_per_account: u32,
-    // Per-account order-rate limit (SEC-04). Same determinism caveat —
-    // primary and replicas must agree on rate + burst.
-    max_orders_per_second: u32,
-    max_orders_burst: u32,
+    // Application factory: produces the empty `App` instances this
+    // receiver hands to fresh pipelines, and reapplies operator-
+    // controlled policy (SEC-03 cap, SEC-04 rate/burst). The policy
+    // is NOT journaled — primary and replica must converge on it
+    // via matching factory configuration.
+    factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = crate::App>>,
 ) -> ReceiverResult<W>
 where
     W: JournalWrite<TradingEvent> + Send + 'static,
@@ -839,34 +837,27 @@ where
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
     // shutdown returns the App + writer directly.
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
-        if journal_path.exists() {
-            let engine = if snapshot_path.exists() {
-                info!("recovering replica from snapshot + journal");
-                melin_transport_core::JournaledApp::<App, W>::recover_from_snapshot(
-                    &snapshot_path,
-                    journal_path,
-                )?
-            } else {
-                melin_transport_core::JournaledApp::<App, W>::recover(
-                    crate::runtime::server::empty_app(),
-                    journal_path,
-                )?
-            };
-            let next = engine.next_sequence();
-            let last = next.saturating_sub(1);
-            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (mut exchange, writer) = engine.into_parts();
-            crate::runtime::server::apply_max_orders(
-                &mut exchange,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
-            (Some(exchange), Some(writer), last, hash)
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if journal_path
+        .exists()
+    {
+        let engine = if snapshot_path.exists() {
+            info!("recovering replica from snapshot + journal");
+            melin_transport_core::JournaledApp::<App, W>::recover_from_snapshot(
+                &snapshot_path,
+                journal_path,
+            )?
         } else {
-            (None, None, 0u64, [0u8; 32])
+            melin_transport_core::JournaledApp::<App, W>::recover(factory.empty(), journal_path)?
         };
+        let next = engine.next_sequence();
+        let last = next.saturating_sub(1);
+        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+        let (mut exchange, writer) = engine.into_parts();
+        factory.apply_operator_policy(&mut exchange);
+        (Some(exchange), Some(writer), last, hash)
+    } else {
+        (None, None, 0u64, [0u8; 32])
+    };
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
     // Reset to 1s on successful streaming (first InputBatch received).
@@ -1159,13 +1150,8 @@ where
         if journal_writer.is_none() {
             let writer =
                 melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
-            let mut fresh = crate::runtime::server::empty_app();
-            crate::runtime::server::apply_max_orders(
-                &mut fresh,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
+            let mut fresh = factory.empty();
+            factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);
             journal_writer = Some(writer);
         }

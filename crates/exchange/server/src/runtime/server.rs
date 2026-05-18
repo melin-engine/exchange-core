@@ -33,6 +33,7 @@ use melin_transport_core::pipeline::{
 };
 pub type Pipeline<W> = GenericPipeline<App, W>;
 
+use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -338,6 +339,16 @@ pub struct ServerConfig {
     /// leave it on.
     #[arg(long, default_value_t = false)]
     pub no_mlock: bool,
+
+    /// Application factory: produces `A` instances for replication
+    /// recovery and yields the bulk-seed events a fresh primary
+    /// journals at startup. `None` after CLI parsing — the binary
+    /// must populate this (typically `Some(Arc::new(ExchangeAppFactory::new(...)))`)
+    /// before calling [`run`]. The runtime panics if missing.
+    /// `#[arg(skip)]` keeps clap out of it; the field uses
+    /// `Option<...>` so `Default::default()` is `None`.
+    #[arg(skip)]
+    pub factory: Option<Arc<dyn AppFactory<App = App>>>,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -402,11 +413,24 @@ impl Default for ServerConfig {
             snapshot_path: None,
             tick_interval_ms: 250,
             no_mlock: false,
+            factory: None,
         }
     }
 }
 
 impl ServerConfig {
+    /// Borrow the `AppFactory` the runtime uses to construct fresh
+    /// applications (replication recovery) and produce the bulk-seed
+    /// event list (fresh-primary startup). Panics if the field was
+    /// not set before [`run`] — the binary populates it after CLI
+    /// parsing; in-process tests construct one inline.
+    pub fn factory(&self) -> &Arc<dyn AppFactory<App = App>> {
+        self.factory.as_ref().expect(
+            "ServerConfig::factory must be set before run() — \
+             populate it after CLI parsing or struct construction",
+        )
+    }
+
     /// Group commit delay as a Duration.
     pub fn group_commit_delay(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.group_commit_us)
@@ -674,9 +698,7 @@ where
             config.replication_pipeline_depth,
             !config.yield_idle,
             rotation,
-            config.max_orders_per_account,
-            config.max_orders_per_second,
-            config.max_orders_burst,
+            Arc::clone(config.factory()),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1107,7 +1129,7 @@ where
                     heartbeat_interval,
                     busy_spin,
                     utilization: response_utilization_thread,
-                    encoder: Arc::new(crate::domain::response_encoder::TradingResponseEncoder),
+                    encoder: Arc::new(crate::domain::response_encoder::ExchangeResponseEncoder),
                 },
                 &s3,
             );
@@ -1350,55 +1372,29 @@ where
         use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
         use melin_transport_core::trace::mono_trace_ns;
-        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
+        let seed_events = config.factory().seed_events();
+        let seed_count = seed_events.len();
 
         // `sequence: 0` — the journal stage allocates sequences in
-        // disruptor cursor order at encode time.
-        for i in 0..config.instruments {
-            input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(
-                    melin_trading::trading_event::TradingEvent::AddInstrument {
-                        spec: InstrumentSpec {
-                            symbol: Symbol(i),
-                            base: CurrencyId(i * 2),
-                            quote: CurrencyId(i * 2 + 1),
-                        },
-                    },
-                ),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
-        }
-
-        let instrument_elapsed = seed_start.elapsed();
-
-        let account_start = std::time::Instant::now();
+        // disruptor cursor order at encode time. The factory yields
+        // the application-shaped events; the runtime wraps each as
+        // `JournalEvent::App` and stamps transport-level metadata.
         let mut last_published_seq = 0u64;
-        for acct in 1..=config.accounts {
+        for event in seed_events {
             last_published_seq = input_producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(
-                    melin_trading::trading_event::TradingEvent::ProvisionAccount {
-                        account: AccountId(acct),
-                        amount: u64::MAX / 4,
-                    },
-                ),
+                event: JournalEvent::App(event),
                 publish_ts: mono_trace_ns(),
                 recv_ts: mono_trace_ns(),
             });
         }
-        let publish_elapsed = account_start.elapsed();
+        let publish_elapsed = seed_start.elapsed();
 
         // Wait for all seed events to be fully processed by the pipeline
         // before accepting clients. Without this, early client orders
@@ -1465,13 +1461,11 @@ where
         let drain_elapsed = drain_start.elapsed();
 
         info!(
-            accounts = config.accounts,
-            instruments = config.instruments,
-            instrument_ms = instrument_elapsed.as_millis(),
+            seed_events = seed_count,
             publish_ms = publish_elapsed.as_millis(),
             drain_ms = drain_elapsed.as_millis(),
             total_ms = seed_start.elapsed().as_millis(),
-            "seeded test data through pipeline"
+            "seeded application state through pipeline"
         );
     }
 
@@ -1486,7 +1480,7 @@ where
     let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = crate::runtime::reader::spawn_reader(
         input_producer,
-        Arc::new(crate::domain::request::TradingRequestDecoder),
+        Arc::new(crate::domain::request::ExchangeRequestDecoder),
         control_tx.clone(),
         config.reader_cores,
         connection_timeout,
@@ -1809,9 +1803,7 @@ where
             config.replication_pipeline_depth,
             !config.yield_idle,
             rotation,
-            config.max_orders_per_account,
-            config.max_orders_per_second,
-            config.max_orders_burst,
+            Arc::clone(config.factory()),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -2082,7 +2074,7 @@ where
                 tx_producers,
                 response_utilization_thread,
                 busy_spin,
-                Arc::new(crate::domain::response_encoder::TradingResponseEncoder),
+                Arc::new(crate::domain::response_encoder::ExchangeResponseEncoder),
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -2240,45 +2232,20 @@ where
         use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
         use melin_transport_core::trace::mono_trace_ns;
-        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+
+        let seed_events = config.factory().seed_events();
 
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
-        for i in 0..config.instruments {
-            input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(
-                    melin_trading::trading_event::TradingEvent::AddInstrument {
-                        spec: InstrumentSpec {
-                            symbol: Symbol(i),
-                            base: CurrencyId(i * 2),
-                            quote: CurrencyId(i * 2 + 1),
-                        },
-                    },
-                ),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
-        }
-
         let mut last_published_seq = 0u64;
-        for acct in 1..=config.accounts {
+        for event in seed_events {
             last_published_seq = input_producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(
-                    melin_trading::trading_event::TradingEvent::ProvisionAccount {
-                        account: AccountId(acct),
-                        amount: u64::MAX / 4,
-                    },
-                ),
+                event: JournalEvent::App(event),
                 publish_ts: mono_trace_ns(),
                 recv_ts: mono_trace_ns(),
             });
@@ -2401,7 +2368,7 @@ where
     crate::runtime::dpdk_transport::run_dpdk_poll(
         transport_0,
         input_producer,
-        Arc::new(crate::domain::request::TradingRequestDecoder),
+        Arc::new(crate::domain::request::ExchangeRequestDecoder),
         control_tx,
         tx_rx_0,
         &shutdown,
@@ -2435,83 +2402,18 @@ where
     )
 }
 
-/// Apply operator-set runtime knobs that aren't carried in the journal /
-/// snapshot. Called on every fresh / recovered / restored engine — the
-/// per-account open-order cap (SEC-03) and the order-submission rate
-/// limit (SEC-04) live in `Exchange` state but are operator policy, so
-/// primary and replicas must converge on them via configuration rather
-/// than replay.
-pub fn apply_max_orders(
-    app: &mut App,
-    max_orders_per_account: u32,
-    max_orders_per_second: u32,
-    max_orders_burst: u32,
-) {
-    // SEC-04 mismatch detection (must run BEFORE we apply the new
-    // config). Non-empty bucket map paired with a disabled limiter
-    // means we just restored a snapshot whose primary had the limiter
-    // active, but the local operator forgot to wire matching
-    // `--max-orders-per-second` / `--max-orders-burst` flags. The
-    // engine will continue accepting all orders unthrottled — silent
-    // until the replica is promoted and starts diverging from the
-    // primary's accept/reject decisions. Surface the misconfig loudly
-    // so operators catch it at startup, not on incident.
-    let restored_buckets = app.order_bucket_count();
-    let limiter_disabled = max_orders_per_second == 0 || max_orders_burst == 0;
-    if limiter_disabled && restored_buckets > 0 {
-        warn!(
-            restored_buckets,
-            max_orders_per_second,
-            max_orders_burst,
-            "SEC-04 config mismatch: snapshot carries rate-limit buckets but local limiter is \
-             disabled — primary and replica must run with matching values"
-        );
-    }
-
-    app.set_max_open_orders_per_account(max_orders_per_account);
-    app.set_max_orders_per_second(max_orders_per_second, max_orders_burst);
-
-    // Visibility for operators verifying primary↔replica parity at a
-    // glance. SEC-03 cap and SEC-04 rate-limit knobs are operator
-    // policy (not journaled), so logging the applied values is the
-    // only way to confirm both processes started with the same config.
-    info!(
-        max_orders_per_account,
-        max_orders_per_second,
-        max_orders_burst,
-        "applied per-account order limits (SEC-03 cap, SEC-04 rate)"
-    );
-}
-
-pub(crate) fn empty_app() -> App {
-    crate::domain::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity())
-}
-
-/// Build a fresh, empty application sized for a known bulk-seed workload.
-///
-/// Same as [`empty_app`] but pre-sizes the trading variant's
-/// AccountManager balances HashMap to `accounts × instruments × 2` so the
-/// bulk `ProvisionAccount` flow doesn't hit per-rehash hundred-millisecond
-/// stalls (see T1's outlier log on the seed phase). Used by `init_engine`
-/// when starting from an empty journal (the only path where the server
-/// itself does bulk seeding). Replica receivers and other paths use
-/// [`empty_app`] because they reconstruct state from snapshots / replicated
-/// frames, both of which already size their HashMap from a known count.
-pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
-    let mut app = crate::domain::exchange_app::ServerApp(
-        melin_engine::exchange::Exchange::with_seed_capacity(
-            config.accounts as usize,
-            config.instruments as usize,
-        ),
-    );
-    apply_max_orders(
-        &mut app,
-        config.max_orders_per_account,
-        config.max_orders_per_second,
-        config.max_orders_burst,
-    );
-    app
-}
+// The `apply_max_orders` / `empty_app` / `empty_app_for_seed` helpers
+// that used to live here have moved behind the `AppFactory` trait —
+// see `crate::domain::app_factory::ExchangeAppFactory`. The runtime
+// reaches them through `config.factory().{empty, empty_for_seed,
+// apply_operator_policy}()`; replication paths take a
+// `factory: Arc<dyn AppFactory<App = App>>` parameter instead of
+// the three rate-limit primitives they used to pass through.
+//
+// SEC-03 (per-account open-order cap) and SEC-04 (order-submission
+// rate limit) live in `Exchange` state but are operator policy, not
+// journaled — primary and replicas must converge on them via
+// matching factory configuration rather than replay.
 
 /// Initialize or recover the journaled application from disk.
 ///
@@ -2564,10 +2466,10 @@ where
         JournaledApp::<App, W>::from_parts(app, writer)
     } else if journal_exists {
         info!(writer_mode = %writer_mode, "recovering from journal");
-        JournaledApp::<App, W>::recover(empty_app_for_seed(config), &config.journal)?
+        JournaledApp::<App, W>::recover(config.factory().empty_for_seed(), &config.journal)?
     } else {
         info!(writer_mode = %writer_mode, "creating new journal");
-        JournaledApp::<App, W>::create(empty_app_for_seed(config), &config.journal)?
+        JournaledApp::<App, W>::create(config.factory().empty_for_seed(), &config.journal)?
     };
 
     let needs_seeding = !journal_exists;
@@ -2587,12 +2489,7 @@ where
     //     restored state is preserved. An operator mis-set that differs
     //     from the primary's config will silently clear those buckets;
     //     primary and replica must run with matching values.
-    apply_max_orders(
-        engine.app_mut(),
-        config.max_orders_per_account,
-        config.max_orders_per_second,
-        config.max_orders_burst,
-    );
+    config.factory().apply_operator_policy(engine.app_mut());
 
     // Archive the live journal segment if it exceeds the configured
     // size threshold. The shadow exchange owns snapshot writes; here we

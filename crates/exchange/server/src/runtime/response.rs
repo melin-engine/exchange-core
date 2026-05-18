@@ -93,7 +93,7 @@ pub struct Response {
     pub busy_spin: bool,
     pub utilization: Arc<StageUtilization>,
     /// Wire encoder for application-shaped payloads. Constructed
-    /// once at boot (`Arc::new(TradingResponseEncoder)`) and shared
+    /// once at boot (`Arc::new(ExchangeResponseEncoder)`) and shared
     /// with the DPDK response stage.
     pub encoder: ResponseEncoderArc,
 }

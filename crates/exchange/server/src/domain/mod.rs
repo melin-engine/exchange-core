@@ -10,6 +10,7 @@
 //!
 //! [`runtime`]: crate::runtime
 
+pub mod app_factory;
 pub mod exchange_app;
 pub mod request;
 pub mod response_encoder;

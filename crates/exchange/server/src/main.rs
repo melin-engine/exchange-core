@@ -67,7 +67,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(&shutdown);
 
-    let config = ServerConfig::parse();
+    let mut config = ServerConfig::parse();
+    // Wire the trading-side AppFactory the runtime needs for fresh-app
+    // construction (replication recovery, snapshot rebuild) and for
+    // the bulk-seed events a fresh primary journals at startup. The
+    // factory captures `accounts`/`instruments`/`max_orders_*` so the
+    // runtime never names trading concepts by their wire variants.
+    config.factory = Some(std::sync::Arc::new(
+        melin_server::domain::app_factory::ExchangeAppFactory::new(
+            melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+                accounts: config.accounts,
+                instruments: config.instruments,
+                max_orders_per_account: config.max_orders_per_account,
+                max_orders_per_second: config.max_orders_per_second,
+                max_orders_burst: config.max_orders_burst,
+            },
+        ),
+    ));
 
     if !config.no_mlock {
         try_lock_memory();

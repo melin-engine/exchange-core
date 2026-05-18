@@ -247,10 +247,16 @@ fn main() {
                 std::time::Duration::ZERO,
                 8, // pipeline_depth
                 busy_spin,
-                None,   // rotation: bench replica doesn't rotate
-                10_000, // max_orders_per_account: bench uses default
-                0,      // max_orders_per_second: rate limit disabled in bench
-                0,      // max_orders_burst: rate limit disabled in bench
+                None, // rotation: bench replica doesn't rotate
+                std::sync::Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
+                    melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+                        accounts: 0,
+                        instruments: 0,
+                        max_orders_per_account: 10_000,
+                        max_orders_per_second: 0,
+                        max_orders_burst: 0,
+                    },
+                )),
             );
         })
         .expect("spawn run_receiver");

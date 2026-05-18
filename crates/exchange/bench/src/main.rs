@@ -1677,7 +1677,7 @@ fn run_roundtrip_bench(
 
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("bench.journal"));
 
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         journal: effective_journal,
         snapshot: None,
         group_commit_us,
@@ -1694,6 +1694,21 @@ fn run_roundtrip_bench(
         durability_mode: melin_server::runtime::durability_policy::DurabilityMode::Local,
         ..ServerConfig::default()
     };
+    // Wire the trading AppFactory: replication / seed paths read it
+    // through `config.factory`. The bench server runs standalone but
+    // still bulk-seeds via the same code path as the binary, so the
+    // factory must be set even for in-process benchmarks.
+    config.factory = Some(std::sync::Arc::new(
+        melin_server::domain::app_factory::ExchangeAppFactory::new(
+            melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+                accounts: config.accounts,
+                instruments: config.instruments,
+                max_orders_per_account: config.max_orders_per_account,
+                max_orders_per_second: config.max_orders_per_second,
+                max_orders_burst: config.max_orders_burst,
+            },
+        ),
+    ));
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
