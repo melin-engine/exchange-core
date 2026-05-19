@@ -80,6 +80,8 @@ struct HealthPoint {
     journal_sequence: u64,
     replication_lag: u64,
     input_queue_depth: u64,
+    // Field-only by design: this is the y-axis bound for the queue-depth
+    // chart, not a series. No `HealthMetric` variant.
     input_queue_capacity: u64,
     pipeline_healthy: bool,
     trading_active: bool,
@@ -187,10 +189,10 @@ impl HealthMetric {
     fn read(self, h: &HealthPoint) -> f64 {
         match self {
             Self::ActiveConnections => h.active_connections as f64,
-            Self::EventsProcessed => HealthMetric::EventsProcessed.read(h),
-            Self::JournalSequence => HealthMetric::JournalSequence.read(h),
-            Self::ReplicationLag => HealthMetric::ReplicationLag.read(h),
-            Self::InputQueueDepth => HealthMetric::InputQueueDepth.read(h),
+            Self::EventsProcessed => h.events_processed as f64,
+            Self::JournalSequence => h.journal_sequence as f64,
+            Self::ReplicationLag => h.replication_lag as f64,
+            Self::InputQueueDepth => h.input_queue_depth as f64,
             Self::PipelineHealthy => h.pipeline_healthy as u64 as f64,
             Self::TradingActive => h.trading_active as u64 as f64,
             Self::ReplicasConnected => h.replicas_connected as f64,
@@ -225,10 +227,14 @@ impl HealthMetric {
 
 /// Compile-time check: every field on `HealthPoint` must be named here. If
 /// a new typed field is added without updating this destructure, the
-/// compiler errors with "pattern does not mention field `...`". That is the
-/// guarantee that every metric gets a plot decision.
+/// compiler errors with "pattern does not mention field `...`".
 ///
-/// The `// plotted by` comments document where each field is consumed.
+/// `HealthMetric::read` already enforces exhaustiveness over the *variants*
+/// it knows about — this destructure is the complementary guard that
+/// catches a new field being added without adding a matching variant. The
+/// `// plotted by` comments document where each field is consumed; fields
+/// that have no `HealthMetric` variant by design (`input_queue_capacity`,
+/// `elapsed_secs`, `unknown`) are noted in their corresponding row.
 #[allow(dead_code, unused_variables)]
 fn _assert_all_metrics_plotted(p: &HealthPoint) {
     let HealthPoint {
@@ -2074,20 +2080,98 @@ mod tests {
         assert_eq!(h.unknown.len(), 1);
     }
 
+    /// Exercise every `HealthMetric` variant. A recursive `.read()` arm
+    /// would stack-overflow this test before producing a value, and a
+    /// new variant added without a `match` arm would fail to compile —
+    /// together these guarantee every metric is reachable and terminates.
     #[test]
-    fn health_metric_read_returns_typed_field_value() {
-        let r: HealthResult = serde_json::from_str(sample_health_json()).expect("parse");
+    fn health_metric_read_covers_every_variant() {
+        // JSON encoded so every typed field gets a distinct sentinel value;
+        // we then assert read() returns that exact value per variant.
+        let json = r#"{"label":"x","throughput_ops":0.0,"health":[{
+            "elapsed_secs": 0.0,
+            "active_connections": 1,
+            "events_processed": 2,
+            "journal_sequence": 3,
+            "replication_lag": 4,
+            "input_queue_depth": 5,
+            "input_queue_capacity": 6,
+            "pipeline_healthy": true,
+            "trading_active": false,
+            "melin_replicas_connected": 7,
+            "melin_replica_acked_sequence_slot_0": 8,
+            "melin_replica_acked_sequence_slot_1": 9,
+            "melin_replica_in_memory_sequence_slot_0": 10,
+            "melin_replica_in_memory_sequence_slot_1": 11,
+            "melin_replica_lag_slot_0": 12,
+            "melin_replica_lag_slot_1": 13,
+            "melin_replica_bytes_sent_total_slot_0": 14,
+            "melin_replica_bytes_sent_total_slot_1": 15,
+            "melin_replica_ack_latency_us_slot_0": 16,
+            "melin_replica_ack_latency_us_slot_1": 17,
+            "melin_replica_catching_up_slot_0": 1,
+            "melin_replica_catching_up_slot_1": 0,
+            "melin_replica_evictions_total": 18,
+            "melin_replication_ring_depth_slot_0": 19,
+            "melin_replication_ring_depth_slot_1": 20,
+            "melin_fastest_replica_cursor": 21,
+            "melin_stage_busy_total_stage_journal": 22,
+            "melin_stage_busy_total_stage_matching": 23,
+            "melin_stage_busy_total_stage_response": 24,
+            "melin_stage_idle_total_stage_journal": 25,
+            "melin_stage_idle_total_stage_matching": 26,
+            "melin_stage_idle_total_stage_response": 27,
+            "melin_response_gate_total_blocker_journal": 28,
+            "melin_response_gate_total_blocker_replication": 29,
+            "melin_durability_policy_degraded": 1
+        }]}"#;
+        let r: HealthResult = serde_json::from_str(json).expect("parse");
         let h = &r.health[0];
-        assert_eq!(HealthMetric::ReplicaLagSlot0.read(h), 12.0);
-        assert_eq!(HealthMetric::ReplicaEvictionsTotal.read(h), 3.0);
-        assert_eq!(HealthMetric::ActiveConnections.read(h), 8.0);
-        // Booleans expose as 0/1.
-        assert_eq!(HealthMetric::PipelineHealthy.read(h), 1.0);
-        assert_eq!(HealthMetric::TradingActive.read(h), 1.0);
-        // A metric with no JSON entry defaults to 0 via serde(default).
-        assert_eq!(HealthMetric::ReplicasConnected.read(h), 2.0);
-        assert_eq!(HealthMetric::FastestReplicaCursor.read(h), 49993.0);
-        assert_eq!(HealthMetric::DurabilityPolicyDegraded.read(h), 0.0);
+
+        // Pair every variant with its expected value. Adding a variant
+        // without a row here is a non-exhaustive match in the body, which
+        // is fine — but the variant won't be tested. Keep the list aligned
+        // with HealthMetric.
+        let expected: &[(HealthMetric, f64)] = &[
+            (HealthMetric::ActiveConnections, 1.0),
+            (HealthMetric::EventsProcessed, 2.0),
+            (HealthMetric::JournalSequence, 3.0),
+            (HealthMetric::ReplicationLag, 4.0),
+            (HealthMetric::InputQueueDepth, 5.0),
+            (HealthMetric::PipelineHealthy, 1.0),
+            (HealthMetric::TradingActive, 0.0),
+            (HealthMetric::ReplicasConnected, 7.0),
+            (HealthMetric::ReplicaAckedSequenceSlot0, 8.0),
+            (HealthMetric::ReplicaAckedSequenceSlot1, 9.0),
+            (HealthMetric::ReplicaInMemorySequenceSlot0, 10.0),
+            (HealthMetric::ReplicaInMemorySequenceSlot1, 11.0),
+            (HealthMetric::ReplicaLagSlot0, 12.0),
+            (HealthMetric::ReplicaLagSlot1, 13.0),
+            (HealthMetric::ReplicaBytesSentTotalSlot0, 14.0),
+            (HealthMetric::ReplicaBytesSentTotalSlot1, 15.0),
+            (HealthMetric::ReplicaAckLatencyUsSlot0, 16.0),
+            (HealthMetric::ReplicaAckLatencyUsSlot1, 17.0),
+            (HealthMetric::ReplicaCatchingUpSlot0, 1.0),
+            (HealthMetric::ReplicaCatchingUpSlot1, 0.0),
+            (HealthMetric::ReplicaEvictionsTotal, 18.0),
+            (HealthMetric::ReplicationRingDepthSlot0, 19.0),
+            (HealthMetric::ReplicationRingDepthSlot1, 20.0),
+            (HealthMetric::FastestReplicaCursor, 21.0),
+            (HealthMetric::StageBusyTotalJournal, 22.0),
+            (HealthMetric::StageBusyTotalMatching, 23.0),
+            (HealthMetric::StageBusyTotalResponse, 24.0),
+            (HealthMetric::StageIdleTotalJournal, 25.0),
+            (HealthMetric::StageIdleTotalMatching, 26.0),
+            (HealthMetric::StageIdleTotalResponse, 27.0),
+            (HealthMetric::ResponseGateTotalJournal, 28.0),
+            (HealthMetric::ResponseGateTotalReplication, 29.0),
+            (HealthMetric::DurabilityPolicyDegraded, 1.0),
+        ];
+
+        for (metric, want) in expected {
+            let got = metric.read(h);
+            assert_eq!(got, *want, "{metric:?} read {got}, expected {want}");
+        }
     }
 
     #[test]
