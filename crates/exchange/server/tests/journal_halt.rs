@@ -41,6 +41,19 @@ type MatchingHaltResult = (
     std::thread::JoinHandle<App>,
 );
 
+/// Return type for `build_matching_with_halt`:
+/// (input_producer, output_consumer, connected_counter, shutdown, stage).
+/// Same shape as `MatchingHaltResult` but with the stage handed back
+/// unspawned so a test can publish events and toggle `shutdown` before
+/// the matching loop ever runs.
+type UnspawnedMatchingHaltResult = (
+    ring::Producer<InputSlot>,
+    ring::Consumer<OutputSlot>,
+    Arc<AtomicU32>,
+    Arc<AtomicBool>,
+    MatchingStage<App>,
+);
+
 fn limit_order(id: u64, account: AccountId, side: Side, price: u64, qty: u64) -> Order {
     Order {
         id: OrderId(id),
@@ -57,11 +70,11 @@ fn limit_order(id: u64, account: AccountId, side: Side, price: u64, qty: u64) ->
     }
 }
 
-/// Build a minimal matching stage wired with a `replicas_connected`
-/// counter. The seeded exchange has one instrument plus a funded
-/// account so a `SubmitOrder` would normally succeed — the halt
-/// gate is what we're isolating.
-fn start_matching_with_halt(initial_connected: u32) -> MatchingHaltResult {
+/// Unspawned counterpart to [`start_matching_with_halt`]. Lets a test
+/// publish events into the input ring and tweak `shutdown` before the
+/// matching thread starts — required to exercise the drain-on-shutdown
+/// path of the halt check separately from the main run loop.
+fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResult {
     let mut app = App::new();
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
@@ -97,10 +110,18 @@ fn start_matching_with_halt(initial_connected: u32) -> MatchingHaltResult {
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    (input_producer, output_consumer, counter, shutdown, stage)
+}
+
+/// Build a minimal matching stage wired with a `replicas_connected`
+/// counter, spawn its run loop, and hand back the controls. The seeded
+/// exchange has one instrument plus a funded account so a `SubmitOrder`
+/// would normally succeed — the halt gate is what we're isolating.
+fn start_matching_with_halt(initial_connected: u32) -> MatchingHaltResult {
+    let (input, output, counter, shutdown, stage) = build_matching_with_halt(initial_connected);
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
-
-    (input_producer, output_consumer, counter, shutdown, handle)
+    (input, output, counter, shutdown, handle)
 }
 
 /// Consume outputs until the request terminator, returning all
@@ -287,4 +308,133 @@ fn halt_then_reconnect_resumes_trading() {
 
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap();
+}
+
+/// Transport-internal events (`connection_id == 0`) are seed/recovery
+/// events the runtime publishes before any client connects — there's
+/// no client to whom a `ReplicaDisconnected` rejection would be
+/// addressed, and they predate any client write whose persist-before-
+/// ack invariant the halt gate exists to defend. The matching stage
+/// must apply them even while halted.
+///
+/// Without the halt exemption, a fresh primary that seeds before its
+/// first replica connects (the only viable startup order on the DPDK
+/// single-queue path) ends up with an empty instrument table — every
+/// subsequent client request rejects with `UnknownSymbol`.
+#[test]
+fn seed_event_bypasses_halt() {
+    let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
+
+    input.publish(InputSlot {
+        connection_id: 0,
+        key_hash: 0,
+        request_seq: 0,
+        sequence: 0,
+        timestamp_ns: 0,
+        event: JournalEvent::App(TradingEvent::AddInstrument {
+            spec: InstrumentSpec {
+                symbol: Symbol(99),
+                base: CurrencyId(2),
+                quote: CurrencyId(3),
+            },
+        }),
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    });
+
+    // Transport-internal events have no client to reply to, so the
+    // matching stage emits no output slot (see the `connection_id !=
+    // 0` guard in pipeline.rs around the BatchEnd terminator). Let
+    // the run loop consume the event, then shut down and inspect the
+    // returned app to confirm the seed was applied.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        output.try_consume().is_none(),
+        "transport-internal event emitted an output slot"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let app = handle.join().unwrap();
+
+    // The constructor seeded Symbol(1); the halt-time seed added
+    // Symbol(99). If the halt exemption is missing, the second add
+    // would have been rejected and we'd see only Symbol(1).
+    assert_eq!(
+        app.instrument_count(),
+        2,
+        "halt-time seed should have been applied; count={}",
+        app.instrument_count()
+    );
+    let symbols: Vec<u32> = app.instrument_specs().map(|s| s.symbol.0).collect();
+    assert!(
+        symbols.contains(&99),
+        "Symbol(99) seed not applied; have {symbols:?}"
+    );
+}
+
+/// The same exemption must hold in the drain-on-shutdown path, which
+/// runs when the matching loop observes `shutdown == true` and walks
+/// any remaining slots in the input ring before exiting. Without it,
+/// a primary shutting down with seed events still in flight would
+/// silently drop them — and the next startup would recover a journal
+/// whose seeds were never applied to the live engine in the first
+/// place.
+#[test]
+fn seed_event_during_drain_bypasses_halt() {
+    let (mut input, mut output, _flag, shutdown, stage) = build_matching_with_halt(0);
+
+    // Publish the seed before the matching thread starts so the event
+    // sits in the input ring. Flipping `shutdown` to true before spawn
+    // forces the run loop's first iteration into `drain_remaining` —
+    // exercising the second halt-check site (the drain path), not the
+    // main loop.
+    input.publish(InputSlot {
+        connection_id: 0,
+        key_hash: 0,
+        request_seq: 0,
+        sequence: 0,
+        timestamp_ns: 0,
+        event: JournalEvent::App(TradingEvent::AddInstrument {
+            spec: InstrumentSpec {
+                symbol: Symbol(99),
+                base: CurrencyId(2),
+                quote: CurrencyId(3),
+            },
+        }),
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    });
+    shutdown.store(true, Ordering::Relaxed);
+
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+    let app = handle.join().unwrap();
+
+    // The drain path emits a BatchEnd terminator for every consumed
+    // input slot — including transport-internal ones, where the run
+    // loop's `connection_id != 0` guard would have suppressed it.
+    // That asymmetry is harmless (downstream consumers drop slots
+    // routed to connection_id 0) and orthogonal to what we're
+    // verifying. What matters is that the slot is a BatchEnd marker,
+    // *not* a `Rejected{ReplicaDisconnected}` report.
+    if let Some((_, slot)) = output.try_consume() {
+        assert!(
+            matches!(slot.payload, OutputPayload::BatchEnd),
+            "drain emitted a non-BatchEnd payload for a transport-internal event: {:?}",
+            slot.payload
+        );
+        assert_eq!(slot.connection_id, 0);
+    }
+
+    assert_eq!(
+        app.instrument_count(),
+        2,
+        "drain-time seed should have been applied; count={}",
+        app.instrument_count()
+    );
+    let symbols: Vec<u32> = app.instrument_specs().map(|s| s.symbol.0).collect();
+    assert!(
+        symbols.contains(&99),
+        "Symbol(99) seed not applied via drain; have {symbols:?}"
+    );
 }

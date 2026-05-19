@@ -1928,8 +1928,23 @@ impl<A: Application> MatchingStage<A> {
                 // `OutputSlot::durability_bypass` for the correctness
                 // argument. Queries bypass halt entirely (they're
                 // read-only), so they keep the gate as usual.
+                // Transport-internal events carry `connection_id == 0`:
+                // the runtime emits them for startup seeds (AddInstrument /
+                // ProvisionAccount) and the journal-replay path on
+                // recovery. They are server-originated, predate any
+                // client traffic, and have no client to whom a
+                // `ReplicaDisconnected` rejection would be addressed. The
+                // halt check exists to refuse *client writes* while the
+                // replication policy can't honour the persist-before-ack
+                // invariant; applying transport-internal events to the
+                // local engine during halt doesn't violate that invariant
+                // (no ack to a client) and is required so a fresh primary
+                // can seed its instruments before any replica connects.
+                // Mirrors the existing dedup exemption a few lines below
+                // (`key_hash == 0` — same provenance, same reasoning).
+                let is_transport_internal = slot.connection_id == 0;
                 let halt_bypass = halted && !is_query;
-                if !is_query && halted {
+                if !is_query && halted && !is_transport_internal {
                     // Only app events produce client-facing rejections;
                     // transport variants (Tick, GenesisHash, Checkpoint)
                     // have no client to reject to, so they silently
@@ -2169,8 +2184,13 @@ impl<A: Application> MatchingStage<A> {
             reports.clear();
 
             // Halt check first, then dedup (same order as the main run loop).
+            // `connection_id == 0` marks transport-internal events
+            // (startup seeds, journal replay) — mirror the main loop's
+            // exemption so a shutdown drain doesn't drop the very seed
+            // events the next startup will recover.
+            let is_transport_internal = slot.connection_id == 0;
             let halt_bypass = self.is_halted();
-            if halt_bypass {
+            if halt_bypass && !is_transport_internal {
                 if let melin_journal::JournalEvent::App(ref e) = slot.event {
                     reports.push(A::build_reject(e, RejectReason::ReplicaDisconnected));
                 }
