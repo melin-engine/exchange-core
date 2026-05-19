@@ -19,10 +19,18 @@ use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_S
 use super::error::JournalError;
 use super::event::JournalEvent;
 
-/// Initial read buffer size. Grows if needed, but entries are typically <100 bytes.
-/// Uses a Vec (growable) rather than a fixed array because the reader may need
-/// to buffer multiple entries when entries span read boundaries.
-const INITIAL_BUF_SIZE: usize = 4096;
+/// Initial read buffer size. Sized to amortize `read()` syscall and
+/// per-call compaction overhead across many entries — at ~50–250 bytes
+/// per entry this holds thousands of entries per refill. Grows if a
+/// single entry exceeds it (snapshots can be larger), but for steady-
+/// state event scans it never resizes. The 1 MiB allocation lives for
+/// the lifetime of the reader; recovery opens readers one-at-a-time so
+/// the working-set cost is bounded.
+///
+/// Uses a Vec (growable) rather than a fixed array because the reader
+/// may need to buffer multiple entries when entries span read
+/// boundaries, and because rare oversized entries grow the buffer.
+const INITIAL_BUF_SIZE: usize = 1 << 20;
 
 /// A decoded journal entry with its metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +51,17 @@ pub struct JournalEntry<E: AppEvent> {
 pub struct JournalReader<E: AppEvent> {
     _marker: PhantomData<fn() -> E>,
     file: File,
-    /// Read buffer — Vec because it may grow when entries span chunk boundaries.
+    /// Read buffer. Sized at `INITIAL_BUF_SIZE` so a single `read()`
+    /// covers thousands of entries; grows only when a single entry
+    /// exceeds the current capacity. Vec rather than a fixed array so
+    /// rare oversized entries (e.g. snapshots) can still be decoded.
     buffer: Vec<u8>,
-    /// Current read position within `buffer`.
+    /// Current read position within `buffer`. Advances per decoded
+    /// entry; compaction back to 0 is deferred until the buffer tail
+    /// is exhausted (see `try_extend_buffer`).
     pos: usize,
-    /// Number of valid bytes in `buffer` (from last read).
+    /// Number of valid bytes in `buffer` (from last read). Bytes
+    /// `[pos..valid]` are the unconsumed window the decoder reads from.
     valid: usize,
     /// Last sequence number read, for gap detection.
     last_sequence: Option<u64>,
@@ -428,6 +442,18 @@ impl<E: AppEvent> JournalReader<E> {
         }))
     }
 
+    /// Test-only constructor that opens the journal with a custom
+    /// initial buffer size. Lets unit tests force entries to straddle
+    /// buffer boundaries (and exercise the refill/grow paths) without
+    /// having to write millions of entries to overflow the production
+    /// 1 MiB buffer.
+    #[cfg(test)]
+    pub(crate) fn open_with_buffer(path: &Path, buf_size: usize) -> Result<Self, JournalError> {
+        let mut reader = Self::open(path)?;
+        reader.buffer = vec![0u8; buf_size];
+        Ok(reader)
+    }
+
     /// Last successfully read sequence number.
     pub fn last_sequence(&self) -> Option<u64> {
         self.last_sequence
@@ -531,32 +557,55 @@ impl<E: AppEvent> JournalReader<E> {
             .map(|c| (c.current_hash, c.batch_hasher, c.events_since_checkpoint))
     }
 
-    /// Compact the buffer by moving unconsumed data to the front, then
-    /// read more from the file.
+    /// Ensure the buffer has data to decode from. Lazy: when bytes are
+    /// already buffered, returns immediately and lets the caller try
+    /// `codec::decode` first — only on `TruncatedEntry` does
+    /// `try_extend_buffer` actually refill. This avoids a per-entry
+    /// `read()` syscall and a per-entry `copy_within` compaction in the
+    /// steady-state scan, both of which dominated the old reader's
+    /// runtime when the buffer was small relative to the journal.
     fn fill_buffer(&mut self) -> Result<(), JournalError> {
-        if self.pos > 0 {
-            // Shift unconsumed data to the front.
-            self.buffer.copy_within(self.pos..self.valid, 0);
-            self.valid -= self.pos;
-            self.pos = 0;
+        if self.valid > self.pos {
+            return Ok(());
         }
-
-        // Read more data.
-        let n = self.file.read(&mut self.buffer[self.valid..])?;
-        self.valid += n;
+        // Buffer fully consumed — reset cursors and refill from disk.
+        self.pos = 0;
+        self.valid = 0;
+        let n = self.file.read(&mut self.buffer)?;
+        self.valid = n;
         Ok(())
     }
 
-    /// Try to read more data into the buffer. Returns true if new data was read.
+    /// Try to read more data into the buffer. Returns true if new data
+    /// was read.
+    ///
+    /// Called from `next_entry`'s `TruncatedEntry` path — i.e. only
+    /// when decode could not consume a full entry from the current
+    /// `[pos..valid]` window. This call must make as much free tail
+    /// room as possible so the single follow-up decode attempt
+    /// succeeds even when the underlying `read()` is short (the retry
+    /// in `next_entry` is one-shot: a second `TruncatedEntry` is
+    /// treated as EOF). Always compacting the consumed prefix here is
+    /// cheap because the function only fires once per buffer-full,
+    /// not per decoded entry — the steady-state cost lives in
+    /// `fill_buffer`, which stays lazy.
     fn try_extend_buffer(&mut self) -> Result<bool, JournalError> {
-        // Compact first.
+        // Reclaim the consumed prefix to maximize the free tail. Skip
+        // when pos is already 0 to avoid a no-op copy_within.
         if self.pos > 0 {
             self.buffer.copy_within(self.pos..self.valid, 0);
             self.valid -= self.pos;
             self.pos = 0;
         }
 
-        // Grow the buffer if it's full.
+        // Grow when the pending partial entry already fills the
+        // buffer — rare under production traffic; the codec caps
+        // entry length at `u16::MAX` (~64 KiB total), so with the
+        // 1 MiB INITIAL_BUF_SIZE this branch is structurally
+        // unreachable. Kept for the small-buffer test path and as
+        // defense-in-depth if the codec's cap is ever loosened.
+        // Doubles on each miss so the loop is bounded by the entry
+        // size, not by buffer size.
         if self.valid == self.buffer.len() {
             self.buffer.resize(self.buffer.len() * 2, 0);
         }
@@ -807,6 +856,42 @@ mod tests {
         for (i, entry) in decoded.iter().enumerate() {
             assert_eq!(entry.sequence, FIRST_SEQ + i as u64);
             assert_eq!(entry.event, events[i]);
+        }
+    }
+
+    /// Forces entries to straddle the reader's internal buffer
+    /// boundary by opening with a buffer smaller than a single entry.
+    /// Every `next_entry` then exercises the lazy-refill ↔
+    /// compact-grow-read split: `fill_buffer` returns early when the
+    /// buffer holds the entry header but not the payload, decode
+    /// returns `TruncatedEntry`, `try_extend_buffer` compacts the
+    /// consumed prefix and reads more, decode succeeds. With 100
+    /// entries and a 64-byte buffer (one entry ≈ 49 bytes), the seam
+    /// is crossed dozens of times within the same scan.
+    #[test]
+    fn entries_straddling_buffer_boundary_decode_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        const N: u64 = 100;
+        {
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            for i in 0..N {
+                writer.append(&JournalEvent::App(TestEvent(i))).unwrap();
+            }
+        }
+
+        // Tiny buffer (< one entry) guarantees a refill straddles
+        // every entry. The grow path also fires once when the buffer
+        // is full of header bytes but still can't fit the payload.
+        let mut reader = JournalReader::<TestEvent>::open_with_buffer(&path, 64).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            decoded.push(entry);
+        }
+        assert_eq!(decoded.len(), N as usize);
+        for (i, entry) in decoded.iter().enumerate() {
+            assert_eq!(entry.sequence, FIRST_SEQ + i as u64);
+            assert_eq!(entry.event, JournalEvent::App(TestEvent(i as u64)));
         }
     }
 
