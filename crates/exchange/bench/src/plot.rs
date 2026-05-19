@@ -207,15 +207,15 @@ impl HealthPoint {
 #[allow(dead_code, unused_variables)]
 fn _assert_all_metrics_plotted(p: &HealthPoint) {
     let HealthPoint {
-        elapsed_secs,                      // x-axis
-        active_connections,                // plot_health_connections
-        events_processed,                  // plot_health_throughput
-        journal_sequence,                  // plot_health_journal_sequence
+        elapsed_secs,                      // x-axis for every plot
+        active_connections,                // plot_health_extra_metric
+        events_processed,                  // plot_health_events
+        journal_sequence,                  // plot_health_journal_seq
         replication_lag,                   // plot_health_replication_lag
         input_queue_depth,                 // plot_health_queue_depth
-        input_queue_capacity,              // y-axis bound for queue_depth
-        pipeline_healthy,                  // plot_health_binary (status)
-        trading_active,                    // plot_health_binary (status)
+        input_queue_capacity,              // y-axis bound for plot_health_queue_depth
+        pipeline_healthy,                  // plot_health_extra_metric
+        trading_active,                    // plot_health_extra_metric
         replicas_connected,                // plot_health_extra_metric
         replica_acked_sequence_slot_0,     // plot_health_extra_metric (per-slot)
         replica_acked_sequence_slot_1,     // plot_health_extra_metric (per-slot)
@@ -241,7 +241,7 @@ fn _assert_all_metrics_plotted(p: &HealthPoint) {
         stage_idle_total_response,         // plot_health_utilization (derivative)
         response_gate_total_journal,       // plot_health_extra_metric
         response_gate_total_replication,   // plot_health_extra_metric
-        durability_policy_degraded,        // plot_health_binary (status)
+        durability_policy_degraded,        // plot_health_extra_metric
         unknown,                           // warned at load time, not plotted
     } = p;
 }
@@ -1263,6 +1263,33 @@ fn cmd_health(args: &[String]) {
 
     plot_health_extra_metric(
         &all_results,
+        &PathBuf::from(format!("{stem}-active-connections.svg")),
+        &["melin_active_connections"],
+        &["connections"],
+        "Authenticated Client Connections Over Time",
+        "Count",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-pipeline-healthy.svg")),
+        &["melin_pipeline_healthy"],
+        &["healthy"],
+        "Pipeline Healthy (1 = healthy, 0 = degraded)",
+        "Status",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-trading-active.svg")),
+        &["melin_trading_active"],
+        &["trading"],
+        "Trading Active (1 = accepting orders, 0 = halted)",
+        "Status",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
         &PathBuf::from(format!("{stem}-replica-acked-sequence.svg")),
         &[
             "melin_replica_acked_sequence_slot_0",
@@ -2005,6 +2032,30 @@ fn cmd_all(args: &[String]) {
         );
         plot_health_extra_metric(
             &health_results,
+            &PathBuf::from(format!("{stem}-active-connections.svg")),
+            &["melin_active_connections"],
+            &["connections"],
+            "Authenticated Client Connections Over Time",
+            "Count",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-pipeline-healthy.svg")),
+            &["melin_pipeline_healthy"],
+            &["healthy"],
+            "Pipeline Healthy (1 = healthy, 0 = degraded)",
+            "Status",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-trading-active.svg")),
+            &["melin_trading_active"],
+            &["trading"],
+            "Trading Active (1 = accepting orders, 0 = halted)",
+            "Status",
+        );
+        plot_health_extra_metric(
+            &health_results,
             &PathBuf::from(format!("{stem}-replica-acked-sequence.svg")),
             &[
                 "melin_replica_acked_sequence_slot_0",
@@ -2067,4 +2118,85 @@ fn cmd_all(args: &[String]) {
     }
 
     eprintln!("all plots generated in {}", dir.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_health_json() -> &'static str {
+        // Mirrors the JSON layout written by bench/src/main.rs — typed fields
+        // for fixed metrics plus sanitized Prometheus labels for the rest.
+        r#"{
+            "label": "fsync",
+            "throughput_ops": 100000.0,
+            "health": [{
+                "elapsed_secs": 1.5,
+                "active_connections": 8,
+                "events_processed": 50000,
+                "journal_sequence": 50000,
+                "replication_lag": 0,
+                "input_queue_depth": 128,
+                "input_queue_capacity": 1048576,
+                "pipeline_healthy": true,
+                "trading_active": true,
+                "melin_replicas_connected": 2,
+                "melin_replica_lag_slot_0": 12,
+                "melin_replica_lag_slot_1": 7,
+                "melin_replica_evictions_total": 3,
+                "melin_fastest_replica_cursor": 49993,
+                "melin_stage_busy_total_stage_journal": 999,
+                "melin_stage_idle_total_stage_journal": 1,
+                "melin_future_metric": 42
+            }]
+        }"#
+    }
+
+    #[test]
+    fn deserializes_typed_fields_and_captures_unknowns() {
+        let r: HealthResult = serde_json::from_str(sample_health_json()).expect("parse");
+        let h = &r.health[0];
+        assert_eq!(h.active_connections, 8);
+        assert_eq!(h.replicas_connected, 2);
+        assert_eq!(h.replica_lag_slot_0, 12);
+        assert_eq!(h.replica_lag_slot_1, 7);
+        assert_eq!(h.replica_evictions_total, 3);
+        assert_eq!(h.stage_busy_total_journal, 999);
+        // Metrics without a typed field land in `unknown` for warn-time
+        // visibility — they are not silently dropped.
+        assert!(
+            h.unknown.contains_key("melin_future_metric"),
+            "unknown map should capture metrics absent from HealthPoint"
+        );
+        assert_eq!(h.unknown.len(), 1);
+    }
+
+    #[test]
+    fn metric_f64_routes_known_keys_to_typed_fields() {
+        let r: HealthResult = serde_json::from_str(sample_health_json()).expect("parse");
+        let h = &r.health[0];
+        assert_eq!(h.metric_f64("melin_replica_lag_slot_0"), 12.0);
+        assert_eq!(h.metric_f64("melin_replica_evictions_total"), 3.0);
+        assert_eq!(h.metric_f64("melin_active_connections"), 8.0);
+        // Booleans round-trip as 0/1.
+        assert_eq!(h.metric_f64("melin_pipeline_healthy"), 1.0);
+        // Unknown-but-captured falls through to the flatten map.
+        assert_eq!(h.metric_f64("melin_future_metric"), 42.0);
+        // Missing-entirely returns 0.0.
+        assert_eq!(h.metric_f64("melin_does_not_exist"), 0.0);
+    }
+
+    #[test]
+    fn warn_unknown_metrics_is_silent_when_all_typed() {
+        // Build a HealthPoint via deserialize with no unknown keys.
+        let json = r#"{"label":"x","throughput_ops":0.0,"health":[{
+            "elapsed_secs":0.0,"active_connections":0,"events_processed":0,
+            "journal_sequence":0,"replication_lag":0,"input_queue_depth":0,
+            "input_queue_capacity":0,"pipeline_healthy":false,"trading_active":false
+        }]}"#;
+        let r: HealthResult = serde_json::from_str(json).expect("parse");
+        assert!(r.health[0].unknown.is_empty());
+        // Function should run without panicking when there's nothing to warn about.
+        warn_unknown_metrics(&r, "test.json");
+    }
 }
