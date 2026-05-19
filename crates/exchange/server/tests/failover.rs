@@ -1083,18 +1083,12 @@ fn recovered_primary_durability_gate_holds() {
     wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
     cluster.wait_replicated();
 
-    // Phase 2: submit BURST new orders. The new client is a fresh
-    // connection so its session-local `next_seq` starts at 0; without
-    // an explicit sync it would collide with the recovered primary's
-    // `request_seq` HWM (50 after phase 1) and every request would
-    // come back as `Rejected{DuplicateRequest}` rather than a
-    // gate-driven `Placed`. The test's invariant is about Placed
-    // responses on the durability gate, not dedup behaviour, so adopt
-    // the engine's HWM up front.
+    // Phase 2: submit BURST new orders. `Client::connect` auto-syncs
+    // against the engine's per-key request_seq HWM (50 after phase 1)
+    // so the first phase-2 request lands at HWM + 1 and skips dedup.
+    // Without that, every request would come back as
+    // `Rejected{DuplicateRequest}` rather than a gate-driven `Placed`.
     let mut client = cluster.connect_primary();
-    client
-        .synchronize_request_seq()
-        .expect("synchronize_request_seq with recovered primary");
     let mut acked: Vec<u64> = Vec::with_capacity(BURST as usize);
     for i in 0..BURST {
         let id = PREFILL + 1 + i;
@@ -1338,26 +1332,30 @@ fn journals_contiguous_across_checkpoint_boundary() {
     );
 }
 
-/// Reconnect with the SAME key after failover and retry the last request.
-/// The per-key request sequence HWM must reject it as DuplicateRequest
-/// (not re-execute it). This tests that the per-key dedup state survives
-/// replication and promotion.
+/// Reconnect with the SAME key after failover and confirm the
+/// promoted replica preserved this key's request_seq HWM. The dedup
+/// state must survive replication and promotion: querying the HWM on
+/// the new connection must report the count we drove the original
+/// primary to, not a freshly-initialised zero.
+///
+/// Originally framed as "first replay request is rejected as
+/// DuplicateRequest" — that observation depended on a fresh client
+/// starting `next_seq` at 0 and colliding with the HWM. Now that
+/// `Client::connect` auto-syncs the HWM on connect, the collision
+/// cannot occur from the client side; we assert the same invariant by
+/// inspecting the HWM the auto-sync adopts.
 #[test]
 #[serial]
-fn same_key_retry_after_failover_is_rejected() {
+fn same_key_request_seq_hwm_survives_failover() {
     let mut cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
 
-    // Submit 10 orders. The client's internal next_seq reaches 10.
+    // Submit 10 orders. The engine's per-key HWM for this key reaches 10.
     for i in 1..=10u64 {
         submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
     }
 
     cluster.wait_replicated();
-
-    // Record the client's last request sequence (next_seq was incremented
-    // to 10 after the 10th send_request). We'll need to replicate this
-    // exact state on the new connection.
     drop(client);
 
     // Kill + promote.
@@ -1370,21 +1368,16 @@ fn same_key_retry_after_failover_is_rejected() {
     set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(cluster.replica.health_addr, Duration::from_secs(30));
 
-    // Reconnect with the SAME key (key, not key2). The promoted replica's
-    // per-key HWM for this key should be 10 (from the 10 requests above).
-    // A fresh Client starts at next_seq=0, so the first send uses seq=1.
-    // Since 1 <= 10 (the HWM), it should be rejected as DuplicateRequest.
+    // Reconnect with the SAME key. `Client::connect` auto-syncs against
+    // the engine's HWM; calling `synchronize_request_seq` again returns
+    // the value it adopted — which must equal the pre-failover count.
     let mut client_retry = connect_with_timeout(cluster.replica.client_addr, &cluster.key);
-    let r = submit_order(&mut client_retry, 11, 1, 1, Side::Buy, 100, 10);
-    assert!(
-        has_report(&r, |rep| matches!(
-            rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateRequest,
-                ..
-            }
-        )),
-        "expected DuplicateRequest for stale seq on same key, got: {r:?}"
+    let hwm = client_retry
+        .synchronize_request_seq()
+        .expect("query request_seq HWM on promoted replica");
+    assert_eq!(
+        hwm, 10,
+        "promoted replica lost per-key request_seq HWM: got {hwm}, expected 10"
     );
 }
 
@@ -2737,6 +2730,17 @@ fn rotation_soak_under_load() {
     assert_eq!(count_archives(&replica_journal), 2, "replica archive count");
 
     // ----- Restart and verify recovered state matches -----
+    // primary2 is brought up alone — no replica is spawned alongside it
+    // because this phase only validates journal recovery, not
+    // replication. Run with `--durability-mode local` so the recovered
+    // primary is fully operational without a replica (same pattern the
+    // other "recovered primary, no replica" tests use); default policy
+    // would leave it halted and unable to service client requests.
+    let primary2_extra: Vec<&str> = primary_extra
+        .iter()
+        .copied()
+        .chain(["--durability-mode", "local"])
+        .collect();
     let mut primary2 = spawn_primary_with_extra_env(
         &bin,
         tmp.path(),
@@ -2744,7 +2748,7 @@ fn rotation_soak_under_load() {
         free_port(),
         free_port(),
         free_port(),
-        primary_extra,
+        &primary2_extra,
         extra_env,
     );
     wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(30));

@@ -40,9 +40,69 @@ impl Client {
     /// 2. Signs the nonce with the provided `SigningKey`.
     /// 3. Sends a `ChallengeResponse` (signature + public key).
     /// 4. Waits for `ServerReady` (success) or `AuthFailed`.
+    /// 5. Issues a `QueryRequestSeq` and adopts the engine's per-key
+    ///    request_seq HWM (see [`Client::synchronize_request_seq`]).
+    ///
+    /// Step 5 closes a footgun for reconnecting clients: a fresh
+    /// `Client` starts at `next_seq = 0`, but the engine remembers the
+    /// HWM from any prior session under the same key. Without the
+    /// auto-sync, the first ~N post-reconnect requests come back as
+    /// `RejectReason::DuplicateRequest` until the local counter catches
+    /// up. The cost is one extra round-trip on connect — acceptable, as
+    /// connect is not on the hot path.
+    ///
+    /// # Blocking semantics
+    ///
+    /// Steps 1, 3 and 5 each wait for a server response and will block
+    /// indefinitely if the server never replies. Step 5 in particular
+    /// goes through the engine pipeline, so its response is gated on
+    /// the configured durability policy: connecting to a primary whose
+    /// policy is unsatisfiable (e.g. `primary-needs-replica` with no
+    /// replica attached) will hang here forever. Callers that need a
+    /// bounded wait should use [`Client::connect_with_timeout`].
     pub fn connect(addr: SocketAddr, key: &SigningKey) -> Result<Self, ClientError> {
-        let stream = std::net::TcpStream::connect(addr)?;
+        Self::connect_inner(addr, key, None)
+    }
+
+    /// Like [`Client::connect`], but bounds every read on the
+    /// connection (handshake frames *and* the auto-sync
+    /// `QueryRequestSeq` response) by `timeout`. A handshake that
+    /// stalls — e.g. against a halted primary — returns an
+    /// `io::ErrorKind::WouldBlock` / `TimedOut` error wrapped in
+    /// [`ClientError::Io`] instead of hanging.
+    ///
+    /// The TCP connect itself is also subject to the same `timeout`.
+    /// The read timeout on the returned socket is cleared before
+    /// return, so post-connect calls (`send_request`, etc.) behave
+    /// exactly like the untimed [`Client::connect`] path. Callers that
+    /// also want a steady-state read timeout should call
+    /// [`Client::set_read_timeout`] after this method returns.
+    pub fn connect_with_timeout(
+        addr: SocketAddr,
+        key: &SigningKey,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        Self::connect_inner(addr, key, Some(timeout))
+    }
+
+    /// Shared body for [`Client::connect`] and
+    /// [`Client::connect_with_timeout`]. When `timeout` is `Some`, both
+    /// the TCP connect and every subsequent read run under that bound;
+    /// the timeout is cleared before the constructed client is
+    /// returned so the caller sees the same defaults either way.
+    fn connect_inner(
+        addr: SocketAddr,
+        key: &SigningKey,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Self, ClientError> {
+        let stream = match timeout {
+            Some(t) => std::net::TcpStream::connect_timeout(&addr, t)?,
+            None => std::net::TcpStream::connect(addr)?,
+        };
         stream.set_nodelay(true)?;
+        if let Some(t) = timeout {
+            stream.set_read_timeout(Some(t))?;
+        }
         let mut reader = BlockingFrameReader::new(stream.try_clone()?);
         let mut writer = BlockingFrameWriter::new(stream);
 
@@ -85,12 +145,26 @@ impl Client {
             }
         }
 
-        Ok(Self {
+        let mut client = Self {
             reader,
             writer,
             encode_buf: [0u8; 128],
             next_seq: 0,
-        })
+        };
+
+        // Step 5: Adopt the engine's per-key request_seq HWM so the next
+        // request lands at HWM + 1 instead of 1 (which would dedup if a
+        // prior session under this key already advanced the counter).
+        client.synchronize_request_seq()?;
+
+        // Restore the default (untimed) read behaviour before handing
+        // the client back, so post-connect calls match `connect`'s
+        // contract regardless of which entry point was used.
+        if timeout.is_some() {
+            client.set_read_timeout(None)?;
+        }
+
+        Ok(client)
     }
 
     /// Set a read timeout on the underlying TCP socket. A pending
@@ -141,11 +215,12 @@ impl Client {
     /// Query and adopt the engine's current request_seq HWM for this
     /// connection's authenticated key, then return the value.
     ///
-    /// Reconnecting clients should call this immediately after
-    /// [`Client::connect`] so subsequent requests skip past the dedup
-    /// HWM the engine accumulated under any prior connection lifetime.
-    /// Without it, a fresh client process re-uses seqs starting at 1
-    /// and every request gets `RejectReason::DuplicateRequest`.
+    /// [`Client::connect`] already invokes this automatically — exposed
+    /// publicly so callers that have a reason to suspect their local
+    /// counter has drifted from the engine's (manual reconnect flows,
+    /// scripted recovery tools, long-lived `Client`s carried across
+    /// state changes the transport may have observed) can re-sync
+    /// without tearing the connection down.
     ///
     /// On return, `self.next_seq == hwm`; the next [`Client::send_request`]
     /// will increment to `hwm + 1` before sending. Safe to call against
@@ -204,10 +279,14 @@ mod tests {
     }
 
     /// Run the server side of the challenge-response handshake, accepting
-    /// any valid signature from the test key.
+    /// any valid signature from the test key, then service the auto-sync
+    /// `QueryRequestSeq` that `Client::connect` issues immediately after
+    /// auth. `sync_hwm` is the HWM the server reports; pass `0` to mimic
+    /// a never-before-seen key.
     fn mock_auth_handshake(
         reader: &mut BlockingFrameReader<std::net::TcpStream>,
         writer: &mut BlockingFrameWriter<std::net::TcpStream>,
+        sync_hwm: u64,
     ) {
         use ed25519_dalek::{Verifier, VerifyingKey};
 
@@ -238,6 +317,22 @@ mod tests {
         let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
+
+        // Service the auto-sync QueryRequestSeq: read the query, reply
+        // with RequestSeqHwm + BatchEnd.
+        let frame = reader.read_frame().unwrap().unwrap();
+        let (_seq, req) = codec::decode_request(frame).unwrap();
+        assert!(
+            matches!(req, Request::QueryRequestSeq),
+            "expected auto-sync QueryRequestSeq, got {req:?}"
+        );
+        let written =
+            codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: sync_hwm }, &mut buf)
+                .unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
     }
 
     /// Mock server that authenticates, reads one request, responds with BatchEnd.
@@ -246,7 +341,7 @@ mod tests {
         let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
         let mut writer = BlockingFrameWriter::new(stream);
 
-        mock_auth_handshake(&mut reader, &mut writer);
+        mock_auth_handshake(&mut reader, &mut writer, 0);
 
         // Read one request frame (discard it).
         let _frame = reader.read_frame().unwrap().unwrap();
@@ -280,27 +375,68 @@ mod tests {
     }
 
     #[test]
-    fn synchronize_request_seq_adopts_engine_hwm() {
+    fn connect_auto_syncs_engine_request_seq_hwm() {
+        // Reconnecting against an engine that has already advanced this
+        // key's HWM: the auto-sync in `connect` must pull the HWM so the
+        // first post-connect request lands at HWM + 1 and skips dedup.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Server: complete auth, accept QueryRequestSeq, reply with HWM.
         let server_hwm: u64 = 8423;
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
             let mut writer = BlockingFrameWriter::new(stream);
-            mock_auth_handshake(&mut reader, &mut writer);
+            mock_auth_handshake(&mut reader, &mut writer, server_hwm);
+        });
 
-            // Read the request and verify it's QueryRequestSeq.
+        let key = test_key();
+        let client = Client::connect(addr, &key).unwrap();
+        assert_eq!(client.next_seq, server_hwm);
+    }
+
+    #[test]
+    fn connect_with_fresh_key_starts_at_zero() {
+        // A never-before-seen key: engine replies hwm=0, so next_seq
+        // stays at 0 and the first send increments normally to 1.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+        });
+
+        let key = test_key();
+        let client = Client::connect(addr, &key).unwrap();
+        assert_eq!(client.next_seq, 0);
+    }
+
+    #[test]
+    fn synchronize_request_seq_can_be_called_again_mid_session() {
+        // The public `synchronize_request_seq` still works after the
+        // implicit connect-time sync — exercised by callers that need
+        // to re-sync mid-session.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let later_hwm: u64 = 12_345;
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+            // Auto-sync at connect reports hwm=0; the explicit re-sync
+            // below reports a higher HWM the test should adopt.
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+
             let frame = reader.read_frame().unwrap().unwrap();
             let (_seq, req) = codec::decode_request(frame).unwrap();
             assert!(matches!(req, Request::QueryRequestSeq));
 
-            // Reply: RequestSeqHwm + BatchEnd, mirroring the live pipeline.
             let mut buf = [0u8; 64];
             let written =
-                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: server_hwm }, &mut buf)
+                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: later_hwm }, &mut buf)
                     .unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
@@ -310,38 +446,69 @@ mod tests {
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
-        // Pre-call: next_seq advances to 1 on the next send. Post-call:
-        // it sits at server_hwm, so the next send increments to hwm+1.
+        assert_eq!(client.next_seq, 0);
         let returned = client.synchronize_request_seq().unwrap();
-        assert_eq!(returned, server_hwm);
-        assert_eq!(client.next_seq, server_hwm);
+        assert_eq!(returned, later_hwm);
+        assert_eq!(client.next_seq, later_hwm);
     }
 
     #[test]
-    fn synchronize_request_seq_handles_fresh_key() {
-        // A never-before-seen key reads back hwm=0; next_seq stays at 0
-        // and the next send increments normally to 1.
+    fn connect_with_timeout_returns_error_when_server_never_responds() {
+        // Server accepts the TCP connection but never sends the
+        // Challenge — `connect` would block forever on the read in
+        // step 1. `connect_with_timeout` must surface a timeout error
+        // instead of hanging.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+
+        // Hold the accepted stream alive for the duration of the test
+        // so the client doesn't observe a clean EOF — we want it to
+        // genuinely time out reading, not race against close().
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
-            let mut writer = BlockingFrameWriter::new(stream);
-            mock_auth_handshake(&mut reader, &mut writer);
-            let _ = reader.read_frame().unwrap().unwrap();
-            let mut buf = [0u8; 64];
-            let written =
-                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: 0 }, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = rx.recv();
         });
 
         let key = test_key();
-        let mut client = Client::connect(addr, &key).unwrap();
-        assert_eq!(client.synchronize_request_seq().unwrap(), 0);
-        assert_eq!(client.next_seq, 0);
+        let started = std::time::Instant::now();
+        let result =
+            Client::connect_with_timeout(addr, &key, std::time::Duration::from_millis(150));
+        let elapsed = started.elapsed();
+        let _ = tx.send(());
+
+        assert!(
+            matches!(result.as_ref(), Err(ClientError::Io(_))),
+            "expected io timeout error, got Err = {:?}",
+            result.err()
+        );
+        // Sanity: returned promptly rather than waiting on the default
+        // socket timeout (minutes on Linux).
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "connect_with_timeout took too long ({elapsed:?}) — did the bound apply?"
+        );
+    }
+
+    #[test]
+    fn connect_with_timeout_clears_socket_timeout_on_success() {
+        // After `connect_with_timeout` returns successfully, the read
+        // timeout the helper installed must be cleared so post-connect
+        // calls behave like the untimed `connect` path. Otherwise an
+        // idle `send_request` against a slow but healthy server would
+        // start failing once the bound elapsed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || mock_batch_end_server(listener));
+
+        let key = test_key();
+        let client = Client::connect_with_timeout(addr, &key, std::time::Duration::from_secs(2))
+            .expect("connect_with_timeout");
+        let socket_timeout = client.reader.get_ref().read_timeout().unwrap();
+        assert!(
+            socket_timeout.is_none(),
+            "expected read timeout to be cleared after successful connect, got {socket_timeout:?}"
+        );
     }
 
     #[test]
@@ -472,7 +639,7 @@ mod tests {
             let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
             let mut writer = BlockingFrameWriter::new(stream);
 
-            mock_auth_handshake(&mut reader, &mut writer);
+            mock_auth_handshake(&mut reader, &mut writer, 0);
 
             // Read the request.
             let _frame = reader.read_frame().unwrap().unwrap();
@@ -508,7 +675,7 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
             let mut writer = BlockingFrameWriter::new(stream);
-            mock_auth_handshake(&mut reader, &mut writer);
+            mock_auth_handshake(&mut reader, &mut writer, 0);
             let _frame = reader.read_frame().unwrap();
             // Drop without sending BatchEnd.
         });
