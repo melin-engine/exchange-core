@@ -7,14 +7,12 @@ edition = "2024"
 latency-trace = []
 
 [dependencies]
-blake3 = { workspace = true }
-ed25519-dalek = { workspace = true }
 # Typed views over raw byte buffers for the wire frame header —
 # replaces hand-rolled le::put / le::get pairs. derive feature for
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-types = { path = "../types" }
+melin-wire-protocol = { path = "../../core/wire-protocol" }
 
 [dev-dependencies]
 bolero = "0.13"
-tempfile = "3"

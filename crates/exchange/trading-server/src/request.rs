@@ -8,9 +8,9 @@
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_protocol::codec;
-use melin_protocol::error::ProtocolError;
 use melin_protocol::message::Request;
 use melin_trading::trading_event::TradingEvent;
+use melin_wire_protocol::error::ProtocolError;
 
 /// Decoder for the trading wire protocol.
 ///

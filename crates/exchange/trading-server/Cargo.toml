@@ -22,6 +22,7 @@ melin-disruptor = { path = "../../core/disruptor" }
 melin-engine = { path = "../engine" }
 melin-journal = { path = "../../core/journal" }
 melin-protocol = { path = "../protocol" }
+melin-wire-protocol = { path = "../../core/wire-protocol" }
 melin-trading = { path = "../trading" }
 melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }

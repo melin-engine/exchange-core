@@ -6,10 +6,10 @@ use std::net::SocketAddr;
 
 use ed25519_dalek::{Signer, SigningKey};
 
-use melin_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_protocol::codec;
-use melin_protocol::error::ProtocolError;
 use melin_protocol::message::{Request, ResponseKind};
+use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
+use melin_wire_protocol::error::ProtocolError;
 
 use crate::{ClientError, StatsSnapshot};
 

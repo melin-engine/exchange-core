@@ -78,10 +78,10 @@ use hdrhistogram::Histogram;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 #[cfg(not(feature = "dpdk"))]
-use melin_protocol::transport::BlockingTransportListener;
-#[cfg(not(feature = "dpdk"))]
 use melin_server::runtime::server::ServerConfig;
 use melin_types::types::*;
+#[cfg(not(feature = "dpdk"))]
+use melin_wire_protocol::transport::BlockingTransportListener;
 
 /// Number of completed orders between latency time-series samples.
 /// Each sample captures interval p99/p99.9 (reset after each sample),
@@ -1753,7 +1753,7 @@ fn run_roundtrip_bench(
     let effective_health_addr = health_addr.or(config.health_bind);
 
     if use_uds {
-        use melin_protocol::uds::BlockingUdsListener;
+        use melin_wire_protocol::uds::BlockingUdsListener;
 
         let sock_path = tmp_dir.join("bench.sock");
         let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
@@ -1790,7 +1790,7 @@ fn run_roundtrip_bench(
             max_reject_pct,
         );
     } else {
-        use melin_protocol::tcp::BlockingTcpListener;
+        use melin_wire_protocol::tcp::BlockingTcpListener;
 
         let listener = BlockingTcpListener::bind("127.0.0.1:0".parse().expect("valid addr"))
             .expect("bind TCP");

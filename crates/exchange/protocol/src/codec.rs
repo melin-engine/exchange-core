@@ -37,8 +37,8 @@ use melin_types::types::{
 use zerocopy::little_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::error::ProtocolError;
 use crate::message::{Request, ResponseKind};
+use melin_wire_protocol::error::ProtocolError;
 
 // --- Wire header structs ---
 //

@@ -69,9 +69,9 @@ pub type EventPublisherFn<A> = fn(
     busy_spin: bool,
 );
 
-use melin_protocol::blocking::BlockingFrameWriter;
 use melin_protocol::message::ConnectionId;
-use melin_protocol::transport::BlockingTransportListener;
+use melin_wire_protocol::blocking::BlockingFrameWriter;
+use melin_wire_protocol::transport::BlockingTransportListener;
 
 /// Default replica pipeline depth (pending ack queue capacity).
 const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 8;
@@ -1938,7 +1938,7 @@ where
                 // TODO: run_as_primary_dpdk — for now, fall back to
                 // kernel TCP primary after promotion.
                 warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
-                let listener = melin_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+                let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
                 return run_as_primary::<A, _, W>(
                     exchange,
                     writer,

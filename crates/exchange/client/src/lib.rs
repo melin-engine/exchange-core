@@ -6,7 +6,7 @@
 
 use std::io;
 
-use melin_protocol::error::ProtocolError;
+use melin_wire_protocol::error::ProtocolError;
 
 /// Error returned by client operations.
 #[derive(Debug)]

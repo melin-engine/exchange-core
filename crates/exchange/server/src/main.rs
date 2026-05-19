@@ -28,9 +28,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
-#[cfg(not(feature = "dpdk"))]
-use melin_protocol::tcp::BlockingTcpListener;
 use melin_server::runtime::server::ServerConfig;
+#[cfg(not(feature = "dpdk"))]
+use melin_wire_protocol::tcp::BlockingTcpListener;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()

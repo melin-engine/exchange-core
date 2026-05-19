@@ -31,7 +31,7 @@ pub enum ControlEvent {
     Connected {
         connection_id: u64,
         fd: std::os::unix::io::RawFd,
-        writer: melin_protocol::blocking::BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
+        writer: melin_wire_protocol::blocking::BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
     },
     Disconnected {
         connection_id: u64,

@@ -1,15 +1,9 @@
-//! Wire protocol for the trading engine.
-//!
-//! Defines message types, binary codec, and transport abstraction.
-//! Shared by the server and client crates.
+//! Trading-shaped wire protocol: `Request` / `Response` enums and the
+//! binary codec. Framing, transport listeners, and the protocol error
+//! type live in `melin-wire-protocol`.
 
-pub mod blocking;
 pub mod codec;
-pub mod error;
 pub mod message;
-pub mod tcp;
-pub mod transport;
-pub mod uds;
 
 /// Re-export engine types that clients need to construct requests and
 /// interpret responses, so they don't need a direct dependency on the

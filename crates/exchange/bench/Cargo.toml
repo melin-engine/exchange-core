@@ -76,6 +76,7 @@ melin-types = { path = "../types" }
 melin-journal = { path = "../../core/journal" }
 melin-disruptor = { path = "../../core/disruptor" }
 melin-protocol = { path = "../protocol" }
+melin-wire-protocol = { path = "../../core/wire-protocol" }
 melin-server = { path = "../server", default-features = false }
 melin-app = { path = "../../core/app" }
 melin-transport-core = { path = "../../core/transport-core" }

@@ -90,6 +90,7 @@ melin-types = { path = "../types" }
 melin-disruptor = { path = "../../core/disruptor" }
 melin-market-data = { path = "../market-data", optional = true }
 melin-protocol = { path = "../protocol" }
+melin-wire-protocol = { path = "../../core/wire-protocol" }
 blake3 = "1"
 clap = { workspace = true }
 base64 = { workspace = true }

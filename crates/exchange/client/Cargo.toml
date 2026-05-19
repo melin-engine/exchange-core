@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 ed25519-dalek = { workspace = true }
 melin-protocol = { path = "../protocol" }
+melin-wire-protocol = { path = "../../core/wire-protocol" }

@@ -173,7 +173,7 @@ fn read_frame(reader: &mut dyn io::Read) -> Result<(u64, ResponseKind), Snapshot
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(io::Error),
-    Protocol(melin_protocol::error::ProtocolError),
+    Protocol(melin_wire_protocol::error::ProtocolError),
     FrameTooLarge(usize),
     DuplicateSymbol(Symbol),
 }
@@ -184,8 +184,8 @@ impl From<io::Error> for SnapshotError {
     }
 }
 
-impl From<melin_protocol::error::ProtocolError> for SnapshotError {
-    fn from(e: melin_protocol::error::ProtocolError) -> Self {
+impl From<melin_wire_protocol::error::ProtocolError> for SnapshotError {
+    fn from(e: melin_wire_protocol::error::ProtocolError) -> Self {
         Self::Protocol(e)
     }
 }
