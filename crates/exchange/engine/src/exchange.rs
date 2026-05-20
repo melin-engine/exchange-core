@@ -275,12 +275,17 @@ impl TokenBucket {
         // in by `rate_limit_clock_backwards_is_defensive_not_panic`.
         if now_ns > self.last_refill_ns {
             let elapsed = now_ns - self.last_refill_ns;
-            // u128 intermediate to avoid overflow at extreme rates: at
-            // u32::MAX rate × ~3.4e9 elapsed ns the product overflows u64.
-            // Pre-clamp by burst so the cast back to u64 is always safe
-            // (burst fits in u32, so `min(burst)` fits in u64).
-            let earned =
-                ((elapsed as u128 * rate as u128) / 1_000_000_000u128).min(burst as u128) as u64;
+            // saturating_mul instead of u128: at u32::MAX rate × ~4.3e9
+            // elapsed ns the product overflows u64. On overflow we cap at
+            // u64::MAX which, divided by 1e9, still exceeds any u32 burst,
+            // so the .min(burst) below yields the same result as the
+            // u128 form (saturation absorbs the overflow case). The u64
+            // form lets the compiler emit a magic-number multiply for
+            // the constant-1e9 divide and a single `div` for /rate, vs
+            // the ~50ns __udivti3 library call per event the u128 form
+            // emitted on the matching hot path (perf: ~2.6% of total
+            // CPU).
+            let earned = (elapsed.saturating_mul(rate as u64) / 1_000_000_000).min(burst as u64);
             let new_tokens = (self.tokens + earned).min(burst as u64);
             if new_tokens >= burst as u64 {
                 // Bucket is at capacity — discard any remaining elapsed
@@ -289,8 +294,10 @@ impl TokenBucket {
             } else if earned > 0 {
                 // Below cap and we earned tokens — advance by exactly the
                 // time those tokens consumed, preserving fractional-token
-                // time below one token's worth.
-                let consumed_ns = ((earned as u128 * 1_000_000_000u128) / rate as u128) as u64;
+                // time below one token's worth. We reach this branch only
+                // when new_tokens < burst, so earned < burst ≤ u32::MAX,
+                // and earned × 1e9 < 4.3e18 fits in u64 with room to spare.
+                let consumed_ns = (earned * 1_000_000_000) / rate as u64;
                 self.last_refill_ns += consumed_ns;
             }
             // else: earned == 0 (sub-token time elapsed, bucket below
