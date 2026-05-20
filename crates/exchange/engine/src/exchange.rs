@@ -11192,4 +11192,35 @@ mod tests {
             "after burst orders the bucket must reject — no phantom credit from u64::MAX",
         );
     }
+
+    #[test]
+    fn rate_limit_refill_saturation_grants_full_burst() {
+        // The u64 saturating_mul rewrite (replacing the u128 intermediate)
+        // is correct iff overflow of `elapsed * rate` produces u64::MAX,
+        // which after /1e9 still exceeds any u32 burst — so .min(burst)
+        // yields the same answer the u128 version would have produced
+        // (a fully-refilled bucket). Drive that path directly: at the
+        // largest legal rate and a near-u64::MAX elapsed time, the
+        // multiply saturates and the bucket must end up at exactly
+        // `burst` tokens (no fewer due to truncation, no more due to
+        // forgotten clamp).
+        let mut bucket = TokenBucket {
+            tokens: 0,
+            last_refill_ns: 0,
+        };
+        let burst: u32 = 1000;
+        let rate: u32 = u32::MAX;
+        // now_ns chosen so `elapsed * rate` overflows u64
+        // (u64::MAX / u32::MAX ≈ 4.29e9 — pick larger).
+        bucket.refill(u64::MAX, rate, burst);
+        assert_eq!(
+            bucket.tokens, burst as u64,
+            "saturation path must grant exactly `burst` tokens",
+        );
+        assert_eq!(
+            bucket.last_refill_ns,
+            u64::MAX,
+            "bucket-at-capacity branch must snap last_refill_ns to now",
+        );
+    }
 }
