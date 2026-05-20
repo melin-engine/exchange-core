@@ -94,6 +94,12 @@ fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> HealthReport {
     let mut samples = Vec::new();
     let mut dropped: u64 = 0;
     let mut warned = false;
+    // Only count drops once we've seen a successful scrape — pre-startup
+    // failures (server not yet listening on /metrics) would otherwise
+    // conflate with under-load failures, which is the signal users care
+    // about. The warn below still fires on the very first failure so a
+    // fully-broken endpoint isn't silent.
+    let mut seen_success = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(POLL_INTERVAL);
@@ -103,9 +109,14 @@ fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> HealthReport {
         }
 
         match scrape_metrics(addr, start) {
-            Some(sample) => samples.push(sample),
+            Some(sample) => {
+                seen_success = true;
+                samples.push(sample);
+            }
             None => {
-                dropped += 1;
+                if seen_success {
+                    dropped += 1;
+                }
                 if !warned {
                     warned = true;
                     tracing::warn!(
