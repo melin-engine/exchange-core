@@ -12,9 +12,9 @@ use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::scheduler::{ScheduledTask, ScheduledTaskHeap, ScheduledTaskKind};
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
-    InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason,
-    ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, FxHashMap, HashMap,
+    HashMap4, InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
+    RejectReason, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
 
 /// Helper: get an immutable reference to the InstrumentState at `symbol`.
@@ -85,7 +85,13 @@ pub struct Exchange {
     /// forever," which keeps the gateway's session-local id_map workable
     /// across reconnects without needing to query the engine for HWMs.
     /// Used as a set: the unit value carries no information.
-    live_order_ids: HashMap4<(AccountId, OrderId), ()>,
+    /// Open-addressing (hashbrown) rather than the project's HashMap4
+    /// (astenn) — `(AccountId, OrderId)` has unbounded distinct keys
+    /// under the bench's churn pattern but bounded live count, exactly
+    /// the workload extendible hashing handles poorly (directory grows
+    /// with lifetime inserts). Hashbrown's backshift deletion keeps
+    /// capacity tracking the live set.
+    live_order_ids: FxHashMap<(AccountId, OrderId), ()>,
     /// Per-account count of resting orders (on the book or pending stops).
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
@@ -365,7 +371,7 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            live_order_ids: HashMap4::default(),
+            live_order_ids: FxHashMap::default(),
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
@@ -392,8 +398,10 @@ impl Exchange {
             // 1M live-order slots × ~24 bytes per entry ≈ 24 MB. Sized
             // for the default benchmark's peak resting depth — orders
             // turn over fast at 10M ord/s so the live count is much
-            // smaller than the lifetime total.
-            live_order_ids: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            // smaller than the lifetime total. hashbrown-backed: the
+            // bounded-live-count + unbounded-distinct-keys workload
+            // doesn't grow the table once warmup settles.
+            live_order_ids: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
             // 1M accounts × ~32 bytes per entry ≈ 32 MB. Covers the
             // default benchmark (1M accounts) with no hot-path resizes.
             // Pages are faulted during prefault() via insert/clear.
@@ -443,7 +451,7 @@ impl Exchange {
         Self {
             instruments: Vec::with_capacity(num_instruments.max(64)),
             accounts: AccountManager::with_balance_capacity(balance_capacity),
-            live_order_ids: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            live_order_ids: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
             order_counts: HashMap4::with_capacity_and_hasher(
                 num_accounts.max(1_000_000),
                 Default::default(),
@@ -478,7 +486,7 @@ impl Exchange {
         // so the snapshot doesn't carry them — the only source of truth
         // is the order index.
         let mut order_counts: HashMap4<AccountId, u32> = HashMap4::default();
-        let mut live_order_ids: HashMap4<(AccountId, OrderId), ()> = HashMap4::default();
+        let mut live_order_ids: FxHashMap<(AccountId, OrderId), ()> = FxHashMap::default();
         for inst in &instruments {
             if let Some(inst) = inst.as_deref() {
                 for ((account, order_id), _) in inst.book.active_order_slots() {
