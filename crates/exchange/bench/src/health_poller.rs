@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Polling interval between metric scrapes.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Polling interval between metric scrapes. 1 Hz keeps the poller out of
+/// the bench-host CPU budget; 100 ms was starving alongside the pacer.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read timeout for the HTTP response. Short because the metrics endpoint
 /// is a small, fast response — if it takes longer something is wrong.
@@ -42,10 +43,20 @@ pub struct HealthSample {
     pub extra: HashMap<String, f64>,
 }
 
+/// Final output of a poller run: the captured samples plus a count of
+/// scrapes that failed (connect refused, read timeout, truncated body, parse
+/// error). A non-zero `dropped` count means the gauge time series has gaps
+/// vs the configured cadence — surface it so users notice when the server
+/// can't render `/metrics` fast enough under load.
+pub struct HealthReport {
+    pub samples: Vec<HealthSample>,
+    pub dropped: u64,
+}
+
 /// Background poller that scrapes the Prometheus `/metrics` endpoint at
 /// regular intervals and collects timestamped health samples.
 pub struct HealthPoller {
-    handle: Option<std::thread::JoinHandle<Vec<HealthSample>>>,
+    handle: Option<std::thread::JoinHandle<HealthReport>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -66,8 +77,8 @@ impl HealthPoller {
         }
     }
 
-    /// Signal the poller to stop and return all collected samples.
-    pub fn stop(mut self) -> Vec<HealthSample> {
+    /// Signal the poller to stop and return the captured report.
+    pub fn stop(mut self) -> HealthReport {
         self.shutdown.store(true, Ordering::Relaxed);
         self.handle
             .take()
@@ -78,9 +89,17 @@ impl HealthPoller {
 }
 
 /// Main polling loop. Runs until `shutdown` is set.
-fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> Vec<HealthSample> {
+fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> HealthReport {
     let start = Instant::now();
     let mut samples = Vec::new();
+    let mut dropped: u64 = 0;
+    let mut warned = false;
+    // Only count drops once we've seen a successful scrape — pre-startup
+    // failures (server not yet listening on /metrics) would otherwise
+    // conflate with under-load failures, which is the signal users care
+    // about. The warn below still fires on the very first failure so a
+    // fully-broken endpoint isn't silent.
+    let mut seen_success = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(POLL_INTERVAL);
@@ -89,12 +108,26 @@ fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> Vec<HealthSample> {
             break;
         }
 
-        if let Some(sample) = scrape_metrics(addr, start) {
-            samples.push(sample);
+        match scrape_metrics(addr, start) {
+            Some(sample) => {
+                seen_success = true;
+                samples.push(sample);
+            }
+            None => {
+                if seen_success {
+                    dropped += 1;
+                }
+                if !warned {
+                    warned = true;
+                    tracing::warn!(
+                        "health scrape failed — subsequent failures will be counted silently"
+                    );
+                }
+            }
         }
     }
 
-    samples
+    HealthReport { samples, dropped }
 }
 
 /// Connect to the health endpoint, send `GET /metrics`, parse the response.
@@ -110,15 +143,29 @@ fn scrape_metrics(addr: SocketAddr, start: Instant) -> Option<HealthSample> {
         .ok()?;
 
     // Read the full response. The metrics payload is ~3 KiB with
-    // per-replica replication metrics.
-    let mut buf = [0u8; 8192];
+    // per-replica replication metrics; 16 KiB leaves headroom for new
+    // gauges so legitimate responses don't bump into the buffer ceiling.
+    let mut buf = [0u8; 16384];
     let mut total = 0;
+    // Distinguish "server closed the socket" (HTTP/1.1 `Connection: close`
+    // delimits the body by EOF) from "read timed out mid-response" — under
+    // load the server can take longer than READ_TIMEOUT to render the full
+    // metrics payload, and parsing a truncated body produces a sample with
+    // late-emitted gauges silently defaulted to 0. We treat anything other
+    // than a clean EOF as an incomplete scrape and drop the sample.
+    let mut got_eof = false;
     loop {
         match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
+            Ok(0) => {
+                got_eof = true;
+                break;
+            }
             Ok(n) => {
                 total += n;
                 if total >= buf.len() {
+                    // Buffer full before EOF — response is larger than we
+                    // budgeted for. Drop rather than parse a guaranteed-
+                    // truncated body.
                     break;
                 }
             }
@@ -126,6 +173,9 @@ fn scrape_metrics(addr: SocketAddr, start: Instant) -> Option<HealthSample> {
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(_) => return None,
         }
+    }
+    if !got_eof {
+        return None;
     }
 
     let body = std::str::from_utf8(&buf[..total]).ok()?;
@@ -325,5 +375,75 @@ melin_events_processed 100
         let sample = parse_prometheus(text, 0.0).expect("should parse");
         assert_eq!(sample.active_connections, 10);
         assert_eq!(sample.events_processed, 200);
+    }
+
+    /// In-process HTTP-ish server for `scrape_metrics` tests. `body` is sent
+    /// over a fresh TCP connection; `close_after_body=true` half-closes the
+    /// socket to mimic the real server's `Connection: close` EOF, while
+    /// `false` keeps the socket open until `release` is signaled, so the
+    /// client's read times out (the truncation scenario this fix targets).
+    fn spawn_fake_metrics(
+        body: Vec<u8>,
+        close_after_body: bool,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Drain the request so the client's write doesn't get a RST; we
+            // don't validate its contents, the scrape format is fixed.
+            let mut req = [0u8; 256];
+            let _ = stream.read(&mut req);
+            stream.write_all(&body).expect("write body");
+            if close_after_body {
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            } else {
+                // Block until the test signals release (or the channel is
+                // dropped). Keeps the socket parked while the client's
+                // READ_TIMEOUT fires, without a fixed sleep.
+                let _ = release_rx.recv();
+            }
+        });
+        (addr, release_tx, handle)
+    }
+
+    #[test]
+    fn scrape_drops_sample_when_response_truncated() {
+        // Server writes a partial response (only the early base gauges,
+        // mimicking truncation before the labeled `melin_replica_*`
+        // metrics) and never closes. Read times out → sample dropped.
+        let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n\
+                     melin_active_connections 16\n\
+                     melin_trading_active 1\n"
+            .to_vec();
+        let (addr, release, handle) = spawn_fake_metrics(body, false);
+        let result = scrape_metrics(addr, Instant::now());
+        let _ = release.send(());
+        handle.join().ok();
+        assert!(
+            result.is_none(),
+            "truncated response must not produce a sample"
+        );
+    }
+
+    #[test]
+    fn scrape_accepts_complete_response() {
+        // Same payload, but the server closes the socket after writing it.
+        // The client receives EOF and the sample is accepted.
+        let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n\
+                     melin_active_connections 16\n\
+                     melin_trading_active 1\n"
+            .to_vec();
+        let (addr, _release, handle) = spawn_fake_metrics(body, true);
+        let result = scrape_metrics(addr, Instant::now());
+        handle.join().ok();
+        let sample = result.expect("complete response must produce a sample");
+        assert_eq!(sample.active_connections, 16);
+        assert!(sample.trading_active);
     }
 }
