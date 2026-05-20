@@ -43,10 +43,20 @@ pub struct HealthSample {
     pub extra: HashMap<String, f64>,
 }
 
+/// Final output of a poller run: the captured samples plus a count of
+/// scrapes that failed (connect refused, read timeout, truncated body, parse
+/// error). A non-zero `dropped` count means the gauge time series has gaps
+/// vs the configured cadence — surface it so users notice when the server
+/// can't render `/metrics` fast enough under load.
+pub struct HealthReport {
+    pub samples: Vec<HealthSample>,
+    pub dropped: u64,
+}
+
 /// Background poller that scrapes the Prometheus `/metrics` endpoint at
 /// regular intervals and collects timestamped health samples.
 pub struct HealthPoller {
-    handle: Option<std::thread::JoinHandle<Vec<HealthSample>>>,
+    handle: Option<std::thread::JoinHandle<HealthReport>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -67,8 +77,8 @@ impl HealthPoller {
         }
     }
 
-    /// Signal the poller to stop and return all collected samples.
-    pub fn stop(mut self) -> Vec<HealthSample> {
+    /// Signal the poller to stop and return the captured report.
+    pub fn stop(mut self) -> HealthReport {
         self.shutdown.store(true, Ordering::Relaxed);
         self.handle
             .take()
@@ -79,9 +89,11 @@ impl HealthPoller {
 }
 
 /// Main polling loop. Runs until `shutdown` is set.
-fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> Vec<HealthSample> {
+fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> HealthReport {
     let start = Instant::now();
     let mut samples = Vec::new();
+    let mut dropped: u64 = 0;
+    let mut warned = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(POLL_INTERVAL);
@@ -90,12 +102,21 @@ fn poll_loop(addr: SocketAddr, shutdown: Arc<AtomicBool>) -> Vec<HealthSample> {
             break;
         }
 
-        if let Some(sample) = scrape_metrics(addr, start) {
-            samples.push(sample);
+        match scrape_metrics(addr, start) {
+            Some(sample) => samples.push(sample),
+            None => {
+                dropped += 1;
+                if !warned {
+                    warned = true;
+                    tracing::warn!(
+                        "health scrape failed — subsequent failures will be counted silently"
+                    );
+                }
+            }
         }
     }
 
-    samples
+    HealthReport { samples, dropped }
 }
 
 /// Connect to the health endpoint, send `GET /metrics`, parse the response.
@@ -348,29 +369,36 @@ melin_events_processed 100
     /// In-process HTTP-ish server for `scrape_metrics` tests. `body` is sent
     /// over a fresh TCP connection; `close_after_body=true` half-closes the
     /// socket to mimic the real server's `Connection: close` EOF, while
-    /// `false` keeps the socket open so the read times out (the truncation
-    /// scenario this fix targets).
+    /// `false` keeps the socket open until `release` is signaled, so the
+    /// client's read times out (the truncation scenario this fix targets).
     fn spawn_fake_metrics(
         body: Vec<u8>,
         close_after_body: bool,
-    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            // Drain the request so the client's write doesn't get a RST.
+            // Drain the request so the client's write doesn't get a RST; we
+            // don't validate its contents, the scrape format is fixed.
             let mut req = [0u8; 256];
             let _ = stream.read(&mut req);
             stream.write_all(&body).expect("write body");
             if close_after_body {
                 stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
             } else {
-                // Keep the socket parked until the client gives up — the
-                // poller's READ_TIMEOUT will fire before this returns.
-                std::thread::sleep(Duration::from_millis(500));
+                // Block until the test signals release (or the channel is
+                // dropped). Keeps the socket parked while the client's
+                // READ_TIMEOUT fires, without a fixed sleep.
+                let _ = release_rx.recv();
             }
         });
-        (addr, handle)
+        (addr, release_tx, handle)
     }
 
     #[test]
@@ -382,8 +410,9 @@ melin_events_processed 100
                      melin_active_connections 16\n\
                      melin_trading_active 1\n"
             .to_vec();
-        let (addr, handle) = spawn_fake_metrics(body, false);
+        let (addr, release, handle) = spawn_fake_metrics(body, false);
         let result = scrape_metrics(addr, Instant::now());
+        let _ = release.send(());
         handle.join().ok();
         assert!(
             result.is_none(),
@@ -399,7 +428,7 @@ melin_events_processed 100
                      melin_active_connections 16\n\
                      melin_trading_active 1\n"
             .to_vec();
-        let (addr, handle) = spawn_fake_metrics(body, true);
+        let (addr, _release, handle) = spawn_fake_metrics(body, true);
         let result = scrape_metrics(addr, Instant::now());
         handle.join().ok();
         let sample = result.expect("complete response must produce a sample");
