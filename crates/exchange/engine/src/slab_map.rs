@@ -49,6 +49,7 @@ enum Slot<V> {
 /// shape the engine uses; generalising would add a type parameter for
 /// negligible benefit.
 #[allow(dead_code)] // call sites land in the next commit on the same branch
+#[derive(Debug)]
 pub(crate) struct SlabMap<V> {
     /// `(AccountId, OrderId)` → slot_id (`u32`). hashbrown-backed via
     /// `std`. `FxBuildHasher` matches the hasher astenn used so the
