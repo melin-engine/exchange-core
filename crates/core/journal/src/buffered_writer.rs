@@ -280,6 +280,7 @@ impl<E: AppEvent> BufferedWriter<E> {
         let allocated_end = fallocate_chunk(&file, valid_end)?;
         file.sync_all()?;
 
+        // `mut` only used under `hash-chain` (mid-segment hasher rebuild below).
         #[allow(unused_mut)]
         let mut writer = Self {
             _marker: PhantomData,

@@ -615,6 +615,7 @@ impl<E: AppEvent> SectorWriter<E> {
         Self::lock_buffer(spare_buf.as_ptr(), BATCH_BUF_CAPACITY);
         Self::lock_buffer(tail_sector.as_ptr(), sector_size);
 
+        // `mut` only used under `hash-chain` (mid-segment hasher rebuild below).
         #[allow(unused_mut)]
         let mut writer = Self {
             _marker: PhantomData,
