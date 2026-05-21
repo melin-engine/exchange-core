@@ -48,6 +48,7 @@ pub struct HealthSample {
 /// error). A non-zero `dropped` count means the gauge time series has gaps
 /// vs the configured cadence — surface it so users notice when the server
 /// can't render `/metrics` fast enough under load.
+#[derive(Default)]
 pub struct HealthReport {
     pub samples: Vec<HealthSample>,
     pub dropped: u64,

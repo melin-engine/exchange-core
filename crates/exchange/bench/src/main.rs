@@ -1193,8 +1193,7 @@ fn run_engine_bench(
         &extra_lines,
         json_path,
         &series,
-        &[],
-        0,
+        &health_poller::HealthReport::default(),
         // Engine mode runs the matching engine in-process with no
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
@@ -1628,8 +1627,7 @@ where
         &extra_lines,
         json_path,
         &Vec::new(),
-        &[],
-        0,
+        &health_poller::HealthReport::default(),
         // Pipeline mode runs the disruptor stages in-process with no
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
@@ -2364,12 +2362,7 @@ fn run_uring_roundtrip<R, W, F>(
     let _ = progress_handle.join();
 
     // Collect health samples.
-    let (health_samples, health_dropped) = health_poller
-        .map(|p| {
-            let r = p.stop();
-            (r.samples, r.dropped)
-        })
-        .unwrap_or_default();
+    let health = health_poller.map(|p| p.stop()).unwrap_or_default();
 
     // Measure throughput over the measured phase only — from when the
     // first thread finished warmup until either `end` (captured above,
@@ -2443,8 +2436,7 @@ fn run_uring_roundtrip<R, W, F>(
         &extra_lines,
         json_path,
         &all_series,
-        &health_samples,
-        health_dropped,
+        &health,
         &server_stages,
         pacing_report.as_ref(),
         Some(&outcomes),
@@ -3152,8 +3144,7 @@ pub(crate) fn print_results(
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
     series: &[LatencySample],
-    health_samples: &[health_poller::HealthSample],
-    health_dropped: u64,
+    health: &health_poller::HealthReport,
     server_stages: &stats_client::Body,
     pacing: Option<&PacingReport>,
     outcomes: Option<&OutcomeReport>,
@@ -3188,30 +3179,33 @@ pub(crate) fn print_results(
 
     // Print health summary if we collected anything — drops alone (no
     // successful sample) still warrant a line so the gap is visible.
-    if !health_samples.is_empty() || health_dropped > 0 {
-        let duration = health_samples.last().map_or(0.0, |s| s.elapsed_secs)
-            - health_samples.first().map_or(0.0, |s| s.elapsed_secs);
-        let peak_depth = health_samples
+    if !health.samples.is_empty() || health.dropped > 0 {
+        let duration = health.samples.last().map_or(0.0, |s| s.elapsed_secs)
+            - health.samples.first().map_or(0.0, |s| s.elapsed_secs);
+        let peak_depth = health
+            .samples
             .iter()
             .map(|s| s.input_queue_depth)
             .max()
             .unwrap_or(0);
-        let capacity = health_samples
+        let capacity = health
+            .samples
             .iter()
             .map(|s| s.input_queue_capacity)
             .max()
             .unwrap_or(0);
-        let final_events = health_samples.last().map_or(0, |s| s.events_processed);
+        let final_events = health.samples.last().map_or(0, |s| s.events_processed);
         println!();
-        let total = health_samples.len() as u64 + health_dropped;
+        let total = health.samples.len() as u64 + health.dropped;
         let drop_pct = if total > 0 {
-            health_dropped as f64 / total as f64 * 100.0
+            health.dropped as f64 / total as f64 * 100.0
         } else {
             0.0
         };
         println!(
-            "  Health ({} samples over {duration:.1}s, {health_dropped} dropped, {drop_pct:.1}%)",
-            health_samples.len()
+            "  Health ({} samples over {duration:.1}s, {dropped} dropped, {drop_pct:.1}%)",
+            health.samples.len(),
+            dropped = health.dropped,
         );
         if capacity > 0 {
             let pct = peak_depth as f64 / capacity as f64 * 100.0;
@@ -3279,10 +3273,10 @@ pub(crate) fn print_results(
         };
 
         // Serialize health samples (fixed fields + any extra metrics).
-        let health_json = if health_samples.is_empty() {
+        let health_json = if health.samples.is_empty() {
             String::from("[]")
         } else {
-            let entries: Vec<String> = health_samples
+            let entries: Vec<String> = health.samples
                 .iter()
                 .map(|s| {
                     let mut json = format!(
