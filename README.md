@@ -69,6 +69,18 @@ Same hybrid gate as above, just at window=1 so queueing drops out entirely. The 
 
 ![Latency stability — dual replication](docs/plots/latency-stability-tcp-dual-repl-throughput.png)
 
+### Matching engine in isolation
+
+Just the matching engine, no network, no journal, no replication. Measures the `Exchange::execute()` hot path on a single core under the same realistic order flow; 30 s measurement window after 10 s warmup. Commit [`95a3ddbb`](../../commit/95a3ddbb).
+
+Single AMD EPYC 9255 (24C Zen 5, SMT off, latency-tuned BIOS).
+
+| Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 | p99.9999 | p99.99999 | max |
+|------------|-----|-----|-------|--------|---------|----------|-----------|-----|
+| **4.60M/s** | 0.10 µs | 0.42 µs | 0.58 µs | 0.77 µs | 0.99 µs | 1.17 µs | 1.35 µs | 1.79 µs |
+
+Reproducible via `cargo run --release -p melin-bench -- --mode engine --bench-cores=11`. Reaching these figures requires extensive kernel and BIOS tuning. Without it, periodic firmware activity (SMU, DF C-states, USB legacy SMIs) may drive p99.99999 ten to twenty times higher. See [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+
 ### Going further
 
 - **DPDK kernel bypass** for both client and replication transport is under active experimentation and should bring significant latency and throughput improvements by eliminating kernel TCP overhead entirely.
