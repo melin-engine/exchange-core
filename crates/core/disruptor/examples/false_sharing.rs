@@ -2,34 +2,48 @@
 //!
 //! Two slot variants share the harness:
 //!   - `Slot104`: 104 bytes — exactly the size of the production
-//!     `InputSlot<TradingEvent>`. Each slot straddles two 64-byte cache
-//!     lines and adjacent slots share lines, so producer writes to slot
-//!     N invalidate the line a consumer needs to finish reading slot N±1.
-//!   - `Slot128`: same fields padded to 128 bytes and 64-byte aligned.
-//!     Each slot occupies exactly two cache lines; adjacent slots never
-//!     share a line.
+//!     `InputSlot<TradingEvent>` before the cache-line padding change.
+//!     Each slot straddles two 64-byte cache lines and adjacent slots
+//!     share lines, so producer writes to slot N invalidate the line a
+//!     consumer needs to finish reading slot N±1.
+//!   - `Slot128`: same field set as `Slot104`, with `#[repr(C, align(64))]`
+//!     so the compiler rounds the struct size up to two full cache lines
+//!     without an explicit pad field. Mirrors what `#[repr(align(64))]`
+//!     does on the production `InputSlot` today — only the stride changes;
+//!     the bytes written per slot match `Slot104` exactly, because the
+//!     trailing 24 B of implicit padding is *not* touched by `fill`.
+//!
+//! Each iteration the producer overwrites the full slot (every metadata
+//! u64 plus the 64-byte payload) — matching what the production decoder
+//! does when it stamps a request into the ring. Writing only one field
+//! would under-state the cross-slot line traffic.
+//!
+//! Samples are interleaved (Slot104, Slot128, Slot104, …) so thermal
+//! drift cannot bias either variant. Per-sample Mops/s prints inline;
+//! a summary at the end gives median / min / max for each variant.
 //!
 //! Run with the producer and consumer pinned to two different physical
 //! cores (ideally on the same CCX/CCD to keep L3 effects out of the
 //! signal):
 //!
-//!     cargo run --release --example false_sharing -- 4 6 10 65536
-//!                                                    │ │ │  └─ ring capacity (pow2)
-//!                                                    │ │ └──── duration (seconds)
-//!                                                    │ └────── consumer core
-//!                                                    └──────── producer core
+//!     cargo run --release --example false_sharing -- 4 6 10 65536 5
+//!                                                    │ │ │  │     └─ samples per variant
+//!                                                    │ │ │  └─────── ring capacity (pow2)
+//!                                                    │ │ └────────── per-sample duration (seconds)
+//!                                                    │ └──────────── consumer core
+//!                                                    └────────────── producer core
 //!
 //! Pair with `perf c2c record -F 4000 -- <bench>` then `perf c2c report`
 //! to confirm HITM events drop to ~zero after padding.
 
 use melin_disruptor::ring::DisruptorBuilder;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// 104-byte slot — mirrors the production `InputSlot<TradingEvent>` layout
-// (5×u64 metadata header + 64-byte event payload). `#[repr(C)]` so the
-// compiler does not reorder fields.
+// 104-byte slot — mirrors the pre-padding production `InputSlot<TradingEvent>`
+// layout (5×u64 metadata header + 64-byte event payload). `#[repr(C)]`
+// so the compiler does not reorder fields.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Slot104 {
@@ -56,9 +70,10 @@ impl Default for Slot104 {
 
 const _: () = assert!(std::mem::size_of::<Slot104>() == 104);
 
-// 128-byte padded slot. `align(64)` forces the array start on a cache
-// line boundary; the trailing 24-byte pad rounds each slot up to two
-// full lines.
+// Same fields as `Slot104`; `#[repr(C, align(64))]` rounds the size up
+// to a multiple of 64 (→ 128 B) without an explicit pad field. The 24 B
+// of trailing padding is implicit and stays untouched by `fill`, matching
+// the way the production `InputSlot` behaves after `#[repr(align(64))]`.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct Slot128 {
@@ -68,7 +83,6 @@ struct Slot128 {
     sequence: u64,
     timestamp_ns: u64,
     payload: [u8; 64],
-    _pad: [u8; 24],
 }
 
 impl Default for Slot128 {
@@ -80,7 +94,6 @@ impl Default for Slot128 {
             sequence: 0,
             timestamp_ns: 0,
             payload: [0; 64],
-            _pad: [0; 24],
         }
     }
 }
@@ -107,63 +120,70 @@ fn pin(core: Option<usize>) {
 }
 
 trait BenchSlot: Copy + Default + Send + 'static {
+    /// Overwrite every named field of the slot. Mirrors the production
+    /// hot path where the reader populates the entire `InputSlot` per
+    /// request — touching the full slot is what generates the cross-slot
+    /// line traffic this bench is trying to measure. The `seq`-derived
+    /// payload defeats compiler hoisting.
     fn fill(&mut self, seq: u64);
 }
 
 impl BenchSlot for Slot104 {
     #[inline(always)]
     fn fill(&mut self, seq: u64) {
-        self.sequence = seq;
+        *self = Self {
+            connection_id: seq,
+            key_hash: seq.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            request_seq: seq,
+            sequence: seq,
+            timestamp_ns: seq,
+            payload: [seq as u8; 64],
+        };
     }
 }
 
 impl BenchSlot for Slot128 {
     #[inline(always)]
     fn fill(&mut self, seq: u64) {
-        self.sequence = seq;
+        *self = Self {
+            connection_id: seq,
+            key_hash: seq.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            request_seq: seq,
+            sequence: seq,
+            timestamp_ns: seq,
+            payload: [seq as u8; 64],
+        };
     }
 }
 
-fn run<T: BenchSlot>(
-    name: &str,
+/// One measurement: spin a consumer, pin both ends, run the producer
+/// for `duration`, return throughput in Mops/s.
+fn run_once<T: BenchSlot>(
     capacity: usize,
     duration: Duration,
     prod_core: Option<usize>,
     cons_core: Option<usize>,
-) {
+) -> f64 {
     let (mut producer, mut consumers) = DisruptorBuilder::<T>::new(capacity).add_consumer().build();
     let mut consumer = consumers.pop().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_c = Arc::clone(&stop);
-    let consumed = Arc::new(AtomicU64::new(0));
-    let consumed_c = Arc::clone(&consumed);
 
     let handle = std::thread::Builder::new()
-        .name(format!("cons-{name}"))
+        .name("cons".into())
         .spawn(move || {
             pin(cons_core);
-            // Local batch buffer — `consume_batch` copies into this. Keeping
-            // it at 64 matches the producer's batch size.
+            // Local batch buffer — `consume_batch` copies into this.
+            // 64 matches the producer's batch size.
             let mut buf = vec![T::default(); 64];
-            let mut local: u64 = 0;
             while !stop_c.load(Ordering::Relaxed) {
-                let n = consumer.consume_batch(&mut buf, 64);
-                if n == 0 {
+                if consumer.consume_batch(&mut buf, 64) == 0 {
                     std::hint::spin_loop();
-                } else {
-                    local += n as u64;
                 }
             }
             // Drain anything the producer left behind so backpressure
             // isn't the bottleneck on the last iteration.
-            loop {
-                let n = consumer.consume_batch(&mut buf, 64);
-                if n == 0 {
-                    break;
-                }
-                local += n as u64;
-            }
-            consumed_c.store(local, Ordering::Relaxed);
+            while consumer.consume_batch(&mut buf, 64) != 0 {}
         })
         .unwrap();
 
@@ -187,16 +207,18 @@ fn run<T: BenchSlot>(
     stop.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 
-    let ns_per = elapsed.as_nanos() as f64 / produced as f64;
-    let mops = produced as f64 / elapsed.as_secs_f64() / 1e6;
+    produced as f64 / elapsed.as_secs_f64() / 1e6
+}
+
+fn summary(label: &str, samples: &[f64]) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted[sorted.len() / 2];
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
     println!(
-        "{name:>8}  size={:>3}B  align={:>2}B  produced={:>12}  consumed={:>12}  {:>7.2} Mops/s  {:>6.2} ns/op",
-        std::mem::size_of::<T>(),
-        std::mem::align_of::<T>(),
-        produced,
-        consumed.load(Ordering::Relaxed),
-        mops,
-        ns_per
+        "{label:>8}  median={median:>7.2} Mops/s  min={min:>7.2}  max={max:>7.2}  n={}",
+        samples.len()
     );
 }
 
@@ -209,25 +231,35 @@ fn main() {
     // in L3 on any modern x86 — keeps the test on the false-sharing axis
     // rather than memory bandwidth.
     let capacity: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1 << 16);
+    let samples: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     println!(
-        "config: prod_core={:?} cons_core={:?} duration={dur_s}s capacity={capacity}",
-        prod_core, cons_core
+        "config: prod_core={prod_core:?} cons_core={cons_core:?} \
+         duration={dur_s}s/sample capacity={capacity} samples={samples}/variant"
     );
     println!("note: pin to two distinct cores to surface the false-sharing signal\n");
 
-    // Quick warmup to settle CPU frequency / branch predictor before the
-    // real measurement.
-    run::<Slot104>(
-        "warmup",
-        capacity,
-        Duration::from_secs(2),
-        prod_core,
-        cons_core,
-    );
-    println!("--");
+    // Warmup: settle CPU frequency / branch predictor before the first
+    // measured sample. Result is discarded.
+    let _ = run_once::<Slot104>(capacity, Duration::from_secs(2), prod_core, cons_core);
+    println!("warmup done\n");
 
     let dur = Duration::from_secs(dur_s);
-    run::<Slot104>("Slot104", capacity, dur, prod_core, cons_core);
-    run::<Slot128>("Slot128", capacity, dur, prod_core, cons_core);
+    let mut s104 = Vec::with_capacity(samples);
+    let mut s128 = Vec::with_capacity(samples);
+
+    // Interleave so thermal drift can't bias either variant.
+    for i in 0..samples {
+        let r = run_once::<Slot104>(capacity, dur, prod_core, cons_core);
+        println!("[{i:>2}] Slot104  {r:>7.2} Mops/s");
+        s104.push(r);
+
+        let r = run_once::<Slot128>(capacity, dur, prod_core, cons_core);
+        println!("[{i:>2}] Slot128  {r:>7.2} Mops/s");
+        s128.push(r);
+    }
+
+    println!();
+    summary("Slot104", &s104);
+    summary("Slot128", &s128);
 }
