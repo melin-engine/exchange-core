@@ -1395,6 +1395,18 @@ where
                     let mut consumed = 0;
                     let mut drain_last_target = 0u64;
                     let mut drain_any_published = false;
+                    // One batch covers every slot extracted from this drain
+                    // recv-cycle (multiple frames, each carrying multiple
+                    // slots). Without batching the inner `for slot in slots`
+                    // loop emits one Release store on the input cursor per
+                    // slot; under post-promotion drain the primary may have
+                    // hundreds of unread slots queued. `pending_accum`
+                    // shadows `accum_end_sequence` until `batch.commit()`
+                    // so the post-commit `pending_acks.push` cannot reference
+                    // a slot that isn't yet visible to consumers (same
+                    // invariant `tcp_receiver` enforces — see its line 627).
+                    let mut batch = input_producer.batch();
+                    let mut pending_accum = accum_end_sequence;
                     loop {
                         let remaining = &recv_buf[consumed..];
                         match try_extract_frame(remaining, MAX_DATA_FRAME) {
@@ -1403,8 +1415,8 @@ where
                                 if let Ok(slots) = try_decode_input_batch(payload) {
                                     for slot in slots {
                                         let primary_seq = slot.sequence;
-                                        drain_last_target = input_producer.publish(slot);
-                                        accum_end_sequence = primary_seq;
+                                        drain_last_target = batch.push_with(|s| *s = slot);
+                                        pending_accum = primary_seq;
                                         drain_any_published = true;
                                     }
                                 }
@@ -1413,6 +1425,11 @@ where
                             _ => break,
                         }
                     }
+                    // Single Release store on the input cursor for every
+                    // slot pushed above; no-op when `drain_any_published`
+                    // is false. Must happen before `pending_acks.push`.
+                    batch.commit();
+                    accum_end_sequence = pending_accum;
                     compact_recv_buf(&mut recv_buf, consumed);
                     if drain_any_published && !pending_acks.is_full() {
                         pending_acks.push(drain_last_target, accum_end_sequence);
@@ -1480,10 +1497,25 @@ where
             // Parse frames from the receive buffer and publish slots
             // straight into the input ring (mirrors the io_uring TCP
             // receiver — no journal-codec round-trip on the wire).
+            //
+            // Open one batch across every frame extracted from this recv
+            // pass so the input-ring cursor advances with a single Release
+            // store, not one per slot. Steady-state primary→replica traffic
+            // can pack tens of slots per frame and multiple frames per
+            // recv; collapsing those cursor writes is the same optimisation
+            // d9259003 applied to the primary's TCP reader (perf c2c
+            // attributed the dominant remote-HITMs to the cursor line, not
+            // the slot data). `pending_accum` shadows `accum_end_sequence`
+            // until `batch.commit()` so a fatal break (oversize / decode
+            // error) or the post-loop `pending_acks.push` can never reference
+            // a slot the consumer hasn't yet observed — same invariant
+            // `tcp_receiver` enforces around its commit (see its line 627).
             let mut consumed = 0;
             let mut burst_last_target = 0u64;
             let mut burst_any_published = false;
             let mut frame_err: Option<Box<dyn std::error::Error>> = None;
+            let mut batch = input_producer.batch();
+            let mut pending_accum = accum_end_sequence;
             loop {
                 let remaining = &recv_buf[consumed..];
                 match try_extract_frame(remaining, MAX_DATA_FRAME) {
@@ -1495,8 +1527,8 @@ where
                                     received_data = true;
                                     for slot in slots {
                                         let primary_seq = slot.sequence;
-                                        burst_last_target = input_producer.publish(slot);
-                                        accum_end_sequence = primary_seq;
+                                        burst_last_target = batch.push_with(|s| *s = slot);
+                                        pending_accum = primary_seq;
                                         burst_any_published = true;
                                     }
                                 }
@@ -1525,6 +1557,11 @@ where
                     FrameResult::Incomplete => break,
                 }
             }
+            // Commit before either the fatal break or the per-recv ack
+            // push, so the slots we did decode become visible to the
+            // apply consumer in every exit path.
+            batch.commit();
+            accum_end_sequence = pending_accum;
             compact_recv_buf(&mut recv_buf, consumed);
             if let Some(e) = frame_err {
                 break 'streaming SessionExit::Fatal(e);
