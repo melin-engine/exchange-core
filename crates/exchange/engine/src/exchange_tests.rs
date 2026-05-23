@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use super::*;
-use crate::types::{OrderType, Price, Quantity, SelfTradeProtection, TimeInForce};
+use crate::types::{Order, OrderType, Price, Quantity, SelfTradeProtection, TimeInForce};
 
 const ACCT_A: AccountId = AccountId(1);
 const ACCT_B: AccountId = AccountId(2);
