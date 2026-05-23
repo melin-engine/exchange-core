@@ -1883,7 +1883,7 @@ fn start_server<L: BlockingTransportListener>(
     // Trading-side codecs constructed at the call boundary, mirroring
     // the binary in `crates/exchange/server/src/main.rs`.
     let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
-        Arc::new(melin_server::request::ExchangeRequestDecoder);
+        Arc::new(melin_server::request_decoder::ExchangeRequestDecoder);
     let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
         Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
     // The bench has no event subscribers; pass `None` so the runtime

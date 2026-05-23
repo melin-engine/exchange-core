@@ -10,7 +10,7 @@
 //! - [`app_factory::ExchangeAppFactory`] — `AppFactory` impl that
 //!   builds empty / seed-ready exchanges and yields the bulk-seed
 //!   events the runtime journals on first start.
-//! - [`request::ExchangeRequestDecoder`] — wire-`Request` →
+//! - [`request_decoder::ExchangeRequestDecoder`] — wire-`Request` →
 //!   `TradingEvent` decoder.
 //! - [`response_encoder::ExchangeResponseEncoder`] —
 //!   `ExecutionReport` / `QueryResponse` → wire encoder.
@@ -19,7 +19,7 @@
 
 pub mod app_factory;
 pub mod exchange_app;
-pub mod request;
+pub mod request_decoder;
 pub mod response_encoder;
 
 #[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
@@ -32,5 +32,5 @@ pub mod event_publisher;
 // resolving without requiring callers to know the internal module layout.
 pub use app_factory::ExchangeAppFactory;
 pub use exchange_app::ServerApp;
-pub use request::ExchangeRequestDecoder;
+pub use request_decoder::ExchangeRequestDecoder;
 pub use response_encoder::ExchangeResponseEncoder;

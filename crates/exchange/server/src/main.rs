@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so non-trading applications plug in their own codecs without
     // touching server.rs.
     let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
-        Arc::new(melin_server::request::ExchangeRequestDecoder);
+        Arc::new(melin_server::request_decoder::ExchangeRequestDecoder);
     let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
         Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
     // Event publisher is trading-only: under `trading` the binary wires

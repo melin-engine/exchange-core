@@ -39,6 +39,8 @@ use melin_transport_core::pipeline::{
     OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
 };
 use melin_types::types::{ExecutionReport, QueryResponse, Symbol};
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 // Trading-bound shorthand for the wire-format types this publisher
 // consumes. The runtime feeds it `Consumer<OutputSlot<A>>` where
@@ -189,8 +191,10 @@ pub fn run(
             // so their read timeouts don't fire on a quiet firehose.
             if last_broadcast.elapsed() >= std::time::Duration::from_secs(10) {
                 frame_buf[..8].copy_from_slice(&last_seq.to_le_bytes());
-                if let Ok(n) = codec::encode_response(&ResponseKind::Heartbeat, &mut frame_buf[8..])
-                {
+                if let Ok(n) = control_codec::encode_transport_response(
+                    &TransportResponse::Heartbeat,
+                    &mut frame_buf[8..],
+                ) {
                     let frame = &frame_buf[..8 + n];
                     subscribers.retain_mut(|sub| {
                         if !matches!(sub.state, SubscriberState::Streaming) {
@@ -504,8 +508,9 @@ fn authenticate_subscriber(
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    let written =
+        control_codec::encode_transport_response(&TransportResponse::Challenge { nonce }, &mut buf)
+            .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     write_stream.write_all(&buf[..written])?;
     write_stream.flush()?;
 
@@ -520,7 +525,7 @@ fn authenticate_subscriber(
     let mut frame_buf = [0u8; 256];
     io::Read::read_exact(&mut read_stream, &mut frame_buf[..frame_len])?;
 
-    let (_seq, request) = match codec::decode_request(&frame_buf[..frame_len]) {
+    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
         Ok(pair) => pair,
         Err(e) => {
             send_auth_failed(&mut write_stream);
@@ -528,20 +533,7 @@ fn authenticate_subscriber(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
-        Request::ChallengeResponse {
-            signature,
-            public_key,
-        } => (signature, public_key),
-        other => {
-            send_auth_failed(&mut write_stream);
-            return Err(format!(
-                "expected ChallengeResponse, got {:?}",
-                std::mem::discriminant(&other)
-            )
-            .into());
-        }
-    };
+    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
 
     // Look up the public key in authorized_keys.
     let _permission = match authorized_keys.lookup(&public_key_bytes) {
@@ -565,8 +557,9 @@ fn authenticate_subscriber(
     })?;
 
     // Auth succeeded — send ServerReady.
-    let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode ServerReady: {e}")))?;
+    let written =
+        control_codec::encode_transport_response(&TransportResponse::ServerReady, &mut buf)
+            .map_err(|e| io::Error::other(format!("encode ServerReady: {e}")))?;
     write_stream.write_all(&buf[..written])?;
     write_stream.flush()?;
 
@@ -577,7 +570,9 @@ fn authenticate_subscriber(
 /// Best-effort send of AuthFailed to the client.
 fn send_auth_failed(writer: &mut dyn Write) {
     let mut buf = [0u8; 8];
-    if let Ok(n) = codec::encode_response(&ResponseKind::AuthFailed, &mut buf) {
+    if let Ok(n) =
+        control_codec::encode_transport_response(&TransportResponse::AuthFailed, &mut buf)
+    {
         // Best-effort: ignore write errors during auth failure notification.
         let _ = writer.write_all(&buf[..n]);
         let _ = writer.flush();
