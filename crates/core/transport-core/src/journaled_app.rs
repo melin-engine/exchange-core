@@ -1085,6 +1085,38 @@ mod tests {
         assert_eq!(recovered.app().total, expected_state(&all, 1).total);
     }
 
+    /// Recovery accepts a snapshot whose recorded sequence corresponds
+    /// to a control entry (`GenesisHash` here) rather than an app
+    /// event. The reader processes control entries internally and
+    /// never surfaces them via `next_entry`, but the post-walk
+    /// `journal_max_seq` check uses `reader.last_sequence()` which
+    /// advances for all entry types. Without this, a snapshot
+    /// anchored on a control entry would be rejected as
+    /// `SnapshotAnchorMissing` even though the journal does contain
+    /// that sequence.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_from_snapshot_accepts_control_entry_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let events = [TestEvent::Add(10), TestEvent::Add(20), TestEvent::Add(30)];
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &events, 1);
+        drop(ja);
+
+        // Forge a snapshot at seq 1 — the GenesisHash entry. This is a
+        // control entry the reader processes internally and never
+        // returns from next_entry. The snapshot's app state is empty
+        // (nothing applied before the genesis), so recovery must
+        // replay all three app events to reconstruct the full state.
+        snapshot::save::<TestApp>(&TestApp::new(), 1, [0u8; 32], &snap_path).unwrap();
+
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(recovered.app().total, expected_state(&events, 1).total);
+    }
+
     /// Recovery refuses to pair a snapshot with a journal that doesn't
     /// reach the snapshot's recorded sequence. Without this guard a
     /// stale journal restored from before the snapshot would be
