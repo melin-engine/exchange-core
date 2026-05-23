@@ -926,6 +926,8 @@ impl Default for Exchange {
 #[cfg(test)]
 mod cancel_replace_tests;
 #[cfg(test)]
+mod circuit_breaker_tests;
+#[cfg(test)]
 mod gtd_tests;
 #[cfg(test)]
 mod open_order_cap_tests;
