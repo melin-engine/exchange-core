@@ -34,6 +34,7 @@ rustc-hash = "2"
 tracing = { workspace = true }
 
 [dev-dependencies]
+bolero = "0.13"
 tempfile = "3"
 melin-journal = { path = "../../core/journal", features = ["test-utils"] }
 melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }

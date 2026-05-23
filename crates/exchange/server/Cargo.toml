@@ -65,10 +65,6 @@ no-o-direct = [
     "melin-server-runtime/no-o-direct",
 ]
 
-[lib]
-name = "melin_server"
-path = "src/lib.rs"
-
 [[bin]]
 name = "melin-server"
 path = "src/main.rs"
@@ -111,18 +107,9 @@ zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../../core/dpdk", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 melin-client = { path = "../client" }
+melin-journal = { path = "../../core/journal" }
 melin-protocol = { path = "../protocol" }
 ed25519-dalek = { workspace = true }
-base64 = { workspace = true }
 serial_test = "3"
-proptest = "1"
-# Fuzz-test driver — only used by the journal/codec fuzz tests in tests/.
-bolero = "0.13"
-# Re-list `melin-journal` / `melin-transport-core` with `test-utils` so
-# the recovery tests in tests/ can reach `apply_journaled`,
-# `tick_journaled`, and `writer_mut` (test-only primitives gated behind
-# that feature in transport-core).
-melin-journal = { path = "../../core/journal", features = ["test-utils"] }
-melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }
+tempfile = "3"

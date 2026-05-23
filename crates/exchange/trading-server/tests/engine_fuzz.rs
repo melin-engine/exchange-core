@@ -6,6 +6,7 @@
 
 use melin_journal::codec;
 use melin_trading::trading_event::TradingEvent;
+use melin_trading_server::exchange_app::ServerApp;
 
 /// Journal entry decoder must never panic on arbitrary input.
 /// It must return Ok or a well-formed Err for any byte sequence.
@@ -65,7 +66,7 @@ fn fuzz_snapshot_decode() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fuzz.snapshot");
         std::fs::write(&path, data).expect("write");
-        let _ = melin_transport_core::snapshot::load::<melin_server::App>(&path);
+        let _ = melin_transport_core::snapshot::load::<ServerApp>(&path);
     });
 }
 

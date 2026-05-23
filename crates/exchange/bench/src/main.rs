@@ -78,7 +78,8 @@ use hdrhistogram::Histogram;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 #[cfg(not(feature = "dpdk"))]
-use melin_server::runtime::server::ServerConfig;
+use melin_server_runtime::server::ServerConfig;
+use melin_trading_server::exchange_app::ServerApp;
 use melin_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_wire_protocol::transport::BlockingTransportListener;
@@ -556,10 +557,10 @@ struct BenchArgs {
     /// docs/journal-writer-modes.md before benchmarking with it.
     #[arg(
         long,
-        default_value_t = melin_server::JournalWriterMode::default(),
-        value_parser = melin_server::JournalWriterMode::parse,
+        default_value_t = melin_journal::JournalWriterMode::default(),
+        value_parser = melin_journal::JournalWriterMode::parse,
     )]
-    journal_writer: melin_server::JournalWriterMode,
+    journal_writer: melin_journal::JournalWriterMode,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -1232,17 +1233,15 @@ fn run_pipeline_bench(
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
-    journal_writer_mode: melin_server::JournalWriterMode,
+    journal_writer_mode: melin_journal::JournalWriterMode,
     target_rate: u64,
     max_reject_pct: f64,
 ) {
+    use melin_journal::JournalWriterMode;
     use melin_journal::{BufferedWriter, SectorWriter};
-    use melin_server::JournalWriterMode;
 
     // Set up exchange with one instrument and funded account.
-    let mut app = melin_server::domain::exchange_app::ServerApp(
-        melin_exchange_core::exchange::Exchange::with_capacity(),
-    );
+    let mut app = ServerApp(melin_exchange_core::exchange::Exchange::with_capacity());
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -1297,23 +1296,23 @@ struct PipelineInnerCfg<'a> {
     max_reject_pct: f64,
 }
 
+use melin_trading::trading_event::TradingEvent;
 /// Pipeline-mode body, generic over the journal writer so we get a
 /// statically-dispatched `run_sync` or `run_uring` per writer.
 // Module-scope imports for `run_pipeline_inner`'s where clause —
 // the bound has to name `TradingEvent` / `JournalStage` /
 // `JournalStageRun` in the signature scope, not the body scope.
-use melin_server::pipeline::{JournalStage, JournalStageRun};
-use melin_trading::trading_event::TradingEvent;
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
-fn run_pipeline_inner<W>(app: melin_server::App, writer: W, cfg: PipelineInnerCfg<'_>)
+fn run_pipeline_inner<W>(app: ServerApp, writer: W, cfg: PipelineInnerCfg<'_>)
 where
-    W: melin_server::JournalWrite<TradingEvent> + Send + 'static,
+    W: melin_journal::JournalWrite<TradingEvent> + Send + 'static,
     JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     use melin_journal::JournalEvent;
-    use melin_server::pipeline::{InputSlot, build_pipeline_with_replication};
-    use melin_server::trace::mono_trace_ns;
     use melin_transport_core::pipeline::OutputPayload;
+    use melin_transport_core::pipeline::{InputSlot, build_pipeline_with_replication};
+    use melin_transport_core::trace::mono_trace_ns;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -1336,7 +1335,7 @@ where
         active_conns,
         false, // no replication
         max_journal_batch,
-        melin_server::journal_replication::REPLICATION_RING_CAPACITY,
+        melin_journal::replication::REPLICATION_RING_CAPACITY,
         true,  // busy_spin — match production default (yield_idle=false)
         false, // event_publisher
         false, // shadow
@@ -1752,7 +1751,7 @@ fn run_roundtrip_bench(
         // local persistence alone. The default `Hybrid` mode waits for
         // `in_memory>=2` replica acks that never arrive when nothing else
         // is connected, which would stall every response.
-        durability_mode: melin_server::runtime::durability_policy::DurabilityMode::Local,
+        durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
         ..ServerConfig::default()
     };
     // Wire the trading AppFactory: replication / seed paths take it
@@ -1760,9 +1759,9 @@ fn run_roundtrip_bench(
     // standalone but still bulk-seeds via the same code path as the
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
-    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>> =
-        Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
-            melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>> =
+        Arc::new(melin_trading_server::app_factory::ExchangeAppFactory::new(
+            melin_trading_server::app_factory::ExchangeAppFactoryConfig {
                 accounts: config.accounts,
                 instruments: config.instruments,
                 max_orders_per_account: config.max_orders_per_account,
@@ -1878,24 +1877,22 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>>,
+    factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>>,
     shutdown: Arc<AtomicBool>,
 ) {
     // Trading-side codecs constructed at the call boundary, mirroring
     // the binary in `crates/exchange/server/src/main.rs`.
-    let decoder: melin_server::runtime::reader::RequestDecoderArc<melin_server::App> =
-        Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
-    let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
-        Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
+    let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
+        Arc::new(melin_trading_server::request::ExchangeRequestDecoder);
+    let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
+        Arc::new(melin_trading_server::response_encoder::ExchangeResponseEncoder);
     // The bench has no event subscribers; pass `None` so the runtime
     // never allocates the publisher consumer slot.
-    let event_publisher: Option<
-        melin_server::runtime::server::EventPublisherFn<melin_server::App>,
-    > = None;
+    let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> = None;
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            if let Err(e) = melin_server::runtime::server::run_with_shutdown(
+            if let Err(e) = melin_server_runtime::server::run_with_shutdown(
                 listener,
                 config,
                 factory,

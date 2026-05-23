@@ -64,7 +64,7 @@ mod tcp_sender;
 // cursor management, and per-replica metrics now live in
 // `melin_transport_core::replication`. Re-export the public types
 // here so the module's public API surface (e.g.
-// `melin_server::runtime::replication::Ack` / `::ReplicationMetrics`) is
+// `melin_server_runtime::replication::Ack` / `::ReplicationMetrics`) is
 // unchanged for downstream consumers and tests.
 pub use melin_transport_core::replication::ReplicationMetrics;
 pub use melin_transport_core::replication::ack_queue::{

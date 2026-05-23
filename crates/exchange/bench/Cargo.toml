@@ -10,31 +10,32 @@ default-run = "melin-bench"
 ## features with `--no-default-features --features=...` to benchmark
 ## without trading, hash-chain, or release-tracing.
 default = ["trading", "hash-chain", "release-tracing"]
-## Forward to `melin-server/trading` (real matching engine).
-trading = ["melin-server/trading"]
-## Forward to `melin-server/hash-chain` (BLAKE3 tamper-evident journal
-## chain — adds ~15-30 ns per event).
-hash-chain = ["melin-server/hash-chain"]
-## Forward to `melin-server/release-tracing` (compile out debug!/trace!).
-release-tracing = ["melin-server/release-tracing"]
-## Transport-only build — short-circuits `Exchange::execute` so the
-## matching hot path is bypassed. Mutually exclusive with `trading` at
-## the server level. Use
-## `--no-default-features --features=skip-order-exec` to bench the
-## pipeline without the matching engine.
-skip-order-exec = ["melin-server/skip-order-exec"]
-no-persist = ["melin-server/no-persist"]
-## Open the journal without `O_DIRECT`. Passthrough — see the
-## `melin-journal` feature of the same name. Use this when benching on
-## consumer NVMe drives that lack Power Loss Protection.
-no-o-direct = ["melin-server/no-o-direct"]
-## Forward to `melin-server/latency-trace` — lightweight 4-stage
-## histograms only.
-latency-trace = ["melin-server/latency-trace"]
-## Forward to `melin-server/tick-to-trade` — full per-stage
-## decomposition (9+ stages). Implies latency-trace via the server
-## crate's feature graph.
-tick-to-trade = ["melin-server/tick-to-trade"]
+trading = ["melin-trading-server/trading"]
+hash-chain = [
+    "melin-journal/hash-chain",
+    "melin-transport-core/hash-chain",
+    "melin-server-runtime/hash-chain",
+]
+release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-tracing"]
+skip-order-exec = [
+    "melin-exchange-core/skip-order-exec",
+    "melin-trading-server/skip-order-exec",
+    "hash-chain",
+    "release-tracing",
+]
+no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persist"]
+no-o-direct = [
+    "melin-journal/no-o-direct",
+    "melin-transport-core/no-o-direct",
+    "melin-server-runtime/no-o-direct",
+]
+latency-trace = [
+    "melin-transport-core/latency-trace",
+    "melin-protocol/latency-trace",
+    "melin-server-runtime/latency-trace",
+    "melin-trading-server/latency-trace",
+]
+tick-to-trade = ["latency-trace", "melin-server-runtime/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 ## DPDK userspace TCP transport. Implies `trading` + `release-tracing`
@@ -50,7 +51,10 @@ dpdk = [
     "trading",
     "release-tracing",
 ]
-pipeline-stats = ["melin-server/pipeline-stats"]
+pipeline-stats = [
+    "melin-transport-core/pipeline-stats",
+    "melin-server-runtime/pipeline-stats",
+]
 plot = ["dep:plotters"]
 
 [lib]
@@ -78,7 +82,8 @@ melin-journal = { path = "../../core/journal" }
 melin-disruptor = { path = "../../core/disruptor" }
 melin-protocol = { path = "../protocol" }
 melin-wire-protocol = { path = "../../core/wire-protocol" }
-melin-server = { path = "../server", default-features = false }
+melin-server-runtime = { path = "../../core/server-runtime" }
+melin-trading-server = { path = "../trading-server", default-features = false }
 melin-app = { path = "../../core/app" }
 melin-transport-core = { path = "../../core/transport-core" }
 base64 = { workspace = true }

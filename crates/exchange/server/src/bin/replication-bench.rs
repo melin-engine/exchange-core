@@ -31,9 +31,10 @@ use melin_app::unix_epoch_nanos;
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
-use melin_server::runtime::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
-use melin_server::runtime::server::PipelineCores;
+use melin_server_runtime::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
+use melin_server_runtime::server::PipelineCores;
 use melin_trading::trading_event::TradingEvent;
+use melin_trading_server::exchange_app::ServerApp;
 type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
 type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_types::types::ExecutionReport,
@@ -102,10 +103,8 @@ fn main() {
     // Bench runs the buffered writer end-to-end; the sector path is
     // exercised separately in pipeline tests until the boot-site
     // dispatch refactor lands.
-    let engine = JournaledApp::<melin_server::App, melin_journal::BufferedWriter<_>>::create(
-        melin_server::domain::exchange_app::ServerApp(
-            melin_exchange_core::exchange::Exchange::with_capacity(),
-        ),
+    let engine = JournaledApp::<ServerApp, melin_journal::BufferedWriter<_>>::create(
+        ServerApp(melin_exchange_core::exchange::Exchange::with_capacity()),
         &primary_journal,
     )
     .expect("create primary journal");
@@ -215,7 +214,7 @@ fn main() {
     let c = Arc::clone(&connected_counter);
     let sender_handle = std::thread::Builder::new()
         .name("bench-repl-sender".into())
-        .spawn(move || run_sender::<melin_server::App>(sender_config, &s, &r, &c))
+        .spawn(move || run_sender::<ServerApp>(sender_config, &s, &r, &c))
         .expect("spawn run_sender");
 
     // --- Spawn run_receiver ---
@@ -239,7 +238,7 @@ fn main() {
     let receiver_handle = std::thread::Builder::new()
         .name("bench-repl-receiver".into())
         .spawn(move || {
-            let _ = run_receiver::<melin_server::App, melin_journal::BufferedWriter<_>>(
+            let _ = run_receiver::<ServerApp, melin_journal::BufferedWriter<_>>(
                 bind_addr,
                 &replica_journal,
                 &replica_key,
@@ -253,8 +252,8 @@ fn main() {
                 8, // pipeline_depth
                 busy_spin,
                 None, // rotation: bench replica doesn't rotate
-                std::sync::Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
-                    melin_server::domain::app_factory::ExchangeAppFactoryConfig {
+                std::sync::Arc::new(melin_trading_server::app_factory::ExchangeAppFactory::new(
+                    melin_trading_server::app_factory::ExchangeAppFactoryConfig {
                         accounts: 0,
                         instruments: 0,
                         max_orders_per_account: 10_000,

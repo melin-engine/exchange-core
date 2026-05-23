@@ -33,8 +33,8 @@ use std::time::Instant;
 
 use melin_journal::BufferedWriter;
 use melin_journal::JournalEvent;
+use melin_journal::JournalWrite;
 use melin_journal::SectorWriter;
-use melin_server::JournalWrite;
 use melin_trading::trading_event::TradingEvent;
 
 #[derive(Parser)]
