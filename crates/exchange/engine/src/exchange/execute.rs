@@ -76,9 +76,9 @@ impl Exchange {
         }
 
         // Existence already established by the `let Some(inst) = inst_ref(...)
-        // else { ... return; }` guard at the top of `execute` (~line 1017).
-        // The matcher is single-threaded and no instrument deregistration
-        // runs between events, so the slot is still populated here.
+        // else { ... return; }` guard at the top of `execute`. The matcher
+        // is single-threaded and no instrument deregistration runs between
+        // events, so the slot is still populated here.
         let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
 
         // Circuit breaker checks: trading halt rejects all orders; price
@@ -297,8 +297,8 @@ impl Exchange {
 
         // Single mutable lookup: book, fees all from the same struct.
         // Existence was established by the `inst_ref` guard at the top of
-        // `execute` (line ~1017); same single-threaded invariant as the
-        // earlier re-lookup applies.
+        // `execute`; same single-threaded invariant as the earlier
+        // re-lookup applies.
         let inst =
             inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
         let taker_rested = inst.book.execute(order, quote_budget, slot, reports);

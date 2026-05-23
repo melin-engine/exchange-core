@@ -938,7 +938,6 @@ mod stp_tests;
 #[cfg(test)]
 mod test_helpers;
 #[cfg(test)]
-#[path = "exchange_tests.rs"]
 mod tests;
 #[cfg(test)]
 mod token_bucket_tests;
