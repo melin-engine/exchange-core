@@ -924,6 +924,8 @@ impl Default for Exchange {
 }
 
 #[cfg(test)]
+mod cancel_replace_tests;
+#[cfg(test)]
 mod test_helpers;
 #[cfg(test)]
 #[path = "exchange_tests.rs"]
