@@ -32,25 +32,22 @@ pub enum JournaledAppError {
     Journal(JournalError),
     Snapshot(snapshot::SnapshotError),
     Io(std::io::Error),
-    /// The loaded snapshot's recorded sequence is not present in the
-    /// journal. Either the journal was restored from before the
-    /// snapshot was taken (audit-trail loss) or the snapshot was
-    /// copied from a different cluster/run. Recovery refuses to
-    /// proceed because the engine state would silently outrun the
-    /// journal.
-    SnapshotAheadOfJournal {
+    /// The journal's tail sequence sits below the snapshot's recorded
+    /// anchor sequence — recovery cannot reconcile the two. Causes
+    /// include a journal restored from before the snapshot was taken
+    /// (audit-trail loss), a snapshot copied from a different
+    /// cluster/run, or archive trimming that removed the segment
+    /// holding the anchor. Recovery refuses to proceed because the
+    /// engine state would silently outrun the journal.
+    ///
+    /// The anchor's existence is verified against the reader's
+    /// observed last-sequence (which advances for both app events and
+    /// internal control entries — `GenesisHash`, `Checkpoint`), so
+    /// snapshots whose anchor lands on a control-entry sequence are
+    /// still detected as present.
+    SnapshotAnchorMissing {
         snap_sequence: u64,
         journal_last_seq: u64,
-    },
-    /// The journal contains an entry at the snapshot's recorded
-    /// sequence, but the chain hash at that point differs from the
-    /// snapshot's hash. The snapshot and journal belong to different
-    /// timelines (e.g. the snapshot was copied from a forked replica).
-    /// Only fires under the `hash-chain` feature.
-    SnapshotChainMismatch {
-        snap_sequence: u64,
-        snap_hash: [u8; 32],
-        journal_hash: [u8; 32],
     },
 }
 
@@ -60,24 +57,14 @@ impl std::fmt::Display for JournaledAppError {
             Self::Journal(e) => write!(f, "journal: {e}"),
             Self::Snapshot(e) => write!(f, "snapshot: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
-            Self::SnapshotAheadOfJournal {
+            Self::SnapshotAnchorMissing {
                 snap_sequence,
                 journal_last_seq,
             } => write!(
                 f,
-                "snapshot recorded sequence {snap_sequence} but journal only reaches {journal_last_seq} — \
-                 stale journal or mismatched snapshot",
-            ),
-            Self::SnapshotChainMismatch {
-                snap_sequence,
-                snap_hash,
-                journal_hash,
-            } => write!(
-                f,
-                "snapshot/journal chain mismatch at sequence {snap_sequence}: snapshot hash \
-                 {} differs from journal hash {}",
-                hex32(snap_hash),
-                hex32(journal_hash),
+                "snapshot anchor at sequence {snap_sequence} not present in journal \
+                 (journal reaches {journal_last_seq}) — stale journal, mismatched \
+                 snapshot, or trimmed archive",
             ),
         }
     }
@@ -89,18 +76,9 @@ impl std::error::Error for JournaledAppError {
             Self::Journal(e) => Some(e),
             Self::Snapshot(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::SnapshotAheadOfJournal { .. } | Self::SnapshotChainMismatch { .. } => None,
+            Self::SnapshotAnchorMissing { .. } => None,
         }
     }
-}
-
-fn hex32(bytes: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 impl From<JournalError> for JournaledAppError {
@@ -180,7 +158,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
 
         let has_snapshot = snapshot.is_some();
-        let (snap_sequence, snap_chain_hash) = snapshot.unwrap_or((0, [0u8; 32]));
+        let (snap_sequence, _snap_chain_hash) = snapshot.unwrap_or((0, [0u8; 32]));
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
@@ -193,31 +171,24 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // between the live → archive rename and the new live file's
         // creation.
         let mut last_seq_seen: u64 = snap_sequence;
-        // True once we read a journal entry whose sequence matches the
-        // snapshot's recorded sequence. Anchor-less recovery (no
-        // snapshot, or `snap_sequence == 0`) starts true so the final
-        // post-walk validation is a no-op for those paths.
-        let mut snapshot_anchor_seen = !has_snapshot || snap_sequence == 0;
-        // Highest sequence we actually read from the journal — used
-        // only for diagnostics on the [`SnapshotAheadOfJournal`]
-        // error. Distinct from `last_seq_seen` because the latter is
-        // seeded with `snap_sequence` to bootstrap the writer in the
-        // missing-live branch; we want the error to report the true
-        // observed tail (0 when the journal had no entries at all).
+        // Highest sequence the reader actually advanced through. Updated
+        // from `reader.last_sequence()`, which tracks both app events
+        // and control entries (`GenesisHash`, `Checkpoint`), so a
+        // snapshot anchor that lands on a control sequence is still
+        // recognised as "reached." Used both for diagnostics on
+        // [`SnapshotAnchorMissing`] and for the post-walk anchor-
+        // existence check. Seeded at 0 (not `snap_sequence`) so the
+        // error reports the true observed tail when a stale journal
+        // never reaches the anchor.
         let mut journal_max_seq: u64 = 0;
 
         // --- Walk each sealed archive in monotonic order ---
         for (idx, archive_path) in &archives {
             let mut reader = JournalReader::<A::Event>::open(archive_path)?;
-            let mut anchor = SnapAnchor {
-                sequence: snap_sequence,
-                chain_hash: snap_chain_hash,
-                seen: &mut snapshot_anchor_seen,
-            };
             replay_segment(
                 &mut reader,
                 &mut app,
-                &mut anchor,
+                snap_sequence,
                 &mut last_drain_ns,
                 &mut reports,
                 /* allow_partial_tail = */ false,
@@ -261,11 +232,12 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 )
                 .into());
             }
-            // Archives-only case: anchor must have been found during
-            // the archive walk if a snapshot was supplied. Validate
-            // before synthesizing the new live segment.
-            if !snapshot_anchor_seen {
-                return Err(JournaledAppError::SnapshotAheadOfJournal {
+            // Archives-only case: validate the snapshot's anchor sits
+            // inside the journal we walked before synthesizing the new
+            // live segment. See [`Self::SnapshotAnchorMissing`] for the
+            // failure modes this catches.
+            if has_snapshot && snap_sequence > 0 && journal_max_seq < snap_sequence {
+                return Err(JournaledAppError::SnapshotAnchorMissing {
                     snap_sequence,
                     journal_last_seq: journal_max_seq,
                 });
@@ -279,15 +251,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // The live segment may have a partial-tail crash: replay loop
         // tolerates `SequenceGap` by stopping early, mirroring legacy
         // behaviour.
-        let mut anchor = SnapAnchor {
-            sequence: snap_sequence,
-            chain_hash: snap_chain_hash,
-            seen: &mut snapshot_anchor_seen,
-        };
         replay_segment(
             &mut reader,
             &mut app,
-            &mut anchor,
+            snap_sequence,
             &mut last_drain_ns,
             &mut reports,
             /* allow_partial_tail = */ true,
@@ -302,13 +269,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             journal_max_seq = journal_max_seq.max(seq);
         }
 
-        // Final validation: the snapshot's anchor entry must exist
-        // somewhere in the journal we just walked. Without this check
-        // a stale journal (or a snapshot copied from a different
-        // cluster) is silently accepted and the engine boots into
-        // snapshot state with the journal effectively orphaned.
-        if !snapshot_anchor_seen {
-            return Err(JournaledAppError::SnapshotAheadOfJournal {
+        // Final validation: the journal must have advanced through (or
+        // past) the snapshot's anchor sequence. The check runs against
+        // `reader.last_sequence()` rather than the entries surfaced to
+        // `replay_segment`, so a snapshot anchored on a control entry
+        // (`Checkpoint`, `GenesisHash`) — which the reader processes
+        // internally — still registers as present.
+        if has_snapshot && snap_sequence > 0 && journal_max_seq < snap_sequence {
+            return Err(JournaledAppError::SnapshotAnchorMissing {
                 snap_sequence,
                 journal_last_seq: journal_max_seq,
             });
@@ -512,60 +480,17 @@ fn replay_entry<A: Application>(
 /// segments are sealed and any gap is corruption (returned as an error);
 /// the live segment may have a torn tail from a crash, so a gap
 /// terminates replay cleanly.
-/// Snapshot anchor state threaded through [`replay_segment`].
-///
-/// Bundles the three fields the per-entry anchor check reads — kept as
-/// a struct rather than separate args so `replay_segment` stays under
-/// the clippy `too_many_arguments` threshold.
-///
-/// `sequence == 0` means no snapshot was supplied (or the snapshot is
-/// the genesis state); in that case the anchor check is a no-op and
-/// `seen` starts `true`.
-struct SnapAnchor<'a> {
-    sequence: u64,
-    chain_hash: [u8; 32],
-    seen: &'a mut bool,
-}
-
 fn replay_segment<A: Application>(
     reader: &mut JournalReader<A::Event>,
     app: &mut A,
-    anchor: &mut SnapAnchor<'_>,
+    snap_sequence: u64,
     last_drain_ns: &mut u64,
     reports: &mut Vec<A::Report>,
     allow_partial_tail: bool,
 ) -> Result<(), JournaledAppError> {
-    let snap_sequence = anchor.sequence;
     loop {
         match reader.next_entry() {
             Ok(Some(entry)) => {
-                // Anchor: the journal entry whose sequence matches the
-                // snapshot's recorded sequence. The reader's chain
-                // hash after this entry must equal the hash the
-                // snapshotter captured.
-                //
-                // Two paths short-circuit the hash compare and only
-                // record that the anchor was found:
-                //   - `hash-chain` feature off — reader has no hash.
-                //   - Snapshot's hash is the all-zero sentinel —
-                //     legitimate for older snapshots and for replicas
-                //     that don't track the chain; see
-                //     `recover_from_snapshot_accepts_zero_chain_hash_sentinel`.
-                // The sequence-existence check still catches a stale
-                // journal in either path.
-                if snap_sequence > 0 && entry.sequence == snap_sequence && !*anchor.seen {
-                    if anchor.chain_hash != [0u8; 32]
-                        && let Some(reader_hash) = reader.chain_hash()
-                        && reader_hash != anchor.chain_hash
-                    {
-                        return Err(JournaledAppError::SnapshotChainMismatch {
-                            snap_sequence,
-                            snap_hash: anchor.chain_hash,
-                            journal_hash: reader_hash,
-                        });
-                    }
-                    *anchor.seen = true;
-                }
                 if entry.sequence > snap_sequence {
                     replay_entry(
                         app,
@@ -1196,7 +1121,7 @@ mod tests {
             Err(e) => e,
         };
         match err {
-            JournaledAppError::SnapshotAheadOfJournal {
+            JournaledAppError::SnapshotAnchorMissing {
                 snap_sequence,
                 journal_last_seq,
             } => {
@@ -1206,62 +1131,7 @@ mod tests {
                     "journal tail {journal_last_seq} should sit below snap_sequence {snap_sequence}"
                 );
             }
-            other => panic!("expected SnapshotAheadOfJournal, got {other:?}"),
-        }
-    }
-
-    /// Recovery refuses to pair a snapshot with a journal that reaches
-    /// the snapshot's sequence but has a different chain hash at that
-    /// point — i.e. the snapshot came from a forked timeline (e.g. a
-    /// snapshot copied from a different cluster onto this journal).
-    /// Only meaningful under `hash-chain`; the zero-sentinel path
-    /// covered by [`recover_from_snapshot_accepts_zero_chain_hash_sentinel`]
-    /// intentionally bypasses this compare.
-    #[cfg(feature = "hash-chain")]
-    #[test]
-    fn recover_from_snapshot_rejects_chain_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("journal.bin");
-        let snap_path = dir.path().join("snap.bin");
-
-        let events_a = [TestEvent::Add(3), TestEvent::Add(5)];
-        let events_b = [TestEvent::Add(99), TestEvent::Add(99)];
-
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events_a, 1);
-        drop(ja);
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
-        ja.save_snapshot(&snap_path).unwrap();
-        drop(ja);
-        let (_app, snap_seq, _hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
-
-        // Replace the journal with the same number of events at the
-        // same sequence positions but with different payloads — the
-        // anchor entry's sequence still matches `snap_seq` but the
-        // chain hash at that point diverges from what the snapshot
-        // recorded.
-        std::fs::remove_file(&journal_path).unwrap();
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let _ja = append_events(ja, &events_b, 1);
-        drop(_ja);
-
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
-            Ok(_) => panic!("expected recovery to reject snapshot/journal mismatch"),
-            Err(e) => e,
-        };
-        match err {
-            JournaledAppError::SnapshotChainMismatch {
-                snap_sequence,
-                snap_hash,
-                journal_hash,
-            } => {
-                assert_eq!(snap_sequence, snap_seq);
-                assert_ne!(
-                    snap_hash, journal_hash,
-                    "error should only fire when hashes actually differ"
-                );
-            }
-            other => panic!("expected SnapshotChainMismatch, got {other:?}"),
+            other => panic!("expected SnapshotAnchorMissing, got {other:?}"),
         }
     }
 
