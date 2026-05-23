@@ -55,16 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
         Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
 
-    let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> = {
-        #[cfg(feature = "trading")]
-        {
-            Some(melin_server::event_publisher::run)
-        }
-        #[cfg(not(feature = "trading"))]
-        {
-            None
-        }
-    };
+    let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> =
+        Some(melin_server::event_publisher::run);
 
     melin_server_runtime::server::run(config, factory, decoder, encoder, event_publisher)
 }

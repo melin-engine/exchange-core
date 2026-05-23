@@ -14,15 +14,13 @@
 //!   `TradingEvent` decoder.
 //! - [`response_encoder::ExchangeResponseEncoder`] —
 //!   `ExecutionReport` / `QueryResponse` → wire encoder.
-//! - [`event_publisher`] — market-data firehose (trading-only;
-//!   gated on `feature = "trading"`).
+//! - [`event_publisher`] — market-data firehose.
 
 pub mod app_factory;
 pub mod exchange_app;
 pub mod request_decoder;
 pub mod response_encoder;
 
-#[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
 pub mod event_publisher;
 
 // Crate-root re-exports for the three trading adapters most often

@@ -8,9 +8,8 @@ default-run = "melin-bench"
 ## Default mirrors `melin-server`'s default set so plain `cargo run -p
 ## melin-bench` behaves like a stock server build. Disable individual
 ## features with `--no-default-features --features=...` to benchmark
-## without trading, hash-chain, or release-tracing.
-default = ["trading", "hash-chain", "release-tracing"]
-trading = ["melin-server/trading"]
+## without hash-chain or release-tracing.
+default = ["hash-chain", "release-tracing"]
 hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
@@ -37,17 +36,14 @@ latency-trace = [
 tick-to-trade = ["latency-trace", "melin-server-runtime/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
-## DPDK userspace TCP transport. Implies `trading` + `release-tracing`
-## because the server crate needs an app selected to compile, and
-## `release-tracing` matches the production-style binary the DPDK rig
-## benches against. Add `--features=hash-chain` separately if you want
-## to measure with the journal hash chain on; add `skip-order-exec`
-## and drop `trading` to bench transport-only.
+## DPDK userspace TCP transport. Implies `release-tracing` to match the
+## production-style binary the DPDK rig benches against. Add
+## `--features=hash-chain` separately if you want to measure with the
+## journal hash chain on; add `skip-order-exec` to bench transport-only.
 dpdk = [
     "dep:melin-dpdk",
     "melin-dpdk/dpdk-sys",
     "dep:smoltcp",
-    "trading",
     "release-tracing",
 ]
 pipeline-stats = [

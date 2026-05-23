@@ -19,7 +19,7 @@
 //! `cargo test` against the skip-order-exec build this file is
 //! compiled as an empty test crate.
 
-#![cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
+#![cfg(not(feature = "skip-order-exec"))]
 
 use ed25519_dalek::Signer;
 use serial_test::serial;
