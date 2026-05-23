@@ -930,6 +930,8 @@ mod circuit_breaker_tests;
 #[cfg(test)]
 mod gtd_tests;
 #[cfg(test)]
+mod instrument_lifecycle_tests;
+#[cfg(test)]
 mod open_order_cap_tests;
 #[cfg(test)]
 mod stp_tests;
