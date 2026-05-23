@@ -87,14 +87,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "dpdk")]
     {
-        let dpdk_config = dpdk_config_from(&config);
         melin_server_runtime::server::run_dpdk(
             config,
             factory,
             decoder,
             encoder,
             event_publisher,
-            dpdk_config,
             shutdown,
         )
     }
@@ -102,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server_runtime::server::run_with_shutdown(
+        melin_server_runtime::server::run(
             listener,
             config,
             factory,
@@ -111,31 +109,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_publisher,
             shutdown,
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DPDK config
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "dpdk")]
-fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
-    melin_dpdk::DpdkConfig {
-        eal_args: cfg
-            .dpdk_eal_args
-            .split_whitespace()
-            .map(String::from)
-            .collect(),
-        port_ids: cfg.dpdk_ports.clone(),
-        ip_addr: cfg.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
-        prefix_len: cfg.dpdk_prefix_len,
-        gateway: cfg
-            .dpdk_gateway
-            .as_deref()
-            .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
-        listen_port: cfg.bind.port(),
-        mtu: cfg.dpdk_mtu,
-        vlan_id: cfg.dpdk_vlan,
-        num_queues: 1,
     }
 }

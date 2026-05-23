@@ -566,7 +566,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     })
 }
 
-/// Run the trading server.
+/// Run the server.
 ///
 /// 1. Initializes (or recovers) the `JournaledApp<A>`, then decomposes
 ///    it into `A` and `W` (the operator-selected writer) for the pipeline.
@@ -579,47 +579,13 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// journals at startup. `decoder` parses inbound client frames into
 /// `A::Event` values for the input ring; `encoder` serialises
 /// `A::Report` / `A::QueryResponse` values into wire frames on the
-/// response stage. The trading binary constructs the three trading-side
-/// impls
-/// (`melin_server::ExchangeAppFactory`,
-/// `melin_server::ExchangeRequestDecoder`,
-/// `melin_server::ExchangeResponseEncoder`);
-/// alternative applications plug in different trait impls without
-/// touching the runtime.
+/// response stage. The application binary constructs the concrete
+/// trait impls; alternative applications plug in different impls
+/// without touching the runtime.
 ///
-/// Returns when the listener encounters a fatal error.
+/// Set `shutdown` to `true` to trigger a clean shutdown of all
+/// pipeline threads.
 pub fn run<A, L>(
-    listener: L,
-    config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = A>>,
-    decoder: RequestDecoderArc<A>,
-    encoder: ResponseEncoderArc<A>,
-    event_publisher: Option<EventPublisherFn<A>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    A: Application + Send + 'static,
-    A::Event: Send + Sync + 'static,
-    A::Report: Send + 'static,
-    A::QueryResponse: Send + 'static,
-    L: BlockingTransportListener,
-{
-    run_with_shutdown(
-        listener,
-        config,
-        factory,
-        decoder,
-        encoder,
-        event_publisher,
-        Arc::new(AtomicBool::new(false)),
-    )
-}
-
-/// Run the trading server with an externally controlled shutdown flag.
-///
-/// Same as [`run`], but the caller can set `shutdown` to `true` to trigger
-/// a clean shutdown of all pipeline threads (useful for benchmarks that need
-/// to collect latency trace reports).
-pub fn run_with_shutdown<A, L>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
@@ -641,32 +607,28 @@ where
     // takes the writer type as a parameter rather than reading the mode
     // at runtime.
     match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => {
-            run_with_shutdown_impl::<A, L, BufferedWriter<A::Event>>(
-                listener,
-                config,
-                factory,
-                decoder,
-                encoder,
-                event_publisher,
-                shutdown,
-            )
-        }
-        melin_journal::JournalWriterMode::Sector => {
-            run_with_shutdown_impl::<A, L, SectorWriter<A::Event>>(
-                listener,
-                config,
-                factory,
-                decoder,
-                encoder,
-                event_publisher,
-                shutdown,
-            )
-        }
+        melin_journal::JournalWriterMode::Buffered => run_impl::<A, L, BufferedWriter<A::Event>>(
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
+        ),
+        melin_journal::JournalWriterMode::Sector => run_impl::<A, L, SectorWriter<A::Event>>(
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
+        ),
     }
 }
 
-fn run_with_shutdown_impl<A, L, W>(
+fn run_impl<A, L, W>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
@@ -1099,7 +1061,7 @@ where
 
     // Wire runtime journal rotation into the journal stage. The flag is
     // shared with the admin endpoint (spawned once at process start in
-    // `run_with_shutdown`) — passing it through here means PROMOTE-then-
+    // `run`) — passing it through here means PROMOTE-then-
     // ROTATE on a freshly-promoted node still drives rotation against
     // the new primary's stage. The size threshold uses the same
     // `max_journal_mib` knob that drives startup rotation.
@@ -1174,7 +1136,7 @@ where
     // command writes it. Re-derive the active mode here for the
     // startup log so what we log matches what's actually live (an
     // operator may have stored a different mode via `DURABILITY`
-    // between `run_with_shutdown` and this point).
+    // between `run` and this point).
     let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
         durability_mode_atomic.load(Ordering::Relaxed),
     )
@@ -1794,7 +1756,6 @@ pub fn run_dpdk<A>(
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
-    dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -1803,7 +1764,8 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
-    // Dispatch the DPDK boot path on the operator-selected journal writer.
+    let dpdk_config = dpdk_config_from(&config);
+
     match config.journal_writer {
         melin_journal::JournalWriterMode::Buffered => run_dpdk_impl::<A, BufferedWriter<A::Event>>(
             config,
@@ -1827,6 +1789,28 @@ where
 }
 
 #[cfg(feature = "dpdk")]
+fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
+    melin_dpdk::DpdkConfig {
+        eal_args: cfg
+            .dpdk_eal_args
+            .split_whitespace()
+            .map(String::from)
+            .collect(),
+        port_ids: cfg.dpdk_ports.clone(),
+        ip_addr: cfg.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
+        prefix_len: cfg.dpdk_prefix_len,
+        gateway: cfg
+            .dpdk_gateway
+            .as_deref()
+            .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
+        listen_port: cfg.bind.port(),
+        mtu: cfg.dpdk_mtu,
+        vlan_id: cfg.dpdk_vlan,
+        num_queues: 1,
+    }
+}
+
+#[cfg(feature = "dpdk")]
 fn run_dpdk_impl<A, W>(
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
@@ -1844,7 +1828,7 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    // Mirrors the kernel-TCP `run_with_shutdown` path: one atomic per
+    // Mirrors the kernel-TCP `run` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)
     // and primary admin listeners.
     let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
@@ -1870,7 +1854,7 @@ where
         );
 
         // Shared admin flags, same shape as the kernel TCP replica path
-        // — see `run_with_shutdown` for the rationale on lifetime.
+        // — see `run` for the rationale on lifetime.
         let promote_flag = Arc::new(AtomicBool::new(false));
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
