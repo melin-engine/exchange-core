@@ -7,18 +7,18 @@
 use crate::control::{ChallengeResponse, TransportResponse};
 use crate::error::ProtocolError;
 
-// Wire tags for transport-level control frames. Public so the
-// exchange-level codec can import them instead of redefining its own
-// copies — a single source of truth prevents silent wire drift.
-// Domain-level tags (SubmitOrder, Placed, etc.) stay in the exchange crate.
-pub const TAG_CHALLENGE_RESPONSE: u8 = 5;
-pub const TAG_ENGINE_ERROR: u8 = 16;
-pub const TAG_BATCH_END: u8 = 17;
-pub const TAG_SERVER_READY: u8 = 18;
-pub const TAG_RESPONSE_HEARTBEAT: u8 = 19;
-pub const TAG_CHALLENGE: u8 = 20;
-pub const TAG_AUTH_FAILED: u8 = 21;
-pub const TAG_SERVER_BUSY: u8 = 24;
+// Wire tags for transport-level control frames (0x01–0x0F reserved).
+// Public so the exchange-level codec imports them instead of redefining
+// its own copies — single source of truth prevents silent wire drift.
+// Domain-level tags start at 0x10 (requests) and 0x30 (responses).
+pub const TAG_RESPONSE_HEARTBEAT: u8 = 0x01;
+pub const TAG_BATCH_END: u8 = 0x02;
+pub const TAG_ENGINE_ERROR: u8 = 0x03;
+pub const TAG_SERVER_BUSY: u8 = 0x04;
+pub const TAG_CHALLENGE: u8 = 0x05;
+pub const TAG_CHALLENGE_RESPONSE: u8 = 0x06;
+pub const TAG_AUTH_FAILED: u8 = 0x07;
+pub const TAG_SERVER_READY: u8 = 0x08;
 
 /// Encode a transport-level response into `buf`.
 ///

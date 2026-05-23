@@ -81,45 +81,43 @@ use melin_wire_protocol::control_codec::{
     TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
 };
 
-// --- Request tags ---
-const TAG_SUBMIT_ORDER: u8 = 1;
-const TAG_CANCEL_ORDER: u8 = 2;
-const TAG_REQUEST_HEARTBEAT: u8 = 3;
-const TAG_CANCEL_ALL: u8 = 4;
-const TAG_ADD_INSTRUMENT: u8 = 6;
-const TAG_DEPOSIT: u8 = 7;
-const TAG_SET_RISK_LIMITS: u8 = 8;
-const TAG_SET_CIRCUIT_BREAKER: u8 = 9;
-const TAG_CANCEL_REPLACE: u8 = 10;
-const TAG_SET_FEE_SCHEDULE: u8 = 31;
-const TAG_QUERY_STATS: u8 = 30;
-const TAG_WITHDRAW: u8 = 32;
-const TAG_END_OF_DAY: u8 = 33;
-const TAG_DISABLE_INSTRUMENT: u8 = 35;
-const TAG_ENABLE_INSTRUMENT: u8 = 36;
-const TAG_REMOVE_INSTRUMENT: u8 = 37;
-const TAG_SUBSCRIBE: u8 = 38;
-const TAG_QUERY_POSITION: u8 = 39;
-const TAG_QUERY_REQUEST_SEQ: u8 = 45;
+// --- Domain request tags (0x10–0x2F) ---
+const TAG_SUBMIT_ORDER: u8 = 0x10;
+const TAG_CANCEL_ORDER: u8 = 0x11;
+const TAG_REQUEST_HEARTBEAT: u8 = 0x12;
+const TAG_CANCEL_ALL: u8 = 0x13;
+const TAG_CANCEL_REPLACE: u8 = 0x14;
+const TAG_ADD_INSTRUMENT: u8 = 0x15;
+const TAG_DEPOSIT: u8 = 0x16;
+const TAG_WITHDRAW: u8 = 0x17;
+const TAG_SET_RISK_LIMITS: u8 = 0x18;
+const TAG_SET_CIRCUIT_BREAKER: u8 = 0x19;
+const TAG_SET_FEE_SCHEDULE: u8 = 0x1A;
+const TAG_END_OF_DAY: u8 = 0x1B;
+const TAG_DISABLE_INSTRUMENT: u8 = 0x1C;
+const TAG_ENABLE_INSTRUMENT: u8 = 0x1D;
+const TAG_REMOVE_INSTRUMENT: u8 = 0x1E;
+const TAG_SUBSCRIBE: u8 = 0x1F;
+const TAG_QUERY_STATS: u8 = 0x20;
+const TAG_QUERY_POSITION: u8 = 0x21;
+const TAG_QUERY_REQUEST_SEQ: u8 = 0x22;
 
-// --- Response tags ---
-const TAG_PLACED: u8 = 11;
-const TAG_FILL: u8 = 12;
-const TAG_CANCELLED: u8 = 13;
-const TAG_TRIGGERED: u8 = 14;
-const TAG_REJECTED: u8 = 15;
-// TAG_ENGINE_ERROR (16), TAG_BATCH_END (17), TAG_SERVER_READY (18),
-// TAG_RESPONSE_HEARTBEAT (19), TAG_CHALLENGE (20), TAG_AUTH_FAILED (21),
-// TAG_SERVER_BUSY (24) — imported from wire-protocol above.
-const TAG_REPLACED: u8 = 22;
-const TAG_STATS_HEADER: u8 = 23;
-const TAG_INSTRUMENT_STATUS_CHANGED: u8 = 25;
-const TAG_BOOK_SNAPSHOT_BEGIN: u8 = 40;
-const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 41;
-const TAG_BOOK_SNAPSHOT_END: u8 = 42;
-const TAG_SNAPSHOT_COMPLETE: u8 = 43;
-const TAG_POSITION_SNAPSHOT: u8 = 44;
-const TAG_REQUEST_SEQ_HWM: u8 = 46;
+// --- Domain response tags (0x30–0x4F) ---
+// Transport-level response tags (0x01–0x0F) imported from wire-protocol above.
+const TAG_PLACED: u8 = 0x30;
+const TAG_FILL: u8 = 0x31;
+const TAG_CANCELLED: u8 = 0x32;
+const TAG_TRIGGERED: u8 = 0x33;
+const TAG_REJECTED: u8 = 0x34;
+const TAG_REPLACED: u8 = 0x35;
+const TAG_INSTRUMENT_STATUS_CHANGED: u8 = 0x36;
+const TAG_STATS_HEADER: u8 = 0x37;
+const TAG_BOOK_SNAPSHOT_BEGIN: u8 = 0x38;
+const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 0x39;
+const TAG_BOOK_SNAPSHOT_END: u8 = 0x3A;
+const TAG_SNAPSHOT_COMPLETE: u8 = 0x3B;
+const TAG_POSITION_SNAPSHOT: u8 = 0x3C;
+const TAG_REQUEST_SEQ_HWM: u8 = 0x3D;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
