@@ -42,6 +42,8 @@ use melin_app::Application;
 use melin_app::app_factory::AppFactory;
 use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
+use melin_app::decoder::RequestDecoder;
+use melin_app::encoder::ResponseEncoder;
 use melin_disruptor::ring::Consumer;
 
 /// Output-slot sugar parameterised on the application — saves spelling
@@ -576,11 +578,11 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// For callers that need a pre-bound listener or an externally
 /// controlled shutdown flag (e.g. benchmarks), use
 /// [`run_with_listener`] instead.
-pub fn run<A>(
+pub fn run<A, F, D, E>(
     config: ServerConfig,
-    factory: Arc<dyn AppFactory<App = A>>,
-    decoder: RequestDecoderArc<A>,
-    encoder: ResponseEncoderArc<A>,
+    factory: F,
+    decoder: D,
+    encoder: E,
     event_publisher: Option<EventPublisherFn<A>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -588,7 +590,14 @@ where
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
+    F: AppFactory<App = A> + 'static,
+    D: RequestDecoder<Event = A::Event> + 'static,
+    E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
 {
+    let factory: Arc<dyn AppFactory<App = A>> = Arc::new(factory);
+    let decoder: RequestDecoderArc<A> = Arc::new(decoder);
+    let encoder: ResponseEncoderArc<A> = Arc::new(encoder);
+
     let shutdown = Arc::new(AtomicBool::new(false));
     crate::process::install_shutdown_handler(&shutdown);
 

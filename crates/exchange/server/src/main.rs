@@ -27,18 +27,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:53000,muzzy_decay_ms:57000\0";
 
-use std::sync::Arc;
-
 use clap::Parser;
-use melin_app::app_factory::AppFactory;
 use melin_server::app_factory::{ExchangeAppFactory, ExchangeAppFactoryConfig};
 use melin_server::event_publisher;
-use melin_server::exchange_app::ServerApp;
 use melin_server::request_decoder::ExchangeRequestDecoder;
 use melin_server::response_encoder::ExchangeResponseEncoder;
-use melin_server_runtime::reader::RequestDecoderArc;
-use melin_server_runtime::response::ResponseEncoderArc;
-use melin_server_runtime::server::{self, EventPublisherFn, ServerConfig};
+use melin_server_runtime::server::{self, ServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -49,18 +43,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    let factory: Arc<dyn AppFactory<App = ServerApp>> =
-        Arc::new(ExchangeAppFactory::new(ExchangeAppFactoryConfig {
-            accounts: config.accounts,
-            instruments: config.instruments,
-            max_orders_per_account: config.max_orders_per_account,
-            max_orders_per_second: config.max_orders_per_second,
-            max_orders_burst: config.max_orders_burst,
-        }));
+    let factory = ExchangeAppFactory::new(ExchangeAppFactoryConfig {
+        accounts: config.accounts,
+        instruments: config.instruments,
+        max_orders_per_account: config.max_orders_per_account,
+        max_orders_per_second: config.max_orders_per_second,
+        max_orders_burst: config.max_orders_burst,
+    });
 
-    let decoder: RequestDecoderArc<ServerApp> = Arc::new(ExchangeRequestDecoder);
-    let encoder: ResponseEncoderArc<ServerApp> = Arc::new(ExchangeResponseEncoder);
-    let event_publisher: Option<EventPublisherFn<ServerApp>> = Some(event_publisher::run);
-
-    server::run(config, factory, decoder, encoder, event_publisher)
+    server::run(
+        config,
+        factory,
+        ExchangeRequestDecoder,
+        ExchangeResponseEncoder,
+        Some(event_publisher::run),
+    )
 }
