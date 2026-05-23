@@ -1759,16 +1759,15 @@ fn run_roundtrip_bench(
     // standalone but still bulk-seeds via the same code path as the
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
-    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>> =
-        Arc::new(melin_server::app_factory::ExchangeAppFactory::new(
-            melin_server::app_factory::ExchangeAppFactoryConfig {
-                accounts: config.accounts,
-                instruments: config.instruments,
-                max_orders_per_account: config.max_orders_per_account,
-                max_orders_per_second: config.max_orders_per_second,
-                max_orders_burst: config.max_orders_burst,
-            },
-        ));
+    let factory = melin_server::app_factory::ExchangeAppFactory::new(
+        melin_server::app_factory::ExchangeAppFactoryConfig {
+            accounts: config.accounts,
+            instruments: config.instruments,
+            max_orders_per_account: config.max_orders_per_account,
+            max_orders_per_second: config.max_orders_per_second,
+            max_orders_burst: config.max_orders_burst,
+        },
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1780,12 +1779,7 @@ fn run_roundtrip_bench(
 
         let sock_path = tmp_dir.join("bench.sock");
         let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
-        start_server(
-            listener,
-            config,
-            Arc::clone(&factory),
-            Arc::clone(&shutdown),
-        );
+        start_server(listener, config, factory, Arc::clone(&shutdown));
 
         let sock_path_ref = &sock_path;
         let connect = || {
@@ -1818,12 +1812,7 @@ fn run_roundtrip_bench(
         let listener = BlockingTcpListener::bind("127.0.0.1:0".parse().expect("valid addr"))
             .expect("bind TCP");
         let addr = listener.local_addr().expect("local addr");
-        start_server(
-            listener,
-            config,
-            Arc::clone(&factory),
-            Arc::clone(&shutdown),
-        );
+        start_server(listener, config, factory, Arc::clone(&shutdown));
 
         let connect = || {
             let stream = connect_tcp(addr);
@@ -1877,18 +1866,14 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
-    factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>>,
+    factory: melin_server::app_factory::ExchangeAppFactory,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Trading-side codecs constructed at the call boundary, mirroring
-    // the binary in `crates/exchange/server/src/main.rs`.
-    let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
-        Arc::new(melin_server::request_decoder::ExchangeRequestDecoder);
-    let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
-        Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
-    // The bench has no event subscribers; pass `None` so the runtime
-    // never allocates the publisher consumer slot.
-    let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> = None;
+    use melin_server::request_decoder::ExchangeRequestDecoder;
+    use melin_server::response_encoder::ExchangeResponseEncoder;
+    use melin_server_runtime::server::EventPublisherFn;
+
+    let event_publisher: Option<EventPublisherFn<ServerApp>> = None;
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
@@ -1896,8 +1881,8 @@ fn start_server<L: BlockingTransportListener>(
                 listener,
                 config,
                 factory,
-                decoder,
-                encoder,
+                ExchangeRequestDecoder,
+                ExchangeResponseEncoder,
                 event_publisher,
                 shutdown,
             ) {

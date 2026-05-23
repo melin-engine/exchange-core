@@ -594,10 +594,6 @@ where
     D: RequestDecoder<Event = A::Event> + 'static,
     E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
 {
-    let factory: Arc<dyn AppFactory<App = A>> = Arc::new(factory);
-    let decoder: RequestDecoderArc<A> = Arc::new(decoder);
-    let encoder: ResponseEncoderArc<A> = Arc::new(encoder);
-
     let shutdown = Arc::new(AtomicBool::new(false));
     crate::process::install_shutdown_handler(&shutdown);
 
@@ -607,18 +603,25 @@ where
 
     #[cfg(feature = "dpdk")]
     {
-        run_dpdk(config, factory, decoder, encoder, event_publisher, shutdown)
+        run_dpdk(
+            config,
+            Arc::new(factory),
+            Arc::new(decoder),
+            Arc::new(encoder),
+            event_publisher,
+            shutdown,
+        )
     }
 
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
-        run_with_listener(
+        run_tcp(
             listener,
             config,
-            factory,
-            decoder,
-            encoder,
+            Arc::new(factory),
+            Arc::new(decoder),
+            Arc::new(encoder),
             event_publisher,
             shutdown,
         )
@@ -633,7 +636,37 @@ where
 ///
 /// Set `shutdown` to `true` to trigger a clean shutdown of all
 /// pipeline threads.
-pub fn run_with_listener<A, L>(
+pub fn run_with_listener<A, L, F, D, E>(
+    listener: L,
+    config: ServerConfig,
+    factory: F,
+    decoder: D,
+    encoder: E,
+    event_publisher: Option<EventPublisherFn<A>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+    L: BlockingTransportListener,
+    F: AppFactory<App = A> + 'static,
+    D: RequestDecoder<Event = A::Event> + 'static,
+    E: ResponseEncoder<Report = A::Report, Query = A::QueryResponse> + 'static,
+{
+    run_tcp(
+        listener,
+        config,
+        Arc::new(factory),
+        Arc::new(decoder),
+        Arc::new(encoder),
+        event_publisher,
+        shutdown,
+    )
+}
+
+fn run_tcp<A, L>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
@@ -649,11 +682,6 @@ where
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
 {
-    // Dispatch on the operator-selected journal writer. Each branch
-    // monomorphises the boot path against a concrete writer type; from
-    // here down every function is generic over `W: JournalWrite<E>` and
-    // takes the writer type as a parameter rather than reading the mode
-    // at runtime.
     match config.journal_writer {
         melin_journal::JournalWriterMode::Buffered => run_impl::<A, L, BufferedWriter<A::Event>>(
             listener,
