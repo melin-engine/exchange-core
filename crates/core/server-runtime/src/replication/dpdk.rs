@@ -1253,12 +1253,14 @@ where
         // so smoltcp can advertise a window large enough to sustain throughput.
         const REPL_RX_BUF: usize = 512 * 1024;
         const REPL_TX_BUF: usize = 64 * 1024;
+        const REPL_TX_QUEUE: usize = 64 * 1024;
         let handle = transport.connect_to_with_buffers(
             primary_ip,
             primary_port,
             local_port,
             REPL_RX_BUF,
             REPL_TX_BUF,
+            REPL_TX_QUEUE,
         );
         local_port = local_port.wrapping_add(1).max(40000);
 

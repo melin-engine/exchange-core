@@ -820,20 +820,22 @@ stop_servers() {
     # seconds; if we restart too early the VFIO groups are still held.
     # After 10s, SIGKILL any stragglers so VFIO devices are released.
     local waited=0
-    while (( waited < 10 )); do
+    while [ "$waited" -lt 10 ]; do
         local any_alive=0
         for host in "$@"; do
-            if ssh $SSH_OPTS "$host" "pgrep -x melin-server >/dev/null 2>&1 || \
-                                      pgrep -f '[m]elin-server.dpdk' >/dev/null 2>&1"; then
+            # Treat SSH failures as "still alive" — a dropped control
+            # socket shouldn't make us skip the wait and race VFIO.
+            if ! ssh $SSH_OPTS "$host" "! pgrep -x melin-server >/dev/null 2>&1 && \
+                                        ! pgrep -f '[m]elin-server.dpdk' >/dev/null 2>&1" 2>/dev/null; then
                 any_alive=1
                 break
             fi
         done
-        if (( !any_alive )); then break; fi
+        if [ "$any_alive" -eq 0 ]; then break; fi
         sleep 1
-        (( waited++ ))
+        waited=$((waited + 1))
     done
-    if (( waited >= 10 )); then
+    if [ "$waited" -ge 10 ]; then
         for host in "$@"; do
             ssh $SSH_OPTS "$host" "pkill -KILL -x melin-server 2>/dev/null; \
                                    pkill -KILL -f '[m]elin-server.dpdk' 2>/dev/null; true"

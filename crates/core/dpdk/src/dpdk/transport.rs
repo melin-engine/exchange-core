@@ -470,11 +470,12 @@ impl DpdkTransport {
             local_port,
             SOCKET_RX_BUF_SIZE,
             SOCKET_TX_BUF_SIZE,
+            MAX_TX_QUEUE_SIZE,
         )
     }
 
-    /// Like `connect_to` but with custom buffer sizes. Used for
-    /// replication connections that need larger RX/TX buffers.
+    /// Like `connect_to` but with custom buffer sizes and TX queue limit.
+    /// Used for replication connections that need larger RX/TX buffers.
     pub fn connect_to_with_buffers(
         &mut self,
         remote_ip: std::net::Ipv4Addr,
@@ -482,6 +483,7 @@ impl DpdkTransport {
         local_port: u16,
         rx_buf_size: usize,
         tx_buf_size: usize,
+        tx_queue_limit: usize,
     ) -> SocketHandle {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
@@ -505,7 +507,11 @@ impl DpdkTransport {
             )
             .expect("smoltcp connect failed");
 
-        self.sockets.add(socket)
+        let handle = self.sockets.add(socket);
+        if handle.index() < self.tx_queue_limits.len() {
+            self.tx_queue_limits[handle.index()] = tx_queue_limit;
+        }
+        handle
     }
 
     /// Check if a socket has completed the TCP handshake and is ready
