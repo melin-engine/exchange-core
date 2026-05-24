@@ -580,15 +580,14 @@ fi
 # DPDK build on server (and replica if dpdk-repl).
 # In TAP mode, test-containers-start.sh already built the .dpdk binary.
 # In SR-IOV mode we rebuild melin-server here with the dpdk feature plus
-# the mode selector (trading by default, skip-order-exec under
-# SKIP_ORDER_EXEC=1). `--features dpdk` alone fails to compile — the
-# server requires exactly one of `trading` or `skip-order-exec`.
+# the mode selector (skip-order-exec under SKIP_ORDER_EXEC=1, trading
+# is the default and no longer needs a feature flag).
 if [[ "$NEED_DPDK" == "1" ]]; then
     # Feature set for the DPDK server build. Mirrors MAIN_BUILD above.
     if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
         DPDK_SERVER_FEATURES="dpdk,skip-order-exec"
     else
-        DPDK_SERVER_FEATURES="dpdk,trading,hash-chain,release-tracing"
+        DPDK_SERVER_FEATURES="dpdk,hash-chain,release-tracing"
     fi
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
         DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},no-persist"
