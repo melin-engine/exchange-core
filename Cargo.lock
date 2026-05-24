@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "melin-admin"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "melin-app"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "melin-bench"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "melin-client"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "melin-protocol",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "melin-dpdk"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "melin-exchange-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "astenn",
  "melin-trading",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "melin-gateway-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "proptest",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "melin-journal"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "melin-market-data"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "astenn",
  "ed25519-dalek",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "melin-md-gateway"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "melin-oe-gateway"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
@@ -1649,14 +1649,14 @@ dependencies = [
 
 [[package]]
 name = "melin-pipeline"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "melin-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bolero",
  "melin-types",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "melin-server"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "melin-server-runtime"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "melin-trading"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "melin-app",
  "melin-types",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "melin-transport-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "melin-tui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
@@ -1769,7 +1769,7 @@ dependencies = [
 
 [[package]]
 name = "melin-tui-fix-client"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "crossterm",
  "melin-gateway-core",
@@ -1778,11 +1778,11 @@ dependencies = [
 
 [[package]]
 name = "melin-types"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "melin-wire-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "tempfile",
 ]
