@@ -816,7 +816,30 @@ stop_servers() {
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
                                pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
-    sleep 2
+    # Wait for processes to exit. DPDK EAL cleanup can take several
+    # seconds; if we restart too early the VFIO groups are still held.
+    # After 10s, SIGKILL any stragglers so VFIO devices are released.
+    local waited=0
+    while (( waited < 10 )); do
+        local any_alive=0
+        for host in "$@"; do
+            if ssh $SSH_OPTS "$host" "pgrep -x melin-server >/dev/null 2>&1 || \
+                                      pgrep -f '[m]elin-server.dpdk' >/dev/null 2>&1"; then
+                any_alive=1
+                break
+            fi
+        done
+        if (( !any_alive )); then break; fi
+        sleep 1
+        (( waited++ ))
+    done
+    if (( waited >= 10 )); then
+        for host in "$@"; do
+            ssh $SSH_OPTS "$host" "pkill -KILL -x melin-server 2>/dev/null; \
+                                   pkill -KILL -f '[m]elin-server.dpdk' 2>/dev/null; true"
+        done
+        sleep 1
+    fi
 }
 
 # Remove DPDK EAL lock files left by a previous run. Without this,
