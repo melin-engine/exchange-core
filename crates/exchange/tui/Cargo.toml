@@ -2,6 +2,7 @@
 name = "melin-tui"
 version = "0.9.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 melin-client = { path = "../client" }

@@ -2,6 +2,9 @@
 members = ["crates/*/*"]
 resolver = "3"
 
+[workspace.package]
+license = "LicenseRef-BuSL-1.1"
+
 [workspace.dependencies]
 base64 = "0.22"
 blake3 = "1"

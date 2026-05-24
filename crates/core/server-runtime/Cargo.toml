@@ -2,6 +2,7 @@
 name = "melin-server-runtime"
 version = "0.9.0"
 edition = "2024"
+license.workspace = true
 description = "Application-agnostic LMAX-pipeline server runtime (accept loop, journal/matching/response stages, replication, optional DPDK transport)."
 
 [features]

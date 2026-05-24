@@ -2,6 +2,7 @@
 name = "melin-protocol"
 version = "0.9.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 # Typed views over raw byte buffers for the wire frame header —
