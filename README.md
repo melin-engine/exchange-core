@@ -86,4 +86,4 @@ Melin ships with an exchange core built on the sequencer: order matching, accoun
 
 Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. — contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
-The Licensed Work will convert to Apache License, Version 2.0 on 2030-05-24.
+Each version of the Licensed Work converts to Apache License, Version 2.0 on the fourth anniversary of its first public distribution.
