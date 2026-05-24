@@ -758,7 +758,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     //    replication_cursor stalls, and the response
                     //    gate freezes the whole exchange. We saw this
                     //    exact symptom on dpdk-dual-repl.
-                    let max_tx = melin_dpdk::DpdkTransport::max_tx_queue_size();
+                    let max_tx = transport.max_tx_queue_size(handle);
                     let used = transport.tx_queue_bytes(handle);
                     let mut available = max_tx.saturating_sub(used);
 
@@ -1249,7 +1249,17 @@ where
         transport.poll();
 
         // Connect to primary via smoltcp.
-        let handle = transport.connect_to(primary_ip, primary_port, local_port);
+        // Replication streams large journal batches; use bigger RX buffer
+        // so smoltcp can advertise a window large enough to sustain throughput.
+        const REPL_RX_BUF: usize = 512 * 1024;
+        const REPL_TX_BUF: usize = 64 * 1024;
+        let handle = transport.connect_to_with_buffers(
+            primary_ip,
+            primary_port,
+            local_port,
+            REPL_RX_BUF,
+            REPL_TX_BUF,
+        );
         local_port = local_port.wrapping_add(1).max(40000);
 
         // Poll until TCP handshake completes (with timeout).

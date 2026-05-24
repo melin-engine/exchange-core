@@ -152,6 +152,18 @@ pub struct AcceptedConnection {
     pub listen_port: u16,
 }
 
+/// Per-listener state: port, handle, and buffer sizes for accepted sockets.
+struct ListenerEntry {
+    port: u16,
+    handle: SocketHandle,
+    /// smoltcp RX buffer size for sockets accepted on this port.
+    rx_buf_size: usize,
+    /// smoltcp TX buffer size for sockets accepted on this port.
+    tx_buf_size: usize,
+    /// TX queue limit for sockets accepted on this port.
+    tx_queue_limit: usize,
+}
+
 /// Shared DPDK resources created once and shared across all poll threads.
 ///
 /// Fields are ordered so that DPDK resources are dropped before EAL
@@ -197,7 +209,7 @@ pub struct DpdkTransport {
     /// transitioned to Established, and replaces it with a fresh
     /// listener on the same port — so the slot for that port stays
     /// receptive while the accepted connection moves into `accepted`.
-    listeners: Vec<(u16, SocketHandle)>,
+    listeners: Vec<ListenerEntry>,
     accepted: Vec<AcceptedConnection>,
     /// Per-connection TX buffers, indexed by `SocketHandle::index()`.
     /// Dense `Vec<Option<_>>` instead of a HashMap — HashMap hashing
@@ -205,6 +217,10 @@ pub struct DpdkTransport {
     /// `None` = slot free (no socket or no pending TX). Uses a cursor
     /// inside TxQueue to avoid O(n) drain on partial sends.
     tx_queues: Vec<Option<TxQueue>>,
+    /// Per-connection TX queue limit, indexed by `SocketHandle::index()`.
+    /// Defaults to `MAX_TX_QUEUE_SIZE`; overridden for replication sockets
+    /// via `add_listener_with_buffers`.
+    tx_queue_limits: Vec<usize>,
     /// Cached smoltcp timestamp. Refreshed periodically, not every poll.
     cached_timestamp: Instant,
     /// Poll iteration counter for timestamp refresh.
@@ -401,12 +417,19 @@ impl DpdkTransport {
             device,
             iface,
             sockets,
-            listeners: vec![(config.listen_port, listen_handle)],
+            listeners: vec![ListenerEntry {
+                port: config.listen_port,
+                handle: listen_handle,
+                rx_buf_size: SOCKET_RX_BUF_SIZE,
+                tx_buf_size: SOCKET_TX_BUF_SIZE,
+                tx_queue_limit: MAX_TX_QUEUE_SIZE,
+            }],
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
             // always in-bounds. Each empty slot is a single discriminant
             // tag — no heap allocation per slot.
             tx_queues: (0..MAX_CONNECTIONS).map(|_| None).collect(),
+            tx_queue_limits: vec![MAX_TX_QUEUE_SIZE; MAX_CONNECTIONS],
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
@@ -441,8 +464,27 @@ impl DpdkTransport {
         remote_port: u16,
         local_port: u16,
     ) -> SocketHandle {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+        self.connect_to_with_buffers(
+            remote_ip,
+            remote_port,
+            local_port,
+            SOCKET_RX_BUF_SIZE,
+            SOCKET_TX_BUF_SIZE,
+        )
+    }
+
+    /// Like `connect_to` but with custom buffer sizes. Used for
+    /// replication connections that need larger RX/TX buffers.
+    pub fn connect_to_with_buffers(
+        &mut self,
+        remote_ip: std::net::Ipv4Addr,
+        remote_port: u16,
+        local_port: u16,
+        rx_buf_size: usize,
+        tx_buf_size: usize,
+    ) -> SocketHandle {
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         tune_socket(&mut socket);
         socket.set_zero_copy_retain_fn(retain_mbuf);
@@ -577,7 +619,8 @@ impl DpdkTransport {
         // the same transport) keep their own listener slots.
         let mut i = 0;
         while i < self.listeners.len() {
-            let (port, handle) = self.listeners[i];
+            let port = self.listeners[i].port;
+            let handle = self.listeners[i].handle;
             let (state, peer) = match self.sockets.try_get_mut::<tcp::Socket>(handle) {
                 Some(socket) => {
                     if socket.state() != State::Established {
@@ -641,16 +684,26 @@ impl DpdkTransport {
             // Replace the listener slot in-place so the port stays
             // receptive while the just-accepted handle is moved out
             // into `accepted`.
+            let entry = &self.listeners[i];
+            let rx_buf_size = entry.rx_buf_size;
+            let tx_buf_size = entry.tx_buf_size;
+            let tx_queue_limit = entry.tx_queue_limit;
+
+            // Set per-handle TX queue limit for the accepted socket.
+            if handle.index() < self.tx_queue_limits.len() {
+                self.tx_queue_limits[handle.index()] = tx_queue_limit;
+            }
+
             let new_listener = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
                 tune_socket(&mut socket);
                 socket.listen(port).expect("re-listen after accept");
                 socket
             };
             let new_handle = self.sockets.add(new_listener);
-            self.listeners[i] = (port, new_handle);
+            self.listeners[i].handle = new_handle;
 
             self.accepted.push(AcceptedConnection {
                 handle,
@@ -671,15 +724,39 @@ impl DpdkTransport {
     /// multiple distinct services (e.g. trading on 9876 and replication
     /// on 9877) without needing separate queues / threads.
     pub fn add_listener(&mut self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+        self.add_listener_with_buffers(
+            port,
+            SOCKET_RX_BUF_SIZE,
+            SOCKET_TX_BUF_SIZE,
+            MAX_TX_QUEUE_SIZE,
+        )
+    }
+
+    /// Like `add_listener` but with custom buffer sizes for sockets
+    /// accepted on this port. Used for replication, which needs larger
+    /// TX buffers to keep up with journal batch throughput.
+    pub fn add_listener_with_buffers(
+        &mut self,
+        port: u16,
+        rx_buf_size: usize,
+        tx_buf_size: usize,
+        tx_queue_limit: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_buf_size]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_buf_size]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         tune_socket(&mut socket);
         socket
             .listen(port)
             .map_err(|e| format!("TCP listen on port {port} failed: {e}"))?;
         let handle = self.sockets.add(socket);
-        self.listeners.push((port, handle));
+        self.listeners.push(ListenerEntry {
+            port,
+            handle,
+            rx_buf_size,
+            tx_buf_size,
+            tx_queue_limit,
+        });
         tracing::info!(port, "DPDK transport: added listener");
         Ok(())
     }
@@ -763,9 +840,10 @@ impl DpdkTransport {
         // Slot is always in-bounds: tx_queues is pre-sized to
         // MAX_CONNECTIONS and smoltcp never hands out a handle beyond
         // its socket capacity (also MAX_CONNECTIONS).
+        let limit = self.tx_queue_limits[handle.index()];
         let slot = &mut self.tx_queues[handle.index()];
         let queue = slot.get_or_insert_with(TxQueue::new);
-        if queue.queued_bytes() + data.len() > MAX_TX_QUEUE_SIZE {
+        if queue.queued_bytes() + data.len() > limit {
             return false;
         }
         queue.push(data);
@@ -783,10 +861,11 @@ impl DpdkTransport {
             .map_or(0, |q| q.queued_bytes())
     }
 
-    /// Maximum bytes that `queue_send` will accept per connection before
-    /// returning `false`. Exposed so callers can size their batches.
-    pub const fn max_tx_queue_size() -> usize {
-        MAX_TX_QUEUE_SIZE
+    /// Maximum bytes that `queue_send` will accept for this connection
+    /// before returning `false`. Replication sockets get a higher limit
+    /// via `add_listener_with_buffers`.
+    pub fn max_tx_queue_size(&self, handle: SocketHandle) -> usize {
+        self.tx_queue_limits[handle.index()]
     }
 
     /// Check if a connection is still open. A stale handle reads as

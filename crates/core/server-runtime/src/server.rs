@@ -2363,8 +2363,13 @@ where
         // Add the replication listener to the client transport so the
         // poll thread accepts both trading and replication connections
         // off the same queue.
+        // Replication needs larger TX buffers than trading: journal batches
+        // can be 100-200 KiB, far exceeding the 16 KiB client TX buffer.
+        const REPL_TX_BUF: usize = 512 * 1024;
+        const REPL_TX_QUEUE: usize = 512 * 1024;
+        const REPL_RX_BUF: usize = 64 * 1024;
         transports[0]
-            .add_listener(repl_port)
+            .add_listener_with_buffers(repl_port, REPL_RX_BUF, REPL_TX_BUF, REPL_TX_QUEUE)
             .map_err(|e| format!("add replication listener: {e}"))?;
 
         let driver = crate::replication::DpdkReplicationDriver::new(
