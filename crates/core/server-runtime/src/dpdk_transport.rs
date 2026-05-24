@@ -40,15 +40,15 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
+use melin_app::Application;
 use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
-use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::decoder::RequestDecoder;
 use melin_app::unix_epoch_nanos;
-use melin_app::{AppEvent, Application};
 use melin_dpdk::transport::DpdkTransport;
-use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
+#[cfg(feature = "latency-trace")]
 use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::ConnectionId;
 use melin_wire_protocol::control::TransportResponse;
@@ -60,8 +60,7 @@ use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
 
-/// Maximum frame payload size (matches reader).
-const MAX_FRAME_SIZE: usize = 1024;
+use crate::client_frames::MAX_FRAME_SIZE;
 
 /// Auth handshake timeout. Connections that don't complete auth within
 /// this window are dropped.
@@ -777,146 +776,41 @@ fn process_trading_frames<A: Application>(
     batch_wall_ns: u64,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) {
-    const COMMIT_EVERY: u64 = 16;
-    let mut cursor = 0;
-    let mut batch = producer.batch();
+    use crate::client_frames::{FrameAction, process_client_frames};
 
-    loop {
-        let remaining = &conn.parse_buf[cursor..];
-        let frame_len = match try_extract_frame(remaining) {
-            FrameResult::Complete(payload) => payload.len(),
-            FrameResult::Incomplete => break,
-            FrameResult::Oversized(len) => {
-                debug!(
-                    connection_id = conn.connection_id.0,
-                    frame_len = len,
-                    "DPDK: oversized frame, dropping connection"
-                );
-                // Commit any slots pushed before the oversize frame so
-                // they're visible to the journal stage. Without this
-                // the early `return` would let `Drop` roll the batch
-                // back, dropping work the client already had ack'd
-                // at TCP level.
-                batch.commit();
-                transport.close(conn.handle);
-                let _ = control_tx.send(ControlEvent::Disconnected {
-                    connection_id: conn.connection_id.0,
-                });
-                id_to_handle.remove(&conn.connection_id.0);
-                conn.parse_buf.clear();
-                return;
-            }
-        };
+    #[cfg(feature = "latency-trace")]
+    let mut publish_rec = melin_transport_core::trace::register_stage("dpdk: publish");
 
-        let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-
-        let (seq, event) = match decoder.decode(payload, permission) {
-            Decoded::Filter => {
-                cursor += 4 + frame_len;
-                continue;
-            }
-            Decoded::PermissionDenied(reason) => {
-                debug!(
-                    connection_id = conn.connection_id.0,
-                    reason, "DPDK: permission denied, dropping request"
-                );
-                cursor += 4 + frame_len;
-                continue;
-            }
-            Decoded::DecodeError(reason) => {
-                debug!(
-                    connection_id = conn.connection_id.0,
-                    reason, "DPDK: decode error"
-                );
-                cursor += 4 + frame_len;
-                continue;
-            }
-            Decoded::Permitted { request_seq, event } => (request_seq, event),
-        };
-
-        #[allow(clippy::let_unit_value)]
-        // mono_trace_ns() returns () without latency-trace
-        let recv_ts = mono_trace_ns();
-        // Sequence is allocated by the journal stage in disruptor
-        // cursor order — see `InputSlot::sequence`. Read-only query
-        // events (`AppEvent::is_query`) bypass the journal and skip
-        // the wall-clock stamp.
-        let ts = if event.is_query() { 0 } else { batch_wall_ns };
-        let event = JournalEvent::App(event);
-        let connection_id = conn.connection_id.0;
-        let key_hash = conn.key_hash;
-        #[allow(clippy::let_unit_value)]
-        let publish_ts = mono_trace_ns();
-        batch.push_with(|slot| {
-            slot.connection_id = connection_id;
-            slot.key_hash = key_hash;
-            slot.request_seq = seq;
-            slot.sequence = 0;
-            slot.timestamp_ns = ts;
-            slot.event = event;
-            slot.publish_ts = publish_ts;
-            slot.recv_ts = recv_ts;
-        });
+    let action = process_client_frames(
+        &mut conn.parse_buf,
+        conn.connection_id.0,
+        conn.key_hash,
+        permission,
+        producer,
+        decoder,
+        batch_wall_ns,
+        #[cfg(feature = "latency-trace")]
+        &mut publish_rec,
         #[cfg(feature = "tick-to-trade")]
-        ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
+        ingest_rec,
+    );
 
-        cursor += 4 + frame_len;
-
-        // Rotate at the visibility-delay cap (see reader.rs for the
-        // measured rationale). Most connections push <16 events per
-        // outer iter; the cap only fires on burst-heavy connections
-        // whose first frame would otherwise wait for tens of later
-        // frames to decode before becoming visible to the journal stage.
-        if batch.len() >= COMMIT_EVERY {
-            batch.commit();
-            batch = producer.batch();
+    match action {
+        FrameAction::Continue => {}
+        FrameAction::Disconnect | FrameAction::PipelineFull => {
+            if matches!(action, FrameAction::PipelineFull) {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    "DPDK: pipeline full, dropping connection"
+                );
+            }
+            transport.close(conn.handle);
+            let _ = control_tx.send(ControlEvent::Disconnected {
+                connection_id: conn.connection_id.0,
+            });
+            id_to_handle.remove(&conn.connection_id.0);
         }
     }
-
-    // Final commit for the residual batch (0..COMMIT_EVERY slots). Safe
-    // when the batch is empty — `Batch::commit` is a no-op for count=0.
-    batch.commit();
-
-    // Compact: shift remaining bytes to front. Single memmove for the
-    // entire batch instead of one per frame.
-    if cursor > 0 {
-        let remaining = conn.parse_buf.len() - cursor;
-        conn.parse_buf.copy_within(cursor.., 0);
-        conn.parse_buf.truncate(remaining);
-    }
-}
-
-/// Result of trying to extract a length-prefixed frame from a parse buffer.
-#[derive(Debug, PartialEq)]
-enum FrameResult<'a> {
-    /// Complete frame extracted. Payload is the frame data (without length prefix).
-    Complete(&'a [u8]),
-    /// Not enough data yet — need more bytes.
-    Incomplete,
-    /// Frame length exceeds MAX_FRAME_SIZE — connection should be dropped.
-    Oversized(usize),
-}
-
-/// Try to extract a length-prefixed frame from a parse buffer.
-///
-/// Wire format: `[u32 little-endian length][payload]`.
-/// Returns the payload slice on success, or Incomplete/Oversized.
-fn try_extract_frame(buf: &[u8]) -> FrameResult<'_> {
-    if buf.len() < 4 {
-        return FrameResult::Incomplete;
-    }
-
-    let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-
-    if frame_len > MAX_FRAME_SIZE {
-        return FrameResult::Oversized(frame_len);
-    }
-
-    if buf.len() < 4 + frame_len {
-        return FrameResult::Incomplete;
-    }
-
-    FrameResult::Complete(&buf[4..4 + frame_len])
 }
 
 #[cfg(test)]
@@ -925,6 +819,28 @@ mod tests {
     use std::num::NonZeroU64;
 
     use melin_types::types::*;
+
+    /// Result of trying to extract a length-prefixed frame from a parse buffer.
+    #[derive(Debug, PartialEq)]
+    enum FrameResult<'a> {
+        Complete(&'a [u8]),
+        Incomplete,
+        Oversized(usize),
+    }
+
+    fn try_extract_frame(buf: &[u8]) -> FrameResult<'_> {
+        if buf.len() < 4 {
+            return FrameResult::Incomplete;
+        }
+        let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if frame_len > MAX_FRAME_SIZE {
+            return FrameResult::Oversized(frame_len);
+        }
+        if buf.len() < 4 + frame_len {
+            return FrameResult::Incomplete;
+        }
+        FrameResult::Complete(&buf[4..4 + frame_len])
+    }
 
     // --- try_extract_frame tests ---
 

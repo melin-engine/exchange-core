@@ -26,10 +26,9 @@ use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
 use crate::ControlEvent;
-use melin_app::AppEvent;
 use melin_app::Application;
 use melin_app::auth::Permission;
-use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::decoder::RequestDecoder;
 
 /// Decoder type alias: request decoder bound to the application's `Event`
 /// type. Mirrors [`crate::response::ResponseEncoderArc`]; hides
@@ -37,10 +36,8 @@ use melin_app::decoder::{Decoded, RequestDecoder};
 /// the decoder through several functions.
 pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;
 use melin_app::unix_epoch_nanos;
-use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
-use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
@@ -58,8 +55,7 @@ const NUM_BUFFERS: u16 = 2048;
 /// Buffer group ID for the provided recv buffer pool.
 const BUF_GROUP_ID: u16 = 0;
 
-/// Maximum frame payload size (matches `BlockingFrameReader`).
-const MAX_FRAME_SIZE: usize = 1024;
+use crate::client_frames::MAX_FRAME_SIZE;
 
 /// io_uring submission queue depth. Power of 2, sized for up to ~1024
 /// connections per reader thread (multishot RECVs + eventfd read +
@@ -795,194 +791,48 @@ fn process_frames<A: Application, R>(
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> bool {
-    let mut cursor = 0;
-    // Disconnect signal returned to caller (set on oversize frame).
-    let mut disconnect = false;
-    // Set when `try_push_with` reports the input ring is full. We commit
-    // whatever made it into the batch before sending ServerBusy and
-    // breaking out of the loop, so the consumer sees this connection's
-    // earlier frames promptly.
-    let mut pipeline_full = false;
+    use crate::client_frames::{FrameAction, process_client_frames};
 
-    // Batch every publish from this recv-cycle into a single Release
-    // store on the input ring's producer cursor. Per-event `try_publish`
-    // emits one cursor-store per frame; under steady-state TCP load the
-    // matching/journal consumers see that store cross the cache line on
-    // every event. Coalescing into one store per recv-loop iteration
-    // brings the TCP path to parity with the DPDK ingress (which
-    // already uses the batch API — see `dpdk_transport.rs`). The batch
-    // is committed at function exit regardless of how the loop ends; on
-    // an early return we explicitly commit before propagating.
-    //
-    // Bounded at `COMMIT_EVERY` events to cap consumer-visibility delay.
-    // Unbounded batching let tcp-dual-repl p99.9 drift +~80 µs vs the
-    // pre-batch baseline: tail recv-cycles up to ~100 events left their
-    // first frame waiting ~tens of µs before becoming visible to the
-    // journal stage, which then interacted with replica ack pacing.
-    // A diagnostic histogram (now removed) measured the recv-cycle
-    // distribution under steady-state load — p50 ≈ 10, p99 ≈ 30,
-    // p99.9 ≈ 40, max ≈ 100 events per batch. Capping at 16 leaves the
-    // median path unsplit (≤1% extra cursor stores) while bounding
-    // worst-case visibility delay to ~16 decode iterations. The cap
-    // turned out to *also* improve median throughput on tcp single-node
-    // (+4.75% vs main vs +3.15% unbounded) — pipeline backpressure
-    // visibly eased once consumers stopped waiting on long batches.
-    const COMMIT_EVERY: u64 = 16;
-    let mut batch = producer.batch();
-
-    while cursor + 4 <= conn.parse_buf.len() {
-        // Read 4-byte little-endian length prefix.
-        let len_bytes: [u8; 4] = conn.parse_buf[cursor..cursor + 4]
-            .try_into()
-            .expect("slice is exactly 4 bytes");
-        let frame_len = u32::from_le_bytes(len_bytes) as usize;
-
-        if frame_len > MAX_FRAME_SIZE {
-            debug!(
-                connection_id = conn.connection_id,
-                addr = %conn.addr,
-                frame_len,
-                "frame too large, dropping connection"
-            );
-            disconnect = true;
-            break;
-        }
-
-        // Wait for the complete frame before parsing.
-        if cursor + 4 + frame_len > conn.parse_buf.len() {
-            break;
-        }
-
-        let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-        cursor += 4 + frame_len;
-
-        let (seq, event) = match decoder.decode(frame, conn.permission) {
-            Decoded::Filter => continue,
-            Decoded::PermissionDenied(reason) => {
-                debug!(
-                    connection_id = conn.connection_id,
-                    reason, "permission denied, dropping request"
-                );
-                continue;
-            }
-            Decoded::DecodeError(reason) => {
-                debug!(
-                    connection_id = conn.connection_id,
-                    addr = %conn.addr,
-                    reason, "decode error"
-                );
-                continue;
-            }
-            Decoded::Permitted { request_seq, event } => (request_seq, event),
-        };
-
-        #[allow(clippy::let_unit_value)]
-        let recv_ts = mono_trace_ns();
-
-        // Sequence is allocated by the journal stage in disruptor cursor
-        // order — see `InputSlot::sequence`. Read-only query events
-        // (`AppEvent::is_query`) bypass the journal and skip the
-        // wall-clock stamp; everything else inherits this batch's
-        // shared `batch_wall_ns`.
-        let ts = if event.is_query() { 0 } else { batch_wall_ns };
-        let event = JournalEvent::App(event);
-
+    let action = process_client_frames(
+        &mut conn.parse_buf,
+        conn.connection_id,
+        conn.key_hash,
+        conn.permission,
+        producer,
+        decoder,
+        batch_wall_ns,
         #[cfg(feature = "latency-trace")]
-        let pre_publish = mono_trace_ns();
-        #[allow(clippy::let_unit_value)]
-        let publish_ts = mono_trace_ns();
-        let connection_id = conn.connection_id;
-        let key_hash = conn.key_hash;
-
-        // Slot fields are captured by-value into the closure so the slot
-        // can be filled in place inside the ring buffer — same idiom as
-        // the DPDK ingress path.
-        let push_result = batch.try_push_with(|slot| {
-            slot.connection_id = connection_id;
-            slot.key_hash = key_hash;
-            slot.request_seq = seq;
-            slot.sequence = 0;
-            slot.timestamp_ns = ts;
-            slot.event = event;
-            slot.publish_ts = publish_ts;
-            slot.recv_ts = recv_ts;
-        });
-
-        if push_result.is_err() {
-            // Pipeline full. The frame's bytes have already been
-            // consumed from `parse_buf` via the `cursor +=` above and
-            // will be dropped at the compaction step — the client
-            // receives a ServerBusy in lieu of a response for this
-            // frame. We send ServerBusy *after* committing the batch
-            // below so the events that did fit become visible to the
-            // pipeline before the client is told we're busy.
-            pipeline_full = true;
-            break;
-        }
-
-        #[cfg(feature = "latency-trace")]
-        let publish_done = mono_trace_ns();
-        #[cfg(feature = "latency-trace")]
-        publish_rec.record_elapsed(pre_publish, publish_done);
-        // Ingest covers the entire reader cost for this frame:
-        // decode + auth/dedup + slot construction + publish.
-        // `recv_ts` is the frame-extraction timestamp (a software
-        // approximation of NIC ingress — true HW timestamping is
-        // a follow-up; see `docs/benchmarking.md`). Measured up to the
-        // slot-fill completion; the cursor-advance cost is amortised
-        // across the whole batch and not attributed per-frame.
+        publish_rec,
         #[cfg(feature = "tick-to-trade")]
-        ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
+        ingest_rec,
+    );
 
-        // Rotate the batch once it reaches the visibility-delay cap. The
-        // commit produces a single Release store on the input cursor; a
-        // fresh `producer.batch()` starts the next group from the new
-        // cursor with `count = 0`. Recv-cycles smaller than the cap (the
-        // common case — p50 ≈ 10 events) commit exactly once at function
-        // exit and never enter this branch.
-        if batch.len() >= COMMIT_EVERY {
-            batch.commit();
-            batch = producer.batch();
-        }
-    }
-
-    // Single Release store on the input cursor for every slot pushed in
-    // this call. Safe to invoke with zero slots — `Batch::commit` is a
-    // no-op when nothing was written.
-    batch.commit();
-
-    if pipeline_full {
-        debug!(
-            connection_id = conn.connection_id,
-            "pipeline full, sending ServerBusy"
-        );
-        // Best-effort: if the write fails, the client will timeout.
-        let n = unsafe {
-            libc::write(
-                conn.fd,
-                server_busy_frame.as_ptr().cast(),
-                server_busy_frame.len(),
-            )
-        };
-        if n != server_busy_frame.len() as isize {
+    match action {
+        FrameAction::Continue => false,
+        FrameAction::Disconnect => true,
+        FrameAction::PipelineFull => {
             debug!(
                 connection_id = conn.connection_id,
-                written = n,
-                "ServerBusy write incomplete"
+                "pipeline full, sending ServerBusy"
             );
+            // Best-effort: if the write fails, the client will timeout.
+            let n = unsafe {
+                libc::write(
+                    conn.fd,
+                    server_busy_frame.as_ptr().cast(),
+                    server_busy_frame.len(),
+                )
+            };
+            if n != server_busy_frame.len() as isize {
+                debug!(
+                    connection_id = conn.connection_id,
+                    written = n,
+                    "ServerBusy write incomplete"
+                );
+            }
+            false
         }
     }
-
-    // Compact: shift remaining bytes to the front of the parse buffer.
-    // Uses copy_within + truncate instead of drain() to avoid the
-    // Drain iterator overhead.
-    if cursor > 0 {
-        let remaining = conn.parse_buf.len() - cursor;
-        conn.parse_buf.copy_within(cursor.., 0);
-        conn.parse_buf.truncate(remaining);
-    }
-
-    disconnect
 }
 
 #[cfg(test)]
@@ -998,6 +848,7 @@ mod tests {
     use melin_app::auth::Permission;
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+    use melin_journal::JournalEvent;
     use melin_pipeline::ring::DisruptorBuilder;
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
