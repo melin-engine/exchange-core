@@ -505,6 +505,12 @@ pub fn run_dpdk_roundtrip(
     // until the next flush_tx() at the end of the loop.
     const POLL_EVERY_N_CONNS: usize = 4;
 
+    let mut diag_sends: u64 = 0;
+    let mut diag_batch_ends: u64 = 0;
+    let mut diag_cant_send: u64 = 0;
+    let mut diag_pacer_none: u64 = 0;
+    let mut diag_window_full: u64 = 0;
+
     loop {
         // Stamp the start of each outer iter for the poll_iter histogram.
         // Cheap: rdtsc is a few cycles. The compiler elides this when the
@@ -610,6 +616,11 @@ pub fn run_dpdk_roundtrip(
             // With pacing, `pop_due` gates each new frame on the schedule
             // and the recorded timestamp is the *scheduled* tick (closes
             // the coordinated-omission loophole).
+            if !socket.can_send() {
+                diag_cant_send += 1;
+            } else if conn.inflight_ts.len() >= window {
+                diag_window_full += 1;
+            }
             while conn.send_pending.is_empty()
                 && conn.inflight_ts.len() < window
                 && socket.can_send()
@@ -628,7 +639,10 @@ pub fn run_dpdk_roundtrip(
                             }
                             Some(scheduled)
                         }
-                        None => break,
+                        None => {
+                            diag_pacer_none += 1;
+                            break;
+                        }
                     }
                 } else {
                     None
@@ -647,6 +661,7 @@ pub fn run_dpdk_roundtrip(
                     Ok(n) if n == wire_frame.len() => {
                         conn.inflight_ts
                             .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
+                        diag_sends += 1;
                     }
                     Ok(n) if n > 0 => {
                         // Partial send — remainder goes to send_pending; the
@@ -654,6 +669,7 @@ pub fn run_dpdk_roundtrip(
                         conn.send_pending.extend_from_slice(&wire_frame[n..]);
                         conn.inflight_ts
                             .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
+                        diag_sends += 1;
                     }
                     Ok(_) => {
                         // Zero bytes sent — socket transiently full. Park the
@@ -717,6 +733,7 @@ pub fn run_dpdk_roundtrip(
                 // genuine throughput regressions during a long run.
                 if let Ok(response) = codec::decode_response(payload) {
                     if matches!(response, ResponseKind::BatchEnd) {
+                        diag_batch_ends += 1;
                         // Capture `rdtscp()` BEFORE any per-frame
                         // bookkeeping (outcome tally below) so the
                         // histogram reflects only the wire roundtrip.
@@ -787,6 +804,24 @@ pub fn run_dpdk_roundtrip(
     // Stop progress reporter.
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
+
+    eprintln!(
+        "\n=== DPDK Bench Diagnostics ===\n  \
+         total sends:      {diag_sends}\n  \
+         total batch_ends: {diag_batch_ends}\n  \
+         cant_send hits:   {diag_cant_send}\n  \
+         pacer_none hits:  {diag_pacer_none}\n  \
+         window_full hits: {diag_window_full}"
+    );
+    for (ci, conn) in connections.iter().enumerate() {
+        let socket = sockets.get::<tcp::Socket>(conn.handle);
+        eprintln!(
+            "  conn[{ci}]: state={:?} inflight={} pending={}",
+            socket.state(),
+            conn.inflight_ts.len(),
+            conn.send_pending.len(),
+        );
+    }
 
     let measured_wall = measured_start
         .map(|s| end.duration_since(s).min(phases.measured))
