@@ -91,7 +91,8 @@ pub(super) fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
 /// Remove `consumed` leading bytes from a receive buffer.
 pub(super) fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
     if consumed > 0 {
-        buf.drain(..consumed);
+        buf.copy_within(consumed.., 0);
+        buf.truncate(buf.len() - consumed);
     }
 }
 
@@ -497,10 +498,11 @@ fn drain_pending_acks<T: ReceiverTransport>(
             acked_sequence: seq,
             in_memory_sequence: accum_end_sequence,
         };
+        // Best-effort: session is ending; failure just means the primary won't advance its cursor.
         let _ = transport.send_ack(&ack);
-        // Drain the ack to the wire (best-effort).
         let mut attempts = 0u32;
         while transport.ack_in_flight() && attempts < 64 {
+            // Best-effort drain; we're already on the exit path.
             let _ = transport.poll_recv(recv_buf);
             attempts += 1;
         }

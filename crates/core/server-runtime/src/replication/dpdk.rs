@@ -28,7 +28,7 @@ use super::{
     update_dual_replication_cursor,
 };
 use melin_transport_core::replication::catchup::{
-    can_catch_up_from_journal, catch_up_from_journal_with, snapshot_transfer_with,
+    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
@@ -413,26 +413,36 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                             genesis_entry,
                                             &mut slot.send_buf,
                                         );
-                                        dpdk_publish(&slot.send_buf)
-                                            .and_then(|()| {
-                                                catch_up_from_journal_with::<A::Event>(
-                                                    journal_path,
-                                                    h.last_sequence,
-                                                    &mut dpdk_publish,
-                                                    shutdown,
-                                                )
-                                                .map(|_| ())
-                                            })
-                                            .err()
+                                        dpdk_publish(&slot.send_buf).and_then(|()| {
+                                            match catch_up_from_journal_with::<A::Event>(
+                                                journal_path,
+                                                h.last_sequence,
+                                                &mut dpdk_publish,
+                                                shutdown,
+                                            )? {
+                                                CatchUpResult::Ok(_) => Ok(()),
+                                                CatchUpResult::NeedSnapshot => {
+                                                    Err(io::Error::other(
+                                                        "catch-up failed unexpectedly after probe",
+                                                    ))
+                                                }
+                                            }
+                                        }).err()
                                     } else {
-                                        snapshot_transfer_with::<A::Event>(
+                                        match snapshot_transfer_with::<A::Event>(
                                             journal_path,
                                             genesis_entry,
                                             &mut dpdk_publish,
                                             shutdown,
-                                        )
-                                        .map(|_| ())
-                                        .err()
+                                        ) {
+                                            Ok(CatchUpResult::Ok(_)) => None,
+                                            Ok(CatchUpResult::NeedSnapshot) => {
+                                                Some(io::Error::other(
+                                                    "catch-up failed even after snapshot transfer",
+                                                ))
+                                            }
+                                            Err(e) => Some(e),
+                                        }
                                     };
 
                                     if let Some(e) = catchup_err {
