@@ -146,14 +146,6 @@ if [[ -f "$CARGO_PROFILE" ]]; then
     fi
 fi
 
-# Cargo's built-in libgit2 can't authenticate private git SSH deps.
-# Configure cargo to shell out to git which uses the SSH agent/key.
-CARGO_CONFIG="$USER_HOME/.cargo/config.toml"
-if ! grep -q "git-fetch-with-cli" "$CARGO_CONFIG" 2>/dev/null; then
-    run_as_user "mkdir -p $USER_HOME/.cargo && echo -e '[net]\ngit-fetch-with-cli = true' >> $CARGO_CONFIG"
-    echo "  Added git-fetch-with-cli to $CARGO_CONFIG"
-fi
-
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -640,7 +632,7 @@ else
     echo "  Cloning repo..."
     mkdir -p "$USER_HOME/workspace"
     chown "$USER_NAME:" "$USER_HOME/workspace"
-    run_as_user "git clone git@github.com:melin-engine/melin.git $REPO_DIR"
+    run_as_user "git clone https://github.com/melin-engine/melin.git $REPO_DIR"
     run_as_user "cd $REPO_DIR && git checkout main"
 fi
 

@@ -60,21 +60,6 @@ if [[ -z "$SSH_PUB" ]]; then
 fi
 echo "Using SSH key: $SSH_PUB"
 
-# GitHub deploy key for cloning the repo inside containers.
-GITHUB_KEY="${GITHUB_DEPLOY_KEY:-}"
-if [[ -z "$GITHUB_KEY" ]]; then
-    for candidate in ~/.ssh/te-test2 ~/.ssh/te_test_ed; do
-        if [[ -f "$candidate" ]]; then
-            GITHUB_KEY="$candidate"
-            break
-        fi
-    done
-fi
-if [[ -z "$GITHUB_KEY" || ! -f "$GITHUB_KEY" ]]; then
-    echo "error: GitHub deploy key not found. Set GITHUB_DEPLOY_KEY=<path>" >&2
-    exit 1
-fi
-echo "Using GitHub deploy key: $GITHUB_KEY"
 
 # Create network (ignore if exists).
 docker network create "$NETWORK" 2>/dev/null || true
@@ -113,24 +98,10 @@ for name in "${CONTAINERS[@]}"; do
         /usr/sbin/sshd
     "
 
-    # Copy GitHub deploy key so the container can clone the repo.
-    docker cp "$GITHUB_KEY" "$name":/root/.ssh/deploy_key
-    docker exec "$name" bash -c "
-        chmod 600 /root/.ssh/deploy_key && \
-        cat >> /root/.ssh/config << 'EOF'
-Host github.com
-    IdentityFile /root/.ssh/deploy_key
-    StrictHostKeyChecking no
-EOF
-        chmod 600 /root/.ssh/config
-    "
-
     # Install Rust.
     echo "  Installing Rust in $name..."
     docker exec "$name" bash -c "
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
-        mkdir -p /root/.cargo && \
-        echo -e '[net]\ngit-fetch-with-cli = true' >> /root/.cargo/config.toml
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
     " > /dev/null 2>&1
 
     # Clone the repo and build.
@@ -142,7 +113,7 @@ EOF
     docker exec "$name" bash -c "
         source /root/.cargo/env && \
         mkdir -p /root/workspace && \
-        git clone git@github.com:melin-engine/melin.git $REPO_DIR && \
+        git clone https://github.com/melin-engine/melin.git $REPO_DIR && \
         cd $REPO_DIR && \
         $CHECKOUT_CMD
         cargo build --release

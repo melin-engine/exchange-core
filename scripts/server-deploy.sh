@@ -19,8 +19,6 @@ if [[ $# -lt 1 ]]; then
 fi
 
 REMOTE="$1"
-SSH_KEY="$HOME/.ssh/te_test_ed"
-SSH_PUB="$HOME/.ssh/te_test_ed.pub"
 SETUP_SCRIPT="$(dirname "$0")/server-setup.sh"
 
 # Skip host key prompt on first connect — these are throwaway bench boxes.
@@ -28,35 +26,14 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 ssh()  { command ssh  "${SSH_OPTS[@]}" "$@"; }
 scp()  { command scp  "${SSH_OPTS[@]}" "$@"; }
 
-# Verify local files exist.
-for f in "$SSH_KEY" "$SSH_PUB" "$SETUP_SCRIPT"; do
-    if [[ ! -f "$f" ]]; then
-        echo "error: $f not found" >&2
-        exit 1
-    fi
-done
+if [[ ! -f "$SETUP_SCRIPT" ]]; then
+    echo "error: $SETUP_SCRIPT not found" >&2
+    exit 1
+fi
 
 echo "=== Deploying to $REMOTE ==="
 
-# 1. Copy SSH credentials for GitHub access.
-echo "  Copying SSH keys..."
-ssh "$REMOTE" "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-scp -q "$SSH_KEY" "$REMOTE:~/.ssh/te_test_ed"
-scp -q "$SSH_PUB" "$REMOTE:~/.ssh/te_test_ed.pub"
-ssh "$REMOTE" "chmod 600 ~/.ssh/te_test_ed ~/.ssh/te_test_ed.pub"
-
-# Configure SSH to use this key for GitHub.
-ssh "$REMOTE" 'grep -q "github.com" ~/.ssh/config 2>/dev/null || cat >> ~/.ssh/config << EOF
-
-Host github.com
-    IdentityFile ~/.ssh/te_test_ed
-    StrictHostKeyChecking no
-EOF
-chmod 600 ~/.ssh/config'
-
-echo "  SSH keys deployed."
-
-# 2. Copy and run the setup script.
+# 1. Copy and run the setup script.
 echo "  Copying setup script..."
 scp -q "$SETUP_SCRIPT" "$REMOTE:/tmp/server-setup.sh"
 ssh "$REMOTE" "chmod +x /tmp/server-setup.sh"
