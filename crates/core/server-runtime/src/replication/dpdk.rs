@@ -629,6 +629,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
+                    let mut tx_overflow = false;
                     while batches_sent < batch_size {
                         let Some((meta, data)) = slot.consumer.try_read() else {
                             break;
@@ -643,6 +644,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     .fetch_add(slot.send_buf.len() as u64, Ordering::Relaxed);
                                 if !transport.queue_send(handle, &slot.send_buf) {
                                     slot.send_buf.clear();
+                                    tx_overflow = true;
                                     break;
                                 }
                                 slot.send_buf.clear();
@@ -661,40 +663,40 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         available = available.saturating_sub(data_len);
                     }
 
-                    if !slot.send_buf.is_empty() {
+                    if !tx_overflow && !slot.send_buf.is_empty() {
                         metrics.bytes_sent[slot_idx]
                             .fetch_add(slot.send_buf.len() as u64, Ordering::Relaxed);
                         if !transport.queue_send(handle, &slot.send_buf) {
-                            // Pre-check should have prevented this; this
-                            // branch is defense-in-depth. Replica catches
-                            // up via journal on reconnect, so committed
-                            // (now-unsent) batches aren't lost.
-                            warn!(
-                                slot = slot_idx,
-                                used,
-                                send_len = slot.send_buf.len(),
-                                "TX overflow on replica socket — disconnecting"
-                            );
-                            transport.close(handle);
-                            // Zero metrics before active_flag Release — see B2.
-                            metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
-                            metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
-                            slot.active_flag.store(false, Ordering::Release);
-                            slot.acked_cursor = u64::MAX;
-                            slot.recv_buf.clear();
-                            slot.state = SlotState::Idle;
-                            replicas_connected.fetch_sub(1, Ordering::Release);
-                            update_dual_replication_cursor(
-                                u64::MAX,
-                                other_acked,
-                                replication_cursor,
-                                fastest_replica_cursor,
-                            );
-                            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                warn!("all replicas disconnected — trading halted");
-                            }
-                            continue;
+                            tx_overflow = true;
                         }
+                    }
+                    if tx_overflow {
+                        slot.send_buf.clear();
+                        warn!(
+                            slot = slot_idx,
+                            "TX overflow on replica socket — disconnecting"
+                        );
+                        transport.close(handle);
+                        // Zero metrics before active_flag Release — see B2.
+                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        slot.active_flag.store(false, Ordering::Release);
+                        slot.acked_cursor = u64::MAX;
+                        slot.recv_buf.clear();
+                        slot.state = SlotState::Idle;
+                        replicas_connected.fetch_sub(1, Ordering::Release);
+                        update_dual_replication_cursor(
+                            u64::MAX,
+                            other_acked,
+                            replication_cursor,
+                            fastest_replica_cursor,
+                        );
+                        if replicas_connected.load(Ordering::Relaxed) == 0 {
+                            warn!("all replicas disconnected — trading halted");
+                        }
+                        continue;
+                    }
+                    if !slot.send_buf.is_empty() {
                         // Flush immediately so replication data hits the
                         // wire without waiting for the next outer-loop
                         // poll. Without this, a client-traffic burst
