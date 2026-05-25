@@ -94,7 +94,8 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "astenn"
 version = "0.1.0"
-source = "git+ssh://git@github.com/pierre-l/astenn.git#25754e517c108710ac3be2d259c4b34a46bac177"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94a04bb09d6719cdbec41bbdadbd52183519f8b8d2388eb86fdf12cefa7aff15"
 
 [[package]]
 name = "atomic"

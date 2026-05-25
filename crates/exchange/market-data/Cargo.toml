@@ -10,7 +10,7 @@ melin-protocol = { path = "../protocol" }
 melin-wire-protocol = { path = "../../core/wire-protocol" }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
-astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
+astenn = "0.1"
 rustc-hash = "2"
 
 [dev-dependencies]
