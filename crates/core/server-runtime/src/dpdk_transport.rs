@@ -602,12 +602,19 @@ pub fn run_dpdk_poll<A: Application>(
             }
         }
 
+        // Final drain + poll before the replication tick so fresh ACK
+        // data from replicas is available (arrived since the last mid-
+        // iteration poll) and any remaining client TX is flushed.
+        drain_tx!();
+        transport.poll();
+
         // Drive the replication driver's per-iteration work — handshake
         // progression, journal catch-up (blocking on first connect),
         // ack processing, and live data-batch sends. With a single
         // queue + single thread, this is what replaces the previous
-        // dedicated repl-sender thread; transport.poll() above flushed
-        // any TX the driver queued on the prior iteration.
+        // dedicated repl-sender thread; the poll above flushed any TX
+        // the driver queued on the prior iteration and received any
+        // pending ACKs from replicas.
         if let Some(ref mut driver) = repl_driver {
             driver.tick(&mut transport, shutdown);
         }
