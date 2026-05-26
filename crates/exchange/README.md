@@ -74,12 +74,6 @@ End-to-end numbers (including journal, replication, and network) are in the [seq
 - Admin TUI dashboard (live connection count, events processed, throughput, journal sequence)
 - Sparse account storage to reduce memory usage, see [account lifecycle](../../docs/account-lifecycle.md)
 
-## Going Further
-
-- **DPDK kernel bypass** for both client and replication transport: under active experimentation
-- **SPDK** and **dual-NVMe hedged writes**: being evaluated for journal fsync tail reduction
-- **Instrument-level sharding** across multiple cores: lifts the single-threaded matching bottleneck for workloads spanning many independent order books
-
 ## License
 
 Licensed under the [Business Source License 1.1](../../LICENSE). Production use requires a commercial license from P.L.S.C. Contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
