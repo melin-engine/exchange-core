@@ -8,11 +8,9 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it as long as it stays pure (no I/O, no non-deterministic state).
 
-**Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. Configurable durability modes let you trade latency for stronger guarantees:
+**Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. CRC32C integrity checks and BLAKE3 hash chain for tamper evidence. Journal catch-up, snapshot transfer, and automatic trading halt on replica loss. Sub-second switchover upon promotion. Configurable durability modes let you trade latency for stronger guarantees:
 - **Hybrid** (default): one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
 - **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
-- CRC32C integrity checks and BLAKE3 hash chain for tamper evidence.
-- Journal catch-up, snapshot transfer, and automatic trading halt on replica loss. Sub-second switchover upon promotion.
 
 **Fast.** p99 ~ 520 µs at 1M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 27 µs p99.
 
