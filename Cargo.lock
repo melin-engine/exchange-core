@@ -1576,6 +1576,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-example-counter"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "ed25519-dalek",
+ "melin-app",
+ "melin-server-runtime",
+ "melin-wire-protocol",
+ "tempfile",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "melin-exchange-core"
 version = "0.10.1"
 dependencies = [
