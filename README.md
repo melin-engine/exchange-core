@@ -8,7 +8,7 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 
 **Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it as long as it stays pure (no I/O, no non-deterministic state).
 
-**Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. CRC32C integrity checks and BLAKE3 hash chain for tamper evidence. Journal catch-up, snapshot transfer, and automatic trading halt on replica loss. Sub-second switchover upon promotion. Configurable durability modes let you trade latency for stronger guarantees:
+**Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. CRC32C integrity checks and BLAKE3 hash chain for tamper evidence. Journal catch-up, snapshot transfer, and sub-second switchover upon promotion. Configurable durability modes let you trade latency for stronger guarantees:
 - **Hybrid** (default): one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
 - **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
 
@@ -33,7 +33,7 @@ Melin's core crates form a generic sequencer. Your application plugs in via four
 | Trait | Role |
 |-------|------|
 | `Application` | Your business logic: receives events, produces output. No I/O, no syscalls. Determinism is required for replay. |
-| `AppFactory` | Constructs your application, loads snapshots, seeds initial state |
+| `AppFactory` | Constructs your application, deserializes snapshots, seeds initial state |
 | `RequestDecoder` | Deserializes wire bytes into your domain request type |
 | `ResponseEncoder` | Serializes your domain response type into wire bytes |
 
