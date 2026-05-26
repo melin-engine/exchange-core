@@ -3,6 +3,10 @@ name = "melin-exchange-core"
 version = "0.9.0"
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Order matching engine with account management, risk controls, and circuit breakers"
 
 [features]
 ## Short-circuit `Exchange::execute` to a single `Rejected{NoLiquidity}`
