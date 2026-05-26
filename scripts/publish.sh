@@ -75,7 +75,16 @@ DELAY=30
 
 for crate in "${CRATES[@]}"; do
     echo "--- Publishing $crate ---"
-    cargo publish -p "$crate" $DRY_RUN
+    OUTPUT=$(cargo publish -p "$crate" $DRY_RUN 2>&1) && STATUS=0 || STATUS=$?
+    if [[ $STATUS -ne 0 ]]; then
+        if echo "$OUTPUT" | grep -q "already exists"; then
+            echo "    Already published, skipping."
+            continue
+        fi
+        echo "$OUTPUT" >&2
+        exit $STATUS
+    fi
+    echo "$OUTPUT"
     if [[ -z "$DRY_RUN" ]]; then
         echo "    Waiting ${DELAY}s for crates.io to index..."
         sleep "$DELAY"
