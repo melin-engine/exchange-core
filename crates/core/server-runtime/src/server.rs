@@ -1460,57 +1460,63 @@ where
         // (sent or being sent to replicas). Stronger than no gate, faster
         // than waiting for replica TCP acks, and deadlock-free because the
         // ring backpressures instead of dropping batches.
+        //
+        // Skip the drain entirely when the factory produced no seed events —
+        // `last_published_seq` is still 0 (no events on the ring) and the
+        // cursor will never advance past it.
         let drain_start = std::time::Instant::now();
-        let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
+        if seed_count > 0 {
+            let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
 
-        info!(
-            last_seed_seq,
-            journal = journal_cursor
-                .get()
-                .load(std::sync::atomic::Ordering::Relaxed),
-            matching = matching_cursor
-                .get()
-                .load(std::sync::atomic::Ordering::Relaxed),
-            "seed drain: waiting for pipeline cursors"
-        );
+            info!(
+                last_seed_seq,
+                journal = journal_cursor
+                    .get()
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                matching = matching_cursor
+                    .get()
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "seed drain: waiting for pipeline cursors"
+            );
 
-        while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-            && (journal_cursor
-                .get()
-                .load(std::sync::atomic::Ordering::Acquire)
-                < last_seed_seq
-                || matching_cursor
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                && (journal_cursor
                     .get()
                     .load(std::sync::atomic::Ordering::Acquire)
-                    < last_seed_seq)
-        {
-            std::hint::spin_loop();
-        }
-
-        info!("seed drain: pipeline cursors reached target");
-
-        // After journal + matching are done, wait for each ACTIVE
-        // replication ring's consumer to have read all published batches.
-        // Inactive rings (no connected replica) were never published to,
-        // so their producer cursor is 0 — no wait needed.
-        if let Some(ref ring_progress) = replication_ring_progress {
-            for i in 0..ring_progress.producer_cursors.len() {
-                if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
-                    continue;
-                }
-                let target = ring_progress.producer_cursors[i].load();
-                while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    && ring_progress.consumer_cursors[i]
+                    < last_seed_seq
+                    || matching_cursor
                         .get()
                         .load(std::sync::atomic::Ordering::Acquire)
-                        < target
-                {
-                    std::hint::spin_loop();
+                        < last_seed_seq)
+            {
+                std::hint::spin_loop();
+            }
+
+            info!("seed drain: pipeline cursors reached target");
+
+            // After journal + matching are done, wait for each ACTIVE
+            // replication ring's consumer to have read all published batches.
+            // Inactive rings (no connected replica) were never published to,
+            // so their producer cursor is 0 — no wait needed.
+            if let Some(ref ring_progress) = replication_ring_progress {
+                for i in 0..ring_progress.producer_cursors.len() {
+                    if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    let target = ring_progress.producer_cursors[i].load();
+                    while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                        && ring_progress.consumer_cursors[i]
+                            .get()
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            < target
+                    {
+                        std::hint::spin_loop();
+                    }
                 }
             }
-        }
 
-        info!("seed drain: replication rings drained");
+            info!("seed drain: replication rings drained");
+        }
         let drain_elapsed = drain_start.elapsed();
 
         info!(
@@ -2311,6 +2317,7 @@ where
         use melin_transport_core::trace::mono_trace_ns;
 
         let seed_events = factory.seed_events();
+        let seed_count = seed_events.len();
 
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
@@ -2330,32 +2337,35 @@ where
 
         // Wait for seeding to complete through journal + matching stages,
         // then wait for the replication ring to drain. See TCP path comment.
-        let last_seed_seq = last_published_seq + 1;
-        while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-            && (journal_cursor
-                .get()
-                .load(std::sync::atomic::Ordering::Acquire)
-                < last_seed_seq
-                || matching_cursor
+        // Skip when the factory produced no seed events — nothing on the ring.
+        if seed_count > 0 {
+            let last_seed_seq = last_published_seq + 1;
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                && (journal_cursor
                     .get()
                     .load(std::sync::atomic::Ordering::Acquire)
-                    < last_seed_seq)
-        {
-            std::hint::spin_loop();
-        }
-        if let Some(ref ring_progress) = replication_ring_progress {
-            for i in 0..ring_progress.producer_cursors.len() {
-                if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
-                    continue;
-                }
-                let target = ring_progress.producer_cursors[i].load();
-                while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    && ring_progress.consumer_cursors[i]
+                    < last_seed_seq
+                    || matching_cursor
                         .get()
                         .load(std::sync::atomic::Ordering::Acquire)
-                        < target
-                {
-                    std::hint::spin_loop();
+                        < last_seed_seq)
+            {
+                std::hint::spin_loop();
+            }
+            if let Some(ref ring_progress) = replication_ring_progress {
+                for i in 0..ring_progress.producer_cursors.len() {
+                    if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    let target = ring_progress.producer_cursors[i].load();
+                    while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                        && ring_progress.consumer_cursors[i]
+                            .get()
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            < target
+                    {
+                        std::hint::spin_loop();
+                    }
                 }
             }
         }
