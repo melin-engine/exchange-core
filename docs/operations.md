@@ -307,7 +307,7 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
     --journal /mnt/nvme/melin.journal \
     --snapshot-path /var/lib/melin/melin.snapshot \
     --snapshot-interval-ms 60000 \
-    --cores 1,2,3,6,7,8 \
+    --cores 1,2,3,4,5,6,7,8,9 \
     ...
 ```
 
@@ -451,7 +451,7 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 For lowest latency, configure kernel boot parameters. Edit `/etc/default/grub` and append to `GRUB_CMDLINE_LINUX_DEFAULT`:
 
 ```
-isolcpus=nohz,domain,1-10 nohz_full=1-10 rcu_nocbs=1-10
+isolcpus=nohz,domain,1-9 nohz_full=1-9 rcu_nocbs=1-9
 ```
 
 Then apply:
@@ -463,16 +463,16 @@ sudo reboot
 
 What each parameter does:
 
-- **`isolcpus=nohz,domain,1-10`**: Removes cores 1-10 from the scheduler's load balancing and timer tick distribution. Only explicitly pinned threads run on these cores.
-- **`nohz_full=1-10`**: Stops the timer tick on cores 1-10 when only one task is running. Eliminates ~1-10us jitter every 4ms (HZ=250).
-- **`rcu_nocbs=1-10`**: Moves RCU callback processing off cores 1-10. Without this, RCU grace periods can still interrupt isolated cores.
+- **`isolcpus=nohz,domain,1-9`**: Removes cores 1-9 from the scheduler's load balancing and timer tick distribution. Only explicitly pinned threads run on these cores.
+- **`nohz_full=1-9`**: Stops the timer tick on cores 1-9 when only one task is running. Eliminates ~1-9us jitter every 4ms (HZ=250).
+- **`rcu_nocbs=1-9`**: Moves RCU callback processing off cores 1-9. Without this, RCU grace periods can still interrupt isolated cores.
 
 Verify after reboot:
 
 ```sh
-cat /sys/devices/system/cpu/isolated      # should print: 1-10
-cat /sys/devices/system/cpu/nohz_full     # should print: 1-10
-grep rcu_nocbs /proc/cmdline              # should show rcu_nocbs=1-10
+cat /sys/devices/system/cpu/isolated      # should print: 1-9
+cat /sys/devices/system/cpu/nohz_full     # should print: 1-9
+grep rcu_nocbs /proc/cmdline              # should show rcu_nocbs=1-9
 ```
 
 To revert:
@@ -516,11 +516,11 @@ systemctl disable --now irqbalance
 
 ### Compact Layout for Smaller Hosts
 
-The default core layout above assumes 12+ logical CPUs — i.e., a box where cores 1-10 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 8-10 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
+The default core layout above assumes 10+ logical CPUs — i.e., a box where cores 1-9 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 7-9 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
 
-For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal=1, matching=2, response=3, repl-sender=4, event-publisher=5, shadow=6, bench client=7. Replication-handler cores are left unpinned (they don't run in standalone mode anyway).
+For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal=1, matching=2, response=3, reader=4, event-publisher=5, shadow=6, bench client=7. Replication-sender and handler cores are left unpinned (replication is not used in embedded bench mode).
 
-For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
+For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,7,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
 
 ---
 

@@ -508,10 +508,10 @@ impl PipelineCores {
     /// the pipeline cores.
     ///
     /// On the default workstation `Default` layout the journal (core 1),
-    /// matching (core 2), and shadow/repl_handler cores (8/9/10) are HT
+    /// matching (core 2), and shadow/repl_handler cores (7/8/9) are HT
     /// siblings of each other on an 8-core (16-thread) Ryzen — a layout
-    /// designed for a 16-physical-core box. This packs everything into
-    /// the lower physical cores and leaves the last one free.
+    /// designed for a 10-physical-core box. This packs everything into
+    /// the lower physical cores and leaves core 10+ free.
     ///
     /// Returns the chosen layout and the recommended bench/client core.
     /// Errors if `num_cpus` is too small to host the pipeline.
