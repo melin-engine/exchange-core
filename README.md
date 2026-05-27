@@ -51,6 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+See [`crates/examples/counter`](crates/examples/counter) for a complete working example.
+
 ## Benchmarks
 
 All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](crates/exchange/README.md). Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).

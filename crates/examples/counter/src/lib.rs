@@ -133,6 +133,8 @@ impl Application for Counter {
     ) -> Option<Self::QueryResponse> {
         match event {
             CounterEvent::Increment { amount } => {
+                // Wraps on overflow — a deliberate simplification for this example.
+                // A production app would saturate, reject, or use a wider type.
                 self.value = self.value.wrapping_add(amount);
                 out.push(CounterReport::Ack {
                     new_value: self.value,
@@ -145,6 +147,8 @@ impl Application for Counter {
 
     fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Self::Report>) {}
 
+    // Simplification: always accepts. A production app should track per-key
+    // high-water marks and reject duplicates.
     fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
         true
     }
@@ -344,6 +348,13 @@ mod tests {
         let query = counter.apply(CounterEvent::GetValue, &ctx, &mut reports);
         assert!(reports.is_empty());
         assert_eq!(query.unwrap().value, 99);
+    }
+
+    #[test]
+    fn build_reject() {
+        let event = CounterEvent::Increment { amount: 1 };
+        let report = Counter::build_reject(&event, RejectReason::DuplicateRequest);
+        assert!(matches!(report, CounterReport::Rejected));
     }
 
     #[test]
