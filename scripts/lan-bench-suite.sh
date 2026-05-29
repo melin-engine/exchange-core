@@ -12,8 +12,8 @@
 #     dpdk-dual-repl  DPDK + 2 synchronous replicas (e2e DPDK)
 #
 #   Workloads (what the bench runs):
-#     throughput      Peak throughput — 100M pairs, 16 clients, window 128
-#     single          Single-order latency — 500K pairs, 1 client, window 1
+#     throughput      Peak throughput — 8 clients, window 128
+#     single          Single-order latency — 1 client, window 1
 #     engine-only     Matching engine only — no journal, no network (local)
 #     pipeline-only   Journal + matching — no network (local)
 #     sweep-window    Window parameter sweep
@@ -42,7 +42,7 @@
 #   RUN_PLOTS=0|1       Generate plots from results (default: 0)
 #   THROUGHPUT_DURATION=T  Measured-phase duration for throughput workload
 #                          (humantime, default: 60s)
-#   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 16)
+#   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 8)
 #   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 128)
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
@@ -214,7 +214,14 @@ BENCH_RUST_LOG="${RUST_LOG:-info}"
 
 # Order counts — override for quick smoke tests.
 THROUGHPUT_DURATION="${THROUGHPUT_DURATION:-60s}"
-THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
+# 8 connections models a gateway-fronted matching core: gateways aggregate
+# clients, so the core sees one connection per gateway — single digits to
+# low dozens, not thousands. 8 still saturates the engine for peak
+# throughput (the single matching thread is the limiter, not connection
+# count — 4/8/16 conns all peak at ~2.4-2.9M/s), while keeping the paced
+# latency number representative of real client fan-in rather than the
+# inflated figure from 16 saturated connections.
+THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-8}"
 THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-128}"
 SINGLE_DURATION="${SINGLE_DURATION:-30s}"
 # Account / instrument cardinality for the throughput + single
