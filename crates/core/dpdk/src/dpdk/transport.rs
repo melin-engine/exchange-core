@@ -24,8 +24,11 @@ use crate::port::{ChecksumOffloads, Port};
 /// Called on every socket (listen + accepted) to configure for trading:
 /// - Nagle disabled (TCP_NODELAY): send small messages immediately
 /// - Delayed ACK disabled: ACK every segment without waiting 10ms
-/// - RTO floor lowered to 10ms (default 1s is 10,000x the LAN RTT)
-/// - Initial RTO lowered to 50ms (first retransmit before any RTT sample)
+/// - RTO floor and initial RTO both at 1ms — fastcp's minimum (its RTT
+///   estimator is u32-millisecond, so sub-ms truncates to 0 and panics).
+///   The response path (server->client) is what gates client-visible
+///   latency, and a 50ms initial RTO turned any dropped response segment
+///   into a 50ms tail; on a µs-RTT LAN the first retransmit should be ~1ms.
 /// - Initial congestion window raised to 64 KiB (skip slow start on LAN)
 ///
 /// These settings sacrifice marginal bandwidth efficiency and RFC
@@ -34,7 +37,7 @@ fn tune_socket(socket: &mut tcp::Socket<'_>) {
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
     socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
-    socket.set_initial_rto(smoltcp::time::Duration::from_millis(50));
+    socket.set_initial_rto(smoltcp::time::Duration::from_millis(1));
     socket.set_initial_congestion_window(64 * 1024);
 }
 
