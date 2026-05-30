@@ -915,8 +915,13 @@ run_bench() {
     if [[ -n "${BENCH_THREADS:-}" ]]; then
         threads_arg="--bench-threads ${BENCH_THREADS}"
     fi
+    # ${SUDO} is empty under SSH_USER=root and `sudo -n` for the
+    # debian/ubuntu user. The DPDK transport needs root for hugepages
+    # and PCI access; kernel-TCP transports don't need it but adding
+    # sudo is harmless (the output JSON lands under /tmp with mode 644
+    # so the scp-back as the SSH user still works).
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ${SUDO} ./target/release/melin-bench \
             --addr ${server_addr} \
             --health-addr ${health_addr} \
             --key bench.key \
