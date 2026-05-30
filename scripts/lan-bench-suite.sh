@@ -700,6 +700,18 @@ echo "  Builds complete."
 echo ""
 
 # ---------------------------------------------------------------------------
+# Grant CAP_SYS_NICE to the freshly-built bench binary so it can set
+# SCHED_FIFO on its pipeline threads without running as root. Without
+# this, melin-bench logs "SCHED_FIFO failed (run as root or grant
+# CAP_SYS_NICE)" at startup and falls back to CFS scheduling — which
+# leaves a tail-latency hole (the bench threads can be preempted by
+# unrelated userspace on the same cores). The server doesn't need this
+# step because it's already launched via ${SUDO} and inherits caps.
+# Idempotent: runs after every build, costs ~50 ms.
+ssh $SSH_OPTS "$BENCH" "${SUDO} setcap cap_sys_nice+ep ${REPO_DIR}/target/release/melin-bench" || \
+    echo "  WARN: setcap on melin-bench failed — bench threads will run on SCHED_OTHER"
+
+# ---------------------------------------------------------------------------
 # Generate auth keys (shared setup — needed by all benchmarks)
 # ---------------------------------------------------------------------------
 echo "=== Setting up auth keys ==="
