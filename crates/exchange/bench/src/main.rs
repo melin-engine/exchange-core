@@ -592,6 +592,20 @@ struct BenchArgs {
     /// IPv4 gateway for the DPDK bench interface.
     #[arg(long)]
     dpdk_gateway: Option<String>,
+    /// Peer IPv4 used for the bifurcated `rte_flow` steering rule. When
+    /// set, the DPDK port opens in isolated mode and only IPv4 packets
+    /// sourced from this address are delivered into DPDK queue 0 —
+    /// everything else stays with the kernel netdev. Required for L3
+    /// setups that share the public NIC with the kernel (SSH, etc.).
+    #[arg(long)]
+    dpdk_peer_ip: Option<String>,
+    /// Gateway MAC (aa:bb:cc:dd:ee:ff) seeded into smoltcp for the
+    /// `--dpdk-gateway` IP. Used in L3 bifurcated mode where the ARP
+    /// reply for the gateway would not match the steering rule and
+    /// would be eaten by the kernel. Source it from `ip neigh` on the
+    /// host.
+    #[arg(long)]
+    dpdk_gateway_mac: Option<String>,
     /// MTU for the DPDK interface. Use 9000 for jumbo frames. Must match server.
     #[arg(long, default_value_t = 1500)]
     dpdk_mtu: usize,
@@ -737,6 +751,14 @@ fn main() {
                         server_addr: addr,
                         mtu: args.dpdk_mtu,
                         vlan_id: args.dpdk_vlan,
+                        peer_ip: args
+                            .dpdk_peer_ip
+                            .as_deref()
+                            .map(|s| s.parse().expect("invalid --dpdk-peer-ip")),
+                        gateway_mac: args
+                            .dpdk_gateway_mac
+                            .as_deref()
+                            .map(melin_dpdk::parse_mac),
                     },
                     phases,
                     args.window,

@@ -285,6 +285,21 @@ pub struct ServerConfig {
     #[arg(long)]
     pub dpdk_gateway: Option<String>,
 
+    /// Peer IPv4 used for the bifurcated `rte_flow` steering rule. When
+    /// set, the DPDK port opens in isolated mode and only IPv4 packets
+    /// sourced from this address are delivered into DPDK queue 0 —
+    /// everything else stays with the kernel netdev. Required for L3
+    /// setups that share the public NIC with the kernel (SSH, etc.).
+    #[arg(long)]
+    pub dpdk_peer_ip: Option<String>,
+
+    /// Gateway MAC (aa:bb:cc:dd:ee:ff) seeded into smoltcp for the
+    /// `--dpdk-gateway` IP. Required in L3 bifurcated mode because the
+    /// gateway's ARP reply would not match the steering rule and would
+    /// be eaten by the kernel. Source from `ip neigh` on the host.
+    #[arg(long)]
+    pub dpdk_gateway_mac: Option<String>,
+
     /// MTU for the DPDK interface. Use 9000 for jumbo frames (6x fewer TCP
     /// segments). Requires switch and PF MTU to be set accordingly.
     #[arg(long, default_value_t = 1500)]
@@ -419,6 +434,8 @@ impl Default for ServerConfig {
             durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
             yield_idle: false,
             dpdk_eal_args: String::new(),
+            dpdk_peer_ip: None,
+            dpdk_gateway_mac: None,
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
             dpdk_prefix_len: 24,
@@ -1809,6 +1826,11 @@ fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
         listen_port: cfg.bind.port(),
         mtu: cfg.dpdk_mtu,
         vlan_id: cfg.dpdk_vlan,
+        peer_ip: cfg
+            .dpdk_peer_ip
+            .as_deref()
+            .map(|s| s.parse().expect("invalid --dpdk-peer-ip address")),
+        gateway_mac: cfg.dpdk_gateway_mac.as_deref().map(melin_dpdk::parse_mac),
         num_queues: 1,
     }
 }

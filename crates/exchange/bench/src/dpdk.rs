@@ -92,6 +92,16 @@ pub struct DpdkBenchConfig {
     pub mtu: usize,
     /// VLAN ID for hardware strip/insert. Required for dedicated NIC mode.
     pub vlan_id: Option<u16>,
+    /// When set, the port is opened in bifurcated mode and an `rte_flow`
+    /// rule steers IPv4 packets sourced from this IP into DPDK queue 0.
+    /// All other traffic stays with the kernel (SSH, ARP, etc.).
+    /// Used for L3 setups that share the NIC with the host's public IP.
+    pub peer_ip: Option<Ipv4Addr>,
+    /// MAC to seed into smoltcp for the gateway IP. In L3 bifurcated
+    /// mode, ARP for the gateway wouldn't reach DPDK (the reply has a
+    /// different source IP than `peer_ip`), so the operator pulls the
+    /// gateway MAC from `ip neigh` and passes it in here.
+    pub gateway_mac: Option<[u8; 6]>,
 }
 
 /// Run the DPDK roundtrip benchmark.
@@ -141,12 +151,24 @@ pub fn run_dpdk_roundtrip(
     };
 
     // Configure and start all ports. Use intersection of offload caps.
+    // In bifurcated mode (peer_ip set), open in isolated mode and install
+    // an src-IP steering rule so DPDK only sees the server's traffic.
+    let bifurcated = config.peer_ip.is_some();
     let mut ports = Vec::with_capacity(config.port_ids.len());
     let mut combined_offloads: Option<melin_dpdk::port::ChecksumOffloads> = None;
     for &pid in &config.port_ids {
-        let mut port = Port::configure_with_vlan(pid, &mempool, config.vlan_id, 1)
-            .expect("port config failed");
+        let mut port = if bifurcated {
+            Port::configure_bifurcated(pid, &mempool, config.vlan_id, 1)
+                .expect("port config (bifurcated) failed")
+        } else {
+            Port::configure_with_vlan(pid, &mempool, config.vlan_id, 1)
+                .expect("port config failed")
+        };
         port.start().expect("port start failed");
+        if let Some(peer) = config.peer_ip {
+            port.install_src_ipv4_steering(peer)
+                .expect("rte_flow steering rule install failed");
+        }
         combined_offloads = Some(match combined_offloads {
             None => port.offloads,
             Some(prev) => prev.intersect(port.offloads),
@@ -200,13 +222,47 @@ pub fn run_dpdk_roundtrip(
             .expect("default route");
     }
 
-    // SR-IOV VFs can't receive broadcast ARP, so normal ARP resolution
-    // fails. Two workarounds:
-    // 1. Send a gratuitous ARP so the switch learns our MAC.
-    // 2. Seed the server's MAC into smoltcp's neighbor cache via a crafted
-    //    ARP reply. The server's VF MAC is derived from its DPDK IP
-    //    (02:00:IP[0]:IP[1]:IP[2]:IP[3]) — same scheme as dpdk-setup.sh.
-    {
+    // Two seeding strategies, picked by mode:
+    //   - L3 bifurcated: smoltcp routes the server IP via the gateway,
+    //     and the gateway's ARP reply has a different source IP than
+    //     `peer_ip`, so it never reaches DPDK. Seed (gateway, gateway_mac)
+    //     statically — the operator pulled it from `ip neigh`.
+    //   - Legacy SR-IOV: VFs can't receive broadcast ARP, so smoltcp
+    //     can't resolve the server either. Send a gratuitous ARP for
+    //     the switch's benefit and seed the server's deterministic VF
+    //     MAC (02:00:IP[0..4]).
+    if let (Some(gw), Some(gw_mac)) = (config.gateway, config.gateway_mac) {
+        // Build a synthetic ARP reply: peer = gateway. The pre-existing
+        // ARP reply path on the device populates smoltcp's neighbor cache
+        // without going through the wire.
+        let our_ip_bytes = config.local_ip.octets();
+        let gw_bytes = gw.octets();
+        let mut arp_reply = [0u8; 42];
+        arp_reply[0..6].copy_from_slice(&mac); // dst: us
+        arp_reply[6..12].copy_from_slice(&gw_mac); // src: gateway
+        arp_reply[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+        arp_reply[14..16].copy_from_slice(&[0x00, 0x01]);
+        arp_reply[16..18].copy_from_slice(&[0x08, 0x00]);
+        arp_reply[18] = 6;
+        arp_reply[19] = 4;
+        arp_reply[20..22].copy_from_slice(&[0x00, 0x02]); // opcode: reply
+        arp_reply[22..28].copy_from_slice(&gw_mac);
+        arp_reply[28..32].copy_from_slice(&gw_bytes);
+        arp_reply[32..38].copy_from_slice(&mac);
+        arp_reply[38..42].copy_from_slice(&our_ip_bytes);
+        device.inject_rx(arp_reply.to_vec());
+
+        // Poll once so smoltcp consumes the injected ARP reply.
+        let mut tmp_sockets = SocketSet::new(Vec::new());
+        device.poll_rx();
+        iface.poll(now, &mut device, &mut tmp_sockets);
+        device.flush_tx();
+
+        eprintln!(
+            "  ARP: seeded gateway {gw} = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (L3 mode)",
+            gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5],
+        );
+    } else {
         let our_ip = config.local_ip.octets();
         let mut frame = [0u8; 42];
         // Ethernet header: broadcast destination
