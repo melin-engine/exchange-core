@@ -205,7 +205,7 @@ pub fn run_dpdk_roundtrip(
     // 1. Send a gratuitous ARP so the switch learns our MAC.
     // 2. Seed the server's MAC into smoltcp's neighbor cache via a crafted
     //    ARP reply. The server's VF MAC is derived from its DPDK IP
-    //    (02:00:IP[0]:IP[1]:IP[2]:IP[3]) — same scheme as dpdk-setup-sriov.sh.
+    //    (02:00:IP[0]:IP[1]:IP[2]:IP[3]) — same scheme as dpdk-setup.sh.
     {
         let our_ip = config.local_ip.octets();
         let mut frame = [0u8; 42];

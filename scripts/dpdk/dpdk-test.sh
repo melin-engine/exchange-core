@@ -16,7 +16,7 @@
 # Prerequisites:
 #   - dpdk-testpmd installed (dnf install dpdk-tools / apt install dpdk)
 #   - Hugepages configured
-#   - VFs bound to vfio-pci (run dpdk-setup-sriov.sh first)
+#   - VFs bound to vfio-pci (run dpdk-setup.sh first)
 #
 # Examples:
 #   # Verify ports are detected and link is up:
@@ -44,14 +44,14 @@ fi
 
 MODE="${1:-info}"
 
-# Read config from dpdk-setup-sriov.sh if available.
+# Read config from dpdk-setup.sh if available.
 CONF="/etc/melin-dpdk.conf"
 if [[ -f "$CONF" ]]; then
     source "$CONF"
     echo "  Loaded config from $CONF"
     echo "    DPDK_IP=$DPDK_IP, MTU=${MTU:-1500}, VF_MAC=${VF_MAC:-auto}"
 else
-    echo "  No $CONF found — using defaults (run dpdk-setup-sriov.sh first for SR-IOV)"
+    echo "  No $CONF found — using defaults (run dpdk-setup.sh first for SR-IOV)"
 fi
 
 HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"

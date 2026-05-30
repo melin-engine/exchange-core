@@ -40,15 +40,19 @@ ssh "$REMOTE" "chmod +x /tmp/server-setup.sh"
 
 echo "  Running setup (this may take a few minutes)..."
 echo ""
-# Run directly (not via sudo) — we're already root.
+# `sudo` here is a no-op when REMOTE is `root@host` and an
+# elevation when REMOTE is e.g. `debian@host` / `ubuntu@host` on
+# bare-metal providers that don't expose root via SSH (latitude.sh,
+# Hetzner Robot, etc.). Relies on NOPASSWD sudo, which is the
+# default on those images.
 # Use bash explicitly to avoid TTY issues with ssh -t.
-ssh "$REMOTE" "bash /tmp/server-setup.sh"
+ssh "$REMOTE" "sudo -n bash /tmp/server-setup.sh"
 
 # 3. Reboot if kernel boot params were just configured.
 NEEDS_REBOOT=$(ssh "$REMOTE" "test -f /tmp/.server-needs-reboot && echo yes || echo no")
 if [[ "$NEEDS_REBOOT" == "yes" ]]; then
     echo "=== Rebooting for kernel boot params (isolcpus, nohz_full, rcu_nocbs) ==="
-    ssh "$REMOTE" "rm -f /tmp/.server-needs-reboot && shutdown -r now" 2>/dev/null || true
+    ssh "$REMOTE" "sudo -n rm -f /tmp/.server-needs-reboot && sudo -n shutdown -r now" 2>/dev/null || true
 
     # Wait for SSH to go down.
     echo -n "  Waiting for shutdown..."

@@ -879,7 +879,7 @@ where
         // this, smoltcp emits a broadcast ARP on connect which the SR-IOV
         // PF silently drops, and the SYN never goes out — the replica
         // spins on "failed to connect (DPDK)" forever. VF MACs follow the
-        // 02:00:<IP-bytes> convention set by dpdk-setup-sriov.sh, matching
+        // 02:00:<IP-bytes> convention set by dpdk-setup.sh, matching
         // what the bench client does on its outbound connect.
         let primary_mac = [
             0x02,

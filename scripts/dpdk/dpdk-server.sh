@@ -2,8 +2,9 @@
 # Start the melin server with DPDK transport.
 #
 # Auto-detects DPDK IP from /etc/melin-dpdk.conf (written by
-# dpdk-setup-sriov.sh) or derives it from the bond VLAN interface.
-# Falls back to TAP mode if no SR-IOV config is found.
+# dpdk-setup.sh) or derives it from the bond VLAN interface.
+# Recognizes sriov (vfio-pci VFs), mlx5 (bifurcated PMD), and tap
+# (Docker/standalone fallback) modes.
 #
 # Usage:
 #   sudo ./scripts/dpdk/dpdk-server.sh [extra server args...]
@@ -69,7 +70,7 @@ fi
 
 if [[ -z "${DPDK_IP:-}" ]]; then
     echo "error: could not detect DPDK IP" >&2
-    echo "  Set DPDK_IP=... or run dpdk-setup-sriov.sh first" >&2
+    echo "  Set DPDK_IP=... or run dpdk-setup.sh first" >&2
     exit 1
 fi
 
@@ -89,35 +90,56 @@ if ! mount | grep -q "pagesize=2M"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Detect SR-IOV vs TAP mode
+# Detect mode (sriov / mlx5 / tap)
 # ---------------------------------------------------------------------------
+# The conf author (dpdk-setup.sh / test-containers-start.sh) writes
+# DPDK_MODE explicitly. When the conf is absent we fall back to the
+# legacy auto-detection: vfio-pci bindings → sriov, otherwise TAP.
 EAL_ARGS="${DPDK_EAL_ARGS:-}"
 DPDK_PORTS_ARG=""
 DPDK_VLAN_ARG=""
 DPDK_MTU_ARG=""
-
-if ls /sys/bus/pci/drivers/vfio-pci/0000:* &>/dev/null; then
-    # SR-IOV mode — VFs are bound to vfio-pci. Use both ports for LACP
-    # bonds so traffic arriving on either bond member is received.
-    MODE="SR-IOV"
-    VF_COUNT=$(ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l)
-    EAL_ARGS="${EAL_ARGS:+$EAL_ARGS }--huge-dir=$HUGE_DIR"
-    if [[ "$VF_COUNT" -ge 2 ]]; then
-        DPDK_PORTS_ARG="--dpdk-ports 0,1"
+MODE="${DPDK_MODE:-}"
+if [[ -z "$MODE" ]]; then
+    if ls /sys/bus/pci/drivers/vfio-pci/0000:* &>/dev/null; then
+        MODE="sriov"
     else
-        DPDK_PORTS_ARG="--dpdk-ports $DPDK_PORT"
+        MODE="tap"
     fi
-    if [[ -n "${VLAN_ID:-}" ]]; then
-        DPDK_VLAN_ARG="--dpdk-vlan $VLAN_ID"
-    fi
-    if [[ "$MTU" != "1500" ]]; then
-        DPDK_MTU_ARG="--dpdk-mtu $MTU"
-    fi
-else
-    # TAP mode — no SR-IOV, use virtual TAP device.
-    MODE="TAP"
-    EAL_ARGS="--vdev=net_tap0 --no-pci --huge-dir=$HUGE_DIR"
 fi
+
+case "$MODE" in
+    mlx5)
+        # Bifurcated PMD — conf provides the full EAL args (`-a <PCI>
+        # --huge-dir=...`). No vfio-pci bindings to count.
+        if [[ -z "$EAL_ARGS" ]]; then
+            echo "error: DPDK_MODE=mlx5 but DPDK_EAL_ARGS missing in $CONF" >&2
+            exit 1
+        fi
+        DPDK_PORTS_ARG="--dpdk-ports ${DPDK_PORT}"
+        if [[ "$MTU" != "1500" ]]; then DPDK_MTU_ARG="--dpdk-mtu $MTU"; fi
+        ;;
+    sriov)
+        # VFs bound to vfio-pci. Two VFs = bonded SR-IOV; one VF = single port.
+        VF_COUNT=$(ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l)
+        EAL_ARGS="${EAL_ARGS:+$EAL_ARGS }--huge-dir=$HUGE_DIR"
+        if [[ "$VF_COUNT" -ge 2 ]]; then
+            DPDK_PORTS_ARG="--dpdk-ports 0,1"
+        else
+            DPDK_PORTS_ARG="--dpdk-ports $DPDK_PORT"
+        fi
+        if [[ -n "${VLAN_ID:-}" ]]; then DPDK_VLAN_ARG="--dpdk-vlan $VLAN_ID"; fi
+        if [[ "$MTU" != "1500" ]]; then DPDK_MTU_ARG="--dpdk-mtu $MTU"; fi
+        ;;
+    tap)
+        # Virtual TAP device — no NIC ownership.
+        EAL_ARGS="--vdev=net_tap0 --no-pci --huge-dir=$HUGE_DIR"
+        ;;
+    *)
+        echo "error: unknown DPDK_MODE='${MODE}' in $CONF" >&2
+        exit 1
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Start
