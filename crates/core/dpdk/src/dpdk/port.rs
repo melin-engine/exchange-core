@@ -274,9 +274,8 @@ impl Port {
         // layout the matcher expects on both LE and BE hosts.
         let src_be = u32::from_ne_bytes(src_ipv4.octets());
         let mut err_type: i32 = 0;
-        let ret = unsafe {
-            ffi::dpdk_install_src_ipv4_steering(self.port_id, src_be, &mut err_type)
-        };
+        let ret =
+            unsafe { ffi::dpdk_install_src_ipv4_steering(self.port_id, src_be, &mut err_type) };
         if ret != 0 {
             return Err(PortError::FlowRuleFailed { ret, err_type });
         }
@@ -334,10 +333,9 @@ impl std::fmt::Display for PortError {
             PortError::TxQueueFailed(c) => write!(f, "rte_eth_tx_queue_setup failed: {c}"),
             PortError::StartFailed(c) => write!(f, "rte_eth_dev_start failed: {c}"),
             PortError::FlowIsolateFailed(c) => write!(f, "rte_flow_isolate failed: {c}"),
-            PortError::FlowRuleFailed { ret, err_type } => write!(
-                f,
-                "rte_flow_create failed: ret={ret} err_type={err_type}"
-            ),
+            PortError::FlowRuleFailed { ret, err_type } => {
+                write!(f, "rte_flow_create failed: ret={ret} err_type={err_type}")
+            }
         }
     }
 }

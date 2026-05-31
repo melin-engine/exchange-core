@@ -755,10 +755,7 @@ fn main() {
                             .dpdk_peer_ip
                             .as_deref()
                             .map(|s| s.parse().expect("invalid --dpdk-peer-ip")),
-                        gateway_mac: args
-                            .dpdk_gateway_mac
-                            .as_deref()
-                            .map(melin_dpdk::parse_mac),
+                        gateway_mac: args.dpdk_gateway_mac.as_deref().map(melin_dpdk::parse_mac),
                     },
                     phases,
                     args.window,
