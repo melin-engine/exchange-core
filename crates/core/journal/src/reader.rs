@@ -88,6 +88,19 @@ pub struct JournalReader<E: AppEvent> {
     /// catch.
     #[cfg(feature = "hash-chain")]
     genesis_payload: Option<[u8; 32]>,
+    /// One-shot chain-anchor capture: when set, `validate_and_advance`
+    /// records the chain hash at the moment the entry whose sequence
+    /// equals `target_seq` is processed — whether that entry is a
+    /// `GenesisHash`, a `Checkpoint`, or a normal app event. Lets snapshot-
+    /// based recovery cross-check the snapshot's recorded chain hash
+    /// against the journal's, uniformly across all anchor kinds, without
+    /// the reader having to surface control entries to the caller. Both
+    /// fields stay `None` when no anchor was requested or when the
+    /// reader never observed the target sequence.
+    #[cfg(feature = "hash-chain")]
+    target_seq: Option<u64>,
+    #[cfg(feature = "hash-chain")]
+    captured_chain_hash: Option<[u8; 32]>,
 }
 
 /// Hash chain state maintained by the reader for verification.
@@ -136,6 +149,10 @@ impl<E: AppEvent> JournalReader<E> {
             hash_chain: None,
             #[cfg(feature = "hash-chain")]
             genesis_payload: None,
+            #[cfg(feature = "hash-chain")]
+            target_seq: None,
+            #[cfg(feature = "hash-chain")]
+            captured_chain_hash: None,
         })
     }
 
@@ -364,6 +381,9 @@ impl<E: AppEvent> JournalReader<E> {
                     events_since_checkpoint: 0,
                 });
                 self.last_sequence = Some(sequence);
+                if Some(sequence) == self.target_seq {
+                    self.captured_chain_hash = Some(*genesis_hash.as_bytes());
+                }
                 self.pos += consumed;
                 self.valid_file_end += consumed as u64;
                 return self.next_entry();
@@ -403,6 +423,13 @@ impl<E: AppEvent> JournalReader<E> {
                     chain.events_since_checkpoint = 0;
                 }
                 self.last_sequence = Some(sequence);
+                if Some(sequence) == self.target_seq
+                    && let Some(chain) = &self.hash_chain
+                {
+                    // events_since_checkpoint just reset to 0, so the
+                    // canonical chain hash at this seq is current_hash.
+                    self.captured_chain_hash = Some(chain.current_hash);
+                }
                 self.pos += consumed;
                 self.valid_file_end += consumed as u64;
                 return self.next_entry();
@@ -430,6 +457,14 @@ impl<E: AppEvent> JournalReader<E> {
         }
 
         self.last_sequence = Some(sequence);
+        #[cfg(feature = "hash-chain")]
+        if Some(sequence) == self.target_seq {
+            // App-event branch: the batch hasher has just absorbed this
+            // entry, so chain_hash() returns the canonical post-entry
+            // value — matches what the writer's chain_hash() recorded
+            // in the snapshot.
+            self.captured_chain_hash = self.chain_hash();
+        }
         self.pos += consumed;
         self.valid_file_end += consumed as u64;
 
@@ -491,6 +526,41 @@ impl<E: AppEvent> JournalReader<E> {
                     *h.finalize().as_bytes()
                 }
             })
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        None
+    }
+
+    /// Arm a one-shot chain-anchor capture at `target_seq`. When the
+    /// reader processes the entry at this sequence — whether it surfaces
+    /// to the caller (app event) or is consumed internally (`GenesisHash`,
+    /// `Checkpoint`) — the chain hash at that moment is stashed and
+    /// becomes readable via [`captured_chain_hash`]. Lets snapshot
+    /// recovery cross-check a snapshot's recorded hash against the
+    /// journal's uniformly, without the carve-out a per-entry compare
+    /// in the replay loop would force at control-entry anchors.
+    ///
+    /// No-op when the `hash-chain` feature is disabled (no chain to
+    /// capture). Must be called before [`next_entry`] reaches `target_seq`.
+    pub fn set_chain_anchor_target(&mut self, target_seq: u64) {
+        #[cfg(feature = "hash-chain")]
+        {
+            self.target_seq = Some(target_seq);
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        {
+            let _ = target_seq;
+        }
+    }
+
+    /// Chain hash captured at the sequence armed via
+    /// [`set_chain_anchor_target`]. `None` until that sequence is
+    /// observed (or always, when `hash-chain` is disabled, or when no
+    /// anchor was armed).
+    pub fn captured_chain_hash(&self) -> Option<[u8; 32]> {
+        #[cfg(feature = "hash-chain")]
+        {
+            self.captured_chain_hash
         }
         #[cfg(not(feature = "hash-chain"))]
         None

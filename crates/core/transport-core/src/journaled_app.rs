@@ -91,23 +91,11 @@ impl std::fmt::Display for JournaledAppError {
                  snapshot recorded {} but journal computes {} — mismatched \
                  snapshot/journal pair (different cluster, divergent history, \
                  or tampered journal)",
-                hex_prefix(expected_chain_hash),
-                hex_prefix(actual_chain_hash),
+                melin_journal::error::hex_prefix(expected_chain_hash),
+                melin_journal::error::hex_prefix(actual_chain_hash),
             ),
         }
     }
-}
-
-/// Format a 32-byte hash as a short hex prefix for diagnostic output.
-/// Mirrors `journal::error::hex` (which is private to that crate) to
-/// keep the same operator-facing format across journal and journaled-
-/// app errors without re-exporting the helper.
-fn hex_prefix(hash: &[u8; 32]) -> String {
-    hash.iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
-        + "..."
 }
 
 impl std::error::Error for JournaledAppError {
@@ -205,13 +193,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // sentinel is the "uninitialized" marker — legacy snapshots
         // written before hash-chain tracking, or replicas that don't
         // track the chain — and is mapped to None so it doesn't fire a
-        // spurious compare. Anchors on a control entry (Checkpoint /
-        // GenesisHash) are also not cross-checked here: the reader
-        // processes those internally and never surfaces them to
-        // `replay_segment`, so the equality test below can never match.
-        // App-event coverage is sufficient in practice (see
-        // roadmap entry "Re-enable snapshot/journal chain-hash
-        // cross-check on recovery").
+        // spurious compare. The reader captures its chain hash at the
+        // armed target sequence inside `validate_and_advance`, so the
+        // check fires uniformly for app, `GenesisHash`, and `Checkpoint`
+        // anchors — no carve-out for control entries.
         let snap_chain_check: Option<[u8; 32]> = if snap_chain_hash == [0u8; 32] {
             None
         } else {
@@ -243,15 +228,18 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // --- Walk each sealed archive in monotonic order ---
         for (idx, archive_path) in &archives {
             let mut reader = JournalReader::<A::Event>::open(archive_path)?;
+            if has_snapshot {
+                reader.set_chain_anchor_target(snap_sequence);
+            }
             replay_segment(
                 &mut reader,
                 &mut app,
                 snap_sequence,
-                snap_chain_check,
                 &mut last_drain_ns,
                 &mut reports,
                 /* allow_partial_tail = */ false,
             )?;
+            verify_snapshot_chain_anchor(&reader, snap_sequence, snap_chain_check)?;
             verify_segment_boundary(*idx, prev_tail_hash, reader.genesis_payload())?;
             // Carry forward only when this segment actually had a chain
             // (hash-chain feature on, segment had at least its
@@ -307,6 +295,9 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
+        if has_snapshot {
+            reader.set_chain_anchor_target(snap_sequence);
+        }
         // The live segment may have a partial-tail crash: replay loop
         // tolerates `SequenceGap` by stopping early, mirroring legacy
         // behaviour.
@@ -314,11 +305,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             &mut reader,
             &mut app,
             snap_sequence,
-            snap_chain_check,
             &mut last_drain_ns,
             &mut reports,
             /* allow_partial_tail = */ true,
         )?;
+        verify_snapshot_chain_anchor(&reader, snap_sequence, snap_chain_check)?;
         verify_segment_boundary(0, prev_tail_hash, reader.genesis_payload())?;
 
         let last_seq = reader.last_sequence().unwrap_or(snap_sequence);
@@ -544,7 +535,6 @@ fn replay_segment<A: Application>(
     reader: &mut JournalReader<A::Event>,
     app: &mut A,
     snap_sequence: u64,
-    snap_chain_hash: Option<[u8; 32]>,
     last_drain_ns: &mut u64,
     reports: &mut Vec<A::Report>,
     allow_partial_tail: bool,
@@ -552,17 +542,6 @@ fn replay_segment<A: Application>(
     loop {
         match reader.next_entry() {
             Ok(Some(entry)) => {
-                if entry.sequence == snap_sequence
-                    && let Some(expected) = snap_chain_hash
-                    && let Some(actual) = reader.chain_hash()
-                    && actual != expected
-                {
-                    return Err(JournaledAppError::SnapshotChainMismatch {
-                        snap_sequence,
-                        expected_chain_hash: expected,
-                        actual_chain_hash: actual,
-                    });
-                }
                 if entry.sequence > snap_sequence {
                     replay_entry(
                         app,
@@ -590,6 +569,34 @@ fn replay_segment<A: Application>(
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    Ok(())
+}
+
+/// Compare the snapshot's recorded chain hash against the journal's
+/// computed chain hash at the anchor sequence. The reader captured its
+/// chain hash at that moment inside `validate_and_advance`, uniformly
+/// for app, `GenesisHash`, and `Checkpoint` anchors. No-op when no
+/// snapshot was supplied (`expected = None`) or when the reader didn't
+/// observe the anchor sequence within this segment (`captured = None`)
+/// — the cross-segment caller (`recover_inner`) calls this after every
+/// segment walk; whichever segment contains the anchor produces the
+/// `Some`, and `SnapshotAnchorMissing` covers the "no segment did"
+/// case independently.
+fn verify_snapshot_chain_anchor<E: melin_app::AppEvent>(
+    reader: &JournalReader<E>,
+    snap_sequence: u64,
+    expected: Option<[u8; 32]>,
+) -> Result<(), JournaledAppError> {
+    if let Some(expected) = expected
+        && let Some(actual) = reader.captured_chain_hash()
+        && actual != expected
+    {
+        return Err(JournaledAppError::SnapshotChainMismatch {
+            snap_sequence,
+            expected_chain_hash: expected,
+            actual_chain_hash: actual,
+        });
     }
     Ok(())
 }
@@ -1354,18 +1361,16 @@ mod tests {
         }
     }
 
-    /// Documents the app-event-only design of the chain-hash cross-
-    /// check: a snapshot anchored on a Checkpoint (or GenesisHash)
-    /// control entry is silently accepted even when its recorded chain
-    /// hash is wrong, because the reader processes those entries
-    /// internally and never surfaces them to `replay_segment`. The
-    /// roadmap notes this gap is acceptable in practice — tightening
-    /// the check to cover control-entry anchors (by exposing the
-    /// reader's chain hash at control boundaries) will need to flip
-    /// this test.
+    /// Companion to `recover_from_snapshot_rejects_chain_hash_mismatch`,
+    /// targeting a control-entry anchor: the snapshot's anchor sequence
+    /// lands on an auto-emitted `Checkpoint`, which the reader processes
+    /// internally and never surfaces to `replay_segment`. The check
+    /// still fires because the reader captures its chain hash at the
+    /// armed anchor sequence inside `validate_and_advance`, uniformly
+    /// across app and control entries — no carve-out.
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn recover_from_snapshot_skips_chain_check_at_control_anchor() {
+    fn recover_from_snapshot_rejects_chain_hash_mismatch_at_control_anchor() {
         // 3-event Checkpoint cadence: a Checkpoint lands at seq 5 in
         // a fresh journal (1=Genesis, 2,3,4=events, 5=Checkpoint).
         let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(3);
@@ -1381,13 +1386,32 @@ mod tests {
 
         // Forge a snapshot anchored at the Checkpoint seq (5) with a
         // deliberately wrong chain hash. The snapshot's app state is
-        // immaterial here — the point is that the chain-hash cross-
-        // check does not fire for control-entry anchors, so recovery
-        // must succeed despite the bad hash.
-        snapshot::save::<TestApp>(&TestApp::new(), 5, [0xFF; 32], &snap_path).unwrap();
+        // immaterial here — what we're proving is that the chain-hash
+        // cross-check now catches a control-anchor mismatch.
+        let bad_hash = [0xFF; 32];
+        snapshot::save::<TestApp>(&TestApp::new(), 5, bad_hash, &snap_path).unwrap();
 
-        let _recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path)
-            .expect("control-anchor snapshot must bypass the chain-hash cross-check");
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+            Ok(_) => panic!("expected recovery to reject control-anchor chain-hash mismatch"),
+            Err(e) => e,
+        };
+        match err {
+            JournaledAppError::SnapshotChainMismatch {
+                snap_sequence,
+                expected_chain_hash,
+                actual_chain_hash,
+            } => {
+                assert_eq!(snap_sequence, 5);
+                assert_eq!(expected_chain_hash, bad_hash);
+                // The actual hash is the journal's Checkpoint chain hash;
+                // its exact bytes depend on event payloads, so we only
+                // assert it differs from the forged value (and is non-
+                // zero, ruling out the "no capture" failure mode).
+                assert_ne!(actual_chain_hash, bad_hash);
+                assert_ne!(actual_chain_hash, [0u8; 32]);
+            }
+            other => panic!("expected SnapshotChainMismatch, got {other:?}"),
+        }
     }
 
     /// Multi-segment variant of the chain-hash mismatch check: the
