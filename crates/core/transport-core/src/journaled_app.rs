@@ -187,21 +187,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
 
         let has_snapshot = snapshot.is_some();
-        let (snap_sequence, snap_chain_hash) = snapshot.unwrap_or((0, [0u8; 32]));
+        let snap_sequence = snapshot.map(|(s, _)| s).unwrap_or(0);
         // Cross-check the snapshot's chain hash against the journal's
-        // computed chain hash at the anchor sequence. The all-zero
-        // sentinel is the "uninitialized" marker — legacy snapshots
-        // written before hash-chain tracking, or replicas that don't
-        // track the chain — and is mapped to None so it doesn't fire a
-        // spurious compare. The reader captures its chain hash at the
-        // armed target sequence inside `validate_and_advance`, so the
-        // check fires uniformly for app, `GenesisHash`, and `Checkpoint`
-        // anchors — no carve-out for control entries.
-        let snap_chain_check: Option<[u8; 32]> = if snap_chain_hash == [0u8; 32] {
-            None
-        } else {
-            Some(snap_chain_hash)
-        };
+        // computed chain hash at the anchor sequence. The reader
+        // captures its chain hash at the armed target sequence inside
+        // `validate_and_advance`, so the check fires uniformly for
+        // app, `GenesisHash`, and `Checkpoint` anchors — no carve-out
+        // for control entries.
+        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|(_, h)| h);
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
@@ -1130,40 +1123,6 @@ mod tests {
         assert_eq!(recovered.app().total, expected);
     }
 
-    /// Replicas may restore from a snapshot whose chain hash is the
-    /// `[0u8; 32]` "uninitialized" sentinel (e.g. an older snapshot
-    /// written before hash-chain tracking). `recover_from_snapshot`
-    /// must still load the app state and replay the post-snapshot
-    /// journal delta — `seed_chain_hash` treats the sentinel as a
-    /// no-op rather than seeding the chain with zeros.
-    #[test]
-    fn recover_from_snapshot_accepts_zero_chain_hash_sentinel() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("journal.bin");
-        let snap_path = dir.path().join("snap.bin");
-
-        let pre = [TestEvent::Add(3), TestEvent::Add(5)];
-        let post = [TestEvent::Add(7), TestEvent::Add(11)];
-
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &pre, 1);
-        drop(ja);
-
-        // `append_events` writes the journal but doesn't apply to the
-        // app — recover() to get a populated app, then save a snapshot
-        // through the generic API with the all-zero sentinel chain
-        // hash (replica scenario, where the chain isn't tracked).
-        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
-        let seq = ja.next_sequence().saturating_sub(1);
-        snapshot::save::<TestApp>(ja.app(), seq, [0u8; 32], &snap_path).unwrap();
-        let ja = append_events(ja, &post, 1 + pre.len() as u64);
-        drop(ja);
-
-        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
-        let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
-        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
-    }
-
     /// Recovery accepts a snapshot whose recorded sequence corresponds
     /// to a control entry (`GenesisHash` here) rather than an app
     /// event. The reader processes control entries internally and
@@ -1172,7 +1131,9 @@ mod tests {
     /// advances for all entry types. Without this, a snapshot
     /// anchored on a control entry would be rejected as
     /// `SnapshotAnchorMissing` even though the journal does contain
-    /// that sequence.
+    /// that sequence. The forged snapshot also carries the journal's
+    /// real chain hash at seq 1 so the chain-hash cross-check (which
+    /// now covers control anchors uniformly) passes.
     #[cfg(feature = "hash-chain")]
     #[test]
     fn recover_from_snapshot_accepts_control_entry_anchor() {
@@ -1185,12 +1146,23 @@ mod tests {
         let ja = append_events(ja, &events, 1);
         drop(ja);
 
-        // Forge a snapshot at seq 1 — the GenesisHash entry. This is a
-        // control entry the reader processes internally and never
-        // returns from next_entry. The snapshot's app state is empty
-        // (nothing applied before the genesis), so recovery must
-        // replay all three app events to reconstruct the full state.
-        snapshot::save::<TestApp>(&TestApp::new(), 1, [0u8; 32], &snap_path).unwrap();
+        // Capture the journal's real chain hash at the GenesisHash seq
+        // via the reader's anchor-target API — same path recovery
+        // uses, so the forged snapshot's hash matches what the cross-
+        // check will compute during the real recovery walk.
+        let genesis_hash = {
+            let mut reader = JournalReader::<TestEvent>::open(&journal_path).unwrap();
+            reader.set_chain_anchor_target(1);
+            // One next_entry() consumes the GenesisHash internally and
+            // returns the first app event, by which point the capture
+            // hook has stashed the Genesis chain hash.
+            let _ = reader.next_entry().unwrap();
+            reader.captured_chain_hash().expect("genesis captured")
+        };
+        // Forge a snapshot at seq 1 with empty app state. Recovery
+        // must accept the control-entry anchor and replay all three
+        // app events to reconstruct the full state.
+        snapshot::save::<TestApp>(&TestApp::new(), 1, genesis_hash, &snap_path).unwrap();
 
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         assert_eq!(recovered.app().total, expected_state(&events, 1).total);
