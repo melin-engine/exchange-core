@@ -2,8 +2,11 @@
 
 use std::fmt;
 
-/// Format a 32-byte hash as a hex string (first 8 bytes for readability).
-fn hex(hash: &[u8; 32]) -> String {
+/// Format a 32-byte hash as a short hex prefix (first 8 bytes) for
+/// operator-facing diagnostics. Public so downstream crates (e.g.
+/// `melin-transport-core`) can produce the same format when surfacing
+/// chain-hash mismatches from their own error types.
+pub fn hex_prefix(hash: &[u8; 32]) -> String {
     hash.iter()
         .take(8)
         .map(|b| format!("{b:02x}"))
@@ -109,8 +112,8 @@ impl fmt::Display for JournalError {
             } => write!(
                 f,
                 "hash chain mismatch at sequence {sequence}: expected {}, got {}",
-                hex(expected),
-                hex(actual)
+                hex_prefix(expected),
+                hex_prefix(actual)
             ),
             Self::SectorSizeMismatch { journal, device } => write!(
                 f,
@@ -125,8 +128,8 @@ impl fmt::Display for JournalError {
                 f,
                 "segment chain break at archive {index}: GenesisHash {} does not match \
                  previous segment's final chain hash {}",
-                hex(actual),
-                hex(expected)
+                hex_prefix(actual),
+                hex_prefix(expected)
             ),
         }
     }
