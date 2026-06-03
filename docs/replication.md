@@ -242,6 +242,12 @@ normal-case post-recovery state.
 - `melin_durability_policy_degraded` (Prometheus gauge on the health
   endpoint) — `1` while the active mode can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.
+- `melin_durability_policy_degraded_seconds_total` (Prometheus counter)
+  — cumulative seconds spent in the degraded state, advancing
+  continuously while degraded. Use
+  `rate(melin_durability_policy_degraded_seconds_total[5m])` for the
+  fraction of the last 5 minutes spent degraded, without scraping the
+  gauge at high frequency to reconstruct intervals.
 - A warn-level log fires on transition into the degraded state and
   every 5 seconds while it persists; an info-level log fires on
   return to target.

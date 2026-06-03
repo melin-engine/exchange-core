@@ -86,6 +86,16 @@ pub struct StageUtilization {
     /// Surfaced on `/healthz` so dashboards and alerting can fire on
     /// it. Only used by the response stage.
     pub policy_degraded: AtomicBool,
+    /// Cumulative nanoseconds the durability policy has spent in the
+    /// degraded state above. Paired with the `policy_degraded` gauge so
+    /// dashboards can compute time-in-degraded over a window with
+    /// `rate(...degraded_seconds_total[5m])` instead of reconstructing
+    /// intervals from high-frequency gauge samples. `u64` nanoseconds:
+    /// the response stage accumulates sub-second tick intervals, and
+    /// u64 holds ~584 years of nanos before overflow — `u128` would be
+    /// wasteful and `AtomicU128` isn't available anyway. Only written
+    /// by the response stage; read by the health endpoint.
+    pub policy_degraded_nanos: AtomicU64,
 }
 
 impl StageUtilization {
@@ -96,6 +106,7 @@ impl StageUtilization {
             gate_journal: AtomicU64::new(0),
             gate_replication: AtomicU64::new(0),
             policy_degraded: AtomicBool::new(false),
+            policy_degraded_nanos: AtomicU64::new(0),
         }
     }
 }

@@ -965,6 +965,11 @@ pub(crate) struct DegradationLogger {
     /// When the last warn fired. Drives the periodic re-emit while
     /// degraded.
     last_log: Option<Instant>,
+    /// Wall clock of the previous `tick`. Each tick attributes the
+    /// interval since this instant to the state observed at that prior
+    /// tick (`pending_state`), accumulating degraded time into the
+    /// `policy_degraded_nanos` counter. Updated on every tick.
+    last_tick: Instant,
 }
 
 impl DegradationLogger {
@@ -974,6 +979,7 @@ impl DegradationLogger {
             pending_since: now,
             pending_logged: true, // healthy is the assumed initial state; nothing to log
             last_log: None,
+            last_tick: now,
         }
     }
 
@@ -991,6 +997,7 @@ impl DegradationLogger {
             pending_since: now,
             pending_logged: true,
             last_log: Some(now),
+            last_tick: now,
         }
     }
 
@@ -1005,6 +1012,23 @@ impl DegradationLogger {
         now: Instant,
         heartbeat_interval: Duration,
     ) {
+        // Accumulate the just-elapsed interval against the state observed
+        // at the *previous* tick — `pending_state` still holds it here,
+        // before any update below. This drives the `_seconds_total`
+        // counter so `rate()` reflects time-in-degraded continuously,
+        // even mid-incident, rather than only stepping on recovery.
+        // A logger re-seed on a runtime mode swap resets `last_tick`,
+        // rebasing accrual to the swap instant so pre-swap time isn't
+        // re-counted. `saturating_duration_since` is belt-and-suspenders:
+        // `now` is always >= `last_tick` here, so it never underflows.
+        if self.pending_state {
+            let elapsed = now.saturating_duration_since(self.last_tick);
+            utilization
+                .policy_degraded_nanos
+                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.last_tick = now;
+
         utilization
             .policy_degraded
             .store(degraded_now, Ordering::Relaxed);
@@ -1724,6 +1748,76 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(utilization.policy_degraded.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn logger_accumulates_degraded_seconds_only_while_degraded() {
+        // The `policy_degraded_nanos` counter must advance by exactly
+        // the wall-clock time spent in the degraded state and stay flat
+        // while healthy. Each tick attributes the interval since the
+        // previous tick to the state observed at that previous tick.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let start = Instant::now();
+        let mut logger = DegradationLogger::new(start);
+        let sec = Duration::from_secs(1);
+
+        // t0: healthy -> degraded. The zero-length interval before the
+        // transition is attributed to the healthy start: no accrual.
+        logger.tick(&p, &utilization, true, start, Duration::from_secs(5));
+        assert_eq!(utilization.policy_degraded_nanos.load(Ordering::Relaxed), 0);
+
+        // t0..t1 spent degraded -> +1s.
+        logger.tick(&p, &utilization, true, start + sec, Duration::from_secs(5));
+        // t1..t2 still degraded, then flips healthy at the tick -> +1s.
+        logger.tick(
+            &p,
+            &utilization,
+            false,
+            start + 2 * sec,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            2 * sec.as_nanos() as u64
+        );
+
+        // t2..t3 spent healthy -> counter holds flat.
+        logger.tick(
+            &p,
+            &utilization,
+            false,
+            start + 3 * sec,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            2 * sec.as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn logger_starting_degraded_accrues_from_construction() {
+        // A primary that boots already-degraded (e.g. `hybrid` with no
+        // replica yet) must accrue from construction, not from the first
+        // observed transition — `new_starting_degraded` seeds the
+        // degraded state so the first tick's interval counts.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let start = Instant::now();
+        let mut logger = DegradationLogger::new_starting_degraded(start, &p);
+
+        logger.tick(
+            &p,
+            &utilization,
+            true,
+            start + Duration::from_secs(1),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            Duration::from_secs(1).as_nanos() as u64
+        );
     }
 
     #[test]

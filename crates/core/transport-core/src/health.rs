@@ -152,6 +152,11 @@ struct HealthSnapshot {
     /// 2-of-3 cluster running `persisted>=2 best_effort`, etc. Operator alerting
     /// should fire on this transitioning to `true`.
     response_policy_degraded: bool,
+    /// Cumulative nanoseconds the durability policy has spent degraded.
+    /// Emitted as a `_seconds_total` counter (nanos / 1e9) so operators
+    /// can `rate()` time-in-degraded over a window — see
+    /// `StageUtilization::policy_degraded_nanos`.
+    response_policy_degraded_nanos: u64,
 }
 
 impl HealthSnapshot {
@@ -330,6 +335,10 @@ impl HealthSnapshot {
                 .response_utilization
                 .policy_degraded
                 .load(Ordering::Relaxed),
+            response_policy_degraded_nanos: state
+                .response_utilization
+                .policy_degraded_nanos
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -444,7 +453,10 @@ impl HealthSnapshot {
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\
              # HELP melin_durability_policy_degraded Durability policy currently clamped below its target node count (1 = degraded, 0 = healthy).\n\
              # TYPE melin_durability_policy_degraded gauge\n\
-             melin_durability_policy_degraded {}\n",
+             melin_durability_policy_degraded {}\n\
+             # HELP melin_durability_policy_degraded_seconds_total Cumulative seconds the durability policy has spent clamped below its target node count.\n\
+             # TYPE melin_durability_policy_degraded_seconds_total counter\n\
+             melin_durability_policy_degraded_seconds_total {:.6}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -481,6 +493,7 @@ impl HealthSnapshot {
             self.response_gate_journal,
             self.response_gate_replication,
             if self.response_policy_degraded { 1 } else { 0 },
+            self.response_policy_degraded_nanos as f64 / 1e9,
         );
         c.position() as usize
     }
@@ -1608,6 +1621,11 @@ mod tests {
         response_util.gate_journal.store(13, Ordering::Relaxed);
         response_util.gate_replication.store(17, Ordering::Relaxed);
         response_util.policy_degraded.store(true, Ordering::Relaxed);
+        // 2.5s in nanos — exercises the nanos -> seconds conversion and
+        // the sub-second precision of the `_seconds_total` formatting.
+        response_util
+            .policy_degraded_nanos
+            .store(2_500_000_000, Ordering::Relaxed);
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
@@ -1643,6 +1661,10 @@ mod tests {
         assert!(
             response.contains("melin_durability_policy_degraded 1\n"),
             "policy_degraded: {response}"
+        );
+        assert!(
+            response.contains("melin_durability_policy_degraded_seconds_total 2.500000\n"),
+            "policy_degraded_seconds_total: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);
