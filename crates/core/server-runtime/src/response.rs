@@ -996,10 +996,11 @@ pub(crate) struct DegradationLogger {
     /// When the last warn fired. Drives the periodic re-emit while
     /// degraded.
     last_log: Option<Instant>,
-    /// Wall clock of the previous `tick`. Each tick attributes the
-    /// interval since this instant to the state observed at that prior
-    /// tick (`pending_state`), accumulating degraded time into the
-    /// `policy_degraded_nanos` counter. Updated on every tick.
+    /// Wall clock of the previous accrual. The interval since this
+    /// instant is attributed to the state observed then (`pending_state`)
+    /// and accumulated into the `policy_degraded_nanos` counter. Advanced
+    /// by [`Self::accrue`] — reached on every `tick` (post-gate, idle, and
+    /// the gate-wait pacing tick) and on `reseed`.
     last_tick: Instant,
 }
 
