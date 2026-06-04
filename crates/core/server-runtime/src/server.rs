@@ -2472,6 +2472,43 @@ where
 // journaled — primary and replicas must converge on them via
 // matching factory configuration rather than replay.
 
+/// Bootstrap source chosen by [`init_engine`] from the on-disk layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapSource {
+    /// Snapshot plus at least one journal segment (live or archived):
+    /// restore the snapshot, replay the post-snapshot delta.
+    SnapshotAndJournal,
+    /// Snapshot with no journal segment at all: restore the snapshot and
+    /// open a fresh segment continuing its sequence + chain.
+    SnapshotOnly,
+    /// Journal segments but no snapshot: full replay from genesis.
+    JournalOnly,
+    /// Nothing on disk: first-ever startup.
+    Fresh,
+}
+
+/// Pure bootstrap decision, extracted so the matrix is unit-testable.
+///
+/// The critical cell: `(snapshot, no live, archives)` must route through
+/// snapshot+journal recovery — the archives may hold acked events past
+/// the snapshot (post-rotation crash window), and only the recovery walk
+/// replays them, verifies the lineage, and synthesizes the missing live
+/// segment. Likewise `(no snapshot, no live, archives)` is journal
+/// recovery, not a fresh start.
+fn choose_bootstrap(
+    snapshot_exists: bool,
+    live_exists: bool,
+    archives_exist: bool,
+) -> BootstrapSource {
+    let lineage_exists = live_exists || archives_exist;
+    match (snapshot_exists, lineage_exists) {
+        (true, true) => BootstrapSource::SnapshotAndJournal,
+        (true, false) => BootstrapSource::SnapshotOnly,
+        (false, true) => BootstrapSource::JournalOnly,
+        (false, false) => BootstrapSource::Fresh,
+    }
+}
+
 /// Initialize or recover the journaled application from disk.
 ///
 /// Returns `(app, writer, needs_seeding)`. `needs_seeding` is true on
@@ -2499,43 +2536,60 @@ where
         }
     });
 
+    // The journal *lineage* exists if either the live segment or any
+    // archived segment is on disk. Deciding on the live file alone is
+    // how acked events used to vanish: a crash between `archive_live`
+    // and `create_continuing` leaves archives (holding events past the
+    // snapshot) with no live file — bootstrapping "snapshot only" from
+    // that layout would silently rewind every event in the archives.
+    // `JournaledApp::recover*` handles the missing-live case itself
+    // (replays archives, synthesizes a fresh live continuing the chain).
     let journal_exists = config.journal.exists();
+    let archives_exist = !melin_journal::segment::list_archives(&config.journal)?.is_empty();
+    let snapshot_exists = snap_path.is_some_and(|p| p.exists());
     let writer_mode = config.journal_writer;
-    let mut engine: JournaledApp<A, W> = if let Some(snap_path) = snap_path
-        && snap_path.exists()
-        && journal_exists
-    {
-        info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
-        JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
-    } else if let Some(snap_path) = snap_path
-        && snap_path.exists()
-        && !journal_exists
-    {
-        // Snapshot exists but journal doesn't — likely a crash between
-        // rotate_file() and create_continuing(). Recover from snapshot
-        // alone and create a fresh journal.
-        info!(
-            snapshot = %snap_path.display(),
-            writer_mode = %writer_mode,
-            "recovering from snapshot only (journal missing, post-rotation crash?)"
-        );
-        let (app, snap_sequence, snap_chain_hash) =
-            melin_transport_core::snapshot::load::<A>(snap_path)?;
-        let writer = W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-        JournaledApp::<A, W>::from_parts(app, writer)
-    } else if journal_exists {
-        info!(writer_mode = %writer_mode, "recovering from journal");
-        let mut app = factory.empty();
-        factory.prefault(&mut app);
-        JournaledApp::<A, W>::recover(app, &config.journal)?
-    } else {
-        info!(writer_mode = %writer_mode, "creating new journal");
-        let mut app = factory.empty();
-        factory.prefault(&mut app);
-        JournaledApp::<A, W>::create(app, &config.journal)?
+    let mut engine: JournaledApp<A, W> = match choose_bootstrap(
+        snapshot_exists,
+        journal_exists,
+        archives_exist,
+    ) {
+        BootstrapSource::SnapshotAndJournal => {
+            let snap_path = snap_path.expect("snapshot_exists implies snap_path");
+            info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
+            JournaledApp::<A, W>::recover_from_snapshot(snap_path, &config.journal)?
+        }
+        BootstrapSource::SnapshotOnly => {
+            // Snapshot exists but no journal segment survives at all —
+            // recover from the snapshot alone and start a fresh segment
+            // continuing its sequence and chain.
+            let snap_path = snap_path.expect("snapshot_exists implies snap_path");
+            info!(
+                snapshot = %snap_path.display(),
+                writer_mode = %writer_mode,
+                "recovering from snapshot only (no journal segments on disk)"
+            );
+            let (app, snap_sequence, snap_chain_hash) =
+                melin_transport_core::snapshot::load::<A>(snap_path)?;
+            let writer = W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
+            JournaledApp::<A, W>::from_parts(app, writer)
+        }
+        BootstrapSource::JournalOnly => {
+            info!(writer_mode = %writer_mode, "recovering from journal");
+            let mut app = factory.empty();
+            factory.prefault(&mut app);
+            JournaledApp::<A, W>::recover(app, &config.journal)?
+        }
+        BootstrapSource::Fresh => {
+            info!(writer_mode = %writer_mode, "creating new journal");
+            let mut app = factory.empty();
+            factory.prefault(&mut app);
+            JournaledApp::<A, W>::create(app, &config.journal)?
+        }
     };
 
-    let needs_seeding = !journal_exists;
+    // Seed only on a genuinely fresh start — any surviving lineage
+    // (live or archived) already contains the seed events.
+    let needs_seeding = !journal_exists && !archives_exist;
 
     // Apply runtime config knobs that the snapshot doesn't carry. The
     // SEC-03 cap and the SEC-04 rate-limit `(rate, burst)` pair are
@@ -2994,6 +3048,35 @@ mod tests {
     use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 
     use super::authenticate_connection;
+    use super::{BootstrapSource, choose_bootstrap};
+
+    /// Full bootstrap decision matrix. The two archive-only cells are
+    /// the regression guard: a post-rotation crash leaves archives with
+    /// no live segment, and bootstrapping "snapshot only" (or "fresh")
+    /// from that layout silently rewinds every acked event held in the
+    /// archives. Recovery must own any layout where a lineage survives.
+    #[test]
+    fn bootstrap_decision_routes_archives_through_recovery() {
+        use BootstrapSource::*;
+        // (snapshot, live, archives) → source
+        let matrix = [
+            ((false, false, false), Fresh),
+            ((false, false, true), JournalOnly), // post-rotation crash, no snapshot
+            ((false, true, false), JournalOnly),
+            ((false, true, true), JournalOnly),
+            ((true, false, false), SnapshotOnly),
+            ((true, false, true), SnapshotAndJournal), // post-rotation crash
+            ((true, true, false), SnapshotAndJournal),
+            ((true, true, true), SnapshotAndJournal),
+        ];
+        for ((snap, live, arch), expected) in matrix {
+            assert_eq!(
+                choose_bootstrap(snap, live, arch),
+                expected,
+                "snapshot={snap} live={live} archives={arch}"
+            );
+        }
+    }
 
     /// Deterministic test key.
     fn test_key() -> SigningKey {

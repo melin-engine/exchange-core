@@ -795,26 +795,31 @@ where
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
     // shutdown returns the App + writer directly.
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
-        if journal_path.exists() {
-            let engine = if snapshot_path.exists() {
-                info!("recovering replica from snapshot + journal (DPDK)");
-                melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
-                    &snapshot_path,
-                    journal_path,
-                )?
-            } else {
-                melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
-            };
-            let next = engine.next_sequence();
-            let last = next.saturating_sub(1);
-            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (mut exchange, writer) = engine.into_parts();
-            factory.apply_operator_policy(&mut exchange);
-            (Some(exchange), Some(writer), last, hash)
+    //
+    // Recover whenever any journal segment survives — live OR archived;
+    // a post-rotation crash leaves archives with no live segment, and
+    // recovery handles that layout (see the kernel-TCP receiver).
+    let lineage_exists =
+        journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if lineage_exists {
+        let engine = if snapshot_path.exists() {
+            info!("recovering replica from snapshot + journal (DPDK)");
+            melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
+                &snapshot_path,
+                journal_path,
+            )?
         } else {
-            (None, None, 0u64, [0u8; 32])
+            melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
         };
+        let next = engine.next_sequence();
+        let last = next.saturating_sub(1);
+        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+        let (mut exchange, writer) = engine.into_parts();
+        factory.apply_operator_policy(&mut exchange);
+        (Some(exchange), Some(writer), last, hash)
+    } else {
+        (None, None, 0u64, [0u8; 32])
+    };
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
     // Reset to 1s on successful streaming (first InputBatch received).
@@ -989,6 +994,10 @@ where
         recv_buf.clear();
         // `None` from the loop = failure path (disconnect or snapshot
         // error) → reconnect. `Some(lineage)` = StreamStart received.
+        // After a snapshot transfer, the next StreamStart's lineage must
+        // agree with the snapshot the primary just sent (see the
+        // kernel-TCP receiver for the rationale).
+        let mut expected_post_snapshot: Option<(u64, [u8; 32])> = None;
         let stream_lineage: Option<(u64, [u8; 32])> = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
@@ -1010,6 +1019,20 @@ where
                             segment_start_sequence,
                             anchor_hash,
                         } => {
+                            if let Some((expected_start, expected_anchor)) = expected_post_snapshot
+                                && (segment_start_sequence != expected_start
+                                    || anchor_hash != expected_anchor)
+                            {
+                                fatal_err_dpdk!(
+                                    format!(
+                                        "post-snapshot StreamStart lineage (start \
+                                     {segment_start_sequence}) disagrees with the \
+                                     transferred snapshot (expected start \
+                                     {expected_start}) — inconsistent primary"
+                                    )
+                                    .into()
+                                );
+                            }
                             info!(start_sequence, "streaming started (DPDK)");
                             break 'handshake Some((segment_start_sequence, anchor_hash));
                         }
@@ -1053,7 +1076,10 @@ where
                                     last_sequence = snap_seq;
                                     chain_hash = snap_hash;
 
-                                    // After snapshot, expect StreamStart.
+                                    // After snapshot, expect a StreamStart
+                                    // whose lineage matches what was just
+                                    // transferred.
+                                    expected_post_snapshot = Some((snap_seq + 1, snap_hash));
                                     continue;
                                 }
                                 Err(e) => {
@@ -1109,8 +1135,11 @@ where
         //
         // The StreamStart lineage carries the segment header identity
         // (starting sequence + chain anchor); creating the local segment
-        // from the same identity makes the replica's journal
-        // byte-identical to the primary's as the stream is consumed.
+        // from the same identity makes the replica's segment
+        // byte-identical to the primary's until the first rotation on
+        // either node (rotations are local, so segment boundaries
+        // diverge after that even though the entry stream stays
+        // identical).
         if pipeline.is_none() && journal_writer.is_none() {
             let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
             let mut fresh = factory.empty();

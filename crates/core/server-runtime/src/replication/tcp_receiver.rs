@@ -352,26 +352,33 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
-        if journal_path.exists() {
-            let engine = if snapshot_path.exists() {
-                info!("recovering replica from snapshot + journal");
-                melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
-                    &snapshot_path,
-                    journal_path,
-                )?
-            } else {
-                melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
-            };
-            let next = engine.next_sequence();
-            let last = next.saturating_sub(1);
-            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (mut exchange, writer) = engine.into_parts();
-            factory.apply_operator_policy(&mut exchange);
-            (Some(exchange), Some(writer), last, hash)
+    // Recover whenever any journal segment survives — live OR archived.
+    // A crash between rotation's rename and the new live file's creation
+    // leaves archives with no live segment; recovery handles that layout
+    // (replays the archives, synthesizes a fresh live). Treating it as a
+    // fresh replica would discard the local durable history and then
+    // fail `create_new` against the surviving archives' lineage.
+    let lineage_exists =
+        journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if lineage_exists {
+        let engine = if snapshot_path.exists() {
+            info!("recovering replica from snapshot + journal");
+            melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
+                &snapshot_path,
+                journal_path,
+            )?
         } else {
-            (None, None, 0u64, [0u8; 32])
+            melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
         };
+        let next = engine.next_sequence();
+        let last = next.saturating_sub(1);
+        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+        let (mut exchange, writer) = engine.into_parts();
+        factory.apply_operator_policy(&mut exchange);
+        (Some(exchange), Some(writer), last, hash)
+    } else {
+        (None, None, 0u64, [0u8; 32])
+    };
 
     let mut backoff = std::time::Duration::from_secs(1);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
@@ -598,6 +605,23 @@ where
                         segment_start_sequence,
                         anchor_hash,
                     } => {
+                        // The lineage must agree with the snapshot the
+                        // primary just transferred — the local journal
+                        // was created from the (verified) snapshot body,
+                        // so an inconsistent StreamStart means a buggy
+                        // or mismatched primary. Trust nothing
+                        // unvalidated at this boundary: a future chain
+                        // verifier would inherit the value.
+                        if segment_start_sequence != snap_sequence + 1
+                            || anchor_hash != snap_chain_hash
+                        {
+                            return Err(format!(
+                                "post-snapshot StreamStart lineage (start \
+                                 {segment_start_sequence}) disagrees with the transferred \
+                                 snapshot (sequence {snap_sequence}) — inconsistent primary"
+                            )
+                            .into());
+                        }
                         info!(start_sequence, "streaming resumed after snapshot transfer");
                         (segment_start_sequence, anchor_hash)
                     }
@@ -620,8 +644,10 @@ where
         // The StreamStart lineage gives the segment header identity
         // (starting sequence + chain anchor) the primary's own journal
         // lineage began with; creating the local segment from the same
-        // identity makes the replica's journal byte-identical to the
-        // primary's as the stream is consumed.
+        // identity makes the replica's segment byte-identical to the
+        // primary's until the first rotation on either node (rotations
+        // are local, so segment boundaries diverge after that even
+        // though the entry stream stays identical).
         if pipeline.is_none() && journal_writer.is_none() {
             let (lineage_start, lineage_anchor) = stream_lineage;
             let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
