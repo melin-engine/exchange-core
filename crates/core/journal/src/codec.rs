@@ -5,15 +5,23 @@
 //!
 //! ## File header (one sector, written once at creation)
 //!
-//! The header occupies exactly one sector on disk (512 or 4096 bytes depending
-//! on the device's physical sector size). The meaningful fields fit in the
-//! first 8 bytes; the remainder of the sector is zero-padded.
+//! The header occupies the first [`ENTRY_OFFSET`] bytes on disk. The
+//! meaningful fields fit in the first 52 bytes; the remainder is
+//! zero-padded.
 //!
-//! | Field          | Type | Bytes | Purpose                                |
-//! |----------------|------|-------|----------------------------------------|
-//! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
-//! | format_version | u16  | 2     | Current version = 12                   |
-//! | sector_size    | u16  | 2     | Physical sector size in bytes (0 = legacy 512) |
+//! | Field             | Type     | Bytes | Purpose                             |
+//! |-------------------|----------|-------|-------------------------------------|
+//! | file_magic        | u32      | 4     | `0x4A4F5552` ("JOUR")               |
+//! | format_version    | u16      | 2     | Current version = 14                |
+//! | sector_size       | u16      | 2     | Always [`MAX_SECTOR_SIZE`] (4096)   |
+//! | starting_sequence | u64      | 8     | Sequence of this segment's first entry |
+//! | anchor_hash       | [u8; 32] | 32    | Chain anchor: random salt (fresh journal) or previous segment's tail hash (rotation) |
+//! | header_crc        | u32      | 4     | CRC32C of the preceding 48 bytes    |
+//!
+//! The anchor seeds the segment's BLAKE3 hash chain (see
+//! [`crate::chain`]); chain metadata lives *only* here — the entry
+//! stream contains application events exclusively, so sequence numbers
+//! are dense over user-visible entries.
 //!
 //! ## Entry layout (little-endian, repeats after file header)
 //!
@@ -34,15 +42,15 @@
 //!
 //! ## Event tag space
 //!
-//! The journal reserves four tags for transport-intrinsic events. Tags
-//! ≥ `TAG_APP` are opaque to the journal and carry `E::encode` payloads:
-//! app codecs may use any internal tag layout they like inside that
-//! payload.
+//! The journal reserves the low tag range for transport-intrinsic
+//! events. Tags ≥ `TAG_APP` are opaque to the journal and carry
+//! `E::encode` payloads: app codecs may use any internal tag layout they
+//! like inside that payload.
 //!
 //! | Tag  | Variant              |
 //! |------|----------------------|
-//! | 0x01 | `GenesisHash`        |
-//! | 0x02 | `Checkpoint`         |
+//! | 0x01 | retired (`GenesisHash`, ≤ v13 — anchor now lives in the file header) |
+//! | 0x02 | retired (`Checkpoint`, ≤ v13 — chain is schedule-free, no in-stream seals) |
 //! | 0x03 | `Tick`               |
 //! | 0x80 | `App(E)` (dispatches to [`AppEvent::encode`]) |
 
@@ -70,7 +78,13 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// recreation. The header's `sector_size` field is now always 4096 in
 /// newly-written files; SectorWriter derives its O_DIRECT alignment
 /// from the device (`detect_sector_size`) rather than the header.
-pub const FORMAT_VERSION: u16 = 13;
+///
+/// v13 → v14: hash-chain metadata moved out of the entry stream. The
+/// file header gained `starting_sequence`, `anchor_hash`, and its own
+/// CRC; the `GenesisHash` (0x01) and `Checkpoint` (0x02) entry tags were
+/// retired. The chain is anchored per segment and schedule-free —
+/// `chain(S) = BLAKE3(entry bytes ≤ S || anchor)` (see [`crate::chain`]).
+pub const FORMAT_VERSION: u16 = 14;
 
 /// Entry magic bytes for corruption/misalignment detection.
 const ENTRY_MAGIC: u16 = 0x4A45;
@@ -85,16 +99,44 @@ const ENTRY_MAGIC: u16 = 0x4A45;
 // break compatibility with journals on disk written by older builds, so
 // we fail the compile instead.
 
-/// File header (8 bytes of meaningful fields; on disk, padded to one sector).
+/// File header (52 bytes of meaningful fields; on disk, padded to
+/// [`ENTRY_OFFSET`]).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct FileHeader {
     file_magic: U32,
     format_version: U16,
     /// Physical sector size used when the journal was created, in bytes.
-    /// 0 in journals written before dynamic sector detection was added —
-    /// readers treat 0 as 512 for backward compatibility.
+    /// Always [`MAX_SECTOR_SIZE`] in v13+ journals; readers treat 0 as
+    /// 512 for backward compatibility with pre-v13 layouts.
     sector_size: U16,
+    /// Sequence number carried by this segment's first entry. 1 for a
+    /// fresh journal; the rotation boundary's next sequence for archived
+    /// and rotated-in segments.
+    starting_sequence: U64,
+    /// BLAKE3 chain anchor for this segment: random salt for a fresh
+    /// journal, the previous segment's tail chain hash after rotation.
+    /// All-zeros only when a build without the `hash-chain` feature
+    /// rotated this segment in (it has no tail hash to anchor to).
+    anchor_hash: [u8; 32],
+    /// CRC32C over all preceding header bytes. The header is written
+    /// once and never modified, so a mismatch means storage corruption —
+    /// in particular it protects the anchor, which every chain
+    /// verification depends on.
+    header_crc: U32,
+}
+
+/// Decoded file-header fields returned by [`decode_file_header`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileHeaderInfo {
+    pub version: u16,
+    /// Byte offset where entries begin (one header reservation).
+    pub sector_size: usize,
+    /// Sequence number of the segment's first entry.
+    pub starting_sequence: u64,
+    /// Chain anchor for this segment (zeros only for segments rotated
+    /// in by a build without `hash-chain`).
+    pub anchor_hash: [u8; 32],
 }
 
 /// Per-entry fixed prefix (20 bytes). `length` covers everything after
@@ -158,15 +200,18 @@ pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 /// CRC32C checksum size in bytes.
 pub(crate) const CRC_SIZE: usize = 4;
 
-const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 8);
+const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 52);
 const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
 const _: () = assert!(ENTRY_HEADER_SIZE == 20);
 const _: () = assert!(ENTRY_META_SIZE == 17);
 
 /// Event tag space — 0x01..0x7F reserved for transport-intrinsic
-/// variants, 0x80 and above for `App(E)` payloads.
-const TAG_GENESIS_HASH: u8 = 0x01;
-const TAG_CHECKPOINT: u8 = 0x02;
+/// variants, 0x80 and above for `App(E)` payloads. Tags 0x01
+/// (`GenesisHash`) and 0x02 (`Checkpoint`) were retired in v14 — chain
+/// metadata lives in the file header now. Do not reuse them: a v14
+/// reader pointed at a ≤ v13 file fails fast at the header version
+/// check, but distinct tags keep any forensic byte-level inspection
+/// unambiguous.
 const TAG_TICK: u8 = 0x03;
 const TAG_APP: u8 = 0x80;
 
@@ -183,7 +228,16 @@ pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
 /// fields into the first `FILE_HEADER_FIELDS_SIZE` bytes and zero-fills
 /// the rest, so the buffer can be written directly as one sector-aligned
 /// O_DIRECT pwrite. `sector_size` must be 512 or 4096.
-pub fn encode_file_header(buf: &mut [u8], sector_size: usize) {
+///
+/// `starting_sequence` is the sequence the segment's first entry will
+/// carry; `anchor_hash` seeds the segment's hash chain (zeros when the
+/// `hash-chain` feature is off).
+pub fn encode_file_header(
+    buf: &mut [u8],
+    sector_size: usize,
+    starting_sequence: u64,
+    anchor_hash: [u8; 32],
+) {
     debug_assert!(
         sector_size == 512 || sector_size == 4096,
         "sector_size must be 512 or 4096, got {sector_size}"
@@ -198,15 +252,18 @@ pub fn encode_file_header(buf: &mut [u8], sector_size: usize) {
     header.file_magic = U32::new(FILE_MAGIC);
     header.format_version = U16::new(FORMAT_VERSION);
     header.sector_size = U16::new(sector_size as u16);
+    header.starting_sequence = U64::new(starting_sequence);
+    header.anchor_hash = anchor_hash;
+    let crc_offset = FILE_HEADER_FIELDS_SIZE - CRC_SIZE;
+    let crc = crc32c::crc32c(&buf[..crc_offset]);
+    let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_FIELDS_SIZE])
+        .expect("FILE_HEADER_FIELDS_SIZE slice matches struct size");
+    header.header_crc = U32::new(crc);
     buf[FILE_HEADER_FIELDS_SIZE..].fill(0);
 }
 
-/// Validate a file header. Returns `Ok((version, sector_size))` on success.
-///
-/// `sector_size` is the physical sector size used when the journal was
-/// created. Legacy journals with the field zeroed return 512 for backward
-/// compatibility.
-pub fn decode_file_header(buf: &[u8]) -> Result<(u16, usize), JournalError> {
+/// Validate a file header. Returns the decoded fields on success.
+pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
     let header = FileHeader::ref_from_prefix(buf)
         .map_err(|_| JournalError::TruncatedEntry)?
         .0;
@@ -219,6 +276,19 @@ pub fn decode_file_header(buf: &[u8]) -> Result<(u16, usize), JournalError> {
     if version != FORMAT_VERSION {
         return Err(JournalError::UnsupportedVersion { version });
     }
+    // CRC over everything before the trailer. Validated before any field
+    // is trusted — the anchor in particular is the root of all chain
+    // verification, so a corrupted header must fail loudly rather than
+    // cascade into a bogus `SegmentChainBreak` later.
+    let crc_offset = FILE_HEADER_FIELDS_SIZE - CRC_SIZE;
+    let actual_crc = crc32c::crc32c(&buf[..crc_offset]);
+    if header.header_crc.get() != actual_crc {
+        return Err(JournalError::ChecksumMismatch {
+            sequence: 0,
+            expected: header.header_crc.get(),
+            actual: actual_crc,
+        });
+    }
     let sector_size = match header.sector_size.get() {
         // Legacy journals written before dynamic sector detection: assume 512.
         0 => 512,
@@ -228,7 +298,12 @@ pub fn decode_file_header(buf: &[u8]) -> Result<(u16, usize), JournalError> {
         // that the caller incorrectly decoded as 512-byte.
         _ => return Err(JournalError::InvalidFile),
     };
-    Ok((version, sector_size))
+    Ok(FileHeaderInfo {
+        version,
+        sector_size,
+        starting_sequence: header.starting_sequence.get(),
+        anchor_hash: header.anchor_hash,
+    })
 }
 
 /// Encode a journal entry into `buf`.
@@ -253,21 +328,6 @@ pub fn encode<E: AppEvent>(
     let mut pos = payload_start;
 
     let event_tag = match event {
-        JournalEvent::GenesisHash { hash } => {
-            buf[pos..pos + 32].copy_from_slice(hash);
-            pos += 32;
-            TAG_GENESIS_HASH
-        }
-        JournalEvent::Checkpoint {
-            chain_hash,
-            events_since_checkpoint,
-        } => {
-            buf[pos..pos + 32].copy_from_slice(chain_hash);
-            pos += 32;
-            le::put_u64(&mut buf[pos..], *events_since_checkpoint);
-            pos += 8;
-            TAG_CHECKPOINT
-        }
         JournalEvent::Tick { now_ns } => {
             le::put_u64(&mut buf[pos..], *now_ns);
             pos += 8;
@@ -391,32 +451,6 @@ pub fn decode<E: AppEvent>(buf: &[u8], _version: u16) -> Result<DecodedEntry<E>,
     let event_payload = &buf[ENTRY_HEADER_SIZE + ENTRY_META_SIZE..data_end];
 
     let event = match event_tag {
-        TAG_GENESIS_HASH => {
-            if event_payload.len() < 32 {
-                return Err(JournalError::CorruptEntry {
-                    sequence,
-                    reason: "GenesisHash payload too short",
-                });
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&event_payload[..32]);
-            JournalEvent::GenesisHash { hash }
-        }
-        TAG_CHECKPOINT => {
-            if event_payload.len() < 40 {
-                return Err(JournalError::CorruptEntry {
-                    sequence,
-                    reason: "Checkpoint payload too short",
-                });
-            }
-            let mut chain_hash = [0u8; 32];
-            chain_hash.copy_from_slice(&event_payload[..32]);
-            let events_since_checkpoint = le::get_u64(&event_payload[32..]);
-            JournalEvent::Checkpoint {
-                chain_hash,
-                events_since_checkpoint,
-            }
-        }
         TAG_TICK => {
             if event_payload.len() < 8 {
                 return Err(JournalError::CorruptEntry {
@@ -534,21 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_genesis() {
-        let hash = [0x5a; 32];
-        round_trip(JournalEvent::GenesisHash { hash });
-    }
-
-    #[test]
-    fn round_trip_checkpoint() {
-        let chain_hash = [0xff; 32];
-        round_trip(JournalEvent::Checkpoint {
-            chain_hash,
-            events_since_checkpoint: 100_000,
-        });
-    }
-
-    #[test]
     fn round_trip_tick() {
         round_trip(JournalEvent::Tick {
             now_ns: 1_700_000_000_000_000_000,
@@ -627,46 +646,47 @@ mod tests {
     #[test]
     fn file_header_round_trip() {
         let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf, 512);
-        assert_eq!(decode_file_header(&buf).unwrap(), (FORMAT_VERSION, 512));
+        let anchor = [0xab; 32];
+        encode_file_header(&mut buf, 512, 42, anchor);
+        assert_eq!(
+            decode_file_header(&buf).unwrap(),
+            FileHeaderInfo {
+                version: FORMAT_VERSION,
+                sector_size: 512,
+                starting_sequence: 42,
+                anchor_hash: anchor,
+            }
+        );
     }
 
     #[test]
     fn file_header_round_trip_4096() {
         let mut buf = [0u8; MAX_SECTOR_SIZE];
-        encode_file_header(&mut buf, 4096);
-        assert_eq!(decode_file_header(&buf).unwrap(), (FORMAT_VERSION, 4096));
+        encode_file_header(&mut buf, 4096, 1, [0u8; 32]);
+        let info = decode_file_header(&buf).unwrap();
+        assert_eq!(info.version, FORMAT_VERSION);
+        assert_eq!(info.sector_size, 4096);
+        assert_eq!(info.starting_sequence, 1);
     }
 
     #[test]
-    fn file_header_legacy_sector_size_zero() {
-        // Journals written before the sector_size field defaulted to 0 in
-        // the reserved bytes. Decode must treat 0 as 512.
+    fn file_header_rejects_corrupted_anchor() {
+        // The anchor is the root of all chain verification — a flipped
+        // bit in it must surface at header decode, not as a downstream
+        // chain mismatch.
         let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf, 512);
-        // Force sector_size field to 0 (legacy layout).
-        buf[6] = 0;
-        buf[7] = 0;
-        assert_eq!(decode_file_header(&buf).unwrap(), (FORMAT_VERSION, 512));
-    }
-
-    #[test]
-    fn file_header_rejects_unknown_sector_size() {
-        let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf, 512);
-        // Write an unrecognised sector_size value.
-        buf[6] = 0x01; // 256 — not 512 or 4096
-        buf[7] = 0x00;
+        encode_file_header(&mut buf, 512, 7, [0x11; 32]);
+        buf[20] ^= 0xff; // inside anchor_hash (offset 16..48)
         assert!(matches!(
             decode_file_header(&buf),
-            Err(JournalError::InvalidFile)
+            Err(JournalError::ChecksumMismatch { .. })
         ));
     }
 
     #[test]
     fn file_header_rejects_wrong_version() {
         let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf, 512);
+        encode_file_header(&mut buf, 512, 1, [0u8; 32]);
         // Bump version.
         buf[4] = buf[4].wrapping_add(1);
         assert!(matches!(

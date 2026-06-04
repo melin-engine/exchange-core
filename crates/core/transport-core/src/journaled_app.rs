@@ -32,7 +32,7 @@ pub enum JournaledAppError {
     Journal(JournalError),
     Snapshot(snapshot::SnapshotError),
     Io(std::io::Error),
-    /// The journal's tail sequence sits below the snapshot's recorded
+    /// The journal's history does not reach the snapshot's recorded
     /// anchor sequence — recovery cannot reconcile the two. Causes
     /// include a journal restored from before the snapshot was taken
     /// (audit-trail loss), a snapshot copied from a different
@@ -40,11 +40,11 @@ pub enum JournaledAppError {
     /// holding the anchor. Recovery refuses to proceed because the
     /// engine state would silently outrun the journal.
     ///
-    /// The anchor's existence is verified against the reader's
-    /// observed last-sequence (which advances for both app events and
-    /// internal control entries — `GenesisHash`, `Checkpoint`), so
-    /// snapshots whose anchor lands on a control-entry sequence are
-    /// still detected as present.
+    /// "Reaches" counts both observed entries and header evidence: a
+    /// segment whose header `starting_sequence` is `S + 1` proves
+    /// history through `S` existed, so a snapshot anchored exactly at
+    /// a rotation boundary is accepted even when the next segment is
+    /// still empty.
     SnapshotAnchorMissing {
         snap_sequence: u64,
         journal_last_seq: u64,
@@ -54,11 +54,10 @@ pub enum JournaledAppError {
     /// snapshot was taken on a journal that has since diverged (e.g.
     /// snapshot from one cluster paired with another cluster's journal,
     /// or a journal with tampered entries). Detected during replay when
-    /// an app event at the anchor sequence is observed and the reader's
-    /// chain hash disagrees with the snapshot's. Checkpoint- or
-    /// GenesisHash-anchored snapshots are not cross-checked here — the
-    /// reader processes those control entries internally and does not
-    /// surface them to the replay loop.
+    /// the entry at the anchor sequence is observed, or — for a
+    /// snapshot anchored exactly at a rotation boundary — by comparing
+    /// against the successor segment's header anchor (which *is* the
+    /// chain value at that boundary).
     SnapshotChainMismatch {
         snap_sequence: u64,
         expected_chain_hash: [u8; 32],
@@ -173,12 +172,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// are skipped during replay but still walked so per-segment chain
     /// validation runs.
     ///
-    /// Cross-segment chain continuity is enforced: each segment's
-    /// `GenesisHash` payload must equal the previous segment's tail
-    /// chain hash. A break is reported as
-    /// [`JournalError::SegmentChainBreak`] — distinct from a within-
-    /// segment `HashChainMismatch` so operators can locate which
-    /// archive on disk is at fault.
+    /// Cross-segment continuity is enforced before each segment is
+    /// replayed: its header anchor must equal the previous segment's
+    /// tail chain hash ([`JournalError::SegmentChainBreak`] otherwise),
+    /// and its header `starting_sequence` must continue the sequence
+    /// space without gap or overlap.
     fn recover_inner(
         mut app: A,
         journal_path: &Path,
@@ -188,12 +186,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
         let has_snapshot = snapshot.is_some();
         let snap_sequence = snapshot.map(|(s, _)| s).unwrap_or(0);
-        // Cross-check the snapshot's chain hash against the journal's
-        // computed chain hash at the anchor sequence. The reader
-        // captures its chain hash at the armed target sequence inside
-        // `validate_and_advance`, so the check fires uniformly for
-        // app, `GenesisHash`, and `Checkpoint` anchors — no carve-out
-        // for control entries.
+        // Expected chain hash at the snapshot's anchor sequence. Compared
+        // inside `replay_segment` when the anchor entry is observed, and
+        // against a successor segment's header anchor when the snapshot
+        // is anchored exactly at a rotation boundary.
         let snap_chain_check: Option<[u8; 32]> = snapshot.map(|(_, h)| h);
 
         let mut reports: Vec<A::Report> = Vec::new();
@@ -202,50 +198,56 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // no boundary check has anything to compare against yet — the
         // very first segment we walk has no predecessor in this run.
         let mut prev_tail_hash: Option<[u8; 32]> = None;
+        // Sequence the next segment's header must start at. `None` for
+        // the first walked segment (no predecessor in this run).
+        let mut expected_start: Option<u64> = None;
         // Highest sequence observed across walked archives. Used to seed
         // a synthesized live segment when a crash interrupted rotation
         // between the live → archive rename and the new live file's
         // creation.
         let mut last_seq_seen: u64 = snap_sequence;
-        // Highest sequence the reader actually advanced through. Updated
-        // from `reader.last_sequence()`, which tracks both app events
-        // and control entries (`GenesisHash`, `Checkpoint`), so a
-        // snapshot anchor that lands on a control sequence is still
-        // recognised as "reached." Used both for diagnostics on
-        // [`SnapshotAnchorMissing`] and for the post-walk anchor-
-        // existence check. Seeded at 0 (not `snap_sequence`) so the
-        // error reports the true observed tail when a stale journal
-        // never reaches the anchor.
+        // Highest sequence the journal's history provably reaches:
+        // observed entries, plus header evidence (a segment starting at
+        // `S + 1` proves history through `S`). Used for the
+        // [`SnapshotAnchorMissing`] check. Seeded at 0 (not
+        // `snap_sequence`) so the error reports the true observed tail
+        // when a stale journal never reaches the anchor.
         let mut journal_max_seq: u64 = 0;
 
         // --- Walk each sealed archive in monotonic order ---
         for (idx, archive_path) in &archives {
             let mut reader = JournalReader::<A::Event>::open(archive_path)?;
-            if has_snapshot {
-                reader.set_chain_anchor_target(snap_sequence);
-            }
+            // Verify lineage continuity from the header alone, before
+            // any of this segment's events reach the application.
+            verify_segment_link(*idx, &reader, prev_tail_hash, expected_start)?;
+            verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
             replay_segment(
                 &mut reader,
                 &mut app,
                 snap_sequence,
+                snap_chain_check,
                 &mut last_drain_ns,
                 &mut reports,
                 /* allow_partial_tail = */ false,
             )?;
-            verify_snapshot_chain_anchor(&reader, snap_sequence, snap_chain_check)?;
-            verify_segment_boundary(*idx, prev_tail_hash, reader.genesis_payload())?;
             // Carry forward only when this segment actually had a chain
-            // (hash-chain feature on, segment had at least its
-            // GenesisHash entry). Otherwise leave `prev_tail_hash`
+            // (hash-chain feature on). Otherwise leave `prev_tail_hash`
             // unchanged so the next boundary still gets a meaningful
             // compare target.
             if let Some(h) = reader.chain_hash() {
                 prev_tail_hash = Some(h);
             }
+            journal_max_seq = journal_max_seq.max(reader.starting_sequence().saturating_sub(1));
             if let Some(seq) = reader.last_sequence() {
                 last_seq_seen = last_seq_seen.max(seq);
                 journal_max_seq = journal_max_seq.max(seq);
             }
+            expected_start = Some(
+                reader
+                    .last_sequence()
+                    .map(|s| s + 1)
+                    .unwrap_or_else(|| reader.starting_sequence()),
+            );
         }
 
         // --- Walk the live segment, if it exists ---
@@ -282,15 +284,14 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                     journal_last_seq: journal_max_seq,
                 });
             }
-            let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = W::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
+            let anchor = prev_tail_hash.unwrap_or([0u8; 32]);
+            let writer = W::create_continuing(journal_path, last_seq_seen + 1, anchor)?;
             return Ok(Self { app, writer });
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
-        if has_snapshot {
-            reader.set_chain_anchor_target(snap_sequence);
-        }
+        verify_segment_link(0, &reader, prev_tail_hash, expected_start)?;
+        verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
         // The live segment may have a partial-tail crash: replay loop
         // tolerates `SequenceGap` by stopping early, mirroring legacy
         // behaviour.
@@ -298,27 +299,26 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             &mut reader,
             &mut app,
             snap_sequence,
+            snap_chain_check,
             &mut last_drain_ns,
             &mut reports,
             /* allow_partial_tail = */ true,
         )?;
-        verify_snapshot_chain_anchor(&reader, snap_sequence, snap_chain_check)?;
-        verify_segment_boundary(0, prev_tail_hash, reader.genesis_payload())?;
 
-        let last_seq = reader.last_sequence().unwrap_or(snap_sequence);
+        // An empty live segment resumes at its header's starting
+        // sequence; a non-empty one after its last entry.
+        let last_seq = reader
+            .last_sequence()
+            .unwrap_or_else(|| reader.starting_sequence().saturating_sub(1));
         let valid_end = reader.valid_file_end();
-        let chain_hash = reader.chain_hash();
-        let events_since_checkpoint = reader.events_since_checkpoint();
+        journal_max_seq = journal_max_seq.max(reader.starting_sequence().saturating_sub(1));
         if let Some(seq) = reader.last_sequence() {
             journal_max_seq = journal_max_seq.max(seq);
         }
 
-        // Final validation: the journal must have advanced through (or
-        // past) the snapshot's anchor sequence. The check runs against
-        // `reader.last_sequence()` rather than the entries surfaced to
-        // `replay_segment`, so a snapshot anchored on a control entry
-        // (`Checkpoint`, `GenesisHash`) — which the reader processes
-        // internally — still registers as present.
+        // Final validation: the journal's history must provably reach
+        // the snapshot's anchor sequence — via an observed entry or via
+        // a segment header starting at `anchor + 1`.
         if has_snapshot && snap_sequence > 0 && journal_max_seq < snap_sequence {
             return Err(JournaledAppError::SnapshotAnchorMissing {
                 snap_sequence,
@@ -326,13 +326,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             });
         }
 
-        let writer = W::open_append(
-            journal_path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )?;
+        let writer = W::open_append(journal_path, last_seq, valid_end)?;
 
         Ok(Self { app, writer })
     }
@@ -349,7 +343,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
     /// Archive the live journal segment to its next monotonic slot
     /// (`<path>.NNNNNN`) and open a fresh live segment continuing the
-    /// sequence. The new segment's `GenesisHash` carries the chain
+    /// sequence. The new segment's header anchor carries the chain
     /// state at the boundary so multi-segment recovery can verify
     /// cross-segment continuity. Snapshots are produced separately by
     /// the shadow exchange.
@@ -464,9 +458,8 @@ fn replay_entry<A: Application>(
     // so the journal can contain duplicates the primary rejected without
     // calling `apply`. Replay must skip `apply` on those entries or
     // state will diverge from the live primary (e.g. a retried deposit
-    // applied twice). For transport events (`Tick`, `GenesisHash`,
-    // `Checkpoint`) `key_hash == 0`, which `check_request_seq` exempts
-    // — `is_new` is always true there.
+    // applied twice). For `Tick` events `key_hash == 0`, which
+    // `check_request_seq` exempts — `is_new` is always true there.
     let is_new = app.check_request_seq(key_hash, request_seq);
 
     if timestamp_ns > *last_drain_ns {
@@ -501,10 +494,6 @@ fn replay_entry<A: Application>(
         JournalEvent::Tick { now_ns } => {
             app.tick(*now_ns, reports);
         }
-        JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
-            // Chain metadata — handled by the reader itself during
-            // `next_entry`; no application action.
-        }
         JournalEvent::Shutdown => {
             // Pipeline-only sentinel; never written to disk and so
             // unreachable on the replay path. Treat defensively rather
@@ -518,7 +507,10 @@ fn replay_entry<A: Application>(
 ///
 /// Skips events with `seq <= snap_sequence` so a snapshot caller can
 /// share this routine with no-snapshot recovery (where `snap_sequence`
-/// is `0`, accepting all events).
+/// is `0`, accepting all events). When `snap_chain` is supplied, the
+/// reader's chain hash is compared against it at the moment the anchor
+/// entry (`seq == snap_sequence`) is observed — every entry surfaces to
+/// this loop, so no capture machinery is needed.
 ///
 /// `allow_partial_tail` controls how `SequenceGap` is treated: archived
 /// segments are sealed and any gap is corruption (returned as an error);
@@ -528,6 +520,7 @@ fn replay_segment<A: Application>(
     reader: &mut JournalReader<A::Event>,
     app: &mut A,
     snap_sequence: u64,
+    snap_chain: Option<[u8; 32]>,
     last_drain_ns: &mut u64,
     reports: &mut Vec<A::Report>,
     allow_partial_tail: bool,
@@ -535,6 +528,21 @@ fn replay_segment<A: Application>(
     loop {
         match reader.next_entry() {
             Ok(Some(entry)) => {
+                // Snapshot/journal cross-check at the anchor: the chain
+                // value after absorbing the anchor entry must equal what
+                // the snapshot recorded. Fires before any post-anchor
+                // event is replayed.
+                if entry.sequence == snap_sequence
+                    && let Some(expected) = snap_chain
+                    && let Some(actual) = reader.chain_hash()
+                    && actual != expected
+                {
+                    return Err(JournaledAppError::SnapshotChainMismatch {
+                        snap_sequence,
+                        expected_chain_hash: expected,
+                        actual_chain_hash: actual,
+                    });
+                }
                 if entry.sequence > snap_sequence {
                     replay_entry(
                         app,
@@ -566,44 +574,23 @@ fn replay_segment<A: Application>(
     Ok(())
 }
 
-/// Compare the snapshot's recorded chain hash against the journal's
-/// computed chain hash at the anchor sequence. The reader captured its
-/// chain hash at that moment inside `validate_and_advance`, uniformly
-/// for app, `GenesisHash`, and `Checkpoint` anchors. No-op when no
-/// snapshot was supplied (`expected = None`) or when the reader didn't
-/// observe the anchor sequence within this segment (`captured = None`)
-/// — the cross-segment caller (`recover_inner`) calls this after every
-/// segment walk; whichever segment contains the anchor produces the
-/// `Some`, and `SnapshotAnchorMissing` covers the "no segment did"
-/// case independently.
-fn verify_snapshot_chain_anchor<E: melin_app::AppEvent>(
-    reader: &JournalReader<E>,
-    snap_sequence: u64,
-    expected: Option<[u8; 32]>,
-) -> Result<(), JournaledAppError> {
-    if let Some(expected) = expected
-        && let Some(actual) = reader.captured_chain_hash()
-        && actual != expected
-    {
-        return Err(JournaledAppError::SnapshotChainMismatch {
-            snap_sequence,
-            expected_chain_hash: expected,
-            actual_chain_hash: actual,
-        });
-    }
-    Ok(())
-}
-
-/// Verify that a segment's `GenesisHash` payload equals the previous
-/// segment's tail chain hash. `index = 0` denotes the live segment in
-/// diagnostics. No-op when either side is `None` (chain feature off, or
-/// no predecessor in this recovery run).
-fn verify_segment_boundary(
+/// Verify a segment's header links it to the previous segment in the
+/// walk: the header anchor must equal the previous segment's tail chain
+/// hash, and the header `starting_sequence` must continue the sequence
+/// space exactly. Runs *before* the segment is replayed, so a foreign or
+/// tampered segment never reaches the application.
+///
+/// `index = 0` denotes the live segment in diagnostics. The chain
+/// compare is a no-op when either side is unavailable (hash-chain off,
+/// or no predecessor in this run); the sequence compare is a no-op for
+/// the first walked segment.
+fn verify_segment_link<E: melin_app::AppEvent>(
     index: u32,
+    reader: &JournalReader<E>,
     prev_tail: Option<[u8; 32]>,
-    genesis_payload: Option<[u8; 32]>,
+    expected_start: Option<u64>,
 ) -> Result<(), JournaledAppError> {
-    if let (Some(expected), Some(actual)) = (prev_tail, genesis_payload)
+    if let (Some(expected), Some(actual)) = (prev_tail, reader.anchor())
         && expected != actual
     {
         return Err(JournalError::SegmentChainBreak {
@@ -612,6 +599,40 @@ fn verify_segment_boundary(
             actual,
         }
         .into());
+    }
+    if let Some(expected) = expected_start
+        && reader.starting_sequence() != expected
+    {
+        return Err(JournalError::SequenceGap {
+            expected,
+            actual: reader.starting_sequence(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Snapshot anchored exactly at a rotation boundary: the anchor entry
+/// lives at the tail of the *previous* segment, but the successor
+/// segment's header anchor is, by construction, the chain value at that
+/// boundary — so it can stand in for the comparison. This keeps the
+/// cross-check effective even when the anchor-bearing segment was
+/// archived off-box, and covers the empty-live-after-rotation layout.
+fn verify_boundary_snapshot_anchor<E: melin_app::AppEvent>(
+    reader: &JournalReader<E>,
+    snap_sequence: u64,
+    expected: Option<[u8; 32]>,
+) -> Result<(), JournaledAppError> {
+    if let Some(expected) = expected
+        && snap_sequence + 1 == reader.starting_sequence()
+        && let Some(anchor) = reader.anchor()
+        && anchor != expected
+    {
+        return Err(JournaledAppError::SnapshotChainMismatch {
+            snap_sequence,
+            expected_chain_hash: expected,
+            actual_chain_hash: anchor,
+        });
     }
     Ok(())
 }
@@ -680,11 +701,9 @@ mod tests {
 
         let ja = TestApp_::create(TestApp::new(), &path).unwrap();
         // Sequences start at 1: seq=0 is the InputSlot "not yet allocated"
-        // sentinel the journal stage branches on (see pipeline.rs:488).
-        // With `hash-chain`, `create` writes a GenesisHash entry first,
-        // consuming seq 1 and leaving next_sequence at 2.
-        let genesis_overhead: u64 = if cfg!(feature = "hash-chain") { 1 } else { 0 };
-        assert_eq!(ja.next_sequence(), 1 + genesis_overhead);
+        // sentinel the journal stage branches on. Chain metadata lives in
+        // the file header, so creation consumes no sequence.
+        assert_eq!(ja.next_sequence(), 1);
         drop(ja);
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
@@ -721,9 +740,7 @@ mod tests {
         assert_eq!(restored, expected_state(&events, 1));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
-        // Under `hash-chain`, the genesis entry consumes an extra seq.
-        let genesis_overhead: u64 = if cfg!(feature = "hash-chain") { 1 } else { 0 };
-        assert_eq!(seq, events.len() as u64 + genesis_overhead);
+        assert_eq!(seq, events.len() as u64);
     }
 
     #[test]
@@ -819,11 +836,9 @@ mod tests {
         // Archived journal lives at `.000001` (monotonic naming).
         let archived = dir.path().join("journal.bin.000001");
         assert!(archived.exists(), "pre-rotate journal must be archived");
-        // Sequence continues past the archive cut. With `hash-chain`, the
-        // new journal starts with a GenesisHash at `pre_rotate_next_seq`,
-        // bumping next_sequence by 1 just like initial `create`.
-        let genesis_overhead: u64 = if cfg!(feature = "hash-chain") { 1 } else { 0 };
-        assert_eq!(ja.next_sequence(), pre_rotate_next_seq + genesis_overhead);
+        // Sequence continues past the archive cut — rotation consumes
+        // no sequence number.
+        assert_eq!(ja.next_sequence(), pre_rotate_next_seq);
         // Snapshot captures the pre-rotate state.
         let (snap_app, _seq, _chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(snap_app, pre_rotate_state);
@@ -937,9 +952,15 @@ mod tests {
     }
 
     /// Cross-segment chain validation: tampering with an archived
-    /// segment's tail (post-rotation) is detectable as a SegmentChainBreak
-    /// at recovery, because the next segment's GenesisHash no longer
+    /// segment (post-rotation) is detectable as a `SegmentChainBreak`
+    /// at recovery, because the next segment's header anchor no longer
     /// matches the tampered segment's tail chain hash.
+    ///
+    /// The tamper is **CRC-consistent**: the entry's payload is altered
+    /// and its CRC32C recomputed, so per-entry integrity checks pass —
+    /// only the chain can catch it. This is the guarantee the chain
+    /// exists for (CRC covers accidental corruption; the chain covers
+    /// deliberate, internally-consistent rewrites).
     #[cfg(feature = "hash-chain")]
     #[test]
     fn recover_detects_cross_segment_chain_break() {
@@ -959,26 +980,19 @@ mod tests {
         let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
         drop(ja);
 
-        // Flip a bit in the middle of archive 000001 to change its
-        // tail chain hash. The byte we touch is well past the file
-        // header, in the body of the first event.
+        // Rewrite the first entry of archive 000001 with a modified
+        // payload byte and a *recomputed* CRC, so the entry itself
+        // decodes cleanly. Entry layout: header(20) + length-covered
+        // body + crc(4), starting at ENTRY_OFFSET.
         let archive = dir.path().join("journal.bin.000001");
         let mut buf = std::fs::read(&archive).unwrap();
-        // Find the first non-zero byte past the magic + header range
-        // (skip 64 to clear the file header reliably on both 512 and
-        // 4Kn devices; entries follow at sector_size offset, but the
-        // first sector contains valid header magic + version fields,
-        // so the first non-zero byte after offset 64 is in either the
-        // header tail or the first entry — both work for inducing a
-        // chain mismatch).
-        let flip_at = buf
-            .iter()
-            .enumerate()
-            .skip(64)
-            .find(|(_, b)| **b != 0)
-            .map(|(i, _)| i)
-            .expect("archive should have at least one non-zero byte");
-        buf[flip_at] ^= 0xFF;
+        let entry_start = melin_journal::codec::ENTRY_OFFSET as usize;
+        let length = u16::from_le_bytes([buf[entry_start + 2], buf[entry_start + 3]]) as usize;
+        let body_end = entry_start + 20 + length;
+        // Flip the last payload byte (inside the app event's encoding).
+        buf[body_end - 1] ^= 0xFF;
+        let new_crc = crc32c::crc32c(&buf[entry_start..body_end]);
+        buf[body_end..body_end + 4].copy_from_slice(&new_crc.to_le_bytes());
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open(&archive)
@@ -998,13 +1012,12 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected recovery to detect tampered archive, but it succeeded"),
         };
+        // The tamper is CRC-consistent, so the only mechanism that can
+        // catch it is the cross-segment chain compare.
         let msg = format!("{err}");
         assert!(
-            msg.contains("hash chain mismatch")
-                || msg.contains("segment chain break")
-                || msg.contains("checksum mismatch")
-                || msg.contains("corrupt entry"),
-            "expected tamper-detection error, got: {msg}"
+            msg.contains("segment chain break"),
+            "expected SegmentChainBreak for a CRC-consistent rewrite, got: {msg}"
         );
     }
 
@@ -1058,10 +1071,9 @@ mod tests {
             journal_path.exists(),
             "recovery should have synthesized a fresh live segment"
         );
-        // The new live starts with a GenesisHash at pre_crash_seq, so
-        // next_sequence advances by one beyond the archive's tail.
-        let genesis_overhead: u64 = if cfg!(feature = "hash-chain") { 1 } else { 0 };
-        assert_eq!(recovered.next_sequence(), pre_crash_seq + genesis_overhead);
+        // The synthesized live consumes no sequence — its header records
+        // the continuation point.
+        assert_eq!(recovered.next_sequence(), pre_crash_seq);
 
         // Append more events through the synthesized live and re-recover
         // — proves the new live is fully usable, not just a placeholder.
@@ -1086,10 +1098,10 @@ mod tests {
     }
 
     /// Phase C crash: rotation completed (live → archive renamed, new
-    /// live opened with `GenesisHash`), but no application events
-    /// landed in the new live before the crash. On disk: archive(s) +
-    /// live containing only the GenesisHash entry. Recovery walks both
-    /// and reproduces the pre-rotation state exactly.
+    /// live created with its header), but no application events landed
+    /// in the new live before the crash. On disk: archive(s) + an
+    /// empty live segment. Recovery walks both and reproduces the
+    /// pre-rotation state exactly.
     #[test]
     fn recover_after_phase_c_crash_yields_pre_rotation_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -1123,72 +1135,98 @@ mod tests {
         assert_eq!(recovered.app().total, expected);
     }
 
-    /// Recovery accepts a snapshot whose recorded sequence corresponds
-    /// to a control entry (`GenesisHash` here) rather than an app
-    /// event. The reader processes control entries internally and
-    /// never surfaces them via `next_entry`, but the post-walk
-    /// `journal_max_seq` check uses `reader.last_sequence()` which
-    /// advances for all entry types. Without this, a snapshot
-    /// anchored on a control entry would be rejected as
-    /// `SnapshotAnchorMissing` even though the journal does contain
-    /// that sequence. The forged snapshot also carries the journal's
-    /// real chain hash at seq 1 so the chain-hash cross-check (which
-    /// now covers control anchors uniformly) passes.
+    /// Recovery accepts a snapshot anchored exactly at a rotation
+    /// boundary even when the segment holding the anchor entry has been
+    /// trimmed (e.g. moved to cold storage). The successor segment's
+    /// header proves history through `starting_sequence - 1` existed,
+    /// and its anchor — which *is* the chain value at the boundary —
+    /// verifies the snapshot's recorded hash.
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn recover_from_snapshot_accepts_control_entry_anchor() {
+    fn recover_from_snapshot_accepts_trimmed_archive_at_boundary_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
 
-        let events = [TestEvent::Add(10), TestEvent::Add(20), TestEvent::Add(30)];
+        let pre = [TestEvent::Add(10), TestEvent::Add(20), TestEvent::Add(30)];
+        let post = [TestEvent::Add(40)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events, 1);
+        let ja = append_events(ja, &pre, 1);
+        drop(ja);
+        // Recover (populates app state), snapshot at the tail, rotate.
+        let mut ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let expected_pre_total = ja.app().total;
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        let ja = append_events(ja, &post, 1 + pre.len() as u64);
         drop(ja);
 
-        // Capture the journal's real chain hash at the GenesisHash seq
-        // via the reader's anchor-target API — same path recovery
-        // uses, so the forged snapshot's hash matches what the cross-
-        // check will compute during the real recovery walk.
-        let genesis_hash = {
-            let mut reader = JournalReader::<TestEvent>::open(&journal_path).unwrap();
-            reader.set_chain_anchor_target(1);
-            // One next_entry() consumes the GenesisHash internally and
-            // returns the first app event, by which point the capture
-            // hook has stashed the Genesis chain hash.
-            let _ = reader.next_entry().unwrap();
-            reader.captured_chain_hash().expect("genesis captured")
-        };
-        // Forge a snapshot at seq 1 with empty app state. Recovery
-        // must accept the control-entry anchor and replay all three
-        // app events to reconstruct the full state.
-        snapshot::save::<TestApp>(&TestApp::new(), 1, genesis_hash, &snap_path).unwrap();
+        // Trim the archive that contains the anchor entry.
+        let archive = dir.path().join("journal.bin.000001");
+        std::fs::remove_file(&archive).unwrap();
 
+        // Recovery must accept (header evidence reaches the anchor) and
+        // verify the snapshot hash against the live segment's anchor.
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
-        assert_eq!(recovered.app().total, expected_state(&events, 1).total);
+        assert_eq!(recovered.app().total, expected_pre_total + 40);
     }
 
-    /// Snapshot + recovery round-trip when auto-emitted Checkpoints
-    /// are present in the journal. With a low checkpoint interval the
-    /// snapshot's `sequence` (from `writer.next_sequence() - 1`) may
-    /// land on a Checkpoint entry rather than an App event. Recovery
-    /// must still accept the snapshot — the post-walk anchor check
-    /// uses `reader.last_sequence()` which advances for control
-    /// entries too.
+    /// Negative companion: a snapshot anchored at the rotation boundary
+    /// with the wrong chain hash is rejected against the successor
+    /// segment's header anchor — even though no entry at the anchor
+    /// sequence is ever observed.
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn recover_from_snapshot_with_checkpoints_in_journal() {
-        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(3);
+    fn recover_from_snapshot_rejects_chain_hash_mismatch_at_boundary_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let pre = [TestEvent::Add(1), TestEvent::Add(2)];
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &pre, 1);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        drop(ja);
+
+        let archive = dir.path().join("journal.bin.000001");
+        std::fs::remove_file(&archive).unwrap();
+
+        // Forge the snapshot's chain hash; sequence stays at the boundary.
+        let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let bad_hash = [0xEE; 32];
+        assert_ne!(real_hash, bad_hash);
+        snapshot::save::<TestApp>(&loaded_app, snap_seq, bad_hash, &snap_path).unwrap();
+
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+            Ok(_) => panic!("expected boundary-anchor mismatch rejection"),
+            Err(e) => e,
+        };
+        match err {
+            JournaledAppError::SnapshotChainMismatch {
+                snap_sequence,
+                expected_chain_hash,
+                actual_chain_hash,
+            } => {
+                assert_eq!(snap_sequence, snap_seq);
+                assert_eq!(expected_chain_hash, bad_hash);
+                assert_eq!(actual_chain_hash, real_hash);
+            }
+            other => panic!("expected SnapshotChainMismatch, got {other:?}"),
+        }
+    }
+
+    /// Snapshot sequences live in journal space: with chain metadata out
+    /// of the entry stream, `save_snapshot` records exactly the count of
+    /// journaled events — no control-entry inflation.
+    #[test]
+    fn snapshot_sequence_counts_only_journaled_events() {
         let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
 
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
 
-        // 6 events → 2 Checkpoints (at interval 3). Journal seqs:
-        //   1=Genesis, 2-4=events, 5=Checkpoint, 6-8=events, 9=Checkpoint.
-        // save_snapshot records writer.next_sequence()-1 which may be
-        // the Checkpoint's seq.
         let pre = [
             TestEvent::Add(1),
             TestEvent::Add(2),
@@ -1206,12 +1244,10 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
 
         let (_, snap_seq, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
-        // With genesis + 6 events + 2 checkpoints, last seq = 9.
-        // snap_seq should be in journal-space, not ring-space.
-        assert!(
-            snap_seq > pre.len() as u64,
-            "snap_seq {snap_seq} should exceed event count {} (checkpoints add seqs)",
-            pre.len()
+        assert_eq!(
+            snap_seq,
+            pre.len() as u64,
+            "snapshot sequence must equal the journaled event count"
         );
 
         // Append post-snapshot events and verify round-trip.
@@ -1279,22 +1315,16 @@ mod tests {
     /// cluster paired with another cluster's journal — or a journal
     /// with tampered entries — would be silently accepted and the
     /// recovered state would diverge from the events that produced the
-    /// snapshot. The cross-check fires when an app event at the anchor
+    /// snapshot. The cross-check fires when the entry at the anchor
     /// sequence is observed during replay.
     #[cfg(feature = "hash-chain")]
     #[test]
     fn recover_from_snapshot_rejects_chain_hash_mismatch() {
-        // High checkpoint interval keeps the journal free of Checkpoint
-        // control entries within this test's event count, so the
-        // snapshot's anchor will land on an app event (the cross-check
-        // is app-event-only by design).
-        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(1000);
-
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
 
-        // Three events → seqs 1=Genesis, 2,3,4=events. snap_seq = 4.
+        // Three events → seqs 1,2,3. snap_seq = 3.
         let events = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let ja = append_events(ja, &events, 1);
@@ -1333,59 +1363,6 @@ mod tests {
         }
     }
 
-    /// Companion to `recover_from_snapshot_rejects_chain_hash_mismatch`,
-    /// targeting a control-entry anchor: the snapshot's anchor sequence
-    /// lands on an auto-emitted `Checkpoint`, which the reader processes
-    /// internally and never surfaces to `replay_segment`. The check
-    /// still fires because the reader captures its chain hash at the
-    /// armed anchor sequence inside `validate_and_advance`, uniformly
-    /// across app and control entries — no carve-out.
-    #[cfg(feature = "hash-chain")]
-    #[test]
-    fn recover_from_snapshot_rejects_chain_hash_mismatch_at_control_anchor() {
-        // 3-event Checkpoint cadence: a Checkpoint lands at seq 5 in
-        // a fresh journal (1=Genesis, 2,3,4=events, 5=Checkpoint).
-        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(3);
-
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("journal.bin");
-        let snap_path = dir.path().join("snap.bin");
-
-        let events = [TestEvent::Add(1), TestEvent::Add(2), TestEvent::Add(3)];
-        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
-        let ja = append_events(ja, &events, 1);
-        drop(ja);
-
-        // Forge a snapshot anchored at the Checkpoint seq (5) with a
-        // deliberately wrong chain hash. The snapshot's app state is
-        // immaterial here — what we're proving is that the chain-hash
-        // cross-check now catches a control-anchor mismatch.
-        let bad_hash = [0xFF; 32];
-        snapshot::save::<TestApp>(&TestApp::new(), 5, bad_hash, &snap_path).unwrap();
-
-        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
-            Ok(_) => panic!("expected recovery to reject control-anchor chain-hash mismatch"),
-            Err(e) => e,
-        };
-        match err {
-            JournaledAppError::SnapshotChainMismatch {
-                snap_sequence,
-                expected_chain_hash,
-                actual_chain_hash,
-            } => {
-                assert_eq!(snap_sequence, 5);
-                assert_eq!(expected_chain_hash, bad_hash);
-                // The actual hash is the journal's Checkpoint chain hash;
-                // its exact bytes depend on event payloads, so we only
-                // assert it differs from the forged value (and is non-
-                // zero, ruling out the "no capture" failure mode).
-                assert_ne!(actual_chain_hash, bad_hash);
-                assert_ne!(actual_chain_hash, [0u8; 32]);
-            }
-            other => panic!("expected SnapshotChainMismatch, got {other:?}"),
-        }
-    }
-
     /// Multi-segment variant of the chain-hash mismatch check: the
     /// snapshot anchor sits in a sealed archive (not the live
     /// segment), so the cross-check must fire from inside the
@@ -1397,11 +1374,6 @@ mod tests {
     #[cfg(feature = "hash-chain")]
     #[test]
     fn recover_from_snapshot_rejects_chain_hash_mismatch_in_archive() {
-        // Keep both segments free of Checkpoint control entries so
-        // the snapshot anchor is guaranteed to land on an app event
-        // (the cross-check is app-event-only).
-        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(1000);
-
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         let snap_path = dir.path().join("snap.bin");
@@ -1409,9 +1381,9 @@ mod tests {
         let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
 
-        // Phase A: 2 events at seqs 2,3 (Genesis at seq 1); snapshot
-        // anchors at seq 3 — the last event before rotation, which
-        // ends up inside archive 000001 after the rotate below.
+        // Phase A: 2 events at seqs 1,2; snapshot anchors at seq 2 —
+        // the last event before rotation, which ends up inside archive
+        // 000001 after the rotate below.
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
         ja.save_snapshot(&snap_path).unwrap();
@@ -1656,7 +1628,7 @@ mod tests {
     /// when the process died. Per the persist-before-ack contract, those
     /// in-flight events were never acknowledged to the client and must
     /// be discarded — recovery sees only what the durable storage has,
-    /// which is the archive's contents plus the new live's GenesisHash.
+    /// which is the archive's contents plus an empty live segment.
     #[test]
     fn recover_after_phase_d_crash_drops_unflushed_events() {
         let dir = tempfile::tempdir().unwrap();
@@ -1677,7 +1649,7 @@ mod tests {
         writer.rotate_segment().unwrap();
         // Encode an event into the new live's in-memory batch but DON'T
         // flush. The bytes live in `batch_buf` only; the on-disk live
-        // has just its GenesisHash entry.
+        // is empty past its header.
         let unflushed_seq = writer.allocate_sequence();
         writer
             .encode_event(

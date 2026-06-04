@@ -135,7 +135,6 @@ pub struct DpdkReplicationDriver<A: Application> {
     slots: [DpdkReplicaSlot; 2],
     replication_cursor: Arc<AtomicU64>,
     fastest_replica_cursor: Arc<AtomicU64>,
-    genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
     replica_ready: Arc<AtomicBool>,
     replicas_connected: Arc<AtomicU32>,
@@ -156,7 +155,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
         repl_consumers: [ReplicationConsumer; 2],
         replication_cursor: Arc<AtomicU64>,
         fastest_replica_cursor: Arc<AtomicU64>,
-        genesis_entry: Vec<u8>,
         journal_path: std::path::PathBuf,
         replica_ready: Arc<AtomicBool>,
         replicas_connected: Arc<AtomicU32>,
@@ -195,7 +193,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
             ],
             replication_cursor,
             fastest_replica_cursor,
-            genesis_entry,
             journal_path,
             replica_ready,
             replicas_connected,
@@ -246,7 +243,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let slots = &mut self.slots;
         let replication_cursor = &self.replication_cursor;
         let fastest_replica_cursor = &self.fastest_replica_cursor;
-        let genesis_entry = &self.genesis_entry;
         let journal_path = &self.journal_path;
         let replica_ready = &self.replica_ready;
         let replicas_connected = &self.replicas_connected;
@@ -412,12 +408,19 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                                     let catchup_err = if can_catch_up {
                                         slot.send_buf.clear();
-                                        encode_stream_start(
-                                            h.last_sequence,
-                                            genesis_entry,
-                                            &mut slot.send_buf,
-                                        );
-                                        dpdk_publish(&slot.send_buf).and_then(|()| {
+                                        melin_transport_core::replication::catchup::lineage_origin(
+                                            journal_path,
+                                        )
+                                        .and_then(|(lineage_start, lineage_anchor)| {
+                                            encode_stream_start(
+                                                h.last_sequence,
+                                                lineage_start,
+                                                lineage_anchor,
+                                                &mut slot.send_buf,
+                                            );
+                                            dpdk_publish(&slot.send_buf)
+                                        })
+                                        .and_then(|()| {
                                             match catch_up_from_journal_with::<A::Event>(
                                                 journal_path,
                                                 h.last_sequence,
@@ -431,11 +434,11 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                                     ))
                                                 }
                                             }
-                                        }).err()
+                                        })
+                                        .err()
                                     } else {
                                         match snapshot_transfer_with::<A::Event>(
                                             journal_path,
-                                            genesis_entry,
                                             &mut dpdk_publish,
                                             shutdown,
                                         ) {
@@ -984,7 +987,9 @@ where
             }};
         }
         recv_buf.clear();
-        let primary_genesis_entry = 'handshake: loop {
+        // `None` from the loop = failure path (disconnect or snapshot
+        // error) → reconnect. `Some(lineage)` = StreamStart received.
+        let stream_lineage: Option<(u64, [u8; 32])> = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
                     let _ = teardown_replica_pipeline::<A, W>(p);
@@ -1002,10 +1007,11 @@ where
                     match response {
                         PrimaryMessage::StreamStart {
                             start_sequence,
-                            genesis_entry,
+                            segment_start_sequence,
+                            anchor_hash,
                         } => {
                             info!(start_sequence, "streaming started (DPDK)");
-                            break 'handshake genesis_entry;
+                            break 'handshake Some((segment_start_sequence, anchor_hash));
                         }
                         PrimaryMessage::NeedSnapshot => {
                             info!("primary requires snapshot transfer — receiving snapshot (DPDK)");
@@ -1055,7 +1061,7 @@ where
                                     transport.close(handle);
                                     sleep_checking_flags(backoff, shutdown, promote);
                                     backoff = (backoff * 2).min(MAX_BACKOFF);
-                                    break 'handshake Vec::new(); // will be caught by the empty check below
+                                    break 'handshake None; // caught by the None check below
                                 }
                             }
                         }
@@ -1080,16 +1086,16 @@ where
                 transport.close(handle);
                 sleep_checking_flags(backoff, shutdown, promote);
                 backoff = (backoff * 2).min(MAX_BACKOFF);
-                break Vec::new(); // trigger reconnect via empty check
+                break None; // trigger reconnect via the None check below
             }
             std::thread::yield_now();
         };
 
-        // Empty genesis entry means the handshake loop exited via a
-        // failure path (disconnect or snapshot error) — reconnect.
-        if primary_genesis_entry.is_empty() {
+        // `None` means the handshake loop exited via a failure path
+        // (disconnect or snapshot error) — reconnect.
+        let Some((lineage_start, lineage_anchor)) = stream_lineage else {
             continue;
-        }
+        };
 
         // Create journal for fresh replica (first connection only).
         //
@@ -1100,9 +1106,13 @@ where
         // pipeline. `pipeline.is_none()` distinguishes "true first connect or
         // post-snapshot rebuild" from "reconnect against an existing
         // pipeline" — the latter must not recreate the journal file.
+        //
+        // The StreamStart lineage carries the segment header identity
+        // (starting sequence + chain anchor); creating the local segment
+        // from the same identity makes the replica's journal
+        // byte-identical to the primary's as the stream is consumed.
         if pipeline.is_none() && journal_writer.is_none() {
-            let writer =
-                melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
+            let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
             let mut fresh = factory.empty();
             factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);

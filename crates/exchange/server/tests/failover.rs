@@ -506,8 +506,7 @@ fn spawn_primary_with_extra_env(
         .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100");
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4");
     for (k, v) in extra_env {
         command.env(k, v);
     }
@@ -642,8 +641,7 @@ fn spawn_replica_named_with_extra_env(
         .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100");
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4");
     for (k, v) in extra_env {
         command.env(k, v);
     }
@@ -1142,7 +1140,7 @@ fn recovered_primary_durability_gate_holds() {
 /// without recreating its journal file.
 ///
 /// Before the fix, the replica's reconnect loop gated the
-/// `create_fresh_replica` call on `journal_writer.is_none()`. The writer
+/// fresh-journal creation on `journal_writer.is_none()`. The writer
 /// is moved into the pipeline on first connect and never returned, so
 /// every subsequent reconnect sees `journal_writer == None` and tries to
 /// create a fresh journal file — which fails `AlreadyExists` against the
@@ -1191,8 +1189,8 @@ fn replica_reconnects_after_primary_restart_without_journal_wipe() {
 
     // The replica was never restarted: its journal file still exists, and
     // its in-process pipeline still owns the writer. Before the fix this
-    // reconnect would fail with `AlreadyExists` from `create_fresh_replica`
-    // and replication lag would never converge.
+    // reconnect would fail with `AlreadyExists` from the fresh-journal
+    // creation path and replication lag would never converge.
     wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
     cluster.wait_replicated();
 
@@ -1281,7 +1279,6 @@ fn crashed_primary_recovers_from_journal() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn recovered primary");
         ServerProcess {
@@ -1327,34 +1324,25 @@ fn crashed_primary_recovers_from_journal() {
     );
 }
 
-/// End-to-end repro attempt for the checkpoint-boundary sequence
-/// corruption seen by `journal_verify` after LAN benches:
-///
-///     error at entry 10001: sequence gap: expected 10003, got 10002
-///
-/// Spins up a real primary + replica pair (`melin-server` binary, TCP
-/// loopback), submits enough orders to cross the first auto-emitted
-/// checkpoint boundary, waits for replication to catch up, then walks
-/// both journal files end-to-end with `JournalReader`. Any
-/// `SequenceGap` surfaced by the strict-continuity check is the same
-/// corruption mode reported by the external verifier.
-///
-/// Spawned servers are launched with `MELIN_JOURNAL_CHECKPOINT_INTERVAL=100`
-/// (see the test setup — env vars below `Command::new`), so the test only
-/// has to push a few hundred orders to cross multiple checkpoint boundaries
-/// instead of 100_000+ at the production default.
+/// End-to-end dense-sequence audit across a real primary + replica
+/// pair: submits a few hundred orders over TCP loopback, waits for
+/// replication to catch up, then walks both journal files end-to-end
+/// with `JournalReader`. Any `SequenceGap` surfaced by the
+/// strict-continuity check is the corruption mode an external
+/// `journal_verify` run would report. (Historically this reproduced an
+/// in-stream checkpoint sequence collision; those entries no longer
+/// exist, but the dense-sequence invariant is still the property
+/// production audits rely on.)
 #[test]
 #[serial]
-fn journals_contiguous_across_checkpoint_boundary() {
+fn journals_contiguous_across_replication() {
     use melin_journal::JournalReader;
 
     let cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
 
-    // Server seeds 10 accounts + 2 instruments → 12 seed events before the
-    // first order. With CHECKPOINT_INTERVAL=100 (set via env on the spawned
-    // server), 250 orders cross the boundary at least twice — exercising
-    // first-segment and post-checkpoint-segment both.
+    // Server seeds 10 accounts + 2 instruments → 12 seed events before
+    // the first order.
     const ORDERS: u64 = 250;
     for i in 1..=ORDERS {
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
@@ -1969,7 +1957,6 @@ fn replacement_replica_catches_up_from_journal() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn replacement replica");
         ServerProcess {
@@ -2095,7 +2082,6 @@ fn catchup_with_fills_during_gap() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn replacement");
         ServerProcess {
@@ -2209,7 +2195,6 @@ fn catchup_then_immediate_failover() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn replacement");
         ServerProcess {
@@ -2330,7 +2315,6 @@ fn fresh_replica_full_catchup() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn fresh replacement");
         ServerProcess {
@@ -2444,7 +2428,6 @@ fn snapshot_transfer_when_archives_purged() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn primary");
         ServerProcess {
@@ -2539,7 +2522,6 @@ fn snapshot_transfer_when_archives_purged() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn primary2");
         ServerProcess {
@@ -2685,12 +2667,6 @@ fn rotation_soak_under_load() {
     let replica_health_port = free_port();
     let replica_admin_port = free_port();
 
-    // Both nodes get a very high checkpoint interval so the soak's
-    // ~200 events do not cross a checkpoint boundary. The interaction
-    // between auto-emitted checkpoints and rotation is a known race
-    // (see `pipeline_tests.rs::primary_journal_sequences_contiguous_
-    // across_checkpoint_boundary`) tracked separately — this test
-    // focuses on rotation correctness in isolation.
     let primary_admin_addr = format!("127.0.0.1:{primary_admin_port}");
     let primary_extra: &[&str] = &[
         "--admin-bind",
@@ -2698,7 +2674,7 @@ fn rotation_soak_under_load() {
         "--max-journal-mib",
         "0", // disable size trigger; rely on ROTATE for determinism
     ];
-    let extra_env: &[(&str, &str)] = &[("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "1000000")];
+    let extra_env: &[(&str, &str)] = &[];
     let mut primary = spawn_primary_with_extra_env(
         &bin,
         tmp.path(),

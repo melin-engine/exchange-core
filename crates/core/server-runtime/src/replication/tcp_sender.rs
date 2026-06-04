@@ -33,9 +33,6 @@ pub struct Sender {
     pub repl_consumer_2: ReplicationConsumer,
     pub replication_cursor: Arc<AtomicU64>,
     pub fastest_replica_cursor: Arc<AtomicU64>,
-    /// Raw genesis entry bytes (encoded GenesisHash journal entry), sent to
-    /// replicas in `StreamStart` so they write a byte-identical genesis.
-    pub genesis_entry: Vec<u8>,
     pub journal_path: std::path::PathBuf,
     pub authorized_keys: Arc<melin_app::auth::AuthorizedKeys>,
     pub evict_flags: [Arc<AtomicBool>; 2],
@@ -64,7 +61,6 @@ pub fn run_sender<A: Application>(
         repl_consumer_2,
         replication_cursor,
         fastest_replica_cursor,
-        genesis_entry,
         journal_path,
         authorized_keys,
         evict_flags,
@@ -264,7 +260,6 @@ pub fn run_sender<A: Application>(
                     let fastest_cursor = Arc::clone(&fastest_replica_cursor);
                     let this_slot_acked = Arc::clone(&slot_acked[slot_idx]);
                     let other_slot_acked = Arc::clone(&slot_acked[1 - slot_idx]);
-                    let genesis = genesis_entry.clone();
                     let jpath = journal_path.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
                     let slot_metrics = Arc::clone(&metrics);
@@ -305,7 +300,6 @@ pub fn run_sender<A: Application>(
                                 fastest_replica_cursor: &fastest_cursor,
                                 this_slot_acked: &this_slot_acked,
                                 other_slot_acked: &other_slot_acked,
-                                genesis_entry: &genesis,
                                 journal_path: &jpath,
                                 authorized_keys: &auth_keys,
                                 shutdown: shutdown_ref,
@@ -347,7 +341,6 @@ struct SlotContext<'a> {
     fastest_replica_cursor: &'a Arc<AtomicU64>,
     this_slot_acked: &'a Arc<AtomicU64>,
     other_slot_acked: &'a Arc<AtomicU64>,
-    genesis_entry: &'a [u8],
     journal_path: &'a std::path::Path,
     authorized_keys: &'a melin_app::auth::AuthorizedKeys,
     shutdown: &'a AtomicBool,
@@ -385,7 +378,6 @@ fn handle_replica_connection<A: Application>(
         fastest_replica_cursor,
         this_slot_acked,
         other_slot_acked,
-        genesis_entry,
         journal_path,
         authorized_keys,
         shutdown,
@@ -441,7 +433,17 @@ fn handle_replica_connection<A: Application>(
     };
 
     let catchup_end = if can_catch_up {
-        encode_stream_start(handshake.last_sequence, genesis_entry, &mut send_buf);
+        // The lineage origin (oldest segment's header identity) lets a
+        // fresh replica create a byte-identical journal before
+        // consuming the stream. Replicas with local state ignore it.
+        let (lineage_start, lineage_anchor) =
+            melin_transport_core::replication::catchup::lineage_origin(journal_path)?;
+        encode_stream_start(
+            handshake.last_sequence,
+            lineage_start,
+            lineage_anchor,
+            &mut send_buf,
+        );
         publish(&send_buf)?;
         send_buf.clear();
 
@@ -457,12 +459,7 @@ fn handle_replica_connection<A: Application>(
             }
         }
     } else {
-        match snapshot_transfer_with::<A::Event>(
-            journal_path,
-            genesis_entry,
-            &mut publish,
-            shutdown,
-        )? {
+        match snapshot_transfer_with::<A::Event>(journal_path, &mut publish, shutdown)? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
                 return Err(io::Error::other(
@@ -570,7 +567,6 @@ fn live_stream_uring(
         batch_size,
         busy_spin,
         // Only used during handshake/catch-up (handle_replica_connection).
-        genesis_entry: _,
         journal_path: _,
         authorized_keys: _,
         replica_ready: _,

@@ -81,9 +81,15 @@ pub struct Ack {
 pub enum PrimaryMessage {
     StreamStart {
         start_sequence: u64,
-        /// Primary's raw genesis entry bytes — the replica writes these
-        /// directly to its journal for a byte-identical hash chain start.
-        genesis_entry: Vec<u8>,
+        /// Header identity for the journal segment a *fresh* replica
+        /// should create before consuming the stream: the segment's
+        /// `starting_sequence` and chain `anchor_hash`. For full
+        /// catch-up this is the primary's oldest segment (lineage
+        /// origin); after a snapshot transfer it is `snap_sequence + 1`
+        /// anchored to the snapshot's chain hash. Replicas with
+        /// existing local state ignore it.
+        segment_start_sequence: u64,
+        anchor_hash: [u8; 32],
     },
     NeedSnapshot,
     HashMismatch,
@@ -180,15 +186,15 @@ struct HeartbeatFrame {
     sequence: U64,
 }
 
-/// Variable-tail frame: `tag(1) + start_sequence(8) + genesis_len(4)`
-/// followed by `genesis_len` raw bytes. Decoder peels this 13-byte
-/// prefix typed; the genesis bytes are read as a slice.
+/// Fixed-size StreamStart frame: stream resume point plus the segment
+/// header identity a fresh replica should create its journal with.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
-struct StreamStartHeader {
+struct StreamStartFrame {
     tag: u8,
     start_sequence: U64,
-    genesis_len: U32,
+    segment_start_sequence: U64,
+    anchor_hash: [u8; 32],
 }
 
 const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 41);
@@ -198,7 +204,7 @@ const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
 const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
-const _: () = assert!(core::mem::size_of::<StreamStartHeader>() == 13);
+const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 49);
 
 /// Helper: `length_prefix(buf, payload_len)` writes the 4-byte LE
 /// frame length prefix for a payload of `payload_len` bytes.
@@ -272,20 +278,25 @@ pub fn encode_auth_failed(buf: &mut Vec<u8>) {
 
 /// Encode a StreamStart message into a frame.
 ///
-/// Includes the primary's raw genesis entry bytes so the replica can
-/// write a byte-identical genesis to its journal. This ensures the
-/// BLAKE3 hash chain starts from the exact same encoded bytes (including
-/// the timestamp), so checkpoint verification works on the replica.
-pub fn encode_stream_start(start_sequence: u64, genesis_entry_bytes: &[u8], buf: &mut Vec<u8>) {
-    let header = StreamStartHeader {
+/// `segment_start_sequence` and `anchor_hash` identify the journal
+/// segment a fresh replica should create before consuming the stream —
+/// with the same header identity and the same entry bytes, the replica's
+/// journal is byte-identical to the primary's from that point on.
+pub fn encode_stream_start(
+    start_sequence: u64,
+    segment_start_sequence: u64,
+    anchor_hash: [u8; 32],
+    buf: &mut Vec<u8>,
+) {
+    let frame = StreamStartFrame {
         tag: MSG_STREAM_START,
         start_sequence: U64::new(start_sequence),
-        genesis_len: U32::new(genesis_entry_bytes.len() as u32),
+        segment_start_sequence: U64::new(segment_start_sequence),
+        anchor_hash,
     };
-    let header_bytes = header.as_bytes();
-    write_length_prefix(buf, (header_bytes.len() + genesis_entry_bytes.len()) as u32);
-    buf.extend_from_slice(header_bytes);
-    buf.extend_from_slice(genesis_entry_bytes);
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode a NeedSnapshot message.
@@ -340,8 +351,7 @@ pub fn encode_hash_mismatch(buf: &mut Vec<u8>) {
     buf.push(MSG_HASH_MISMATCH);
 }
 
-/// Encode a Heartbeat message. Carries only the last-acked sequence;
-/// the chain hash is verified at Checkpoint events, not on every heartbeat.
+/// Encode a Heartbeat message. Carries only the last-sent sequence.
 pub fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
     let frame = HeartbeatFrame {
         tag: MSG_HEARTBEAT,
@@ -447,15 +457,12 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
     }
     match payload[0] {
         MSG_STREAM_START => {
-            let (header, tail) = StreamStartHeader::ref_from_prefix(payload)
+            let (frame, _) = StreamStartFrame::ref_from_prefix(payload)
                 .map_err(|_| io::Error::other("StreamStart too short"))?;
-            let genesis_len = header.genesis_len.get() as usize;
-            if tail.len() < genesis_len {
-                return Err(io::Error::other("StreamStart genesis truncated"));
-            }
             Ok(PrimaryMessage::StreamStart {
-                start_sequence: header.start_sequence.get(),
-                genesis_entry: tail[..genesis_len].to_vec(),
+                start_sequence: frame.start_sequence.get(),
+                segment_start_sequence: frame.segment_start_sequence.get(),
+                anchor_hash: frame.anchor_hash,
             })
         }
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),

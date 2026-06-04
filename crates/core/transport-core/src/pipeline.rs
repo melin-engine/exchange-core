@@ -266,10 +266,9 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Set by the matching stage; the journal stage publishes a parallel
     /// `journal_wire_seq_cursor` on the persisted track. Both follow the
     /// journal-allocation rule (events the journal would `continue` past
-    /// — `Query` and `Checkpoint` — do not advance the counter; their
-    /// output slots carry the prior wire seq, so the gate waits for
-    /// preceding allocated events to be durable before releasing a
-    /// query response).
+    /// — `Query` — do not advance the counter; their output slots carry
+    /// the prior wire seq, so the gate waits for preceding allocated
+    /// events to be durable before releasing a query response).
     pub wire_seq: u64,
     /// The response payload.
     pub payload: OutputPayload<R, Q>,
@@ -291,8 +290,8 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// replicas disconnected). Two kinds of slot reach the output ring
     /// under halt: the explicit `Rejected{ReplicaDisconnected}` reports
     /// produced for incoming client orders, and the empty `BatchEnd`
-    /// terminators emitted for transport-internal events (Tick /
-    /// GenesisHash / Checkpoint). Neither carries engine state worth
+    /// terminators emitted for transport-internal events (Tick).
+    /// Neither carries engine state worth
     /// replicating before delivery — the rejection records no mutation,
     /// and replicas deterministically reach the same halt decision when
     /// they replay the same inputs. Gating either under a structurally
@@ -662,17 +661,13 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 // Data stays in the buffer until the write point — one
                 // O_DIRECT pwrite covers the entire batch.
                 // QueryStats/QueryPosition are not journaled (no state change).
-                // Checkpoint events are not encoded (each node auto-emits
-                // its own), but their chain hash is verified for divergence
-                // detection when received from a primary.
                 //
                 // The journal stage is the authoritative sequence allocator
                 // on the primary: when `slot.sequence == 0` (every primary-
                 // side input) we allocate at encode time in disruptor cursor
                 // order. On replicas the replication receiver stamps the
                 // primary's sequence onto `slot.sequence` before publish, and
-                // we use it verbatim (also syncing the writer's counter so
-                // its own checkpoint auto-emission stays aligned).
+                // we use it verbatim (also syncing the writer's counter).
                 // Encoding always runs — under no-persist the bytes still
                 // populate `batch_buf` so replication can publish them, and
                 // sequence allocation must happen so downstream stages see
@@ -686,18 +681,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     }
                     consumed += 1;
                     if slot.event.is_query() {
-                        continue;
-                    }
-                    if let melin_journal::JournalEvent::Checkpoint {
-                        #[cfg(feature = "hash-chain")]
-                        chain_hash,
-                        ..
-                    } = &slot.event
-                    {
-                        #[cfg(feature = "hash-chain")]
-                        if slot.sequence != 0 {
-                            self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
-                        }
                         continue;
                     }
                     let seq = if slot.sequence != 0 {
@@ -1008,8 +991,10 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 if let Some(p) = self.preparer.as_ref() {
                     p.arm();
                 }
-                // The new segment's GenesisHash advanced the chain;
-                // republish so shadow + cursor observers see it.
+                // Rotation consumes no sequence and the chain value is
+                // unchanged (the new segment's anchor *is* the old
+                // tail), but republish so observers see a state that is
+                // consistent with the new on-disk layout.
                 self.publish_fsync_state();
                 true
             }
@@ -1033,34 +1018,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
     }
 
-    /// Verify the replica's chain hash against a checkpoint from the
-    /// primary. Called when the JournalStage encounters a Checkpoint
-    /// event with a pre-assigned sequence (replica mode). The replica's
-    /// writer has just auto-emitted its own checkpoint at the same
-    /// position, so the chain hashes must match.
-    ///
-    /// Returns `Err` on mismatch — the caller should shut down the
-    /// pipeline to prevent silent divergence.
-    ///
-    /// No-op when the `hash-chain` feature is disabled (checkpoints
-    /// don't exist without it).
-    #[cfg(feature = "hash-chain")]
-    fn verify_primary_checkpoint(
-        &self,
-        primary_hash: &[u8; 32],
-        sequence: u64,
-    ) -> Result<(), JournalError> {
-        if let Some(local_hash) = self.writer.chain_hash()
-            && local_hash != *primary_hash
-        {
-            return Err(JournalError::Io(std::io::Error::other(format!(
-                "divergence detected at checkpoint seq {sequence}: \
-                 replica hash {local_hash:02x?} != primary hash {primary_hash:02x?}"
-            ))));
-        }
-        Ok(())
-    }
-
     /// Drain any remaining entries from the ring buffer on shutdown.
     fn drain_remaining(&mut self, batch: &mut [InputSlot<E>]) {
         loop {
@@ -1075,21 +1032,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                         // Sentinel is never persisted (codec rejects it).
                         // Reaching this path means the shutdown flag fired
                         // before the sentinel was consumed — skip it.
-                        continue;
-                    }
-                    if let melin_journal::JournalEvent::Checkpoint {
-                        #[cfg(feature = "hash-chain")]
-                        chain_hash,
-                        ..
-                    } = &slot.event
-                    {
-                        #[cfg(feature = "hash-chain")]
-                        if slot.sequence != 0
-                            && let Err(e) =
-                                self.verify_primary_checkpoint(chain_hash, slot.sequence)
-                        {
-                            tracing::error!(error = %e, "divergence on drain");
-                        }
                         continue;
                     }
                     let seq = if slot.sequence != 0 {
@@ -1457,18 +1399,6 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     if slot.event.is_query() {
                         continue;
                     }
-                    if let melin_journal::JournalEvent::Checkpoint {
-                        #[cfg(feature = "hash-chain")]
-                        chain_hash,
-                        ..
-                    } = &slot.event
-                    {
-                        #[cfg(feature = "hash-chain")]
-                        if slot.sequence != 0 {
-                            self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
-                        }
-                        continue;
-                    }
                     let seq = if slot.sequence != 0 {
                         self.writer.set_next_sequence(slot.sequence + 1);
                         slot.sequence
@@ -1732,11 +1662,11 @@ pub struct MatchingStage<A: Application> {
     /// into `OutputSlot.wire_seq` so the response stage's durability gate
     /// can compare against replica metrics in the same space. Initialised
     /// to the journal writer's `starting_sequence` and advanced for each
-    /// event the journal would allocate (App non-query, Tick,
-    /// GenesisHash); held flat for events the journal skips (Query,
-    /// Checkpoint). The skip-rule mirrors `JournalStage::run` exactly —
-    /// any drift would re-introduce the off-by-one the wire-seq field
-    /// exists to eliminate. Tests pin this invariant.
+    /// event the journal would allocate (App non-query, Tick); held flat
+    /// for events the journal skips (Query). The skip-rule mirrors
+    /// `JournalStage::run` exactly — any drift would re-introduce the
+    /// off-by-one the wire-seq field exists to eliminate. Tests pin this
+    /// invariant.
     next_wire_seq: u64,
 }
 
@@ -1899,17 +1829,14 @@ impl<A: Application> MatchingStage<A> {
                 // Wire seq for this event, in the same space as
                 // `metrics.in_memory_sequence` / the journal stage's
                 // allocator. Skip the counter advance for the same event
-                // kinds the journal skips (Queries via `is_query()`, plus
-                // `Checkpoint` which the journal `continue`s past). For
+                // kind the journal skips (Queries via `is_query()`). For
                 // those skipped slots we stamp the *prior* allocated wire
                 // seq so the response gate waits on already-allocated
                 // events to be durable before releasing — a query
                 // arriving before any allocation gets `0`, which the gate
                 // is guaranteed to satisfy.
                 let is_query_event = slot.event.is_query();
-                let is_checkpoint =
-                    matches!(slot.event, melin_journal::JournalEvent::Checkpoint { .. });
-                let wire_seq = if is_query_event || is_checkpoint {
+                let wire_seq = if is_query_event {
                     self.next_wire_seq.saturating_sub(1)
                 } else {
                     let s = self.next_wire_seq;
@@ -1943,9 +1870,9 @@ impl<A: Application> MatchingStage<A> {
                 // the output ring during halt: the explicit halt-state
                 // rejection below (`Rejected{ReplicaDisconnected}` —
                 // operator-visible refusal, no engine state changed) and
-                // the empty `BatchEnd` terminator that transport variants
-                // (Tick / Checkpoint / GenesisHash) emit as their "I
-                // produced no client payload" marker. Neither carries
+                // the empty `BatchEnd` terminator that the transport
+                // variant (Tick) emits as its "I produced no client
+                // payload" marker. Neither carries
                 // engine state worth replicating before delivery; gating
                 // them under a structurally unsatisfiable policy
                 // (e.g. `Hybrid` with no replicas) would stall the gate
@@ -1972,7 +1899,7 @@ impl<A: Application> MatchingStage<A> {
                 let halt_bypass = halted && !is_query;
                 if !is_query && halted && !is_transport_internal {
                     // Only app events produce client-facing rejections;
-                    // transport variants (Tick, GenesisHash, Checkpoint)
+                    // transport variants (Tick)
                     // have no client to reject to, so they silently
                     // skip during halt.
                     if let melin_journal::JournalEvent::App(ref e) = slot.event {
@@ -2006,8 +1933,6 @@ impl<A: Application> MatchingStage<A> {
                         melin_journal::JournalEvent::Tick { now_ns } => {
                             self.app.tick(now_ns, &mut reports);
                         }
-                        melin_journal::JournalEvent::GenesisHash { .. }
-                        | melin_journal::JournalEvent::Checkpoint { .. } => {}
                         melin_journal::JournalEvent::Shutdown => {}
                     }
                 }
@@ -2026,8 +1951,6 @@ impl<A: Application> MatchingStage<A> {
                         let event_kind: &'static str = match &slot.event {
                             melin_journal::JournalEvent::App(_) => "app",
                             melin_journal::JournalEvent::Tick { .. } => "tick",
-                            melin_journal::JournalEvent::GenesisHash { .. } => "genesis_hash",
-                            melin_journal::JournalEvent::Checkpoint { .. } => "checkpoint",
                             melin_journal::JournalEvent::Shutdown => "shutdown",
                         };
                         tracing::warn!(
@@ -2062,8 +1985,8 @@ impl<A: Application> MatchingStage<A> {
                 let report_count = reports.len();
                 let last_is_query = query_report.is_some();
                 if report_count == 0 && !last_is_query {
-                    // Transport-internal events (Tick / GenesisHash /
-                    // Checkpoint published by the reader thread) carry
+                    // Transport-internal events (Tick published by the
+                    // reader thread) carry
                     // `connection_id == 0` and have no client to reply
                     // to. They previously emitted a BatchEnd-payload
                     // slot as a terminator; downstream consumers
@@ -2179,22 +2102,9 @@ impl<A: Application> MatchingStage<A> {
             // response stage's gate. Queries are skipped below (their
             // output slots are meaningless on shutdown) — for non-query
             // events the journal would still allocate, so advance the
-            // counter. Checkpoint-without-allocation matches the main
-            // loop's `saturating_sub` behavior.
-            //
-            // The `Checkpoint` arm is defensive on the primary
-            // (`Checkpoint` events are auto-emitted inside the journal
-            // stage and never enter the input ring), but load-bearing on
-            // the replica: catch-up replays the primary's journal
-            // verbatim, including its `Checkpoint` entries, which do
-            // reach matching via the input ring. Keeping the rule
-            // symmetric here (rather than gating on a primary/replica
-            // role flag) means the lockstep with the journal allocator
-            // holds regardless of which side this code runs on.
+            // counter.
             let is_query_event = slot.event.is_query();
-            let is_checkpoint =
-                matches!(slot.event, melin_journal::JournalEvent::Checkpoint { .. });
-            let wire_seq = if is_query_event || is_checkpoint {
+            let wire_seq = if is_query_event {
                 self.next_wire_seq.saturating_sub(1)
             } else {
                 let s = self.next_wire_seq;
@@ -2313,11 +2223,6 @@ impl<A: Application> MatchingStage<A> {
                 // Ticks) so time still advances as documented on
                 // `JournalEvent::Tick`.
                 self.app.tick(now_ns, reports);
-            }
-            melin_journal::JournalEvent::GenesisHash { .. }
-            | melin_journal::JournalEvent::Checkpoint { .. } => {
-                // Hash chain metadata — journal internal, never reaches
-                // the application.
             }
             melin_journal::JournalEvent::Shutdown => {
                 // Pipeline sentinel — handled at the run-loop level

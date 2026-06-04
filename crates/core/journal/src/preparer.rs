@@ -19,9 +19,9 @@
 //!      parks the result in `slot`.
 //!   3. At rotation time the writer calls
 //!      [`SegmentPreparer::take`]; if it returns `Some`, the writer
-//!      renames the staging file into place and writes the file header +
-//!      `GenesisHash` entry. Cost: two renames + one dir fsync. The
-//!      ~38 ms is gone.
+//!      renames the staging file into place and writes the file header
+//!      (which carries the boundary's sequence + chain anchor). Cost:
+//!      two renames + one dir fsync. The ~38 ms is gone.
 //!   4. If `take` returns `None` (the worker hasn't caught up, manual
 //!      rotation arrived early, or preparation errored), the writer
 //!      falls back to today's synchronous path.
@@ -51,9 +51,9 @@ use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 ///   - the corresponding pages prefaulted into the page cache,
 ///   - `sync_all` issued so the allocation is durable across crashes.
 ///
-/// The file header and `GenesisHash` entry are *not* yet written —
-/// `SectorWriter::adopt_prepared` writes them at adopt time so they
-/// reflect the rotation boundary's sequence + chain hash.
+/// The file header is *not* yet written — `SectorWriter::adopt_prepared`
+/// writes it at adopt time so it reflects the rotation boundary's
+/// sequence + chain anchor.
 pub struct PreparedSegment {
     /// O_DIRECT file handle. Reused by the writer after rename.
     pub file: File,

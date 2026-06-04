@@ -10,11 +10,34 @@
 //! `rename(2)` regardless of how many archives already exist, and the
 //! sort order matches the chronological order of rotations.
 
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+use crate::codec::{self, FileHeaderInfo};
+use crate::error::JournalError;
 
 /// Width of the zero-padded archive index. Six digits accommodates one
 /// million rotations — over a century at hourly rotations.
 const ARCHIVE_INDEX_WIDTH: usize = 6;
+
+/// Read and validate a segment's file header, returning its decoded
+/// fields (`starting_sequence`, `anchor_hash`, …).
+///
+/// Opens a plain (non-O_DIRECT) handle — startup/diagnostic path only.
+/// Used by replication bootstrap to hand a replica the live segment's
+/// identity, and by recovery to verify cross-segment lineage.
+pub fn read_header_info(path: &Path) -> Result<FileHeaderInfo, JournalError> {
+    let file = std::fs::File::open(path)?;
+    let mut buf = [0u8; codec::FILE_HEADER_SIZE];
+    let n = file.read_at(&mut buf, 0)?;
+    if n < codec::FILE_HEADER_SIZE {
+        return Err(JournalError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "journal file too short to read file header",
+        )));
+    }
+    codec::decode_file_header(&buf)
+}
 
 /// Build the path for archive number `n`.
 pub fn archive_path(live: &Path, n: u32) -> PathBuf {

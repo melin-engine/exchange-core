@@ -748,7 +748,7 @@ where
 
     // Replica mode: connect to primary, receive journal stream, replay.
     // Must run before init_engine — the replica's journal is created from
-    // the primary's genesis during the replication handshake.
+    // the primary's segment lineage during the replication handshake.
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
 
@@ -1054,18 +1054,6 @@ where
         )
         .into());
     }
-    // Read the raw genesis entry bytes from the journal file before
-    // moving the writer into the pipeline. Sent to the replica during
-    // handshake so it can write a byte-identical genesis, ensuring the
-    // BLAKE3 hash chain starts from the exact same encoded bytes.
-    let genesis_entry = if enable_replication {
-        writer
-            .read_genesis_entry()
-            .map_err(|e| format!("failed to read genesis entry: {e}"))?
-    } else {
-        Vec::new()
-    };
-
     // Clone the exchange for the shadow snapshot stage before the pipeline
     // consumes it. Uses snapshot_state() + restore_state() round-trip since
     // `A` doesn't implement Clone (internal data structures are complex).
@@ -1336,7 +1324,6 @@ where
                         repl_consumer_2,
                         replication_cursor: repl_cursor,
                         fastest_replica_cursor: fastest_repl_cursor,
-                        genesis_entry,
                         journal_path,
                         authorized_keys: repl_auth_keys,
                         evict_flags,
@@ -2027,14 +2014,6 @@ where
         .into());
     }
 
-    let genesis_entry = if enable_replication {
-        writer
-            .read_genesis_entry()
-            .map_err(|e| format!("failed to read genesis entry: {e}"))?
-    } else {
-        Vec::new()
-    };
-
     // Build disruptor pipeline (same flags as the kernel TCP path).
     // DPDK doesn't currently spawn the publisher thread (see
     // `event_publisher: None` in the handles bundle further down) but
@@ -2286,7 +2265,6 @@ where
             [repl_consumer_1, repl_consumer_2],
             repl_cursor,
             fastest_repl_cursor,
-            genesis_entry,
             journal_path,
             ready_flag,
             connected_counter,

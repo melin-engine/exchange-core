@@ -130,7 +130,7 @@ pub struct ApplyCtx {
     pub events_processed: u64,
     /// FxHash of the public key that authenticated the connection
     /// submitting this event. `0` for transport-internal events
-    /// (`Tick`, `GenesisHash`, `Checkpoint`) which carry no client
+    /// (`Tick`) which carry no client
     /// identity. Used by self-introspecting queries (e.g. "what is my
     /// current request_seq HWM?") to look up per-key state without
     /// embedding identity in the event payload — the transport already

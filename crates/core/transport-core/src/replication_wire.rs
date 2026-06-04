@@ -39,8 +39,9 @@ use crate::pipeline::InputSlot;
 
 pub const MSG_INPUT_BATCH: u8 = 0x21;
 
-pub const SLOT_TAG_GENESIS_HASH: u8 = 0x01;
-pub const SLOT_TAG_CHECKPOINT: u8 = 0x02;
+// Slot tags 0x01 (`GenesisHash`) and 0x02 (`Checkpoint`) are retired —
+// chain metadata never rides in the entry stream; divergence checks use
+// dedicated chain frames instead. Do not reuse the values.
 pub const SLOT_TAG_TICK: u8 = 0x03;
 pub const SLOT_TAG_APP: u8 = 0x80;
 
@@ -131,18 +132,6 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
     buf.resize(header_start + SLOT_HEADER_LEN, 0);
 
     let tag = match &slot.event {
-        JournalEvent::GenesisHash { hash } => {
-            buf.extend_from_slice(hash);
-            SLOT_TAG_GENESIS_HASH
-        }
-        JournalEvent::Checkpoint {
-            chain_hash,
-            events_since_checkpoint,
-        } => {
-            buf.extend_from_slice(chain_hash);
-            buf.extend_from_slice(&events_since_checkpoint.to_le_bytes());
-            SLOT_TAG_CHECKPOINT
-        }
         JournalEvent::Tick { now_ns } => {
             buf.extend_from_slice(&now_ns.to_le_bytes());
             SLOT_TAG_TICK
@@ -256,30 +245,6 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
         rest = &after_header[payload_size..];
 
         let event = match header.event_tag {
-            SLOT_TAG_GENESIS_HASH => {
-                if event_payload.len() < 32 {
-                    return Err(io::Error::other("GenesisHash payload too short"));
-                }
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&event_payload[..32]);
-                JournalEvent::GenesisHash { hash }
-            }
-            SLOT_TAG_CHECKPOINT => {
-                if event_payload.len() < 40 {
-                    return Err(io::Error::other("Checkpoint payload too short"));
-                }
-                let mut chain_hash = [0u8; 32];
-                chain_hash.copy_from_slice(&event_payload[..32]);
-                let events_since_checkpoint = u64::from_le_bytes(
-                    event_payload[32..40]
-                        .try_into()
-                        .expect("8-byte slice into [u8; 8]"),
-                );
-                JournalEvent::Checkpoint {
-                    chain_hash,
-                    events_since_checkpoint,
-                }
-            }
             SLOT_TAG_TICK => {
                 if event_payload.len() < 8 {
                     return Err(io::Error::other("Tick payload too short"));
@@ -370,17 +335,7 @@ mod tests {
 
     #[test]
     fn roundtrip_transport_variants() {
-        let slots = vec![
-            sample_slot(10, JournalEvent::Tick { now_ns: 12_345_678 }),
-            sample_slot(
-                11,
-                JournalEvent::Checkpoint {
-                    chain_hash: [0x42; 32],
-                    events_since_checkpoint: 1_000_000,
-                },
-            ),
-            sample_slot(12, JournalEvent::GenesisHash { hash: [0x77; 32] }),
-        ];
+        let slots = vec![sample_slot(10, JournalEvent::Tick { now_ns: 12_345_678 })];
 
         let mut buf = Vec::new();
         encode_input_batch(&slots, &mut buf);
@@ -392,7 +347,7 @@ mod tests {
 
         let decoded: Vec<InputSlot<TestEvent>> =
             try_decode_input_batch(payload).expect("decode succeeds");
-        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.len(), 1);
 
         for (orig, dec) in slots.iter().zip(decoded.iter()) {
             assert_eq!(dec.sequence, orig.sequence);
@@ -405,20 +360,6 @@ mod tests {
         match decoded[0].event {
             JournalEvent::Tick { now_ns } => assert_eq!(now_ns, 12_345_678),
             ref other => panic!("expected Tick, got {other:?}"),
-        }
-        match decoded[1].event {
-            JournalEvent::Checkpoint {
-                chain_hash,
-                events_since_checkpoint,
-            } => {
-                assert_eq!(chain_hash, [0x42; 32]);
-                assert_eq!(events_since_checkpoint, 1_000_000);
-            }
-            ref other => panic!("expected Checkpoint, got {other:?}"),
-        }
-        match decoded[2].event {
-            JournalEvent::GenesisHash { hash } => assert_eq!(hash, [0x77; 32]),
-            ref other => panic!("expected GenesisHash, got {other:?}"),
         }
     }
 

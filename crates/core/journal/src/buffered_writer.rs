@@ -33,13 +33,11 @@ use std::path::{Path, PathBuf};
 
 use melin_app::AppEvent;
 
+#[cfg(feature = "hash-chain")]
+use crate::chain::SegmentChain;
 use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
-#[cfg(feature = "hash-chain")]
-use crate::sector_writer::checkpoint_interval;
-#[cfg(feature = "hash-chain")]
-use melin_app::unix_epoch_nanos;
 
 /// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
 /// entries are ~81-101 bytes; the array is sized generously so the
@@ -89,78 +87,35 @@ pub struct BufferedWriter<E: AppEvent> {
     // approaches this, another `prealloc_chunk_bytes()` is allocated.
     allocated_end: u64,
     #[cfg(feature = "hash-chain")]
-    hash_chain: Option<HashChain>,
+    hash_chain: SegmentChain,
     // Debug-only monotonicity guard: every fresh seq must strictly
     // exceed this. Excluded from release builds — zero hot-path cost.
     #[cfg(debug_assertions)]
     last_encoded_seq: u64,
     // Byte range of the most-recent user entry within `batch_buf` —
-    // captured by `encode_event` before any auto-checkpoint emission so
-    // `last_user_entry_replication_slice` returns the user entry only.
+    // `last_user_entry_replication_slice` ships it to replication
+    // without a second encode pass.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
 }
 
-/// Running BLAKE3 hash chain state. Mirrors the struct in
-/// `writer.rs` — extracted as a private copy here to keep the buffered
-/// writer free of any dependency on the O_DIRECT writer's internals.
-#[cfg(feature = "hash-chain")]
-struct HashChain {
-    current_hash: [u8; 32],
-    batch_hasher: blake3::Hasher,
-    events_since_checkpoint: u64,
-}
-
 impl<E: AppEvent> BufferedWriter<E> {
-    /// Create a fresh journal file with a random genesis hash.
+    /// Create a fresh journal file. The chain anchor is random salt so
+    /// histories from different runs/clusters are never confusable.
     pub fn create(path: &Path) -> Result<Self, JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
-        #[cfg(feature = "hash-chain")]
-        {
-            let mut genesis = [0u8; 32];
-            getrandom::fill(&mut genesis)
-                .map_err(|e| JournalError::Io(std::io::Error::other(e.to_string())))?;
-            Self::create_with_genesis(path, 1, genesis)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        Self::create_without_chain(path, 1)
+        Self::create_continuing(path, 1, crate::fresh_anchor()?)
     }
 
     /// Create a fresh journal that continues a previous segment's sequence
-    /// numbers, anchored to `genesis_hash` (the prior segment's chain tip).
+    /// numbers, anchored to `anchor_hash` (the prior segment's chain tip,
+    /// or random salt for a brand-new journal). Both values are recorded
+    /// in the file header; no entries are written.
     pub fn create_continuing(
         path: &Path,
         starting_sequence: u64,
-        genesis_hash: [u8; 32],
+        anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
-        #[cfg(feature = "hash-chain")]
-        {
-            Self::create_with_genesis(path, starting_sequence, genesis_hash)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            let _ = genesis_hash;
-            Self::create_without_chain(path, starting_sequence)
-        }
-    }
-
-    #[cfg(feature = "hash-chain")]
-    fn create_with_genesis(
-        path: &Path,
-        starting_sequence: u64,
-        genesis: [u8; 32],
-    ) -> Result<Self, JournalError> {
-        let mut writer = Self::create_bare(path, starting_sequence)?;
-        writer.emit_genesis_and_init_chain(genesis)?;
-        Ok(writer)
-    }
-
-    #[cfg(not(feature = "hash-chain"))]
-    fn create_without_chain(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
-        Self::create_bare(path, starting_sequence)
-    }
-
-    fn create_bare(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -176,10 +131,13 @@ impl<E: AppEvent> BufferedWriter<E> {
         // first `MAX_SECTOR_SIZE` (= 4096) bytes for the header
         // regardless of writer mode or device sector size, so a
         // journal created here is layout-compatible with SectorWriter.
-        // The meaningful fields occupy only the first ~8 bytes; the
-        // rest is zero padding.
         let mut header_buf = [0u8; MAX_SECTOR_SIZE];
-        codec::encode_file_header(&mut header_buf, MAX_SECTOR_SIZE);
+        codec::encode_file_header(
+            &mut header_buf,
+            MAX_SECTOR_SIZE,
+            starting_sequence,
+            anchor_hash,
+        );
         write_all_at(&file, &header_buf, 0)?;
 
         // Flush the header durably before returning. Subsequent batch
@@ -198,36 +156,12 @@ impl<E: AppEvent> BufferedWriter<E> {
             write_pos: HEADER_OFFSET,
             allocated_end,
             #[cfg(feature = "hash-chain")]
-            hash_chain: None,
+            hash_chain: SegmentChain::new(anchor_hash),
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
         })
-    }
-
-    #[cfg(feature = "hash-chain")]
-    fn emit_genesis_and_init_chain(&mut self, genesis: [u8; 32]) -> Result<(), JournalError> {
-        let genesis_event: JournalEvent<E> = JournalEvent::GenesisHash { hash: genesis };
-        let seq = self.next_sequence;
-        let ts = unix_epoch_nanos();
-        let written = codec::encode(seq, ts, 0, 0, &genesis_event, &mut self.buffer)?;
-
-        // Initialize chain: hash the genesis entry bytes (excluding CRC).
-        let entry_bytes = &self.buffer[..written - 4];
-        let hash = blake3::hash(entry_bytes);
-        self.hash_chain = Some(HashChain {
-            current_hash: *hash.as_bytes(),
-            batch_hasher: blake3::Hasher::new(),
-            events_since_checkpoint: 0,
-        });
-
-        self.batch_buf[0..written].copy_from_slice(&self.buffer[..written]);
-        self.last_user_entry_offset = 0;
-        self.last_user_entry_len = written;
-        self.batch_len = written;
-        self.next_sequence += 1;
-        self.flush_batch_sync()
     }
 
     /// Open an existing journal for appending after recovery.
@@ -236,23 +170,19 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// by the reader. `valid_end` is the byte offset immediately past
     /// that entry — new entries are written starting here, overwriting
     /// any trailing garbage from a partial crash write.
-    pub fn open_append(
-        path: &Path,
-        last_seq: u64,
-        valid_end: u64,
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))] chain_hash: Option<
-            [u8; 32],
-        >,
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
-        events_since_checkpoint: u64,
-    ) -> Result<Self, JournalError> {
+    ///
+    /// The hash chain is rebuilt self-containedly: the anchor comes from
+    /// the file header and the hasher re-absorbs the raw byte range
+    /// `[ENTRY_OFFSET, valid_end)` — the chain is a pure function of
+    /// those two inputs, so no chain state needs to be threaded in from
+    /// the recovery walk.
+    pub fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-        // Validate the file header is parseable. We don't actually need
-        // the sector_size value (the buffered path has no alignment
-        // requirement), but a header that fails to decode means the file
-        // isn't a journal — bail rather than overwrite it.
+        // Validate the file header and extract the chain anchor. A
+        // header that fails to decode means the file isn't a journal —
+        // bail rather than overwrite it.
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
         let n = file.read_at(&mut header_buf, 0)?;
         if n < FILE_HEADER_SIZE {
@@ -261,7 +191,8 @@ impl<E: AppEvent> BufferedWriter<E> {
                 "journal file too short to read file header",
             )));
         }
-        codec::decode_file_header(&header_buf)?;
+        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
+        let info = codec::decode_file_header(&header_buf)?;
 
         // Truncate down to `valid_end` so any torn-write garbage past
         // it is gone before we resume appending. Without this, the
@@ -280,9 +211,7 @@ impl<E: AppEvent> BufferedWriter<E> {
         let allocated_end = fallocate_chunk(&file, valid_end)?;
         file.sync_all()?;
 
-        // `mut` only used under `hash-chain` (mid-segment hasher rebuild below).
-        #[allow(unused_mut)]
-        let mut writer = Self {
+        Ok(Self {
             _marker: PhantomData,
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
@@ -292,47 +221,18 @@ impl<E: AppEvent> BufferedWriter<E> {
             path: path.to_path_buf(),
             write_pos: valid_end,
             allocated_end,
-            // `events_since_checkpoint` is initialised to 0 here and
-            // overwritten below by the reader-driven reconstruction
-            // when the caller indicates mid-segment recovery. The
-            // chain-hash parameter is only authoritative when the
-            // resume lands exactly on a checkpoint boundary.
             #[cfg(feature = "hash-chain")]
-            hash_chain: chain_hash.map(|h| HashChain {
-                current_hash: h,
-                batch_hasher: blake3::Hasher::new(),
-                events_since_checkpoint: 0,
-            }),
+            hash_chain: SegmentChain::rebuild_from_file(
+                path,
+                info.anchor_hash,
+                ENTRY_OFFSET,
+                valid_end,
+            )?,
             #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
-        };
-
-        // Mid-segment resume: the caller's `chain_hash` is the running
-        // hash including unfinalised entries since the last checkpoint,
-        // which doesn't decompose into (current_hash, batch_hasher)
-        // arithmetically. To rebuild a hasher whose next checkpoint
-        // matches what the writer would have produced without a crash,
-        // we re-read the segment via JournalReader — which carries the
-        // same accumulation rule — and adopt its (current_hash,
-        // hasher, count) tuple. Without this, the next emitted
-        // Checkpoint would carry a hash that disagrees with the
-        // pre-crash invariant and verification would fail.
-        #[cfg(feature = "hash-chain")]
-        if events_since_checkpoint > 0
-            && let Some(chain) = &mut writer.hash_chain
-        {
-            let mut reader = crate::reader::JournalReader::<E>::open(path)?;
-            while reader.next_entry()?.is_some() {}
-            if let Some((raw_hash, hasher, count)) = reader.take_chain_state() {
-                chain.current_hash = raw_hash;
-                chain.batch_hasher = hasher;
-                chain.events_since_checkpoint = count;
-            }
-        }
-
-        Ok(writer)
+        })
     }
 
     /// Allocate and return the next sequence number, advancing the
@@ -348,8 +248,9 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// Does not advance the internal sequence counter — the caller
     /// owns sequencing (via [`allocate_sequence`](Self::allocate_sequence)
     /// on the primary or [`set_next_sequence`](Self::set_next_sequence)
-    /// on a replica). Also handles hash-chain bookkeeping and auto-emits
-    /// a checkpoint entry when the interval is reached.
+    /// on a replica). The entry's raw bytes are absorbed into the
+    /// segment hash chain; nothing else is emitted — the chain has no
+    /// in-stream metadata.
     pub fn encode_event(
         &mut self,
         seq: u64,
@@ -378,14 +279,10 @@ impl<E: AppEvent> BufferedWriter<E> {
             &mut self.buffer,
         )?;
 
+        // Absorb the full on-disk bytes (incl. CRC) — see crate::chain
+        // for why the CRC is included.
         #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &mut self.hash_chain {
-            let entry_bytes_len = written - 4; // exclude CRC
-            chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
-            if !matches!(event, JournalEvent::GenesisHash { .. }) {
-                chain.events_since_checkpoint += 1;
-            }
-        }
+        self.hash_chain.absorb(&self.buffer[..written]);
 
         self.reserve_batch(written);
         let offset = self.batch_len;
@@ -394,54 +291,6 @@ impl<E: AppEvent> BufferedWriter<E> {
         self.last_user_entry_len = written;
         self.batch_len += written;
 
-        // Auto-emit a checkpoint at the interval boundary.
-        #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &mut self.hash_chain
-            && chain.events_since_checkpoint >= checkpoint_interval()
-        {
-            chain.batch_hasher.update(&chain.current_hash);
-            let checkpoint_hash = *chain.batch_hasher.finalize().as_bytes();
-            chain.current_hash = checkpoint_hash;
-            chain.batch_hasher = blake3::Hasher::new();
-            let count = chain.events_since_checkpoint;
-            self.emit_checkpoint(checkpoint_hash, count)?;
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "hash-chain")]
-    fn emit_checkpoint(
-        &mut self,
-        chain_hash: [u8; 32],
-        events_since_checkpoint: u64,
-    ) -> Result<(), JournalError> {
-        let checkpoint: JournalEvent<E> = JournalEvent::Checkpoint {
-            chain_hash,
-            events_since_checkpoint,
-        };
-        let seq = self.next_sequence;
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                seq > self.last_encoded_seq,
-                "emit_checkpoint: seq {seq} <= last_encoded_seq {}",
-                self.last_encoded_seq
-            );
-            self.last_encoded_seq = seq;
-        }
-        let ts = unix_epoch_nanos();
-        let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
-
-        if let Some(chain) = &mut self.hash_chain {
-            chain.events_since_checkpoint = 0;
-        }
-
-        self.reserve_batch(written);
-        self.batch_buf[self.batch_len..self.batch_len + written]
-            .copy_from_slice(&self.buffer[..written]);
-        self.batch_len += written;
-        self.next_sequence += 1;
         Ok(())
     }
 
@@ -533,68 +382,24 @@ impl<E: AppEvent> BufferedWriter<E> {
         &self.path
     }
 
-    /// Read the genesis entry bytes from the journal header. Mirrors
-    /// [`crate::sector_writer::SectorWriter::read_genesis_entry`]; the
-    /// fixed [`FILE_HEADER_SIZE`] offset replaces the sector-size
-    /// constant used there. Used at primary startup to forward the
-    /// genesis frame to replicas so the BLAKE3 chain seeds from the
-    /// same bytes on both nodes.
-    pub fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
-        let file = std::fs::File::open(&self.path)?;
-        let offset = HEADER_OFFSET;
-        let mut hdr4 = [0u8; 4];
-        let n = file.read_at(&mut hdr4, offset)?;
-        if n < 4 {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "journal too short to contain genesis entry",
-            )));
-        }
-        let entry_len = u16::from_le_bytes([hdr4[2], hdr4[3]]) as usize;
-        // EntryHeader (20) + payload + CRC (4) — same on-disk frame as
-        // SectorWriter, only the file-header prefix differs.
-        let total = 20 + entry_len + 4;
-        let mut entry = vec![0u8; total];
-        let n = file.read_at(&mut entry, offset)?;
-        if n < total {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "journal truncated at genesis entry",
-            )));
-        }
-        Ok(entry)
+    /// Decoded file-header fields of the live segment (read from disk).
+    /// Used at primary startup to hand replicas the segment's
+    /// `(starting_sequence, anchor_hash)` so a fresh replica journal is
+    /// byte-identical from the segment's first entry onward.
+    pub fn read_header_info(&self) -> Result<codec::FileHeaderInfo, JournalError> {
+        crate::segment::read_header_info(&self.path)
     }
 
-    /// Current BLAKE3 chain hash if hash-chain is active. Includes any
-    /// entries accumulated since the last checkpoint by cloning the
-    /// batch hasher and finalising with the previous chain hash —
-    /// non-destructive.
+    /// Current chain value: `BLAKE3(entry bytes so far || anchor)`, or
+    /// the anchor itself for an empty segment. `None` when `hash-chain`
+    /// is disabled. Non-destructive (clone + finalize).
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            self.hash_chain.as_ref().map(|c| {
-                if c.events_since_checkpoint == 0 {
-                    c.current_hash
-                } else {
-                    let mut h = c.batch_hasher.clone();
-                    h.update(&c.current_hash);
-                    *h.finalize().as_bytes()
-                }
-            })
+            Some(self.hash_chain.value())
         }
         #[cfg(not(feature = "hash-chain"))]
         None
-    }
-
-    pub fn events_since_checkpoint(&self) -> u64 {
-        #[cfg(feature = "hash-chain")]
-        {
-            self.hash_chain
-                .as_ref()
-                .map_or(0, |c| c.events_since_checkpoint)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        0
     }
 
     /// Encoded bytes that have been appended to the batch buffer but
@@ -620,40 +425,24 @@ impl<E: AppEvent> BufferedWriter<E> {
     ///
     /// Flushes any pending batch durably, archives the live segment via
     /// [`crate::segment::archive_live`], and opens a fresh live segment
-    /// at the original path seeded with `GenesisHash(prev_chain_hash)`.
-    /// Returns the path of the archived segment.
+    /// at the original path whose header anchor is the outgoing
+    /// segment's tail chain hash. Returns the path of the archived
+    /// segment. No sequence number is consumed — the next event written
+    /// gets exactly `next_sequence`.
     pub fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
         self.flush_batch_sync()?;
 
         let path = self.path.clone();
         let next_seq = self.next_sequence;
 
-        // GenesisHash carries the chain state at the rotation boundary
-        // so the new segment's chain anchors to the previous one.
-        // Mirrors writer.rs's invariant: with hash-chain enabled,
-        // chain_hash() must be Some after a successful flush; a None
-        // here would silently anchor to zeros.
-        #[allow(clippy::manual_unwrap_or_default)]
-        let genesis = match self.chain_hash() {
-            Some(h) => h,
-            None => {
-                #[cfg(feature = "hash-chain")]
-                {
-                    return Err(JournalError::Io(std::io::Error::other(
-                        "rotate_segment: hash-chain enabled but chain_hash() is None — \
-                         refusing to rotate with zero genesis",
-                    )));
-                }
-                #[cfg(not(feature = "hash-chain"))]
-                {
-                    [0u8; 32]
-                }
-            }
-        };
+        // The new segment's header anchor is the outgoing segment's tail
+        // chain hash, giving recovery a verifiable cross-segment link.
+        // Zeros when hash-chain is disabled (nothing verifies them).
+        let anchor = self.chain_hash().unwrap_or([0u8; 32]);
 
         let archived = crate::segment::archive_live(&path)?;
 
-        match Self::create_continuing(&path, next_seq, genesis) {
+        match Self::create_continuing(&path, next_seq, anchor) {
             Ok(new_writer) => {
                 *self = new_writer;
                 // Persist both the rename (archive_live) and the new
@@ -771,10 +560,8 @@ mod tests {
         }
     }
 
-    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
-    #[cfg(feature = "hash-chain")]
-    const FIRST_SEQ: u64 = 2;
-    #[cfg(not(feature = "hash-chain"))]
+    /// First user-event sequence. Chain metadata lives in the file
+    /// header, so sequence 1 is a real event under every feature config.
     const FIRST_SEQ: u64 = 1;
 
     fn sample(n: u64) -> JournalEvent<TestEvent> {
@@ -862,8 +649,8 @@ mod tests {
         for i in 1..=10u64 {
             writer.batch_append_with_ts(&sample(i), 0, 0, 0).unwrap();
         }
-        // Before flush, no user data has reached disk past the header
-        // + genesis. After flush, all ten entries land in one pwrite.
+        // Before flush, no user data has reached disk past the header.
+        // After flush, all ten entries land in one pwrite.
         writer.flush_batch_sync().unwrap();
         drop(writer);
 
@@ -902,18 +689,10 @@ mod tests {
         writer.append(&sample(2)).unwrap();
         let last_seq = writer.next_sequence() - 1;
         let valid_end = writer.valid_end();
-        let chain_hash = writer.chain_hash();
-        let events_since_checkpoint = writer.events_since_checkpoint();
         drop(writer);
 
-        let mut reopened = BufferedWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )
-        .unwrap();
+        let mut reopened =
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         reopened.append(&sample(3)).unwrap();
         reopened.append(&sample(4)).unwrap();
         drop(reopened);
@@ -933,21 +712,15 @@ mod tests {
 
         let archived = writer.rotate_segment().unwrap();
         assert!(archived.exists(), "archived segment {archived:?} missing");
-        // With hash-chain, the new segment emits a GenesisHash entry
-        // at `seq_before_rotate` and advances the counter by one.
-        // Without hash-chain, no genesis is emitted and the counter
-        // is unchanged across rotation.
-        #[cfg(feature = "hash-chain")]
-        assert_eq!(writer.next_sequence(), seq_before_rotate + 1);
-        #[cfg(not(feature = "hash-chain"))]
+        // Rotation consumes no sequence number — chain metadata lives in
+        // the new segment's header, not in the entry stream.
         assert_eq!(writer.next_sequence(), seq_before_rotate);
 
         writer.append(&sample(3)).unwrap();
         drop(writer);
 
-        // The live file contains only the new user entry (plus a
-        // genesis under hash-chain, which `read_all_payloads`
-        // filters out). The archive holds the pre-rotation entries.
+        // The live file contains only the new user entry. The archive
+        // holds the pre-rotation entries.
         assert_eq!(read_all_payloads(&path), vec![3]);
         assert_eq!(read_all_payloads(&archived), vec![1, 2]);
     }
@@ -979,23 +752,16 @@ mod tests {
         let chain_before = writer.chain_hash().unwrap();
         let last_seq = writer.next_sequence() - 1;
         let valid_end = writer.valid_end();
-        let events_since_checkpoint = writer.events_since_checkpoint();
         drop(writer);
 
-        let reopened = BufferedWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            Some(chain_before),
-            events_since_checkpoint,
-        )
-        .unwrap();
+        let reopened =
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
 
         // Without any new events, the chain hash must reproduce the
-        // value captured before close — proves the resume seeded both
-        // `current_hash` and `events_since_checkpoint` correctly.
+        // value captured before close — proves the self-contained
+        // rebuild (header anchor + raw byte re-absorption) matches the
+        // never-crashed writer's state.
         assert_eq!(reopened.chain_hash(), Some(chain_before));
-        assert_eq!(reopened.events_since_checkpoint(), events_since_checkpoint);
     }
 
     #[test]
@@ -1031,8 +797,6 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        let chain_before = writer.chain_hash();
-        let events_since_checkpoint = writer.events_since_checkpoint();
         writer.append(&sample(11)).unwrap();
         writer.append(&sample(22)).unwrap();
         let valid_end = writer.valid_end();
@@ -1056,31 +820,24 @@ mod tests {
         // the garbage is gone; otherwise a subsequent reader would
         // either fail with a CRC error past `valid_end` or worse, treat
         // the garbage as a valid frame.
-        let reopened = BufferedWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            chain_before,
-            events_since_checkpoint,
-        )
-        .unwrap();
+        let reopened =
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         drop(reopened);
 
-        // Fresh reader: must see exactly the two pre-crash entries plus
-        // any genesis (under hash-chain) — no extra frames decoded from
-        // the garbage.
+        // Fresh reader: must see exactly the two pre-crash entries —
+        // no extra frames decoded from the garbage.
         let payloads = read_all_payloads(&path);
         assert_eq!(payloads, vec![11, 22]);
     }
 
     /// Cross-segment chain continuity: after `rotate_segment`, the new
-    /// segment's GenesisHash payload must equal the live segment's
-    /// chain hash at the rotation moment. Without this, multi-segment
-    /// recovery would report `SegmentChainBreak` against a journal
-    /// that's actually intact.
+    /// segment's header anchor must equal the live segment's chain hash
+    /// at the rotation moment. Without this, multi-segment recovery
+    /// would report `SegmentChainBreak` against a journal that's
+    /// actually intact.
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn rotate_segment_anchors_new_genesis_to_pre_rotate_tail() {
+    fn rotate_segment_anchors_new_header_to_pre_rotate_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
@@ -1088,63 +845,57 @@ mod tests {
         writer.append(&sample(7)).unwrap();
         writer.append(&sample(8)).unwrap();
         let pre_rotate_chain = writer.chain_hash().expect("hash-chain enabled");
+        let seq_at_rotate = writer.next_sequence();
 
         let archived = writer.rotate_segment().unwrap();
         assert!(archived.exists());
 
-        // The reader exposes the segment's GenesisHash payload via
-        // `genesis_payload`. Walking the new live segment is enough to
-        // populate it.
-        let mut reader = crate::reader::JournalReader::<TestEvent>::open(&path).unwrap();
-        while reader.next_entry().unwrap().is_some() {}
-        let genesis = reader
-            .genesis_payload()
-            .expect("new segment must carry a genesis hash anchor");
+        // The new live segment's header carries the anchor + starting
+        // sequence — no entries need to be read.
+        let info = crate::segment::read_header_info(&path).unwrap();
         assert_eq!(
-            genesis, pre_rotate_chain,
-            "new segment's genesis must anchor to the pre-rotation tail",
+            info.anchor_hash, pre_rotate_chain,
+            "new segment's anchor must equal the pre-rotation tail",
         );
+        assert_eq!(info.starting_sequence, seq_at_rotate);
+
+        // An empty segment's chain value is its anchor — the in-memory
+        // writer agrees with the on-disk header.
+        assert_eq!(writer.chain_hash(), Some(pre_rotate_chain));
     }
 
-    /// Mid-segment `open_append` with `events_since_checkpoint > 0`
-    /// must reconstruct the running chain hash by replaying via the
-    /// reader. Asserts that the resumed writer's chain state matches
-    /// what a never-crashed writer would have produced.
+    /// Mid-segment `open_append` rebuilds the chain from the header
+    /// anchor plus the raw on-disk bytes. Asserts the resumed writer's
+    /// chain matches what a never-crashed writer would have produced,
+    /// and that it keeps evolving identically for subsequent appends.
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn open_append_mid_segment_rebuilds_chain_via_reader_replay() {
+    fn open_append_mid_segment_rebuilds_chain_from_raw_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        // Three appends mid-segment — well below `checkpoint_interval`
-        // so `events_since_checkpoint > 0` at the snapshot point.
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         writer.append(&sample(3)).unwrap();
         let chain_no_crash = writer.chain_hash().unwrap();
-        let events_no_crash = writer.events_since_checkpoint();
-        assert!(events_no_crash > 0, "test setup: must be mid-segment");
 
         let valid_end = writer.valid_end();
         let last_seq = writer.next_sequence() - 1;
         drop(writer);
 
-        // Resume — open_append must replay the segment via the reader
-        // to seed the chain state, since the running hash includes
-        // unfinalised entries that can't decompose arithmetically.
-        let reopened = BufferedWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            // The caller's chain_hash is the running hash including
-            // unfinalised entries — supply it; open_append replaces it
-            // with the reader-derived state.
-            Some(chain_no_crash),
-            events_no_crash,
-        )
-        .unwrap();
+        let mut reopened =
+            BufferedWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         assert_eq!(reopened.chain_hash(), Some(chain_no_crash));
-        assert_eq!(reopened.events_since_checkpoint(), events_no_crash);
+
+        // The rebuilt hasher must continue identically: append one more
+        // event and compare against a reader walking the whole segment.
+        reopened.append(&sample(4)).unwrap();
+        let chain_after = reopened.chain_hash().unwrap();
+        drop(reopened);
+
+        let mut reader = crate::reader::JournalReader::<TestEvent>::open(&path).unwrap();
+        while reader.next_entry().unwrap().is_some() {}
+        assert_eq!(reader.chain_hash(), Some(chain_after));
     }
 }

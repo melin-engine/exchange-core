@@ -38,12 +38,11 @@ type Writer = SectorWriter<TestEvent>;
 type TestInput = InputSlot<TestEvent>;
 type TestOutput = OutputSlot<TestReport, TestQuery>;
 
-/// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
-/// Only referenced from journal-reader assertions, which are themselves
+/// First user-event sequence. Chain metadata lives in the file header,
+/// so sequence 1 is a real event under every feature config. Only
+/// referenced from journal-reader assertions, which are themselves
 /// gated on `not(no-persist)`.
-#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
-const FIRST_SEQ: u64 = 2;
-#[cfg(all(not(feature = "hash-chain"), not(feature = "no-persist")))]
+#[cfg(not(feature = "no-persist"))]
 const FIRST_SEQ: u64 = 1;
 
 /// Build an input slot carrying a single `TestEvent::Add(n)`. Primary-
@@ -191,10 +190,10 @@ fn matching_stage_processes_events() {
 /// drift. The response stage's durability gate depends on
 /// `OutputSlot.wire_seq` being in lockstep with what the journal stage's
 /// allocator would assign — same starting value, same per-event rule
-/// (advance for App-non-query / Tick / GenesisHash, hold flat for
-/// `Query` and `Checkpoint`). The lockstep is the load-bearing piece
-/// behind `fix(durability): gate on wire-seq`; this test fails fast if
-/// either side's rule changes without the other tracking it.
+/// (advance for App-non-query / Tick, hold flat for `Query`). The
+/// lockstep is the load-bearing piece behind `fix(durability): gate on
+/// wire-seq`; this test fails fast if either side's rule changes
+/// without the other tracking it.
 #[test]
 fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let app = TestApp::new();
@@ -237,24 +236,22 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
 
     // Input sequence mixes every event class the rule cares about. The
     // expected wire_seq column is what the journal stage's allocator
-    // would assign under the same rule (allocate for App / Tick /
-    // GenesisHash, `continue` past Query and Checkpoint); the matching
-    // stage must produce the same values into `OutputSlot.wire_seq`.
+    // would assign under the same rule (allocate for App / Tick,
+    // `continue` past Query); the matching stage must produce the same
+    // values into `OutputSlot.wire_seq`.
     //
     //   #  | event                | journal allocates | wire_seq stamped
     //   ---+----------------------+-------------------+-------------------
     //   1  | App(Add 1)           | yes → 10          | 10
     //   2  | Query                | no                | 10  (= 11 - 1)
     //   3  | App(Add 2)           | yes → 11          | 11
-    //   4  | Checkpoint           | no                | 11  (= 12 - 1)
-    //   5  | App(Add 3)           | yes → 12          | 12
-    //   6  | Tick                 | yes → 13          | 13
+    //   4  | App(Add 3)           | yes → 12          | 12
+    //   5  | Tick                 | yes → 13          | 13
     //
     // All slots carry `connection_id = 1` so events that produce no
-    // application reports (Checkpoint, Tick) still emit a `BatchEnd`
-    // terminator on the output ring; that way every input event
-    // appears exactly once in the assertions below regardless of
-    // payload shape.
+    // application reports (Tick) still emit a `BatchEnd` terminator on
+    // the output ring; that way every input event appears exactly once
+    // in the assertions below regardless of payload shape.
     let conn_id = 1u64;
     let mut publish = |event: JournalEvent<TestEvent>| {
         input_producer.publish(InputSlot {
@@ -271,18 +268,14 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     publish(JournalEvent::App(TestEvent::Add(1)));
     publish(JournalEvent::App(TestEvent::Query));
     publish(JournalEvent::App(TestEvent::Add(2)));
-    publish(JournalEvent::Checkpoint {
-        chain_hash: [0; 32],
-        events_since_checkpoint: 0,
-    });
     publish(JournalEvent::App(TestEvent::Add(3)));
     publish(JournalEvent::Tick { now_ns: 1 });
 
-    // Drain six output slots — one per input event under the
+    // Drain five output slots — one per input event under the
     // connection-id-1 invariant above.
-    let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(5);
     let mut spins = 0u64;
-    while outputs.len() < 6 {
+    while outputs.len() < 5 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
@@ -295,7 +288,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let actual: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
     assert_eq!(
         actual,
-        vec![10, 10, 11, 11, 12, 13],
+        vec![10, 10, 11, 12, 13],
         "wire_seq stamping diverged from the journal allocator's per-event rule"
     );
 
@@ -314,14 +307,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         .collect();
     assert_eq!(
         payload_kinds,
-        vec![
-            "Report",
-            "QueryResponse",
-            "Report",
-            "BatchEnd",
-            "Report",
-            "BatchEnd"
-        ],
+        vec!["Report", "QueryResponse", "Report", "Report", "BatchEnd"],
     );
 
     shutdown.store(true, Ordering::Relaxed);
@@ -349,12 +335,11 @@ fn journal_stage_uses_preassigned_sequences() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown2 = Arc::clone(&shutdown);
 
-    // Publish events with pre-assigned sequences (simulating replica mode).
-    // Start at sequence 2: when the hash-chain feature is enabled,
-    // SectorWriter::create writes a GenesisHash at sequence 1, so the
-    // next expected sequence is 2. The reader enforces strict continuity.
-    producer.publish(add_slot_with_seq(7, 2, 1_700_000_000_000_000_000));
-    producer.publish(add_slot_with_seq(11, 3, 1_700_000_000_000_000_001));
+    // Publish events with pre-assigned sequences (simulating replica
+    // mode). Start at sequence 1 — the fresh journal's header records
+    // starting_sequence = 1 and the reader enforces it.
+    producer.publish(add_slot_with_seq(7, 1, 1_700_000_000_000_000_000));
+    producer.publish(add_slot_with_seq(11, 2, 1_700_000_000_000_000_001));
 
     let handle = std::thread::spawn(move || stage.run(&shutdown2));
 
@@ -367,12 +352,12 @@ fn journal_stage_uses_preassigned_sequences() {
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
 
         let entry1 = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry1.sequence, 2);
+        assert_eq!(entry1.sequence, 1);
         assert_eq!(entry1.timestamp_ns, 1_700_000_000_000_000_000);
         assert!(matches!(entry1.event, JournalEvent::App(TestEvent::Add(7))));
 
         let entry2 = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry2.sequence, 3);
+        assert_eq!(entry2.sequence, 2);
         assert_eq!(entry2.timestamp_ns, 1_700_000_000_000_000_001);
         assert!(matches!(
             entry2.event,
@@ -380,63 +365,6 @@ fn journal_stage_uses_preassigned_sequences() {
         ));
 
         assert!(reader.next_entry().unwrap().is_none());
-    }
-}
-
-/// Verify that the JournalStage detects divergence when a primary
-/// checkpoint carries a chain hash that doesn't match the replica's.
-/// The stage must return a fatal error, not silently continue.
-#[cfg(feature = "hash-chain")]
-#[test]
-fn divergence_detected_on_checkpoint_hash_mismatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("divergence.journal");
-
-    let writer = Writer::create(&path).unwrap();
-
-    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
-        .add_consumer()
-        .build();
-
-    let consumer = consumers.pop().unwrap();
-    let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown2 = Arc::clone(&shutdown);
-
-    // Normal event with pre-assigned sequence, then a checkpoint whose
-    // chain hash deliberately doesn't match anything the stage could
-    // have computed locally.
-    producer.publish(add_slot_with_seq(1, 100, 1_000_000_000));
-    producer.publish(InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        request_seq: 0,
-        sequence: 101,
-        timestamp_ns: 1_000_000_001,
-        event: JournalEvent::Checkpoint {
-            chain_hash: [0xFF; 32],
-            events_since_checkpoint: 1,
-        },
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    });
-
-    let handle = std::thread::spawn(move || stage.run(&shutdown2));
-
-    std::thread::sleep(Duration::from_millis(100));
-    shutdown.store(true, Ordering::Relaxed);
-    let result = handle.join().unwrap();
-
-    match result {
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("divergence detected"),
-                "error should mention divergence: {msg}"
-            );
-        }
-        Ok(_) => panic!("expected divergence error, got Ok"),
     }
 }
 
@@ -678,26 +606,20 @@ fn replication_cursor_always_starts_at_max() {
     }
 }
 
-/// Regression guard for the production failure mode:
-///
-///     error at entry 100001: sequence gap: expected N+1, got N
-///
-/// reported by `journal_verify` after a dual-replica LAN bench run.
-/// The signature (expected = last + 1, actual = last) is produced by
-/// the reader when an auto-emitted Checkpoint at seq X is followed
-/// by a normal event that re-uses seq X — the Checkpoint is skipped
-/// transparently, advances the reader's internal `last_sequence` to
-/// X, then the duplicate event fails the strict-continuity check.
+/// High-volume soak: a large multi-batch run through the journal stage
+/// must produce a journal whose user sequences are dense — no gaps, no
+/// duplicates — when scanned back. (Historically this guarded against
+/// in-stream Checkpoint entries colliding with user sequences; those
+/// entries no longer exist, but the dense-sequence invariant remains
+/// the property `journal_verify` audits in production.)
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 #[test]
-fn primary_journal_sequences_contiguous_across_checkpoint_boundary() {
-    use melin_journal::sector_writer::checkpoint_interval;
-
+fn primary_journal_sequences_contiguous_across_many_batches() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("checkpoint_boundary.journal");
+    let path = dir.path().join("many_batches.journal");
     let writer = Writer::create(&path).unwrap();
 
-    let total: u64 = checkpoint_interval() * 2 + 100;
+    let total: u64 = 200_100;
     let cap = ((total as usize) + MAX_JOURNAL_BATCH).next_power_of_two();
     let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(cap)
         .add_consumer()
@@ -760,28 +682,25 @@ fn dump_journal_for_diagnosis(src: &std::path::Path, label: &str) -> String {
 
 /// End-to-end primary → replica test. The primary's journal stage
 /// publishes replication batches; a relay thread decodes the wire
-/// frames and republishes them onto the replica's input ring (skipping
-/// the primary's checkpoint frames, since the replica re-derives its
-/// chain hash from its own genesis here). Both journals must end up
-/// with contiguous app sequences covering every published event.
+/// frames and republishes them onto the replica's input ring. Both
+/// journals must end up with contiguous app sequences covering every
+/// published event — and, because the replica re-encodes the same
+/// (seq, timestamp, key, payload) tuples over the same anchor, the two
+/// journals must be chain-identical (the bitwise-mirror property).
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 #[test]
-fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
-    use melin_journal::sector_writer::checkpoint_interval;
-
+fn primary_and_replica_journals_contiguous_and_chain_identical() {
     let dir = tempfile::tempdir().unwrap();
     let primary_path = dir.path().join("primary.journal");
     let replica_path = dir.path().join("replica.journal");
 
-    // Shared genesis hash so the two writers seed identical BLAKE3
-    // chains. In production the replica gets this via snapshot
-    // transfer; here we hard-code it so the chain-hash divergence
-    // check inside the replica's JournalStage doesn't short-circuit
-    // the test at the first auto-emitted Checkpoint.
-    let shared_genesis = [0xA5u8; 32];
+    // Shared anchor so the two writers seed identical BLAKE3 chains.
+    // In production the replica gets this via the bootstrap handshake
+    // (the primary ships its live segment's header info).
+    let shared_anchor = [0xA5u8; 32];
 
     // -------- primary --------
-    let primary_writer = Writer::create_continuing(&primary_path, 1, shared_genesis).unwrap();
+    let primary_writer = Writer::create_continuing(&primary_path, 1, shared_anchor).unwrap();
     let primary_active_conns = Arc::new(AtomicU64::new(0));
     let mut primary = build_pipeline_with_replication(
         TestApp::new(),
@@ -797,7 +716,7 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
     );
 
     // -------- replica --------
-    let replica_writer = Writer::create_continuing(&replica_path, 1, shared_genesis).unwrap();
+    let replica_writer = Writer::create_continuing(&replica_path, 1, shared_anchor).unwrap();
     let replica = build_replica_pipeline(
         TestApp::new(),
         replica_writer,
@@ -837,15 +756,6 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
                     crate::replication_wire::try_decode_input_batch(payload)
                         .expect("relay InputBatch decode");
                 for slot in slots {
-                    // Skip the primary's auto-emitted Checkpoint frames:
-                    // the replica seeds its chain hash from its own (test-
-                    // local) genesis, so verify_primary_checkpoint would
-                    // diverge on the first one and kill the replica
-                    // JournalStage. The replica still auto-emits its own
-                    // Checkpoints at the same sequence positions.
-                    if matches!(slot.event, JournalEvent::Checkpoint { .. }) {
-                        continue;
-                    }
                     replica_input.publish(InputSlot {
                         connection_id: 0,
                         key_hash: slot.key_hash,
@@ -908,7 +818,8 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
     let t_r_journal = std::thread::spawn(move || replica.journal_stage.run(&r_j_stop));
     let t_r_matching = std::thread::spawn(move || replica.matching_stage.run(&r_m_stop));
 
-    let total: u64 = checkpoint_interval() * 5 + 250;
+    // Enough events to span many fsync batches and replication frames.
+    let total: u64 = 50_250;
     for i in 0..total {
         primary
             .input_producer
@@ -933,7 +844,7 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
     replica_drain_stop.store(true, Ordering::Relaxed);
     let _ = t_replica_drain.join();
 
-    let scan = |label: &str, path: &std::path::Path| -> u64 {
+    let scan = |label: &str, path: &std::path::Path| -> (u64, Option<[u8; 32]>) {
         let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
         let mut count = 0u64;
         loop {
@@ -952,11 +863,11 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
                 }
             }
         }
-        count
+        (count, reader.chain_hash())
     };
 
-    let primary_count = scan("primary", &primary_path);
-    let replica_count = scan("replica", &replica_path);
+    let (primary_count, primary_chain) = scan("primary", &primary_path);
+    let (replica_count, replica_chain) = scan("replica", &replica_path);
     if primary_count != total {
         let dump = dump_journal_for_diagnosis(&primary_path, "primary_count");
         panic!(
@@ -979,6 +890,14 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
     assert_eq!(
         replica_count, total,
         "expected all {total} user events recoverable from the replica journal"
+    );
+
+    // Bitwise-mirror property: same anchor + same entry bytes ⇒ same
+    // chain value. This is the invariant divergence detection rests on.
+    assert_eq!(
+        primary_chain.expect("hash-chain enabled"),
+        replica_chain.expect("hash-chain enabled"),
+        "replica journal must be chain-identical to the primary's"
     );
 }
 
@@ -1279,8 +1198,7 @@ fn post_rotation_events_land_in_live_not_archive() {
     shutdown.store(true, Ordering::Relaxed);
     let _ = handle.join().unwrap();
 
-    // Read each segment directly. Collect every entry's sequence,
-    // skipping the GenesisHash anchors used for chain continuity.
+    // Read each segment directly and collect every entry's sequence.
     fn collect_app_seqs(p: &std::path::Path) -> Vec<u64> {
         let mut reader = JournalReader::<TestEvent>::open(p).unwrap();
         let mut out = Vec::new();

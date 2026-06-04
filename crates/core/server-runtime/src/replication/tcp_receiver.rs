@@ -492,13 +492,14 @@ where
         // --- Protocol negotiation ---
         let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
         let response = decode_primary_message(&response_frame)?;
-        let primary_genesis_entry = match response {
+        let stream_lineage = match response {
             PrimaryMessage::StreamStart {
                 start_sequence,
-                genesis_entry,
+                segment_start_sequence,
+                anchor_hash,
             } => {
                 info!(start_sequence, "streaming started");
-                genesis_entry
+                (segment_start_sequence, anchor_hash)
             }
             PrimaryMessage::NeedSnapshot => {
                 info!("primary requires snapshot transfer — receiving snapshot");
@@ -594,10 +595,11 @@ where
                 match decode_primary_message(&ss_frame)? {
                     PrimaryMessage::StreamStart {
                         start_sequence,
-                        genesis_entry,
+                        segment_start_sequence,
+                        anchor_hash,
                     } => {
                         info!(start_sequence, "streaming resumed after snapshot transfer");
-                        genesis_entry
+                        (segment_start_sequence, anchor_hash)
                     }
                     other => {
                         return Err(
@@ -615,9 +617,14 @@ where
         };
 
         // --- Create journal for fresh replica ---
+        // The StreamStart lineage gives the segment header identity
+        // (starting sequence + chain anchor) the primary's own journal
+        // lineage began with; creating the local segment from the same
+        // identity makes the replica's journal byte-identical to the
+        // primary's as the stream is consumed.
         if pipeline.is_none() && journal_writer.is_none() {
-            let writer =
-                melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
+            let (lineage_start, lineage_anchor) = stream_lineage;
+            let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
             let mut fresh = factory.empty();
             factory.apply_operator_policy(&mut fresh);
             exchange = Some(fresh);

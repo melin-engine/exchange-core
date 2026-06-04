@@ -28,7 +28,10 @@
 //! - **Ack**: `[len:u32][0x02][acked_sequence:u64][in_memory_sequence:u64]`
 //!
 //! ### Primary → Replica
-//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][genesis_len:u32][genesis_bytes...]`
+//! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]`
+//!   — the segment header identity a fresh replica creates its journal
+//!   with (lineage origin for full catch-up, `snap_sequence + 1` +
+//!   snapshot hash after a snapshot transfer)
 //! - **NeedSnapshot**: `[len:u32][0x11]`
 //! - **HashMismatch**: `[len:u32][0x12]`
 //! - **SnapshotBegin**: `[len:u32][0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]`
@@ -40,7 +43,9 @@
 //!
 //! ## v1 Limitations
 //!
-//! - No handshake chain hash validation (HashMismatch never sent)
+//! - No handshake chain hash validation (HashMismatch never sent).
+//!   Cross-node chain comparison requires aligned segment boundaries —
+//!   see the slaved-rotation follow-up in `docs/roadmap.md`.
 //! - Dual replication (up to 2 replicas in parallel)
 //!
 //! See `docs/replication.md` for the full design document and limitation details.
@@ -479,17 +484,19 @@ mod tests {
     #[test]
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();
-        encode_stream_start(99, &[0xAA; 64], &mut buf);
+        encode_stream_start(99, 42, [0xAA; 32], &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         match msg {
             PrimaryMessage::StreamStart {
                 start_sequence,
-                genesis_entry,
+                segment_start_sequence,
+                anchor_hash,
             } => {
                 assert_eq!(start_sequence, 99);
-                assert_eq!(genesis_entry, vec![0xAA; 64]);
+                assert_eq!(segment_start_sequence, 42);
+                assert_eq!(anchor_hash, [0xAA; 32]);
             }
             _ => panic!("expected StreamStart"),
         }
@@ -860,7 +867,7 @@ mod tests {
 
         // Send StreamStart.
         let mut buf = Vec::new();
-        encode_stream_start(0, &[0u8; 32], &mut buf); // fake genesis bytes for test
+        encode_stream_start(0, 1, [0u8; 32], &mut buf); // fake lineage for test
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1004,7 +1011,7 @@ mod tests {
         ));
 
         // Send StreamStart.
-        encode_stream_start(0, &[0u8; 32], &mut buf);
+        encode_stream_start(0, 1, [0u8; 32], &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1114,7 +1121,7 @@ mod tests {
         assert_eq!(handshake.chain_hash, [0xBB; 32]);
 
         // Send StreamStart echoing the replica's sequence.
-        encode_stream_start(handshake.last_sequence, &[0u8; 32], &mut buf);
+        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();

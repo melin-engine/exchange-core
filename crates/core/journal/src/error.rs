@@ -43,29 +43,23 @@ pub enum JournalError {
     /// corrupted entry skipped by the caller, bug dropping a batch.
     SequenceGap { expected: u64, actual: u64 },
     /// Sequence number already seen — the decoded entry re-uses a
-    /// sequence that was observed earlier in this read pass, usually
-    /// as a transparently-skipped `Checkpoint` or `GenesisHash`.
-    /// Distinct from `SequenceGap`: a gap means *missing* entries, a
-    /// duplicate means the writer emitted the same seq twice.
+    /// sequence that was observed earlier in this read pass. Distinct
+    /// from `SequenceGap`: a gap means *missing* entries, a duplicate
+    /// means the writer emitted the same seq twice.
     SequenceDuplicate { sequence: u64, previous_seq: u64 },
     /// Entry is incomplete (likely a crash during write).
     TruncatedEntry,
-    /// BLAKE3 hash chain verification failed at a checkpoint.
-    HashChainMismatch {
-        sequence: u64,
-        expected: [u8; 32],
-        actual: [u8; 32],
-    },
     /// The journal's recorded sector size is smaller than the device's physical
     /// sector size. O_DIRECT writes would fail with EINVAL. The journal must be
     /// re-created on the target device or moved back to the original device.
     SectorSizeMismatch { journal: usize, device: usize },
-    /// A successor segment's `GenesisHash` payload does not equal the
-    /// preceding segment's final chain hash. Indicates either tampering
-    /// with archived segments or a missing segment between two surviving
-    /// archives. Reported with the boundary segment's archive index.
+    /// A successor segment's header anchor does not equal the preceding
+    /// segment's final chain hash. Indicates tampering with an archived
+    /// segment's contents, a missing segment between two surviving
+    /// archives, or a foreign segment spliced into the chain. Reported
+    /// with the boundary segment's archive index.
     SegmentChainBreak {
-        /// Archive index of the segment whose GenesisHash was found to
+        /// Archive index of the segment whose header anchor was found to
         /// disagree with the previous segment's tail. The bare live
         /// segment uses `index = 0` for diagnostics only.
         index: u32,
@@ -105,16 +99,6 @@ impl fmt::Display for JournalError {
                  (immediately after seq {previous_seq})"
             ),
             Self::TruncatedEntry => write!(f, "truncated entry at end of journal"),
-            Self::HashChainMismatch {
-                sequence,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "hash chain mismatch at sequence {sequence}: expected {}, got {}",
-                hex_prefix(expected),
-                hex_prefix(actual)
-            ),
             Self::SectorSizeMismatch { journal, device } => write!(
                 f,
                 "journal sector size ({journal}) is smaller than the device's physical \
@@ -126,7 +110,7 @@ impl fmt::Display for JournalError {
                 actual,
             } => write!(
                 f,
-                "segment chain break at archive {index}: GenesisHash {} does not match \
+                "segment chain break at archive {index}: header anchor {} does not match \
                  previous segment's final chain hash {}",
                 hex_prefix(actual),
                 hex_prefix(expected)

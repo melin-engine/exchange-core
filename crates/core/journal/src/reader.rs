@@ -68,52 +68,22 @@ pub struct JournalReader<E: AppEvent> {
     /// Byte offset in the file of the end of the last successfully decoded entry.
     /// Used by recovery to know where to truncate trailing garbage.
     valid_file_end: u64,
-    /// Journal format version from the file header. Used to determine entry
-    /// layout during decoding (v8+ has key_hash/request_seq fields).
+    /// Journal format version from the file header. Reserved for future
+    /// per-version layout branches in the codec.
     version: u16,
-    /// Physical sector size used when the journal was created (512 or 4096).
-    /// Determines the byte offset where entries begin (one sector after the
-    /// file header). Decoded from the file header at open time.
+    /// Byte offset where entries begin (one header reservation). Decoded
+    /// from the file header at open time.
     sector_size: usize,
-    /// BLAKE3 hash chain verification state. Initialized when a GenesisHash
-    /// entry is read, updated on each normal entry, verified at Checkpoints.
-    /// `None` when `hash-chain` feature is disabled or for v5 journals.
+    /// Sequence number the segment's first entry must carry, from the
+    /// file header. Validated against the first decoded entry so a
+    /// segment spliced in from elsewhere in the lineage fails fast.
+    starting_sequence: u64,
+    /// Segment hash chain, seeded from the header anchor and fed every
+    /// entry's raw bytes. Same definition as the writers' (see
+    /// [`crate::chain`]), so reader and writer values agree at every
+    /// sequence.
     #[cfg(feature = "hash-chain")]
-    hash_chain: Option<ReaderHashChain>,
-    /// Payload of the most recently observed `GenesisHash` entry (i.e. the
-    /// chain hash this segment was anchored to at creation time). Used by
-    /// multi-segment recovery to verify that segment N+1's genesis matches
-    /// segment N's final chain hash, closing the cross-segment tamper-
-    /// evidence gap that within-segment chain validation alone cannot
-    /// catch.
-    #[cfg(feature = "hash-chain")]
-    genesis_payload: Option<[u8; 32]>,
-    /// One-shot chain-anchor capture: when set, `validate_and_advance`
-    /// records the chain hash at the moment the entry whose sequence
-    /// equals `target_seq` is processed — whether that entry is a
-    /// `GenesisHash`, a `Checkpoint`, or a normal app event. Lets snapshot-
-    /// based recovery cross-check the snapshot's recorded chain hash
-    /// against the journal's, uniformly across all anchor kinds, without
-    /// the reader having to surface control entries to the caller. Both
-    /// fields stay `None` when no anchor was requested or when the
-    /// reader never observed the target sequence.
-    #[cfg(feature = "hash-chain")]
-    target_seq: Option<u64>,
-    #[cfg(feature = "hash-chain")]
-    captured_chain_hash: Option<[u8; 32]>,
-}
-
-/// Hash chain state maintained by the reader for verification.
-/// Uses the same batch-level hashing as the writer: entry bytes are fed
-/// into an incremental hasher, finalized at checkpoints.
-#[cfg(feature = "hash-chain")]
-struct ReaderHashChain {
-    /// Chain hash from the last checkpoint (or genesis).
-    current_hash: [u8; 32],
-    /// Incremental hasher accumulating entry bytes since last checkpoint.
-    batch_hasher: blake3::Hasher,
-    /// Events since last checkpoint (for verification against Checkpoint entries).
-    events_since_checkpoint: u64,
+    chain: crate::chain::SegmentChain,
 }
 
 impl<E: AppEvent> JournalReader<E> {
@@ -128,12 +98,12 @@ impl<E: AppEvent> JournalReader<E> {
         // decode all header fields (the meaningful content is 8 bytes).
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
-        let (version, sector_size) = codec::decode_file_header(&header)?;
+        let info = codec::decode_file_header(&header)?;
 
         // Skip any padding between FILE_HEADER_SIZE and sector_size (zero on
         // 512-byte devices; up to 3.5 KiB on 4Kn devices). Entries start at
         // exactly one sector offset.
-        file.seek(std::io::SeekFrom::Start(sector_size as u64))?;
+        file.seek(std::io::SeekFrom::Start(info.sector_size as u64))?;
 
         Ok(Self {
             _marker: PhantomData,
@@ -142,17 +112,12 @@ impl<E: AppEvent> JournalReader<E> {
             pos: 0,
             valid: 0,
             last_sequence: None,
-            valid_file_end: sector_size as u64,
-            version,
-            sector_size,
+            valid_file_end: info.sector_size as u64,
+            version: info.version,
+            sector_size: info.sector_size,
+            starting_sequence: info.starting_sequence,
             #[cfg(feature = "hash-chain")]
-            hash_chain: None,
-            #[cfg(feature = "hash-chain")]
-            genesis_payload: None,
-            #[cfg(feature = "hash-chain")]
-            target_seq: None,
-            #[cfg(feature = "hash-chain")]
-            captured_chain_hash: None,
+            chain: crate::chain::SegmentChain::new(info.anchor_hash),
         })
     }
 
@@ -241,9 +206,9 @@ impl<E: AppEvent> JournalReader<E> {
     /// hole, i.e. *data loss*, and must surface as corruption so recovery
     /// halts loudly instead of silently truncating the journal.
     ///
-    /// We only apply the heuristic past genesis (`last_sequence` is set)
-    /// — at the very start of a file, a zero CRC genuinely indicates
-    /// corruption of the first entry.
+    /// We only apply the heuristic past the first entry (`last_sequence`
+    /// is set) — at the very start of a file, a zero CRC genuinely
+    /// indicates corruption of the first entry.
     ///
     /// The log line is `warn` so the event is always visible: a
     /// CRC-32C of valid data CAN coincidentally equal zero (≈1 in 2^32),
@@ -323,11 +288,9 @@ impl<E: AppEvent> JournalReader<E> {
         Ok(true)
     }
 
-    /// Validate sequence continuity, update hash chain, and advance read position.
-    ///
-    /// For `GenesisHash` and `Checkpoint` entries, processes them internally
-    /// and returns the next real event via recursive call — they are
-    /// transparent to callers.
+    /// Validate sequence continuity, update the hash chain, and advance
+    /// the read position. Every decoded entry is surfaced to the caller —
+    /// the entry stream contains no reader-internal control entries.
     fn validate_and_advance(
         &mut self,
         consumed: usize,
@@ -337,134 +300,46 @@ impl<E: AppEvent> JournalReader<E> {
         request_seq: u64,
         event: JournalEvent<E>,
     ) -> Result<Option<JournalEntry<E>>, JournalError> {
-        // For the first entry, accept whatever sequence we find (supports
-        // rotated journals that continue from a prior sequence). For
-        // subsequent entries, enforce strict continuity.
-        if let Some(last) = self.last_sequence {
-            let expected = last + 1;
-            // `last` is the reader's internal cursor, which advances
-            // through transparent entries (GenesisHash, Checkpoint) as
-            // well as visible events. A duplicate-of-a-skipped-seq
-            // therefore produces `sequence == last`, not `sequence ==
-            // expected`. Split the two cases so operators can tell
-            // "data missing" from "writer emitted the same seq twice".
-            if sequence < expected {
-                return Err(JournalError::SequenceDuplicate {
-                    sequence,
-                    previous_seq: last,
-                });
+        // The first entry must carry the header's starting_sequence —
+        // catches a segment spliced in from elsewhere in the lineage.
+        // Subsequent entries enforce strict continuity.
+        match self.last_sequence {
+            None => {
+                if sequence != self.starting_sequence {
+                    return Err(JournalError::SequenceGap {
+                        expected: self.starting_sequence,
+                        actual: sequence,
+                    });
+                }
             }
-            if sequence > expected {
-                return Err(JournalError::SequenceGap {
-                    expected,
-                    actual: sequence,
-                });
+            Some(last) => {
+                let expected = last + 1;
+                // Split below-vs-above so operators can tell "data
+                // missing" from "writer emitted the same seq twice".
+                if sequence < expected {
+                    return Err(JournalError::SequenceDuplicate {
+                        sequence,
+                        previous_seq: last,
+                    });
+                }
+                if sequence > expected {
+                    return Err(JournalError::SequenceGap {
+                        expected,
+                        actual: sequence,
+                    });
+                }
             }
         }
 
-        // --- BLAKE3 hash chain verification (feature-gated) ---
+        // Absorb the entry's raw on-disk bytes (header + payload + CRC)
+        // into the segment chain. Verification happens at the consumers'
+        // compare points: snapshot anchor, segment boundary, divergence
+        // frames — the entry stream itself carries no chain metadata.
         #[cfg(feature = "hash-chain")]
-        {
-            // Raw entry bytes excluding CRC (for hash chain computation).
-            let entry_bytes_end = self.pos + consumed - 4;
-
-            // Handle GenesisHash: (re)initialize the chain. Capture the
-            // payload (the previous-segment chain hash) so multi-segment
-            // recovery can verify the boundary against the tail of the
-            // prior segment.
-            if let JournalEvent::GenesisHash { hash } = &event {
-                self.genesis_payload = Some(*hash);
-                let genesis_hash = blake3::hash(&self.buffer[self.pos..entry_bytes_end]);
-                self.hash_chain = Some(ReaderHashChain {
-                    current_hash: *genesis_hash.as_bytes(),
-                    batch_hasher: blake3::Hasher::new(),
-                    events_since_checkpoint: 0,
-                });
-                self.last_sequence = Some(sequence);
-                if Some(sequence) == self.target_seq {
-                    self.captured_chain_hash = Some(*genesis_hash.as_bytes());
-                }
-                self.pos += consumed;
-                self.valid_file_end += consumed as u64;
-                return self.next_entry();
-            }
-
-            // Checkpoint: finalize accumulated batch hash and verify against
-            // the checkpoint's recorded hash.
-            if let JournalEvent::Checkpoint {
-                chain_hash,
-                events_since_checkpoint,
-            } = &event
-            {
-                if let Some(chain) = &mut self.hash_chain {
-                    // Finalize: feed accumulated event bytes + previous chain
-                    // hash, then compare with the recorded hash. The checkpoint
-                    // entry itself is NOT part of this hash — it goes into the
-                    // next batch (matching writer behaviour).
-                    chain.batch_hasher.update(&chain.current_hash);
-                    let computed = *chain.batch_hasher.finalize().as_bytes();
-
-                    if computed != *chain_hash {
-                        return Err(JournalError::HashChainMismatch {
-                            sequence,
-                            expected: *chain_hash,
-                            actual: computed,
-                        });
-                    }
-                    if chain.events_since_checkpoint != *events_since_checkpoint {
-                        return Err(JournalError::CorruptEntry {
-                            sequence,
-                            reason: "checkpoint event count mismatch",
-                        });
-                    }
-
-                    chain.current_hash = computed;
-                    chain.batch_hasher = blake3::Hasher::new();
-                    chain.events_since_checkpoint = 0;
-                }
-                self.last_sequence = Some(sequence);
-                if Some(sequence) == self.target_seq
-                    && let Some(chain) = &self.hash_chain
-                {
-                    // events_since_checkpoint just reset to 0, so the
-                    // canonical chain hash at this seq is current_hash.
-                    self.captured_chain_hash = Some(chain.current_hash);
-                }
-                self.pos += consumed;
-                self.valid_file_end += consumed as u64;
-                return self.next_entry();
-            }
-
-            // Normal event: feed bytes into incremental batch hasher.
-            if let Some(chain) = &mut self.hash_chain {
-                chain
-                    .batch_hasher
-                    .update(&self.buffer[self.pos..entry_bytes_end]);
-                chain.events_since_checkpoint += 1;
-            }
-        }
-
-        // Without hash-chain, skip GenesisHash/Checkpoint (no state change).
-        #[cfg(not(feature = "hash-chain"))]
-        if matches!(
-            event,
-            JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. }
-        ) {
-            self.last_sequence = Some(sequence);
-            self.pos += consumed;
-            self.valid_file_end += consumed as u64;
-            return self.next_entry();
-        }
+        self.chain
+            .absorb(&self.buffer[self.pos..self.pos + consumed]);
 
         self.last_sequence = Some(sequence);
-        #[cfg(feature = "hash-chain")]
-        if Some(sequence) == self.target_seq {
-            // App-event branch: the batch hasher has just absorbed this
-            // entry, so chain_hash() returns the canonical post-entry
-            // value — matches what the writer's chain_hash() recorded
-            // in the snapshot.
-            self.captured_chain_hash = self.chain_hash();
-        }
         self.pos += consumed;
         self.valid_file_end += consumed as u64;
 
@@ -506,125 +381,37 @@ impl<E: AppEvent> JournalReader<E> {
         self.sector_size
     }
 
-    /// Current BLAKE3 chain hash after all entries read so far.
-    /// Returns `None` when `hash-chain` is disabled, for v5 journals, or
-    /// if no events have been read.
+    /// Current chain value after all entries read so far:
+    /// `BLAKE3(entry bytes so far || anchor)`, or the anchor itself when
+    /// no entries have been read. `None` when `hash-chain` is disabled.
     ///
-    /// When events have been accumulated since the last checkpoint (or
-    /// genesis), computes the hash on-demand by cloning the incremental
-    /// hasher and finalizing with the previous chain hash. When no events
-    /// are pending, returns the stored checkpoint/genesis hash directly.
+    /// Computed on demand by cloning the incremental hasher —
+    /// non-destructive and O(log absorbed bytes).
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            self.hash_chain.as_ref().map(|c| {
-                if c.events_since_checkpoint == 0 {
-                    c.current_hash
-                } else {
-                    let mut h = c.batch_hasher.clone();
-                    h.update(&c.current_hash);
-                    *h.finalize().as_bytes()
-                }
-            })
+            Some(self.chain.value())
         }
         #[cfg(not(feature = "hash-chain"))]
         None
     }
 
-    /// Arm a one-shot chain-anchor capture at `target_seq`. When the
-    /// reader processes the entry at this sequence — whether it surfaces
-    /// to the caller (app event) or is consumed internally (`GenesisHash`,
-    /// `Checkpoint`) — the chain hash at that moment is stashed and
-    /// becomes readable via [`captured_chain_hash`]. Lets snapshot
-    /// recovery cross-check a snapshot's recorded hash against the
-    /// journal's uniformly, without the carve-out a per-entry compare
-    /// in the replay loop would force at control-entry anchors.
-    ///
-    /// No-op when the `hash-chain` feature is disabled (no chain to
-    /// capture). Must be called before [`next_entry`] reaches `target_seq`.
-    pub fn set_chain_anchor_target(&mut self, target_seq: u64) {
+    /// Segment anchor from the file header. `None` when `hash-chain` is
+    /// disabled. Multi-segment recovery compares this against the
+    /// previous segment's tail chain hash to verify lineage continuity.
+    pub fn anchor(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            self.target_seq = Some(target_seq);
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            let _ = target_seq;
-        }
-    }
-
-    /// Chain hash captured at the sequence armed via
-    /// [`set_chain_anchor_target`]. `None` until that sequence is
-    /// observed (or always, when `hash-chain` is disabled, or when no
-    /// anchor was armed).
-    pub fn captured_chain_hash(&self) -> Option<[u8; 32]> {
-        #[cfg(feature = "hash-chain")]
-        {
-            self.captured_chain_hash
+            Some(self.chain.anchor())
         }
         #[cfg(not(feature = "hash-chain"))]
         None
     }
 
-    /// Events since last checkpoint in the hash chain.
-    pub fn events_since_checkpoint(&self) -> u64 {
-        #[cfg(feature = "hash-chain")]
-        {
-            self.hash_chain
-                .as_ref()
-                .map_or(0, |c| c.events_since_checkpoint)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        0
-    }
-
-    /// Payload of the `GenesisHash` entry seen for the current segment,
-    /// if any. Returns `None` when no GenesisHash has been observed yet
-    /// or when the `hash-chain` feature is disabled.
-    pub fn genesis_payload(&self) -> Option<[u8; 32]> {
-        #[cfg(feature = "hash-chain")]
-        {
-            self.genesis_payload
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            None
-        }
-    }
-
-    /// Seed the hash chain from a snapshot's chain hash.
-    pub fn seed_chain_hash(&mut self, chain_hash: [u8; 32], _snap_sequence: u64) {
-        #[cfg(feature = "hash-chain")]
-        {
-            if chain_hash == [0u8; 32] {
-                return;
-            }
-            self.hash_chain = Some(ReaderHashChain {
-                current_hash: chain_hash,
-                batch_hasher: blake3::Hasher::new(),
-                events_since_checkpoint: 0,
-            });
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            let _ = chain_hash;
-        }
-    }
-
-    /// Extract the raw hash chain state for use by a resumed writer.
-    ///
-    /// Returns `(current_hash, batch_hasher, events_since_checkpoint)`:
-    /// - `current_hash`: the chain hash from the last checkpoint (or genesis)
-    /// - `batch_hasher`: incremental hasher with entry bytes since last checkpoint
-    /// - `events_since_checkpoint`: event count since last checkpoint
-    ///
-    /// This allows the writer to reconstruct the exact hasher state needed
-    /// for correct checkpoint computation after crash recovery.
-    #[cfg(feature = "hash-chain")]
-    pub fn take_chain_state(&mut self) -> Option<([u8; 32], blake3::Hasher, u64)> {
-        self.hash_chain
-            .take()
-            .map(|c| (c.current_hash, c.batch_hasher, c.events_since_checkpoint))
+    /// Sequence number the segment's first entry carries, from the file
+    /// header. Available before any entry is read.
+    pub fn starting_sequence(&self) -> u64 {
+        self.starting_sequence
     }
 
     /// Ensure the buffer has data to decode from. Lazy: when bytes are
@@ -714,8 +501,8 @@ impl RawJournalScanner {
         let mut file = File::open(path)?;
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
-        let (_, sector_size) = codec::decode_file_header(&header)?;
-        file.seek(std::io::SeekFrom::Start(sector_size as u64))?;
+        let info = codec::decode_file_header(&header)?;
+        file.seek(std::io::SeekFrom::Start(info.sector_size as u64))?;
 
         Ok(Self {
             file,
@@ -884,10 +671,8 @@ mod tests {
         }
     }
 
-    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
-    #[cfg(feature = "hash-chain")]
-    const FIRST_SEQ: u64 = 2;
-    #[cfg(not(feature = "hash-chain"))]
+    /// First user-event sequence. Chain metadata lives in the file
+    /// header, so sequence 1 is a real event under every feature config.
     const FIRST_SEQ: u64 = 1;
 
     fn sample_events() -> Vec<JournalEvent<TestEvent>> {
@@ -972,16 +757,10 @@ mod tests {
         let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        assert!(reader.next_entry().unwrap().is_none());
+        // An empty segment's chain value is its anchor.
         #[cfg(feature = "hash-chain")]
-        {
-            // Genesis entry is present but transparent; reader consumes
-            // it internally and returns None on the first next_entry.
-            assert!(reader.next_entry().unwrap().is_none());
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            assert!(reader.next_entry().unwrap().is_none());
-        }
+        assert_eq!(reader.chain_hash(), reader.anchor());
     }
 
     #[test]
@@ -1042,10 +821,10 @@ mod tests {
     /// CQE hasn't arrived, or a torn multi-sector write), look entry-shaped
     /// while the CRC slot is still preallocation zeros. The reader treats
     /// that exact signature (`ChecksumMismatch` with stored CRC = 0, past
-    /// genesis) as end-of-data so recovery succeeds on a journal whose
-    /// last write was only partially observable.
+    /// the first entry) as end-of-data so recovery succeeds on a journal
+    /// whose last write was only partially observable.
     #[test]
-    fn zero_crc_past_genesis_treated_as_end_of_data() {
+    fn zero_crc_past_first_entry_treated_as_end_of_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
@@ -1083,9 +862,8 @@ mod tests {
         file.write_all(&scratch[..entry_len]).unwrap();
         file.sync_all().unwrap();
 
-        // Reader yields the two real entries (transparent genesis already
-        // consumed under hash-chain) and stops gracefully on the forged
-        // zero-CRC entry instead of surfacing `ChecksumMismatch`.
+        // Reader yields the two real entries and stops gracefully on the
+        // forged zero-CRC entry instead of surfacing `ChecksumMismatch`.
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
         let mut count = 0;
         while let Some(_entry) = reader.next_entry().unwrap() {
@@ -1094,18 +872,10 @@ mod tests {
         assert_eq!(count, 2, "two real entries should be recoverable");
     }
 
-    /// Inverse guard: a zero CRC at the *very first* entry (no genesis
-    /// consumed yet, `last_sequence == None`) still surfaces as a
-    /// `ChecksumMismatch`. We only relax the check past genesis, so
-    /// corruption of the first entry remains visible.
-    ///
-    /// Runs under both feature configs: under hash-chain, the writer's
-    /// genesis at ENTRY_OFFSET gets overwritten by the forged entry, so
-    /// the reader's first decode hits the CRC check before any
-    /// hash-chain state has been built (`codec::decode` validates CRC
-    /// before returning, and `validate_and_advance` — where hash-chain
-    /// validation lives — only runs on a successful decode). Either way,
-    /// `last_sequence` is still `None` at the moment the mismatch fires.
+    /// Inverse guard: a zero CRC at the *very first* entry
+    /// (`last_sequence == None`) still surfaces as a `ChecksumMismatch`.
+    /// We only relax the check past the first entry, so corruption of
+    /// the first entry remains visible.
     #[test]
     fn zero_crc_at_first_entry_still_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -1229,31 +999,69 @@ mod tests {
         // skipped value. Layout: each entry = ENTRY_HEADER_SIZE(20) +
         // payload_len + CRC_SIZE(4). For TestEvent, payload = 17
         // (key_hash+request_seq+tag) + 8 (payload) = 25. Full = 49.
-        // With hash-chain, a genesis entry sits between header and first
-        // user event — but its payload size is larger. Rather than
-        // hardcode offsets, skip the test under hash-chain where the
-        // layout is feature-dependent.
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            const FIRST_ENTRY_SIZE: u64 = 20 + 25 + 4;
-            let second_seq_offset = ENTRY_OFFSET + FIRST_ENTRY_SIZE + 4;
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
-            use std::io::{Seek, SeekFrom};
-            file.seek(SeekFrom::Start(second_seq_offset)).unwrap();
-            // Write sequence = 99 and fix the CRC.
-            let new_seq: u64 = 99;
-            file.write_all(&new_seq.to_le_bytes()).unwrap();
+        // The layout is identical under both feature configs — chain
+        // metadata lives in the file header, not the entry stream.
+        const FIRST_ENTRY_SIZE: u64 = 20 + 25 + 4;
+        let second_seq_offset = ENTRY_OFFSET + FIRST_ENTRY_SIZE + 4;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(second_seq_offset)).unwrap();
+        // Write sequence = 99 and fix the CRC.
+        let new_seq: u64 = 99;
+        file.write_all(&new_seq.to_le_bytes()).unwrap();
 
-            let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
-            // First entry decodes cleanly; second trips CRC (we didn't
-            // refix) or gap. Either is a non-Ok outcome.
-            let _ = reader.next_entry(); // first entry ok
-            let err = reader.next_entry();
-            assert!(err.is_err(), "expected error, got {err:?}");
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        // First entry decodes cleanly; second trips CRC (we didn't
+        // refix) or gap. Either is a non-Ok outcome.
+        let _ = reader.next_entry(); // first entry ok
+        let err = reader.next_entry();
+        assert!(err.is_err(), "expected error, got {err:?}");
+    }
+
+    /// The header's `starting_sequence` pins the first entry: a segment
+    /// whose first entry carries a different sequence (e.g. an archive
+    /// renamed into the wrong lineage slot) is rejected at the first
+    /// decode rather than silently re-based.
+    #[test]
+    fn first_entry_must_match_header_starting_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            // Continue from sequence 100 — header records 100.
+            let mut writer =
+                SectorWriter::<TestEvent>::create_continuing(&path, 100, [0u8; 32]).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
+
+        // Reading the intact segment works and starts at 100.
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        assert_eq!(reader.starting_sequence(), 100);
+        let entry = reader.next_entry().unwrap().expect("entry");
+        assert_eq!(entry.sequence, 100);
+
+        // Forge: rewrite the first entry with sequence 200 (valid CRC).
+        let mut scratch = [0u8; 256];
+        let len =
+            codec::encode(200, 0, 0, 0, &JournalEvent::App(TestEvent(1)), &mut scratch).unwrap();
+        use std::io::{Seek, SeekFrom};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(ENTRY_OFFSET)).unwrap();
+        file.write_all(&scratch[..len]).unwrap();
+        file.sync_all().unwrap();
+
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let err = reader.next_entry();
+        assert!(
+            matches!(err, Err(JournalError::SequenceGap { expected: 100, .. })),
+            "expected SequenceGap at first entry, got {err:?}"
+        );
     }
 }

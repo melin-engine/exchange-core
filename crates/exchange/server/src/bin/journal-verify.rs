@@ -29,15 +29,17 @@ fn main() {
     }
 
     println!("entries:    {count}");
+    println!("start_seq:  {}", reader.starting_sequence());
     println!("last_seq:   {last_seq}");
+    let hex = |h: [u8; 32]| h.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    match reader.anchor() {
+        Some(a) => println!("anchor:     {}", hex(a)),
+        None => println!("anchor:     (hash-chain disabled in this build)"),
+    }
+    // For a sealed segment, this value must equal the next segment's
+    // header anchor — that pairing is the cross-segment tamper check.
     match reader.chain_hash() {
-        Some(h) => {
-            print!("chain_hash: ");
-            for b in h {
-                print!("{b:02x}");
-            }
-            println!();
-        }
-        None => println!("chain_hash: (none — v5 journal)"),
+        Some(h) => println!("chain_hash: {}", hex(h)),
+        None => println!("chain_hash: (hash-chain disabled in this build)"),
     }
 }

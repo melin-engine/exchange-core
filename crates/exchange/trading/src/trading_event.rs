@@ -1,13 +1,13 @@
 //! `TradingEvent` — the `melin-app` `AppEvent` for the Melin trading engine.
 //!
 //! Mirrors the state-mutating and read-only query variants of the current
-//! `JournalEvent`, minus transport-intrinsic variants (GenesisHash,
-//! Checkpoint, Tick) which stay with the transport. Phase 2 of the
-//! transport/app split will unify the journal's wire format around
-//! `JournalEvent<TradingEvent>`; for Phase 1 this enum and its codec live
-//! alongside the existing `JournalEvent` with deliberately independent
-//! encoding — both are reachable from tests so we can prove the
-//! `Application` trait round-trips.
+//! `JournalEvent`, minus the transport-intrinsic variant (Tick) which
+//! stays with the transport. Phase 2 of the transport/app split will
+//! unify the journal's wire format around `JournalEvent<TradingEvent>`;
+//! for Phase 1 this enum and its codec live alongside the existing
+//! `JournalEvent` with deliberately independent encoding — both are
+//! reachable from tests so we can prove the `Application` trait
+//! round-trips.
 //!
 //! Wire layout (payload-only — transport supplies framing):
 //!

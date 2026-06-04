@@ -34,26 +34,38 @@ pub enum CatchUpResult {
     NeedSnapshot,
 }
 
-/// Discover journal archive files, sorted oldest to newest.
-/// Returns `[path.3, path.2, path.1, path]` — only files that exist.
+/// Discover journal segment files, sorted oldest to newest: archived
+/// segments in monotonic order (`.000001` is the oldest), then the live
+/// segment. Uses the same discovery as recovery
+/// ([`melin_journal::segment::list_archives`]), so catch-up sees exactly
+/// the segments a local replay would.
 pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut archives = Vec::new();
-    let mut n = 1u32;
-    loop {
-        let archive = std::path::PathBuf::from(format!("{}.{n}", journal_path.display()));
-        if !archive.exists() {
-            break;
-        }
-        archives.push(archive);
-        n += 1;
-    }
-    // Reverse so oldest is first (highest number = oldest).
-    archives.reverse();
+    let mut files: Vec<std::path::PathBuf> =
+        match melin_journal::segment::list_archives(journal_path) {
+            Ok(archives) => archives.into_iter().map(|(_, p)| p).collect(),
+            Err(e) => {
+                warn!(error = %e, "archive discovery failed — catch-up limited to live segment");
+                Vec::new()
+            }
+        };
     // Current journal is newest.
     if journal_path.exists() {
-        archives.push(journal_path.to_path_buf());
+        files.push(journal_path.to_path_buf());
     }
-    archives
+    files
+}
+
+/// Header identity of the oldest available segment — the lineage origin
+/// a fresh replica must create its journal with so full catch-up
+/// produces a byte-identical journal.
+pub fn lineage_origin(journal_path: &std::path::Path) -> io::Result<(u64, [u8; 32])> {
+    let files = discover_journal_files(journal_path);
+    let oldest = files
+        .first()
+        .ok_or_else(|| io::Error::other("no journal segments on disk"))?;
+    let info = melin_journal::segment::read_header_info(oldest)
+        .map_err(|e| io::Error::other(format!("read header of {}: {e}", oldest.display())))?;
+    Ok((info.starting_sequence, info.anchor_hash))
 }
 
 /// Check if journal catch-up is possible without sending any data.
@@ -162,11 +174,11 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
         let mut scanner = RawJournalScanner::open(path)
             .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
 
-        // Skip entries the replica already has. Always skip at least
-        // genesis (seq 1) — it's delivered via StreamStart, not catch-up.
-        let skip_to = end_sequence.max(1);
+        // Skip entries the replica already has. Sequence 1 is a real
+        // user event (chain metadata lives in segment headers, not the
+        // entry stream), so nothing below `end_sequence` is exempt.
         scanner
-            .skip_to_after(skip_to)
+            .skip_to_after(end_sequence)
             .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
 
         // Read and send batches of raw entries.
@@ -221,7 +233,6 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
 /// `queue_send+poll`.
 pub fn snapshot_transfer_with<E: AppEvent>(
     journal_path: &std::path::Path,
-    genesis_entry: &[u8],
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
@@ -304,8 +315,15 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 
     info!(snap_sequence, "snapshot transfer complete");
 
-    // Send StreamStart so the replica can set up its journal.
-    encode_stream_start(snap_sequence, genesis_entry, &mut send_buf);
+    // Send StreamStart so the replica can set up its journal: a fresh
+    // segment continuing at `snap_sequence + 1`, anchored to the
+    // snapshot's chain hash.
+    encode_stream_start(
+        snap_sequence,
+        snap_sequence + 1,
+        snap_chain_hash,
+        &mut send_buf,
+    );
     publisher(&send_buf)?;
     send_buf.clear();
 

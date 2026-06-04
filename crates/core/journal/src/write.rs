@@ -40,21 +40,18 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn create(path: &Path) -> Result<Self, JournalError>;
 
     /// Create a fresh journal that continues a previous segment's
-    /// sequence numbers, anchored to `genesis_hash`.
+    /// sequence numbers, anchored to `anchor_hash` (recorded in the file
+    /// header; no entries are written, no sequence consumed).
     fn create_continuing(
         path: &Path,
         starting_sequence: u64,
-        genesis_hash: [u8; 32],
+        anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError>;
 
-    /// Open an existing journal for appending after recovery.
-    fn open_append(
-        path: &Path,
-        last_seq: u64,
-        valid_end: u64,
-        chain_hash: Option<[u8; 32]>,
-        events_since_checkpoint: u64,
-    ) -> Result<Self, JournalError>;
+    /// Open an existing journal for appending after recovery. The hash
+    /// chain rebuilds itself from the header anchor plus the raw byte
+    /// range up to `valid_end` — no chain state is threaded in.
+    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError>;
 
     // ---- hot-path write API ----
 
@@ -90,11 +87,8 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     fn valid_end(&self) -> u64;
     /// On-disk path of the active segment.
     fn path(&self) -> &Path;
-    /// Current chain anchor, `None` when the `hash-chain` feature is off.
+    /// Current chain value, `None` when the `hash-chain` feature is off.
     fn chain_hash(&self) -> Option<[u8; 32]>;
-    /// Number of user events written since the last checkpoint entry —
-    /// drives checkpoint emission cadence.
-    fn events_since_checkpoint(&self) -> u64;
 
     // ---- replication framing ----
 
@@ -107,9 +101,10 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Close the active segment and open a fresh one; returns the
     /// archived path.
     fn rotate_segment(&mut self) -> Result<PathBuf, JournalError>;
-    /// Read the first entry of the active segment (used by replication
-    /// to bootstrap a fresh replica's chain anchor).
-    fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError>;
+    /// Decoded file-header fields of the active segment (used by
+    /// replication to bootstrap a fresh replica's chain anchor and
+    /// starting sequence).
+    fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError>;
 
     // ---- default convenience wrappers ----
     //
@@ -153,26 +148,14 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     fn create_continuing(
         path: &Path,
         starting_sequence: u64,
-        genesis_hash: [u8; 32],
+        anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
-        SectorWriter::create_continuing(path, starting_sequence, genesis_hash)
+        SectorWriter::create_continuing(path, starting_sequence, anchor_hash)
     }
 
     #[inline]
-    fn open_append(
-        path: &Path,
-        last_seq: u64,
-        valid_end: u64,
-        chain_hash: Option<[u8; 32]>,
-        events_since_checkpoint: u64,
-    ) -> Result<Self, JournalError> {
-        SectorWriter::open_append(
-            path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )
+    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
+        SectorWriter::open_append(path, last_seq, valid_end)
     }
 
     #[inline]
@@ -228,11 +211,6 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     }
 
     #[inline]
-    fn events_since_checkpoint(&self) -> u64 {
-        SectorWriter::events_since_checkpoint(self)
-    }
-
-    #[inline]
     fn last_user_entry_replication_slice(&self) -> &[u8] {
         SectorWriter::last_user_entry_replication_slice(self)
     }
@@ -243,8 +221,8 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     }
 
     #[inline]
-    fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
-        SectorWriter::read_genesis_entry(self)
+    fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError> {
+        SectorWriter::read_header_info(self)
     }
 }
 
@@ -258,26 +236,14 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     fn create_continuing(
         path: &Path,
         starting_sequence: u64,
-        genesis_hash: [u8; 32],
+        anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
-        BufferedWriter::create_continuing(path, starting_sequence, genesis_hash)
+        BufferedWriter::create_continuing(path, starting_sequence, anchor_hash)
     }
 
     #[inline]
-    fn open_append(
-        path: &Path,
-        last_seq: u64,
-        valid_end: u64,
-        chain_hash: Option<[u8; 32]>,
-        events_since_checkpoint: u64,
-    ) -> Result<Self, JournalError> {
-        BufferedWriter::open_append(
-            path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )
+    fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
+        BufferedWriter::open_append(path, last_seq, valid_end)
     }
 
     #[inline]
@@ -333,11 +299,6 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     }
 
     #[inline]
-    fn events_since_checkpoint(&self) -> u64 {
-        BufferedWriter::events_since_checkpoint(self)
-    }
-
-    #[inline]
     fn last_user_entry_replication_slice(&self) -> &[u8] {
         BufferedWriter::last_user_entry_replication_slice(self)
     }
@@ -348,8 +309,8 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     }
 
     #[inline]
-    fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
-        BufferedWriter::read_genesis_entry(self)
+    fn read_header_info(&self) -> Result<crate::codec::FileHeaderInfo, JournalError> {
+        BufferedWriter::read_header_info(self)
     }
 }
 
@@ -391,7 +352,9 @@ mod tests {
         // the O_DIRECT path and won't tip over for a single small event.
         let initial_valid_end = writer.valid_end();
         assert!(initial_valid_end > 0);
-        assert_eq!(writer.events_since_checkpoint(), 0);
+        // Header info round-trips through the trait: fresh journals
+        // start at sequence 1.
+        assert_eq!(writer.read_header_info().unwrap().starting_sequence, 1);
 
         // discard on an empty batch is a no-op but must not panic.
         writer.discard_batch_buf();

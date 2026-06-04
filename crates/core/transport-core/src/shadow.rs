@@ -226,9 +226,6 @@ fn dispatch_event<A: Application>(
             // (tests, manually constructed events).
             app.tick(now_ns, reports);
         }
-        JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
-            // Hash chain metadata — no application state change.
-        }
         JournalEvent::Shutdown => {
             // Pipeline-only sentinel — handled at the run-loop level by
             // exiting; should never reach this dispatch.
@@ -373,7 +370,7 @@ mod tests {
     //     Application::apply
     //   - Query events skip the HWM advance
     //   - `timestamp_ns` drives a monotonic Application::tick drain
-    //   - Transport variants (Tick / GenesisHash / Checkpoint / Shutdown)
+    //   - Transport variants (Tick / Shutdown)
     //     are handled without touching app-event state
     //
     // Each test below pins one of those behaviours. The fixture is the
@@ -501,27 +498,11 @@ mod tests {
 
     #[test]
     fn transport_variants_are_state_noops() {
-        // GenesisHash, Checkpoint, and Shutdown carry hash-chain or
-        // pipeline-control metadata and must never mutate app state.
-        // (Shutdown shouldn't even reach dispatch_event in practice — the
-        // run loop exits on it — but the match arm exists as defence in
-        // depth and is exercised here.)
+        // Shutdown carries pipeline-control metadata and must never
+        // mutate app state. (It shouldn't even reach dispatch_event in
+        // practice — the run loop exits on it — but the match arm exists
+        // as defence in depth and is exercised here.)
         let mut app = TestApp::new();
-        dispatch(
-            &mut app,
-            &JournalEvent::GenesisHash { hash: [0xAA; 32] },
-            0,
-            1,
-        );
-        dispatch(
-            &mut app,
-            &JournalEvent::Checkpoint {
-                chain_hash: [0xBB; 32],
-                events_since_checkpoint: 7,
-            },
-            0,
-            2,
-        );
         dispatch(&mut app, &JournalEvent::Shutdown, 0, 3);
 
         assert_eq!(app.total, 0, "no app-event state change");
@@ -530,7 +511,7 @@ mod tests {
 
     #[test]
     fn key_hash_zero_bypasses_hwm_dedup() {
-        // Transport-internal events (Tick, GenesisHash, Checkpoint) and
+        // Transport-internal events (Tick) and
         // any seed-time inserts use key_hash=0 to opt out of per-key
         // dedup. dispatch_event must hand those events to apply
         // regardless of the request_seq value — TestApp::check_request_seq

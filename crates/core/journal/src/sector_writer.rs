@@ -37,15 +37,13 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use melin_app::AppEvent;
-#[cfg(feature = "hash-chain")]
-use melin_app::unix_epoch_nanos;
 
+#[cfg(feature = "hash-chain")]
+use super::chain::SegmentChain;
 use super::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
 use super::preparer::PreparedSegment;
-#[cfg(feature = "hash-chain")]
-use super::reader::JournalReader;
 
 /// Maximum encoded entry size. Generously sized — actual entries are ~81-101 bytes
 /// (v8 adds 16 bytes for key_hash + request_seq).
@@ -54,7 +52,7 @@ const MAX_ENTRY_SIZE: usize = 144;
 
 /// Batch buffer capacity. Sized for MAX_JOURNAL_BATCH (4096) entries at
 /// ~104 bytes each (payload + 24-byte header/CRC) ≈ 416 KiB. Rounded up
-/// to 512 KiB for headroom (checkpoint entries, variable-size events).
+/// to 512 KiB for headroom (variable-size events).
 /// Pre-allocated once, reused across batches.
 const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
@@ -62,8 +60,6 @@ const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 // module (env override `MELIN_JOURNAL_PREALLOC_MIB`, 256 MiB default).
 // Read once per extension, off the hot path.
 use crate::prealloc::prealloc_chunk_bytes;
-
-pub use crate::checkpoint::checkpoint_interval;
 
 /// A batch of encoded journal data ready for async write via io_uring.
 /// Owns the buffer to prevent aliasing while io_uring holds a pointer to it.
@@ -108,18 +104,17 @@ pub struct SectorWriter<E: AppEvent> {
     /// Byte offset of the end of pre-allocated space. When `write_pos`
     /// approaches this, another `PREALLOC_CHUNK` is allocated.
     allocated_end: u64,
-    /// BLAKE3 hash chain state. `None` when the `hash-chain` feature is
-    /// disabled or for v5 journals (no hash chain). When active, each encoded
-    /// entry's bytes (excluding CRC) are hashed with the previous hash to
-    /// form a tamper-evident chain.
+    /// Segment hash chain: anchor from the file header plus an
+    /// incremental hasher over every encoded entry's raw bytes. Same
+    /// definition as the reader's (see [`crate::chain`]).
     #[cfg(feature = "hash-chain")]
-    hash_chain: Option<HashChain>,
-    /// Highest sequence ever passed through `encode_event` or
-    /// `emit_checkpoint`. Debug-only monotonicity guard: every fresh seq
-    /// must strictly exceed this, otherwise we're about to emit a
-    /// duplicate — which would surface as a `SequenceGap` at the reader
-    /// side. Zero means "nothing encoded yet." Excluded from release
-    /// builds to keep the hot path cost at exactly zero.
+    hash_chain: SegmentChain,
+    /// Highest sequence ever passed through `encode_event`. Debug-only
+    /// monotonicity guard: every fresh seq must strictly exceed this,
+    /// otherwise we're about to emit a duplicate — which would surface
+    /// as a `SequenceGap` at the reader side. Zero means "nothing
+    /// encoded yet." Excluded from release builds to keep the hot path
+    /// cost at exactly zero.
     #[cfg(debug_assertions)]
     last_encoded_seq: u64,
     /// Number of valid bytes currently written into `batch_buf`. Acts as the
@@ -127,11 +122,9 @@ pub struct SectorWriter<E: AppEvent> {
     /// Reset to 0 on every flush or discard. Separate from `last_user_entry_len`
     /// which tracks only the most-recent user entry's size.
     batch_len: usize,
-    /// Byte range of the most-recent user entry within `batch_buf`.
-    /// Captured by `encode_event` BEFORE any auto-checkpoint emission,
-    /// so `last_user_entry_replication_slice` returns the user entry
-    /// only — not a trailing checkpoint that may have been auto-emitted
-    /// in the same call. `(0, 0)` means no user entry encoded yet.
+    /// Byte range of the most-recent user entry within `batch_buf` —
+    /// `last_user_entry_replication_slice` ships it to replication
+    /// without a second encode pass. `(0, 0)` means no entry encoded yet.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
     /// Physical sector size of the underlying block device in bytes (512 or
@@ -188,33 +181,9 @@ pub struct SectorWriter<E: AppEvent> {
     tail_sector_len: usize,
 }
 
-/// Running BLAKE3 hash chain state for tamper evidence.
-///
-/// Uses segment-level hashing for correctness: entry bytes are fed into an
-/// incremental hasher during `batch_append`, finalized at checkpoint
-/// boundaries (every `CHECKPOINT_INTERVAL` events). The chain hash is
-/// computed on-demand by `chain_hash()` via clone + finalize — no
-/// per-flush finalization, ensuring the hash is deterministic regardless
-/// of write batching strategy.
-///
-/// Chain: `hash_n = BLAKE3(segment_bytes || hash_{n-1})` where segment_bytes
-/// is the concatenation of all entry bytes (excluding CRCs) between
-/// checkpoints.
-#[cfg(feature = "hash-chain")]
-struct HashChain {
-    /// Chain hash from the last checkpoint (or genesis). Used as the
-    /// suffix in the next finalization.
-    current_hash: [u8; 32],
-    /// Incremental hasher accumulating entry bytes since last checkpoint.
-    batch_hasher: blake3::Hasher,
-    /// Events since last checkpoint. When this reaches `CHECKPOINT_INTERVAL`,
-    /// a Checkpoint entry is auto-emitted.
-    events_since_checkpoint: u64,
-}
-
 impl<E: AppEvent> SectorWriter<E> {
-    /// Create a new journal file. Writes the file header and a `GenesisHash`
-    /// entry with random bytes, pre-allocates storage, and returns a writer
+    /// Create a new journal file. Writes the file header (with a random
+    /// chain anchor), pre-allocates storage, and returns a writer
     /// starting at sequence 1.
     ///
     /// Fails if the file already exists (use `open_append` for existing journals).
@@ -225,92 +194,21 @@ impl<E: AppEvent> SectorWriter<E> {
         // because this entry point runs only at startup, before any
         // preparer is spawned.
         crate::preparer::cleanup_staging_orphan(path);
-        #[cfg(feature = "hash-chain")]
-        {
-            let mut genesis = [0u8; 32];
-            getrandom::fill(&mut genesis)
-                .map_err(|e| JournalError::Io(std::io::Error::other(e.to_string())))?;
-            Self::create_with_genesis(path, 1, genesis)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        Self::create_without_chain(path, 1)
+        Self::create_continuing(path, 1, crate::fresh_anchor()?)
     }
 
-    /// Create a new journal file that continues from a given sequence number.
-    ///
-    /// Used by journal rotation: after snapshotting, the old journal is archived
-    /// and a new one is created. Sequence numbers must be continuous across
-    /// rotation boundaries so that snapshot + journal recovery works correctly.
+    /// Create a new journal file that continues from a given sequence
+    /// number, anchored to `anchor_hash` (the prior segment's tail chain
+    /// hash, or random salt for a brand-new journal). Both values are
+    /// recorded in the file header; no entries are written and no
+    /// sequence number is consumed.
     ///
     /// Fails if the file already exists.
     pub fn create_continuing(
         path: &Path,
         starting_sequence: u64,
-        genesis_hash: [u8; 32],
+        anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
-        #[cfg(feature = "hash-chain")]
-        {
-            Self::create_with_genesis(path, starting_sequence, genesis_hash)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            let _ = genesis_hash;
-            Self::create_without_chain(path, starting_sequence)
-        }
-    }
-
-    /// Internal: create a new journal with a specific genesis hash.
-    #[cfg(feature = "hash-chain")]
-    fn create_with_genesis(
-        path: &Path,
-        starting_sequence: u64,
-        genesis: [u8; 32],
-    ) -> Result<Self, JournalError> {
-        let mut writer = Self::create_bare(path, starting_sequence)?;
-        writer.emit_genesis_and_init_chain(genesis)?;
-        Ok(writer)
-    }
-
-    /// Write the `GenesisHash` entry, seed the BLAKE3 chain from it, and
-    /// flush. Extracted so `create_with_genesis` and `adopt_prepared` (the
-    /// pre-staged segment fast path used by rotation) share the same
-    /// initialisation sequence.
-    ///
-    /// Preconditions: the writer was just constructed (empty batch buffer,
-    /// `hash_chain` is `None`, `next_sequence` is the starting sequence
-    /// for the new segment).
-    #[cfg(feature = "hash-chain")]
-    fn emit_genesis_and_init_chain(&mut self, genesis: [u8; 32]) -> Result<(), JournalError> {
-        let genesis_event: JournalEvent<E> = JournalEvent::GenesisHash { hash: genesis };
-        let seq = self.next_sequence;
-        let timestamp_ns = unix_epoch_nanos();
-        let written = codec::encode(seq, timestamp_ns, 0, 0, &genesis_event, &mut self.buffer)?;
-
-        // Initialize chain: hash the genesis entry bytes (excluding CRC).
-        let entry_bytes = &self.buffer[..written - 4]; // exclude CRC
-        let hash = blake3::hash(entry_bytes);
-        self.hash_chain = Some(HashChain {
-            current_hash: *hash.as_bytes(),
-            batch_hasher: blake3::Hasher::new(),
-            events_since_checkpoint: 0,
-        });
-
-        self.batch_buf[0..written].copy_from_slice(&self.buffer[..written]);
-        self.last_user_entry_len = written;
-        self.batch_len += written;
-        self.next_sequence += 1;
-        self.flush_batch_sync()
-    }
-
-    /// Internal: create a new journal without a hash chain.
-    #[cfg(not(feature = "hash-chain"))]
-    fn create_without_chain(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
-        let writer = Self::create_bare(path, starting_sequence)?;
-        Ok(writer)
-    }
-
-    /// Shared file setup: header, pre-allocation, sync.
-    fn create_bare(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
         // O_DIRECT requires writes aligned to the device's physical sector
         // size. Read permission is required for prefault_pages (mmap
         // MAP_SHARED) and for partial-tail recovery on open_append.
@@ -321,7 +219,7 @@ impl<E: AppEvent> SectorWriter<E> {
         let file = opts.open(path)?;
 
         let sector_size = detect_sector_size(file.as_fd());
-        Self::create_bare_inner(file, path, starting_sequence, sector_size)
+        Self::create_bare_inner(file, path, starting_sequence, anchor_hash, sector_size)
     }
 
     /// Test hook: create with a forced sector size, bypassing `detect_sector_size`.
@@ -336,13 +234,14 @@ impl<E: AppEvent> SectorWriter<E> {
         #[cfg(not(feature = "no-o-direct"))]
         opts.custom_flags(libc::O_DIRECT);
         let file = opts.open(path)?;
-        Self::create_bare_inner(file, path, starting_sequence, sector_size)
+        Self::create_bare_inner(file, path, starting_sequence, [0u8; 32], sector_size)
     }
 
     fn create_bare_inner(
         file: File,
         path: &Path,
         starting_sequence: u64,
+        anchor_hash: [u8; 32],
         sector_size: usize,
     ) -> Result<Self, JournalError> {
         // Reserve `ENTRY_OFFSET` bytes for the file header regardless of
@@ -362,6 +261,7 @@ impl<E: AppEvent> SectorWriter<E> {
             file,
             path,
             starting_sequence,
+            anchor_hash,
             sector_size,
             allocated_end,
         )?;
@@ -373,9 +273,7 @@ impl<E: AppEvent> SectorWriter<E> {
     /// `[sector_size, allocated_end)` range is already prepared
     /// (allocated, zeroed, prefaulted). Writes the file header sector
     /// and locks the in-memory buffers. Does not call `sync_all` — the
-    /// caller decides whether to issue one (e.g. fresh-create wants to
-    /// durably commit the header alone; the rotation/adopt path
-    /// piggybacks on the immediately-following `flush_batch_sync`).
+    /// caller issues one so the header is durable before first use.
     ///
     /// Shared by `create_bare_inner` (full first-time setup) and
     /// `adopt_prepared` (the rotation fast path).
@@ -383,6 +281,7 @@ impl<E: AppEvent> SectorWriter<E> {
         file: File,
         path: &Path,
         starting_sequence: u64,
+        anchor_hash: [u8; 32],
         sector_size: usize,
         allocated_end: u64,
     ) -> Result<Self, JournalError> {
@@ -396,7 +295,12 @@ impl<E: AppEvent> SectorWriter<E> {
         // — on a 4Kn drive this is one device sector, on a 512n drive
         // it's eight (still aligned). The tail_sector scratch buffer
         // is `MAX_SECTOR_SIZE`-sized so this always fits.
-        codec::encode_file_header(&mut tail_sector[..MAX_SECTOR_SIZE], MAX_SECTOR_SIZE);
+        codec::encode_file_header(
+            &mut tail_sector[..MAX_SECTOR_SIZE],
+            MAX_SECTOR_SIZE,
+            starting_sequence,
+            anchor_hash,
+        );
         pwrite_aligned_sector(file.as_fd(), &tail_sector[..MAX_SECTOR_SIZE], 0)?;
         tail_sector.fill(0);
 
@@ -415,7 +319,7 @@ impl<E: AppEvent> SectorWriter<E> {
             write_pos: ENTRY_OFFSET,
             allocated_end,
             #[cfg(feature = "hash-chain")]
-            hash_chain: None,
+            hash_chain: SegmentChain::new(anchor_hash),
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
             batch_len: 0,
@@ -432,9 +336,8 @@ impl<E: AppEvent> SectorWriter<E> {
     /// Mirrors `create_continuing` but reuses the already-allocated /
     /// zero-ranged / prefaulted staging file instead of doing that work
     /// synchronously. On a successful return the new live segment is at
-    /// `live_path`, the file header is written, and (for `hash-chain`
-    /// builds) the `GenesisHash` entry has been emitted and durably
-    /// flushed.
+    /// `live_path` with its file header (anchor included) durably
+    /// written.
     ///
     /// Failure mode contract for [`Self::rotate_segment_inner`]: this
     /// method may or may not have renamed the staging file before
@@ -449,7 +352,7 @@ impl<E: AppEvent> SectorWriter<E> {
         prepared: PreparedSegment,
         live_path: &Path,
         starting_sequence: u64,
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))] genesis_hash: [u8; 32],
+        anchor_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
         let PreparedSegment {
             file,
@@ -464,28 +367,18 @@ impl<E: AppEvent> SectorWriter<E> {
         // staging file is still findable for cleanup.
         std::fs::rename(&staging_path, live_path).map_err(JournalError::Io)?;
 
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_mut))]
-        let mut writer = Self::build_from_owned_parts(
+        let writer = Self::build_from_owned_parts(
             file,
             live_path,
             starting_sequence,
+            anchor_hash,
             sector_size,
             allocated_end,
         )?;
 
-        #[cfg(feature = "hash-chain")]
-        {
-            // `flush_batch_sync` inside this call also commits the file
-            // header sector we just pwrote, so no separate sync_all here.
-            writer.emit_genesis_and_init_chain(genesis_hash)?;
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        {
-            // Without hash-chain there is no GenesisHash entry to flush —
-            // commit the header sector explicitly so a crash before the
-            // next user write doesn't leave a header-less live segment.
-            writer.file.sync_all()?;
-        }
+        // Commit the header sector explicitly so a crash before the next
+        // user write doesn't leave a header-less live segment.
+        writer.file.sync_all()?;
 
         Ok(writer)
     }
@@ -499,18 +392,12 @@ impl<E: AppEvent> SectorWriter<E> {
     /// (including file header). New entries are written starting here,
     /// overwriting any trailing garbage from a partial crash write.
     ///
-    /// `chain_hash` resumes the BLAKE3 hash chain from the reader's final
-    /// state. `None` for v5 journals (no hash chain).
-    pub fn open_append(
-        path: &Path,
-        last_seq: u64,
-        valid_end: u64,
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))] chain_hash: Option<
-            [u8; 32],
-        >,
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
-        events_since_checkpoint: u64,
-    ) -> Result<Self, JournalError> {
+    /// The hash chain is rebuilt self-containedly: the anchor comes from
+    /// the file header and the hasher re-absorbs the raw byte range
+    /// `[ENTRY_OFFSET, valid_end)` — the chain is a pure function of
+    /// those two inputs, so no chain state needs to be threaded in from
+    /// the recovery walk.
+    pub fn open_append(path: &Path, last_seq: u64, valid_end: u64) -> Result<Self, JournalError> {
         // Clear any orphan `<path>.next-staging` from a prior crash
         // before recovery proceeds; matches the cleanup in `create`.
         // Safe at this point — no preparer has been spawned yet.
@@ -536,10 +423,12 @@ impl<E: AppEvent> SectorWriter<E> {
                 "journal file too short to read file header",
             )));
         }
-        // Decoded sector_size is informational — under v13 it always
+        // Decoded sector_size is informational — under v13+ it always
         // equals ENTRY_OFFSET (= 4096). The device's actual O_DIRECT
-        // alignment is detected separately below.
-        codec::decode_file_header(&tail_sector[..FILE_HEADER_SIZE])?;
+        // alignment is detected separately below. The header also
+        // carries the chain anchor used to rebuild the hash chain.
+        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
+        let info = codec::decode_file_header(&tail_sector[..FILE_HEADER_SIZE])?;
         tail_sector.fill(0);
 
         // SectorWriter's O_DIRECT writes must align to the device's
@@ -595,9 +484,7 @@ impl<E: AppEvent> SectorWriter<E> {
         Self::lock_buffer(spare_buf.as_ptr(), BATCH_BUF_CAPACITY);
         Self::lock_buffer(tail_sector.as_ptr(), sector_size);
 
-        // `mut` only used under `hash-chain` (mid-segment hasher rebuild below).
-        #[allow(unused_mut)]
-        let mut writer = Self {
+        Ok(Self {
             _marker: PhantomData,
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
@@ -608,11 +495,12 @@ impl<E: AppEvent> SectorWriter<E> {
             write_pos,
             allocated_end,
             #[cfg(feature = "hash-chain")]
-            hash_chain: chain_hash.map(|h| HashChain {
-                current_hash: h,
-                batch_hasher: blake3::Hasher::new(),
-                events_since_checkpoint: 0,
-            }),
+            hash_chain: SegmentChain::rebuild_from_file(
+                path,
+                info.anchor_hash,
+                ENTRY_OFFSET,
+                valid_end,
+            )?,
             #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
             batch_len: 0,
@@ -621,27 +509,7 @@ impl<E: AppEvent> SectorWriter<E> {
             sector_size,
             tail_sector,
             tail_sector_len: tail_len,
-        };
-
-        // When resuming mid-segment (events since last checkpoint > 0),
-        // reconstruct the batch_hasher by re-reading journal entries since
-        // the last checkpoint. This ensures the writer can compute the
-        // correct next checkpoint hash that includes all events in the
-        // segment, not just the ones written after the resume.
-        #[cfg(feature = "hash-chain")]
-        if events_since_checkpoint > 0
-            && let Some(chain) = &mut writer.hash_chain
-        {
-            let mut reader = JournalReader::<E>::open(path)?;
-            while reader.next_entry()?.is_some() {}
-            if let Some((raw_hash, hasher, count)) = reader.take_chain_state() {
-                chain.current_hash = raw_hash;
-                chain.batch_hasher = hasher;
-                chain.events_since_checkpoint = count;
-            }
-        }
-
-        Ok(writer)
+        })
     }
 
     /// Allocate the next journal sequence number.
@@ -667,8 +535,8 @@ impl<E: AppEvent> SectorWriter<E> {
     /// separation lets the journal stage make the sequencing decision in
     /// disruptor cursor order without coupling encoding to allocation.
     ///
-    /// Also handles hash-chain bookkeeping and auto-emits checkpoint
-    /// entries when the checkpoint interval is reached.
+    /// The entry's raw bytes are absorbed into the segment hash chain;
+    /// nothing else is emitted — the chain has no in-stream metadata.
     pub fn encode_event(
         &mut self,
         seq: u64,
@@ -697,87 +565,20 @@ impl<E: AppEvent> SectorWriter<E> {
             &mut self.buffer,
         )?;
 
-        // Feed entry bytes (excluding CRC) into the batch hasher.
-        // No finalize here — that happens once per batch in flush_batch_sync.
+        // Absorb the full on-disk bytes (incl. CRC) — see crate::chain
+        // for why the CRC is included. Incremental update only; the
+        // value is finalized on demand (fsync publication, snapshots,
+        // rotation), never per entry.
         #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &mut self.hash_chain {
-            let entry_bytes_len = written - 4; // exclude 4-byte CRC
-            chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
-            // GenesisHash initializes the chain — don't count it toward
-            // the checkpoint interval. Matches create_with_genesis() which
-            // sets events_since_checkpoint = 0 after writing the genesis.
-            if !matches!(event, JournalEvent::GenesisHash { .. }) {
-                chain.events_since_checkpoint += 1;
-            }
-        }
+        self.hash_chain.absorb(&self.buffer[..written]);
 
         self.warn_if_batch_overflow(written);
-        // Record the user entry's position in batch_buf BEFORE the
-        // auto-checkpoint append below, so `last_user_entry_replication_slice`
-        // returns the user entry only — not a trailing checkpoint.
         let offset = self.batch_len;
         self.last_user_entry_offset = offset;
         self.batch_buf[offset..offset + written].copy_from_slice(&self.buffer[..written]);
         self.last_user_entry_len = written;
         self.batch_len += written;
 
-        // Auto-emit a checkpoint if we've hit the interval.
-        // Finalize the batch hasher to get the current hash (including all
-        // entries accumulated since the last flush/checkpoint).
-        #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &mut self.hash_chain
-            && chain.events_since_checkpoint >= checkpoint_interval()
-        {
-            // Finalize accumulated entries + previous chain hash.
-            chain.batch_hasher.update(&chain.current_hash);
-            let checkpoint_hash = *chain.batch_hasher.finalize().as_bytes();
-            chain.current_hash = checkpoint_hash;
-            chain.batch_hasher = blake3::Hasher::new();
-            let count = chain.events_since_checkpoint;
-            self.emit_checkpoint(checkpoint_hash, count)?;
-        }
-
-        Ok(())
-    }
-
-    /// Emit a checkpoint entry into the batch buffer and reset the counter.
-    #[cfg(feature = "hash-chain")]
-    fn emit_checkpoint(
-        &mut self,
-        chain_hash: [u8; 32],
-        events_since_checkpoint: u64,
-    ) -> Result<(), JournalError> {
-        let checkpoint: JournalEvent<E> = JournalEvent::Checkpoint {
-            chain_hash,
-            events_since_checkpoint,
-        };
-        let seq = self.next_sequence;
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                seq > self.last_encoded_seq,
-                "emit_checkpoint: seq {seq} <= last_encoded_seq {} — \
-                 auto-emit would duplicate/clash with a prior sequence",
-                self.last_encoded_seq
-            );
-            self.last_encoded_seq = seq;
-        }
-        let ts = unix_epoch_nanos();
-        let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
-
-        // Reset the event counter. The checkpoint entry itself is NOT fed
-        // into the new batch hasher — it acts as a seal for the preceding
-        // segment. This keeps the hash chain deterministic regardless of
-        // write batching strategy.
-        if let Some(chain) = &mut self.hash_chain {
-            chain.events_since_checkpoint = 0;
-        }
-
-        self.warn_if_batch_overflow(written);
-        self.batch_buf[self.batch_len..self.batch_len + written]
-            .copy_from_slice(&self.buffer[..written]);
-        self.batch_len += written;
-        self.next_sequence += 1;
         Ok(())
     }
 
@@ -914,8 +715,7 @@ impl<E: AppEvent> SectorWriter<E> {
     /// Set the next sequence number.
     ///
     /// Used by the replica to keep the writer's internal counter in sync
-    /// with the primary's pre-assigned sequences. This ensures that
-    /// auto-emitted checkpoint entries get the correct sequence numbers.
+    /// with the primary's pre-assigned sequences.
     pub fn set_next_sequence(&mut self, seq: u64) {
         // Debug-only: catch the footgun where a pre-assigned slot
         // sequence would walk the writer's counter backward. This is
@@ -955,45 +755,20 @@ impl<E: AppEvent> SectorWriter<E> {
     }
 
     /// Physical sector size used for this journal, in bytes (512 or 4096).
-    ///
-    /// Callers that read the journal file directly (e.g., to parse the genesis
-    /// entry) need this to know the byte offset where entries begin.
     pub fn sector_size(&self) -> usize {
         self.sector_size
     }
 
-    /// Read the first (genesis) journal entry as raw bytes.
+    /// Decoded file-header fields of the live segment (read from disk).
+    /// Used at primary startup to hand replicas the segment's
+    /// `(starting_sequence, anchor_hash)` so a fresh replica journal is
+    /// byte-identical from the segment's first entry onward.
     ///
-    /// The genesis entry immediately follows the file header at offset
-    /// `sector_size`. Returned bytes include the full framing
-    /// (magic + length + header + payload + CRC).
-    ///
-    /// Opens a separate non-O_DIRECT file handle because the O_DIRECT handle
-    /// used for writes does not allow unaligned reads. This is a startup-only
-    /// operation — the extra open is acceptable.
-    pub fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
-        let file = std::fs::File::open(&self.path)?;
-        let offset = ENTRY_OFFSET;
-        // Read the first 4 bytes to get magic(2) + length(2).
-        let mut hdr4 = [0u8; 4];
-        let n = file.read_at(&mut hdr4, offset)?;
-        if n < 4 {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "journal too short to contain genesis entry",
-            )));
-        }
-        let entry_len = u16::from_le_bytes([hdr4[2], hdr4[3]]) as usize;
-        let total = 20 + entry_len + 4; // EntryHeader(20) + payload + CRC(4)
-        let mut entry = vec![0u8; total];
-        let n = file.read_at(&mut entry, offset)?;
-        if n < total {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "journal truncated at genesis entry",
-            )));
-        }
-        Ok(entry)
+    /// Opens a separate non-O_DIRECT file handle because the O_DIRECT
+    /// handle used for writes does not allow unaligned reads. This is a
+    /// startup-only operation — the extra open is acceptable.
+    pub fn read_header_info(&self) -> Result<codec::FileHeaderInfo, JournalError> {
+        crate::segment::read_header_info(&self.path)
     }
 
     /// `rw_flags` value for io_uring `Write` operations on this journal.
@@ -1008,10 +783,10 @@ impl<E: AppEvent> SectorWriter<E> {
     ///
     /// Flushes any pending batch durably, renames the current live file to
     /// the next monotonic archive slot (`<path>.NNNNNN`), and opens a
-    /// fresh live segment at the original path seeded with
-    /// `GenesisHash(prev_chain_hash)`. The new segment continues the
-    /// sequence counter — the next event written gets `prev_next_seq + 1`
-    /// (the GenesisHash itself takes `prev_next_seq`).
+    /// fresh live segment at the original path whose header anchor is
+    /// the outgoing segment's tail chain hash. The new segment continues
+    /// the sequence counter — no sequence number is consumed, so the
+    /// next event written gets exactly `prev_next_seq`.
     ///
     /// Multi-segment recovery (see [`crate::segment`]) walks archives in
     /// order before opening the live segment, so events written before
@@ -1056,41 +831,16 @@ impl<E: AppEvent> SectorWriter<E> {
 
         let path = self.path.clone();
         let next_seq = self.next_sequence;
-        // GenesisHash carries the chain state at the rotation boundary so
-        // the new segment's chain anchors to the previous one.
-        //
-        // When the `hash-chain` feature is enabled, `chain_hash()` must
-        // return Some after a successful flush (genesis is written at
-        // construction). A None here indicates a logic bug that would
-        // silently break tamper-evidence — the new segment would anchor
-        // to zeros and `verify_segment_boundary` would still pass on
-        // recovery. Refuse to rotate.
-        // clippy suggests unwrap_or_default, but the None arm has a
-        // feature-gated `return Err(...)` that the suggestion would erase.
-        #[allow(clippy::manual_unwrap_or_default)]
-        let genesis = match self.chain_hash() {
-            Some(h) => h,
-            None => {
-                #[cfg(feature = "hash-chain")]
-                {
-                    return Err(JournalError::Io(std::io::Error::other(
-                        "rotate_segment: hash-chain enabled but chain_hash() is None — \
-                         refusing to rotate with zero genesis",
-                    )));
-                }
-                // Hash-chain disabled: zeros are meaningless anyway.
-                #[cfg(not(feature = "hash-chain"))]
-                {
-                    [0u8; 32]
-                }
-            }
-        };
+        // The new segment's header anchor is the outgoing segment's tail
+        // chain hash, giving recovery a verifiable cross-segment link.
+        // Zeros when hash-chain is disabled (nothing verifies them).
+        let anchor = self.chain_hash().unwrap_or([0u8; 32]);
 
         let archived = crate::segment::archive_live(&path).map_err(JournalError::Io)?;
 
         let new_writer_result = match prepared {
-            Some(p) => Self::adopt_prepared(p, &path, next_seq, genesis),
-            None => Self::create_continuing(&path, next_seq, genesis),
+            Some(p) => Self::adopt_prepared(p, &path, next_seq, anchor),
+            None => Self::create_continuing(&path, next_seq, anchor),
         };
 
         match new_writer_result {
@@ -1127,41 +877,17 @@ impl<E: AppEvent> SectorWriter<E> {
         }
     }
 
-    /// Current BLAKE3 chain hash, if hash chain is active.
-    /// Returns `None` when the `hash-chain` feature is disabled, for v5
-    /// journals, or if no events have been written.
-    ///
-    /// When events have been accumulated since the last checkpoint (or
-    /// genesis), computes the hash on-demand by cloning the incremental
-    /// hasher and finalizing with the previous chain hash. When no events
-    /// are pending, returns the stored checkpoint/genesis hash directly.
+    /// Current chain value: `BLAKE3(entry bytes so far || anchor)`, or
+    /// the anchor itself for an empty segment. `None` when `hash-chain`
+    /// is disabled. Non-destructive (clone + finalize, O(log absorbed
+    /// bytes)).
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            self.hash_chain.as_ref().map(|c| {
-                if c.events_since_checkpoint == 0 {
-                    c.current_hash
-                } else {
-                    let mut h = c.batch_hasher.clone();
-                    h.update(&c.current_hash);
-                    *h.finalize().as_bytes()
-                }
-            })
+            Some(self.hash_chain.value())
         }
         #[cfg(not(feature = "hash-chain"))]
         None
-    }
-
-    /// Events since last checkpoint, if hash chain is active.
-    pub fn events_since_checkpoint(&self) -> u64 {
-        #[cfg(feature = "hash-chain")]
-        {
-            self.hash_chain
-                .as_ref()
-                .map_or(0, |c| c.events_since_checkpoint)
-        }
-        #[cfg(not(feature = "hash-chain"))]
-        0
     }
 
     /// Read-only access to the pending batch buffer (encoded but not yet flushed).
@@ -1623,10 +1349,8 @@ mod tests {
         }
     }
 
-    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
-    #[cfg(feature = "hash-chain")]
-    const FIRST_SEQ: u64 = 2;
-    #[cfg(not(feature = "hash-chain"))]
+    /// First user-event sequence. Chain metadata lives in the file
+    /// header, so sequence 1 is a real event under every feature config.
     const FIRST_SEQ: u64 = 1;
 
     fn sample_event() -> JournalEvent<TestEvent> {
@@ -1758,25 +1482,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let (last_seq, valid_end, events_since_checkpoint) = {
+        let (last_seq, valid_end) = {
             let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             writer.append(&sample_event()).unwrap();
-            (
-                writer.next_sequence() - 1,
-                writer.valid_end(),
-                writer.events_since_checkpoint(),
-            )
+            (writer.next_sequence() - 1, writer.valid_end())
         };
 
-        let mut writer = SectorWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            None,
-            events_since_checkpoint,
-        )
-        .unwrap();
+        let mut writer =
+            SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         let next_seq = writer.append(&sample_event()).unwrap();
         assert_eq!(next_seq, last_seq + 1);
     }
@@ -1797,8 +1511,7 @@ mod tests {
 
         {
             let _writer =
-                SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0)
-                    .unwrap();
+                SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         }
 
         let entries = read_all(&path);
@@ -1809,18 +1522,19 @@ mod tests {
 
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn genesis_hash_initializes_chain_transparently() {
-        // The genesis entry is written first but is transparent to
-        // `next_entry`: the reader consumes it internally (chain init)
-        // and surfaces only user events. So a journal with only the
-        // genesis yields zero visible entries, and the chain is active.
+    fn fresh_journal_chain_is_header_anchor() {
+        // A fresh journal has no entries; its chain value is the random
+        // anchor recorded in the file header, and both writer and reader
+        // agree on it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
         let writer = SectorWriter::<TestEvent>::create(&path).unwrap();
-        assert!(writer.chain_hash().is_some());
+        let chain = writer.chain_hash().expect("chain active");
         drop(writer);
 
+        let info = crate::segment::read_header_info(&path).unwrap();
+        assert_eq!(chain, info.anchor_hash);
         assert_eq!(read_all(&path).len(), 0);
     }
 
@@ -1831,60 +1545,33 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
-        let hash_before = writer.chain_hash();
+        let hash_before = writer.chain_hash().expect("chain active");
         writer.append(&sample_event()).unwrap();
-        // The chain hash only advances when batches are finalized — after a
-        // direct `append` with sync, the chain hasher has a segment in flight
-        // but the exposed hash is the last finalized checkpoint hash.
-        // The stability-post-single-append is the normal case; assert the
-        // writer still has a chain.
-        assert!(writer.chain_hash().is_some());
-        assert!(hash_before.is_some());
+        let hash_after = writer.chain_hash().expect("chain active");
+        // The schedule-free chain advances on every absorbed entry.
+        assert_ne!(hash_before, hash_after);
     }
 
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn open_append_with_chain_hash_resumes_chain() {
+    fn open_append_rebuilds_chain_from_raw_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let (last_seq, valid_end, chain_hash, events_since_checkpoint) = {
+        let (last_seq, valid_end, chain_before) = {
             let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             (
                 writer.next_sequence() - 1,
                 writer.valid_end(),
                 writer.chain_hash(),
-                writer.events_since_checkpoint(),
             )
         };
 
-        let writer = SectorWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )
-        .unwrap();
-        assert!(writer.chain_hash().is_some());
-    }
-
-    #[cfg(feature = "hash-chain")]
-    #[test]
-    fn open_append_without_chain_hash_has_no_chain() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.journal");
-
-        let (last_seq, valid_end) = {
-            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
-            writer.append(&sample_event()).unwrap();
-            (writer.next_sequence() - 1, writer.valid_end())
-        };
-
-        let writer =
-            SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
-        assert!(writer.chain_hash().is_none());
+        // open_append is self-contained: header anchor + raw byte
+        // re-absorption reproduce the pre-close chain exactly.
+        let writer = SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
+        assert_eq!(writer.chain_hash(), chain_before);
     }
 
     /// Verify that journals created with sector_size=4096 round-trip correctly.
@@ -1940,7 +1627,7 @@ mod tests {
         };
 
         let mut writer =
-            SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
+            SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         let seq = writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         assert_eq!(seq, last_seq + 1);
         drop(writer);
@@ -1965,8 +1652,6 @@ mod tests {
             writer.flush_batch_sync().unwrap();
         }
 
-        // Genesis is transparent — reader surfaces only the three user
-        // events.
         let entries = read_all(&path);
         assert_eq!(entries.len(), 3);
     }
@@ -1983,28 +1668,17 @@ mod tests {
         let path = dir.path().join("test.journal");
         let staging = staging_path(&path);
 
-        let (last_seq, valid_end, events_since_checkpoint) = {
+        let (last_seq, valid_end) = {
             let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
-            (
-                writer.next_sequence() - 1,
-                writer.valid_end(),
-                writer.events_since_checkpoint(),
-            )
+            (writer.next_sequence() - 1, writer.valid_end())
         };
 
         // Simulate a crash that left a staging file on disk.
         std::fs::write(&staging, b"orphan from prior crash").unwrap();
         assert!(staging.exists());
 
-        let writer = SectorWriter::<TestEvent>::open_append(
-            &path,
-            last_seq,
-            valid_end,
-            None,
-            events_since_checkpoint,
-        )
-        .unwrap();
+        let writer = SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end).unwrap();
         drop(writer);
 
         assert!(
@@ -2086,12 +1760,8 @@ mod tests {
             "staging file should have been renamed onto live path"
         );
 
-        // The new segment's next_sequence must advance past the rotation
-        // boundary by exactly one (the GenesisHash takes that slot when
-        // hash-chain is on) or zero (no genesis without hash-chain).
-        #[cfg(feature = "hash-chain")]
-        assert_eq!(writer.next_sequence(), next_seq_before_rotate + 1);
-        #[cfg(not(feature = "hash-chain"))]
+        // Rotation consumes no sequence number — chain metadata lives in
+        // the new segment's header, not in the entry stream.
         assert_eq!(writer.next_sequence(), next_seq_before_rotate);
 
         // Two more entries on the new segment.
@@ -2100,8 +1770,8 @@ mod tests {
         drop(writer);
         preparer.shutdown();
 
-        // Reading the live (new) segment should surface only the
-        // post-rotation user entries — the genesis is transparent.
+        // Reading the live (new) segment surfaces exactly the
+        // post-rotation user entries.
         let live_entries = read_all(&path);
         assert_eq!(
             live_entries.len(),
@@ -2123,23 +1793,30 @@ mod tests {
         assert_eq!(archived_entries[1].event, JournalEvent::App(TestEvent(2)));
 
         // Sequence continuity across the boundary: last archived user
-        // entry + 1 == first live user entry (with the genesis filling
-        // the gap when hash-chain is on, transparent to the reader's
-        // user-entry view).
+        // entry + 1 == first live user entry — rotation consumes no
+        // sequence.
         let last_archived_seq = archived_entries.last().unwrap().sequence;
         let first_live_seq = live_entries.first().unwrap().sequence;
-        #[cfg(feature = "hash-chain")]
-        assert_eq!(
-            first_live_seq,
-            last_archived_seq + 2,
-            "expected one genesis slot between last archived and first live"
-        );
-        #[cfg(not(feature = "hash-chain"))]
         assert_eq!(
             first_live_seq,
             last_archived_seq + 1,
             "expected contiguous sequence across rotation boundary"
         );
+
+        // Cross-segment chain link: the live header's anchor equals the
+        // archived segment's tail chain hash.
+        #[cfg(feature = "hash-chain")]
+        {
+            let mut archive_reader = crate::reader::JournalReader::<TestEvent>::open(&archived)
+                .expect("open archived segment");
+            while archive_reader.next_entry().unwrap().is_some() {}
+            let live_info = crate::segment::read_header_info(&path).unwrap();
+            assert_eq!(
+                archive_reader.chain_hash(),
+                Some(live_info.anchor_hash),
+                "live segment's anchor must equal the archive's tail"
+            );
+        }
     }
 
     /// Regression: `ensure_allocated` must not zero data the writer has

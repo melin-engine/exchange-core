@@ -110,9 +110,6 @@ fn main() {
     .expect("create primary journal");
     let (exchange, writer) = engine.into_parts();
 
-    // Read genesis before moving writer into the pipeline.
-    let genesis_entry = writer.read_genesis_entry().expect("read genesis");
-
     let active_connections = Arc::new(AtomicU64::new(0));
 
     let pipeline = build_pipeline_with_replication(
@@ -197,7 +194,6 @@ fn main() {
         repl_consumer_2,
         replication_cursor: Arc::clone(&replication_cursor),
         fastest_replica_cursor: Arc::clone(&fastest_replica_cursor),
-        genesis_entry,
         journal_path: primary_journal.clone(),
         authorized_keys: Arc::clone(&authorized_keys),
         evict_flags: replication_ring_progress.evict_flags.clone(),
