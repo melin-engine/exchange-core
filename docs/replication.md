@@ -185,13 +185,13 @@ connection separate from the client protocol.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| StreamStart | `[len:u32][type=0x10][start_sequence:u64][genesis_len:u32][genesis_entry_bytes...]` | Confirms the handshake; includes the raw genesis entry so a fresh replica's hash chain starts byte-identical to the primary's. |
+| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]` | Confirms the handshake; carries the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with, so its journal is byte-identical to the primary's as the stream is consumed. |
 | NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind the live journal and archives have been purged — triggers snapshot transfer. |
 | SnapshotBegin | `[len:u32][type=0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]` | Start of snapshot transfer with metadata. |
 | SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB). |
 | SnapshotEnd | `[len:u32][type=0x15][crc32c:u32]` | End of snapshot transfer; CRC32C of the full payload for integrity. |
 | HashMismatch | `[len:u32][type=0x12]` | Chain hash mismatch at the replica's reported sequence (reserved — see Limitations). |
-| InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events (sequence + timestamp + key/request hash + the event itself). Divergence is verified at Checkpoint markers inside the slot stream. |
+| InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events (sequence + timestamp + key/request hash + the event itself). |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5 s interval) advertising the primary's last published sequence. |
 
 ## Cluster recovery
@@ -259,12 +259,19 @@ primary's own journal at the same sequence. A replica with divergent
 history (e.g. previously connected to a different primary, or with a
 corrupted journal) is accepted without warning. After failover the
 promoted node would hold a journal that doesn't match the events
-clients were told about. Tracked as a roadmap item — two
-implementation shapes are scoped (tip-only check, ~half a day; full
-arbitrary-N check, 1–2 days against the journal-crate hashing
-arithmetic). On mismatch the replica will be re-synced through the
-existing snapshot path, with its divergent journal archived for the
-audit trail rather than deleted.
+clients were told about.
+
+Each node *does* verify its own journal's integrity locally on every
+recovery (per-segment chains, cross-segment anchors, snapshot
+cross-checks). What's missing is the *cross-node* comparison — and
+because chain values are segment-scoped, comparing them between nodes
+requires the nodes to share segment boundaries. The roadmap item
+therefore bundles two pieces: primary-driven rotation (replicas rotate
+at the same sequence boundary as the primary, making a healthy
+replica's journal a bitwise mirror) and chain comparison at handshake
+plus periodically in the live stream. On mismatch the replica will be
+re-synced through the existing snapshot path, with its divergent
+journal archived for the audit trail rather than deleted.
 
 ### No automatic split-brain fencing
 

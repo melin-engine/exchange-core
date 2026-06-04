@@ -818,12 +818,13 @@ For best journal performance, use an NVMe drive with:
 
 ### Journal Size
 
-Each journal entry is approximately **80 bytes** (20-byte header + variable payload + 4-byte CRC32C). The exact size depends on the event type:
+Each journal entry is approximately **90 bytes** (20-byte header + 16 bytes of dedup metadata + variable payload + 4-byte CRC32C). The exact size depends on the event type:
 
-- Limit order submit: ~65-80 bytes
-- Cancel: ~30-40 bytes
-- Deposit: ~30-40 bytes
-- Hash chain checkpoints: ~77 bytes, emitted every 100K events
+- Limit order submit: ~80-100 bytes
+- Cancel: ~50-60 bytes
+- Deposit: ~50-60 bytes
+
+The entry stream contains only input events — hash-chain metadata lives in each segment's file header and adds no per-event or periodic disk overhead.
 
 The journal writer pre-allocates in **256 MiB chunks**. The on-disk file size jumps in 256 MiB increments.
 

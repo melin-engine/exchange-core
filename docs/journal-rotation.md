@@ -56,22 +56,20 @@ When a snapshot is available, recovery loads the snapshot first, then walks segm
 
 ### Sequence continuity
 
-Each segment's first entry is a `GenesisHash` whose payload is the previous segment's final chain hash, anchoring the new segment to the chain it continues. Sequence numbers are monotonic across segment boundaries — no gaps.
+Each segment's file header records the sequence its first entry carries (`starting_sequence`) and the chain anchor it continues from. Sequence numbers are monotonic across segment boundaries with no gaps — rotation consumes no sequence number, so the entry stream is dense over real events.
 
 ### Cross-segment tamper-evidence
 
-Recovery verifies that each segment's `GenesisHash` payload equals the previous segment's tail chain hash. A mismatch indicates either deliberate tampering with an archived segment or a missing segment between two surviving archives, and aborts recovery with an error identifying the boundary.
+Recovery verifies, before replaying each segment, that its header anchor equals the previous segment's tail chain hash and that its `starting_sequence` continues the sequence space exactly. A mismatch indicates deliberate tampering with an archived segment, a missing segment between two surviving archives, or a foreign segment spliced in — and aborts recovery with an error identifying the boundary, before any event from the suspect segment reaches the engine.
 
 ## Sequence Numbering
 
 Journal entries carry monotonically increasing sequence numbers. After rotation, the new segment continues from where the old one left off:
 
 ```
-Segment 000001:   seq 1, 2, 3, ..., 1000
-                  (chain hash at end: H1)
-Segment 000002:   seq 1001 = GenesisHash(H1), then 1002, 1003, ..., 2500
-                  (chain hash at end: H2)
-Live segment:     seq 2501 = GenesisHash(H2), then 2502, 2503, ...
+Segment 000001:   header { start: 1,    anchor: random salt }   seq 1 .. 1000     (tail hash: H1)
+Segment 000002:   header { start: 1001, anchor: H1 }            seq 1001 .. 2500  (tail hash: H2)
+Live segment:     header { start: 2501, anchor: H2 }            seq 2501 ..
 ```
 
 A snapshot records both the sequence of the last event it captured and the chain hash at that point. Recovery from snapshot + segments skips events with `sequence <= snap_sequence`.
@@ -83,7 +81,7 @@ A snapshot records both the sequence of the last event it captured and the chain
 **Recovery flow:**
 1. Load snapshot (restores state as of sequence N)
 2. Walk archived segments in order; skip events with `sequence <= N`, replay the rest
-3. Verify each segment-boundary `GenesisHash` matches the previous tail
+3. Verify each segment's header anchor matches the previous tail
 4. Walk the live segment; truncate at the last valid entry on torn tails
 5. Open the live segment for append
 
@@ -91,7 +89,7 @@ A snapshot records both the sequence of the last event it captured and the chain
 
 ### 2. Live segment missing, archives present (with or without snapshot)
 
-**Recovery flow:** Walk archives in monotonic order, replaying events past the snapshot's sequence (when present). After the last archive, synthesize a fresh live segment continuing from the last archive's tail — its `GenesisHash` payload is the previous segment's final chain hash so the chain stays continuous. The next event written gets `last_archived_seq + 2` (the GenesisHash itself takes `+1`).
+**Recovery flow:** Walk archives in monotonic order, replaying events past the snapshot's sequence (when present). After the last archive, synthesize a fresh live segment continuing from the last archive's tail — its header anchor is the previous segment's final chain hash so the chain stays continuous. The next event written gets `last_archived_seq + 1`.
 
 **When:** Crash between the live → archive rename and the new live file's creation. The just-archived segment captured every event acknowledged before the crash, so no committed event is lost. This used to require a recent snapshot to recover correctly; multi-segment recovery removed that requirement — operators no longer need to time their snapshots to the rotation cadence.
 
@@ -133,7 +131,7 @@ This is materially different from the legacy startup-only rotation, where the sn
 
 Archived segments are append-only history and **not deleted automatically**. The full sequence of events from genesis is preserved across all archive files plus the live segment. Operators who need long-term retention should set up a separate workflow (e.g., copy `melin.journal.NNNNNN` to cold storage when their numeric suffix is sufficiently old).
 
-Replays for forensic purposes can use the standalone reader against any archived segment in isolation: the chain hash is self-contained per segment, with cross-segment continuity validated against neighboring segments' GenesisHash payloads.
+Replays for forensic purposes can use the standalone reader against any archived segment in isolation: the chain is self-contained per segment (header anchor + entry bytes), with cross-segment continuity validated against the next segment's header anchor. Because the chain is defined over the raw byte stream, a sealed segment can even be verified without journal-aware tooling: `BLAKE3(bytes[4096..valid_end] ‖ anchor)` must equal the successor's anchor.
 
 ### Replication
 

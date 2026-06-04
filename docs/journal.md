@@ -12,35 +12,40 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 
 4. **CRC32C integrity** — every journal entry and every snapshot file is checksummed with CRC32C (hardware-accelerated on x86). Corruption is detected on read, never silently replayed.
 
-5. **BLAKE3 hash chain** — each entry is hashed into a running BLAKE3 chain (`hash_n = BLAKE3(entry_bytes || hash_{n-1})`). Periodic checkpoint entries record the chain hash, enabling tamper detection and replica consistency verification without per-entry disk overhead.
+5. **BLAKE3 hash chain, anchored per segment** — every journal segment carries a 32-byte chain **anchor** in its file header (random salt for a fresh journal, the previous segment's tail hash after rotation). The chain value after any entry is a pure function of the anchor and the raw on-disk bytes: `chain(S) = BLAKE3(entry bytes through S ‖ anchor)`. No chain metadata lives in the entry stream — sequence numbers are dense over real events, and a sealed segment can be verified with nothing but its own bytes and its successor's anchor.
 
 ## Journal File Format
 
-### File Header (8 bytes, written once)
+### File Header (52 meaningful bytes, written once, padded to 4096)
 
 ```
-Offset  Size  Field           Value
-0       4     file_magic      0x4A4F5552 ("JOUR")
-4       2     format_version  9
-6       2     reserved        0
+Offset  Size  Field              Value
+0       4     file_magic         0x4A4F5552 ("JOUR")
+4       2     format_version     14
+6       2     sector_size        4096
+8       8     starting_sequence  sequence carried by this segment's first entry
+16      32    anchor_hash        chain anchor (random salt or previous segment's tail hash)
+48      4     header_crc         CRC32C of the preceding 48 bytes
 ```
 
-The header is written when the journal is created and never modified. `format_version` is checked on open; v5, v7, v8, and v9 are accepted (v5 journals lack hash chain verification; v7-v8 lack newer event types).
+The header is written when the journal is created and never modified. Its CRC protects the anchor — the root of all chain verification — against storage corruption. `format_version` is checked on open; only the current version is accepted (pre-production policy — see Migration below).
 
-### Entry Layout (repeats after header)
+### Entry Layout (repeats after the 4096-byte header reservation)
 
 ```
 Offset  Size  Field           Description
 0       2     entry_magic     0x4A45 — misalignment / corruption detection
-2       2     length          byte count of (event_tag + payload), excludes header and CRC
+2       2     length          byte count of (key_hash + request_seq + event_tag + payload)
 4       8     sequence        monotonically increasing, starts at 1, no gaps
 12      8     timestamp_ns    wall-clock nanoseconds since Unix epoch (informational only)
-20      1     event_tag       discriminant (see Event Payloads below)
-21      var   payload         event-specific fields (see below)
-21+len  4     crc32c          CRC32C of all preceding bytes in this entry (offset 0 through 20+len)
+20      8     key_hash        hash of the client's signing key (0 for server-internal events)
+28      8     request_seq     per-key request sequence (idempotency dedup)
+36      1     event_tag       discriminant (Tick, or App for exchange events)
+37      var   payload         event-specific fields (see below)
+37+len  4     crc32c          CRC32C of all preceding bytes in this entry
 ```
 
-Total entry size: `20 + length + 4` bytes. Typical entries are 40-85 bytes.
+Total entry size: `20 + length + 4` bytes. Typical entries are 60-110 bytes. The first entry's `sequence` must equal the header's `starting_sequence` — a segment renamed into the wrong place in the lineage is rejected at the first read.
 
 ### Event Payloads
 
@@ -123,23 +128,6 @@ Total entry size: `20 + length + 4` bytes. Typical entries are 40-85 bytes.
 | 4 | 8 | order_id (u64) |
 | 12 | 8 | new_price (u64, NonZero) |
 | 20 | 8 | new_quantity (u64, NonZero) |
-
-**GenesisHash (tag=9)** — 32 bytes
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 32 | hash ([u8; 32]) — random bytes (fresh journal) or previous chain hash (rotation) |
-
-First entry in every v6 journal. Seeds the BLAKE3 hash chain. Transparent to callers (reader skips it and only returns user events).
-
-**Checkpoint (tag=10)** — 40 bytes
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 32 | chain_hash ([u8; 32]) — running BLAKE3 hash at this point |
-| 32 | 8 | events_since_checkpoint (u64) |
-
-Auto-emitted every 100K events. The reader verifies the chain hash and event count; mismatches produce `HashChainMismatch`. Transparent to callers.
 
 **SetFeeSchedule (tag=11)** — 8 bytes
 
@@ -229,21 +217,26 @@ An explicit group commit delay (`group_commit_delay`) can be configured but is s
 ### Recovery Algorithm
 
 ```
-JournaledExchange::recover(journal_path):
-  1. Open journal file, validate file header (magic + version).
-  2. Read entries sequentially:
-     - Validate entry_magic (0x4A45).
-     - Validate CRC32C.
-     - Validate sequence continuity (expected = last + 1).
-     - On GenesisHash: initialize BLAKE3 hash chain, skip (transparent).
-     - On Checkpoint: verify chain hash + event count, skip (transparent).
-     - On normal entries: update hash chain, replay on Exchange.
-     - If entry_magic is 0x0000 → end of data (pre-allocated space). Stop.
-     - If entry is truncated at EOF → partial write from crash. Stop.
-     - If CRC mismatch, sequence gap, or hash chain mismatch → return error.
-  3. Truncate the file to valid_file_end (remove trailing garbage).
-  4. Re-allocate space from valid_file_end forward.
-  5. Reopen writer for appending, resuming the hash chain from reader's final state.
+recover(journal_path):
+  1. For each archived segment in monotonic order, then the live segment:
+     a. Validate the file header (magic + version + header CRC).
+     b. Verify lineage: the header's anchor must equal the previous
+        segment's tail chain hash, and the header's starting_sequence
+        must continue the sequence space exactly. Checked BEFORE any
+        replay — a foreign or tampered segment never reaches the engine.
+     c. Read entries sequentially:
+        - Validate entry_magic (0x4A45), CRC32C, sequence continuity.
+        - Absorb the entry's raw bytes into the segment hash chain.
+        - Replay on the Exchange.
+        - If entry_magic is 0x0000 → end of data (pre-allocated space). Stop.
+        - If entry is truncated at EOF (live segment) → partial write
+          from crash. Stop.
+        - If CRC mismatch or sequence gap mid-archive → return error.
+  2. Truncate the live file to valid_file_end (remove trailing garbage).
+  3. Re-allocate space from valid_file_end forward.
+  4. Reopen writer for appending. The writer rebuilds its chain state
+     self-containedly: anchor from the header, hasher re-absorbed from
+     the raw byte range — no chain state is handed over from the replay.
 ```
 
 **Key behaviors:**
@@ -255,20 +248,20 @@ JournaledExchange::recover(journal_path):
 ### Recovery with Snapshots
 
 ```
-JournaledExchange::recover_from_snapshot(snapshot_path, journal_path):
+recover_from_snapshot(snapshot_path, journal_path):
   1. Load snapshot → (Exchange state, snapshot_sequence, snapshot_chain_hash).
-  2. Open journal, validate header.
-  3. Read entries sequentially. Skip all entries with sequence <= snapshot_sequence.
-  4. At the snapshot's anchor sequence, verify the journal's chain hash at
+  2. Walk segments as above. Skip events with sequence <= snapshot_sequence
+     (still validated and absorbed into the chain).
+  3. At the snapshot's anchor sequence, verify the journal's chain hash at
      that point matches the snapshot's recorded chain hash. Mismatch aborts
      recovery before any post-snapshot events are replayed.
-  5. Replay only entries after the snapshot.
-  6. Truncate and reopen writer as above.
+  4. Replay only entries after the snapshot.
+  5. Truncate and reopen writer as above.
 ```
 
 This avoids replaying the entire journal from genesis. Recovery time is proportional to the journal tail length (events since last snapshot), not total history.
 
-The chain-hash cross-check at the anchor sequence ensures the snapshot and the journal share the same history: it rejects a snapshot paired with another cluster's journal, a divergent history, or a journal whose entries up to the anchor were tampered with. Coverage is uniform — the check fires whether the anchor lands on an ordinary event, the per-segment genesis entry, or an auto-emitted checkpoint.
+The chain-hash cross-check at the anchor sequence ensures the snapshot and the journal share the same history: it rejects a snapshot paired with another cluster's journal, a divergent history, or a journal whose entries up to the anchor were tampered with. A snapshot anchored exactly at a rotation boundary is verified against the successor segment's header anchor (which *is* the chain value at that boundary) — so the check holds even when the segment holding the anchor entry has been moved to cold storage.
 
 ## Snapshots
 
@@ -325,41 +318,40 @@ Journal segment rotation is independent of snapshots. When the live journal exce
 
 ## BLAKE3 Hash Chain
 
-Every v6 journal maintains a running BLAKE3 hash chain for tamper evidence and replica consistency verification.
+Every journal segment maintains a BLAKE3 hash chain for tamper evidence. The chain is **schedule-free**: its value at any point depends only on the segment's header anchor and the raw bytes written so far — never on how writes were batched or when intermediate values were computed.
 
 ### How It Works
 
-1. **Genesis entry** — the first entry in every v6 journal. Contains 32 random bytes (fresh journal) or the previous chain hash (rotated journal). Initializes the chain: `hash_0 = BLAKE3(genesis_entry_bytes)`.
+1. **Anchor** — each segment's file header carries a 32-byte anchor: random salt for a fresh journal (so two independent journal lineages can never share a chain value), or the previous segment's tail hash after rotation.
 
-2. **Normal entries** — each entry updates the chain: `hash_n = BLAKE3(entry_bytes_excl_CRC || hash_{n-1})`. The hash is computed over the raw encoded bytes (header + tag + payload) so it covers sequence, timestamp, and payload. Computed in-memory only — no extra disk I/O per entry (~15-30ns).
+2. **Chain definition** — `chain(S) = BLAKE3(raw bytes of entries 1..=S ‖ anchor)`, where "raw bytes" are the entries exactly as written on disk, CRC trailers included. An empty segment's chain value is its anchor. Because the definition is over the byte stream, the chain over a sealed segment can be recomputed by any tool that can hash a byte range — no journal-aware decoding required.
 
-3. **Checkpoint entries** — auto-emitted every 100K events. Contains the current chain hash and event count. The reader verifies both at each checkpoint; mismatches produce `HashChainMismatch`. The checkpoint itself is hashed into the chain for continuity.
+3. **Cost** — entries are absorbed into an incremental hasher (~15-30 ns each, in memory only). The 32-byte value is finalized on demand — at fsync boundaries (for snapshot coordination), at snapshot saves, and at rotation — never per entry.
 
-4. **Rotation continuity** — on journal rotation, the new journal's genesis hash is the old journal's final chain hash. This provides cryptographic linkage across rotation boundaries.
+4. **Rotation continuity** — the new segment's header anchor is the outgoing segment's tail chain hash. Recovery verifies this link *before* replaying each segment, so a tampered, missing, or foreign archive is rejected before any of its events reach the engine.
 
-5. **Snapshot integration** — snapshots store the chain hash (v6+ header). Recovery from snapshot seeds the chain so verification continues without replaying from genesis.
+5. **Snapshot integration** — snapshots store the chain hash at their anchor sequence; recovery cross-checks it against the journal (see Recovery with Snapshots above).
 
 ### What It Detects
 
-- **Tampered entries** — modifying any byte in any entry breaks the chain at the next checkpoint.
-- **Reordered entries** — entries hashed in a different order produce a different chain hash.
-- **Replica divergence** — a replica replaying events can compare checkpoint hashes to prove it processed the same events in the same order.
-- **Snapshot/journal mismatch** — at recovery from a snapshot, the journal's computed chain hash at the snapshot's anchor sequence must match the hash the snapshot recorded. Mismatch rejects the pair before any state is restored, catching snapshots paired with the wrong cluster's journal, divergent histories, or pre-anchor tampering.
+- **Tampered entries** — even a CRC-consistent rewrite (payload altered, CRC recomputed) changes the segment's tail hash and breaks the link to the next segment's anchor or the snapshot cross-check. (Plain bit-flips are caught earlier, by per-entry CRC32C.)
+- **Reordered, inserted, or removed entries** — any change to the byte stream changes the chain.
+- **Snapshot/journal mismatch** — a snapshot paired with the wrong cluster's journal, a divergent history, or pre-anchor tampering is rejected before any state is restored.
+- **Lineage breaks** — a missing archive between two surviving segments, or an archive from another deployment spliced into the directory.
 
 ### What It Does NOT Detect
 
-- **Tamper between the last checkpoint and EOF** — the chain diverges but there's no subsequent checkpoint to catch it. A final checkpoint on shutdown would close this gap.
-- **Truncation attacks** — removing entries from the end produces a valid (shorter) chain. Sequence numbers detect this if the expected sequence is known.
+- **Tamper in the live segment after the last snapshot anchor** — nothing has committed to those bytes yet. (An attacker with that level of access could equally truncate the tail, which is likewise undetectable in any design; sealing the segment — rotation — or the next snapshot closes the window.)
+- **Truncation attacks** — removing entries from the end of the live segment produces a valid (shorter) chain. Sequence numbers detect this if the expected sequence is known externally.
 
 ## Journal Rotation
 
-When the journal file exceeds the configured size threshold (`--max-journal-mib`, default 256 MiB), rotation triggers at startup:
+When the live segment exceeds the configured size threshold (`--max-journal-mib`, default 256 MiB), or an operator issues `ROTATE`, the journal stage rotates at the next fsync boundary — while the engine is live:
 
-1. **Save snapshot** at the current sequence boundary (includes chain hash).
-2. **Archive old journal** by renaming: `melin.journal` → `melin.journal.1` (bumping existing archives: `.1` → `.2`, etc.).
-3. **Create new journal** continuing from the same sequence with a genesis hash = old chain hash.
+1. **Archive the live segment** by renaming it to the next monotonic slot (`melin.journal` → `melin.journal.000042`).
+2. **Create a new live segment** at the original path. Its header records the continuing sequence number and an anchor equal to the old segment's tail chain hash. No snapshot is taken and **no sequence number is consumed** — the next event gets exactly the sequence it would have without the rotation.
 
-Recovery from snapshot + new journal produces identical state. Old journals are kept for audit.
+Recovery walks archives in order, then the live segment. Old segments are kept for audit. See [Journal Rotation & Recovery](journal-rotation.md) for crash windows and operational guidance.
 
 ## Pipeline Architecture
 
@@ -399,7 +391,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. Current journal version: **9**. Current snapshot version: **12**.
+Both the journal and snapshot have independent `format_version` fields. Current journal version: **14**. Current snapshot version: **12**.
 
 ### Journal Version History
 
@@ -414,6 +406,9 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 7 | Added `ProvisionAccount` (tag=12), `Withdraw` (tag=13); signed fees (i16); `CancelOrder` now includes `account_id` |
 | 8 | Added `post_only` flag to Limit order type (wire tag=4); `LimitPostOnly` variant |
 | 9 | Added `ExpireOrders` (tag=15), `EndOfDay` (tag=14), `DisableInstrument` (tag=16), `EnableInstrument` (tag=17), `RemoveInstrument` (tag=18); conditional `expiry_ns` in Order encoding for GTD; Day and GTD time-in-force variants |
+| 10-12 | Per-entry `key_hash` + `request_seq` metadata (idempotency dedup); transport/application event-tag split |
+| 13 | Entry offset fixed at 4096 regardless of device sector size, so journals are interchangeable between the buffered and O_DIRECT writers |
+| 14 | Chain metadata moved out of the entry stream: file header gained `starting_sequence`, `anchor_hash`, and a header CRC; `GenesisHash` and `Checkpoint` entry tags retired. The chain is anchored per segment and schedule-free; sequence numbers are dense over real events |
 
 ### Snapshot Version History
 
@@ -434,9 +429,8 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 
 ### Compatibility Rules
 
-- The journal reader accepts v5, v7, v8, and v9 files. V5 journals lack hash chain verification; v7-v8 lack newer event types but are otherwise compatible.
+- **Pre-production policy:** the journal reader accepts only the current format version. Older versions are rejected with `UnsupportedVersion`; migrate via the snapshot-boundary procedure below.
 - The snapshot reader accepts recent versions with backward-compatible loading. Older snapshots may lack fields (fee schedules, key HWMs, instrument status, expiry) which default to safe values on load.
-- Older versions are rejected with `UnsupportedVersion`.
 
 ## Migration Procedure
 
@@ -488,7 +482,7 @@ Inserting a field in the middle or changing field sizes breaks all entries in th
 
 The journal grows monotonically. Pre-allocation extends it in 256 MiB chunks. A single entry is ~40-85 bytes, so 256 MiB covers roughly 3.2M-6.4M entries before the next allocation.
 
-At sustained 830K orders/sec (with fsync), the journal grows at ~50-70 MB/sec. Journal rotation triggers at startup when the file exceeds `--max-journal-mib` (default 256 MiB), creating a snapshot and archiving the old journal.
+At sustained 830K orders/sec (with fsync), the journal grows at ~50-70 MB/sec. Journal rotation triggers live, at the fsync boundary after the segment exceeds `--max-journal-mib` (default 256 MiB), archiving the old segment — see [Journal Rotation & Recovery](journal-rotation.md).
 
 ### Sequence Numbers
 
@@ -505,15 +499,16 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 | `InvalidFile` | Bad magic bytes | Wrong file, not a journal |
 | `UnsupportedVersion` | Format version mismatch | Need matching engine version (see Migration) |
 | `CorruptEntry` | Unknown tag, invalid field | Real corruption — investigate storage |
-| `ChecksumMismatch` | CRC32C validation failed | Bit rot or partial write — investigate storage |
-| `SequenceGap` | Non-contiguous sequence numbers | Corruption or file truncation — investigate |
+| `ChecksumMismatch` | CRC32C validation failed (entry or file header) | Bit rot or partial write — investigate storage |
+| `SequenceGap` | Non-contiguous sequence numbers, or a segment's first entry disagreeing with its header | Corruption, file truncation, or a misplaced segment — investigate |
+| `SequenceDuplicate` | A sequence number repeated | Writer bug or storage anomaly — investigate |
 | `TruncatedEntry` | Incomplete entry at EOF | Normal crash recovery — entry is discarded |
-| `HashChainMismatch` | BLAKE3 chain hash verification failed at checkpoint | Tampered or corrupt entry between checkpoints — investigate |
+| `SegmentChainBreak` | A segment's header anchor does not equal the previous segment's tail chain hash | Tampered archive, missing segment, or foreign segment spliced in — investigate before trusting the history |
 | `Io` | Underlying I/O error | Disk failure, permissions, full disk |
 
 ### Limitations
 
-- **Startup-only rotation** — journal rotation triggers at startup when the file exceeds the size threshold. Runtime rotation (during sustained load) is not yet implemented.
 - **No output event log** — execution reports are not persisted. Audit trail requires replaying the journal.
 - **Single journal file** — no striping or parallel writes. The journal is single-threaded by design (LMAX architecture).
 - **No encryption** — journal and snapshot files are plaintext binary. Sensitive data (account IDs, order details) is visible to anyone with file access.
+- **No cross-node chain comparison at runtime** — each node verifies its own journal's integrity locally. Comparing chain values between primary and replica requires aligned segment boundaries (primary-driven rotation), tracked on the roadmap.
