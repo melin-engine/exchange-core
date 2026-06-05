@@ -2860,10 +2860,6 @@ fn rotation_soak_under_load() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // QueryStats requires operator perm; this client is a trader, so the
-    // unauthenticated health endpoint is the way to read journal_seq.
-    let (_, pre_seq, _, _) = query_health(primary.health_addr).expect("primary health");
-
     // Clean shutdown via SIGINT.
     drop(client);
     unsafe {
@@ -2960,14 +2956,20 @@ fn rotation_soak_under_load() {
     wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(30));
     wait_healthy(primary2.health_addr, Duration::from_secs(30));
 
-    // The health endpoint exposes the pipeline's `journal_cursor`, which
-    // is a since-startup counter — not the absolute on-disk sequence. To
-    // validate that recovery picked up every archived segment, submit one
-    // order on the recovered primary and then read the live segment from
-    // disk after shutdown: its last sequence must be strictly greater
-    // than the pre-shutdown high-water mark, which is only possible if
-    // the writer's `next_sequence` was correctly seeded from the
-    // multi-segment archive walk on startup.
+    // To validate that recovery picked up every archived segment, submit
+    // one order on the recovered primary and then read the live segment
+    // from disk after shutdown: its tail must be strictly greater than
+    // `p_last`, the dense-walk on-disk tail captured before the restart —
+    // only possible if the writer's `next_sequence` was correctly seeded
+    // from the multi-segment archive walk on startup.
+    //
+    // `p_last` is the only valid baseline here. The health endpoint's
+    // `journal_seq` is the pipeline's journal CURSOR, which advances for
+    // every consumed slot including read-only queries that are never
+    // journaled (each client connect's request-seq adopt is one), so it
+    // overshoots the on-disk sequence and the comparison would then
+    // hinge on whether a 250 ms tick happens to fire during the restarted
+    // primary's sub-second life — a coin flip that made this assert flaky.
     let mut client2 = connect_with_timeout(primary2.client_addr, &key);
     submit_resting_burst(&mut client2, total_orders + 1, 1);
     // Allow the order to fsync before shutdown.
@@ -2992,9 +2994,10 @@ fn rotation_soak_under_load() {
     while reader.next_entry().expect("scan live").is_some() {}
     let post_disk_seq = reader.last_sequence().unwrap_or(0);
     assert!(
-        post_disk_seq > pre_seq,
-        "post-restart live tail seq ({post_disk_seq}) must exceed pre-shutdown ({pre_seq}) — \
-         indicates multi-segment recovery reseeded the writer at the right place"
+        post_disk_seq > p_last,
+        "post-restart live tail seq ({post_disk_seq}) must exceed the pre-restart on-disk \
+         tail ({p_last}) — indicates multi-segment recovery reseeded the writer at the \
+         right place"
     );
 }
 
