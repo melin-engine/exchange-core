@@ -14,7 +14,8 @@ path = "src/lib.rs"
 
 [features]
 ## BLAKE3 tamper-evident hash chain. Hashes every journal entry into a
-## cryptographic chain verified at checkpoints. Catches deliberate
+## per-segment chain anchored in the segment header and verified at
+## segment boundaries and snapshot anchors. Catches deliberate
 ## tampering (CRC32C only catches corruption). Adds ~15-30 ns per event.
 hash-chain = ["dep:blake3"]
 ## Open the journal *without* `O_DIRECT`. Writes still go through the

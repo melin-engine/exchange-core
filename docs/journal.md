@@ -444,6 +444,25 @@ When changing the journal or snapshot format (adding fields, changing encoding, 
    - The snapshot must also be at the new version. If the snapshot format changed, the old engine must produce a snapshot in the new format, or a one-time migration tool must convert it.
 4. **Archive the old journal** for audit purposes. It can only be replayed by the old engine version.
 
+### Upgrading a Replicated Deployment
+
+The replication protocol does not negotiate versions: a format bump changes
+both the on-disk journal and the replication frames, so mixed-version pairs
+fail fast at the connection (a reconnect loop on the replica — not data
+corruption). Upgrade the primary and all replicas together:
+
+1. Follow the standard upgrade on the primary (snapshot → deploy → fresh
+   journal from the snapshot).
+2. Deploy the new version on every replica and start each with a clean
+   journal directory, archiving its old files for audit alongside the
+   primary's. Replicas re-bootstrap from the new primary automatically —
+   via catch-up or snapshot transfer — and their new journals carry the
+   primary's lineage identity.
+
+Do not leave a replica on the old version expecting it to resume after the
+primary upgrades: its journal cannot continue under the new format, and the
+stream will not decode.
+
 ### Why This Works
 
 - The snapshot captures the Exchange state completely — no journal replay needed for entries before the snapshot.
