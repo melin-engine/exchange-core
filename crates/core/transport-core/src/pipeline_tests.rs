@@ -670,6 +670,105 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     assert_eq!(report.entries, 6, "six allocated events across both phases");
 }
 
+/// Replica half of the sequence-space invariant: the replica's ack
+/// cursors (`last_seq` feeds the reconnect handshake and, through
+/// `FsyncState`, the durable ack the primary's gate counts) must track
+/// the primary-stamped sequences exactly — a replica-*local* rotation
+/// must consume none. Rotations are local in production (segment
+/// boundaries diverge across nodes), so a writer-internal entry on the
+/// replica side would inflate its acks relative to the primary's wire
+/// space even with a fully-correct primary — the mirror image of the
+/// pre-v14 drift, invisible to every primary-side test.
+///
+/// Feed the replica pipeline pre-assigned sequences (the slot shape the
+/// replication receiver produces), rotate its journal mid-stream, and
+/// assert its durable cursor and on-disk lineage land exactly on the
+/// primary's high-water mark. The dense-sequence walk inside
+/// `verify_lineage` additionally fails loudly if a local entry ever
+/// collides with a primary-stamped sequence.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica_local_rotation.journal");
+
+    // Fresh-replica creation path: segment header identity comes from
+    // the primary's StreamStart in production.
+    let writer = Writer::create_continuing(&path, 1, [0xB7u8; 32]).unwrap();
+    let replica = build_replica_pipeline(
+        TestApp::new(),
+        writer,
+        MAX_JOURNAL_BATCH,
+        Duration::ZERO,
+        false,
+        false,
+    );
+    let mut input_producer = replica.input_producer;
+    let mut journal_stage = replica.journal_stage;
+    let matching_stage = replica.matching_stage;
+    let last_seq = Arc::clone(&replica.last_seq);
+
+    let rotate_flag = Arc::new(AtomicBool::new(false));
+    journal_stage.set_rotation(
+        /* max_journal_bytes */ 0,
+        Some(Arc::clone(&rotate_flag)),
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    // Primary-stamped stream, sequences 1..=3, then a local rotation,
+    // then 4..=5. The replica must consume the stamped values verbatim.
+    for seq in 1..=3u64 {
+        input_producer.publish(add_slot_with_seq(seq * 10, seq, 1_000_000_000 + seq));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while last_seq.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rotate_flag.store(true, Ordering::Release);
+
+    input_producer.publish(add_slot_with_seq(40, 4, 1_000_000_004));
+    let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !archive_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(archive_path.exists(), "rotation did not produce an archive");
+    input_producer.publish(add_slot_with_seq(50, 5, 1_000_000_005));
+
+    // The durable ack cursor must converge on exactly the last
+    // primary-stamped sequence. Overshoot means a replica-local entry
+    // consumed a sequence — the replica would ack events the primary
+    // never sent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while last_seq.load(Ordering::Acquire) < 5 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        last_seq.load(Ordering::Acquire),
+        5,
+        "replica ack cursor diverged from primary-stamped sequences — a \
+         replica-local writer entry is consuming sequences"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let _app = t_matching.join().unwrap();
+
+    let report = melin_journal::segment::verify_lineage::<TestEvent>(&path).unwrap();
+    assert_eq!(report.segments, 2, "expected archive + live after rotation");
+    assert_eq!(
+        report.last_sequence,
+        Some(5),
+        "replica on-disk lineage diverged from the primary-stamped stream"
+    );
+    assert_eq!(report.entries, 5, "exactly the five primary entries");
+}
+
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
 /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
 /// entries must carry the primary's sequence numbers, not locally
