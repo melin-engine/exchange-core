@@ -88,6 +88,16 @@ struct UringTransport {
     ack_buf: Vec<u8>,
     ack_offset: usize,
     ack_in_flight: bool,
+    /// Newest ack accepted while a SEND was in flight — sent the moment
+    /// the in-flight SEND's CQE is reaped (send-latest-on-completion).
+    /// `Option<Ack>` rather than a queue: ack cursors are cumulative
+    /// and monotonic, so when several acks arrive while one send is in
+    /// flight only the newest pair needs the wire — intermediate values
+    /// are subsumed. Exactly one SEND is ever outstanding, which keeps
+    /// the TCP byte stream ordered (io_uring gives no ordering between
+    /// independent SQEs, and interleaved partial sends would corrupt
+    /// the frame stream).
+    pending_ack: Option<Ack>,
 }
 
 impl UringTransport {
@@ -159,7 +169,34 @@ impl UringTransport {
             ack_buf: Vec::with_capacity(64),
             ack_offset: 0,
             ack_in_flight: false,
+            pending_ack: None,
         })
+    }
+
+    /// Encode `ack` into the send buffer and push its SEND SQE. The
+    /// caller is responsible for submitting (next `ring.submit()` —
+    /// either `poll_recv`'s top-of-call submit or the eager submit
+    /// after a chained send). Must only be called with no SEND in
+    /// flight: the buffer is pinned by `ack_in_flight` until the CQE.
+    fn push_ack_send(&mut self, ack: &Ack) {
+        use io_uring::{opcode, types};
+
+        debug_assert!(!self.ack_in_flight);
+        self.ack_buf.clear();
+        encode_ack(ack, &mut self.ack_buf);
+        let sqe = opcode::Send::new(
+            types::Fixed(0),
+            self.ack_buf.as_ptr(),
+            self.ack_buf.len() as u32,
+        )
+        .build()
+        .user_data(TOKEN_SEND);
+        // SAFETY: `ack_buf` is owned by this transport and pinned by
+        // `ack_in_flight = true` until the matching CQE is reaped. The
+        // ring is single-threaded.
+        unsafe { self.ring.submission().push(&sqe).expect("SQ full") };
+        self.ack_in_flight = true;
+        self.ack_offset = 0;
     }
 }
 
@@ -195,6 +232,10 @@ impl ReceiverTransport for UringTransport {
         }
 
         let mut any_recv = false;
+        // Set when a queued ack is chained onto a completed SEND below —
+        // it must hit the wire within THIS call, not ride the next
+        // poll_recv's top-of-call submit one loop iteration later.
+        let mut submit_chained_ack = false;
 
         for &(token, result, flags) in &cqes[..cqe_count] {
             match token {
@@ -261,6 +302,16 @@ impl ReceiverTransport for UringTransport {
                         self.ack_buf.clear();
                         self.ack_offset = 0;
                         self.ack_in_flight = false;
+                        // Send-latest-on-completion: an ack accepted
+                        // while this send was in flight goes out now
+                        // instead of waiting a full loop iteration for
+                        // the next flush. Chained only after FULL
+                        // completion — a partial send's remainder keeps
+                        // exclusive ownership of the byte stream.
+                        if let Some(ack) = self.pending_ack.take() {
+                            self.push_ack_send(&ack);
+                            submit_chained_ack = true;
+                        }
                     } else {
                         // Partial send — resubmit remainder.
                         let sqe = opcode::Send::new(
@@ -287,33 +338,33 @@ impl ReceiverTransport for UringTransport {
             self.multishot_active = true;
         }
 
+        // Flush a chained ack to the kernel before returning (also
+        // carries any multishot resubmission pushed above).
+        if submit_chained_ack {
+            self.ring.submit()?;
+        }
+
         Ok(any_recv)
     }
 
     fn send_ack(&mut self, ack: &Ack) -> io::Result<bool> {
-        use io_uring::{opcode, types};
-
         if self.ack_in_flight {
-            return Ok(false);
+            // Coalesce: overwrite any previously queued value — the
+            // cursors are cumulative, so the newest pair subsumes
+            // everything before it. Sent on the in-flight SEND's CQE.
+            self.pending_ack = Some(*ack);
+            return Ok(true);
         }
-
-        self.ack_buf.clear();
-        encode_ack(ack, &mut self.ack_buf);
-        let sqe = opcode::Send::new(
-            types::Fixed(0),
-            self.ack_buf.as_ptr(),
-            self.ack_buf.len() as u32,
-        )
-        .build()
-        .user_data(TOKEN_SEND);
-        unsafe { self.ring.submission().push(&sqe).expect("SQ full") };
-        self.ack_in_flight = true;
-        self.ack_offset = 0;
+        self.push_ack_send(ack);
         Ok(true)
     }
 
     fn ack_in_flight(&self) -> bool {
-        self.ack_in_flight
+        // Pending counts as in flight: the drain paths use this to mean
+        // "everything offered has reached the wire", and the flush gate
+        // in `streaming_loop` recomputes a fresh ack next iteration
+        // anyway.
+        self.ack_in_flight || self.pending_ack.is_some()
     }
 
     fn is_connected(&mut self) -> bool {
@@ -757,5 +808,113 @@ where
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    use melin_transport_core::replication::protocol::{ReplicaMessage, decode_replica_message};
+
+    /// Connected localhost pair: (transport side, peer side).
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn ack(seq: u64) -> Ack {
+        Ack {
+            acked_sequence: seq,
+            in_memory_sequence: seq,
+        }
+    }
+
+    /// Drive `poll_recv` until every accepted ack has reached the wire.
+    fn flush_acks(transport: &mut UringTransport) {
+        let mut recv_buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while transport.ack_in_flight() {
+            transport.poll_recv(&mut recv_buf).unwrap();
+            assert!(Instant::now() < deadline, "ack send never completed");
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Read `expect` length-prefixed ack frames from the peer socket.
+    fn read_acks(peer: &mut TcpStream, expect: usize) -> Vec<Ack> {
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        let mut acks = Vec::new();
+        while acks.len() < expect {
+            let n = peer.read(&mut chunk).expect("peer read");
+            assert!(n > 0, "peer closed before all acks arrived");
+            buf.extend_from_slice(&chunk[..n]);
+            // Parse complete frames.
+            loop {
+                if buf.len() < 4 {
+                    break;
+                }
+                let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+                if buf.len() < 4 + len {
+                    break;
+                }
+                match decode_replica_message(&buf[4..4 + len]).expect("decodable frame") {
+                    ReplicaMessage::Ack(a) => acks.push(a),
+                    other => panic!("expected Ack frame, got {other:?}"),
+                }
+                buf.drain(..4 + len);
+            }
+        }
+        assert!(buf.is_empty(), "trailing bytes after expected acks");
+        acks
+    }
+
+    #[test]
+    fn coalesces_to_latest_ack_while_send_in_flight() {
+        let (client, mut peer) = socket_pair();
+        let mut transport = UringTransport::new(&client).unwrap();
+
+        // First ack goes straight onto the wire path; the next two are
+        // accepted while it is in flight (the flag clears only when the
+        // CQE is reaped in poll_recv, so this is deterministic) and
+        // coalesce — only the newest survives.
+        assert!(transport.send_ack(&ack(1)).unwrap());
+        assert!(transport.ack_in_flight());
+        assert!(transport.send_ack(&ack(2)).unwrap());
+        assert!(transport.send_ack(&ack(3)).unwrap());
+
+        flush_acks(&mut transport);
+
+        // Exactly two frames, in cursor order: ack(2) was subsumed.
+        let acks = read_acks(&mut peer, 2);
+        let seqs: Vec<u64> = acks.iter().map(|a| a.acked_sequence).collect();
+        assert_eq!(seqs, vec![1, 3]);
+    }
+
+    #[test]
+    fn sequential_acks_all_reach_the_wire_in_order() {
+        let (client, mut peer) = socket_pair();
+        let mut transport = UringTransport::new(&client).unwrap();
+
+        for seq in 1..=3 {
+            assert!(transport.send_ack(&ack(seq)).unwrap());
+            flush_acks(&mut transport);
+        }
+
+        let acks = read_acks(&mut peer, 3);
+        let seqs: Vec<u64> = acks.iter().map(|a| a.acked_sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
     }
 }

@@ -44,12 +44,18 @@ pub(super) trait ReceiverTransport {
 
     /// Queue an ack for sending to the primary.
     ///
-    /// Returns `true` if the ack was accepted (sent or queued).
-    /// Returns `false` if an ack is already in flight (caller retries
-    /// next iteration). Returns `Err` on fatal send error.
+    /// Returns `true` if the ack was accepted (sent or queued —
+    /// implementations may coalesce a queued ack with a newer one,
+    /// since cursors are cumulative and the newest pair subsumes
+    /// everything before it; an accepted ack's *progress* is always
+    /// eventually delivered while the connection lives). Returns
+    /// `false` if the ack was not accepted (caller retries next
+    /// iteration). Returns `Err` on fatal send error.
     fn send_ack(&mut self, ack: &Ack) -> io::Result<bool>;
 
-    /// Whether an ack send is currently in-flight.
+    /// Whether any accepted ack has not yet fully reached the wire.
+    /// The flush path skips composing new acks while true; the drain
+    /// paths poll on it to flush final acks before session exit.
     fn ack_in_flight(&self) -> bool;
 
     /// Whether the underlying connection is still active.
