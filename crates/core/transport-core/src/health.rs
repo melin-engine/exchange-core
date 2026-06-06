@@ -110,6 +110,11 @@ struct HealthSnapshot {
     per_replica_bytes_sent: [u64; 2],
     /// Per-replica ack round-trip latency in microseconds.
     per_replica_ack_latency_us: [u64; 2],
+    /// Per-replica cumulative valid-ack count (monotonic across
+    /// reconnects). Δacked_sequence / Δacks_received between two
+    /// samples gives the mean ack quantum — how many sequences each
+    /// cursor advance covers.
+    per_replica_acks_received: [u64; 2],
     /// Per-replica catch-up state.
     per_replica_catching_up: [bool; 2],
     /// Per-replica last acked sequence number.
@@ -192,6 +197,7 @@ impl HealthSnapshot {
             [u64; 2],
             [u64; 2],
             [u64; 2],
+            [u64; 2],
             [bool; 2],
             u64,
         );
@@ -201,6 +207,7 @@ impl HealthSnapshot {
             per_replica_lag,
             per_replica_bytes_sent,
             per_replica_ack_latency_us,
+            per_replica_acks_received,
             per_replica_catching_up,
             evictions_total,
         ): ReplMetricsTuple = if let Some(ref rm) = state.replication_metrics {
@@ -232,14 +239,29 @@ impl HealthSnapshot {
                 rm.ack_latency_us[0].load(Ordering::Relaxed),
                 rm.ack_latency_us[1].load(Ordering::Relaxed),
             ];
+            let acks = [
+                rm.acks_received[0].load(Ordering::Relaxed),
+                rm.acks_received[1].load(Ordering::Relaxed),
+            ];
             let catching = [
                 rm.catching_up[0].load(Ordering::Relaxed),
                 rm.catching_up[1].load(Ordering::Relaxed),
             ];
             let evictions = rm.evictions_total.load(Ordering::Relaxed);
-            (acked, in_memory, lag, bytes, latency, catching, evictions)
+            (
+                acked, in_memory, lag, bytes, latency, acks, catching, evictions,
+            )
         } else {
-            ([0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
+            (
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [false, false],
+                0,
+            )
         };
 
         // Per-slot replication ring depth: producer_cursor - consumer.processed.
@@ -283,6 +305,7 @@ impl HealthSnapshot {
             per_replica_lag,
             per_replica_bytes_sent,
             per_replica_ack_latency_us,
+            per_replica_acks_received,
             per_replica_catching_up,
             per_replica_acked_sequence,
             per_replica_in_memory_sequence,
@@ -387,6 +410,10 @@ impl HealthSnapshot {
              # TYPE melin_replica_ack_latency_us gauge\n\
              melin_replica_ack_latency_us{{slot=\"0\"}} {}\n\
              melin_replica_ack_latency_us{{slot=\"1\"}} {}\n\
+             # HELP melin_replica_acks_received_total Cumulative valid ack frames recorded per replica slot.\n\
+             # TYPE melin_replica_acks_received_total counter\n\
+             melin_replica_acks_received_total{{slot=\"0\"}} {}\n\
+             melin_replica_acks_received_total{{slot=\"1\"}} {}\n\
              # HELP melin_replica_catching_up Whether each replica is catching up from journal (1) or live (0).\n\
              # TYPE melin_replica_catching_up gauge\n\
              melin_replica_catching_up{{slot=\"0\"}} {}\n\
@@ -437,6 +464,8 @@ impl HealthSnapshot {
             self.per_replica_bytes_sent[1],
             self.per_replica_ack_latency_us[0],
             self.per_replica_ack_latency_us[1],
+            self.per_replica_acks_received[0],
+            self.per_replica_acks_received[1],
             catching_0,
             catching_1,
             self.evictions_total,

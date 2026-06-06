@@ -30,6 +30,14 @@ pub struct ReplicationMetrics {
     /// Per-slot ack round-trip latency in microseconds. Updated on
     /// each ack by measuring elapsed time since the last batch send.
     pub ack_latency_us: [AtomicU64; 2],
+    /// Per-slot cumulative count of valid `Ack` frames recorded
+    /// (monotonic across reconnects — never reset on disconnect, like
+    /// `bytes_sent`). Dividing the growth of `acked_sequence` /
+    /// `in_memory_sequence` by the growth of this counter between two
+    /// health samples gives the mean ack quantum — how many sequences
+    /// each cursor advance covers, the number that bounds the
+    /// durability gate's queueing delay under load.
+    pub acks_received: [AtomicU64; 2],
     /// Per-slot catch-up state: true while streaming historical
     /// journal entries, false once the replica enters live mode.
     pub catching_up: [AtomicBool; 2],
@@ -45,6 +53,7 @@ impl Default for ReplicationMetrics {
             in_memory_sequence: [AtomicU64::new(0), AtomicU64::new(0)],
             bytes_sent: [AtomicU64::new(0), AtomicU64::new(0)],
             ack_latency_us: [AtomicU64::new(0), AtomicU64::new(0)],
+            acks_received: [AtomicU64::new(0), AtomicU64::new(0)],
             catching_up: [AtomicBool::new(false), AtomicBool::new(false)],
             evictions_total: AtomicU64::new(0),
         }

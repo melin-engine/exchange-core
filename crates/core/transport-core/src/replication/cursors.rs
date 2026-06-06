@@ -50,12 +50,44 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tracing::error;
+
 use super::metrics::ReplicationMetrics;
 use super::protocol::Ack;
 
 /// Number of replica slots. Fixed by the `1 primary + 2 replicas`
 /// topology cap (see `ReplicationMetrics` for the same rationale).
 const SLOTS: usize = 2;
+
+/// A replica reported a cursor that cannot be true: ahead of what the
+/// primary ever sent it, or with the persisted track ahead of the
+/// in-memory track. Either is a protocol violation (a bug in the
+/// cluster software or a rogue replica binary), never a load effect —
+/// the caller must evict the replica. The violating ack is NOT applied:
+/// advancing the gate's cursors from it would let the durability policy
+/// release client acks against confirmation that never happened — the
+/// exact failure shape of the pre-v14 vacuous-gate incident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckViolation {
+    pub slot: usize,
+    pub acked_sequence: u64,
+    pub in_memory_sequence: u64,
+    /// Highest primary sequence actually streamed to this replica at
+    /// the time the ack arrived.
+    pub highest_sent_sequence: u64,
+}
+
+impl std::fmt::Display for AckViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "replica ack violation (slot {}): acked={} in_memory={} but highest sent={}",
+            self.slot, self.acked_sequence, self.in_memory_sequence, self.highest_sent_sequence
+        )
+    }
+}
+
+impl std::error::Error for AckViolation {}
 
 /// Single owner of the primary's per-replica progress cursors.
 ///
@@ -118,11 +150,50 @@ impl ReplicaCursors {
 
     /// Record a replica's `Ack` frame: advance the slot cursor and the
     /// wire-ack gauge pair, then recompute the shared min/max.
-    pub fn record_ack(&self, slot: usize, ack: &Ack) {
+    ///
+    /// `highest_sent_sequence` is the highest primary sequence the
+    /// caller has actually streamed to this replica (handshake
+    /// baseline, catch-up end, and live ring drains all count). The
+    /// ack-sanity invariant is checked against it at this single store
+    /// site: a replica cannot truthfully confirm sequences it was never
+    /// sent, nor report its persisted track ahead of its in-memory
+    /// track. On violation the ack is NOT applied and the caller must
+    /// evict the replica — see [`AckViolation`]. This is the check that
+    /// turns a v14-class cursor drift into a same-day `error!` log line
+    /// instead of a months-later benchmark anomaly.
+    pub fn record_ack(
+        &self,
+        slot: usize,
+        ack: &Ack,
+        highest_sent_sequence: u64,
+    ) -> Result<(), AckViolation> {
+        if ack.in_memory_sequence > highest_sent_sequence
+            || ack.acked_sequence > ack.in_memory_sequence
+        {
+            let violation = AckViolation {
+                slot,
+                acked_sequence: ack.acked_sequence,
+                in_memory_sequence: ack.in_memory_sequence,
+                highest_sent_sequence,
+            };
+            // error! (not warn/debug): an authenticated cluster member
+            // reporting an impossible cursor is a software bug on one
+            // side of the connection, never client input or load.
+            error!(
+                slot,
+                acked_sequence = ack.acked_sequence,
+                in_memory_sequence = ack.in_memory_sequence,
+                highest_sent_sequence,
+                "replica ack violation — evicting replica"
+            );
+            return Err(violation);
+        }
         self.metrics.acked_sequence[slot].store(ack.acked_sequence, Ordering::Relaxed);
         self.metrics.in_memory_sequence[slot].store(ack.in_memory_sequence, Ordering::Relaxed);
+        self.metrics.acks_received[slot].fetch_add(1, Ordering::Relaxed);
         self.slot_acked[slot].store(ack.acked_sequence + 1, Ordering::Release);
         self.recompute_shared();
+        Ok(())
     }
 
     /// Disengage a slot on disconnect or eviction: zero the gauge pair,
@@ -208,8 +279,8 @@ mod tests {
         let (min, max, metrics, cursors) = store();
         cursors.seed_on_handshake(0, 0);
         cursors.seed_on_handshake(1, 0);
-        cursors.record_ack(0, &ack(10, 15));
-        cursors.record_ack(1, &ack(7, 12));
+        cursors.record_ack(0, &ack(10, 15), 15).expect("valid ack");
+        cursors.record_ack(1, &ack(7, 12), 12).expect("valid ack");
         assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 10);
         assert_eq!(metrics.in_memory_sequence[0].load(Ordering::Relaxed), 15);
         assert_eq!(metrics.acked_sequence[1].load(Ordering::Relaxed), 7);
@@ -223,7 +294,9 @@ mod tests {
     fn second_replica_joining_behind_lowers_the_min_then_catches_up() {
         let (min, max, _, cursors) = store();
         cursors.seed_on_handshake(0, 100);
-        cursors.record_ack(0, &ack(500, 500));
+        cursors
+            .record_ack(0, &ack(500, 500), 500)
+            .expect("valid ack");
         assert_eq!(min.load(Ordering::Acquire), 501);
         // A fresh replica joins having only caught up to 200 — the min
         // must DECREASE (plain store, not fetch_max).
@@ -232,10 +305,14 @@ mod tests {
         assert_eq!(max.load(Ordering::Acquire), 501);
         // It catches up partially, then fully; the min tracks it until
         // the two slots converge.
-        cursors.record_ack(1, &ack(350, 350));
+        cursors
+            .record_ack(1, &ack(350, 350), 500)
+            .expect("valid ack");
         assert_eq!(min.load(Ordering::Acquire), 351);
         assert_eq!(max.load(Ordering::Acquire), 501);
-        cursors.record_ack(1, &ack(500, 500));
+        cursors
+            .record_ack(1, &ack(500, 500), 500)
+            .expect("valid ack");
         assert_eq!(min.load(Ordering::Acquire), 501);
         assert_eq!(max.load(Ordering::Acquire), 501);
     }
@@ -245,8 +322,8 @@ mod tests {
         let (min, max, metrics, cursors) = store();
         cursors.seed_on_handshake(0, 0);
         cursors.seed_on_handshake(1, 0);
-        cursors.record_ack(0, &ack(10, 15));
-        cursors.record_ack(1, &ack(7, 12));
+        cursors.record_ack(0, &ack(10, 15), 15).expect("valid ack");
+        cursors.record_ack(1, &ack(7, 12), 12).expect("valid ack");
         cursors.clear_on_disconnect(1);
         assert_eq!(metrics.acked_sequence[1].load(Ordering::Relaxed), 0);
         assert_eq!(metrics.in_memory_sequence[1].load(Ordering::Relaxed), 0);
@@ -260,7 +337,7 @@ mod tests {
     fn disconnect_of_last_replica_parks_both_cursors() {
         let (min, max, _, cursors) = store();
         cursors.seed_on_handshake(0, 0);
-        cursors.record_ack(0, &ack(10, 15));
+        cursors.record_ack(0, &ack(10, 15), 15).expect("valid ack");
         cursors.clear_on_disconnect(0);
         assert_eq!(min.load(Ordering::Acquire), u64::MAX);
         assert_eq!(max.load(Ordering::Acquire), u64::MAX);
@@ -270,11 +347,70 @@ mod tests {
     fn disconnect_of_never_engaged_slot_is_a_safe_noop() {
         let (min, max, metrics, cursors) = store();
         cursors.seed_on_handshake(0, 0);
-        cursors.record_ack(0, &ack(10, 15));
+        cursors.record_ack(0, &ack(10, 15), 15).expect("valid ack");
         // Slot 1 fails its handshake without ever engaging.
         cursors.clear_on_disconnect(1);
         assert_eq!(min.load(Ordering::Acquire), 11);
         assert_eq!(max.load(Ordering::Acquire), u64::MAX);
         assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn valid_acks_count_toward_acks_received() {
+        let (_, _, metrics, cursors) = store();
+        cursors.seed_on_handshake(0, 0);
+        cursors.record_ack(0, &ack(10, 15), 20).expect("valid ack");
+        cursors.record_ack(0, &ack(15, 20), 20).expect("valid ack");
+        assert_eq!(metrics.acks_received[0].load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.acks_received[1].load(Ordering::Relaxed), 0);
+        // Disconnect zeroes the gauges but not the cumulative counter
+        // (it's a Prometheus-style total, monotonic across reconnects).
+        cursors.clear_on_disconnect(0);
+        assert_eq!(metrics.acks_received[0].load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn ack_ahead_of_highest_sent_is_rejected_and_not_applied() {
+        let (min, max, metrics, cursors) = store();
+        cursors.seed_on_handshake(0, 100);
+        // The replica claims an in-memory cursor past anything the
+        // primary streamed to it — a v14-class impossible cursor.
+        let violation = cursors
+            .record_ack(0, &ack(150, 250), 200)
+            .expect_err("ack beyond highest sent must be rejected");
+        assert_eq!(violation.slot, 0);
+        assert_eq!(violation.in_memory_sequence, 250);
+        assert_eq!(violation.highest_sent_sequence, 200);
+        // Nothing moved: the gate's view still shows the seeded state.
+        assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 100);
+        assert_eq!(metrics.in_memory_sequence[0].load(Ordering::Relaxed), 100);
+        assert_eq!(metrics.acks_received[0].load(Ordering::Relaxed), 0);
+        assert_eq!(min.load(Ordering::Acquire), 101);
+        assert_eq!(max.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn persisted_track_ahead_of_in_memory_is_rejected() {
+        let (_, _, metrics, cursors) = store();
+        cursors.seed_on_handshake(0, 0);
+        // acked (fsynced) can never lead in-memory (received) — the
+        // replica journals what it has accepted into its pipeline.
+        let violation = cursors
+            .record_ack(0, &ack(50, 40), 100)
+            .expect_err("acked > in_memory must be rejected");
+        assert_eq!(violation.acked_sequence, 50);
+        assert_eq!(violation.in_memory_sequence, 40);
+        assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ack_exactly_at_highest_sent_is_valid() {
+        let (min, _, _, cursors) = store();
+        cursors.seed_on_handshake(0, 0);
+        // Boundary: confirming precisely everything sent is legal.
+        cursors
+            .record_ack(0, &ack(200, 200), 200)
+            .expect("boundary ack is valid");
+        assert_eq!(min.load(Ordering::Acquire), 201);
     }
 }

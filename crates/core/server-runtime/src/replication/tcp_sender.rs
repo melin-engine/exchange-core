@@ -442,6 +442,13 @@ fn handle_replica_connection<A: Application>(
         }
     };
 
+    // Highest primary sequence streamed to this replica so far — the
+    // bound the ack-sanity invariant checks acks against, and the
+    // sequence heartbeats advertise. Starts at the catch-up end
+    // (`CatchUpResult::Ok` is monotonic from the handshake value) and
+    // advances with every chunk forwarded below / in the live loop.
+    let mut last_sequence = handshake.last_sequence.max(catchup_end);
+
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up. Only discard entries whose
     // end_sequence is fully covered by the catch-up. Entries beyond
@@ -453,6 +460,7 @@ fn handle_replica_connection<A: Application>(
                 writer.write_all(data)?;
                 writer.flush()?;
                 repl_consumer.commit();
+                last_sequence = meta.end_sequence;
                 break;
             }
             repl_consumer.commit();
@@ -482,7 +490,6 @@ fn handle_replica_connection<A: Application>(
 
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();
-    let mut last_sequence = handshake.last_sequence;
 
     live_stream_uring(
         writer,
@@ -728,7 +735,12 @@ fn live_stream_uring(
                         }
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                         if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
-                            cursors.record_ack(slot_idx, &ack);
+                            // Eviction on violation: returning Err tears the
+                            // connection down; the accept loop's cleanup
+                            // disengages the cursors and frees the slot.
+                            cursors
+                                .record_ack(slot_idx, &ack, *last_sequence)
+                                .map_err(io::Error::other)?;
                             metrics.ack_latency_us[slot_idx]
                                 .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }

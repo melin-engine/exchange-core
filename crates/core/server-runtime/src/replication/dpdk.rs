@@ -367,6 +367,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         Ok(())
                                     };
 
+                                    // Highest sequence streamed during catch-up /
+                                    // snapshot transfer — monotonic from the
+                                    // handshake value. Seeds the slot's sent
+                                    // high-water mark (heartbeats + ack-sanity
+                                    // bound) below.
+                                    let mut catchup_end = h.last_sequence;
                                     let catchup_err = if can_catch_up {
                                         slot.send_buf.clear();
                                         melin_transport_core::replication::catchup::lineage_origin(
@@ -388,7 +394,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                                 &mut dpdk_publish,
                                                 shutdown,
                                             )? {
-                                                CatchUpResult::Ok(_) => Ok(()),
+                                                CatchUpResult::Ok(end) => {
+                                                    catchup_end = end;
+                                                    Ok(())
+                                                }
                                                 CatchUpResult::NeedSnapshot => {
                                                     Err(io::Error::other(
                                                         "catch-up failed unexpectedly after probe",
@@ -403,7 +412,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                             &mut dpdk_publish,
                                             shutdown,
                                         ) {
-                                            Ok(CatchUpResult::Ok(_)) => None,
+                                            Ok(CatchUpResult::Ok(end)) => {
+                                                catchup_end = end;
+                                                None
+                                            }
                                             Ok(CatchUpResult::NeedSnapshot) => {
                                                 Some(io::Error::other(
                                                     "catch-up failed even after snapshot transfer",
@@ -425,7 +437,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         continue;
                                     }
 
-                                    slot.last_sequence = h.last_sequence;
+                                    // Sent high-water mark: everything up to the
+                                    // catch-up end has been streamed (monotonic
+                                    // from the handshake value).
+                                    slot.last_sequence = catchup_end;
                                     slot.last_send = std::time::Instant::now();
 
                                     // Drain overlapping ring entries from catch-up.
@@ -506,8 +521,15 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 let payload = &remaining[payload_start..frame_end];
                                 if let Ok(ReplicaMessage::Ack(ack)) =
                                     decode_replica_message(payload)
+                                    && cursors
+                                        .record_ack(slot_idx, &ack, slot.last_sequence)
+                                        .is_err()
                                 {
-                                    cursors.record_ack(slot_idx, &ack);
+                                    // Eviction on violation: reuse the ack-error
+                                    // teardown below (the store already logged
+                                    // the violation at error level).
+                                    ack_error = true;
+                                    break;
                                 }
                                 consumed += frame_end;
                             }
