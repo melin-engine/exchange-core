@@ -314,6 +314,176 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let _app = handle.join().unwrap();
 }
 
+/// Regression tripwire for the pre-v14 durability-gate hole: the
+/// response gate compares `OutputSlot.wire_seq` (stamped by the
+/// matching stage) against `last_seq` (published by the journal stage
+/// from the writer's allocator) and against replica ack cursors —
+/// which echo allocator sequences stamped on shipped entries. Before
+/// v14, writer-internal entries (auto-emitted checkpoints, rotation
+/// genesis) consumed allocator sequences without ever crossing the
+/// input ring, so wire space fell permanently behind allocator space —
+/// one sequence per checkpoint/rotation — and the replica clauses of
+/// `hybrid` / `durably-replicated` became vacuous within seconds of
+/// uptime: the gate released client acks before any replica held the
+/// order. v14 made the two spaces identical by removing every
+/// writer-internal sequence consumer; this test fails if one
+/// reappears.
+///
+/// The rule-table lockstep test above cannot catch this class — those
+/// entries never appear on the input ring, so no stamping rule is
+/// consulted. Instead, drive the real journal + matching stages over a
+/// stream that includes a segment rotation (a historical drift source)
+/// and assert the three views of the high-water mark agree exactly:
+///
+///   1. the highest `wire_seq` stamped on the output ring,
+///   2. `last_seq` — the gate's primary `persisted` cursor,
+///   3. the last sequence in the on-disk lineage — what a replica
+///      would ack, since shipped entries carry on-disk sequences.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gate_space_agreement.journal");
+
+    let writer = Writer::create(&path).unwrap();
+    let active_conns = Arc::new(AtomicU64::new(0));
+    let mut out = build_pipeline_with_replication(
+        TestApp::new(),
+        writer,
+        Duration::ZERO,
+        active_conns,
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        false,
+        false,
+        false,
+    );
+    let mut input_producer = out.input_producer;
+    let mut journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+    let last_seq = Arc::clone(&out.last_seq);
+    let mut output_consumer = out.output_consumers.pop().unwrap();
+
+    let rotate_flag = Arc::new(AtomicBool::new(false));
+    journal_stage.set_rotation(
+        /* max_journal_bytes */ 0,
+        Some(Arc::clone(&rotate_flag)),
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    // All slots carry `connection_id = 1` so every event — including
+    // the report-less Tick — emits exactly one output slot (same
+    // invariant as the lockstep test above), letting the drain below
+    // count inputs 1:1.
+    let mut req_seq = 0u64;
+    let mut publish = |event: JournalEvent<TestEvent>| {
+        req_seq += 1;
+        input_producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 1,
+            request_seq: req_seq,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000 + req_seq,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+    };
+
+    // Pre-rotation phase: the allocator assigns 1, 2, holds flat for
+    // the query, then 3 for the tick.
+    publish(JournalEvent::App(TestEvent::Add(100)));
+    publish(JournalEvent::App(TestEvent::Add(200)));
+    publish(JournalEvent::App(TestEvent::Query));
+    publish(JournalEvent::Tick { now_ns: 1 });
+
+    // Wait until the pre-rotation entries are durably in the live
+    // segment (last_seq is published post-fsync) so the rotation
+    // boundary genuinely splits the stream. Polled — fixed sleeps
+    // flake on slow CI machines.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while last_seq.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rotate_flag.store(true, Ordering::Release);
+
+    // Post-rotation phase. The rotation itself must consume no
+    // sequence: 4 and 5.
+    publish(JournalEvent::App(TestEvent::Add(50)));
+    let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !archive_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(archive_path.exists(), "rotation did not produce an archive");
+    publish(JournalEvent::App(TestEvent::Add(1000)));
+
+    // Drain one output slot per input event and pin the stamped wire
+    // seqs. A change here means the allocator/wire rule moved — update
+    // only in lockstep with the journal stage's allocation rule.
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
+    let mut spins = 0u64;
+    while outputs.len() < 6 {
+        if let Some((_, slot)) = output_consumer.try_consume() {
+            outputs.push(slot);
+        } else {
+            spins += 1;
+            assert!(spins < 10_000_000, "timeout draining outputs");
+            std::hint::spin_loop();
+        }
+    }
+    let wire_seqs: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
+    assert_eq!(
+        wire_seqs,
+        vec![1, 2, 2, 3, 4, 5],
+        "wire_seq stamping diverged from the journal allocator's rule"
+    );
+    const MAX_WIRE_SEQ: u64 = 5;
+
+    // View 2: the gate's primary `persisted` cursor must converge on
+    // exactly the wire high-water mark. Poll for catch-up (the fsync
+    // publish runs on the journal thread), then assert equality — an
+    // allocator running ahead of wire space overshoots and fails
+    // immediately rather than timing out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while last_seq.load(Ordering::Acquire) < MAX_WIRE_SEQ && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        last_seq.load(Ordering::Acquire),
+        MAX_WIRE_SEQ,
+        "gate persisted cursor diverged from wire space — a writer-internal \
+         entry is consuming sequences again (the pre-v14 vacuous-gate bug)"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let _app = t_matching.join().unwrap();
+
+    // View 3: what a replica would ack. Shipped entries carry on-disk
+    // sequences, so the lineage's last sequence is the replica-side
+    // view of the same high-water mark. Two segments prove the
+    // rotation actually exercised the historical drift source.
+    let report = melin_journal::segment::verify_lineage::<TestEvent>(&path).unwrap();
+    assert_eq!(report.segments, 2, "expected archive + live after rotation");
+    assert_eq!(
+        report.last_sequence,
+        Some(MAX_WIRE_SEQ),
+        "on-disk lineage diverged from wire space — replica acks would run \
+         ahead of the response gate's wire_seq (the pre-v14 vacuous-gate bug)"
+    );
+    assert_eq!(
+        report.entries, 5,
+        "five allocated events expected (the query is not journaled)"
+    );
+}
+
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
 /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
 /// entries must carry the primary's sequence numbers, not locally
