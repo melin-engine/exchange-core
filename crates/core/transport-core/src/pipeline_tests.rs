@@ -484,6 +484,192 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     );
 }
 
+/// Recovery-seam sibling of
+/// [`allocator_wire_seq_and_gate_cursor_agree_across_rotation`]: the
+/// agreement must *survive recovery*. The pipeline builder derives
+/// `starting_wire_seq` (and the gate cursor's initial value) from the
+/// recovered writer's allocator, which `open_append` reconstitutes from
+/// the on-disk lineage — a misinitialization anywhere along that chain
+/// re-opens the off-by-`starting` gate hole the lockstep test's
+/// `STARTING_WIRE_SEQ = 10` comment warns about, but only on restarted
+/// nodes, where no fresh-journal test can see it.
+///
+/// Phase 1 journals four events across a rotation and shuts down.
+/// Phase 2 recovers through the production path (`recover` →
+/// `into_parts` → pipeline builder), then asserts:
+///   - the gate cursor resumes at exactly the recovered high-water mark
+///     (before any new event),
+///   - a query arriving before any post-recovery allocation stamps that
+///     same mark (the gate must satisfy it from recovered state),
+///   - new allocations continue the wire space with no gap or overlap,
+///   - the on-disk lineage tail agrees after the second shutdown.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn recovery_resumes_allocator_wire_and_gate_agreement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gate_recovery_agreement.journal");
+
+    // Slot builder shared by both phases. `request_seq` increases
+    // monotonically across the recovery boundary so replayed dedup
+    // state can never collide with phase-2 traffic.
+    let mut req_seq = 0u64;
+    let mut make_slot = |event: JournalEvent<TestEvent>| {
+        req_seq += 1;
+        InputSlot {
+            connection_id: 1,
+            key_hash: 1,
+            request_seq: req_seq,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000 + req_seq,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        }
+    };
+
+    // --- Phase 1: journal events 1..=4 across a rotation, shut down ---
+    {
+        let writer = Writer::create(&path).unwrap();
+        let active_conns = Arc::new(AtomicU64::new(0));
+        let mut out = build_pipeline_with_replication(
+            TestApp::new(),
+            writer,
+            Duration::ZERO,
+            active_conns,
+            false,
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+            false,
+            false,
+            false,
+        );
+        let mut input_producer = out.input_producer;
+        let mut journal_stage = out.journal_stage;
+        let matching_stage = out.matching_stage;
+        let last_seq = Arc::clone(&out.last_seq);
+
+        let rotate_flag = Arc::new(AtomicBool::new(false));
+        journal_stage.set_rotation(
+            /* max_journal_bytes */ 0,
+            Some(Arc::clone(&rotate_flag)),
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s1 = Arc::clone(&shutdown);
+        let s2 = Arc::clone(&shutdown);
+        let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+        let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+        for n in 1..=3u64 {
+            input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(n))));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while last_seq.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        rotate_flag.store(true, Ordering::Release);
+        input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(4))));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while last_seq.load(Ordering::Acquire) < 4 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(last_seq.load(Ordering::Acquire), 4, "phase 1 fsync");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = t_journal.join().unwrap();
+        let _app = t_matching.join().unwrap();
+    }
+
+    // --- Phase 2: recover and continue ---
+    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path).unwrap();
+    assert_eq!(engine.app().total, 1 + 2 + 3 + 4, "recovered state");
+    assert_eq!(engine.next_sequence(), 5, "recovered allocator position");
+    let (app, writer) = engine.into_parts();
+
+    let active_conns = Arc::new(AtomicU64::new(0));
+    let mut out = build_pipeline_with_replication(
+        app,
+        writer,
+        Duration::ZERO,
+        active_conns,
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        false,
+        false,
+        false,
+    );
+    let mut input_producer = out.input_producer;
+    let journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+    let last_seq = Arc::clone(&out.last_seq);
+    let mut output_consumer = out.output_consumers.pop().unwrap();
+
+    // The gate cursor must resume at exactly the recovered high-water
+    // mark — before any new event is published. A writer-internal
+    // entry consumed during recovery/reopen would overshoot here.
+    assert_eq!(
+        last_seq.load(Ordering::Acquire),
+        4,
+        "gate persisted cursor must resume at the recovered high-water mark"
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    // A query before any post-recovery allocation must stamp the
+    // recovered mark (4) — the gate satisfies it from recovered state.
+    // Then two allocations continue the space: 5 and 6.
+    input_producer.publish(make_slot(JournalEvent::App(TestEvent::Query)));
+    input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(5))));
+    input_producer.publish(make_slot(JournalEvent::Tick { now_ns: 1 }));
+
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(3);
+    let mut spins = 0u64;
+    while outputs.len() < 3 {
+        if let Some((_, slot)) = output_consumer.try_consume() {
+            outputs.push(slot);
+        } else {
+            spins += 1;
+            assert!(spins < 10_000_000, "timeout draining outputs");
+            std::hint::spin_loop();
+        }
+    }
+    let wire_seqs: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
+    assert_eq!(
+        wire_seqs,
+        vec![4, 5, 6],
+        "post-recovery wire space must continue the recovered allocator \
+         with no gap or overlap"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while last_seq.load(Ordering::Acquire) < 6 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        last_seq.load(Ordering::Acquire),
+        6,
+        "gate persisted cursor diverged from wire space after recovery"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let _app = t_matching.join().unwrap();
+
+    let report = melin_journal::segment::verify_lineage::<TestEvent>(&path).unwrap();
+    assert_eq!(
+        report.last_sequence,
+        Some(6),
+        "on-disk lineage tail diverged from wire space after recovery"
+    );
+    assert_eq!(report.entries, 6, "six allocated events across both phases");
+}
+
 /// Verify the JournalStage uses pre-assigned sequences and timestamps
 /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
 /// entries must carry the primary's sequence numbers, not locally
