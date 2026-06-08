@@ -21,12 +21,25 @@ use crate::replication_wire::peek_first_sequence;
 
 /// Upper bound on how long the catch-up→live handoff waits for the
 /// disk to catch up to the ring (see [`drain_into_contiguity`]). The
-/// gap it closes is one journal `fdatasync` of slack — microseconds to
-/// low milliseconds even on a loaded NVMe — so 250 ms is ~3 orders of
-/// magnitude of headroom. On expiry the handoff falls back to the
-/// receiver's contiguity gate (a reconnect), so this is a safety bound,
-/// not a steady-state cost.
-const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(250);
+/// gap it closes is one journal flush of slack, so the bound is
+/// calibrated to the *required* production config — PLP NVMe + xfs,
+/// where a `buffered` batch flush is ~10–30 µs (`docs/journal.md`) and
+/// the multi-millisecond stall sources are engineered out (xfs removes
+/// the ext4 jbd2 spike; `sector` mode is barred from production). 30 ms
+/// is ~3 orders of magnitude over that close time, so it never expires
+/// on in-spec hardware.
+///
+/// The bound is deliberately tight rather than generous because the
+/// spin runs inline on the single-threaded DPDK driver loop, where it
+/// head-of-line-blocks the other replica's ring drain and ack
+/// processing. A stall long enough to expire 30 ms is a failing drive,
+/// not a hiccup — and on expiry the handoff falls back to the
+/// receiver's contiguity gate (a reconnect), which is the right
+/// outcome when the disk has stopped keeping up. Out-of-spec hardware
+/// (e.g. `buffered` on a consumer drive, ~50–200 µs with fatter tails)
+/// merely falls back more often: still correct, just less efficient.
+/// This is a safety bound, not a steady-state cost.
+const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(30);
 
 /// Closure-based publisher passed to [`catch_up_from_journal_with`].
 /// Receives the fully encoded `InputBatch` frame (length prefix included)
