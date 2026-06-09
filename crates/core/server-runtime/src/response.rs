@@ -197,9 +197,9 @@ pub fn run<A: Application>(
     /// short stalls. The accrual tick is gated by this period, but the
     /// clock read behind it is gated by the `AmortizedTimer` mask, so the
     /// effective resolution is `max(this, the mask's clock-read cadence)`.
-    /// With the default mask (~50–100 ms between reads at this spin's
-    /// rate) the 10 ms here is currently clamped to that floor; lowering
-    /// `AmortizedTimer::CHECK_MASK` realizes the full resolution.
+    /// The mask reads the clock ~every 6.5 ms at this spin's rate
+    /// (`AmortizedTimer::CHECK_MASK` is `2^16`), finer than the 10 ms
+    /// here, so this cadence is the binding one and is realized in full.
     const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
 
     // Initial evaluation so the cached durable position and the
@@ -590,7 +590,8 @@ pub fn run<A: Application>(
                     // wedge would be mis-charged. `spinning = true`: this
                     // loop always spins (never yields), so the clock read
                     // behind the tick is mask-gated, landing only every
-                    // ~1 M iterations regardless of the period below.
+                    // ~65 k iterations (`CHECK_MASK = 2^16`) regardless of
+                    // the period below.
                     if gate_accrual_timer
                         .tick(GATE_ACCRUAL_INTERVAL, true)
                         .is_some()

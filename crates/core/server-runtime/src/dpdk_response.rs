@@ -144,8 +144,9 @@ pub fn run<A: Application>(
     const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
     const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
     /// Gate-wait accrual cadence — see `response::run`. Tighter than the
-    /// idle policy-check cadence to bound boundary error on short stalls;
-    /// currently clamped to the `AmortizedTimer` mask's clock-read floor.
+    /// idle policy-check cadence to bound boundary error on short stalls.
+    /// The `AmortizedTimer` mask reads the clock ~every 6.5 ms
+    /// (`CHECK_MASK = 2^16`), finer than this, so the 10 ms is realized.
     const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
 
     let mut degraded_logger;
