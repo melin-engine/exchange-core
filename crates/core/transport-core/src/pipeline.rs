@@ -33,6 +33,8 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLock;
 
+use crate::cursors::{PipelineCursors, RingPos, WireSeq};
+
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
 /// Post-fsync state published by the journal stage after each durable
@@ -46,8 +48,10 @@ use crate::replication_wire::{finalize_input_batch, init_input_batch};
 #[repr(C)]
 pub struct FsyncState {
     /// Highest journal sequence durably persisted
-    /// (`writer.next_sequence() - 1`).
-    pub journal_seq: u64,
+    /// (`writer.next_sequence() - 1`). Wire-seq space — the same value the
+    /// journal stage publishes through `PipelineCursors::durable_wire_seq`
+    /// (both are written in the same `publish_fsync_state` call).
+    pub journal_seq: WireSeq,
     /// BLAKE3 chain hash after the fsync. `[0u8; 32]` when hash-chain
     /// is disabled.
     pub chain_hash: [u8; 32],
@@ -55,7 +59,7 @@ pub struct FsyncState {
     /// (`consumer.next_read()` right after `commit`/`set_progress`).
     /// The shadow compares this against its own `next_read` to confirm
     /// it has caught up to the exact fsync boundary.
-    pub input_ring_seq: u64,
+    pub input_ring_seq: RingPos,
 }
 
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
@@ -917,9 +921,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         let journal_seq = self.writer.next_sequence().saturating_sub(1);
         if let Some(ref lock) = self.chain_hash {
             lock.store(FsyncState {
-                journal_seq,
+                journal_seq: WireSeq::new(journal_seq),
                 chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
-                input_ring_seq: self.consumer.next_read(),
+                input_ring_seq: RingPos::new(self.consumer.next_read()),
             });
         }
         if let Some(ref atom) = self.last_seq {
@@ -2278,24 +2282,19 @@ pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
     pub journal_stage: JournalStage<A::Event, W>,
     pub matching_stage: MatchingStage<A>,
     pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
-    pub journal_cursor: Arc<Sequence>,
-    pub matching_cursor: Arc<Sequence>,
     pub events_processed: Arc<AtomicU64>,
     pub input_cursor: Box<dyn ring::QueueCursor>,
     pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
-    pub replication_cursor: Arc<AtomicU64>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
-    /// Highest wire seq durably persisted on this node's journal.
-    /// Published by the journal stage after every fsync batch via
-    /// `set_last_seq_publisher`. The response stage uses this — *not*
-    /// `journal_cursor` — for the primary's `persisted` cursor in the
-    /// durability policy view: it's in wire-seq space (same as replica
-    /// metrics and `OutputSlot.wire_seq`), so the gate's numeric
-    /// comparison is sound regardless of `starting_sequence`.
-    pub last_seq: Arc<AtomicU64>,
+    /// Journal-progress cursors, space-typed. Bundles the durable wire seq
+    /// (the response stage's `persisted` cursor and the replica handshake
+    /// value), the journal/matching ring positions (queue-depth monitoring),
+    /// and the fastest-replica ack cursor. See [`PipelineCursors`] for why the
+    /// wire-seq vs ring-index split matters.
+    pub cursors: PipelineCursors,
 }
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
@@ -2304,13 +2303,12 @@ pub struct ReplicaPipeline<A: Application, W: JournalWrite<A::Event>> {
     pub journal_stage: JournalStage<A::Event, W>,
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
-    pub journal_cursor: Arc<Sequence>,
-    pub matching_cursor: Arc<Sequence>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
-    /// Always populated for replicas — the orchestrator reads it for
-    /// reconnect handshakes (last journal sequence the replica has durably
-    /// persisted). Updated by `JournalStage` after each fsync batch.
-    pub last_seq: Arc<AtomicU64>,
+    /// Journal-progress cursors, space-typed. On a replica the orchestrator
+    /// reads `durable_wire_seq` for reconnect handshakes (last journal sequence
+    /// durably persisted); `replica_acked` stays at the `NO_REPLICA` sentinel
+    /// (no downstream replica). Updated by `JournalStage` after each fsync.
+    pub cursors: PipelineCursors,
     pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
 }
 
@@ -2579,22 +2577,29 @@ where
     // This means: `min(journal_cursor, u64::MAX) = journal_cursor`.
     let replication_cursor = Arc::new(AtomicU64::new(u64::MAX));
 
+    // Bundle the journal-progress cursors behind space-typed accessors. The
+    // loose locals above stay only because the stages were wired with `Arc`
+    // clones before this point.
+    let cursors = PipelineCursors::new(
+        last_seq,
+        journal_cursor,
+        matching_cursor,
+        replication_cursor,
+    );
+
     Pipeline {
         input_producer,
         journal_stage,
         matching_stage,
         output_consumers,
-        journal_cursor,
-        matching_cursor,
         events_processed,
         input_cursor,
         replication_consumers,
-        replication_cursor,
         replicas_connected,
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-        last_seq,
+        cursors,
     }
 }
 
@@ -2693,15 +2698,22 @@ where
         starting_wire_seq,
     );
 
+    // A replica has no downstream replica to ack it, so `replica_acked` holds
+    // the `NO_REPLICA` sentinel for the lifetime of the pipeline.
+    let cursors = PipelineCursors::new(
+        last_seq,
+        journal_cursor,
+        matching_cursor,
+        Arc::new(AtomicU64::new(PipelineCursors::NO_REPLICA)),
+    );
+
     ReplicaPipeline {
         input_producer,
         journal_stage,
         matching_stage,
         drain_consumer,
-        journal_cursor,
-        matching_cursor,
         shadow_consumer,
-        last_seq,
+        cursors,
         chain_hash_lock,
     }
 }

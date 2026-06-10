@@ -362,7 +362,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     let mut input_producer = out.input_producer;
     let mut journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
-    let last_seq = Arc::clone(&out.last_seq);
+    let last_seq = out.cursors.durable_wire_seq_arc();
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
     let rotate_flag = Arc::new(AtomicBool::new(false));
@@ -546,7 +546,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         let mut input_producer = out.input_producer;
         let mut journal_stage = out.journal_stage;
         let matching_stage = out.matching_stage;
-        let last_seq = Arc::clone(&out.last_seq);
+        let last_seq = out.cursors.durable_wire_seq_arc();
 
         let rotate_flag = Arc::new(AtomicBool::new(false));
         journal_stage.set_rotation(
@@ -603,7 +603,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
-    let last_seq = Arc::clone(&out.last_seq);
+    let last_seq = out.cursors.durable_wire_seq_arc();
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
     // The gate cursor must resume at exactly the recovered high-water
@@ -706,7 +706,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     let mut input_producer = replica.input_producer;
     let mut journal_stage = replica.journal_stage;
     let matching_stage = replica.matching_stage;
-    let last_seq = Arc::clone(&replica.last_seq);
+    let last_seq = replica.cursors.durable_wire_seq_arc();
 
     let rotate_flag = Arc::new(AtomicBool::new(false));
     journal_stage.set_rotation(
@@ -845,7 +845,7 @@ fn full_pipeline_journal_and_matching_parallel() {
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
-    let journal_cursor = out.journal_cursor;
+    let journal_cursor = out.cursors.journal_ring_arc();
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -931,8 +931,8 @@ fn journal_stage_sends_replication_batches() {
     let journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
     let mut input_producer = out.input_producer;
-    let journal_cursor = out.journal_cursor;
-    let replication_cursor = out.replication_cursor;
+    let journal_cursor = out.cursors.journal_ring_arc();
+    let replication_cursor = out.cursors.replica_acked_arc();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let s1 = Arc::clone(&shutdown);
@@ -1031,7 +1031,10 @@ fn replication_cursor_always_starts_at_max() {
             false,
         );
         assert!(out.replication_consumers.is_none());
-        assert_eq!(out.replication_cursor.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            out.cursors.replica_acked_arc().load(Ordering::Relaxed),
+            u64::MAX
+        );
     }
 
     // Replication enabled — cursor still starts at u64::MAX.
@@ -1054,7 +1057,7 @@ fn replication_cursor_always_starts_at_max() {
         );
         assert!(out.replication_consumers.is_some());
         assert_eq!(
-            out.replication_cursor.load(Ordering::Relaxed),
+            out.cursors.replica_acked_arc().load(Ordering::Relaxed),
             u64::MAX,
             "replication cursor should start at MAX even when enabled"
         );

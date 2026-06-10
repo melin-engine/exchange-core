@@ -1077,17 +1077,14 @@ where
         journal_stage,
         matching_stage,
         mut output_consumers,
-        journal_cursor,
-        matching_cursor,
         events_processed,
         input_cursor,
         replication_consumers,
-        replication_cursor,
         replicas_connected,
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-        last_seq,
+        cursors,
     } = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1100,6 +1097,14 @@ where
         enable_event_publisher,
         enable_shadow,
     );
+    // Re-expose the bundled cursors as named locals (raw `Arc`s) for the wiring
+    // below — the durability gate's persisted handle (`last_seq`), the replica
+    // ack cursor, and the halt-check. The health endpoint takes `cursors`
+    // itself, which still owns the same atomics.
+    let journal_cursor = cursors.journal_ring_arc();
+    let matching_cursor = cursors.matching_ring_arc();
+    let replication_cursor = cursors.replica_acked_arc();
+    let last_seq = cursors.durable_wire_seq_arc();
     // Fastest-replica cursor: `max(slot0_acked, slot1_acked)`. Used by the
     // response stage for quorum durability — an event is durable if either
     // both replicas acked (replication_cursor) or the journal fsynced and
@@ -1399,10 +1404,8 @@ where
         config,
         &active_connections,
         &events_processed,
-        &journal_cursor,
-        &matching_cursor,
+        &cursors,
         input_cursor,
-        &replication_cursor,
         &pipeline_healthy,
         &replicas_connected,
         &replication_metrics,
@@ -2027,17 +2030,14 @@ where
         journal_stage,
         matching_stage,
         mut output_consumers,
-        journal_cursor,
-        matching_cursor,
         events_processed,
         input_cursor,
         replication_consumers,
-        replication_cursor,
         replicas_connected,
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-        last_seq,
+        cursors,
     } = build_pipeline_with_replication(
         exchange,
         writer,
@@ -2050,6 +2050,14 @@ where
         enable_event_publisher,
         enable_shadow,
     );
+    // Re-expose the bundled cursors as named locals (raw `Arc`s) for the wiring
+    // below — the durability gate's persisted handle (`last_seq`), the replica
+    // ack cursor, and the halt-check. The health endpoint takes `cursors`
+    // itself, which still owns the same atomics.
+    let journal_cursor = cursors.journal_ring_arc();
+    let matching_cursor = cursors.matching_ring_arc();
+    let replication_cursor = cursors.replica_acked_arc();
+    let last_seq = cursors.durable_wire_seq_arc();
 
     let heartbeat_interval = config.heartbeat_interval();
 
@@ -2384,10 +2392,8 @@ where
         &config,
         &active_connections,
         &events_processed,
-        &journal_cursor,
-        &matching_cursor,
+        &cursors,
         input_cursor,
-        &replication_cursor,
         &pipeline_healthy,
         &replicas_connected,
         &replication_metrics,
@@ -2712,10 +2718,8 @@ fn spawn_health_endpoint(
     config: &ServerConfig,
     active_connections: &Arc<AtomicU64>,
     events_processed: &Arc<AtomicU64>,
-    journal_cursor: &Arc<melin_pipeline::padding::Sequence>,
-    matching_cursor: &Arc<melin_pipeline::padding::Sequence>,
+    cursors: &melin_transport_core::PipelineCursors,
     input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
-    replication_cursor: &Arc<AtomicU64>,
     pipeline_healthy: &Arc<AtomicBool>,
     replicas_connected: &Option<Arc<std::sync::atomic::AtomicU32>>,
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
@@ -2753,10 +2757,8 @@ fn spawn_health_endpoint(
         melin_transport_core::health::HealthState {
             active_connections: Arc::clone(active_connections),
             events_processed: Arc::clone(events_processed),
-            journal_cursor: Arc::clone(journal_cursor),
-            matching_cursor: Arc::clone(matching_cursor),
+            cursors: cursors.clone(),
             input_cursor,
-            replication_cursor: Arc::clone(replication_cursor),
             pipeline_healthy: Arc::clone(pipeline_healthy),
             replicas_connected: replicas_connected.clone(),
             replication_metrics: replication_metrics.clone(),

@@ -129,7 +129,7 @@ fn main() {
     let journal_stage = pipeline.journal_stage;
     let matching_stage = pipeline.matching_stage;
     let mut output_consumers = pipeline.output_consumers;
-    let replication_cursor = pipeline.replication_cursor;
+    let replication_cursor = pipeline.cursors.replica_acked_arc();
     let (repl_consumer_1, repl_consumer_2) =
         pipeline.replication_consumers.expect("replication enabled");
     let replication_ring_progress = pipeline

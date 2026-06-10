@@ -350,8 +350,8 @@ where
 
     Ok(ReplicaPipelineHandles {
         input_producer: pipeline.input_producer,
-        journal_cursor: pipeline.journal_cursor,
-        last_seq: pipeline.last_seq,
+        journal_cursor: pipeline.cursors.journal_ring_arc(),
+        last_seq: pipeline.cursors.durable_wire_seq_arc(),
         chain_hash_lock: pipeline.chain_hash_lock,
         pipeline_shutdown,
         journal_handle,
