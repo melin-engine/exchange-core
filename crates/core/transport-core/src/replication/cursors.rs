@@ -59,6 +59,14 @@ use super::protocol::Ack;
 /// topology cap (see `ReplicationMetrics` for the same rationale).
 const SLOTS: usize = 2;
 
+/// A disengaged slot's parking value. Defined as the reader-side sentinel
+/// (`PipelineCursors::NO_REPLICA`) on purpose: `min`/`max` over all-disengaged
+/// slots propagate it into the shared cursors, where
+/// `PipelineCursors::load_replica_quorum_acked` maps it to `None`. The two
+/// modules must agree on this value or the health endpoint would misread a
+/// disengaged cluster as an absurdly-far-ahead replica.
+const DISENGAGED: u64 = crate::cursors::PipelineCursors::NO_REPLICA;
+
 /// A replica reported a cursor that cannot be true: ahead of what the
 /// primary ever sent it, or with the persisted track ahead of the
 /// in-memory track. Either is a protocol violation (a bug in the
@@ -125,7 +133,7 @@ impl ReplicaCursors {
         metrics: Arc<ReplicationMetrics>,
     ) -> Self {
         let cursors = Self {
-            slot_acked: [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)],
+            slot_acked: [AtomicU64::new(DISENGAGED), AtomicU64::new(DISENGAGED)],
             cursor_min,
             cursor_max,
             metrics,
@@ -215,7 +223,7 @@ impl ReplicaCursors {
     pub fn clear_on_disconnect(&self, slot: usize) {
         self.metrics.acked_sequence[slot].store(0, Ordering::Relaxed);
         self.metrics.in_memory_sequence[slot].store(0, Ordering::Relaxed);
-        self.slot_acked[slot].store(u64::MAX, Ordering::Release);
+        self.slot_acked[slot].store(DISENGAGED, Ordering::Release);
         self.recompute_shared();
     }
 

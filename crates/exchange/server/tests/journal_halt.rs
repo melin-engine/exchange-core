@@ -92,7 +92,13 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
         .build();
     let output_consumer = output_consumers.pop().unwrap();
 
-    let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+    // Durable cursor unused by the halt test — a throwaway bundle's handle.
+    let dummy_cursor = melin_transport_core::PipelineCursors::new(
+        melin_transport_core::WireSeq::new(0),
+        Arc::new(Sequence::new(AtomicU64::new(0))),
+        Arc::new(Sequence::new(AtomicU64::new(0))),
+    )
+    .durable_wire_seq();
     let events_counter = Arc::new(AtomicU64::new(0));
     let active_conns = Arc::new(AtomicU64::new(0));
     let counter = Arc::new(AtomicU32::new(initial_connected));

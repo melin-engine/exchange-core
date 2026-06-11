@@ -120,8 +120,12 @@ pub struct ApplyCtx {
     /// nanoseconds since the Unix epoch. Identical across primary and
     /// replica for deterministic replay.
     pub now_ns: u64,
-    /// Journal sequence number of the last event durably persisted.
-    /// Advances on every fsynced batch.
+    /// Journal sequence number of the last event durably persisted
+    /// (wire-seq space, same as the health endpoint's `journal_seq`
+    /// gauge — survives recovery and does not count non-journaled
+    /// queries). Advances on every fsynced batch; batch-stale by up to
+    /// one matching batch. Advisory only — apps must not derive
+    /// deterministic state from it (it depends on fsync timing).
     pub journal_sequence: u64,
     /// Count of client connections currently attached to this server.
     pub active_connections: u64,

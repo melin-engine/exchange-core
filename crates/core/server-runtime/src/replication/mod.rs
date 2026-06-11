@@ -51,7 +51,9 @@
 //! See `docs/replication.md` for the full design document and limitation details.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_journal::JournalWrite;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
@@ -213,10 +215,12 @@ pub(super) fn shutdown_pipeline<A: Application + Send + 'static, W: Send + 'stat
 pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     pub(super) input_producer: melin_pipeline::ring::Producer<InputSlot<A::Event>>,
     pub(super) journal_cursor: Arc<melin_pipeline::padding::Sequence>,
-    /// Highest journal sequence durably persisted, published by JournalStage
-    /// after each fsync. Read by the orchestrator to fill in the reconnect
-    /// handshake without owning the writer.
-    pub(super) last_seq: Arc<AtomicU64>,
+    /// Highest wire seq durably persisted, published by JournalStage after
+    /// each fsync. Read by the orchestrator to fill in the reconnect
+    /// handshake without owning the writer. Typed so the handshake's resume
+    /// point can never be sourced from a ring-space counter (the adjacent
+    /// `journal_cursor` resets to ~0 every process start).
+    pub(super) last_seq: melin_transport_core::DurableWireSeqCursor,
     /// SeqLock-published fsync state (chain hash + journal seq + ring
     /// cursor). Option to mirror the primary-side pattern; always Some
     /// on replicas now.
@@ -351,7 +355,7 @@ where
     Ok(ReplicaPipelineHandles {
         input_producer: pipeline.input_producer,
         journal_cursor: pipeline.cursors.journal_ring_arc(),
-        last_seq: pipeline.cursors.durable_wire_seq_arc(),
+        last_seq: pipeline.cursors.durable_wire_seq(),
         chain_hash_lock: pipeline.chain_hash_lock,
         pipeline_shutdown,
         journal_handle,

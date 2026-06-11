@@ -183,8 +183,9 @@ pub struct ServerConfig {
     #[arg(long)]
     pub replication_bind: Option<std::net::SocketAddr>,
 
-    /// Disable replication (dev/test mode). Sets the replication cursor to
-    /// `u64::MAX` so `min(journal_cursor, MAX) = journal_cursor`.
+    /// Disable replication (dev/test mode). The replica quorum cursor stays
+    /// at its no-replica sentinel (health reports zero replication lag) and
+    /// the durability policy evaluates against the primary's journal alone.
     /// Mutually exclusive with `--replication-bind` and `--replica-of`.
     #[arg(long, default_value_t = false)]
     pub standalone: bool,
@@ -1097,21 +1098,21 @@ where
         enable_event_publisher,
         enable_shadow,
     );
-    // Re-expose the bundled cursors as named locals (raw `Arc`s) for the wiring
-    // below — the durability gate's persisted handle (`last_seq`), the replica
-    // ack cursor, and the halt-check. The health endpoint takes `cursors`
-    // itself, which still owns the same atomics.
+    // Ring-position cursors for the seed-drain gate below (Acquire loads,
+    // stronger than the bundle's monitoring reads). The durability gate and
+    // the replication sender pull their typed handles straight from
+    // `cursors`; the health endpoint takes `cursors` itself.
     let journal_cursor = cursors.journal_ring_arc();
     let matching_cursor = cursors.matching_ring_arc();
-    let replication_cursor = cursors.replica_acked_arc();
-    let last_seq = cursors.durable_wire_seq_arc();
-    // Fastest-replica cursor: `max(slot0_acked, slot1_acked)`. Used by the
-    // response stage for quorum durability — an event is durable if either
-    // both replicas acked (replication_cursor) or the journal fsynced and
-    // the fastest replica acked (journal_cursor.min(fastest_replica_cursor)).
-    // Initialized to u64::MAX so `min(journal, u64::MAX) = journal` when
-    // no replicas are connected.
-    let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
+    // Fastest-replica cursor: `max(slot0_acked, slot1_acked)` in slot-acked
+    // space, maintained by the replication sender alongside the quorum-min
+    // cursor in `cursors`. Monitoring only — the health endpoint's
+    // fastest-replica gauge reads it; the durability gate evaluates replica
+    // progress from `ReplicationMetrics` instead. Parked at the same
+    // no-replica sentinel as the bundle's quorum cursor.
+    let fastest_replica_cursor = Arc::new(AtomicU64::new(
+        melin_transport_core::PipelineCursors::NO_REPLICA,
+    ));
 
     // Consumer 0 is always the response stage. Consumer 1 (if present)
     // is the event publisher — only created when --event-bind is set.
@@ -1220,9 +1221,8 @@ where
             ]
         });
 
-    // Clone cursors for the response thread — the originals are needed
-    // later for seed drain gating.
-    let journal_persisted_wire_seq_response = Arc::clone(&last_seq);
+    // Typed durable-cursor handle for the response thread's gate.
+    let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
     let durability_mode_response = Arc::clone(&durability_mode_atomic);
@@ -1275,7 +1275,7 @@ where
             .replication_bind
             .ok_or("replication_bind must be set when replication is enabled")?;
         let s_repl = Arc::clone(&shutdown);
-        let repl_cursor = Arc::clone(&replication_cursor);
+        let repl_cursor = cursors.replica_quorum_cursor_arc();
         let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
         let ready_flag = Arc::clone(&replica_ready);
         let connected_counter = replicas_connected
@@ -2050,14 +2050,12 @@ where
         enable_event_publisher,
         enable_shadow,
     );
-    // Re-expose the bundled cursors as named locals (raw `Arc`s) for the wiring
-    // below — the durability gate's persisted handle (`last_seq`), the replica
-    // ack cursor, and the halt-check. The health endpoint takes `cursors`
-    // itself, which still owns the same atomics.
+    // Ring-position cursors for the seed-drain gate below (Acquire loads,
+    // stronger than the bundle's monitoring reads). The durability gate and
+    // the replication sender pull their typed handles straight from
+    // `cursors`; the health endpoint takes `cursors` itself.
     let journal_cursor = cursors.journal_ring_arc();
     let matching_cursor = cursors.matching_ring_arc();
-    let replication_cursor = cursors.replica_acked_arc();
-    let last_seq = cursors.durable_wire_seq_arc();
 
     let heartbeat_interval = config.heartbeat_interval();
 
@@ -2073,7 +2071,9 @@ where
     let tick_cadence = config.tick_interval();
 
     // Fastest-replica cursor (see TCP path for explanation).
-    let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
+    let fastest_replica_cursor = Arc::new(AtomicU64::new(
+        melin_transport_core::PipelineCursors::NO_REPLICA,
+    ));
 
     // Control channel: DPDK poll thread → response stage (connect/disconnect).
     let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -2159,7 +2159,8 @@ where
 
     // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
     let output_consumer = output_consumers.remove(0);
-    let journal_persisted_wire_seq_response = Arc::clone(&last_seq);
+    // Typed durable-cursor handle for the response thread's gate.
+    let journal_persisted_wire_seq_response = cursors.durable_wire_seq();
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
     let durability_mode_response = Arc::clone(&durability_mode_atomic);
@@ -2216,7 +2217,7 @@ where
             .ok_or("replication_bind must be set when replication is enabled")?;
         let repl_port = repl_bind.port();
 
-        let repl_cursor = Arc::clone(&replication_cursor);
+        let repl_cursor = cursors.replica_quorum_cursor_arc();
         let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
         let ready_flag = Arc::clone(&replica_ready);
         let batch_size = config.replication_batch_size;

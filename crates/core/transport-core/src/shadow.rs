@@ -144,7 +144,7 @@ fn try_save_snapshot<A: Application>(
     if state.input_ring_seq.get() != consumer.next_read() {
         return;
     }
-    match snapshot::save::<A>(app, state.journal_seq.get(), state.chain_hash, path) {
+    match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, path) {
         Ok(()) => {
             info!(
                 journal_seq = state.journal_seq.get(),
