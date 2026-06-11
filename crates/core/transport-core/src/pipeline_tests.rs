@@ -25,8 +25,8 @@ use crate::journaled_app::JournaledApp;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
 use crate::pipeline::{
-    InputSlot, JournalStage, JournalStageRun, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload,
-    OutputSlot, build_pipeline_with_replication,
+    AdoptedRotation, InputSlot, JournalStage, JournalStageRun, MAX_JOURNAL_BATCH, MatchingStage,
+    OutputPayload, OutputSlot, StreamMark, build_pipeline_with_replication,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;
@@ -1191,12 +1191,10 @@ fn dump_journal_for_diagnosis(src: &std::path::Path, label: &str) -> String {
 /// journals must be chain-identical (the bitwise-mirror property).
 ///
 /// Scope: neither side rotates here, so both journals are single
-/// segments sharing one anchor. Chain equality only holds while
-/// segment boundaries align — an unaligned rotation on either node
-/// legitimately breaks it (the entry *stream* stays identical). Do not
-/// extend this test with rotation and keep the equality assert;
-/// cross-node comparison under rotation is the primary-driven-rotation
-/// roadmap item.
+/// segments sharing one anchor. The rotating counterpart is
+/// `primary_driven_rotation_mirrors_segmentation_on_replica`, where the
+/// replica adopts the primary's announced boundaries and the mirror
+/// property holds per segment.
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 #[test]
 fn primary_and_replica_journals_contiguous_and_chain_identical() {
@@ -1510,6 +1508,597 @@ fn journal_stage_rotates_on_manual_request() {
         1350,
         "all Adds across the rotation must replay"
     );
+}
+
+/// Replica-side primary-driven rotation: a rotation queued between
+/// sequences 2 and 3 must split the encode batch at exactly that
+/// boundary — entries 1..=2 land in the archived segment, entry 3 in a
+/// fresh live segment whose header anchor is the announced tail hash.
+/// Single-threaded and sentinel-driven, so the mid-batch barrier path
+/// is exercised deterministically.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn adopted_rotation_splits_batch_at_announced_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adopt_split.journal");
+    let anchor = [0x7Au8; 32];
+
+    // Reference writer: computes the chain tail at the boundary the
+    // primary would announce. Same anchor + same entry tuples ⇒ the
+    // replica's local tail must equal it.
+    let tail_at_2 = {
+        let ref_path = dir.path().join("reference.journal");
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor).unwrap();
+        for seq in 1..=2u64 {
+            assert_eq!(w.allocate_sequence(), seq);
+            w.encode_event(
+                seq,
+                1_000_000_000 + seq,
+                &JournalEvent::App(TestEvent::Add(seq)),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        w.flush_batch_sync().unwrap();
+        w.chain_hash().expect("hash-chain enabled")
+    };
+
+    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+    let rotations: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    rotations
+        .lock()
+        .unwrap()
+        .push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            tail_hash: tail_at_2,
+        }));
+    stage.set_stream_marks(Arc::clone(&rotations));
+
+    // Everything pre-published, sentinel last: one read_batch spans the
+    // boundary, forcing the split + inline flush + adoption.
+    for seq in 1..=3u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+    producer.publish(TestInput::shutdown_sentinel());
+
+    let shutdown = AtomicBool::new(false);
+    let writer = stage.run(&shutdown).expect("clean exit via sentinel");
+
+    let archive = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    assert!(
+        archive.exists(),
+        "adopted rotation must archive the outgoing segment"
+    );
+    let arch_info = melin_journal::segment::read_header_info(&archive).unwrap();
+    assert_eq!(arch_info.starting_sequence, 1);
+    assert_eq!(arch_info.anchor_hash, anchor);
+
+    let live_info = melin_journal::segment::read_header_info(&path).unwrap();
+    assert_eq!(
+        live_info.starting_sequence, 3,
+        "live continues past the boundary"
+    );
+    assert_eq!(
+        live_info.anchor_hash, tail_at_2,
+        "live segment must be anchored at the announced (verified) tail"
+    );
+    assert_eq!(writer.next_sequence(), 4, "rotation consumes no sequence");
+
+    // Entry placement: 1..=2 archived, 3 live.
+    let mut arch_reader = JournalReader::<TestEvent>::open(&archive).unwrap();
+    let mut archived_seqs = Vec::new();
+    while let Some(e) = arch_reader.next_entry().unwrap() {
+        archived_seqs.push(e.sequence);
+    }
+    assert_eq!(archived_seqs, vec![1, 2]);
+    let mut live_reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut live_seqs = Vec::new();
+    while let Some(e) = live_reader.next_entry().unwrap() {
+        live_seqs.push(e.sequence);
+    }
+    assert_eq!(live_seqs, vec![3]);
+}
+
+/// A primary-announced rotation whose tail hash disagrees with the
+/// replica's local chain at the boundary is divergent history: the
+/// journal stage must fail with `ReplicaChainDivergence` (tearing the
+/// pipeline down for snapshot resync), and must NOT rotate or write
+/// past the boundary.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn adopted_rotation_with_wrong_tail_hash_is_divergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adopt_diverge.journal");
+
+    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32]).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+    let rotations: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    rotations
+        .lock()
+        .unwrap()
+        .push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            tail_hash: [0xBBu8; 32], // not the replica's tail at 2
+        }));
+    stage.set_stream_marks(Arc::clone(&rotations));
+
+    for seq in 1..=3u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+    producer.publish(TestInput::shutdown_sentinel());
+
+    let shutdown = AtomicBool::new(false);
+    let err = match stage.run(&shutdown) {
+        Err(e) => e,
+        Ok(_) => panic!("divergent tail hash must be fatal"),
+    };
+    assert!(
+        matches!(
+            err,
+            melin_journal::JournalError::ReplicaChainDivergence { sequence: 2, .. }
+        ),
+        "got: {err}"
+    );
+
+    // No rotation happened, and nothing past the boundary was written.
+    let archive = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    assert!(!archive.exists(), "divergence must not rotate");
+    let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut seqs = Vec::new();
+    while let Some(e) = reader.next_entry().unwrap() {
+        seqs.push(e.sequence);
+    }
+    assert_eq!(
+        seqs,
+        vec![1, 2],
+        "entries up to the boundary are durable; nothing past it"
+    );
+}
+
+/// A ChainCheck mark queued mid-batch must verify against the encoded
+/// chain at exactly its position — no rotation, no flush — and a wrong
+/// hash must surface as divergence.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn chain_check_mark_verifies_at_exact_position() {
+    let anchor = [0x21u8; 32];
+    let dir = tempfile::tempdir().unwrap();
+
+    // Reference chain value at sequence 2.
+    let chain_at_2 = {
+        let ref_path = dir.path().join("reference.journal");
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor).unwrap();
+        for seq in 1..=2u64 {
+            assert_eq!(w.allocate_sequence(), seq);
+            w.encode_event(
+                seq,
+                1_000_000_000 + seq,
+                &JournalEvent::App(TestEvent::Add(seq)),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+        w.flush_batch_sync().unwrap();
+        w.chain_hash().expect("hash-chain enabled")
+    };
+
+    let run_with_check = |name: &str, expected: [u8; 32]| {
+        let path = dir.path().join(format!("{name}.journal"));
+        let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+        let mut stage =
+            JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+        let marks: crate::pipeline::StreamMarkQueue =
+            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        marks.lock().unwrap().push_back(StreamMark::ChainCheck {
+            sequence: 2,
+            chain_hash: expected,
+        });
+        stage.set_stream_marks(Arc::clone(&marks));
+        for seq in 1..=3u64 {
+            producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+        }
+        producer.publish(TestInput::shutdown_sentinel());
+        let shutdown = AtomicBool::new(false);
+        (path, stage.run(&shutdown))
+    };
+
+    // Truthful check: passes, no rotation.
+    let (path, result) = run_with_check("ok", chain_at_2);
+    assert!(result.is_ok(), "matching chain check must pass");
+    assert!(
+        !std::path::PathBuf::from(format!("{}.000001", path.display())).exists(),
+        "a chain check must not rotate"
+    );
+
+    // Lying check: divergence at exactly the marked position.
+    let (_path, result) = run_with_check("diverge", [0xEEu8; 32]);
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("mismatched chain check must be fatal"),
+    };
+    assert!(
+        matches!(
+            err,
+            melin_journal::JournalError::ReplicaChainDivergence { sequence: 2, .. }
+        ),
+        "got: {err}"
+    );
+}
+
+/// The primary emits a live-stream ChainCheck after every
+/// CHAIN_CHECK_INTERVAL_BATCHES published batches, carrying its chain
+/// value at the emission position. Batches are forced one-per-fsync by
+/// waiting for each publish to land before sending the next slot.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn primary_emits_chain_check_every_interval() {
+    use crate::replication::protocol::{PrimaryMessage, decode_primary_message};
+    use crate::replication_wire::{MSG_INPUT_BATCH, peek_frame_tag};
+    use melin_pipeline::seqlock::SeqLock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checks.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(256)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+    let (repl_producer_0, mut repl_consumers_0) =
+        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
+    let (repl_producer_1, _repl_consumers_1) =
+        melin_journal::replication::build_replication_ring(1, REPLICATION_RING_CAPACITY);
+    let evict = [
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ];
+    let active = [
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    ];
+    stage.set_replication_producers(
+        [repl_producer_0, repl_producer_1],
+        [Arc::clone(&evict[0]), Arc::clone(&evict[1])],
+        [Arc::clone(&active[0]), Arc::clone(&active[1])],
+    );
+    let fsync_state = Arc::new(SeqLock::new(crate::pipeline::FsyncState::default()));
+    stage.set_chain_hash_lock(Arc::clone(&fsync_state));
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    // One slot per fsync batch: wait until each lands before the next.
+    let total = 70u64;
+    for seq in 1..=total {
+        producer.publish(add_slot(seq, 1_000_000_000 + seq));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fsync_state.load().journal_seq.get() < seq {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fsync of seq {seq} never landed"
+            );
+            std::hint::spin_loop();
+        }
+    }
+    let chain_at_64 = {
+        // The check is emitted at the 64th batch boundary = sequence 64;
+        // recompute the expected hash from the journal file.
+        melin_journal::segment::chain_value_at(&path, 64).unwrap()
+    };
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+
+    // Classify the ring: 70 input batches and exactly one ChainCheck
+    // (the 128th batch never happened), positioned after batch 64.
+    let mut input_batches = 0u32;
+    let mut checks = Vec::new();
+    while let Some((_meta, data)) = repl_consumers_0[0].try_read() {
+        if peek_frame_tag(data).unwrap() == MSG_INPUT_BATCH {
+            input_batches += 1;
+        } else {
+            match decode_primary_message(&data[4..]).unwrap() {
+                PrimaryMessage::ChainCheck {
+                    sequence,
+                    chain_hash,
+                } => checks.push((sequence, chain_hash, input_batches)),
+                other => panic!("unexpected control frame: {other:?}"),
+            }
+        }
+        repl_consumers_0[0].commit();
+    }
+    assert_eq!(input_batches, total as u32);
+    assert_eq!(checks.len(), 1, "exactly one check in 70 batches");
+    let (sequence, chain_hash, after_batches) = checks[0];
+    assert_eq!(sequence, 64);
+    assert_eq!(after_batches, 64, "check rides right behind the 64th batch");
+    match chain_at_64 {
+        melin_journal::segment::ChainValueAt::Value(v) => assert_eq!(chain_hash, v),
+        other => panic!("chain at 64 must exist: {other:?}"),
+    }
+}
+
+/// End-to-end primary → replica with primary-driven rotation: the
+/// primary rotates twice mid-stream (manual trigger), announcing each
+/// boundary over the replication ring; the relay forwards `Rotate`
+/// frames into the replica's adopted-rotation queue exactly where they
+/// appear in the stream. The replica must reproduce the primary's
+/// segmentation file-for-file: same archive count, same header
+/// identities, same per-segment chain values (bitwise-mirror property).
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn primary_driven_rotation_mirrors_segmentation_on_replica() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary_path = dir.path().join("primary.journal");
+    let replica_path = dir.path().join("replica.journal");
+
+    let shared_anchor = [0xA5u8; 32];
+
+    let primary_writer = Writer::create_continuing(&primary_path, 1, shared_anchor).unwrap();
+    let primary_active_conns = Arc::new(AtomicU64::new(0));
+    let mut primary = build_pipeline_with_replication(
+        TestApp::new(),
+        primary_writer,
+        Duration::ZERO,
+        primary_active_conns,
+        true,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        false,
+        false,
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let rotate_flag = Arc::new(AtomicBool::new(false));
+    primary
+        .journal_stage
+        .set_rotation(0, Some(Arc::clone(&rotate_flag)));
+
+    let replica_writer = Writer::create_continuing(&replica_path, 1, shared_anchor).unwrap();
+    let mut replica = build_replica_pipeline(
+        TestApp::new(),
+        replica_writer,
+        MAX_JOURNAL_BATCH,
+        Duration::ZERO,
+        false,
+        false,
+        Arc::new(crate::fence::FenceState::new(0)),
+    );
+    let rotations: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    replica
+        .journal_stage
+        .set_stream_marks(Arc::clone(&rotations));
+
+    if let Some(ref count) = primary.replicas_connected {
+        count.store(1, Ordering::Relaxed);
+    }
+    if let Some(ref rp) = primary.replication_ring_progress {
+        rp.active_flags[0].store(true, Ordering::Relaxed);
+    }
+
+    let (mut repl_c0, mut repl_c1) = primary.replication_consumers.expect("replication enabled");
+    let mut replica_input = replica.input_producer;
+
+    let primary_shutdown = Arc::new(AtomicBool::new(false));
+    let replica_shutdown = Arc::new(AtomicBool::new(false));
+    let relay_shutdown = Arc::new(AtomicBool::new(false));
+
+    // Relay: pump primary replication ring → replica input ring,
+    // routing Rotate frames into the adopted-rotation queue in stream
+    // order (push before any later slot is published — the receiver's
+    // ordering contract).
+    let relay_stop = Arc::clone(&relay_shutdown);
+    let relay_rotations = Arc::clone(&rotations);
+    let t_relay = std::thread::spawn(move || {
+        loop {
+            let mut got_something = false;
+            if let Some((_meta, data)) = repl_c0.try_read() {
+                let payload_len =
+                    u32::from_le_bytes(data[..4].try_into().expect("4-byte length prefix"))
+                        as usize;
+                let payload = &data[4..4 + payload_len];
+                if crate::replication_wire::peek_frame_tag(data).unwrap()
+                    == crate::replication_wire::MSG_INPUT_BATCH
+                {
+                    let slots: Vec<TestInput> =
+                        crate::replication_wire::try_decode_input_batch(payload)
+                            .expect("relay InputBatch decode");
+                    for slot in slots {
+                        replica_input.publish(InputSlot {
+                            connection_id: 0,
+                            key_hash: slot.key_hash,
+                            request_seq: slot.request_seq,
+                            sequence: slot.sequence,
+                            timestamp_ns: slot.timestamp_ns,
+                            event: slot.event,
+                            publish_ts: mono_trace_ns(),
+                            recv_ts: mono_trace_ns(),
+                        });
+                    }
+                } else {
+                    match crate::replication::protocol::decode_primary_message(payload)
+                        .expect("relay control decode")
+                    {
+                        crate::replication::protocol::PrimaryMessage::Rotate {
+                            boundary_seq,
+                            tail_hash,
+                        } => relay_rotations
+                            .lock()
+                            .unwrap()
+                            .push_back(StreamMark::Rotate(AdoptedRotation {
+                                boundary_seq,
+                                tail_hash,
+                            })),
+                        crate::replication::protocol::PrimaryMessage::ChainCheck {
+                            sequence,
+                            chain_hash,
+                        } => relay_rotations
+                            .lock()
+                            .unwrap()
+                            .push_back(StreamMark::ChainCheck {
+                                sequence,
+                                chain_hash,
+                            }),
+                        other => panic!("unexpected control frame on ring: {other:?}"),
+                    }
+                }
+                repl_c0.commit();
+                got_something = true;
+            }
+            if repl_c1.try_read().is_some() {
+                repl_c1.commit();
+                got_something = true;
+            }
+            if !got_something {
+                if relay_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    });
+
+    let mut primary_output = primary.output_consumers.pop().unwrap();
+    let primary_out_shutdown = Arc::new(AtomicBool::new(false));
+    let primary_out_stop = Arc::clone(&primary_out_shutdown);
+    let t_primary_out = std::thread::spawn(move || {
+        while !primary_out_stop.load(Ordering::Relaxed) {
+            if primary_output.try_consume().is_some() {
+                continue;
+            }
+            std::hint::spin_loop();
+        }
+    });
+
+    let mut replica_drain = replica.drain_consumer;
+    let replica_drain_stop = Arc::new(AtomicBool::new(false));
+    let replica_drain_stop2 = Arc::clone(&replica_drain_stop);
+    let t_replica_drain = std::thread::spawn(move || {
+        while !replica_drain_stop2.load(Ordering::Relaxed) {
+            if replica_drain.try_consume().is_some() {
+                continue;
+            }
+            std::hint::spin_loop();
+        }
+    });
+
+    let p_j_stop = Arc::clone(&primary_shutdown);
+    let p_m_stop = Arc::clone(&primary_shutdown);
+    let t_p_journal = std::thread::spawn(move || primary.journal_stage.run(&p_j_stop));
+    let t_p_matching = std::thread::spawn(move || primary.matching_stage.run(&p_m_stop));
+
+    let r_j_stop = Arc::clone(&replica_shutdown);
+    let r_m_stop = Arc::clone(&replica_shutdown);
+    let t_r_journal = std::thread::spawn(move || replica.journal_stage.run(&r_j_stop));
+    let t_r_matching = std::thread::spawn(move || replica.matching_stage.run(&r_m_stop));
+
+    // Three phases with a manual rotation between each: flip the flag,
+    // then keep publishing — the rotation fires at the next fsync
+    // boundary, wherever that lands. The assertions below don't depend
+    // on the exact boundary, only on the replica mirroring it.
+    let mut next: u64 = 0;
+    let mut publish_phase = |n: u64, producer: &mut ring::Producer<TestInput>| {
+        for _ in 0..n {
+            next += 1;
+            producer.publish(add_slot(next, 1_000_000_000 + next));
+        }
+    };
+    publish_phase(2_000, &mut primary.input_producer);
+    std::thread::sleep(Duration::from_millis(300));
+    rotate_flag.store(true, Ordering::Release);
+    publish_phase(2_000, &mut primary.input_producer);
+    std::thread::sleep(Duration::from_millis(300));
+    rotate_flag.store(true, Ordering::Release);
+    publish_phase(1_000, &mut primary.input_producer);
+    std::thread::sleep(Duration::from_millis(500));
+
+    primary_shutdown.store(true, Ordering::Relaxed);
+    let primary_journal_result = t_p_journal.join().unwrap();
+    let _ = t_p_matching.join().unwrap();
+    relay_shutdown.store(true, Ordering::Relaxed);
+    let _ = t_relay.join();
+    std::thread::sleep(Duration::from_millis(500));
+    replica_shutdown.store(true, Ordering::Relaxed);
+    let replica_journal_result = t_r_journal.join().unwrap();
+    let _ = t_r_matching.join().unwrap();
+    primary_journal_result.expect("primary journal stage must exit cleanly");
+    replica_journal_result.expect("replica journal stage must exit cleanly");
+    primary_out_shutdown.store(true, Ordering::Relaxed);
+    let _ = t_primary_out.join();
+    replica_drain_stop.store(true, Ordering::Relaxed);
+    let _ = t_replica_drain.join();
+
+    // Per-segment fingerprint: header identity + entry count + chain
+    // value at EOF. Chain equality per segment ⇒ byte-identical entry
+    // streams under identical framing — the bitwise-mirror property.
+    fn fingerprint(path: &std::path::Path) -> (u64, [u8; 32], u64, Option<[u8; 32]>) {
+        let info = melin_journal::segment::read_header_info(path).unwrap();
+        let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
+        let mut count = 0u64;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        (
+            info.starting_sequence,
+            info.anchor_hash,
+            count,
+            reader.chain_hash(),
+        )
+    }
+
+    let segment_files = |live: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut files: Vec<std::path::PathBuf> = melin_journal::segment::list_archives(live)
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        files.push(live.to_path_buf());
+        files
+    };
+
+    let primary_files = segment_files(&primary_path);
+    let replica_files = segment_files(&replica_path);
+    assert!(
+        primary_files.len() >= 2,
+        "at least one rotation must have fired on the primary (got {} segment files)",
+        primary_files.len()
+    );
+    assert_eq!(
+        primary_files.len(),
+        replica_files.len(),
+        "replica must mirror the primary's segment count"
+    );
+    for (p, r) in primary_files.iter().zip(replica_files.iter()) {
+        assert_eq!(
+            fingerprint(p),
+            fingerprint(r),
+            "segment mismatch: {} vs {}",
+            p.display(),
+            r.display()
+        );
+    }
 }
 
 /// Size-threshold rotation: setting a small `max_journal_bytes`

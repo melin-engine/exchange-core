@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 
 use melin_app::AppEvent;
-use melin_transport_core::pipeline::InputSlot;
+use melin_transport_core::pipeline::{AdoptedRotation, InputSlot, StreamMark, StreamMarkQueue};
 use melin_transport_core::replication::protocol::{
     Ack, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message, try_decode_input_batch_into,
 };
@@ -154,6 +154,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
+    stream_marks: &StreamMarkQueue,
 ) -> StreamingFrameOutcome {
     let mut consumed = 0;
     let mut last_target = 0u64;
@@ -204,6 +205,73 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                     Err(_) => match decode_primary_message(payload) {
                         Ok(PrimaryMessage::Heartbeat { sequence }) => {
                             debug!(sequence, "heartbeat from primary");
+                        }
+                        Ok(PrimaryMessage::Rotate {
+                            boundary_seq,
+                            tail_hash,
+                        }) => {
+                            // Primary-announced rotation. Queue it for the
+                            // journal stage only when the stream position
+                            // sits exactly on the boundary — the queue push
+                            // happens before any slot past the boundary is
+                            // committed to the input ring, which is the
+                            // ordering the journal stage's split logic
+                            // relies on.
+                            if boundary_seq == pending_accum {
+                                stream_marks
+                                    .lock()
+                                    .expect("stream-mark queue poisoned")
+                                    .push_back(StreamMark::Rotate(AdoptedRotation {
+                                        boundary_seq,
+                                        tail_hash,
+                                    }));
+                            } else if boundary_seq < pending_accum {
+                                // Redundant re-delivery of a covered
+                                // boundary (handoff overlap) — drop it like
+                                // a duplicate slot.
+                                debug!(
+                                    boundary_seq,
+                                    accum = pending_accum,
+                                    "stale Rotate announce skipped"
+                                );
+                            } else {
+                                frame_err = Some(
+                                    format!(
+                                        "Rotate boundary {boundary_seq} ahead of stream \
+                                         position {pending_accum} — sequence gap"
+                                    )
+                                    .into(),
+                                );
+                                break;
+                            }
+                        }
+                        Ok(PrimaryMessage::ChainCheck {
+                            sequence,
+                            chain_hash,
+                        }) => {
+                            // Same position rules as Rotate: queue only at
+                            // the exact stream position, drop covered
+                            // re-deliveries, treat ahead-of-stream as a gap.
+                            if sequence == pending_accum {
+                                stream_marks
+                                    .lock()
+                                    .expect("stream-mark queue poisoned")
+                                    .push_back(StreamMark::ChainCheck {
+                                        sequence,
+                                        chain_hash,
+                                    });
+                            } else if sequence < pending_accum {
+                                debug!(sequence, accum = pending_accum, "stale ChainCheck skipped");
+                            } else {
+                                frame_err = Some(
+                                    format!(
+                                        "ChainCheck at {sequence} ahead of stream \
+                                         position {pending_accum} — sequence gap"
+                                    )
+                                    .into(),
+                                );
+                                break;
+                            }
                         }
                         Ok(PrimaryMessage::NeedSnapshot) => {
                             frame_err =
@@ -372,6 +440,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // picked up by the io_uring multishot RECV.
     mut recv_buf: Vec<u8>,
     utilization: Option<&melin_transport_core::pipeline::StageUtilization>,
+    stream_marks: &StreamMarkQueue,
 ) -> StreamingResult {
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
@@ -523,8 +592,13 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
         }
 
         // --- Parse frames ---
-        let outcome =
-            process_streaming_frames(&recv_buf, input_producer, accum_end_sequence, &mut slot_buf);
+        let outcome = process_streaming_frames(
+            &recv_buf,
+            input_producer,
+            accum_end_sequence,
+            &mut slot_buf,
+            stream_marks,
+        );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
         received_data |= outcome.received_data;
@@ -742,6 +816,12 @@ mod tests {
         melin_pipeline::padding::CachePadded::new(AtomicU64::new(val))
     }
 
+    /// Empty adopted-rotation queue for tests that don't exercise
+    /// rotation adoption.
+    fn no_marks() -> StreamMarkQueue {
+        std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()))
+    }
+
     // ---------------------------------------------------------------
     // streaming_loop tests
     // ---------------------------------------------------------------
@@ -765,6 +845,7 @@ mod tests {
             0,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -795,6 +876,7 @@ mod tests {
             0,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(matches!(result.exit, SessionExit::Promote));
@@ -823,6 +905,7 @@ mod tests {
             0,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -853,6 +936,7 @@ mod tests {
             9,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -895,6 +979,7 @@ mod tests {
             0,
             initial,
             None,
+            &no_marks(),
         );
 
         assert!(result.received_data);
@@ -935,6 +1020,7 @@ mod tests {
             0,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -972,6 +1058,7 @@ mod tests {
             0,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(matches!(result.exit, SessionExit::Fatal(_)));
@@ -1017,6 +1104,7 @@ mod tests {
                 41,
                 Vec::new(),
                 None,
+                &no_marks(),
             );
 
             assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -1055,6 +1143,7 @@ mod tests {
             0,
             Vec::new(),
             Some(&utilization),
+            &no_marks(),
         );
 
         let busy = utilization.busy.load(Ordering::Relaxed);
@@ -1077,7 +1166,13 @@ mod tests {
         encode_heartbeat(99, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(9, 0xA3)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 5, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            5,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(outcome.frame_err.is_none(), "no fatal exit");
         assert_eq!(outcome.consumed, buf.len(), "every byte processed");
@@ -1091,6 +1186,132 @@ mod tests {
         assert_eq!(ids, vec![0xA0, 0xA1, 0xA2, 0xA3]);
     }
 
+    /// A Rotate frame arriving exactly at the stream position is queued
+    /// for the journal stage; the slots around it flow through
+    /// untouched.
+    #[test]
+    fn streaming_rotate_at_exact_boundary_is_queued() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let rotations = no_marks();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
+        melin_transport_core::replication::protocol::encode_rotate(6, &[0x66; 32], &mut buf);
+        append_input_batch_frame(&mut buf, &[slot(7, 0xE1)]);
+
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            5,
+            &mut slot_buf,
+            &rotations,
+        );
+
+        assert!(outcome.frame_err.is_none(), "rotate at boundary is valid");
+        assert_eq!(outcome.accum_end_sequence, 7);
+        assert_eq!(drain(&mut consumer).len(), 2);
+
+        let queued: Vec<_> = rotations.lock().unwrap().iter().copied().collect();
+        assert_eq!(queued.len(), 1);
+        match queued[0] {
+            StreamMark::Rotate(r) => {
+                assert_eq!(r.boundary_seq, 6);
+                assert_eq!(r.tail_hash, [0x66; 32]);
+            }
+            other => panic!("expected a Rotate mark, got {other:?}"),
+        }
+    }
+
+    /// A ChainCheck at the exact stream position is queued as a stream
+    /// mark, with the same position rules as Rotate.
+    #[test]
+    fn streaming_chain_check_at_exact_position_is_queued() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let marks = no_marks();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
+        melin_transport_core::replication::protocol::encode_chain_check(6, &[0x77; 32], &mut buf);
+
+        let outcome =
+            process_streaming_frames::<TestEvent>(&buf, &mut producer, 5, &mut slot_buf, &marks);
+
+        assert!(outcome.frame_err.is_none());
+        assert_eq!(outcome.accum_end_sequence, 6);
+        assert_eq!(drain(&mut consumer).len(), 1);
+
+        let queued: Vec<_> = marks.lock().unwrap().iter().copied().collect();
+        assert_eq!(queued.len(), 1);
+        match queued[0] {
+            StreamMark::ChainCheck {
+                sequence,
+                chain_hash,
+            } => {
+                assert_eq!(sequence, 6);
+                assert_eq!(chain_hash, [0x77; 32]);
+            }
+            other => panic!("expected a ChainCheck mark, got {other:?}"),
+        }
+    }
+
+    /// A Rotate announcing an already-covered boundary (handoff overlap
+    /// re-delivery) is dropped — queuing it after later slots would trip
+    /// the journal stage's ordering invariant.
+    #[test]
+    fn streaming_stale_rotate_is_dropped() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let rotations = no_marks();
+
+        let mut buf = Vec::new();
+        melin_transport_core::replication::protocol::encode_rotate(3, &[0x33; 32], &mut buf);
+        append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
+
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            5,
+            &mut slot_buf,
+            &rotations,
+        );
+
+        assert!(outcome.frame_err.is_none(), "stale rotate is not fatal");
+        assert_eq!(outcome.accum_end_sequence, 6);
+        assert_eq!(drain(&mut consumer).len(), 1);
+        assert!(rotations.lock().unwrap().is_empty(), "stale rotate dropped");
+    }
+
+    /// A Rotate ahead of the stream position implies missing entries —
+    /// same fatal contract as a slot-sequence gap.
+    #[test]
+    fn streaming_rotate_ahead_of_stream_is_fatal_gap() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+        let rotations = no_marks();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
+        melin_transport_core::replication::protocol::encode_rotate(9, &[0x99; 32], &mut buf);
+
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            5,
+            &mut slot_buf,
+            &rotations,
+        );
+
+        assert!(
+            outcome.frame_err.is_some(),
+            "rotate past stream position => fatal"
+        );
+        assert_eq!(outcome.accum_end_sequence, 6, "prefix still committed");
+        assert_eq!(drain(&mut consumer).len(), 1);
+        assert!(rotations.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn streaming_oversize_frame_commits_prior_slots_then_fatal() {
         let (mut producer, mut consumer) = ring(16);
@@ -1102,7 +1323,13 @@ mod tests {
         let oversize_len = (MAX_DATA_FRAME as u32) + 1;
         buf.extend_from_slice(&oversize_len.to_le_bytes());
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 6, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            6,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(outcome.frame_err.is_some(), "oversize => fatal");
         assert_eq!(outcome.accum_end_sequence, 8);
@@ -1121,7 +1348,13 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.push(0xFF);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 2, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            2,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(outcome.frame_err.is_some(), "unknown primary msg => fatal");
         assert_eq!(outcome.accum_end_sequence, 4);
@@ -1139,7 +1372,13 @@ mod tests {
         let complete_len = buf.len();
         buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 0, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            0,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.consumed, complete_len);
@@ -1156,8 +1395,13 @@ mod tests {
         encode_heartbeat(42, &mut buf);
         encode_heartbeat(43, &mut buf);
 
-        let outcome =
-            process_streaming_frames::<TestEvent>(&buf, &mut producer, 100, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            100,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.consumed, buf.len());
@@ -1172,7 +1416,13 @@ mod tests {
         let (mut producer, mut consumer) = ring(4);
         let mut slot_buf = Vec::new();
 
-        let outcome = process_streaming_frames::<TestEvent>(&[], &mut producer, 77, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &[],
+            &mut producer,
+            77,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.consumed, 0);
@@ -1217,7 +1467,13 @@ mod tests {
         // 11 → 14: entries 12..=13 are missing from the wire.
         append_input_batch_frame(&mut buf, &[slot(14, 0xA2), slot(15, 0xA3)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(
             outcome.frame_err.is_some(),
@@ -1245,7 +1501,13 @@ mod tests {
         // 11 → 13 inside a single InputBatch: entry 12 is missing.
         append_input_batch_frame(&mut buf, &[slot(10, 0xB0), slot(11, 0xB1), slot(13, 0xB2)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(
             outcome.frame_err.is_some(),
@@ -1273,7 +1535,13 @@ mod tests {
         // duplicate must be dropped, the new slot accepted.
         append_input_batch_frame(&mut buf, &[slot(11, 0xC1), slot(12, 0xC2)]);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &no_marks(),
+        );
 
         assert!(
             outcome.frame_err.is_none(),
@@ -1350,6 +1618,7 @@ mod tests {
             0,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(
@@ -1412,6 +1681,7 @@ mod tests {
             100, // initial_sequence — the post-snapshot resume point
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(
@@ -1463,6 +1733,7 @@ mod tests {
             100,
             Vec::new(),
             None,
+            &no_marks(),
         );
 
         assert!(

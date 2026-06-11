@@ -20,8 +20,9 @@
 //! This gives maximum pipeline parallelism (matching overlaps journal I/O)
 //! while preserving persist-before-ack at the response boundary.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::trace::{MonoTraceInstant, mono_trace_ns};
@@ -450,12 +451,81 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// zero — non-zero indicates the preparer can't keep up and the
     /// 38 ms tail will be visible again.
     rotations_sync_fallback: u64,
+    /// Primary-announced stream marks to apply (replica mode only;
+    /// `None` on primaries/standalone). Pushed by the replication
+    /// receiver, popped here. See [`StreamMark`].
+    stream_marks: Option<StreamMarkQueue>,
+    /// Front of the stream-mark queue — the next position this stage
+    /// must act at. Held locally so the steady-state cost is one
+    /// `Option` check, not a mutex lock.
+    pending_mark: Option<StreamMark>,
 }
 
 /// How long to suppress size-driven rotation attempts after a failure.
 /// Picked to balance log-flood prevention against responsiveness once
 /// the environmental issue (disk space, fs read-only) is resolved.
 const ROTATION_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A segment rotation announced by the primary over the replication
+/// stream (`Rotate { boundary_seq, tail_hash }`). The replica's journal
+/// stage adopts it at exactly `boundary_seq`: flush everything up to
+/// and including the boundary, verify the local chain tail equals
+/// `tail_hash` (divergence check), then rotate so the new segment's
+/// anchor — the local tail — matches the primary's. Replicas never
+/// rotate on local triggers; shared boundaries are what make chain
+/// values comparable across nodes and healthy replica journals bitwise
+/// mirrors of the primary's.
+#[derive(Debug, Clone, Copy)]
+pub struct AdoptedRotation {
+    /// Last sequence of the outgoing segment.
+    pub boundary_seq: u64,
+    /// The primary's chain value at `boundary_seq` (= the new segment's
+    /// header anchor).
+    pub tail_hash: [u8; 32],
+}
+
+/// A primary-announced action tied to an exact stream position, applied
+/// by the replica's journal stage when its writer reaches that
+/// sequence. Order matters relative to the entry stream AND between
+/// marks, hence one queue for both kinds.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamMark {
+    /// Rotate at the boundary (see [`AdoptedRotation`]). Requires a
+    /// quiesced writer (nothing in flight); the rotation itself flushes.
+    Rotate(AdoptedRotation),
+    /// Compare the local chain value at `sequence` against the
+    /// primary's. Applies inline — the chain is a pure function of
+    /// encoded bytes, so no flush or quiesce is needed.
+    ChainCheck { sequence: u64, chain_hash: [u8; 32] },
+}
+
+impl StreamMark {
+    /// Stream position this mark acts at.
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Rotate(r) => r.boundary_seq,
+            Self::ChainCheck { sequence, .. } => *sequence,
+        }
+    }
+}
+
+/// Cross-thread hand-off of primary-announced stream marks: the
+/// replication receiver pushes (in stream order, before publishing any
+/// slot past the mark's position), the journal stage pops.
+/// `Mutex<VecDeque>` rather than a lock-free queue: marks are strictly
+/// cold (rotations a few per gigabyte, chain checks one per
+/// [`CHAIN_CHECK_INTERVAL_BATCHES`] fsync batches), and the journal
+/// stage only locks at batch/sync boundaries — never per entry.
+pub type StreamMarkQueue = Arc<Mutex<VecDeque<StreamMark>>>;
+
+/// Emit a live-stream `ChainCheck` after every N published replication
+/// batches. Count-based (not time-based) so emission is a pure function
+/// of the event stream. At full load (~12.5K batches/s) this is ~200
+/// checks/s — 45 wire bytes and one BLAKE3 finalize each, negligible
+/// against the data volume; at low rate checks are sparse, which is
+/// fine: handshake validation covers reconnects, and every rotation
+/// adoption is itself a chain check.
+const CHAIN_CHECK_INTERVAL_BATCHES: u32 = 64;
 
 /// Replication state for the journal stage. Boxed in JournalStage to
 /// avoid inflating the struct size on the hot path (standalone mode has
@@ -475,6 +545,9 @@ struct ReplicationState {
     /// Number of slots appended to `input_batch_buf` since the last
     /// publish/reset. Stays in sync with `input_batch_buf`'s contents.
     input_batch_count: u16,
+    /// Published batches since the last live-stream `ChainCheck` was
+    /// emitted — see [`CHAIN_CHECK_INTERVAL_BATCHES`].
+    batches_since_chain_check: u32,
 }
 
 impl Default for ReplicationState {
@@ -491,6 +564,7 @@ impl Default for ReplicationState {
             ],
             input_batch_buf: Vec::new(),
             input_batch_count: 0,
+            batches_since_chain_check: 0,
         }
     }
 }
@@ -533,6 +607,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             preparer: None,
             rotations_fast_path: 0,
             rotations_sync_fallback: 0,
+            stream_marks: None,
+            pending_mark: None,
         }
     }
 
@@ -553,6 +629,21 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         // `enable_preparer` method called from the io_uring run path.
         // The buffered writer rotates via plain `rotate_segment()` — no
         // fast path, but rotation is not on its hot path anyway.
+    }
+
+    /// Replica mode: act only on primary-announced stream marks pushed
+    /// onto `queue` by the replication receiver — rotations at announced
+    /// boundaries, chain checks at announced positions. Mutually
+    /// exclusive with local triggers (`set_rotation`) — a replica that
+    /// rotated on its own would desynchronize its segment boundaries
+    /// from the primary's, making chain values incomparable across
+    /// nodes.
+    pub fn set_stream_marks(&mut self, queue: StreamMarkQueue) {
+        debug_assert!(
+            self.max_journal_bytes == 0 && self.rotate_requested.is_none(),
+            "stream marks are mutually exclusive with local rotation triggers"
+        );
+        self.stream_marks = Some(queue);
     }
 
     /// Shared utilization counters for health endpoint monitoring.
@@ -658,9 +749,6 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             // batch is sync'd so we exit on the same persist-before-ack
             // boundary as steady-state writes.
             let mut saw_shutdown = false;
-            // Number of slots actually consumed from this batch — equals
-            // `count` unless we broke out early on the sentinel.
-            let mut consumed = 0usize;
 
             if count > 0 {
                 idle_spins = 0;
@@ -691,40 +779,71 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 // the same numbering they would in durable mode. The
                 // discard happens at the sync point below in place of the
                 // fsync, keeping `batch_buf` bounded.
-                for slot in &batch[..count] {
-                    if slot.event.is_shutdown() {
-                        saw_shutdown = true;
+                //
+                // Replica mode: a primary-announced stream mark (rotation
+                // boundary or chain check) may fall inside this batch.
+                // `mark_split` bounds each encode span at the pending
+                // mark; between spans the barrier below acts at exactly
+                // the marked entry, then encoding resumes.
+                self.refresh_pending_mark();
+                let mut start = 0usize;
+                loop {
+                    let stop = self.mark_split(&batch, start, count);
+                    let mut span_consumed = 0usize;
+                    for slot in &batch[start..stop] {
+                        if slot.event.is_shutdown() {
+                            saw_shutdown = true;
+                            break;
+                        }
+                        span_consumed += 1;
+                        if slot.event.is_query() {
+                            continue;
+                        }
+                        let seq = if slot.sequence != 0 {
+                            self.writer.set_next_sequence(slot.sequence + 1);
+                            slot.sequence
+                        } else {
+                            self.writer.allocate_sequence()
+                        };
+                        self.writer
+                            .encode_event(
+                                seq,
+                                slot.timestamp_ns,
+                                &slot.event,
+                                slot.key_hash,
+                                slot.request_seq,
+                            )
+                            .map_err(|e| {
+                                JournalError::Io(std::io::Error::other(format!(
+                                    "journal encode (run_sync, seq {seq}): {e}"
+                                )))
+                            })?;
+                        let journal_slice = self.writer.last_user_entry_replication_slice();
+                        Self::record_slot_for_replication(&mut self.repl, journal_slice);
+                    }
+                    pending += span_consumed;
+                    if first_write_ts.is_none() && span_consumed > 0 {
+                        first_write_ts = Some(Instant::now());
+                    }
+                    if stop == count || saw_shutdown {
                         break;
                     }
-                    consumed += 1;
-                    if slot.event.is_query() {
-                        continue;
+                    // Mark barrier: the pending mark sits between
+                    // batch[stop - 1] and batch[stop]. Chain checks
+                    // resolve against the encoded chain — no flush
+                    // needed. A rotation requires the flush + commit
+                    // first so the writer is quiesced exactly at the
+                    // boundary.
+                    self.apply_stream_marks(false)?;
+                    if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
+                        if pending > 0 {
+                            self.sync_point(pending)?;
+                            pending = 0;
+                            first_write_ts = None;
+                        }
+                        self.apply_stream_marks(true)?;
                     }
-                    let seq = if slot.sequence != 0 {
-                        self.writer.set_next_sequence(slot.sequence + 1);
-                        slot.sequence
-                    } else {
-                        self.writer.allocate_sequence()
-                    };
-                    self.writer
-                        .encode_event(
-                            seq,
-                            slot.timestamp_ns,
-                            &slot.event,
-                            slot.key_hash,
-                            slot.request_seq,
-                        )
-                        .map_err(|e| {
-                            JournalError::Io(std::io::Error::other(format!(
-                                "journal encode (run_sync, seq {seq}): {e}"
-                            )))
-                        })?;
-                    let journal_slice = self.writer.last_user_entry_replication_slice();
-                    Self::record_slot_for_replication(&mut self.repl, journal_slice);
-                }
-                pending += consumed;
-                if first_write_ts.is_none() && consumed > 0 {
-                    first_write_ts = Some(Instant::now());
+                    start = stop;
                 }
 
                 #[cfg(feature = "latency-trace")]
@@ -738,46 +857,15 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
 
                 if should_sync {
-                    // Publish the accumulated `InputBatch` frame to the
-                    // replication rings BEFORE the flush or discard below
-                    // clears the buffer. The frame was built up alongside
-                    // the journal-codec writes via
-                    // `record_slot_for_replication` in the encode loop;
-                    // it's already wire-ready except for the back-fill
-                    // inside `publish_input_batch_to_rings`. No-op in
-                    // standalone mode (no producers) or when no slots
-                    // were appended (e.g., a sync that only flushed
-                    // checkpoint metadata).
-                    //
-                    // Runs unconditionally: under `no-persist` the
-                    // replication path must still run, otherwise the
-                    // response stage's replication-cursor gate deadlocks.
-                    if self.repl.any_producer() {
-                        let end_seq = self.writer.next_sequence() - 1;
-                        Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
-                    }
-
-                    // Persist mode: pwrite+O_DIRECT; no-persist mode:
-                    // drop the buffer. `no-persist` means "skip the write
-                    // syscall," not "skip everything that follows."
-                    #[cfg(not(feature = "no-persist"))]
-                    {
-                        // Fatal: journal I/O failure means we can't
-                        // guarantee durability. Surface the error so the
-                        // pipeline shuts down rather than spinning forever
-                        // on a broken disk (e.g., ENOSPC).
-                        self.writer.flush_batch_sync().map_err(|e| {
-                            JournalError::Io(std::io::Error::other(format!(
-                                "journal flush_batch_sync: {e}"
-                            )))
-                        })?;
-                    }
-                    #[cfg(feature = "no-persist")]
-                    self.writer.discard_batch_buf();
-
-                    self.consumer.commit(pending);
-                    self.publish_fsync_state();
+                    self.sync_point(pending)?;
+                    self.maybe_publish_chain_check();
                     let _ = self.maybe_rotate();
+                    // Replica mode: act on a mark that landed exactly at
+                    // this batch's end — no later slot exists yet to
+                    // trigger the mid-batch barrier, and waiting for one
+                    // would leave it unapplied until traffic resumes.
+                    // Just synced, so the writer is quiesced.
+                    self.apply_stream_marks(true)?;
 
                     pending = 0;
                     first_write_ts = None;
@@ -786,10 +874,16 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 idle_count += 1;
                 // Periodically flush utilization counters so the health
                 // endpoint has a reasonably fresh view without adding
-                // atomic stores on the busy path.
+                // atomic stores on the busy path. Piggy-back the
+                // stream-mark check on the same amortization: a trailing
+                // mark (primary rotated or checked, then went quiet)
+                // must be applied while idle, but not at the cost of a
+                // mutex lock per idle spin. `pending == 0` here (this is
+                // the no-pending branch), so the writer is quiesced.
                 if idle_count.is_multiple_of(1024) {
                     self.utilization.busy.store(busy_count, Ordering::Relaxed);
                     self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                    self.apply_stream_marks(true)?;
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
@@ -911,6 +1005,64 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
     }
 
+    /// Emit a live-stream `ChainCheck` every
+    /// [`CHAIN_CHECK_INTERVAL_BATCHES`] published batches: this node's
+    /// chain value at its current position, for replicas to compare
+    /// against their own. Called right after a batch publish, so the
+    /// frame lands after the entries it covers. No-op on standalone
+    /// nodes and with `hash-chain` disabled.
+    fn maybe_publish_chain_check(&mut self) {
+        if !self.repl.any_producer() {
+            return;
+        }
+        self.repl.batches_since_chain_check += 1;
+        if self.repl.batches_since_chain_check < CHAIN_CHECK_INTERVAL_BATCHES {
+            return;
+        }
+        self.repl.batches_since_chain_check = 0;
+        let Some(hash) = self.writer.chain_hash() else {
+            return;
+        };
+        let sequence = self.writer.next_sequence() - 1;
+        // Local buffer: the frame is 45 bytes and checks are sparse.
+        let mut buf = Vec::with_capacity(64);
+        crate::replication::protocol::encode_chain_check(sequence, &hash, &mut buf);
+        Self::publish_to_replication_rings(
+            &mut self.repl.producers,
+            &self.repl.evict,
+            &self.repl.active,
+            &buf,
+            sequence,
+        );
+    }
+
+    /// Publish a `Rotate` frame to the replication rings, announcing
+    /// the boundary the writer just rotated at. Called immediately
+    /// after a successful rotation: `next_sequence - 1` is the outgoing
+    /// segment's last sequence, and the fresh (empty) live segment's
+    /// chain value is its header anchor — the outgoing segment's tail.
+    /// An evicted ring is skipped exactly like a data batch would be:
+    /// the replica re-learns the boundary from journal catch-up on
+    /// reconnect.
+    fn publish_rotate_to_rings(repl: &mut ReplicationState, writer: &W) {
+        if !repl.any_producer() {
+            return;
+        }
+        let boundary_seq = writer.next_sequence() - 1;
+        let tail_hash = writer.chain_hash().unwrap_or([0u8; 32]);
+        // Local buffer: the frame is 45 bytes and rotations are cold —
+        // not worth a dedicated reusable buffer on ReplicationState.
+        let mut buf = Vec::with_capacity(64);
+        crate::replication::protocol::encode_rotate(boundary_seq, &tail_hash, &mut buf);
+        Self::publish_to_replication_rings(
+            &mut repl.producers,
+            &repl.evict,
+            &repl.active,
+            &buf,
+            boundary_seq,
+        );
+    }
+
     /// Publish post-fsync writer state to optional readers:
     /// [`FsyncState`] (for shadow snapshots and replica handshakes) and
     /// `last_seq` (highest journal sequence durably persisted, used by the
@@ -931,6 +1083,41 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         if let Some(ref cursor) = self.last_seq {
             cursor.store(WireSeq::new(journal_seq));
         }
+    }
+
+    /// One durable sync point on the synchronous path: publish the
+    /// accumulated `InputBatch` frame to the replication rings BEFORE
+    /// the flush or discard clears the buffer (the frame was built
+    /// alongside the journal-codec writes via
+    /// `record_slot_for_replication`), persist (`no-persist`: drop the
+    /// buffer — "skip the write syscall," not "skip everything that
+    /// follows"; the replication publish must still run or the response
+    /// stage's replication-cursor gate deadlocks), commit the consumed
+    /// slots, and publish fsync state.
+    ///
+    /// A journal I/O failure is fatal: surface the error so the
+    /// pipeline shuts down rather than spinning forever on a broken
+    /// disk (e.g., ENOSPC).
+    ///
+    /// Shared by `run_sync`'s steady-state sync and the mid-batch
+    /// rotation barrier, which must quiesce the writer identically.
+    fn sync_point(&mut self, pending: usize) -> Result<(), JournalError> {
+        if self.repl.any_producer() {
+            let end_seq = self.writer.next_sequence() - 1;
+            Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+        }
+        #[cfg(not(feature = "no-persist"))]
+        self.writer.flush_batch_sync().map_err(|e| {
+            JournalError::Io(std::io::Error::other(format!(
+                "journal flush_batch_sync: {e}"
+            )))
+        })?;
+        #[cfg(feature = "no-persist")]
+        self.writer.discard_batch_buf();
+
+        self.consumer.commit(pending);
+        self.publish_fsync_state();
+        Ok(())
     }
 
     /// Rotate the live journal segment if a trigger has fired.
@@ -975,7 +1162,29 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         {
             return false;
         }
+        // Never rotate an empty live segment: it would archive an
+        // entry-less file the replicas have no reason to mirror, and a
+        // boundary already exists at this exact sequence. Also keeps
+        // "live starts at boundary+1" an unambiguous already-adopted
+        // signal on replicas (no zero-length segment can sit between).
+        if self.writer.next_sequence() == self.writer.segment_starting_sequence() {
+            if manual {
+                tracing::info!(
+                    next_sequence = self.writer.next_sequence(),
+                    "manual rotation skipped: live segment is empty (already at a boundary)"
+                );
+            }
+            return false;
+        }
         let pre_size = self.writer.valid_end();
+
+        // Entries encoded for replication but not yet published belong
+        // to the outgoing segment (`rotate_segment` flushes them to it),
+        // so they must precede the Rotate frame on the rings.
+        if self.repl.any_producer() {
+            let end_seq = self.writer.next_sequence() - 1;
+            Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+        }
 
         // Generic path: no fast (pre-staged) rotation. The
         // `SectorWriter` specialization overrides this via
@@ -1013,6 +1222,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 // tail), but republish so observers see a state that is
                 // consistent with the new on-disk layout.
                 self.publish_fsync_state();
+                // Announce the boundary to replicas so they rotate at
+                // exactly the same sequence (primary-driven rotation).
+                Self::publish_rotate_to_rings(&mut self.repl, &self.writer);
                 true
             }
             Err(e) => {
@@ -1033,6 +1245,161 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 false
             }
         }
+    }
+
+    /// Pull the next primary-announced stream mark off the queue into
+    /// `pending_mark`. One `Option` check in steady state; the mutex is
+    /// only touched when a mark is actually outstanding or the local
+    /// copy is empty at a batch/sync boundary.
+    #[inline]
+    fn refresh_pending_mark(&mut self) {
+        if self.pending_mark.is_none()
+            && let Some(q) = &self.stream_marks
+        {
+            self.pending_mark = q
+                .lock()
+                .expect("stream-mark queue poisoned (receiver thread panicked)")
+                .pop_front();
+        }
+    }
+
+    /// Index of the first slot in `batch[start..count]` past the
+    /// pending mark's position, or `count` when none is (no mark
+    /// pending, or every slot is at or below the position). Slots with
+    /// `sequence == 0` (locally injected, never journaled) sort below
+    /// any position and stay in the current span.
+    #[inline]
+    fn mark_split(&self, batch: &[InputSlot<E>], start: usize, count: usize) -> usize {
+        let Some(m) = self.pending_mark else {
+            return count;
+        };
+        let position = m.sequence();
+        for (i, slot) in batch[start..count].iter().enumerate() {
+            if slot.sequence > position {
+                return start + i;
+            }
+        }
+        count
+    }
+
+    /// Resolve pending stream marks against the writer position.
+    /// Chain checks apply inline (the chain is a pure function of
+    /// encoded bytes); consecutive resolved marks are drained in order.
+    /// A rotation due at the current position is verified and returned
+    /// for the caller to perform — but only when `quiesced` (nothing
+    /// buffered or in flight on the writer); otherwise it stays pending
+    /// for a later, quiesced call.
+    ///
+    /// `Err` means divergence (local chain disagrees with the
+    /// primary's) or an ordering violation; either tears the pipeline
+    /// down, and the reconnect handshake routes the replica to snapshot
+    /// resync.
+    fn resolve_stream_marks(
+        &mut self,
+        quiesced: bool,
+    ) -> Result<Option<AdoptedRotation>, JournalError> {
+        loop {
+            self.refresh_pending_mark();
+            let Some(mark) = self.pending_mark else {
+                return Ok(None);
+            };
+            let position = mark.sequence();
+            let at = self.writer.next_sequence() - 1;
+            if at < position {
+                return Ok(None);
+            }
+            match mark {
+                StreamMark::ChainCheck {
+                    sequence,
+                    chain_hash,
+                } => {
+                    if at > sequence {
+                        // The receiver pushes marks before publishing any
+                        // slot past their position, and the encode loops
+                        // split batches at pending marks — the writer can
+                        // never legitimately pass one. A bug, not
+                        // divergence.
+                        return Err(JournalError::Io(std::io::Error::other(format!(
+                            "chain-check position {sequence} already passed (writer at \
+                             {at}) — mark/stream ordering bug"
+                        ))));
+                    }
+                    // `None` only with `hash-chain` disabled — nothing to
+                    // compare, the check passes by construction.
+                    let local = self.writer.chain_hash().unwrap_or(chain_hash);
+                    if local != chain_hash {
+                        return Err(JournalError::ReplicaChainDivergence {
+                            sequence,
+                            expected: chain_hash,
+                            actual: local,
+                        });
+                    }
+                    self.pending_mark = None;
+                    // Loop: the next mark may sit at this same position.
+                }
+                StreamMark::Rotate(r) => {
+                    // Duplicate announce of a boundary this journal already
+                    // rotated at (the live segment starts right past it).
+                    // Possible only through redundant delivery — e.g. a
+                    // catch-up walk re-emitting a boundary a held ring chunk
+                    // also carries — never through a second real rotation:
+                    // the primary skips empty-live rotations, so two
+                    // distinct rotations at one sequence cannot exist.
+                    if self.writer.segment_starting_sequence() == r.boundary_seq + 1 {
+                        self.pending_mark = None;
+                        continue;
+                    }
+                    if at > r.boundary_seq {
+                        return Err(JournalError::Io(std::io::Error::other(format!(
+                            "adopted rotation boundary {} already passed (writer at {at}) \
+                             — rotation/stream ordering bug",
+                            r.boundary_seq
+                        ))));
+                    }
+                    if !quiesced {
+                        return Ok(None);
+                    }
+                    let local_tail = self.writer.chain_hash().unwrap_or([0u8; 32]);
+                    if local_tail != r.tail_hash {
+                        return Err(JournalError::ReplicaChainDivergence {
+                            sequence: r.boundary_seq,
+                            expected: r.tail_hash,
+                            actual: local_tail,
+                        });
+                    }
+                    return Ok(Some(r));
+                }
+            }
+        }
+    }
+
+    /// Bookkeeping after a successful adopted rotation.
+    fn finish_adoption(&mut self, boundary_seq: u64) {
+        tracing::info!(
+            boundary_seq,
+            "adopted primary-announced rotation (chain verified at boundary)"
+        );
+        self.pending_mark = None;
+        self.publish_fsync_state();
+    }
+
+    /// Apply pending stream marks: chain checks inline, and — when
+    /// `quiesced` and the writer sits exactly at a verified boundary —
+    /// the rotation itself (plain `rotate_segment`; the sector path's
+    /// preparer-aware twin is `apply_stream_marks_with_prepared`).
+    ///
+    /// Returns `Ok(true)` when a rotation happened, `Ok(false)` when
+    /// there was nothing (left) to do, and `Err` on divergence or an
+    /// ordering violation.
+    fn apply_stream_marks(&mut self, quiesced: bool) -> Result<bool, JournalError> {
+        let Some(r) = self.resolve_stream_marks(quiesced)? else {
+            return Ok(false);
+        };
+        // Verified: the local tail equals the primary's, so rotating
+        // here anchors the new segment identically on both nodes.
+        self.writer.rotate_segment()?;
+        self.finish_adoption(r.boundary_seq);
+        Ok(true)
     }
 
     /// Drain any remaining entries from the ring buffer on shutdown.
@@ -1193,7 +1560,25 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         {
             return false;
         }
+        // Never rotate an empty live segment — see `maybe_rotate`.
+        if self.writer.next_sequence() == self.writer.segment_starting_sequence() {
+            if manual {
+                tracing::info!(
+                    next_sequence = self.writer.next_sequence(),
+                    "manual rotation skipped: live segment is empty (already at a boundary)"
+                );
+            }
+            return false;
+        }
         let pre_size = self.writer.valid_end();
+
+        // Unpublished replication bytes belong to the outgoing segment —
+        // they must precede the Rotate frame on the rings. See
+        // `maybe_rotate`.
+        if self.repl.any_producer() {
+            let end_seq = self.writer.next_sequence() - 1;
+            Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+        }
 
         // Fast path: adopt a sidecar segment pre-allocated by the
         // background preparer. Falls back to the synchronous
@@ -1227,6 +1612,8 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     p.arm();
                 }
                 self.publish_fsync_state();
+                // Announce the boundary to replicas — see `maybe_rotate`.
+                Self::publish_rotate_to_rings(&mut self.repl, &self.writer);
                 true
             }
             Err(e) => {
@@ -1244,6 +1631,101 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 false
             }
         }
+    }
+
+    /// Apply pending stream marks using the preparer fast path for an
+    /// adopted rotation when a pre-staged segment is available. Same
+    /// contract as the generic [`JournalStage::apply_stream_marks`].
+    fn apply_stream_marks_with_prepared(&mut self, quiesced: bool) -> Result<bool, JournalError> {
+        let Some(r) = self.resolve_stream_marks(quiesced)? else {
+            return Ok(false);
+        };
+        let prepared = self.preparer.as_ref().and_then(|p| p.take());
+        match prepared {
+            Some(p) => self.writer.rotate_segment_with_prepared(p)?,
+            None => self.writer.rotate_segment()?,
+        };
+        if let Some(p) = self.preparer.as_ref() {
+            p.arm();
+        }
+        self.finish_adoption(r.boundary_seq);
+        Ok(true)
+    }
+
+    /// Quiesce the writer mid-cycle for a rotation barrier on the
+    /// io_uring path: reap any in-flight write, publish the accumulated
+    /// replication batch, submit-and-wait everything encoded so far,
+    /// and advance the consumer to `progress` — the ring position of
+    /// the last encoded slot. Mid-batch the steady-state pattern
+    /// (`set_progress(consumer.next_read())`) would over-commit: the
+    /// read cursor already covers slots past the boundary that are not
+    /// encoded yet, and committing them would let the ack path
+    /// overstate durability.
+    fn flush_pending_uring(
+        &mut self,
+        ring: &mut io_uring::IoUring,
+        inflight: &mut Option<(melin_journal::AsyncWriteBatch, u64)>,
+        progress: u64,
+    ) -> Result<(), JournalError> {
+        use io_uring::{opcode, types};
+
+        if let Some((batch_data, seq)) = inflight.take() {
+            self.wait_for_cqe(ring, batch_data.len)?;
+            self.consumer.set_progress(seq);
+            self.publish_fsync_state();
+            self.writer.confirm_async_write(batch_data);
+        }
+        if self.repl.any_producer() {
+            let end_seq = self.writer.next_sequence() - 1;
+            Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+        }
+        // `None` needs no write — either query-only, or the bytes fit
+        // the partial tail sector and were written synchronously inside
+        // `take_batch_for_async_write`. Both are durable already.
+        if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
+            let len = async_batch.len;
+            let sqe = opcode::Write::new(types::Fixed(0), async_batch.buf.as_ptr(), len as u32)
+                .offset(async_batch.offset)
+                .rw_flags(self.writer.io_uring_rw_flags())
+                .build()
+                .user_data(1);
+            // SAFETY: `async_batch.buf` stays alive until the CQE is
+            // reaped by `wait_for_cqe` immediately below; the ring
+            // is single-threaded.
+            unsafe {
+                ring.submission().push(&sqe).expect("SQ full");
+            }
+            ring.submit().map_err(|e| {
+                JournalError::Io(std::io::Error::other(format!(
+                    "io_uring submit (rotation barrier): {e}"
+                )))
+            })?;
+            self.wait_for_cqe(ring, len)?;
+            self.writer.confirm_async_write(async_batch);
+        }
+        self.consumer.set_progress(progress);
+        self.publish_fsync_state();
+        Ok(())
+    }
+
+    /// Stream-mark hook for the io_uring loop. Chain checks resolve at
+    /// any call; a rotation is performed only when the writer is fully
+    /// quiesced (nothing buffered, nothing in flight) — otherwise it
+    /// stays pending for a later, quiesced call. Re-registers the
+    /// journal fd when a rotation happened (the writer's fd changes).
+    /// No-op outside replica mode.
+    fn apply_stream_marks_uring(
+        &mut self,
+        ring: &io_uring::IoUring,
+        quiesced: bool,
+    ) -> Result<(), JournalError> {
+        if self.stream_marks.is_none() {
+            return Ok(());
+        }
+        if self.apply_stream_marks_with_prepared(quiesced)? {
+            Self::reregister_journal_fd(ring, self.writer.fd())?;
+        }
+        Ok(())
     }
 
     /// Overlapped io_uring journal loop: submits `Write` asynchronously and
@@ -1387,8 +1869,16 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             if rotated_top {
                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
             }
+            // Replica mode: adopt a boundary reached at the previous
+            // submit (no later slot has arrived to trigger the mid-batch
+            // barrier). Quiesced only when nothing is buffered or in
+            // flight.
+            self.apply_stream_marks_uring(&ring, inflight.is_none() && pending == 0)?;
 
             // --- Read events from disruptor ---
+            // Ring position before this read — the barrier path computes
+            // mid-batch commit targets as `read_start + encoded slots`.
+            let read_start = self.consumer.next_read();
             let remaining = MAX_JOURNAL_BATCH.saturating_sub(pending);
             let count = if remaining > 0 {
                 self.consumer.read_batch(&mut batch, remaining)
@@ -1408,39 +1898,70 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 idle_spins = 0;
                 busy_count += 1;
 
-                for slot in &batch[..count] {
-                    if slot.event.is_shutdown() {
-                        saw_shutdown = true;
+                // Replica mode: a primary-announced stream mark (rotation
+                // boundary or chain check) may fall inside this batch.
+                // `mark_split` bounds each encode span at the pending
+                // mark; between spans the barrier acts at exactly the
+                // marked entry, then encoding resumes.
+                self.refresh_pending_mark();
+                let mut start = 0usize;
+                loop {
+                    let stop = self.mark_split(&batch, start, count);
+                    for slot in &batch[start..stop] {
+                        if slot.event.is_shutdown() {
+                            saw_shutdown = true;
+                            break;
+                        }
+                        if slot.event.is_query() {
+                            continue;
+                        }
+                        let seq = if slot.sequence != 0 {
+                            self.writer.set_next_sequence(slot.sequence + 1);
+                            slot.sequence
+                        } else {
+                            self.writer.allocate_sequence()
+                        };
+                        self.writer
+                            .encode_event(
+                                seq,
+                                slot.timestamp_ns,
+                                &slot.event,
+                                slot.key_hash,
+                                slot.request_seq,
+                            )
+                            .map_err(|e| {
+                                JournalError::Io(std::io::Error::other(format!(
+                                    "journal encode (run_uring, seq {seq}): {e}"
+                                )))
+                            })?;
+                        let journal_slice = self.writer.last_user_entry_replication_slice();
+                        Self::record_slot_for_replication(&mut self.repl, journal_slice);
+                    }
+                    pending += stop - start;
+                    if first_write_ts.is_none() {
+                        first_write_ts = Some(Instant::now());
+                    }
+                    if stop == count || saw_shutdown {
                         break;
                     }
-                    if slot.event.is_query() {
-                        continue;
+                    // Mark barrier: the pending mark sits between
+                    // batch[stop - 1] and batch[stop]. Chain checks
+                    // resolve against the encoded chain — no flush
+                    // needed. A rotation requires the flush + commit
+                    // first (progress = exactly the boundary slot's ring
+                    // position) so the writer is quiesced.
+                    self.apply_stream_marks_uring(&ring, false)?;
+                    if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
+                        self.flush_pending_uring(
+                            &mut ring,
+                            &mut inflight,
+                            read_start + stop as u64,
+                        )?;
+                        pending = 0;
+                        first_write_ts = None;
+                        self.apply_stream_marks_uring(&ring, true)?;
                     }
-                    let seq = if slot.sequence != 0 {
-                        self.writer.set_next_sequence(slot.sequence + 1);
-                        slot.sequence
-                    } else {
-                        self.writer.allocate_sequence()
-                    };
-                    self.writer
-                        .encode_event(
-                            seq,
-                            slot.timestamp_ns,
-                            &slot.event,
-                            slot.key_hash,
-                            slot.request_seq,
-                        )
-                        .map_err(|e| {
-                            JournalError::Io(std::io::Error::other(format!(
-                                "journal encode (run_uring, seq {seq}): {e}"
-                            )))
-                        })?;
-                    let journal_slice = self.writer.last_user_entry_replication_slice();
-                    Self::record_slot_for_replication(&mut self.repl, journal_slice);
-                }
-                pending += count;
-                if first_write_ts.is_none() {
-                    first_write_ts = Some(Instant::now());
+                    start = stop;
                 }
             }
 
@@ -1491,6 +2012,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             if rotated_eager {
                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
             }
+            self.apply_stream_marks_uring(&ring, inflight.is_none() && pending == 0)?;
 
             // --- Decide whether to submit ---
             if pending > 0 {
@@ -1529,6 +2051,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     if self.repl.any_producer() {
                         let end_seq = self.writer.next_sequence() - 1;
                         Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+                        self.maybe_publish_chain_check();
                     }
 
                     // Take the batch buffer and submit async write.
@@ -1565,6 +2088,10 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                             if self.maybe_rotate_with_prepared() {
                                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
                             }
+                            // Replica mode: writer is durable + quiesced
+                            // right here — adopt a boundary that landed
+                            // exactly at this batch's end.
+                            self.apply_stream_marks_uring(&ring, true)?;
                         }
                         Err(e) => {
                             return Err(JournalError::Io(std::io::Error::other(format!(
@@ -1580,6 +2107,12 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 if idle_count.is_multiple_of(1024) {
                     self.utilization.busy.store(busy_count, Ordering::Relaxed);
                     self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                    // Replica mode: adopt a trailing rotation while idle
+                    // (primary rotated, then went quiet). Amortized so
+                    // the queue mutex isn't touched per idle spin.
+                    // `pending == 0` here (no-pending branch); quiesced
+                    // once the last in-flight write has been reaped.
+                    self.apply_stream_marks_uring(&ring, inflight.is_none())?;
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }

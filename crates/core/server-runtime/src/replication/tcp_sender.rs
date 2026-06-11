@@ -21,8 +21,11 @@ use melin_transport_core::replication::catchup::{
     snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
-    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_heartbeat,
-    encode_stream_start, read_frame,
+    MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_hash_mismatch,
+    encode_heartbeat, encode_stream_start, read_frame,
+};
+use melin_transport_core::replication::validate::{
+    HandshakeValidation, validate_replica_handshake,
 };
 
 // --- Replication Sender (Primary side) ---
@@ -426,14 +429,53 @@ fn handle_replica_connection<A: Application>(
 
     let mut send_buf = Vec::with_capacity(128);
 
+    // Chain validation: recompute our chain at the replica's claimed
+    // position and compare with the hash it reported. A mismatch (or a
+    // position beyond our tip) means its journal holds divergent
+    // history — streaming on top would silently fork the audit trail.
+    // Send HashMismatch (the replica archives its local journal on
+    // receipt) and route it through snapshot resync on this same
+    // connection.
+    let divergent = match validate_replica_handshake(journal_path, &handshake)? {
+        HandshakeValidation::Ok => false,
+        HandshakeValidation::Divergent(kind) => {
+            warn!(
+                last_sequence = handshake.last_sequence,
+                ?kind,
+                "replica journal divergent at handshake — routing through snapshot resync"
+            );
+            true
+        }
+    };
+
     // Probe whether journal catch-up is possible before committing to
     // a protocol path. This avoids sending StreamStart only to discover
     // the journals are too old.
-    let can_catch_up = can_catch_up_from_journal(journal_path, handshake.last_sequence)?;
+    let can_catch_up =
+        !divergent && can_catch_up_from_journal(journal_path, handshake.last_sequence)?;
 
     let mut publish = |buf: &[u8]| -> io::Result<()> {
         writer.write_all(buf)?;
         writer.flush()
+    };
+
+    if divergent {
+        encode_hash_mismatch(&mut send_buf);
+        publish(&send_buf)?;
+        send_buf.clear();
+    }
+
+    // Cursor/stream floor for everything downstream. A divergent
+    // replica's claimed position is meaningless (its history forked —
+    // possibly ahead of our tip); the resync rebases it, so seed from 0
+    // like a fresh replica: the ack cursors understate until real acks
+    // arrive (safe), and the sent high-water seeds from the catch-up
+    // end instead of a bogus claim that would mark live ring chunks as
+    // already covered.
+    let stream_base = if divergent {
+        0
+    } else {
+        handshake.last_sequence
     };
 
     let catchup_end = if can_catch_up {
@@ -478,7 +520,7 @@ fn handle_replica_connection<A: Application>(
     // gate's `evaluate_durability` reads. Must happen BEFORE the
     // bridge's active_flag Release — see `ReplicaCursors` for the
     // ordering contract.
-    cursors.seed_on_handshake(slot_idx, handshake.last_sequence);
+    cursors.seed_on_handshake(slot_idx, stream_base);
 
     // Bridge into live streaming: activates the ring, re-reads from the
     // journal the entries that fell into the activation window, then
@@ -496,7 +538,7 @@ fn handle_replica_connection<A: Application>(
         };
         bridge_catchup_to_live::<A::Event>(
             journal_path,
-            handshake.last_sequence,
+            stream_base,
             catchup_end,
             active_flag,
             repl_consumer,

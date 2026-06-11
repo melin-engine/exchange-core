@@ -24,6 +24,7 @@ use super::{
     ReplicaPipelineHandles, build_replica_pipeline_with_threads, sleep_checking_flags,
     teardown_replica_pipeline,
 };
+use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
     encode_ack, encode_handshake, read_frame,
@@ -393,7 +394,6 @@ pub fn run_receiver<A, W>(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
-    rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, W>
@@ -595,8 +595,21 @@ where
                 info!(start_sequence, epoch, "streaming started");
                 ((segment_start_sequence, anchor_hash), last_sequence)
             }
-            PrimaryMessage::NeedSnapshot => {
-                info!("primary requires snapshot transfer — receiving snapshot");
+            ref resync @ (PrimaryMessage::NeedSnapshot | PrimaryMessage::HashMismatch) => {
+                // HashMismatch is NeedSnapshot plus the verdict that our
+                // local journal holds divergent history (forked from the
+                // primary's — e.g. we are an ex-primary rejoining after
+                // failover with an acked-but-unreplicated suffix).
+                let divergent = matches!(resync, PrimaryMessage::HashMismatch);
+                if divergent {
+                    warn!(
+                        last_sequence,
+                        "primary reports chain divergence — archiving local journal, \
+                         resyncing from snapshot"
+                    );
+                } else {
+                    info!("primary requires snapshot transfer — receiving snapshot");
+                }
 
                 if let Some(mut p) = pipeline.take() {
                     p.input_producer
@@ -604,8 +617,17 @@ where
                     let _ = teardown_replica_pipeline::<A, W>(p);
                 }
 
-                let _ = std::fs::remove_file(journal_path);
-                let _ = std::fs::remove_file(&snapshot_path);
+                // Move the local lineage aside — never delete. Divergent
+                // journals are audit-trail material (under `local`
+                // durability they may hold acked orders that did not
+                // survive a failover); stale ones may be the last copy
+                // of history the primary has pruned.
+                let reason = if divergent {
+                    ArchiveReason::Divergent
+                } else {
+                    ArchiveReason::Resync
+                };
+                archive_local_lineage(journal_path, &snapshot_path, reason)?;
 
                 let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
                 let (snap_len, snap_sequence, snap_chain_hash) =
@@ -685,7 +707,88 @@ where
                 fence_state.observe_epoch(snap_epoch);
                 exchange = Some(snap_exchange);
 
-                let writer = W::create_continuing(journal_path, snap_sequence + 1, snap_hash)?;
+                // --- Segment seed ---
+                // The raw byte prefix of the primary's segment containing
+                // `snap_sequence + 1`. Written verbatim as our live
+                // segment, it makes our segmentation a byte-copy of the
+                // primary's from birth — chain values comparable and
+                // `Rotate` verification valid immediately.
+                let seed_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                let seed_len = match decode_primary_message(&seed_frame)? {
+                    PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
+                    other => {
+                        return Err(format!(
+                            "expected SegmentSeedBegin after snapshot, got {other:?}"
+                        )
+                        .into());
+                    }
+                };
+                let seed_tmp = journal_path.with_extension("seed.tmp");
+                {
+                    let mut tmp_file = std::fs::File::create(&seed_tmp)?;
+                    let mut received: u64 = 0;
+                    let mut running_crc: u32 = 0;
+                    loop {
+                        let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
+                        match decode_primary_message(&chunk_frame)? {
+                            PrimaryMessage::SnapshotChunk(data) => {
+                                std::io::Write::write_all(&mut tmp_file, &data)?;
+                                received += data.len() as u64;
+                                running_crc = crc32c::crc32c_append(running_crc, &data);
+                            }
+                            PrimaryMessage::SnapshotEnd {
+                                crc32c: expected_crc,
+                            } => {
+                                tmp_file.sync_all()?;
+                                drop(tmp_file);
+                                if received != seed_len {
+                                    let _ = std::fs::remove_file(&seed_tmp);
+                                    return Err(format!(
+                                        "segment seed length mismatch: expected {seed_len} \
+                                         bytes, got {received}"
+                                    )
+                                    .into());
+                                }
+                                if running_crc != expected_crc {
+                                    let _ = std::fs::remove_file(&seed_tmp);
+                                    return Err(format!(
+                                        "segment seed CRC mismatch: expected \
+                                         {expected_crc:#x}, got {running_crc:#x}"
+                                    )
+                                    .into());
+                                }
+                                std::fs::rename(&seed_tmp, journal_path)?;
+                                melin_journal::segment::fsync_parent_dir(journal_path)?;
+                                break;
+                            }
+                            other => {
+                                let _ = std::fs::remove_file(&seed_tmp);
+                                return Err(format!(
+                                    "expected seed SnapshotChunk/End, got {other:?}"
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                }
+
+                // Open the seeded segment for appending at the snapshot
+                // position — recovery's resume path: the chain rebuilds
+                // from the seeded bytes, and its value at `snap_sequence`
+                // must equal the (verified) snapshot's chain hash, tying
+                // seed and snapshot to the same history. `chain_hash()`
+                // is `None` only with `hash-chain` disabled — nothing to
+                // tie then, so the check passes by construction.
+                let writer = W::open_append(journal_path, snap_sequence, seed_len)?;
+                let seeded_chain = writer.chain_hash().unwrap_or(snap_chain_hash);
+                if seeded_chain != snap_chain_hash {
+                    return Err(format!(
+                        "segment seed chain at {snap_sequence} disagrees with the \
+                         transferred snapshot's hash — inconsistent primary"
+                    )
+                    .into());
+                }
+                let seeded_info = melin_journal::segment::read_header_info(journal_path)?;
                 journal_writer = Some(writer);
 
                 let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -696,20 +799,17 @@ where
                         anchor_hash,
                         epoch,
                     } => {
-                        // The lineage must agree with the snapshot the
-                        // primary just transferred — the local journal
-                        // was created from the (verified) snapshot body,
-                        // so an inconsistent StreamStart means a buggy
-                        // or mismatched primary. Trust nothing
-                        // unvalidated at this boundary: a future chain
-                        // verifier would inherit the value.
-                        if segment_start_sequence != snap_sequence + 1
-                            || anchor_hash != snap_chain_hash
+                        // The announced lineage must agree with the seed
+                        // the primary just transferred. Trust nothing
+                        // unvalidated at this boundary.
+                        if segment_start_sequence != seeded_info.starting_sequence
+                            || anchor_hash != seeded_info.anchor_hash
                         {
                             return Err(format!(
                                 "post-snapshot StreamStart lineage (start \
                                  {segment_start_sequence}) disagrees with the transferred \
-                                 snapshot (sequence {snap_sequence}) — inconsistent primary"
+                                 segment seed (start {}) — inconsistent primary",
+                                seeded_info.starting_sequence
                             )
                             .into());
                         }
@@ -733,9 +833,6 @@ where
                 // (verified) snapshot sequence.
                 (lineage, snap_sequence)
             }
-            PrimaryMessage::HashMismatch => {
-                return Err("chain hash mismatch — replica has divergent history".into());
-            }
             _ => {
                 return Err(format!("unexpected response: {response:?}").into());
             }
@@ -746,9 +843,8 @@ where
         // (starting sequence + chain anchor) the primary's own journal
         // lineage began with; creating the local segment from the same
         // identity makes the replica's segment byte-identical to the
-        // primary's until the first rotation on either node (rotations
-        // are local, so segment boundaries diverge after that even
-        // though the entry stream stays identical).
+        // primary's, and adopted `Rotate` boundaries keep it that way
+        // across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
             let (lineage_start, lineage_anchor) = stream_lineage;
             let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
@@ -770,7 +866,6 @@ where
                 snapshot_path.clone(),
                 group_commit_delay,
                 busy_spin,
-                rotation.clone(),
                 Arc::clone(&fence_state),
             )?);
         }
@@ -780,6 +875,7 @@ where
             let p = pipeline.as_mut().expect("pipeline must exist by here");
             let input_producer = &mut p.input_producer;
             let journal_cursor = p.journal_cursor.as_ref();
+            let stream_marks = &p.stream_marks;
             std::thread::scope(|s| {
                 let handle = std::thread::Builder::new()
                     .name("replica-receiver".into())
@@ -806,6 +902,7 @@ where
                             session_start,
                             Vec::with_capacity(MAX_DATA_FRAME + 4),
                             None,
+                            stream_marks,
                         )
                     })
                     .expect("spawn replica-receiver thread");

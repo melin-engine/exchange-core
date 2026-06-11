@@ -30,22 +30,27 @@
 //! ### Primary → Replica
 //! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]`
 //!   — the segment header identity a fresh replica creates its journal
-//!   with (lineage origin for full catch-up, `snap_sequence + 1` +
-//!   snapshot hash after a snapshot transfer)
+//!   with (lineage origin for full catch-up, the seeded segment's
+//!   identity after a snapshot transfer)
 //! - **NeedSnapshot**: `[len:u32][0x11]`
-//! - **HashMismatch**: `[len:u32][0x12]`
+//! - **HashMismatch**: `[len:u32][0x12]` — divergent replica journal;
+//!   the replica archives its lineage, then the snapshot flow follows
 //! - **SnapshotBegin**: `[len:u32][0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]`
 //! - **SnapshotChunk**: `[len:u32][0x14][data...]`
 //! - **SnapshotEnd**: `[len:u32][0x15][crc32c:u32]`
+//! - **Rotate**: `[len:u32][0x16][boundary_seq:u64][tail_hash:[u8;32]]`
+//!   — primary-driven rotation, verified + adopted by the replica
+//! - **ChainCheck**: `[len:u32][0x17][sequence:u64][chain_hash:[u8;32]]`
+//!   — periodic live-stream chain validation
+//! - **SegmentSeedBegin**: `[len:u32][0x18][seed_len:u64]` — raw byte
+//!   prefix of the primary's segment containing the snapshot boundary;
+//!   body rides SnapshotChunk frames, ends with SnapshotEnd
 //! - **InputBatch**: `[len:u32][0x21][count:u16][slot...]` — see
 //!   `transport-core::replication_wire` for the per-slot layout
 //! - **Heartbeat**: `[len:u32][0x30][sequence:u64]`
 //!
-//! ## v1 Limitations
+//! ## Limitations
 //!
-//! - No handshake chain hash validation (HashMismatch never sent).
-//!   Cross-node chain comparison requires aligned segment boundaries —
-//!   see the slaved-rotation follow-up in `docs/roadmap.md`.
 //! - Dual replication (up to 2 replicas in parallel)
 //!
 //! See `docs/replication.md` for the full design document and limitation details.
@@ -226,6 +231,11 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// on replicas now.
     pub(super) chain_hash_lock:
         Option<Arc<melin_pipeline::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>>,
+    /// Primary-announced rotation hand-off: the receiver thread pushes
+    /// `Rotate` boundaries here (in stream order), the journal stage
+    /// pops and rotates at exactly those sequences. Replicas have no
+    /// local rotation triggers.
+    pub(super) stream_marks: melin_transport_core::pipeline::StreamMarkQueue,
     /// Per-pipeline shutdown flag — flipped only on a controlled teardown
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
@@ -247,7 +257,6 @@ pub(super) fn build_replica_pipeline_with_threads<A, W>(
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
-    rotation: Option<(u64, Arc<AtomicBool>)>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
 ) -> Result<ReplicaPipelineHandles<A, W>, Box<dyn std::error::Error>>
 where
@@ -279,9 +288,13 @@ where
     let ps = Arc::clone(&pipeline_shutdown);
     let journal_core = cores.journal;
     let mut journal_stage = pipeline.journal_stage;
-    if let Some((max_bytes, flag)) = rotation {
-        journal_stage.set_rotation(max_bytes, Some(flag));
-    }
+    // Replicas never rotate on local triggers (size or operator
+    // command) — they adopt the boundaries the primary announces over
+    // the stream, which keeps segment boundaries (and with them chain
+    // values and journal bytes) identical across nodes.
+    let stream_marks: melin_transport_core::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    journal_stage.set_stream_marks(Arc::clone(&stream_marks));
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
@@ -364,6 +377,7 @@ where
         journal_cursor: pipeline.cursors.journal_ring_arc(),
         last_seq: pipeline.cursors.durable_wire_seq(),
         chain_hash_lock: pipeline.chain_hash_lock,
+        stream_marks,
         pipeline_shutdown,
         journal_handle,
         matching_handle,
@@ -402,10 +416,11 @@ mod tests {
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
         decode_challenge_response, decode_primary_message, decode_replica_message, encode_ack,
-        encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response,
-        encode_handshake, encode_hash_mismatch, encode_heartbeat, encode_input_batch,
-        encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-        encode_stream_start, read_frame, try_decode_input_batch,
+        encode_auth_failed, encode_auth_ok, encode_chain_check, encode_challenge,
+        encode_challenge_response, encode_handshake, encode_hash_mismatch, encode_heartbeat,
+        encode_input_batch, encode_need_snapshot, encode_rotate, encode_segment_seed_begin,
+        encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
+        read_frame, try_decode_input_batch,
     };
 
     /// Build a wire-ready `InputBatch` frame containing a single `Tick`
@@ -552,6 +567,85 @@ mod tests {
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         assert!(matches!(msg, PrimaryMessage::HashMismatch));
+    }
+
+    #[test]
+    fn rotate_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_rotate(7_000_000, &[0xBB; 32], &mut buf);
+
+        let payload = &buf[4..];
+        let msg = decode_primary_message(payload).unwrap();
+        match msg {
+            PrimaryMessage::Rotate {
+                boundary_seq,
+                tail_hash,
+            } => {
+                assert_eq!(boundary_seq, 7_000_000);
+                assert_eq!(tail_hash, [0xBB; 32]);
+            }
+            _ => panic!("expected Rotate"),
+        }
+    }
+
+    #[test]
+    fn chain_check_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_chain_check(555, &[0xCC; 32], &mut buf);
+
+        let payload = &buf[4..];
+        let msg = decode_primary_message(payload).unwrap();
+        match msg {
+            PrimaryMessage::ChainCheck {
+                sequence,
+                chain_hash,
+            } => {
+                assert_eq!(sequence, 555);
+                assert_eq!(chain_hash, [0xCC; 32]);
+            }
+            _ => panic!("expected ChainCheck"),
+        }
+    }
+
+    /// Pin the wire layout of the shared `(sequence, hash)` frame body —
+    /// same rationale as `ack_wire_byte_pattern`. Rotate and ChainCheck
+    /// share the layout; only the tag differs.
+    #[test]
+    fn rotate_wire_byte_pattern() {
+        let mut hash = [0u8; 32];
+        for (i, b) in hash.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut buf = Vec::new();
+        encode_rotate(0xDEAD_BEEF_CAFE_F00D, &hash, &mut buf);
+        // [length:u32 LE = 41][tag:u8 = MSG_ROTATE = 0x16]
+        // [boundary_seq:u64 LE][tail_hash:32 bytes verbatim]
+        let mut expected = vec![
+            0x29, 0x00, 0x00, 0x00, // length = 41 LE
+            0x16, // MSG_ROTATE
+            0x0D, 0xF0, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE, // boundary_seq LE
+        ];
+        expected.extend_from_slice(&hash);
+        assert_eq!(
+            buf.as_slice(),
+            expected.as_slice(),
+            "Rotate wire layout drifted"
+        );
+    }
+
+    #[test]
+    fn segment_seed_begin_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_segment_seed_begin(123_456, &mut buf);
+
+        let payload = &buf[4..];
+        let msg = decode_primary_message(payload).unwrap();
+        match msg {
+            PrimaryMessage::SegmentSeedBegin { seed_len } => {
+                assert_eq!(seed_len, 123_456);
+            }
+            _ => panic!("expected SegmentSeedBegin"),
+        }
     }
 
     #[test]

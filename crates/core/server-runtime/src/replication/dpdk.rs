@@ -26,14 +26,18 @@ use super::{
     ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics, SentHighWater,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
 };
+use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal_with,
     snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
-    decode_primary_message, decode_replica_message, encode_ack, encode_handshake, encode_heartbeat,
-    encode_stream_start,
+    decode_primary_message, decode_replica_message, encode_ack, encode_handshake,
+    encode_hash_mismatch, encode_heartbeat, encode_stream_start,
+};
+use melin_transport_core::replication::validate::{
+    HandshakeValidation, validate_replica_handshake,
 };
 
 // ---------------------------------------------------------------------------
@@ -374,20 +378,63 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                                     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
-                                    // Probe whether journal catch-up is possible.
-                                    let can_catch_up = match can_catch_up_from_journal(
+                                    // Chain validation — see the kernel-TCP
+                                    // sender. A divergent replica gets a
+                                    // HashMismatch frame (below) and the
+                                    // snapshot-resync route on this same
+                                    // connection.
+                                    let divergent = match validate_replica_handshake(
                                         journal_path,
-                                        h.last_sequence,
+                                        &h,
                                     ) {
-                                        Ok(v) => v,
+                                        Ok(HandshakeValidation::Ok) => false,
+                                        Ok(HandshakeValidation::Divergent(kind)) => {
+                                            warn!(
+                                                slot = slot_idx,
+                                                last_sequence = h.last_sequence,
+                                                ?kind,
+                                                "replica journal divergent at handshake — \
+                                                 routing through snapshot resync"
+                                            );
+                                            true
+                                        }
                                         Err(e) => {
-                                            warn!(slot = slot_idx, error = %e, "catch-up probe failed — disconnecting");
+                                            warn!(slot = slot_idx, error = %e, "handshake validation failed — disconnecting");
                                             transport.close(handle);
                                             slot.state = SlotState::Idle;
                                             slot.recv_buf.clear();
+                                            metrics.catching_up[slot_idx]
+                                                .store(false, Ordering::Relaxed);
                                             replicas_connected.fetch_sub(1, Ordering::Release);
                                             cursors.clear_on_disconnect(slot_idx);
                                             continue;
+                                        }
+                                    };
+                                    // Cursor/stream floor: a divergent
+                                    // replica's claimed position is
+                                    // meaningless (see the kernel-TCP
+                                    // sender) — seed from 0 like a fresh
+                                    // replica.
+                                    let stream_base = if divergent { 0 } else { h.last_sequence };
+
+                                    // Probe whether journal catch-up is possible.
+                                    let can_catch_up = if divergent {
+                                        false
+                                    } else {
+                                        match can_catch_up_from_journal(
+                                            journal_path,
+                                            h.last_sequence,
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                warn!(slot = slot_idx, error = %e, "catch-up probe failed — disconnecting");
+                                                transport.close(handle);
+                                                slot.state = SlotState::Idle;
+                                                slot.recv_buf.clear();
+                                                replicas_connected.fetch_sub(1, Ordering::Release);
+                                                cursors.clear_on_disconnect(slot_idx);
+                                                continue;
+                                            }
                                         }
                                     };
 
@@ -411,12 +458,31 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         Ok(())
                                     };
 
+                                    // Divergence verdict goes out before any
+                                    // resync data — the replica archives its
+                                    // local journal on receipt.
+                                    if divergent {
+                                        slot.send_buf.clear();
+                                        encode_hash_mismatch(&mut slot.send_buf);
+                                        if let Err(e) = dpdk_publish(&slot.send_buf) {
+                                            warn!(slot = slot_idx, error = %e, "HashMismatch send failed — disconnecting");
+                                            transport.close(handle);
+                                            slot.state = SlotState::Idle;
+                                            slot.recv_buf.clear();
+                                            metrics.catching_up[slot_idx]
+                                                .store(false, Ordering::Relaxed);
+                                            replicas_connected.fetch_sub(1, Ordering::Release);
+                                            cursors.clear_on_disconnect(slot_idx);
+                                            continue;
+                                        }
+                                    }
+
                                     // Highest sequence streamed during catch-up /
                                     // snapshot transfer — monotonic from the
-                                    // handshake value. Seeds the slot's sent
+                                    // stream floor. Seeds the slot's sent
                                     // high-water mark (heartbeats + ack-sanity
                                     // bound) below.
-                                    let mut catchup_end = h.last_sequence;
+                                    let mut catchup_end = stream_base;
                                     let catchup_err = if can_catch_up {
                                         slot.send_buf.clear();
                                         melin_transport_core::replication::catchup::lineage_origin(
@@ -487,7 +553,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     // that observes active=true also observes a
                                     // non-zero cursor pair — see `ReplicaCursors` for
                                     // the ordering contract.
-                                    cursors.seed_on_handshake(slot_idx, h.last_sequence);
+                                    cursors.seed_on_handshake(slot_idx, stream_base);
 
                                     // Bridge into live streaming: activates the
                                     // ring, re-reads from the journal the entries
@@ -506,7 +572,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     // sent high-water (heartbeats + ack-sanity bound).
                                     match bridge_catchup_to_live::<A::Event>(
                                         journal_path,
-                                        h.last_sequence,
+                                        stream_base,
                                         catchup_end,
                                         &slot.active_flag,
                                         &mut slot.consumer,
@@ -761,7 +827,6 @@ pub fn run_receiver_dpdk<A, W>(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
-    rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     // Application factory: see the kernel-TCP `run_receiver` for the
     // shape and rationale. Carries operator policy (rate limits, caps,
     // ...) alongside the empty-app constructor.
@@ -1045,10 +1110,26 @@ where
                             info!(start_sequence, epoch, "streaming started (DPDK)");
                             break 'handshake Some((segment_start_sequence, anchor_hash));
                         }
-                        PrimaryMessage::NeedSnapshot => {
-                            info!("primary requires snapshot transfer — receiving snapshot (DPDK)");
+                        ref resync @ (PrimaryMessage::NeedSnapshot
+                        | PrimaryMessage::HashMismatch) => {
+                            // HashMismatch is NeedSnapshot plus the verdict
+                            // that the local journal is divergent — see the
+                            // kernel-TCP receiver.
+                            let divergent = matches!(resync, PrimaryMessage::HashMismatch);
+                            if divergent {
+                                warn!(
+                                    last_sequence,
+                                    "primary reports chain divergence — archiving local \
+                                     journal, resyncing from snapshot (DPDK)"
+                                );
+                            } else {
+                                info!(
+                                    "primary requires snapshot transfer — receiving \
+                                     snapshot (DPDK)"
+                                );
+                            }
 
-                            // Tear down the live pipeline before wiping its
+                            // Tear down the live pipeline before moving its
                             // backing journal — the journal stage holds the
                             // file open and the App lives on the matching
                             // thread; both must exit cleanly first.
@@ -1056,39 +1137,75 @@ where
                                 let _ = teardown_replica_pipeline::<A, W>(p);
                             }
 
-                            // Remove stale local state. Invalidate the in-memory
-                            // App and SectorWriter — their underlying files
-                            // are about to be deleted. Without this, a failed
-                            // snapshot transfer would leave stale state that
-                            // the reconnect loop mistakes for valid.
+                            // Invalidate the in-memory App and writer — their
+                            // underlying files are about to be moved aside.
+                            // The lineage is archived, never deleted: a
+                            // divergent journal is audit-trail material, a
+                            // stale one may be the last copy of pruned
+                            // history.
                             exchange = None;
                             journal_writer = None;
-                            let _ = std::fs::remove_file(journal_path);
-                            let _ = std::fs::remove_file(&snapshot_path);
+                            let reason = if divergent {
+                                ArchiveReason::Divergent
+                            } else {
+                                ArchiveReason::Resync
+                            };
+                            archive_local_lineage(journal_path, &snapshot_path, reason)?;
 
-                            // Receive snapshot via DPDK transport.
-                            match receive_snapshot_dpdk::<A>(
+                            // Receive snapshot + segment seed via DPDK
+                            // transport. The seed makes this replica's live
+                            // segment a byte-copy of the primary's containing
+                            // segment; opening it for append at the snapshot
+                            // position is recovery's resume path, and its
+                            // rebuilt chain must equal the snapshot's hash.
+                            let seeded = receive_snapshot_dpdk::<A>(
                                 handle,
                                 &mut transport,
                                 &mut recv_buf,
                                 &snapshot_path,
                                 shutdown,
-                            ) {
-                                Ok((snap_exchange, snap_seq, snap_hash)) => {
-                                    exchange = Some(snap_exchange);
-                                    let writer = W::create_continuing(
+                            )
+                            .and_then(
+                                |(snap_exchange, snap_seq, snap_hash)| {
+                                    let seed_len = receive_segment_seed_dpdk(
+                                        handle,
+                                        &mut transport,
+                                        &mut recv_buf,
                                         journal_path,
-                                        snap_seq + 1,
-                                        snap_hash,
+                                        shutdown,
                                     )?;
+                                    Ok((snap_exchange, snap_seq, snap_hash, seed_len))
+                                },
+                            );
+                            match seeded {
+                                Ok((snap_exchange, snap_seq, snap_hash, seed_len)) => {
+                                    exchange = Some(snap_exchange);
+                                    let writer = W::open_append(journal_path, snap_seq, seed_len)?;
+                                    // `chain_hash()` is `None` only with
+                                    // `hash-chain` disabled — nothing to tie
+                                    // then, the check passes by construction.
+                                    let seeded_chain = writer.chain_hash().unwrap_or(snap_hash);
+                                    if seeded_chain != snap_hash {
+                                        fatal_err_dpdk!(
+                                            "segment seed chain disagrees with the \
+                                             transferred snapshot's hash — inconsistent \
+                                             primary"
+                                                .into()
+                                        );
+                                    }
+                                    let seeded_info =
+                                        melin_journal::segment::read_header_info(journal_path)?;
                                     journal_writer = Some(writer);
                                     last_sequence = snap_seq;
                                     chain_hash = snap_hash;
 
-                                    // After snapshot, expect a StreamStart
-                                    // whose lineage matches what was just
-                                    // transferred.
-                                    expected_post_snapshot = Some((snap_seq + 1, snap_hash));
+                                    // After snapshot + seed, expect a
+                                    // StreamStart whose lineage matches the
+                                    // seeded segment's header.
+                                    expected_post_snapshot = Some((
+                                        seeded_info.starting_sequence,
+                                        seeded_info.anchor_hash,
+                                    ));
                                     continue;
                                 }
                                 Err(e) => {
@@ -1099,11 +1216,6 @@ where
                                     break 'handshake None; // caught by the None check below
                                 }
                             }
-                        }
-                        PrimaryMessage::HashMismatch => {
-                            fatal_err_dpdk!(
-                                "chain hash mismatch — replica has divergent history".into()
-                            );
                         }
                         other => {
                             fatal_err_dpdk!(format!("unexpected response: {other:?}").into());
@@ -1145,10 +1257,8 @@ where
         // The StreamStart lineage carries the segment header identity
         // (starting sequence + chain anchor); creating the local segment
         // from the same identity makes the replica's segment
-        // byte-identical to the primary's until the first rotation on
-        // either node (rotations are local, so segment boundaries
-        // diverge after that even though the entry stream stays
-        // identical).
+        // byte-identical to the primary's, and adopted `Rotate`
+        // boundaries keep it that way across rotations (bitwise mirror).
         if pipeline.is_none() && journal_writer.is_none() {
             let writer = W::create_continuing(journal_path, lineage_start, lineage_anchor)?;
             let mut fresh = factory.empty();
@@ -1188,7 +1298,6 @@ where
                 snapshot_path.clone(),
                 group_commit_delay,
                 busy_spin,
-                rotation.clone(),
                 Arc::clone(&fence_state),
             )?);
 
@@ -1204,6 +1313,7 @@ where
             let p = pipeline.as_mut().expect("pipeline must exist by here");
             let input_producer = &mut p.input_producer;
             let journal_cursor = p.journal_cursor.as_ref();
+            let stream_marks = &p.stream_marks;
             let mut dpdk_transport = DpdkReceiverTransport {
                 transport: &mut transport,
                 handle,
@@ -1223,6 +1333,7 @@ where
                 last_sequence,
                 std::mem::take(&mut recv_buf),
                 None,
+                stream_marks,
             );
             send_buf = dpdk_transport.send_buf;
             r
@@ -1423,4 +1534,134 @@ fn receive_snapshot_dpdk<A: Application>(
     }
 
     Ok((snap_exchange, snap_sequence, snap_chain_hash))
+}
+
+/// Receive the post-snapshot segment seed via DPDK transport and write
+/// it verbatim to `journal_path` (tmp + rename + dir fsync). Expects:
+/// SegmentSeedBegin → SnapshotChunk* → SnapshotEnd. Returns the seed
+/// length — the journal's `valid_end` for `open_append`. See the
+/// kernel-TCP receiver for the seeding rationale.
+fn receive_segment_seed_dpdk(
+    handle: melin_dpdk::SocketHandle,
+    transport: &mut melin_dpdk::DpdkTransport,
+    recv_buf: &mut Vec<u8>,
+    journal_path: &std::path::Path,
+    shutdown: &AtomicBool,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    // Read SegmentSeedBegin.
+    let seed_len = loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err("shutdown during segment seed transfer".into());
+        }
+        transport.poll();
+        transport.recv_into_vec(handle, recv_buf);
+
+        match try_extract_frame(recv_buf, MAX_CONTROL_FRAME) {
+            FrameResult::Complete(payload_start, frame_end) => {
+                let payload = &recv_buf[payload_start..frame_end];
+                let msg = decode_primary_message(payload)?;
+                compact_recv_buf(recv_buf, frame_end);
+                match msg {
+                    PrimaryMessage::SegmentSeedBegin { seed_len } => break seed_len,
+                    other => {
+                        return Err(format!("expected SegmentSeedBegin, got {other:?}").into());
+                    }
+                }
+            }
+            FrameResult::Oversized => {
+                return Err("oversized frame during segment seed transfer".into());
+            }
+            FrameResult::Incomplete => {}
+        }
+
+        if !transport.is_active(handle) {
+            return Err("disconnected during segment seed transfer".into());
+        }
+        std::thread::yield_now();
+    };
+
+    let tmp_path = journal_path.with_extension("seed.tmp");
+    {
+        let mut tmp_file = std::fs::File::create(&tmp_path)?;
+        let mut received: u64 = 0;
+        let mut running_crc: u32 = 0;
+
+        'seed_recv: loop {
+            if shutdown.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err("shutdown during segment seed transfer".into());
+            }
+            transport.poll();
+            transport.recv_into_vec(handle, recv_buf);
+
+            let mut consumed = 0;
+            loop {
+                let remaining = &recv_buf[consumed..];
+                match try_extract_frame(remaining, MAX_DATA_FRAME) {
+                    FrameResult::Complete(payload_start, frame_end) => {
+                        let payload = &remaining[payload_start..frame_end];
+                        match decode_primary_message(payload)? {
+                            PrimaryMessage::SnapshotChunk(data) => {
+                                std::io::Write::write_all(&mut tmp_file, &data)?;
+                                received += data.len() as u64;
+                                running_crc = crc32c::crc32c_append(running_crc, &data);
+                            }
+                            PrimaryMessage::SnapshotEnd {
+                                crc32c: expected_crc,
+                            } => {
+                                tmp_file.sync_all()?;
+                                drop(tmp_file);
+
+                                if received != seed_len {
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(format!(
+                                        "segment seed length mismatch: expected {seed_len}, \
+                                         got {received}"
+                                    )
+                                    .into());
+                                }
+                                if running_crc != expected_crc {
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(format!(
+                                        "segment seed CRC mismatch: expected \
+                                         {expected_crc:#x}, got {running_crc:#x}"
+                                    )
+                                    .into());
+                                }
+
+                                std::fs::rename(&tmp_path, journal_path)?;
+                                melin_journal::segment::fsync_parent_dir(journal_path)?;
+                                info!(received, "segment seed received and verified (DPDK)");
+                                consumed += frame_end;
+                                compact_recv_buf(recv_buf, consumed);
+                                break 'seed_recv;
+                            }
+                            other => {
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(format!(
+                                    "expected seed SnapshotChunk/End, got {other:?}"
+                                )
+                                .into());
+                            }
+                        }
+                        consumed += frame_end;
+                    }
+                    FrameResult::Oversized => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err("oversized frame during segment seed transfer".into());
+                    }
+                    FrameResult::Incomplete => break,
+                }
+            }
+            compact_recv_buf(recv_buf, consumed);
+
+            if !transport.is_active(handle) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err("disconnected during segment seed transfer".into());
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    Ok(seed_len)
 }

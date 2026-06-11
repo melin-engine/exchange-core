@@ -811,17 +811,11 @@ where
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
 
-        // Runtime rotation on the replica side. Each node rotates its
-        // own segments independently of the primary.
-        let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-        let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
-            (0, None) => None,
-            (b, f) => Some((
-                b,
-                f.cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            )),
-        };
+        // No local rotation triggers on the replica side: segment
+        // rotation is primary-driven (the replica adopts the boundaries
+        // announced over the replication stream), so replica journals
+        // stay bitwise mirrors of the primary's. `--max-journal-mib`
+        // and the admin `ROTATE` command only act on primaries.
 
         match crate::replication::run_receiver::<A, W>(
             primary_addr,
@@ -835,7 +829,6 @@ where
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            rotation,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {
@@ -1957,15 +1950,8 @@ where
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
 
-        let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-        let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
-            (0, None) => None,
-            (b, f) => Some((
-                b,
-                f.cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            )),
-        };
+        // No local rotation triggers on the replica side — rotation is
+        // primary-driven (see the kernel-TCP receiver path).
 
         // Use queue 0 for the replication receiver's smoltcp connection.
         // Listen port is unused (receiver connects outbound, doesn't listen),
@@ -1998,7 +1984,6 @@ where
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            rotation,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
         )? {

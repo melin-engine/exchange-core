@@ -16,7 +16,11 @@ use std::time::{Duration, Instant};
 use melin_app::AppEvent;
 use tracing::{info, warn};
 
-use super::protocol::{decode_journal_to_input_slots, encode_input_batch, peek_first_sequence};
+use super::protocol::{
+    decode_journal_to_input_slots, encode_input_batch, encode_rotate, peek_first_sequence,
+    peek_frame_tag,
+};
+use crate::replication_wire::MSG_INPUT_BATCH;
 
 /// Upper bound on how long the catch-up→live handoff waits for the
 /// disk to catch up to the ring (see [`drain_into_contiguity`]). The
@@ -99,8 +103,8 @@ pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::
 
 /// Header identity of the oldest available segment — the lineage origin
 /// a fresh replica must create its journal with so full catch-up
-/// produces a byte-identical segment (identical until the first
-/// rotation on either node; segment boundaries are local after that).
+/// produces a byte-identical segment (and the `Rotate` frames emitted
+/// at each segment transition keep it byte-identical across rotations).
 pub fn lineage_origin(journal_path: &std::path::Path) -> io::Result<(u64, [u8; 32])> {
     let files = discover_journal_files(journal_path);
     let oldest = files
@@ -210,9 +214,30 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
         "starting journal catch-up"
     );
 
-    for path in &files[start_file_idx..] {
+    for (file_idx, path) in files.iter().enumerate().skip(start_file_idx) {
         if shutdown.load(Ordering::Relaxed) {
             return Ok(CatchUpResult::Ok(end_sequence));
+        }
+
+        // Boundary announce: every transition between on-disk segments
+        // is a rotation the primary performed, and replicas must rotate
+        // at the same sequence (primary-driven rotation). Emit it when
+        // the stream position sits exactly on the segment's opening
+        // boundary and a predecessor segment exists (the lineage
+        // origin's opening is not a rotation). Covers both mid-walk
+        // transitions and a replica reconnecting exactly at a boundary
+        // whose Rotate frame it missed; a replica that already rotated
+        // there detects the duplicate announce and skips it.
+        if file_idx > 0 {
+            let info = melin_journal::segment::read_header_info(path)
+                .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
+            let boundary = info.starting_sequence.saturating_sub(1);
+            if end_sequence == boundary {
+                encode_rotate(boundary, &info.anchor_hash, &mut send_buf);
+                publisher(&send_buf)
+                    .map_err(|e| io::Error::other(format!("publish catch-up rotate: {e}")))?;
+                send_buf.clear();
+            }
         }
 
         let mut scanner = RawJournalScanner::open(path)
@@ -281,8 +306,8 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
     use super::protocol::{
-        encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-        encode_stream_start,
+        encode_need_snapshot, encode_segment_seed_begin, encode_snapshot_begin,
+        encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
     };
 
     let snap_path = journal_path.with_extension("snapshot");
@@ -352,13 +377,72 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 
     info!(snap_sequence, "snapshot transfer complete");
 
-    // Send StreamStart so the replica can set up its journal: a fresh
-    // segment continuing at `snap_sequence + 1`, anchored to the
-    // snapshot's chain hash.
+    // Segment seed: the raw byte prefix (file header through entry
+    // `snap_sequence`) of our segment containing `snap_sequence + 1`.
+    // Written verbatim as the replica's live segment, it makes the
+    // replica's segmentation a byte-copy of ours from birth — chain
+    // values comparable, `Rotate` verification valid immediately, no
+    // alignment grace period. Header-only (4 KiB) when the snapshot
+    // sits exactly on a rotation boundary; operators rotate before
+    // seeding to keep it near that.
+    let files = discover_journal_files(journal_path);
+    let mut seed = None;
+    for path in files.iter().rev() {
+        let info = melin_journal::segment::read_header_info(path)
+            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
+        if info.starting_sequence <= snap_sequence + 1 {
+            seed = Some((path, info));
+            break;
+        }
+    }
+    let Some((seed_path, seed_info)) = seed else {
+        return Err(io::Error::other(format!(
+            "no on-disk segment contains the snapshot boundary {} — archives pruned past \
+             the serving snapshot; retain segments at least as far back as the snapshot",
+            snap_sequence + 1
+        )));
+    };
+    let seed_bytes = melin_journal::segment::read_segment_prefix(seed_path, snap_sequence)
+        .map_err(|e| io::Error::other(format!("read seed prefix of {}: {e}", seed_path.display())))?
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "segment {} ends before snapshot sequence {snap_sequence} — inconsistent \
+                 snapshot/journal pair",
+                seed_path.display()
+            ))
+        })?;
+
+    encode_segment_seed_begin(seed_bytes.len() as u64, &mut send_buf);
+    publisher(&send_buf)?;
+    send_buf.clear();
+    let mut offset = 0;
+    while offset < seed_bytes.len() {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(CatchUpResult::Ok(snap_sequence));
+        }
+        let end = (offset + CHUNK_SIZE).min(seed_bytes.len());
+        encode_snapshot_chunk(&seed_bytes[offset..end], &mut send_buf);
+        publisher(&send_buf)?;
+        send_buf.clear();
+        offset = end;
+    }
+    encode_snapshot_end(crc32c::crc32c(&seed_bytes), &mut send_buf);
+    publisher(&send_buf)?;
+    send_buf.clear();
+
+    info!(
+        snap_sequence,
+        seed_len = seed_bytes.len(),
+        segment_start = seed_info.starting_sequence,
+        "segment seed transferred"
+    );
+
+    // StreamStart carries the seeded segment's header identity; the
+    // replica cross-checks it against the seed bytes it just verified.
     encode_stream_start(
         snap_sequence,
-        snap_sequence + 1,
-        snap_chain_hash,
+        seed_info.starting_sequence,
+        seed_info.anchor_hash,
         snap_epoch,
         &mut send_buf,
     );
@@ -534,6 +618,32 @@ fn drain_into_contiguity(
         };
         if meta.end_sequence <= sent.get() {
             // Wholly covered by the bulk/residual pass — discard.
+            consumer.commit();
+            continue;
+        }
+        // Control frames (`Rotate`) ride the rings between `InputBatch`
+        // chunks. The journal back-fill re-emits rotations at segment
+        // transitions (the on-disk boundary exists by the time the
+        // frame is in the ring), so the held copy is redundant once the
+        // disk walk has covered its boundary: wait for coverage, then
+        // drop it — forwarding both copies would announce the same
+        // boundary twice.
+        if peek_frame_tag(data)? != MSG_INPUT_BATCH {
+            while meta.end_sequence > sent.get() {
+                let end = refill(sent.get(), forward)?;
+                sent.advance(end);
+                if meta.end_sequence > sent.get() {
+                    if expired() {
+                        return Err(io::Error::other(format!(
+                            "catch-up handoff: control frame at boundary {} but the \
+                             journal stalled at {} — reconnecting",
+                            meta.end_sequence,
+                            sent.get()
+                        )));
+                    }
+                    std::thread::yield_now();
+                }
+            }
             consumer.commit();
             continue;
         }
@@ -717,6 +827,237 @@ mod tests {
             "boundary catch-up must succeed with nothing to send, got {res:?}"
         );
         assert_eq!(published, 0, "no batches expected at the boundary");
+    }
+
+    /// Decoded view of a catch-up publisher's output: one entry per
+    /// published frame.
+    #[derive(Debug, PartialEq)]
+    enum Frame {
+        /// `InputBatch` carrying these sequences.
+        Batch(Vec<u64>),
+        /// `Rotate { boundary_seq, tail_hash }`.
+        Rotate(u64, [u8; 32]),
+    }
+
+    /// Run a journal catch-up, classifying every published frame.
+    fn collect_catchup_frames(
+        live: &std::path::Path,
+        last_sequence: u64,
+    ) -> (CatchUpResult, Vec<Frame>) {
+        use super::super::protocol::{PrimaryMessage, decode_primary_message};
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let mut frames = Vec::new();
+        let mut publish = |buf: &[u8]| -> io::Result<()> {
+            let payload = &buf[4..];
+            if peek_frame_tag(buf).unwrap() == MSG_INPUT_BATCH {
+                let slots = crate::replication_wire::try_decode_input_batch::<TestEvent>(payload)
+                    .expect("decodable InputBatch");
+                frames.push(Frame::Batch(slots.iter().map(|s| s.sequence).collect()));
+            } else {
+                match decode_primary_message(payload).expect("decodable control frame") {
+                    PrimaryMessage::Rotate {
+                        boundary_seq,
+                        tail_hash,
+                    } => frames.push(Frame::Rotate(boundary_seq, tail_hash)),
+                    other => panic!("unexpected control frame in catch-up: {other:?}"),
+                }
+            }
+            Ok(())
+        };
+        let res =
+            catch_up_from_journal_with::<TestEvent>(live, last_sequence, &mut publish, &shutdown)
+                .unwrap();
+        (res, frames)
+    }
+
+    /// Catch-up must announce a rotation at every segment transition it
+    /// walks, carrying the next segment's header anchor (= the previous
+    /// segment's tail) — that's what lets a catching-up replica
+    /// reproduce the primary's segment boundaries exactly.
+    #[test]
+    fn catchup_announces_rotation_at_each_segment_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+
+        let anchor2 =
+            melin_journal::segment::read_header_info(&dir.path().join("j.journal.000002"))
+                .unwrap()
+                .anchor_hash;
+        let anchor_live = melin_journal::segment::read_header_info(&live)
+            .unwrap()
+            .anchor_hash;
+
+        // Fresh replica: full walk from the lineage origin. The origin's
+        // own opening is not a rotation — no leading Rotate.
+        let (res, frames) = collect_catchup_frames(&live, 0);
+        assert!(matches!(res, CatchUpResult::Ok(3)));
+        assert_eq!(
+            frames,
+            vec![
+                Frame::Batch(vec![1]),
+                Frame::Rotate(1, anchor2),
+                Frame::Batch(vec![2]),
+                Frame::Rotate(2, anchor_live),
+                Frame::Batch(vec![3]),
+            ]
+        );
+    }
+
+    /// A replica reconnecting exactly at a segment boundary missed the
+    /// live-stream Rotate for it (it journaled the boundary entry, then
+    /// disconnected before the announce). Catch-up must re-announce that
+    /// boundary before streaming the next segment's entries.
+    #[test]
+    fn catchup_reannounces_boundary_for_replica_sitting_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+
+        let anchor2 =
+            melin_journal::segment::read_header_info(&dir.path().join("j.journal.000002"))
+                .unwrap()
+                .anchor_hash;
+        let anchor_live = melin_journal::segment::read_header_info(&live)
+            .unwrap()
+            .anchor_hash;
+
+        let (res, frames) = collect_catchup_frames(&live, 1);
+        assert!(matches!(res, CatchUpResult::Ok(3)));
+        assert_eq!(
+            frames,
+            vec![
+                Frame::Rotate(1, anchor2),
+                Frame::Batch(vec![2]),
+                Frame::Rotate(2, anchor_live),
+                Frame::Batch(vec![3]),
+            ]
+        );
+    }
+
+    /// End-to-end snapshot transfer with segment seeding: the transfer
+    /// must ship `NeedSnapshot → snapshot → segment seed → StreamStart →
+    /// catch-up`, the seed must be the exact byte prefix of the
+    /// primary's containing segment, and a replica writer opened over
+    /// the seed (recovery's resume path) must report the snapshot's
+    /// chain hash — proving the seeded replica is born aligned.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn snapshot_transfer_seeds_byte_identical_containing_segment() {
+        use crate::cursors::WireSeq;
+        use crate::test_support::TestApp;
+        use melin_journal::JournalWrite;
+
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("p.journal");
+
+        // Primary journal: [1..2] archived, [3..5] live. Snapshot taken
+        // mid-live-segment at sequence 4 — the worst case for seeding
+        // (the seed must carry the live header plus entries 3..=4).
+        let mut w = melin_journal::BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut chain_at_4 = [0u8; 32];
+        for v in 1..=5u64 {
+            w.append(&JournalEvent::App(TestEvent::Add(v))).unwrap();
+            if v == 2 {
+                w.rotate_segment().unwrap();
+            }
+            if v == 4 {
+                chain_at_4 = w.chain_hash().unwrap();
+            }
+        }
+        drop(w);
+        let snap_path = live.with_extension("snapshot");
+        crate::snapshot::save::<TestApp>(
+            &TestApp::new(),
+            WireSeq::new(4),
+            chain_at_4,
+            7,
+            &snap_path,
+        )
+        .unwrap();
+
+        // Drive the transfer, collecting every frame.
+        let shutdown = AtomicBool::new(false);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut publish = |buf: &[u8]| -> io::Result<()> {
+            frames.push(buf.to_vec());
+            Ok(())
+        };
+        let res = snapshot_transfer_with::<TestEvent>(&live, &mut publish, &shutdown).unwrap();
+        assert_eq!(res, CatchUpResult::Ok(5), "catch-up must reach the tip");
+
+        // Walk the frame sequence, reassembling the two chunked bodies.
+        use super::super::protocol::{PrimaryMessage, decode_primary_message};
+        let decode = |f: &Vec<u8>| decode_primary_message(&f[4..]).unwrap();
+        let mut it = frames.iter();
+        assert!(matches!(
+            decode(it.next().unwrap()),
+            PrimaryMessage::NeedSnapshot
+        ));
+        let snap_len = match decode(it.next().unwrap()) {
+            PrimaryMessage::SnapshotBegin {
+                snapshot_len,
+                snap_sequence,
+                snap_chain_hash,
+            } => {
+                assert_eq!(snap_sequence, 4);
+                assert_eq!(snap_chain_hash, chain_at_4);
+                snapshot_len
+            }
+            other => panic!("expected SnapshotBegin, got {other:?}"),
+        };
+        let collect_body = |it: &mut std::slice::Iter<'_, Vec<u8>>| -> Vec<u8> {
+            let mut body = Vec::new();
+            loop {
+                match decode(it.next().expect("chunks then end")) {
+                    PrimaryMessage::SnapshotChunk(data) => body.extend_from_slice(&data),
+                    PrimaryMessage::SnapshotEnd { crc32c } => {
+                        assert_eq!(crc32c, ::crc32c::crc32c(&body), "body CRC");
+                        return body;
+                    }
+                    other => panic!("expected SnapshotChunk/End, got {other:?}"),
+                }
+            }
+        };
+        let snap_body = collect_body(&mut it);
+        assert_eq!(snap_body.len() as u64, snap_len);
+
+        let seed_len = match decode(it.next().unwrap()) {
+            PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
+            other => panic!("expected SegmentSeedBegin, got {other:?}"),
+        };
+        let seed_body = collect_body(&mut it);
+        assert_eq!(seed_body.len() as u64, seed_len);
+
+        // The seed is the exact byte prefix of the live (containing)
+        // segment, and StreamStart announces that segment's identity.
+        let live_bytes = std::fs::read(&live).unwrap();
+        assert_eq!(seed_body[..], live_bytes[..seed_body.len()]);
+        let live_info = melin_journal::segment::read_header_info(&live).unwrap();
+        match decode(it.next().unwrap()) {
+            PrimaryMessage::StreamStart {
+                start_sequence,
+                segment_start_sequence,
+                anchor_hash,
+                epoch,
+            } => {
+                assert_eq!(start_sequence, 4);
+                assert_eq!(segment_start_sequence, live_info.starting_sequence);
+                assert_eq!(anchor_hash, live_info.anchor_hash);
+                assert_eq!(epoch, 7, "snapshot's epoch rides StreamStart");
+            }
+            other => panic!("expected StreamStart, got {other:?}"),
+        }
+
+        // Replica-side reconstruction: write the seed verbatim, open for
+        // append at the snapshot position — the rebuilt chain must equal
+        // the snapshot's hash (born aligned).
+        let replica = dir.path().join("r.journal");
+        std::fs::write(&replica, &seed_body).unwrap();
+        let replica_writer =
+            melin_journal::BufferedWriter::<TestEvent>::open_append(&replica, 4, seed_len).unwrap();
+        assert_eq!(replica_writer.chain_hash().unwrap(), chain_at_4);
+        assert_eq!(replica_writer.segment_starting_sequence(), 3);
+        assert_eq!(replica_writer.next_sequence(), 5);
     }
 
     /// A fresh replica must be routed to snapshot transfer whenever the
@@ -1002,6 +1343,96 @@ mod drain_into_contiguity_tests {
         .expect("empty ring goes live");
         assert!(forwarded.borrow().is_empty());
         assert_eq!(sent.get(), 100);
+    }
+
+    /// Encode a `Rotate` control frame the way the journal stage
+    /// publishes it to the rings (boundary as the chunk's end_sequence).
+    fn rotate_chunk(boundary: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        super::encode_rotate(boundary, &[0x52u8; 32], &mut buf);
+        buf
+    }
+
+    /// A Rotate chunk wholly covered by the bulk pass is discarded like
+    /// any covered chunk (the catch-up walk already re-announced it).
+    #[test]
+    fn covered_rotate_chunk_is_discarded() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&rotate_chunk(99), 99); // covered (<= sent 100)
+        producer.publish(&frame(&[101, 102]), 102);
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill =
+            |from: u64, _: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> { Ok(from) };
+        let mut expired = || false;
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("covered rotate chunk drains cleanly");
+
+        assert_eq!(
+            *forwarded.borrow(),
+            vec![101],
+            "rotate chunk never forwarded"
+        );
+        assert_eq!(sent.get(), 102);
+    }
+
+    /// An uncovered Rotate chunk is dropped only after the disk
+    /// back-fill has covered its boundary — the back-fill re-announces
+    /// the rotation at the segment transition, so forwarding the held
+    /// copy would announce the same boundary twice.
+    #[test]
+    fn uncovered_rotate_chunk_waits_for_backfill_then_drops() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&rotate_chunk(102), 102); // ahead of sent=100
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let refill_calls = Cell::new(0usize);
+
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill =
+            |_from: u64, fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+                refill_calls.set(refill_calls.get() + 1);
+                fwd(&frame(&[101, 102]))?;
+                Ok(102)
+            };
+        let mut expired = || false;
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("rotate chunk resolves via back-fill");
+
+        assert_eq!(
+            *forwarded.borrow(),
+            vec![101],
+            "entries back-filled, rotate dropped"
+        );
+        assert_eq!(sent.get(), 102);
+        assert_eq!(refill_calls.get(), 1);
     }
 
     /// Covered chunks are skipped until the ring drains to empty, then the

@@ -2872,8 +2872,10 @@ fn rotation_soak_under_load() {
     // the rotate flag through the journal stage; rotating after
     // bursts would leave the final ROTATE's flag set with no event
     // to drive observation, producing rounds-1 archives instead of
-    // rounds. Two of the rounds also rotate the replica to validate
-    // independent replica-side rotation.
+    // rounds. Two of the rounds also send ROTATE to the replica's
+    // admin endpoint — rotation is primary-driven, so these must be
+    // accepted but change nothing (the replica's segmentation follows
+    // the primary's; an extra local rotation would break the mirror).
     let per_round: u64 = 15;
     let rounds: u64 = 5;
     let total_orders: u64 = per_round * rounds;
@@ -2921,8 +2923,35 @@ fn rotation_soak_under_load() {
 
     // Primary should have exactly 5 archives (one per ROTATE).
     assert_eq!(count_archives(&primary_journal), 5, "primary archive count");
-    // Replica should have exactly 2 (the two ROTATEs we sent there).
-    assert_eq!(count_archives(&replica_journal), 2, "replica archive count");
+    // Rotation is primary-driven: the replica mirrors the primary's
+    // segmentation exactly — the two ROTATEs sent to the replica's own
+    // admin endpoint must not have produced extra archives.
+    assert_eq!(count_archives(&replica_journal), 5, "replica archive count");
+
+    // Bitwise-mirror property: every sealed (archived) segment must be
+    // identical across the two nodes. The live segments may differ at
+    // the tail (periodic Ticks journaled after the lag-0 observation
+    // may legitimately not have replicated), so they are compared on
+    // header identity only.
+    for n in 1..=5u32 {
+        let p = melin_journal::segment::archive_path(&primary_journal, n);
+        let r = melin_journal::segment::archive_path(&replica_journal, n);
+        let p_bytes = std::fs::read(&p).expect("read primary archive");
+        let r_bytes = std::fs::read(&r).expect("read replica archive");
+        assert_eq!(
+            p_bytes, r_bytes,
+            "archive {n} must be byte-identical across nodes"
+        );
+    }
+    {
+        let p = melin_journal::segment::read_header_info(&primary_journal).unwrap();
+        let r = melin_journal::segment::read_header_info(&replica_journal).unwrap();
+        assert_eq!(
+            p.starting_sequence, r.starting_sequence,
+            "live segment start"
+        );
+        assert_eq!(p.anchor_hash, r.anchor_hash, "live segment anchor");
+    }
 
     // Walk BOTH nodes' full segment chains and assert every lineage
     // invariant holds: dense sequences within and across segments, each
