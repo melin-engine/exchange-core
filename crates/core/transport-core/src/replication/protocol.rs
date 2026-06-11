@@ -17,7 +17,8 @@ use crate::pipeline::InputSlot;
 // Re-export the helpers at replication scope so existing
 // `replication::protocol::{...}` imports keep working.
 pub use crate::replication_wire::{
-    encode_input_batch, peek_first_sequence, try_decode_input_batch, try_decode_input_batch_into,
+    encode_input_batch, peek_first_sequence, peek_frame_tag, try_decode_input_batch,
+    try_decode_input_batch_into,
 };
 
 // --- Wire protocol message tags ---
@@ -35,6 +36,9 @@ pub const MSG_HASH_MISMATCH: u8 = 0x12;
 pub const MSG_SNAPSHOT_BEGIN: u8 = 0x13;
 pub const MSG_SNAPSHOT_CHUNK: u8 = 0x14;
 pub const MSG_SNAPSHOT_END: u8 = 0x15;
+pub const MSG_ROTATE: u8 = 0x16;
+pub const MSG_CHAIN_CHECK: u8 = 0x17;
+pub const MSG_SEGMENT_SEED_BEGIN: u8 = 0x18;
 // `MSG_INPUT_BATCH` (0x21) — re-exported above; carries `InputSlot`
 // records on the wire. Replaces the old `MSG_DATA_BATCH = 0x20` (removed
 // in phase 3 of feat/unified-pipeline).
@@ -46,8 +50,9 @@ pub const MSG_HEARTBEAT: u8 = 0x30;
 /// opaque short-frame decode failure (or, worse, a silently-ignored
 /// trailing field — zerocopy prefix parsing accepts longer frames).
 /// History: 1 = pre-fencing (41-byte handshake, no epoch);
-/// 2 = fencing epochs (epoch on handshake/StreamStart) + this field.
-pub const REPL_PROTOCOL_VERSION: u16 = 2;
+/// 2 = fencing epochs (epoch on handshake/StreamStart) + this field;
+/// 3 = primary-driven rotation (`Rotate`) + chain validation (`ChainCheck`).
+pub const REPL_PROTOCOL_VERSION: u16 = 3;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -130,6 +135,41 @@ pub enum PrimaryMessage {
     Heartbeat {
         sequence: u64,
     },
+    /// Primary-driven segment rotation. Sent in-stream, after the last
+    /// entry of the outgoing segment (`boundary_seq`) and before the
+    /// first entry of the new one. The replica rotates its own journal
+    /// at exactly this boundary, and `tail_hash` — the primary's chain
+    /// value at `boundary_seq`, which is also the new segment's header
+    /// anchor — doubles as a divergence check: a healthy replica's own
+    /// tail equals it. Replicas never rotate on local triggers; shared
+    /// boundaries are what make chain values comparable across nodes
+    /// (and healthy replica journals bitwise mirrors of the primary's).
+    Rotate {
+        boundary_seq: u64,
+        tail_hash: [u8; 32],
+    },
+    /// Live-stream chain validation. `chain_hash` is the primary's
+    /// chain value at `sequence` (an fsync-batch boundary); the replica
+    /// compares its own value at that sequence and treats a mismatch as
+    /// divergence. Extends the handshake-time check to the live stream,
+    /// catching corruption that creeps in mid-session.
+    ChainCheck {
+        sequence: u64,
+        chain_hash: [u8; 32],
+    },
+    /// Start of a segment-seed transfer: the raw byte prefix (file
+    /// header through the snapshot's last entry) of the primary segment
+    /// containing `snap_sequence + 1`. Sent between the snapshot
+    /// transfer and the post-snapshot `StreamStart`; the body rides
+    /// `SnapshotChunk` frames and ends with a `SnapshotEnd` carrying the
+    /// seed's CRC32C. Writing it verbatim as the replica's live segment
+    /// makes the replica's segmentation a byte-copy of the primary's
+    /// from birth, so chain values are comparable (and `Rotate`
+    /// verification holds) with no alignment grace period.
+    SegmentSeedBegin {
+        /// Total seed length in bytes (file header included).
+        seed_len: u64,
+    },
 }
 
 /// Messages from replica to primary.
@@ -210,6 +250,13 @@ struct HeartbeatFrame {
     sequence: U64,
 }
 
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SegmentSeedBeginFrame {
+    tag: u8,
+    seed_len: U64,
+}
+
 /// Fixed-size StreamStart frame: stream resume point plus the segment
 /// header identity a fresh replica should create its journal with.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -222,6 +269,17 @@ struct StreamStartFrame {
     epoch: U64,
 }
 
+/// Shared layout for the two `(sequence, hash)` stream-control frames:
+/// `Rotate` (tag 0x16, hash = outgoing segment's tail / new anchor) and
+/// `ChainCheck` (tag 0x17, hash = chain value at `sequence`).
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SeqHashFrame {
+    tag: u8,
+    sequence: U64,
+    hash: [u8; 32],
+}
+
 const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 51);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
@@ -230,6 +288,8 @@ const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
 const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
 const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 57);
+const _: () = assert!(core::mem::size_of::<SeqHashFrame>() == 41);
+const _: () = assert!(core::mem::size_of::<SegmentSeedBeginFrame>() == 9);
 
 /// Helper: `length_prefix(buf, payload_len)` writes the 4-byte LE
 /// frame length prefix for a payload of `payload_len` bytes.
@@ -308,11 +368,10 @@ pub fn encode_auth_failed(buf: &mut Vec<u8>) {
 /// `segment_start_sequence` and `anchor_hash` identify the journal
 /// segment a fresh replica should create before consuming the stream —
 /// with the same header identity and the same entry bytes, the
-/// replica's segment is byte-identical to the primary's **until the
-/// first rotation on either node**: rotations are local, so segment
-/// boundaries (and with them per-segment anchors and chain values)
-/// diverge after that, even though the entry stream stays identical.
-/// Boundary alignment lands with primary-driven rotation (roadmap).
+/// replica's segment is byte-identical to the primary's, and rotation
+/// being primary-driven (`Rotate` frames) keeps every later segment
+/// boundary aligned too: a healthy replica's journal is a bitwise
+/// mirror.
 pub fn encode_stream_start(
     start_sequence: u64,
     segment_start_sequence: u64,
@@ -389,6 +448,46 @@ pub fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
     let frame = HeartbeatFrame {
         tag: MSG_HEARTBEAT,
         sequence: U64::new(sequence),
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+}
+
+/// Encode a Rotate message. `boundary_seq` is the last sequence of the
+/// outgoing segment; `tail_hash` its tail chain value (= the new
+/// segment's header anchor). Must be placed in the stream after the
+/// frame carrying `boundary_seq` and before any later entry.
+pub fn encode_rotate(boundary_seq: u64, tail_hash: &[u8; 32], buf: &mut Vec<u8>) {
+    let frame = SeqHashFrame {
+        tag: MSG_ROTATE,
+        sequence: U64::new(boundary_seq),
+        hash: *tail_hash,
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+}
+
+/// Encode a SegmentSeedBegin message. The seed body follows as
+/// `SnapshotChunk` frames terminated by a `SnapshotEnd` with the seed's
+/// CRC32C.
+pub fn encode_segment_seed_begin(seed_len: u64, buf: &mut Vec<u8>) {
+    let frame = SegmentSeedBeginFrame {
+        tag: MSG_SEGMENT_SEED_BEGIN,
+        seed_len: U64::new(seed_len),
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+}
+
+/// Encode a ChainCheck message: the primary's chain value at `sequence`.
+pub fn encode_chain_check(sequence: u64, chain_hash: &[u8; 32], buf: &mut Vec<u8>) {
+    let frame = SeqHashFrame {
+        tag: MSG_CHAIN_CHECK,
+        sequence: U64::new(sequence),
+        hash: *chain_hash,
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -545,6 +644,29 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 .map_err(|_| io::Error::other("Heartbeat too short"))?;
             Ok(PrimaryMessage::Heartbeat {
                 sequence: frame.sequence.get(),
+            })
+        }
+        MSG_ROTATE => {
+            let (frame, _) = SeqHashFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("Rotate too short"))?;
+            Ok(PrimaryMessage::Rotate {
+                boundary_seq: frame.sequence.get(),
+                tail_hash: frame.hash,
+            })
+        }
+        MSG_CHAIN_CHECK => {
+            let (frame, _) = SeqHashFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("ChainCheck too short"))?;
+            Ok(PrimaryMessage::ChainCheck {
+                sequence: frame.sequence.get(),
+                chain_hash: frame.hash,
+            })
+        }
+        MSG_SEGMENT_SEED_BEGIN => {
+            let (frame, _) = SegmentSeedBeginFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("SegmentSeedBegin too short"))?;
+            Ok(PrimaryMessage::SegmentSeedBegin {
+                seed_len: frame.seed_len.get(),
             })
         }
         other => Err(io::Error::other(format!(
