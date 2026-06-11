@@ -99,9 +99,10 @@ A node started with `--replica-of <primary_addr>` runs as a replica:
   primary's `authorized_keys` file with the `replication` permission.
 - Receives a stream of input events with pre-assigned sequences and
   timestamps from the primary. The replica's pipeline produces a
-  journal that is logically identical to the primary's — same
-  sequences, same events — and runs the same matching engine over
-  it so its state stays warm for promotion.
+  journal that is a **bitwise mirror** of the primary's — same
+  sequences, same events, same segment boundaries (see "Journal
+  mirroring and divergence detection") — and runs the same matching
+  engine over it so its state stays warm for promotion.
 - Acknowledges each batch on a **dual track**: an `in_memory_sequence`
   that advances as soon as the batch is received, and an
   `acked_sequence` that advances once the local journal write is
@@ -176,14 +177,63 @@ on the same epoch and fencing cannot distinguish them. Promote exactly
 one replica per failover — coordinated election lands with the
 automatic-failover roadmap item.
 
+## Journal mirroring and divergence detection
+
+A healthy replica's journal is **byte-for-byte identical** to the
+primary's — not just the same events, but the same segment files with
+the same boundaries. Two mechanisms maintain and enforce this:
+
+**Primary-driven rotation.** Replicas never rotate journal segments on
+their own. The primary announces each rotation in the replication
+stream at its exact sequence boundary, and replicas rotate at the same
+entry. (`--max-journal-mib` and the admin `ROTATE` command therefore
+act on primaries only; a replica's segmentation always follows its
+primary's. `ROTATE` on an empty live segment is a no-op — the boundary
+already exists.) Because segments match file-for-file, a replica's
+journal can be verified against the primary's offline with a plain
+byte hash — no Melin tooling required for backup or audit
+verification.
+
+**Cross-node chain validation.** Every announced rotation carries the
+primary's tamper-evident chain hash at the boundary, and the replica
+verifies its own chain matches before adopting it. The same check runs
+when a replica connects (the primary recomputes its chain at the
+replica's reported position and compares) and periodically during live
+streaming. A mismatch anywhere means the replica's journal holds
+**divergent history** — most commonly an ex-primary rejoining after a
+failover with orders it journaled but never replicated.
+
+**Divergence repair is automatic.** A divergent replica is re-seeded
+from the primary through the snapshot path on the same connection. Its
+old journal and snapshot are **archived, never deleted** — moved to a
+sibling directory named `<journal>.divergent.<n>`. Under `local`
+durability that journal may hold acked orders that did not survive the
+failover, which is exactly what an operator or regulator needs for
+reconciliation. Routine (non-divergent) resyncs archive to
+`<journal>.resync.<n>` for the same conservative reason. These
+directories are never cleaned up automatically — reclaim the space
+once reconciled.
+
 ## Snapshot transfer
 
 When a replica is too far behind the primary's live journal and the
-intervening archive segments have been purged, the primary streams a
-snapshot of its application state to the replica before resuming
-normal replication. The transfer is checksummed end-to-end (CRC32C)
-and verified incrementally on receipt, so no large in-memory buffer
-is needed.
+intervening archive segments have been purged — or its journal was
+judged divergent — the primary streams a snapshot of its application
+state to the replica before resuming normal replication. The transfer
+is checksummed end-to-end (CRC32C) and verified incrementally on
+receipt, so no large in-memory buffer is needed.
+
+The snapshot is followed by a **segment seed**: the byte prefix of the
+primary's journal segment containing the snapshot position. Written
+verbatim as the replica's live segment, it makes the new replica's
+journal a byte-copy of the primary's from the first moment — chain
+validation holds immediately, with no alignment grace period. The seed
+spans from the containing segment's start through the snapshot
+position, so its size is bounded by the segment size; sending `ROTATE`
+to the primary shortly before attaching a fresh replica keeps it near
+the 4 KiB minimum. The primary must retain journal segments at least
+as far back as its serving snapshot, or transfers fail with an
+explicit error.
 
 This lets a fresh replica bootstrap from a running primary without
 requiring the full journal history.
@@ -219,12 +269,15 @@ connection separate from the client protocol.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64]` | Confirms the handshake; carries the primary's fencing epoch and the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with. The replica's segment is byte-identical to the primary's until the first rotation on either node — rotations are local, so segment boundaries diverge after that even though the event stream stays identical (alignment lands with primary-driven rotation; see Limitations). |
+| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64]` | Confirms the handshake; carries the primary's fencing epoch and the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with. Segment boundaries stay aligned from then on — rotation is primary-driven (see "Journal mirroring"). |
 | NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind the live journal and archives have been purged — triggers snapshot transfer. |
+| HashMismatch | `[len:u32][type=0x12]` | The replica's journal is divergent at its reported position. The replica archives its local journal, then receives the snapshot transfer that follows on the same connection. |
 | SnapshotBegin | `[len:u32][type=0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]` | Start of snapshot transfer with metadata. |
-| SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB). |
-| SnapshotEnd | `[len:u32][type=0x15][crc32c:u32]` | End of snapshot transfer; CRC32C of the full payload for integrity. |
-| HashMismatch | `[len:u32][type=0x12]` | Chain hash mismatch at the replica's reported sequence (reserved — see Limitations). |
+| SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot or segment-seed data (up to 64 KiB). |
+| SnapshotEnd | `[len:u32][type=0x15][crc32c:u32]` | End of a snapshot or segment-seed transfer; CRC32C of the full payload for integrity. |
+| Rotate | `[len:u32][type=0x16][boundary_seq:u64][tail_hash:[u8;32]]` | Primary-driven rotation: the replica rotates its journal at exactly `boundary_seq`, after verifying its own chain at the boundary equals `tail_hash`. |
+| ChainCheck | `[len:u32][type=0x17][sequence:u64][chain_hash:[u8;32]]` | Periodic live-stream validation: the primary's chain value at `sequence`; the replica compares its own and treats a mismatch as divergence. |
+| SegmentSeedBegin | `[len:u32][type=0x18][seed_len:u64]` | Start of the post-snapshot segment seed (see "Snapshot transfer"); the body rides SnapshotChunk frames and ends with a SnapshotEnd. |
 | InputBatch | `[len:u32][type=0x21][count:u16][slot...]` | Batch of input events (sequence + timestamp + key/request hash + the event itself). |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5 s interval) advertising the primary's last published sequence. |
 
@@ -262,9 +315,12 @@ client). The recovery procedure:
 3. Start the node with the longest journal as primary. If two nodes
    tie they have the same entries; either is valid.
 4. Connect the others as replicas. Replicas that are behind catch up
-   from the primary's journal. Replicas that have extra entries past
-   the primary's tail are reset during catch-up — the new primary's
-   journal is authoritative after promotion.
+   from the primary's journal. A replica holding entries past the
+   primary's tail is detected as divergent at handshake and re-seeded
+   automatically, with its old journal archived (see "Journal
+   mirroring and divergence detection") — the new primary's journal is
+   authoritative, and the archived entries remain available for
+   reconciliation.
 
 Under `durably-replicated`, the second-longest journal is also
 guaranteed to hold the acked frontier (by contract two nodes had each
@@ -318,35 +374,6 @@ normal-case post-recovery state.
   the `prev → next` transition.
 
 ## Limitations
-
-### No chain-hash validation at handshake
-
-The replica reports its `chain_hash` at `last_sequence` in the
-`Handshake` frame and the `HashMismatch` response type is reserved in
-the wire protocol, but neither side compares the two against the
-primary's own journal at the same sequence. A replica with divergent
-history (e.g. previously connected to a different primary, or with a
-corrupted journal) is accepted without warning. After failover the
-promoted node would hold a journal that doesn't match the events
-clients were told about.
-
-This includes the live stream: the replica decodes and re-encodes
-events locally, and nothing compares the resulting journals across
-nodes at runtime. (The pre-v14 design verified in-stream checkpoint
-hashes, but only on the catch-up path — live streaming was never
-covered — so v14 retired that partial check rather than replacing it.)
-
-Each node *does* verify its own journal's integrity locally on every
-recovery (per-segment chains, cross-segment anchors, snapshot
-cross-checks). What's missing is the *cross-node* comparison — and
-because chain values are segment-scoped, comparing them between nodes
-requires the nodes to share segment boundaries. The roadmap item
-therefore bundles two pieces: primary-driven rotation (replicas rotate
-at the same sequence boundary as the primary, making a healthy
-replica's journal a bitwise mirror) and chain comparison at handshake
-plus periodically in the live stream. On mismatch the replica will be
-re-synced through the existing snapshot path, with its divergent
-journal archived for the audit trail rather than deleted.
 
 ### Fencing cannot distinguish concurrent promotions
 

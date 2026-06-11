@@ -71,7 +71,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
 | `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
 | `--replication-ring-size` | `256` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 256 (128 MiB). See [Replication Ring Sizing](#replication-ring-sizing). |
 | `--durability-policy` | `persisted>=2 best_effort` | Policy that gates client responses. Syntax: one or more `<level>>=<n>[ best_effort]` clauses joined with `&&`. Levels are `persisted` (event written to NVMe via `O_DIRECT`, durable behind power-loss-protection capacitors) and `in_memory` (event accepted into the node's pipeline). The optional `best_effort` keyword marks the clause as degrade-friendly: the count clamps to the connected cluster shape rather than failing closed. Common values: `persisted>=1` (single-node durability), `persisted>=2` (strict two-node quorum; gate stalls if a replica disconnects), `persisted>=2 best_effort` (default; degrades to surviving cluster on a partial failure), `in_memory>=2` (weaker durability, removes fsync latency from the critical path). Active degradation surfaces on `/healthz` as `melin_durability_policy_degraded`. See [docs/replication.md](replication.md#durability-policy) for full grammar and worked examples. |
-| `--admin-bind` | (none) | Address for the operator admin endpoint. Authenticated with operator keys; accepts `PROMOTE\n` (replica → primary, replica nodes only) and `ROTATE\n` (archive the live journal segment, any node). |
+| `--admin-bind` | (none) | Address for the operator admin endpoint. Authenticated with operator keys; accepts `PROMOTE\n` (replica → primary, replica nodes only) and `ROTATE\n` (archive the live journal segment — primaries only; replicas rotate where the primary announces). |
 
 ### Startup Sequence
 
@@ -231,7 +231,7 @@ The `--journal-writer` flag picks how the journal stage writes batches to disk. 
 
 ### How Rotation Works
 
-Rotation runs online at the journal stage's fsync boundary. Two independent triggers fire it: the live segment crossing `--max-journal-mib` (default 256 MiB), or an operator `ROTATE` admin command. The boot path additionally checks the on-disk segment size on startup and rotates once before opening the pipeline if needed.
+Rotation runs online at the journal stage's fsync boundary. On primaries (and standalone nodes) two independent triggers fire it: the live segment crossing `--max-journal-mib` (default 256 MiB), or an operator `ROTATE` admin command. The boot path additionally checks the on-disk segment size on startup and rotates once before opening the pipeline if needed. Replicas have no local triggers — they rotate exactly where the primary announces over the replication stream, keeping their journals byte-for-byte mirrors of the primary's (see [replication.md](replication.md)).
 
 Each rotation is a single rename of the live file to its next monotonic archive slot, followed by opening a fresh live file that continues the sequence and BLAKE3 hash chain. No snapshot is written at rotation — snapshots are produced exclusively by the shadow exchange on its own cadence.
 

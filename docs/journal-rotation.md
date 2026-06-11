@@ -27,7 +27,9 @@ Archive numbers are assigned in rotation order: `000001` is the oldest archive, 
 
 ## Rotation Triggers
 
-Two independent triggers fire rotation, both observed at the journal stage's fsync boundary so the live segment is durably committed before the rename:
+Two independent triggers fire rotation, both observed at the journal stage's fsync boundary so the live segment is durably committed before the rename. Both act on **primaries** (and standalone nodes): replicas never rotate on local triggers — they rotate exactly where the primary announces over the replication stream, which keeps replica journals byte-for-byte mirrors of the primary's (see `replication.md`, "Journal mirroring and divergence detection").
+
+A rotation requested while the live segment is empty is skipped — the boundary already exists at that position.
 
 ### Size threshold
 
@@ -37,7 +39,7 @@ When `--max-journal-mib` is non-zero (default: 256 MiB) and the live segment cro
 
 When `--admin-bind <addr>` is set, the server listens on that TCP address for operator commands (the same endpoint that accepts `PROMOTE` for replica → primary failover). An operator authenticates with an Ed25519 operator key (challenge-response, same scheme as all other admin handshakes) and sends `ROTATE\n`. The journal stage performs one rotation at the next fsync boundary. Concurrent or repeated `ROTATE` commands collapse into a single rotation rather than queueing.
 
-This command is accepted on both primary and replica nodes; each side rotates its own local segments independently.
+On a replica node the command is a no-op for segmentation — replicas follow the primary's boundaries. Send `ROTATE` to the **primary**; every replica rotates at the same entry.
 
 ## Recovery: Multi-Segment Walk
 

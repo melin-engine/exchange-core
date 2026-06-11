@@ -346,7 +346,7 @@ Every journal segment maintains a BLAKE3 hash chain for tamper evidence. The cha
 
 ## Journal Rotation
 
-When the live segment exceeds the configured size threshold (`--max-journal-mib`, default 256 MiB), or an operator issues `ROTATE`, the journal stage rotates at the next fsync boundary — while the engine is live:
+When the live segment exceeds the configured size threshold (`--max-journal-mib`, default 256 MiB), or an operator issues `ROTATE`, the journal stage rotates at the next fsync boundary — while the engine is live. (On replicas neither trigger applies: rotation is primary-driven, so a replica rotates exactly where its primary did — see [replication.md](replication.md).) The steps:
 
 1. **Archive the live segment** by renaming it to the next monotonic slot (`melin.journal` → `melin.journal.000042`).
 2. **Create a new live segment** at the original path. Its header records the continuing sequence number and an anchor equal to the old segment's tail chain hash. No snapshot is taken and **no sequence number is consumed** — the next event gets exactly the sequence it would have without the rotation.
