@@ -579,7 +579,7 @@ where
                 // carries our higher epoch, so the stale primary also fences
                 // itself on its side.
                 let our_epoch = fence_state.epoch();
-                if epoch < our_epoch {
+                if fence_state.refuses_primary(epoch) {
                     warn!(
                         primary_epoch = epoch,
                         our_epoch,

@@ -240,7 +240,7 @@ fn dispatch_event<A: Application>(
         JournalEvent::EpochBump { epoch: bump } => {
             // Lineage metadata — advance the shadow's tracked epoch so the
             // next snapshot records it. Never touches application state.
-            *epoch = (*epoch).max(bump);
+            crate::fence::observe_into(epoch, bump);
         }
         JournalEvent::Shutdown => {
             // Pipeline-only sentinel — handled at the run-loop level by

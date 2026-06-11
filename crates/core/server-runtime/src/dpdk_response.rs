@@ -112,7 +112,6 @@ pub fn run<A: Application>(
     utilization: Arc<StageUtilization>,
     busy_spin: bool,
     encoder: crate::response::ResponseEncoderArc<A>,
-    fence_state: Arc<melin_transport_core::fence::FenceState>,
 ) {
     // Mirrors `response::run`: derive the local Policy from the shared
     // mode atomic and observe runtime swaps from the admin
@@ -240,16 +239,12 @@ pub fn run<A: Application>(
             }
         }
 
-        // Fence: a superseded ex-primary stops acking immediately (see
-        // `response::run` for the rationale). The fence co-sets `shutdown`,
-        // so the poll thread also winds down; exiting here stops releasing
-        // any further response frames onto the TX rings.
-        if fence_state.is_fenced() {
-            utilization.busy.store(busy_count, Ordering::Relaxed);
-            utilization.idle.store(idle_count, Ordering::Relaxed);
-            return;
-        }
-
+        // Fencing note: a superseded ex-primary exits through this same
+        // shutdown branch (`FenceState::fence_if_superseded` co-sets
+        // `shutdown`). Unlike the kernel response stage there is no
+        // best-effort flush here to suppress, so the fence needs no
+        // dedicated check — exiting stops releasing response frames onto
+        // the TX rings, which is the whole ack gate.
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);

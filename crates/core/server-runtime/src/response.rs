@@ -101,9 +101,10 @@ pub struct Response<A: Application> {
     /// with the DPDK response stage.
     pub encoder: ResponseEncoderArc<A>,
     /// Node fencing state. When latched (a higher epoch was observed), the
-    /// stage stops acking immediately and exits without flushing pending
-    /// responses — in-flight orders on a superseded epoch must not be
-    /// acknowledged. See `crate::fence` and the sender's fence handling.
+    /// stage exits *without* the best-effort flush — in-flight responses
+    /// for orders on a superseded epoch must not be acknowledged. Fencing
+    /// co-sets `shutdown`, so the latch is only consulted on the shutdown
+    /// path (zero steady-state cost). See `crate::fence`.
     pub fence_state: Arc<melin_transport_core::fence::FenceState>,
 }
 
@@ -339,24 +340,18 @@ pub fn run<A: Application>(
             }
         }
 
-        // Fence: a superseded ex-primary must not acknowledge any further
-        // in-flight work. Exit immediately — and, unlike the normal
-        // shutdown path below, *without* the best-effort flush — so
-        // responses buffered for orders on the old epoch are dropped (the
-        // client sees a connection reset and reconciles on reconnect). The
-        // fence always co-sets `shutdown`, so the other stages still wind
-        // down; this branch only changes whether we flush first.
-        if fence_state.is_fenced() {
-            utilization.busy.store(busy_count, Ordering::Relaxed);
-            utilization.idle.store(idle_count, Ordering::Relaxed);
-            #[cfg(feature = "pipeline-stats")]
-            print_utilization("response", busy_count, idle_count);
-            return;
-        }
-
         if shutdown.load(Ordering::Relaxed) {
+            // Fence: a superseded ex-primary must not acknowledge any
+            // further in-flight work — skip the best-effort flush so
+            // responses buffered for orders on the old epoch are dropped
+            // (the client sees a connection reset and reconciles on
+            // reconnect). Checked only here, not per iteration: fencing
+            // always co-sets `shutdown` (`FenceState::fence_if_superseded`
+            // owns that invariant), so this branch is the first one a
+            // fenced node reaches and the steady-state loop pays nothing.
+            let flush = !fence_state.is_fenced();
             // Best-effort flush before shutdown.
-            if !dirty_connections.is_empty() {
+            if flush && !dirty_connections.is_empty() {
                 flush_sends(
                     &mut ring,
                     &mut connections,

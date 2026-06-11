@@ -403,13 +403,14 @@ fn handle_replica_connection<A: Application>(
 
     // Fence: a replica advertising an epoch higher than ours means a
     // promotion happened that this node missed — we are a stale ex-primary.
-    // Self-demote (latch fenced + trigger shutdown): the matching stage
+    // The policy (latch fenced + trigger shutdown) lives on `FenceState` so
+    // the kernel-TCP and DPDK senders cannot drift; the matching stage
     // halts new client writes, the response gate stops acking, and the node
     // winds down for the operator to restart it as a replica. Refuse this
     // connection so we send no stale stream.
     let our_epoch = fence_state.epoch();
-    if handshake.epoch > our_epoch {
-        if fence_state.fence() {
+    if let Some(first_latch) = fence_state.fence_if_superseded(handshake.epoch, shutdown) {
+        if first_latch {
             error!(
                 replica_epoch = handshake.epoch,
                 our_epoch,
@@ -417,7 +418,6 @@ fn handle_replica_connection<A: Application>(
                  superseded; self-demoting and shutting down"
             );
         }
-        shutdown.store(true, Ordering::Release);
         return Err(io::Error::other("fenced by higher-epoch replica"));
     }
 

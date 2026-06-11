@@ -6,7 +6,7 @@
 use std::io::{self, Read};
 
 use melin_app::AppEvent;
-use zerocopy::little_endian::{U32, U64};
+use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::pipeline::InputSlot;
@@ -39,6 +39,15 @@ pub const MSG_SNAPSHOT_END: u8 = 0x15;
 // records on the wire. Replaces the old `MSG_DATA_BATCH = 0x20` (removed
 // in phase 3 of feat/unified-pipeline).
 pub const MSG_HEARTBEAT: u8 = 0x30;
+
+/// Replication protocol version, advertised in the replica's handshake
+/// and validated by the primary. Bumped whenever a frame layout changes
+/// so mixed-version pairs fail with a *diagnosable* error instead of an
+/// opaque short-frame decode failure (or, worse, a silently-ignored
+/// trailing field — zerocopy prefix parsing accepts longer frames).
+/// History: 1 = pre-fencing (41-byte handshake, no epoch);
+/// 2 = fencing epochs (epoch on handshake/StreamStart) + this field.
+pub const REPL_PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
@@ -149,6 +158,10 @@ struct HandshakeFrame {
     last_sequence: U64,
     chain_hash: [u8; 32],
     epoch: U64,
+    /// [`REPL_PROTOCOL_VERSION`] — appended *last* deliberately: prefix
+    /// parsing on an older peer still reads the fields it knows, and the
+    /// new decoder rejects a mismatch with an explicit version error.
+    protocol_version: U16,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -209,7 +222,7 @@ struct StreamStartFrame {
     epoch: U64,
 }
 
-const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 49);
+const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 51);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
@@ -234,6 +247,7 @@ pub fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
         last_sequence: U64::new(h.last_sequence),
         chain_hash: h.chain_hash,
         epoch: U64::new(h.epoch),
+        protocol_version: U16::new(REPL_PROTOCOL_VERSION),
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -448,8 +462,22 @@ pub fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
     }
     match payload[0] {
         MSG_HANDSHAKE => {
-            let (frame, _) = HandshakeFrame::ref_from_prefix(payload)
-                .map_err(|_| io::Error::other("handshake too short"))?;
+            let (frame, _) = HandshakeFrame::ref_from_prefix(payload).map_err(|_| {
+                io::Error::other(format!(
+                    "handshake frame too short ({} bytes, expected {}) — the replica is \
+                     likely running an older, incompatible replication protocol version; \
+                     upgrade it to this binary's version",
+                    payload.len(),
+                    core::mem::size_of::<HandshakeFrame>()
+                ))
+            })?;
+            let peer_version = frame.protocol_version.get();
+            if peer_version != REPL_PROTOCOL_VERSION {
+                return Err(io::Error::other(format!(
+                    "replica speaks replication protocol v{peer_version}, this primary \
+                     speaks v{REPL_PROTOCOL_VERSION} — upgrade both nodes to the same version"
+                )));
+            }
             Ok(ReplicaMessage::Handshake(Handshake {
                 last_sequence: frame.last_sequence.get(),
                 chain_hash: frame.chain_hash,
@@ -477,8 +505,15 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
     }
     match payload[0] {
         MSG_STREAM_START => {
-            let (frame, _) = StreamStartFrame::ref_from_prefix(payload)
-                .map_err(|_| io::Error::other("StreamStart too short"))?;
+            let (frame, _) = StreamStartFrame::ref_from_prefix(payload).map_err(|_| {
+                io::Error::other(format!(
+                    "StreamStart frame too short ({} bytes, expected {}) — the primary is \
+                     likely running an older, incompatible replication protocol version; \
+                     upgrade it to this binary's version",
+                    payload.len(),
+                    core::mem::size_of::<StreamStartFrame>()
+                ))
+            })?;
             Ok(PrimaryMessage::StreamStart {
                 start_sequence: frame.start_sequence.get(),
                 segment_start_sequence: frame.segment_start_sequence.get(),

@@ -591,7 +591,7 @@ fn replay_entry<A: Application>(
         JournalEvent::EpochBump { epoch } => {
             // Lineage metadata — advance the recovered epoch, never touch
             // application state. Mirrors the live matching-stage dispatch.
-            *recovered_epoch = (*recovered_epoch).max(*epoch);
+            crate::fence::observe_into(recovered_epoch, *epoch);
         }
         JournalEvent::Shutdown => {
             // Pipeline-only sentinel; never written to disk and so

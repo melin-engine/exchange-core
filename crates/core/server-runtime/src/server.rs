@@ -1433,6 +1433,7 @@ where
         &replication_cursor,
         &pipeline_healthy,
         &replicas_connected,
+        &fence_state,
         &replication_metrics,
         &replication_ring_progress,
         &fastest_replica_cursor,
@@ -2241,7 +2242,6 @@ where
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
     let busy_spin = !config.yield_idle;
-    let response_fence = Arc::clone(&fence_state);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -2260,7 +2260,6 @@ where
                 response_utilization_thread,
                 busy_spin,
                 encoder,
-                response_fence,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -2476,6 +2475,7 @@ where
         &replication_cursor,
         &pipeline_healthy,
         &replicas_connected,
+        &fence_state,
         &replication_metrics,
         &replication_ring_progress,
         &fastest_replica_cursor,
@@ -2810,6 +2810,7 @@ fn spawn_health_endpoint(
     replication_cursor: &Arc<AtomicU64>,
     pipeline_healthy: &Arc<AtomicBool>,
     replicas_connected: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    fence_state: &Arc<melin_transport_core::fence::FenceState>,
     replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
     replication_ring_progress: &Option<melin_transport_core::pipeline::ReplicationRingProgress>,
     fastest_replica_cursor: &Arc<AtomicU64>,
@@ -2851,6 +2852,7 @@ fn spawn_health_endpoint(
             replication_cursor: Arc::clone(replication_cursor),
             pipeline_healthy: Arc::clone(pipeline_healthy),
             replicas_connected: replicas_connected.clone(),
+            fence_state: Some(Arc::clone(fence_state)),
             replication_metrics: replication_metrics.clone(),
             replication_ring_producer_cursors: repl_ring_producers,
             replication_ring_consumer_cursors: repl_ring_consumers,

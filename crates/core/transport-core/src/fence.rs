@@ -21,14 +21,18 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Shared, lock-free fencing state. One instance per node, wrapped in an
-/// `Arc` and handed to the matching stage, the response stage, the
-/// replication sender/receiver, and the client accept loop.
+/// `Arc` and handed to the matching stage, the response stage, and the
+/// replication sender/receiver threads.
 ///
 /// `AtomicU64` + `AtomicBool` (rather than a `Mutex`) because the epoch is
 /// read on the replication handshake path and the fenced flag is folded
-/// into the matching stage's per-event halt check — both want a single
-/// relaxed load with no contention.
+/// into the matching stage's per-batch halt check — both want a single
+/// relaxed load with no contention. `align(64)` keeps the (read-mostly)
+/// pair on its own cache line so an unrelated write-hot heap neighbour
+/// can't turn those polls into coherence misses — same insurance the
+/// pipeline's `CachePadded` cursors buy.
 #[derive(Debug)]
+#[repr(align(64))]
 pub struct FenceState {
     /// Highest fencing epoch this node has observed. Monotonic:
     /// [`Self::observe_epoch`] only ever raises it.
@@ -68,8 +72,8 @@ impl FenceState {
         prev.max(epoch)
     }
 
-    /// True once the node has been fenced. Read on the matching stage's
-    /// per-event halt check, so it must be a single relaxed load.
+    /// True once the node has been fenced. Folded into the matching
+    /// stage's per-batch halt check, so it must be a single relaxed load.
     #[inline]
     pub fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Relaxed)
@@ -80,6 +84,48 @@ impl FenceState {
     pub fn fence(&self) -> bool {
         !self.fenced.swap(true, Ordering::Relaxed)
     }
+
+    /// Fencing policy, sender side: a peer advertising an epoch strictly
+    /// higher than ours means a promotion happened that this node missed —
+    /// we are a superseded ex-primary and must self-demote.
+    ///
+    /// Returns `None` when the peer does not supersede us. Otherwise
+    /// latches the fence, co-sets `shutdown` (the invariant "fenced ⇒
+    /// shutting down" is owned here, not by each call site), and returns
+    /// `Some(first_latch)` so the caller can log the demotion exactly once.
+    /// Both replication transports route through this method so the
+    /// kernel-TCP and DPDK paths cannot drift apart on when to fence.
+    pub fn fence_if_superseded(&self, peer_epoch: u64, shutdown: &AtomicBool) -> Option<bool> {
+        if peer_epoch <= self.epoch() {
+            return None;
+        }
+        let first = self.fence();
+        // Release: pairs with the Acquire/Relaxed shutdown polls in the
+        // stage loops, same convention as the other shutdown publishers.
+        shutdown.store(true, Ordering::Release);
+        Some(first)
+    }
+
+    /// Fencing policy, receiver side: a primary advertising an epoch
+    /// strictly lower than ours is a stale ex-primary — following its
+    /// divergent lineage would overwrite more-current state, so the
+    /// replica must refuse and retry. Not applicable right after a
+    /// snapshot rebase (the local state was discarded, so the primary's
+    /// epoch is adopted wholesale); callers skip the check there.
+    #[inline]
+    pub fn refuses_primary(&self, primary_epoch: u64) -> bool {
+        primary_epoch < self.epoch()
+    }
+}
+
+/// Monotonic-max merge for the replay paths that track an epoch *outside*
+/// a [`FenceState`] (the recovery accumulator, the shadow stage's
+/// snapshot-stamped epoch). One definition so the live dispatch
+/// ([`FenceState::observe_epoch`]) and the replay dispatches cannot
+/// diverge on `EpochBump` semantics.
+#[inline]
+pub fn observe_into(current: &mut u64, observed: u64) {
+    *current = (*current).max(observed);
 }
 
 #[cfg(test)]
@@ -106,5 +152,41 @@ mod tests {
         assert!(f.is_fenced());
         assert!(!f.fence()); // already fenced
         assert!(f.is_fenced());
+    }
+
+    #[test]
+    fn fence_if_superseded_policy() {
+        let f = FenceState::new(3);
+        let shutdown = AtomicBool::new(false);
+
+        // Equal or lower peer epoch: not superseded, nothing latches.
+        assert_eq!(f.fence_if_superseded(3, &shutdown), None);
+        assert_eq!(f.fence_if_superseded(1, &shutdown), None);
+        assert!(!f.is_fenced());
+        assert!(!shutdown.load(Ordering::Relaxed));
+
+        // Higher peer epoch: fence latches and shutdown co-sets; first
+        // transition reports `true`, repeats report `false`.
+        assert_eq!(f.fence_if_superseded(4, &shutdown), Some(true));
+        assert!(f.is_fenced());
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert_eq!(f.fence_if_superseded(5, &shutdown), Some(false));
+    }
+
+    #[test]
+    fn refuses_primary_policy() {
+        let f = FenceState::new(2);
+        assert!(f.refuses_primary(1)); // stale primary
+        assert!(!f.refuses_primary(2)); // same tenure
+        assert!(!f.refuses_primary(3)); // newer primary — follow and adopt
+    }
+
+    #[test]
+    fn observe_into_is_monotonic_max() {
+        let mut e = 3u64;
+        observe_into(&mut e, 1);
+        assert_eq!(e, 3);
+        observe_into(&mut e, 7);
+        assert_eq!(e, 7);
     }
 }

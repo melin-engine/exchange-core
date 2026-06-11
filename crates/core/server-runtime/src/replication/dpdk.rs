@@ -346,21 +346,24 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                                     // Fence: a replica with a higher epoch
                                     // means we are a superseded ex-primary —
-                                    // self-demote (latch fenced + trigger
-                                    // shutdown) and drop the connection. See
-                                    // the kernel-TCP sender for the rationale.
-                                    if h.epoch > fence_state.epoch() {
-                                        if fence_state.fence() {
+                                    // self-demote and drop the connection.
+                                    // Policy (latch + shutdown) lives on
+                                    // `FenceState`; see the kernel-TCP
+                                    // sender for the rationale.
+                                    let our_epoch = fence_state.epoch();
+                                    if let Some(first_latch) =
+                                        fence_state.fence_if_superseded(h.epoch, shutdown)
+                                    {
+                                        if first_latch {
                                             error!(
                                                 slot = slot_idx,
                                                 replica_epoch = h.epoch,
-                                                our_epoch = fence_state.epoch(),
+                                                our_epoch,
                                                 "fenced: a replica advertises a higher epoch — \
                                                  this primary has been superseded; self-demoting \
                                                  and shutting down (DPDK)"
                                             );
                                         }
-                                        shutdown.store(true, Ordering::Release);
                                         transport.close(handle);
                                         slot.state = SlotState::Idle;
                                         slot.recv_buf.clear();
@@ -1025,7 +1028,9 @@ where
                             // divergent lineage must not overwrite our more
                             // current state. Mirrors the kernel-TCP receiver.
                             let our_epoch = fence_state.epoch();
-                            if expected_post_snapshot.is_none() && epoch < our_epoch {
+                            if expected_post_snapshot.is_none()
+                                && fence_state.refuses_primary(epoch)
+                            {
                                 warn!(
                                     primary_epoch = epoch,
                                     our_epoch,

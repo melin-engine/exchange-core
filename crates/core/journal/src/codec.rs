@@ -218,6 +218,16 @@ const _: () = assert!(ENTRY_META_SIZE == 17);
 const TAG_TICK: u8 = 0x03;
 /// Replication fencing epoch bump (see [`JournalEvent::EpochBump`]).
 /// Payload is the 8-byte little-endian epoch.
+///
+/// Added *without* a `FORMAT_VERSION` bump — a deliberate trade-off. The
+/// tag is additive (this binary reads pre-fencing v14 journals
+/// unchanged), and bumping the version would orphan every existing v14
+/// journal behind the strict equality gate. The cost: a binary *older*
+/// than this tag replaying a post-promotion journal fails with
+/// `CorruptEntry("unknown event tag")` rather than `UnsupportedVersion`.
+/// Rollback across a promotion therefore needs the operator note in
+/// `docs/replication.md` (roll forward, or restart from a snapshot) —
+/// the journal itself is healthy.
 const TAG_EPOCH_BUMP: u8 = 0x04;
 const TAG_APP: u8 = 0x80;
 

@@ -1660,10 +1660,10 @@ pub struct MatchingStage<A: Application> {
     replicas_connected: Option<Arc<AtomicU32>>,
     /// Replication fencing state. Advanced when an `EpochBump` event is
     /// processed (recovery replay, live replication stream, or local
-    /// promotion injection); the per-event halt check folds in its
-    /// `is_fenced()` latch so a fenced node stops accepting client writes.
-    /// One Relaxed load per event (~1ns), shared with the response stage
-    /// and replication threads.
+    /// promotion injection); the halt check folds in its `is_fenced()`
+    /// latch so a fenced node stops accepting client writes. One Relaxed
+    /// load per disruptor batch (hoisted alongside the replica-count
+    /// load), shared with the response stage and replication threads.
     fence_state: Arc<crate::fence::FenceState>,
     /// When true, never yield — spin indefinitely. See [`idle_wait`].
     busy_spin: bool,
@@ -1736,6 +1736,20 @@ impl<A: Application> MatchingStage<A> {
                 .replicas_connected
                 .as_ref()
                 .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
+    }
+
+    /// Reject reason a halted node returns to clients: `Superseded` when
+    /// the fence latched (a higher epoch demoted us), `ReplicaDisconnected`
+    /// otherwise. Fence takes priority — a fenced node is shutting down
+    /// regardless of replica count. The run loop inlines this same rule
+    /// (it can't borrow `self` while the peeked batch is live); keep the two
+    /// in sync.
+    fn halt_reject_reason(&self) -> RejectReason {
+        if self.fence_state.is_fenced() {
+            RejectReason::Superseded
+        } else {
+            RejectReason::ReplicaDisconnected
+        }
     }
 
     /// Run the matching stage loop. Blocks until shutdown.
@@ -1827,13 +1841,31 @@ impl<A: Application> MatchingStage<A> {
             let mut saw_shutdown = false;
 
             // Halt status is constant for the duration of one disruptor
-            // batch (replica counts only change between batches in
-            // practice). One Relaxed load per batch, hoisted out of the
-            // per-event branch.
-            let halted = self
-                .replicas_connected
-                .as_ref()
-                .is_some_and(|count| count.load(Ordering::Relaxed) == 0);
+            // batch (replica counts and the fence latch only change
+            // between batches in practice). Two Relaxed loads per batch,
+            // hoisted out of the per-event branch. Spelled as field
+            // accesses rather than `self.is_halted()` (the consumer's
+            // peeked batch keeps `self` mutably borrowed) — must stay in
+            // sync with that method: a fenced node must stop applying
+            // client writes on the *live* path too, or it keeps extending
+            // the superseded journal lineage until the shutdown sentinel
+            // arrives (the response stage only drops the acks).
+            let fenced = self.fence_state.is_fenced();
+            let halted = fenced
+                || self
+                    .replicas_connected
+                    .as_ref()
+                    .is_some_and(|count| count.load(Ordering::Relaxed) == 0);
+            // Reason a halted node hands back to clients: `Superseded` when
+            // the fence latched (a higher epoch demoted us), else
+            // `ReplicaDisconnected`. Fence wins — a fenced node is shutting
+            // down regardless of replica count. A `Copy` enum captured here
+            // so the per-event reject site needs no fresh `self` borrow.
+            let halt_reason = if fenced {
+                RejectReason::Superseded
+            } else {
+                RejectReason::ReplicaDisconnected
+            };
 
             // Open a single output batch for the entire disruptor batch:
             // all OutputSlots produced below share one Release store on
@@ -1929,7 +1961,7 @@ impl<A: Application> MatchingStage<A> {
                     // have no client to reject to, so they silently
                     // skip during halt.
                     if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                        reports.push(A::build_reject(e, RejectReason::ReplicaDisconnected));
+                        reports.push(A::build_reject(e, halt_reason));
                     }
                 } else if !is_query && !self.app.check_request_seq(slot.key_hash, slot.request_seq)
                 {
@@ -2162,7 +2194,7 @@ impl<A: Application> MatchingStage<A> {
             let halt_bypass = self.is_halted();
             if halt_bypass && !is_transport_internal {
                 if let melin_journal::JournalEvent::App(ref e) = slot.event {
-                    reports.push(A::build_reject(e, RejectReason::ReplicaDisconnected));
+                    reports.push(A::build_reject(e, self.halt_reject_reason()));
                 }
             } else if !self.app.check_request_seq(slot.key_hash, slot.request_seq) {
                 if let melin_journal::JournalEvent::App(ref e) = slot.event {
