@@ -125,7 +125,7 @@ Sector mode under sustained load can show ~1 Hz spikes on some NVMe firmware (dr
 
 ### Segment rotation cost
 
-`sector` mode pre-stages the next segment off the hot path using a background preparer thread. Rotations cost ~microseconds in the journal stage's critical path.
+`sector` mode pre-stages the next segment off the hot path using a background preparer thread whenever rotation recurs — size-driven rotation, or a replica following the primary's announced boundaries. Those rotations cost ~microseconds in the journal stage's critical path. Manual-only configurations (`--max-journal-mib 0`, rotating exclusively via `ROTATE`) skip pre-staging and pay a synchronous allocate of tens of milliseconds per rotation; raise `--max-journal-mib` if fast manual rotation matters. `melin_journal_rotations_total{path=...}` on `/metrics` shows which path rotations are taking.
 
 `buffered` mode rotates synchronously: `posix_fallocate` + `sync_all` on the new live file. At 256 MiB per segment and ~1 GiB/s sustained throughput, this is a ~20-40 ms stall every ~256 ms. For most workloads this is fine; if your tail latency budget is tight at the segment-rotation cadence, consider raising `--max-journal-mib` to extend the rotation period, or pre-allocate a larger segment.
 

@@ -2185,6 +2185,12 @@ fn journal_stage_rotates_on_size_threshold() {
 #[cfg(not(feature = "no-persist"))]
 #[test]
 fn size_rotation_uses_prepared_fast_path_after_warmup() {
+    // The loop below rotates open-endedly until the fast path engages;
+    // at the default 256 MiB prealloc chunk each rotation would
+    // materialize a full archive plus a staged sidecar (real memory on
+    // tmpfs), and disk pressure would make failure self-reinforcing
+    // via the preparer's 30 s error backoff. Shrink the chunk.
+    let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fast_rotate.journal");
     let writer = Writer::create(&path).unwrap();

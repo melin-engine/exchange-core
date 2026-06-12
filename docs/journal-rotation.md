@@ -125,7 +125,7 @@ If the crash occurs after the live → archive rename but before the new live fi
 
 ### Stall duration
 
-Rotation pauses the journal stage for a single rename + open + sync operation — typically tens of microseconds on NVMe. Upstream stages briefly backpressure on the input ring during that window. The shadow snapshot stage is **not** synchronously involved: snapshot capture runs on its own cadence (`--snapshot-interval-ms`), and recovery's multi-segment walk means events written between the last snapshot and the rotation remain replayable from the just-archived segment.
+Rotation pauses the journal stage briefly at an fsync boundary. In `sector` mode with recurring rotation (size-driven, or a replica following the primary's boundaries), the next segment is pre-staged by a background thread and the pause is a rename pair plus a directory sync — typically tens of microseconds on NVMe. Without pre-staging (`buffered` mode, or a sector-mode node with `--max-journal-mib 0` rotating only via `ROTATE`), the new segment is allocated synchronously and the pause is tens of milliseconds — see `journal-writer-modes.md`, "Segment rotation cost". The `melin_journal_rotations_total` counter on `/metrics` labels every rotation `fast`, `sync_fallback`, or `failed`, so which path a deployment is taking is directly observable. Upstream stages briefly backpressure on the input ring during that window. The shadow snapshot stage is **not** synchronously involved: snapshot capture runs on its own cadence (`--snapshot-interval-ms`), and recovery's multi-segment walk means events written between the last snapshot and the rotation remain replayable from the just-archived segment.
 
 This is materially different from the legacy startup-only rotation, where the snapshot and rename were coupled. Operators with strict tail-latency SLOs should still prefer larger `--max-journal-mib` so rotations are infrequent.
 
@@ -139,7 +139,7 @@ Replays for forensic purposes can use the standalone reader against any archived
 
 ### Replication
 
-Each node — primary or replica — manages its own journal segments independently. The replica's archive numbering is local and need not match the primary's; only the per-event sequence numbers (assigned by the primary) are common across nodes. Triggering `ROTATE` on the primary does not cause the replica to rotate, and vice versa.
+Replica journals are byte-for-byte mirrors of the primary's: segment boundaries are announced by the primary over the replication stream and adopted at exactly the same entry, so archive numbering and per-segment content match across nodes. Triggering `ROTATE` on the primary therefore rotates every connected replica at the same boundary; on a replica node the command is a no-op for segmentation. See `replication.md`, "Journal mirroring and divergence detection".
 
 ## Configuration
 
@@ -148,13 +148,13 @@ Each node — primary or replica — manages its own journal segments independen
 | `--journal <path>` | `melin.journal` | Path to the live journal segment. Archives use the same prefix with a `.NNNNNN` suffix. |
 | `--snapshot <path>` | (derived: `<journal>.snapshot`) | Explicit snapshot path. If unset, the server uses `<journal-path-with-.snapshot-extension>`. |
 | `--max-journal-mib <N>` | `256` | Rotate when the live segment exceeds N MiB at the next fsync boundary. Set to `0` to disable size-driven rotation. |
-| `--admin-bind <addr>` | (unset) | TCP address for the operator admin endpoint. Authenticated with operator keys; accepts `ROTATE\n` (any node) and `PROMOTE\n` (replica nodes). |
+| `--admin-bind <addr>` | (unset) | TCP address for the operator admin endpoint. Authenticated with operator keys; accepts `ROTATE\n` (effective on primaries; segmentation no-op on replicas) and `PROMOTE\n` (replica nodes). |
 | `--snapshot-interval-ms <ms>` | `3_000_000` | Cadence of background shadow snapshots. Snapshots are independent of rotation but recovery uses the most recent one. |
 
 ## Operational Notes
 
 - **Archived segments are kept indefinitely.** Set up retention separately if disk usage matters.
 - **`ROTATE` does not block on the snapshot stage.** The admin command sets a flag and returns; the actual rotation happens at the next fsync boundary (typically within a few milliseconds under load).
-- **Both primary and replica honour `--admin-bind`.** Each node rotates locally. To rotate both ends of a 1+1 deployment, send `ROTATE` to each address.
+- **Send `ROTATE` to the primary.** Replicas adopt the primary's announced boundaries, so one command to the primary's admin endpoint rotates the whole deployment. A replica's `--admin-bind` endpoint still serves `PROMOTE`.
 - **Snapshot + segments must be on the same filesystem** for the atomic rename to work. Cross-filesystem `--snapshot` paths fall back to a copy that is not crash-safe.
 - **Legacy `.1`, `.2` archives** from pre-monotonic builds are still discoverable by recovery — they are visible in the archive listing for forensic replay, though new rotations always use the monotonic naming scheme.

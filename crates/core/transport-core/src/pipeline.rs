@@ -119,6 +119,13 @@ pub struct StageUtilization {
     /// isn't keeping up (or isn't armed) and the rotation stall is
     /// landing on the journal thread. Only used by the journal stage.
     pub rotations_sync_fallback: AtomicU64,
+    /// Cumulative rotation *attempts* that failed (ENOSPC, read-only
+    /// filesystem, …) and left the current segment in place. The
+    /// journal keeps growing past its threshold while this climbs, so
+    /// any growth is alert-worthy — and without this counter the
+    /// pathology is visible only in logs. Only used by the journal
+    /// stage.
+    pub rotations_failed: AtomicU64,
 }
 
 impl StageUtilization {
@@ -132,6 +139,7 @@ impl StageUtilization {
             policy_degraded_nanos: AtomicU64::new(0),
             rotations_fast_path: AtomicU64::new(0),
             rotations_sync_fallback: AtomicU64::new(0),
+            rotations_failed: AtomicU64::new(0),
         }
     }
 }
@@ -1227,17 +1235,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         Some(manual)
     }
 
-    /// Bookkeeping half of the local-rotation twins. On success:
-    /// counters, log, backoff reset, preparer re-arm, fsync-state
-    /// republish (rotation consumes no sequence and the chain value is
-    /// unchanged — the new segment's anchor *is* the old tail — but
-    /// observers need a state consistent with the new on-disk layout),
-    /// and the `Rotate` announce so replicas rotate at exactly the same
-    /// sequence. On failure: error log + retry backoff + preparer
-    /// re-arm. Returns whether a rotation happened.
     /// Record a completed rotation's path in the shared utilization
-    /// counters (surfaced on `/healthz` so operators can verify the
-    /// fallback count stays at zero in steady state).
+    /// counters (surfaced on `GET /metrics` so operators can verify
+    /// the fallback count stays at zero in steady state).
     fn count_rotation(&self, used_fast_path: bool) {
         let counter = if used_fast_path {
             &self.utilization.rotations_fast_path
@@ -1247,6 +1247,14 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Bookkeeping half of the local-rotation twins. On success:
+    /// counters, log, backoff reset, preparer re-arm, fsync-state
+    /// republish (rotation consumes no sequence and the chain value is
+    /// unchanged — the new segment's anchor *is* the old tail — but
+    /// observers need a state consistent with the new on-disk layout),
+    /// and the `Rotate` announce so replicas rotate at exactly the same
+    /// sequence. On failure: error log + retry backoff + preparer
+    /// re-arm. Returns whether a rotation happened.
     fn finish_local_rotation(
         &mut self,
         rotate_result: Result<std::path::PathBuf, JournalError>,
@@ -1282,6 +1290,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 true
             }
             Err(e) => {
+                self.utilization
+                    .rotations_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     error = %e,
                     trigger = if manual { "manual" } else { "size" },
@@ -1548,6 +1559,12 @@ impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::Buffered
 /// and the preparer fast-path rotation. Only meaningful for
 /// `SectorWriter` because the io_uring submit/complete path operates on
 /// its `O_DIRECT` fd and its aligned batch buffer.
+///
+/// `run_uring` arms the segment preparer at startup. If a persistent
+/// sector run path other than `run_uring` is ever added (the `run_sync`
+/// arm below is `no-persist`-only), it must call `enable_preparer` too
+/// — forgetting it silently reverts every rotation to the synchronous
+/// allocate stall (see 8a8b9771's unwired-call regression).
 impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::SectorWriter<E>> {
     type Writer = melin_journal::SectorWriter<E>;
     #[inline]

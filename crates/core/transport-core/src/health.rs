@@ -186,6 +186,9 @@ struct HealthSnapshot {
     /// path. Should stay at 0 in steady state on the io_uring path —
     /// growth means rotation stalls are landing on the journal thread.
     journal_rotations_sync_fallback: u64,
+    /// Rotation attempts that failed and left the current segment in
+    /// place (the journal keeps growing) — any growth is alert-worthy.
+    journal_rotations_failed: u64,
 }
 
 impl HealthSnapshot {
@@ -402,6 +405,10 @@ impl HealthSnapshot {
                 .journal_utilization
                 .rotations_sync_fallback
                 .load(Ordering::Relaxed),
+            journal_rotations_failed: state
+                .journal_utilization
+                .rotations_failed
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -514,10 +521,11 @@ impl HealthSnapshot {
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\
-             # HELP melin_journal_rotations_total Journal segment rotations by path (fast = adopted a pre-staged segment; sync_fallback = synchronous allocate on the journal thread).\n\
+             # HELP melin_journal_rotations_total Journal segment rotation attempts by outcome (fast = adopted a pre-staged segment; sync_fallback = synchronous allocate on the journal thread; failed = rotation failed, current segment kept growing).\n\
              # TYPE melin_journal_rotations_total counter\n\
              melin_journal_rotations_total{{path=\"fast\"}} {}\n\
              melin_journal_rotations_total{{path=\"sync_fallback\"}} {}\n\
+             melin_journal_rotations_total{{path=\"failed\"}} {}\n\
              # HELP melin_durability_policy_degraded Durability policy currently clamped below its target node count (1 = degraded, 0 = healthy).\n\
              # TYPE melin_durability_policy_degraded gauge\n\
              melin_durability_policy_degraded {}\n\
@@ -561,6 +569,7 @@ impl HealthSnapshot {
             self.response_gate_replication,
             self.journal_rotations_fast_path,
             self.journal_rotations_sync_fallback,
+            self.journal_rotations_failed,
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
@@ -1344,6 +1353,13 @@ mod tests {
         let journal_util = Arc::new(StageUtilization::new());
         journal_util.busy.store(500, Ordering::Relaxed);
         journal_util.idle.store(9500, Ordering::Relaxed);
+        // Distinct values per rotation outcome so a transposed pair in
+        // the positional format args fails loudly.
+        journal_util.rotations_fast_path.store(7, Ordering::Relaxed);
+        journal_util
+            .rotations_sync_fallback
+            .store(3, Ordering::Relaxed);
+        journal_util.rotations_failed.store(2, Ordering::Relaxed);
 
         let matching_util = Arc::new(StageUtilization::new());
         matching_util.busy.store(2000, Ordering::Relaxed);
@@ -1390,6 +1406,18 @@ mod tests {
         assert!(
             response.contains("melin_stage_busy_total{stage=\"response\"} 0\n"),
             "response busy not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_journal_rotations_total{path=\"fast\"} 7\n"),
+            "fast-path rotation count not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_journal_rotations_total{path=\"sync_fallback\"} 3\n"),
+            "sync-fallback rotation count not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_journal_rotations_total{path=\"failed\"} 2\n"),
+            "failed rotation count not found in: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);

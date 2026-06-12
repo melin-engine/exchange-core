@@ -207,6 +207,17 @@ impl Drop for SegmentPreparer {
 /// (interrupted by shutdown) so transient ENOSPC / RO-FS conditions
 /// don't busy-loop the thread.
 fn worker_loop(state: Arc<State>) {
+    // Spawned from the journal thread, which is pinned to a single core
+    // and runs SCHED_FIFO in tuned deployments — child threads inherit
+    // both. Left in place, this worker either starves behind the
+    // busy-spinning journal thread (a same-priority FIFO peer on the
+    // same core never runs, so the fast path never arms) or executes
+    // the ~38 ms allocate ceremony ON the journal core whenever the
+    // journal thread blocks. Reset to the default mask and SCHED_OTHER
+    // before doing any work, like every other child of a pinned thread.
+    if let Err(e) = melin_app::affinity::clear_affinity() {
+        tracing::warn!(error = e, "failed to clear segment-preparer affinity");
+    }
     loop {
         // Wait for arm or shutdown.
         let mut armed = match state.armed.lock() {
