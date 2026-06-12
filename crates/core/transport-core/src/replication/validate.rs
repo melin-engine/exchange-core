@@ -149,6 +149,13 @@ pub fn validate_replica_handshake_settled(
 /// reported hash is zeros, not a chain value. With `hash-chain`
 /// disabled there is no chain to compare either; every handshake
 /// validates `Ok` (both sides report zeros).
+///
+/// A replica built *without* `hash-chain` talking to a primary built
+/// with it also reports all-zeros at a non-zero position (it has no
+/// chain to report — a real BLAKE3 chain value is never zeros). The
+/// chain comparison is skipped for such peers rather than judging the
+/// mixed-feature pair divergent on every reconnect, but `AheadOfTip`
+/// is still enforced — it is a sequence property, not a chain one.
 pub fn validate_replica_handshake(
     journal_path: &std::path::Path,
     handshake: &Handshake,
@@ -158,7 +165,9 @@ pub fn validate_replica_handshake(
     }
     #[cfg(feature = "hash-chain")]
     {
+        let chainless_peer = handshake.chain_hash == [0u8; 32];
         match chain_at_sequence(journal_path, handshake.last_sequence)? {
+            ChainAtSequence::Value(_) if chainless_peer => Ok(HandshakeValidation::Ok),
             ChainAtSequence::Value(local) if local == handshake.chain_hash => {
                 Ok(HandshakeValidation::Ok)
             }
@@ -250,6 +259,29 @@ mod tests {
         assert_eq!(
             validate_replica_handshake(&live, &hs(5, chains[3])).unwrap(),
             HandshakeValidation::Divergent(DivergenceKind::AheadOfTip)
+        );
+    }
+
+    /// A replica built without `hash-chain` reports an all-zeros hash
+    /// at a real position: the chain comparison is skipped (mixed
+    /// feature builds interoperate with reduced verification), but
+    /// `AheadOfTip` — a sequence property — is still enforced.
+    #[test]
+    fn chainless_peer_skips_chain_check_but_not_tip_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (live, _chains) = journal(dir.path());
+
+        for seq in 1..=4u64 {
+            assert_eq!(
+                validate_replica_handshake(&live, &hs(seq, [0u8; 32])).unwrap(),
+                HandshakeValidation::Ok,
+                "seq {seq}"
+            );
+        }
+        assert_eq!(
+            validate_replica_handshake(&live, &hs(5, [0u8; 32])).unwrap(),
+            HandshakeValidation::Divergent(DivergenceKind::AheadOfTip),
+            "ahead-of-tip must still be caught for chain-less peers"
         );
     }
 

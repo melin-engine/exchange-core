@@ -24,9 +24,12 @@ use crate::cursors::{DurableWireSeqCursor, PipelineCursors, WireSeq};
 use crate::journaled_app::JournaledApp;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
+// Only the hash-chain mark tests touch these.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+use crate::pipeline::{AdoptedRotation, StreamMark};
 use crate::pipeline::{
-    AdoptedRotation, InputSlot, JournalStage, JournalStageRun, MAX_JOURNAL_BATCH, MatchingStage,
-    OutputPayload, OutputSlot, StreamMark, build_pipeline_with_replication,
+    InputSlot, JournalStage, JournalStageRun, MAX_JOURNAL_BATCH, MatchingStage, OutputPayload,
+    OutputSlot, build_pipeline_with_replication,
 };
 use crate::test_support::{TestApp, TestEvent, TestQuery, TestReport};
 use crate::trace::mono_trace_ns;
@@ -1605,6 +1608,143 @@ fn adopted_rotation_splits_batch_at_announced_boundary() {
         live_seqs.push(e.sequence);
     }
     assert_eq!(live_seqs, vec![3]);
+}
+
+/// Regression: a `Rotate` with a trailing `ChainCheck` queued inside
+/// the SAME read batch. After adopting the rotation mid-batch, the
+/// encode loop must re-bound the remaining span at the chain check
+/// instead of encoding past it — which surfaced as a fatal
+/// "position already passed" ordering error and killed the replica.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn adopted_rotation_honors_second_mark_in_same_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adopt_two_marks.journal");
+    let anchor = [0x7Au8; 32];
+
+    // Reference writer: chain tails at the rotation boundary (2) and at
+    // the trailing chain check (4). The primary that announces
+    // ChainCheck(4) has itself rotated at 2, so the reference must
+    // rotate too for its chain at 4 to be comparable.
+    let (tail_at_2, tail_at_4) = {
+        let ref_path = dir.path().join("reference.journal");
+        let mut w = Writer::create_continuing(&ref_path, 1, anchor).unwrap();
+        let mut tail_at_2 = [0u8; 32];
+        for seq in 1..=4u64 {
+            assert_eq!(w.allocate_sequence(), seq);
+            w.encode_event(
+                seq,
+                1_000_000_000 + seq,
+                &JournalEvent::App(TestEvent::Add(seq)),
+                0,
+                0,
+            )
+            .unwrap();
+            if seq == 2 {
+                w.flush_batch_sync().unwrap();
+                tail_at_2 = w.chain_hash().expect("hash-chain enabled");
+                w.rotate_segment().unwrap();
+            }
+        }
+        w.flush_batch_sync().unwrap();
+        (tail_at_2, w.chain_hash().expect("hash-chain enabled"))
+    };
+
+    let writer = Writer::create_continuing(&path, 1, anchor).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+    let marks: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    {
+        let mut q = marks.lock().unwrap();
+        q.push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            tail_hash: tail_at_2,
+        }));
+        q.push_back(StreamMark::ChainCheck {
+            sequence: 4,
+            chain_hash: tail_at_4,
+        });
+    }
+    stage.set_stream_marks(Arc::clone(&marks));
+
+    // Everything pre-published, sentinel last: one read_batch spans
+    // both marks.
+    for seq in 1..=5u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+    producer.publish(TestInput::shutdown_sentinel());
+
+    let shutdown = AtomicBool::new(false);
+    let writer = stage
+        .run(&shutdown)
+        .expect("rotation + trailing chain check in one batch must both resolve");
+    assert_eq!(writer.next_sequence(), 6);
+
+    // Rotation at 2: entries 1..=2 archived, 3..=5 live, live anchored
+    // at the boundary tail.
+    let archive = std::path::PathBuf::from(format!("{}.000001", path.display()));
+    assert!(
+        archive.exists(),
+        "rotation must archive the outgoing segment"
+    );
+    let live_info = melin_journal::segment::read_header_info(&path).unwrap();
+    assert_eq!(live_info.starting_sequence, 3);
+    assert_eq!(live_info.anchor_hash, tail_at_2);
+    let mut live_reader = JournalReader::<TestEvent>::open(&path).unwrap();
+    let mut live_seqs = Vec::new();
+    while let Some(e) = live_reader.next_entry().unwrap() {
+        live_seqs.push(e.sequence);
+    }
+    assert_eq!(live_seqs, vec![3, 4, 5]);
+}
+
+/// A `Rotate` announcing an all-zeros tail comes from a primary built
+/// without `hash-chain` (a real BLAKE3 tail is never zeros). The
+/// replica must adopt it with the chain comparison skipped — not judge
+/// the mixed-feature pair divergent on every rotation.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+#[test]
+fn adopted_rotation_with_zero_tail_skips_chain_comparison() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adopt_zero_tail.journal");
+
+    let writer = Writer::create_continuing(&path, 1, [0x7Au8; 32]).unwrap();
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+    let rotations: crate::pipeline::StreamMarkQueue =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    rotations
+        .lock()
+        .unwrap()
+        .push_back(StreamMark::Rotate(AdoptedRotation {
+            boundary_seq: 2,
+            tail_hash: [0u8; 32], // chain-less primary's sentinel
+        }));
+    stage.set_stream_marks(Arc::clone(&rotations));
+
+    for seq in 1..=3u64 {
+        producer.publish(add_slot_with_seq(seq, seq, 1_000_000_000 + seq));
+    }
+    producer.publish(TestInput::shutdown_sentinel());
+
+    let shutdown = AtomicBool::new(false);
+    let writer = stage
+        .run(&shutdown)
+        .expect("zero-tail rotation must adopt, not diverge");
+    assert_eq!(writer.next_sequence(), 4);
+    assert!(
+        std::path::PathBuf::from(format!("{}.000001", path.display())).exists(),
+        "rotation must still happen"
+    );
 }
 
 /// A primary-announced rotation whose tail hash disagrees with the

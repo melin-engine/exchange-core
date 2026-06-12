@@ -439,6 +439,10 @@ fn receive_chunked_body(
 /// Outcome of `run_receiver`: `None` = clean shutdown, `Some` = promotion.
 pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error>>;
 
+/// Payload of a completed snapshot + segment-seed transfer:
+/// `(exchange, snap_sequence, snap_chain_hash, seed_len)`.
+type ResyncTransfer<A> = (A, u64, [u8; 32], u64);
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver<A, W>(
     primary_addr: SocketAddr,
@@ -681,74 +685,114 @@ where
                     ArchiveReason::Resync
                 };
                 archive_local_lineage(journal_path, &snapshot_path, reason)?;
+                // The local lineage is archived — a retried handshake must
+                // present as a fresh replica: the archived claim would be
+                // judged divergent again (or validated against pruned
+                // history). Mirrors the DPDK receiver.
+                last_sequence = 0;
+                chain_hash = [0u8; 32];
 
-                let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-                let (snap_len, snap_sequence, snap_chain_hash) =
-                    match decode_primary_message(&begin_frame)? {
-                        PrimaryMessage::SnapshotBegin {
-                            snapshot_len,
-                            snap_sequence,
-                            snap_chain_hash,
-                        } => (snapshot_len, snap_sequence, snap_chain_hash),
-                        other => {
-                            return Err(format!("expected SnapshotBegin, got {other:?}").into());
-                        }
-                    };
+                // Snapshot + segment-seed transfer. Failures in this block
+                // are network-shaped (primary restarted, connection dropped
+                // mid-body) — retried with backoff like the DPDK receiver,
+                // NOT fatal: the lineage is already archived, so exiting
+                // here would strand the node until an operator restarts it.
+                // Local install failures below (open_append, chain tie)
+                // remain fatal.
+                let mut receive_transfer =
+                    || -> Result<ResyncTransfer<A>, Box<dyn std::error::Error>> {
+                        let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                        let (snap_len, snap_sequence, snap_chain_hash) =
+                            match decode_primary_message(&begin_frame)? {
+                                PrimaryMessage::SnapshotBegin {
+                                    snapshot_len,
+                                    snap_sequence,
+                                    snap_chain_hash,
+                                } => (snapshot_len, snap_sequence, snap_chain_hash),
+                                other => {
+                                    return Err(
+                                        format!("expected SnapshotBegin, got {other:?}").into()
+                                    );
+                                }
+                            };
 
-                info!(snap_sequence, snap_len, "receiving snapshot");
+                        info!(snap_sequence, snap_len, "receiving snapshot");
 
-                let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-                receive_chunked_body(&mut reader, &tmp_path, snap_len, "snapshot")?;
-                std::fs::rename(&tmp_path, &snapshot_path)?;
-                info!(snap_sequence, snap_len, "snapshot received and verified");
+                        let tmp_path = snapshot_path.with_extension("snapshot.tmp");
+                        receive_chunked_body(&mut reader, &tmp_path, snap_len, "snapshot")?;
+                        std::fs::rename(&tmp_path, &snapshot_path)?;
+                        info!(snap_sequence, snap_len, "snapshot received and verified");
 
-                let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
-                    melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
-                if snap_hash != snap_chain_hash {
-                    return Err(format!(
-                        "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
-                         loaded snapshot has {snap_hash:02x?}"
-                    )
-                    .into());
-                }
-                // Adopt the primary's snapshot epoch — the resync rebases this
-                // replica onto the primary's lineage, including its epoch.
-                fence_state.observe_epoch(snap_epoch);
-                exchange = Some(snap_exchange);
-
-                // --- Segment seed ---
-                // The raw byte prefix of the primary's segment containing
-                // `snap_sequence + 1`. Written verbatim as our live
-                // segment, it makes our segmentation a byte-copy of the
-                // primary's from birth — chain values comparable and
-                // `Rotate` verification valid immediately.
-                let seed_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-                let seed_len = match decode_primary_message(&seed_frame)? {
-                    PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
-                    other => {
-                        return Err(format!(
-                            "expected SegmentSeedBegin after snapshot, got {other:?}"
+                        let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
+                            melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
+                        if snap_hash != snap_chain_hash {
+                            return Err(format!(
+                            "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
+                             loaded snapshot has {snap_hash:02x?}"
                         )
                         .into());
-                    }
-                };
-                let seed_tmp = journal_path.with_extension("seed.tmp");
-                receive_chunked_body(&mut reader, &seed_tmp, seed_len, "segment seed")?;
-                // Structural check before installing: the CRC only
-                // proves transport integrity, not that the primary sent
-                // a well-formed prefix ending at the snapshot sequence.
-                // (With hash-chain on, the chain cross-check below
-                // subsumes this; without it, this is the only guard.)
-                if let Err(e) = melin_journal::segment::verify_segment_prefix(
-                    &seed_tmp,
-                    snap_sequence,
-                    seed_len,
-                ) {
-                    let _ = std::fs::remove_file(&seed_tmp);
-                    return Err(format!("segment seed failed structural verification: {e}").into());
-                }
-                std::fs::rename(&seed_tmp, journal_path)?;
-                melin_journal::segment::fsync_parent_dir(journal_path)?;
+                        }
+                        // Adopt the primary's snapshot epoch — the resync rebases this
+                        // replica onto the primary's lineage, including its epoch.
+                        fence_state.observe_epoch(snap_epoch);
+
+                        // --- Segment seed ---
+                        // The raw byte prefix of the primary's segment containing
+                        // `snap_sequence + 1`. Written verbatim as our live
+                        // segment, it makes our segmentation a byte-copy of the
+                        // primary's from birth — chain values comparable and
+                        // `Rotate` verification valid immediately.
+                        let seed_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                        let seed_len = match decode_primary_message(&seed_frame)? {
+                            PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
+                            other => {
+                                return Err(format!(
+                                    "expected SegmentSeedBegin after snapshot, got {other:?}"
+                                )
+                                .into());
+                            }
+                        };
+                        let seed_tmp = journal_path.with_extension("seed.tmp");
+                        receive_chunked_body(&mut reader, &seed_tmp, seed_len, "segment seed")?;
+                        // Structural check before installing: the CRC only
+                        // proves transport integrity, not that the primary sent
+                        // a well-formed prefix ending at the snapshot sequence.
+                        // (With hash-chain on, the chain cross-check below
+                        // subsumes this; without it, this is the only guard.)
+                        if let Err(e) = melin_journal::segment::verify_segment_prefix(
+                            &seed_tmp,
+                            snap_sequence,
+                            seed_len,
+                        ) {
+                            let _ = std::fs::remove_file(&seed_tmp);
+                            return Err(format!(
+                                "segment seed failed structural verification: {e}"
+                            )
+                            .into());
+                        }
+                        std::fs::rename(&seed_tmp, journal_path)?;
+                        melin_journal::segment::fsync_parent_dir(journal_path)?;
+                        Ok((snap_exchange, snap_sequence, snap_chain_hash, seed_len))
+                    };
+                let (snap_exchange, snap_sequence, snap_chain_hash, seed_len) =
+                    match receive_transfer() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                backoff_secs = backoff.as_secs(),
+                                "snapshot transfer failed — retrying"
+                            );
+                            // Half-applied resync state, not audit material —
+                            // drop it so the retry starts clean (the pre-resync
+                            // lineage is already archived; this is not it).
+                            let _ = std::fs::remove_file(&snapshot_path);
+                            sleep_checking_flags(backoff, shutdown, promote);
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+                exchange = Some(snap_exchange);
 
                 // Open the seeded segment for appending at the snapshot
                 // position — recovery's resume path: the chain rebuilds
@@ -756,10 +800,13 @@ where
                 // must equal the (verified) snapshot's chain hash, tying
                 // seed and snapshot to the same history. `chain_hash()`
                 // is `None` only with `hash-chain` disabled — nothing to
-                // tie then, so the check passes by construction.
+                // tie then, so the check passes by construction. An
+                // all-zeros snapshot hash means the *primary* runs
+                // without `hash-chain` (a real chain value is never
+                // zeros) — also nothing to tie.
                 let writer = W::open_append(journal_path, snap_sequence, seed_len)?;
                 let seeded_chain = writer.chain_hash().unwrap_or(snap_chain_hash);
-                if seeded_chain != snap_chain_hash {
+                if snap_chain_hash != [0u8; 32] && seeded_chain != snap_chain_hash {
                     return Err(format!(
                         "segment seed chain at {snap_sequence} disagrees with the \
                          transferred snapshot's hash — inconsistent primary"
@@ -890,9 +937,14 @@ where
             })
         };
 
-        // Publish sentinel for terminal exits.
+        // Publish sentinel for terminal exits — unless the journal stage
+        // already failed: its gate cursor is frozen, so a full ring
+        // would wedge this publish forever, and the sentinel has no
+        // reader anyway (the matching stage is gated behind the journal
+        // cursor; teardown's shutdown flag covers every consumer).
         if !matches!(result.exit, SessionExit::Disconnected)
             && let Some(p) = pipeline.as_mut()
+            && !p.journal_failed.load(Ordering::Acquire)
         {
             p.input_producer
                 .publish(InputSlot::<A::Event>::shutdown_sentinel());

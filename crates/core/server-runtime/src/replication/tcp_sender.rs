@@ -18,7 +18,7 @@ use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal,
-    snapshot_transfer_with,
+    preflight_snapshot_transfer, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_hash_mismatch,
@@ -509,6 +509,13 @@ fn handle_replica_connection<A: Application>(
         // too-far-behind rebase. The receiver expects `SnapshotBegin`
         // as the very next frame after the verdict, so
         // `snapshot_transfer_with` must follow immediately.
+        //
+        // Pre-flight before the verdict goes on the wire: the replica
+        // archives its lineage on receipt, so promising a snapshot we
+        // cannot produce (none configured, boundary segment pruned)
+        // would strand it with its history moved aside. Failing here
+        // drops the connection with the replica's journal intact.
+        preflight_snapshot_transfer(journal_path)?;
         if divergent {
             encode_hash_mismatch(&mut send_buf);
         } else {

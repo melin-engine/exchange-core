@@ -240,7 +240,27 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                                     );
                                     break;
                                 }
-                                last_target = batch.push_with(|s| *s = slot);
+                                // Abortable push: the loop-top latch check
+                                // only runs between frames — if the journal
+                                // stage dies while this push is blocked on a
+                                // full ring, its gate cursor never advances
+                                // again and an unconditional spin would wedge
+                                // the receiver forever (no Fatal exit, no
+                                // teardown, no divergence repair).
+                                match batch.push_with_or_abort(
+                                    |s| *s = slot,
+                                    || journal_failed.load(Ordering::Relaxed),
+                                ) {
+                                    Ok(target) => last_target = target,
+                                    Err(_full) => {
+                                        frame_err = Some(
+                                            "replica journal stage failed \
+                                             (ring full mid-publish)"
+                                                .into(),
+                                        );
+                                        break;
+                                    }
+                                }
                                 pending_accum = primary_seq;
                                 any_published = true;
                             }
@@ -352,6 +372,7 @@ pub(super) fn process_drain_frames<E: AppEvent>(
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
+    journal_failed: &AtomicBool,
 ) -> DrainFrameOutcome {
     let mut consumed = 0;
     let mut last_target = 0u64;
@@ -380,7 +401,25 @@ pub(super) fn process_drain_frames<E: AppEvent>(
                             );
                             break 'frames;
                         }
-                        last_target = batch.push_with(|s| *s = slot);
+                        // Abortable for the same reason as the streaming
+                        // path: a journal stage that dies mid-promotion
+                        // freezes its gate cursor, and a blocked push
+                        // would wedge the drain forever. Stopping here
+                        // matches the gap semantics — everything after
+                        // the stall is unreachable anyway.
+                        match batch.push_with_or_abort(
+                            |s| *s = slot,
+                            || journal_failed.load(Ordering::Relaxed),
+                        ) {
+                            Ok(target) => last_target = target,
+                            Err(_full) => {
+                                tracing::warn!(
+                                    "journal stage failed during promotion drain — \
+                                     stopping at the last contiguous slot"
+                                );
+                                break 'frames;
+                            }
+                        }
                         pending_accum = primary_seq;
                         any_published = true;
                     }
@@ -517,6 +556,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                     input_producer,
                     accum_end_sequence,
                     &mut slot_buf,
+                    journal_failed,
                 );
                 accum_end_sequence = outcome.accum_end_sequence;
                 compact_recv_buf(&mut recv_buf, outcome.consumed);
@@ -1643,7 +1683,13 @@ mod tests {
         // pipeline that the about-to-be-primary replays from — a gap
         // accepted here becomes a gapped journal on the new primary, at
         // the worst possible moment.
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+        let outcome = process_drain_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            9,
+            &mut slot_buf,
+            &AtomicBool::new(false),
+        );
 
         let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
         assert_eq!(
@@ -1838,7 +1884,13 @@ mod tests {
         encode_heartbeat(999, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(22, 0xE2)]);
 
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 19, &mut slot_buf);
+        let outcome = process_drain_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            19,
+            &mut slot_buf,
+            &AtomicBool::new(false),
+        );
 
         assert!(outcome.any_published);
         assert_eq!(outcome.consumed, buf.len());
@@ -1858,7 +1910,13 @@ mod tests {
         let complete_len = buf.len();
         buf.extend_from_slice(&[0xDE, 0xAD]);
 
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 49, &mut slot_buf);
+        let outcome = process_drain_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            49,
+            &mut slot_buf,
+            &AtomicBool::new(false),
+        );
 
         assert_eq!(outcome.consumed, complete_len);
         assert_eq!(outcome.accum_end_sequence, 50);
@@ -1870,7 +1928,13 @@ mod tests {
         let (mut producer, mut consumer) = ring(4);
         let mut slot_buf = Vec::new();
 
-        let outcome = process_drain_frames::<TestEvent>(&[], &mut producer, 55, &mut slot_buf);
+        let outcome = process_drain_frames::<TestEvent>(
+            &[],
+            &mut producer,
+            55,
+            &mut slot_buf,
+            &AtomicBool::new(false),
+        );
 
         assert_eq!(outcome.consumed, 0);
         assert!(!outcome.any_published);

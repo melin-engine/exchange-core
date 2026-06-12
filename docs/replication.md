@@ -203,8 +203,23 @@ streaming. A mismatch anywhere means the replica's journal holds
 **divergent history** — most commonly an ex-primary rejoining after a
 failover with orders it journaled but never replicated.
 
+Chain validation requires the tamper-evident hash chain on **both**
+nodes (the `hash-chain` build feature, on by default). A pair where one
+node was built without it still replicates, but with reduced
+verification: boundary and connect-time checks fall back to
+sequence-only validation, so a fork on such a pair goes undetected
+until both nodes run hash-chain builds. Run matching builds across a
+deployment.
+
 **Divergence repair is automatic.** A divergent replica is re-seeded
 from the primary through the snapshot path on the same connection.
+The primary confirms a snapshot is actually available *before*
+instructing the replica to archive anything: a primary that cannot
+serve one (snapshots disabled, or the snapshot's boundary segment
+pruned) refuses the resync with an explicit error and the replica's
+journal is left untouched. A transfer that fails midway (network drop,
+primary restart) is retried with backoff on a fresh connection; the
+pre-resync journal stays archived for reconciliation either way.
 Divergence detected *mid-stream* (a rotation announce or periodic
 chain check failing against the local journal) repairs the same way
 without a process restart: the replica tears its pipeline down,
@@ -247,10 +262,10 @@ journal a byte-copy of the primary's from the first moment — chain
 validation holds immediately, with no alignment grace period. The seed
 spans from the containing segment's start through the snapshot
 position, so its size is bounded by the segment size (the primary
-buffers it in memory for the transfer, like the snapshot itself —
-with `--max-journal-mib 0` the live segment, and therefore a
-worst-case seed, is unbounded; keep size-driven rotation on when
-serving replicas). Sending `ROTATE` to the primary shortly before
+buffers it in memory for the transfer — released snapshot first, so
+peak memory is one body at a time — with `--max-journal-mib 0` the
+live segment, and therefore a worst-case seed, is unbounded; keep
+size-driven rotation on when serving replicas). Sending `ROTATE` to the primary shortly before
 attaching a fresh replica keeps the seed near the 4 KiB minimum. The
 primary must retain journal segments at least as far back as its
 serving snapshot, or transfers fail with an explicit error.

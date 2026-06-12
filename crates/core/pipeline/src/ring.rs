@@ -403,6 +403,66 @@ impl<'a, T: Copy + Default> Batch<'a, T> {
         }
     }
 
+    /// [`Self::push_with`] with an escape hatch: when the ring is full
+    /// and `abort()` returns true, gives up with `Err(Full)` without
+    /// invoking the closure instead of spinning forever.
+    ///
+    /// A blocked push only completes when a consumer advances its gate
+    /// cursor; a consumer that has *died* (e.g. a replica's failed
+    /// journal stage) never will, and the unconditional spin in
+    /// `push_with` would wedge the producer thread permanently. The
+    /// predicate is only consulted on the full path — the has-space
+    /// fast path pays nothing for it.
+    pub fn push_with_or_abort<F: FnOnce(&mut T)>(
+        &mut self,
+        f: F,
+        mut abort: impl FnMut() -> bool,
+    ) -> Result<u64, Full> {
+        let capacity = self.producer.shared.buffer.mask + 1;
+        loop {
+            let seq = self.start_seq + self.count;
+
+            if seq - self.producer.cached_gate_min < capacity {
+                // Space available — fill the slot in place.
+                // Safety: backpressure confirmed; single-producer → no concurrent writer.
+                let slot = unsafe { self.producer.shared.buffer.slot_mut(seq) };
+                f(slot);
+                self.count += 1;
+                return Ok(seq);
+            }
+
+            // Refresh gate sequences.
+            let mut min = u64::MAX;
+            for gate in &self.producer.gates {
+                let g = gate.get().load(Ordering::Acquire);
+                if g < min {
+                    min = g;
+                }
+            }
+            self.producer.cached_gate_min = min;
+            if seq - min < capacity {
+                continue;
+            }
+
+            if abort() {
+                return Err(Full);
+            }
+
+            // Commit accumulated writes so consumers can advance, then
+            // spin for space.
+            if self.count > 0 {
+                self.producer
+                    .shared
+                    .cursor
+                    .get()
+                    .store(self.start_seq + self.count, Ordering::Release);
+                self.start_seq += self.count;
+                self.count = 0;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     /// Number of entries written into the batch so far.
     pub fn len(&self) -> u64 {
         self.count
@@ -1070,6 +1130,45 @@ mod tests {
 
         let (mut consumer, drained) = t.join().unwrap();
         assert_eq!(drained, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(consumer.try_consume(), Some((4, 99)));
+    }
+
+    #[test]
+    fn batch_push_with_or_abort_escapes_full_ring() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+
+        // Fill the ring to capacity within one batch; the consumer never
+        // advances — modeling a dead downstream stage.
+        let mut batch = producer.batch();
+        for i in 0..4u64 {
+            assert!(batch.push_with_or_abort(|slot| *slot = i, || true).is_ok());
+        }
+
+        // Full + abort signaled: must give up instead of spinning, and
+        // must not invoke the closure.
+        let mut invoked = false;
+        let res = batch.push_with_or_abort(
+            |_| invoked = true,
+            || true, // "consumer is dead"
+        );
+        assert!(res.is_err());
+        assert!(!invoked, "closure must not run on an aborted push");
+
+        // The caller commits the accumulated prefix after bailing —
+        // mirrors the receiver, which publishes the contiguous prefix
+        // before tearing the session down.
+        batch.commit();
+        let mut consumer = consumers.pop().unwrap();
+        for i in 0..4u64 {
+            assert_eq!(consumer.try_consume(), Some((i, i)));
+        }
+
+        // With the consumer advanced, a fresh batch's push succeeds even
+        // while the abort predicate still fires — it is only consulted
+        // when the ring is full.
+        let mut batch = producer.batch();
+        assert!(batch.push_with_or_abort(|slot| *slot = 99, || true).is_ok());
+        batch.commit();
         assert_eq!(consumer.try_consume(), Some((4, 99)));
     }
 

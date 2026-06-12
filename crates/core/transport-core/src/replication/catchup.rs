@@ -354,6 +354,71 @@ fn publish_chunked_body(
 /// `publisher` is called for each encoded control/chunk frame. The TCP
 /// path passes `write_all+flush`; the DPDK path passes
 /// `queue_send+poll`.
+/// Cheap pre-flight for [`snapshot_transfer_with`]: confirm a transfer
+/// can start before the caller commits to one on the wire.
+///
+/// The resync verdict frame (`NeedSnapshot`/`HashMismatch`) makes the
+/// replica archive its local lineage and expect `SnapshotBegin` as the
+/// very next frame — emitting the verdict and then failing to produce a
+/// snapshot strands the replica with its history moved aside (possibly
+/// the last copy of segments this primary has pruned). Senders call
+/// this *before* the verdict; `snapshot_transfer_with` still
+/// re-validates from scratch, so the small window between the two
+/// degrades to the rare mid-transfer failure case, not the common
+/// no-snapshot-configured one.
+///
+/// Checks: snapshot file exists, its header parses, and an on-disk
+/// segment still contains the snapshot boundary. Reads at most the
+/// 64-byte snapshot header plus segment headers — never a body.
+pub fn preflight_snapshot_transfer(journal_path: &std::path::Path) -> io::Result<()> {
+    use std::io::Read as _;
+
+    let snap_path = journal_path.with_extension("snapshot");
+    if !snap_path.exists() {
+        return Err(io::Error::other(
+            "snapshot transfer required but no snapshot available \
+             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
+        ));
+    }
+
+    // Fixed 64-byte stack buffer: SnapshotHeader::parse needs at most
+    // HEADER_SIZE (v2, 56 bytes); reading the whole file here would pull
+    // a potentially huge body that snapshot_transfer_with reads again.
+    let mut head = [0u8; 64];
+    let mut file = std::fs::File::open(&snap_path)
+        .map_err(|e| io::Error::other(format!("open snapshot {}: {e}", snap_path.display())))?;
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "read snapshot header {}: {e}",
+                    snap_path.display()
+                )));
+            }
+        }
+    }
+    let header = crate::snapshot::SnapshotHeader::parse(&head[..filled]).map_err(|e| {
+        io::Error::other(format!(
+            "snapshot {} not servable for transfer: {e}",
+            snap_path.display()
+        ))
+    })?;
+
+    let files = discover_journal_files(journal_path);
+    if containing_segment(&files, header.sequence + 1)?.is_none() {
+        return Err(io::Error::other(format!(
+            "no on-disk segment contains the snapshot boundary {} — archives pruned past \
+             the serving snapshot; retain segments at least as far back as the snapshot",
+            header.sequence + 1
+        )));
+    }
+    Ok(())
+}
+
 pub fn snapshot_transfer_with<E: AppEvent>(
     journal_path: &std::path::Path,
     publisher: CatchUpPublisher<'_>,
@@ -405,6 +470,11 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     if !publish_chunked_body(&snap_data, &mut send_buf, &mut *publisher, shutdown)? {
         return Ok(CatchUpResult::Ok(snap_sequence));
     }
+
+    // The snapshot body is fully on the wire; release it before the seed
+    // prefix is buffered below so peak sender memory is one body, not two
+    // (snapshot + seed can each run to hundreds of MiB).
+    drop(snap_data);
 
     info!(snap_sequence, "snapshot transfer complete");
 

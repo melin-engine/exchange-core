@@ -481,6 +481,13 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
 /// the environmental issue (disk space, fs read-only) is resolved.
 const ROTATION_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Sleep between encode-loop barrier polls while an adopted rotation is
+/// stalled in its failure backoff. The replica cannot encode past the
+/// boundary, so the stage is blocked on storage recovery — coarse
+/// enough to keep the stall loop cold, fine enough that the retry fires
+/// promptly once the backoff expires.
+const ADOPTION_STALL_POLL: Duration = Duration::from_millis(10);
+
 /// A segment rotation announced by the primary over the replication
 /// stream (`Rotate { boundary_seq, tail_hash }`). The replica's journal
 /// stage adopts it at exactly `boundary_seq`: flush everything up to
@@ -861,7 +868,17 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                             pending = 0;
                             first_write_ts = None;
                         }
-                        self.apply_stream_marks(true)?;
+                        if !self.apply_stream_marks(true)?
+                            && matches!(self.pending_mark, Some(StreamMark::Rotate(_)))
+                        {
+                            // The rotation failed and is backed off; the
+                            // rest of this read batch sits past the
+                            // boundary and cannot be encoded until the
+                            // retry succeeds. Sleep instead of spinning
+                            // hot on the barrier — the stage is stalled
+                            // on storage either way.
+                            std::thread::sleep(ADOPTION_STALL_POLL);
+                        }
                     }
                     start = stop;
                 }
@@ -1424,8 +1441,17 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     if !quiesced {
                         return Ok(None);
                     }
-                    let local_tail = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                    if local_tail != r.tail_hash {
+                    // Skip the comparison when either side cannot produce
+                    // a chain value: locally `chain_hash()` is `None`
+                    // without the `hash-chain` feature, and an all-zeros
+                    // announce means the *primary* runs without it (a
+                    // real BLAKE3 tail is never zeros — the boundary has
+                    // absorbed at least one entry). Mirrors the
+                    // ChainCheck arm and the handshake validator: a
+                    // mixed-feature pair runs with reduced verification
+                    // instead of falsely diverging on every rotation.
+                    let local_tail = self.writer.chain_hash().unwrap_or(r.tail_hash);
+                    if r.tail_hash != [0u8; 32] && local_tail != r.tail_hash {
                         return Err(JournalError::ReplicaChainDivergence {
                             sequence: r.boundary_seq,
                             expected: r.tail_hash,
@@ -1447,7 +1473,55 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             "adopted primary-announced rotation (chain verified at boundary)"
         );
         self.pending_mark = None;
+        // The queue may hold a successor mark that falls inside the
+        // same already-read ring batch (a ChainCheck typically trails a
+        // Rotate; catch-up can deliver two Rotates back-to-back). The
+        // encode loops bound spans with `mark_split`, which only reads
+        // `pending_mark` — left `None`, the rest of the batch would be
+        // encoded straight past the successor, and the next resolve
+        // would report it "already passed" and kill the stage.
+        self.refresh_pending_mark();
         self.publish_fsync_state();
+    }
+
+    /// True while a failed rotation attempt's backoff window is still
+    /// open; clears the window once it expires.
+    fn rotation_backed_off(&mut self) -> bool {
+        match self.rotation_backoff_until {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                self.rotation_backoff_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Failure half of an adopted rotation — the replica twin of
+    /// `finish_local_rotation`'s error arm. The mark stays pending
+    /// (`mark_split` keeps every encode span bounded at the boundary,
+    /// so no entry can pass it) and the rotation is retried after the
+    /// backoff: a transient failure (ENOSPC clearing, a brief RO
+    /// remount) must stall the stage — honest backpressure toward the
+    /// primary — not kill the replica process. Unlike the primary, the
+    /// replica cannot keep writing into the current segment: a
+    /// post-boundary entry there would misframe the mirror and force a
+    /// full resync.
+    fn fail_adoption(&mut self, boundary_seq: u64, e: &JournalError) {
+        self.utilization
+            .rotations_failed
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            error = %e,
+            boundary_seq,
+            backoff_secs = ROTATION_FAILURE_BACKOFF.as_secs(),
+            "adopted rotation failed; stalling at the boundary until retry"
+        );
+        self.rotation_backoff_until = Some(Instant::now() + ROTATION_FAILURE_BACKOFF);
+        // Re-arm the preparer so the retry has a shot at the fast path.
+        if let Some(p) = self.preparer.as_ref() {
+            p.arm();
+        }
     }
 
     /// Apply pending stream marks: chain checks inline, and — when
@@ -1456,17 +1530,28 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// preparer-aware twin is `apply_stream_marks_with_prepared`).
     ///
     /// Returns `Ok(true)` when a rotation happened, `Ok(false)` when
-    /// there was nothing (left) to do, and `Err` on divergence or an
-    /// ordering violation.
+    /// there was nothing (left) to do or the rotation failed and is
+    /// backed off for retry (the mark stays pending), and `Err` on
+    /// divergence or an ordering violation.
     fn apply_stream_marks(&mut self, quiesced: bool) -> Result<bool, JournalError> {
         let Some(r) = self.resolve_stream_marks(quiesced)? else {
             return Ok(false);
         };
+        if self.rotation_backed_off() {
+            return Ok(false);
+        }
         // Verified: the local tail equals the primary's, so rotating
         // here anchors the new segment identically on both nodes.
-        self.writer.rotate_segment()?;
-        self.finish_adoption(r.boundary_seq, false);
-        Ok(true)
+        match self.writer.rotate_segment() {
+            Ok(_) => {
+                self.finish_adoption(r.boundary_seq, false);
+                Ok(true)
+            }
+            Err(e) => {
+                self.fail_adoption(r.boundary_seq, &e);
+                Ok(false)
+            }
+        }
     }
 
     /// Drain any remaining entries from the ring buffer on shutdown.
@@ -1669,17 +1754,28 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         let Some(r) = self.resolve_stream_marks(quiesced)? else {
             return Ok(false);
         };
+        if self.rotation_backed_off() {
+            return Ok(false);
+        }
         let prepared = self.preparer.as_ref().and_then(|p| p.take());
         let used_fast_path = prepared.is_some();
-        match prepared {
-            Some(p) => self.writer.rotate_segment_with_prepared(p)?,
-            None => self.writer.rotate_segment()?,
+        let rotate_result = match prepared {
+            Some(p) => self.writer.rotate_segment_with_prepared(p),
+            None => self.writer.rotate_segment(),
         };
         if let Some(p) = self.preparer.as_ref() {
             p.arm();
         }
-        self.finish_adoption(r.boundary_seq, used_fast_path);
-        Ok(true)
+        match rotate_result {
+            Ok(_) => {
+                self.finish_adoption(r.boundary_seq, used_fast_path);
+                Ok(true)
+            }
+            Err(e) => {
+                self.fail_adoption(r.boundary_seq, &e);
+                Ok(false)
+            }
+        }
     }
 
     /// Quiesce the writer mid-cycle for a rotation barrier on the
@@ -1743,19 +1839,21 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
     /// quiesced (nothing buffered, nothing in flight) — otherwise it
     /// stays pending for a later, quiesced call. Re-registers the
     /// journal fd when a rotation happened (the writer's fd changes).
-    /// No-op outside replica mode.
+    /// No-op outside replica mode. Returns whether a rotation happened
+    /// — same contract as [`JournalStage::apply_stream_marks`].
     fn apply_stream_marks_uring(
         &mut self,
         ring: &io_uring::IoUring,
         quiesced: bool,
-    ) -> Result<(), JournalError> {
+    ) -> Result<bool, JournalError> {
         if self.stream_marks.is_none() {
-            return Ok(());
+            return Ok(false);
         }
-        if self.apply_stream_marks_with_prepared(quiesced)? {
+        let rotated = self.apply_stream_marks_with_prepared(quiesced)?;
+        if rotated {
             Self::reregister_journal_fd(ring, self.writer.fd())?;
         }
-        Ok(())
+        Ok(rotated)
     }
 
     /// Overlapped io_uring journal loop: submits `Write` asynchronously and
@@ -1998,7 +2096,17 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                         )?;
                         pending = 0;
                         first_write_ts = None;
-                        self.apply_stream_marks_uring(&ring, true)?;
+                        if !self.apply_stream_marks_uring(&ring, true)?
+                            && matches!(self.pending_mark, Some(StreamMark::Rotate(_)))
+                        {
+                            // The rotation failed and is backed off; the
+                            // rest of this read batch sits past the
+                            // boundary and cannot be encoded until the
+                            // retry succeeds. Sleep instead of spinning
+                            // hot on the barrier — the stage is stalled
+                            // on storage either way.
+                            std::thread::sleep(ADOPTION_STALL_POLL);
+                        }
                     }
                     start = stop;
                 }

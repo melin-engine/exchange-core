@@ -30,7 +30,7 @@ use super::{
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal_with,
-    snapshot_transfer_with,
+    preflight_snapshot_transfer, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
@@ -108,6 +108,21 @@ enum SlotState {
     Streaming(melin_dpdk::SocketHandle),
 }
 
+/// In-flight handshake chain validation, running on a short-lived
+/// background thread. `validate_replica_handshake_settled` can scan a
+/// full segment per attempt and sleeps between retries (~400 ms budget
+/// on a divergent verdict) — far too long to run inline on the poll
+/// thread, which also services client traffic and the other replica
+/// slot. The slot stays `Handshaking` and polls `verdict_rx` each tick.
+struct PendingValidation {
+    /// The handshake that triggered validation — consumed by the
+    /// post-verdict catch-up/resync flow.
+    handshake: Handshake,
+    /// One-shot verdict channel; the sender half lives on the
+    /// validation thread.
+    verdict_rx: std::sync::mpsc::Receiver<io::Result<HandshakeValidation>>,
+}
+
 /// Per-replica slot — owns its ring consumer and state machine.
 struct DpdkReplicaSlot {
     state: SlotState,
@@ -121,6 +136,8 @@ struct DpdkReplicaSlot {
     /// bound and the heartbeat sequence. Meaningless while `Idle`;
     /// re-seeded on every handshake. See `SentHighWater`.
     sent: SentHighWater,
+    /// `Some` while this slot's handshake validation runs off-thread.
+    pending_validation: Option<PendingValidation>,
 }
 
 /// Step-able DPDK replication state. Owns both slot state machines and the
@@ -190,6 +207,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // Placeholder until the slot engages — re-seeded on
                     // every handshake.
                     sent: SentHighWater::seed(0, 0),
+                    pending_validation: None,
                 },
                 DpdkReplicaSlot {
                     state: SlotState::Idle,
@@ -202,6 +220,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // Placeholder until the slot engages — re-seeded on
                     // every handshake.
                     sent: SentHighWater::seed(0, 0),
+                    pending_validation: None,
                 },
             ],
             cursors: ReplicaCursors::new(
@@ -293,6 +312,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
             slot.active_flag.store(false, Ordering::Release);
             slot.evict_flag.store(false, Ordering::Release);
             slot.recv_buf.clear();
+            // Abandon any in-flight validation; the thread's send into a
+            // dropped channel is ignored.
+            slot.pending_validation = None;
             // Drop any unread ring entries so a reconnecting replica
             // on this slot doesn't replay pre-eviction data and stall
             // the primary's replication cursor. See kernel-TCP path
@@ -329,8 +351,257 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         );
                         slot.state = SlotState::Idle;
                         slot.recv_buf.clear();
+                        // The handshake may have been mid-validation.
+                        slot.pending_validation = None;
+                        metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
                         replicas_connected.fetch_sub(1, Ordering::Release);
                         cursors.clear_on_disconnect(slot_idx);
+                        continue;
+                    }
+
+                    // A validation verdict may be outstanding — poll it
+                    // without blocking. The replica is silent between its
+                    // Handshake and our response, so no frames need
+                    // processing while waiting.
+                    if let Some(pv) = slot.pending_validation.take() {
+                        let res = match pv.verdict_rx.try_recv() {
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                // Not settled yet — revisit next tick.
+                                slot.pending_validation = Some(pv);
+                                continue;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                // The validation thread can only drop the
+                                // sender without a verdict by panicking.
+                                warn!(
+                                    slot = slot_idx,
+                                    "handshake validation thread died — disconnecting"
+                                );
+                                transport.close(handle);
+                                slot.state = SlotState::Idle;
+                                slot.recv_buf.clear();
+                                metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                                replicas_connected.fetch_sub(1, Ordering::Release);
+                                cursors.clear_on_disconnect(slot_idx);
+                                continue;
+                            }
+                            Ok(res) => res,
+                        };
+                        let h = pv.handshake;
+
+                        // Chain validation verdict — see the kernel-TCP
+                        // sender. A divergent replica gets a HashMismatch
+                        // frame (below) and the snapshot-resync route on
+                        // this same connection.
+                        let divergent = match res {
+                            Ok(HandshakeValidation::Ok) => false,
+                            Ok(HandshakeValidation::Divergent(kind)) => {
+                                // Alertable on /metrics: divergence
+                                // outside an expected failover rejoin
+                                // means corruption or a serious bug.
+                                metrics.divergence_total.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    slot = slot_idx,
+                                    last_sequence = h.last_sequence,
+                                    ?kind,
+                                    "replica journal divergent at handshake — \
+                                     routing through snapshot resync"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                warn!(slot = slot_idx, error = %e, "handshake validation failed — disconnecting");
+                                transport.close(handle);
+                                slot.state = SlotState::Idle;
+                                slot.recv_buf.clear();
+                                metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                                replicas_connected.fetch_sub(1, Ordering::Release);
+                                cursors.clear_on_disconnect(slot_idx);
+                                continue;
+                            }
+                        };
+                        // Cursor/stream floor: a divergent replica's
+                        // claimed position is meaningless (see the
+                        // kernel-TCP sender) — seed from 0 like a fresh
+                        // replica.
+                        let stream_base = if divergent { 0 } else { h.last_sequence };
+
+                        // Probe whether journal catch-up is possible.
+                        let can_catch_up = if divergent {
+                            false
+                        } else {
+                            match can_catch_up_from_journal(journal_path, h.last_sequence) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(slot = slot_idx, error = %e, "catch-up probe failed — disconnecting");
+                                    transport.close(handle);
+                                    slot.state = SlotState::Idle;
+                                    slot.recv_buf.clear();
+                                    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                                    replicas_connected.fetch_sub(1, Ordering::Release);
+                                    cursors.clear_on_disconnect(slot_idx);
+                                    continue;
+                                }
+                            }
+                        };
+
+                        // DPDK publisher: queue_send + poll to keep
+                        // smoltcp timers alive during bulk transfer.
+                        let mut dpdk_publish = |buf: &[u8]| -> std::io::Result<()> {
+                            loop {
+                                if transport.queue_send(handle, buf) {
+                                    break;
+                                }
+                                transport.poll();
+                                if !transport.is_active(handle) {
+                                    return Err(std::io::Error::other(
+                                        "replica disconnected during send (TX backpressure)",
+                                    ));
+                                }
+                            }
+                            transport.poll();
+                            Ok(())
+                        };
+
+                        // Highest sequence streamed during catch-up /
+                        // snapshot transfer — monotonic from the
+                        // stream floor. Seeds the slot's sent
+                        // high-water mark (heartbeats + ack-sanity
+                        // bound) below.
+                        let mut catchup_end = stream_base;
+                        let catchup_err = if can_catch_up {
+                            slot.send_buf.clear();
+                            melin_transport_core::replication::catchup::lineage_origin(journal_path)
+                                .and_then(|(lineage_start, lineage_anchor)| {
+                                    encode_stream_start(
+                                        h.last_sequence,
+                                        lineage_start,
+                                        lineage_anchor,
+                                        fence_state.epoch(),
+                                        &mut slot.send_buf,
+                                    );
+                                    dpdk_publish(&slot.send_buf)
+                                })
+                                .and_then(|()| {
+                                    match catch_up_from_journal_with::<A::Event>(
+                                        journal_path,
+                                        h.last_sequence,
+                                        &mut dpdk_publish,
+                                        shutdown,
+                                    )? {
+                                        CatchUpResult::Ok(end) => {
+                                            catchup_end = end;
+                                            Ok(())
+                                        }
+                                        CatchUpResult::NeedSnapshot => Err(io::Error::other(
+                                            "catch-up failed unexpectedly after probe",
+                                        )),
+                                    }
+                                })
+                                .err()
+                        } else {
+                            // Resync verdict precedes the snapshot
+                            // data — `HashMismatch` makes the
+                            // replica archive its local lineage;
+                            // plain `NeedSnapshot` is the
+                            // too-far-behind rebase. The receiver
+                            // expects `SnapshotBegin` as the very
+                            // next frame after the verdict.
+                            slot.send_buf.clear();
+                            if divergent {
+                                encode_hash_mismatch(&mut slot.send_buf);
+                            } else {
+                                encode_need_snapshot(&mut slot.send_buf);
+                            }
+                            // Pre-flight before the verdict goes on
+                            // the wire — see the kernel-TCP sender:
+                            // the replica archives its lineage on
+                            // receipt, so a snapshot we cannot
+                            // produce must fail here, dropping the
+                            // connection with the replica's journal
+                            // intact.
+                            match preflight_snapshot_transfer(journal_path)
+                                .and_then(|()| dpdk_publish(&slot.send_buf))
+                                .and_then(|()| {
+                                    snapshot_transfer_with::<A::Event>(
+                                        journal_path,
+                                        &mut dpdk_publish,
+                                        shutdown,
+                                    )
+                                }) {
+                                Ok(CatchUpResult::Ok(end)) => {
+                                    catchup_end = end;
+                                    None
+                                }
+                                Ok(CatchUpResult::NeedSnapshot) => Some(io::Error::other(
+                                    "catch-up failed even after snapshot transfer",
+                                )),
+                                Err(e) => Some(e),
+                            }
+                        };
+
+                        if let Some(e) = catchup_err {
+                            warn!(slot = slot_idx, error = %e, "catch-up/snapshot failed — disconnecting");
+                            transport.close(handle);
+                            slot.state = SlotState::Idle;
+                            slot.recv_buf.clear();
+                            metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                            replicas_connected.fetch_sub(1, Ordering::Release);
+                            cursors.clear_on_disconnect(slot_idx);
+                            continue;
+                        }
+
+                        // Engage this slot's cursors and seed the gauge
+                        // pair BEFORE the bridge flips active so a reader
+                        // that observes active=true also observes a
+                        // non-zero cursor pair — see `ReplicaCursors` for
+                        // the ordering contract.
+                        cursors.seed_on_handshake(slot_idx, stream_base);
+
+                        // Bridge into live streaming: activates the
+                        // ring, re-reads from the journal the entries
+                        // that fell into the activation window, then
+                        // drains the ring into sequence-contiguity
+                        // (back-filling from disk if a skipped entry
+                        // hasn't flushed yet) before going live. The
+                        // bridge closes the catch-up→live gap under load
+                        // (the receiver's contiguity gate backstops only
+                        // the rare quiescent corner) — see
+                        // `bridge_catchup_to_live`.
+                        // Forwards via the retrying DPDK publisher — the
+                        // drain may leave bytes in the TX queue, so the
+                        // previous fire-and-forget `queue_send` would
+                        // silently drop chunks here. Returns the slot's
+                        // sent high-water (heartbeats + ack-sanity bound).
+                        match bridge_catchup_to_live::<A::Event>(
+                            journal_path,
+                            stream_base,
+                            catchup_end,
+                            &slot.active_flag,
+                            &mut slot.consumer,
+                            &mut dpdk_publish,
+                            shutdown,
+                        ) {
+                            Ok(sent) => slot.sent = sent,
+                            Err(e) => {
+                                warn!(slot = slot_idx, error = %e, "catch-up handoff failed — disconnecting");
+                                transport.close(handle);
+                                slot.state = SlotState::Idle;
+                                slot.recv_buf.clear();
+                                metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                                replicas_connected.fetch_sub(1, Ordering::Release);
+                                // Disengage cursors before clearing
+                                // active — ordering contract B2.
+                                cursors.clear_on_disconnect(slot_idx);
+                                slot.active_flag.store(false, Ordering::Release);
+                                continue;
+                            }
+                        }
+                        slot.last_send = std::time::Instant::now();
+
+                        replica_ready.store(true, Ordering::Release);
+                        metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+                        slot.state = SlotState::Streaming(handle);
                         continue;
                     }
 
@@ -379,230 +650,49 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                                     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
-                                    // Chain validation — see the kernel-TCP
-                                    // sender. A divergent replica gets a
-                                    // HashMismatch frame (below) and the
-                                    // snapshot-resync route on this same
-                                    // connection.
-                                    let divergent = match validate_replica_handshake_settled(
-                                        journal_path,
-                                        &h,
-                                    ) {
-                                        Ok(HandshakeValidation::Ok) => false,
-                                        Ok(HandshakeValidation::Divergent(kind)) => {
-                                            // Alertable on /metrics: divergence
-                                            // outside an expected failover rejoin
-                                            // means corruption or a serious bug.
-                                            metrics
-                                                .divergence_total
-                                                .fetch_add(1, Ordering::Relaxed);
-                                            warn!(
-                                                slot = slot_idx,
-                                                last_sequence = h.last_sequence,
-                                                ?kind,
-                                                "replica journal divergent at handshake — \
-                                                 routing through snapshot resync"
-                                            );
-                                            true
-                                        }
-                                        Err(e) => {
-                                            warn!(slot = slot_idx, error = %e, "handshake validation failed — disconnecting");
-                                            transport.close(handle);
-                                            slot.state = SlotState::Idle;
-                                            slot.recv_buf.clear();
-                                            metrics.catching_up[slot_idx]
-                                                .store(false, Ordering::Relaxed);
-                                            replicas_connected.fetch_sub(1, Ordering::Release);
-                                            cursors.clear_on_disconnect(slot_idx);
-                                            continue;
-                                        }
-                                    };
-                                    // Cursor/stream floor: a divergent
-                                    // replica's claimed position is
-                                    // meaningless (see the kernel-TCP
-                                    // sender) — seed from 0 like a fresh
-                                    // replica.
-                                    let stream_base = if divergent { 0 } else { h.last_sequence };
-
-                                    // Probe whether journal catch-up is possible.
-                                    let can_catch_up = if divergent {
-                                        false
-                                    } else {
-                                        match can_catch_up_from_journal(
-                                            journal_path,
-                                            h.last_sequence,
-                                        ) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                warn!(slot = slot_idx, error = %e, "catch-up probe failed — disconnecting");
-                                                transport.close(handle);
-                                                slot.state = SlotState::Idle;
-                                                slot.recv_buf.clear();
-                                                replicas_connected.fetch_sub(1, Ordering::Release);
-                                                cursors.clear_on_disconnect(slot_idx);
-                                                continue;
-                                            }
-                                        }
-                                    };
-
+                                    // The handshake frame is consumed here;
+                                    // chain validation runs on a short-lived
+                                    // thread (it can scan a full segment per
+                                    // attempt and sleeps between retries —
+                                    // blocking tick() would freeze client
+                                    // traffic and the other slot). The slot
+                                    // stays Handshaking; the verdict is picked
+                                    // up by the pending_validation poll at the
+                                    // top of this arm.
                                     compact_recv_buf(&mut slot.recv_buf, frame_end);
-
-                                    // DPDK publisher: queue_send + poll to keep
-                                    // smoltcp timers alive during bulk transfer.
-                                    let mut dpdk_publish = |buf: &[u8]| -> std::io::Result<()> {
-                                        loop {
-                                            if transport.queue_send(handle, buf) {
-                                                break;
-                                            }
-                                            transport.poll();
-                                            if !transport.is_active(handle) {
-                                                return Err(std::io::Error::other(
-                                                    "replica disconnected during send (TX backpressure)",
-                                                ));
-                                            }
-                                        }
-                                        transport.poll();
-                                        Ok(())
-                                    };
-
-                                    // Highest sequence streamed during catch-up /
-                                    // snapshot transfer — monotonic from the
-                                    // stream floor. Seeds the slot's sent
-                                    // high-water mark (heartbeats + ack-sanity
-                                    // bound) below.
-                                    let mut catchup_end = stream_base;
-                                    let catchup_err = if can_catch_up {
-                                        slot.send_buf.clear();
-                                        melin_transport_core::replication::catchup::lineage_origin(
-                                            journal_path,
-                                        )
-                                        .and_then(|(lineage_start, lineage_anchor)| {
-                                            encode_stream_start(
-                                                h.last_sequence,
-                                                lineage_start,
-                                                lineage_anchor,
-                                                fence_state.epoch(),
-                                                &mut slot.send_buf,
+                                    let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+                                    let validate_path = journal_path.clone();
+                                    let validate_hs = h.clone();
+                                    match std::thread::Builder::new()
+                                        .name(format!("repl-validate-{slot_idx}"))
+                                        .spawn(move || {
+                                            // Send failure means the slot was
+                                            // torn down while validating —
+                                            // nobody is waiting for the verdict.
+                                            let _ = verdict_tx.send(
+                                                validate_replica_handshake_settled(
+                                                    &validate_path,
+                                                    &validate_hs,
+                                                ),
                                             );
-                                            dpdk_publish(&slot.send_buf)
-                                        })
-                                        .and_then(|()| {
-                                            match catch_up_from_journal_with::<A::Event>(
-                                                journal_path,
-                                                h.last_sequence,
-                                                &mut dpdk_publish,
-                                                shutdown,
-                                            )? {
-                                                CatchUpResult::Ok(end) => {
-                                                    catchup_end = end;
-                                                    Ok(())
-                                                }
-                                                CatchUpResult::NeedSnapshot => {
-                                                    Err(io::Error::other(
-                                                        "catch-up failed unexpectedly after probe",
-                                                    ))
-                                                }
-                                            }
-                                        })
-                                        .err()
-                                    } else {
-                                        // Resync verdict precedes the snapshot
-                                        // data — `HashMismatch` makes the
-                                        // replica archive its local lineage;
-                                        // plain `NeedSnapshot` is the
-                                        // too-far-behind rebase. The receiver
-                                        // expects `SnapshotBegin` as the very
-                                        // next frame after the verdict.
-                                        slot.send_buf.clear();
-                                        if divergent {
-                                            encode_hash_mismatch(&mut slot.send_buf);
-                                        } else {
-                                            encode_need_snapshot(&mut slot.send_buf);
-                                        }
-                                        match dpdk_publish(&slot.send_buf).and_then(|()| {
-                                            snapshot_transfer_with::<A::Event>(
-                                                journal_path,
-                                                &mut dpdk_publish,
-                                                shutdown,
-                                            )
                                         }) {
-                                            Ok(CatchUpResult::Ok(end)) => {
-                                                catchup_end = end;
-                                                None
-                                            }
-                                            Ok(CatchUpResult::NeedSnapshot) => {
-                                                Some(io::Error::other(
-                                                    "catch-up failed even after snapshot transfer",
-                                                ))
-                                            }
-                                            Err(e) => Some(e),
+                                        Ok(_detached) => {
+                                            slot.pending_validation = Some(PendingValidation {
+                                                handshake: h,
+                                                verdict_rx,
+                                            });
                                         }
-                                    };
-
-                                    if let Some(e) = catchup_err {
-                                        warn!(slot = slot_idx, error = %e, "catch-up/snapshot failed — disconnecting");
-                                        transport.close(handle);
-                                        slot.state = SlotState::Idle;
-                                        slot.recv_buf.clear();
-                                        metrics.catching_up[slot_idx]
-                                            .store(false, Ordering::Relaxed);
-                                        replicas_connected.fetch_sub(1, Ordering::Release);
-                                        cursors.clear_on_disconnect(slot_idx);
-                                        continue;
-                                    }
-
-                                    // Engage this slot's cursors and seed the gauge
-                                    // pair BEFORE the bridge flips active so a reader
-                                    // that observes active=true also observes a
-                                    // non-zero cursor pair — see `ReplicaCursors` for
-                                    // the ordering contract.
-                                    cursors.seed_on_handshake(slot_idx, stream_base);
-
-                                    // Bridge into live streaming: activates the
-                                    // ring, re-reads from the journal the entries
-                                    // that fell into the activation window, then
-                                    // drains the ring into sequence-contiguity
-                                    // (back-filling from disk if a skipped entry
-                                    // hasn't flushed yet) before going live. The
-                                    // bridge closes the catch-up→live gap under load
-                                    // (the receiver's contiguity gate backstops only
-                                    // the rare quiescent corner) — see
-                                    // `bridge_catchup_to_live`.
-                                    // Forwards via the retrying DPDK publisher — the
-                                    // drain may leave bytes in the TX queue, so the
-                                    // previous fire-and-forget `queue_send` would
-                                    // silently drop chunks here. Returns the slot's
-                                    // sent high-water (heartbeats + ack-sanity bound).
-                                    match bridge_catchup_to_live::<A::Event>(
-                                        journal_path,
-                                        stream_base,
-                                        catchup_end,
-                                        &slot.active_flag,
-                                        &mut slot.consumer,
-                                        &mut dpdk_publish,
-                                        shutdown,
-                                    ) {
-                                        Ok(sent) => slot.sent = sent,
                                         Err(e) => {
-                                            warn!(slot = slot_idx, error = %e, "catch-up handoff failed — disconnecting");
+                                            warn!(slot = slot_idx, error = %e, "failed to spawn handshake validation thread — disconnecting");
                                             transport.close(handle);
                                             slot.state = SlotState::Idle;
                                             slot.recv_buf.clear();
                                             metrics.catching_up[slot_idx]
                                                 .store(false, Ordering::Relaxed);
                                             replicas_connected.fetch_sub(1, Ordering::Release);
-                                            // Disengage cursors before clearing
-                                            // active — ordering contract B2.
                                             cursors.clear_on_disconnect(slot_idx);
-                                            slot.active_flag.store(false, Ordering::Release);
-                                            continue;
                                         }
                                     }
-                                    slot.last_send = std::time::Instant::now();
-
-                                    replica_ready.store(true, Ordering::Release);
-                                    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                                    slot.state = SlotState::Streaming(handle);
                                 }
                                 Ok(ReplicaMessage::Ack(_)) => {
                                     warn!(
@@ -1186,8 +1276,12 @@ where
                                     // `chain_hash()` is `None` only with
                                     // `hash-chain` disabled — nothing to tie
                                     // then, the check passes by construction.
+                                    // All-zeros snapshot hash: the *primary*
+                                    // runs without `hash-chain` (a real chain
+                                    // value is never zeros) — also nothing
+                                    // to tie.
                                     let seeded_chain = writer.chain_hash().unwrap_or(snap_hash);
-                                    if seeded_chain != snap_hash {
+                                    if snap_hash != [0u8; 32] && seeded_chain != snap_hash {
                                         fatal_err_dpdk!(
                                             "segment seed chain disagrees with the \
                                              transferred snapshot's hash — inconsistent \
@@ -1349,9 +1443,14 @@ where
             r
         };
 
-        // Publish sentinel for terminal exits.
+        // Publish sentinel for terminal exits — unless the journal stage
+        // already failed: its gate cursor is frozen, so a full ring
+        // would wedge this publish forever, and the sentinel has no
+        // reader anyway (the matching stage is gated behind the journal
+        // cursor; teardown's shutdown flag covers every consumer).
         if !matches!(result.exit, SessionExit::Disconnected)
             && let Some(p) = pipeline.as_mut()
+            && !p.journal_failed.load(Ordering::Acquire)
         {
             p.input_producer.publish(
                 melin_transport_core::pipeline::InputSlot::<A::Event>::shutdown_sentinel(),
@@ -1402,6 +1501,14 @@ where
                         "mid-stream chain divergence — re-deriving local state for \
                          in-process resync (DPDK)"
                     );
+                    // Close the old session before reconnecting: the TCP
+                    // connection to the primary is still healthy (the
+                    // divergence was detected locally), so without a FIN
+                    // the primary's slot stays occupied — and the DPDK
+                    // primary has no timeout eviction, so the repair
+                    // handshake could be refused indefinitely. Closing
+                    // also returns the socket entry to the socket set.
+                    transport.close(handle);
                     let (ex, wr, seq, hash) = recover_replica_state::<A, W>(
                         journal_path,
                         &snapshot_path,
@@ -1419,6 +1526,11 @@ where
             SessionExit::Disconnected => {
                 // Pipeline stays live — `last_sequence` and `chain_hash`
                 // refresh from its atomics at the top of the next iteration.
+                // The TCP session is already dead, but the smoltcp socket
+                // entry is only reclaimed by an explicit close — each
+                // reconnect allocates a fresh socket, so skipping this
+                // leaks one socket-set entry per disconnect.
+                transport.close(handle);
             }
         }
 
