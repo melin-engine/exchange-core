@@ -210,9 +210,12 @@ sibling directory named `<journal>.divergent.<n>`. Under `local`
 durability that journal may hold acked orders that did not survive the
 failover, which is exactly what an operator or regulator needs for
 reconciliation. Routine (non-divergent) resyncs archive to
-`<journal>.resync.<n>` for the same conservative reason. These
-directories are never cleaned up automatically — reclaim the space
-once reconciled.
+`<journal>.resync.<n>` for the same conservative reason — and note
+that when a replica's position predates the primary's oldest retained
+segment, divergence there *cannot be checked*: a `.resync.<n>` archive
+from a node that was ever a primary may contain a fork and deserves
+the same care as a `.divergent.<n>` one. These directories are never
+cleaned up automatically — reclaim the space once reconciled.
 
 ## Snapshot transfer
 
@@ -229,11 +232,14 @@ verbatim as the replica's live segment, it makes the new replica's
 journal a byte-copy of the primary's from the first moment — chain
 validation holds immediately, with no alignment grace period. The seed
 spans from the containing segment's start through the snapshot
-position, so its size is bounded by the segment size; sending `ROTATE`
-to the primary shortly before attaching a fresh replica keeps it near
-the 4 KiB minimum. The primary must retain journal segments at least
-as far back as its serving snapshot, or transfers fail with an
-explicit error.
+position, so its size is bounded by the segment size (the primary
+buffers it in memory for the transfer, like the snapshot itself —
+with `--max-journal-mib 0` the live segment, and therefore a
+worst-case seed, is unbounded; keep size-driven rotation on when
+serving replicas). Sending `ROTATE` to the primary shortly before
+attaching a fresh replica keeps the seed near the 4 KiB minimum. The
+primary must retain journal segments at least as far back as its
+serving snapshot, or transfers fail with an explicit error.
 
 This lets a fresh replica bootstrap from a running primary without
 requiring the full journal history.

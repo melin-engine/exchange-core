@@ -25,7 +25,7 @@ use melin_transport_core::replication::protocol::{
     encode_heartbeat, encode_stream_start, read_frame,
 };
 use melin_transport_core::replication::validate::{
-    HandshakeValidation, validate_replica_handshake,
+    HandshakeValidation, validate_replica_handshake_settled,
 };
 
 // --- Replication Sender (Primary side) ---
@@ -436,7 +436,7 @@ fn handle_replica_connection<A: Application>(
     // Send HashMismatch (the replica archives its local journal on
     // receipt) and route it through snapshot resync on this same
     // connection.
-    let divergent = match validate_replica_handshake(journal_path, &handshake)? {
+    let divergent = match validate_replica_handshake_settled(journal_path, &handshake)? {
         HandshakeValidation::Ok => false,
         HandshakeValidation::Divergent(kind) => {
             warn!(

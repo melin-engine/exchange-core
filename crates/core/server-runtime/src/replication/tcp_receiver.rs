@@ -378,6 +378,63 @@ impl ReceiverTransport for UringTransport {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Receive a chunked body (`SnapshotChunk*` → `SnapshotEnd`) into
+/// `tmp_path`, verifying the byte length and CRC32C trailer — the
+/// framing shared by the snapshot payload and the segment seed. The
+/// tmp file is removed on any failure (including transport errors), so
+/// callers never see a partial file.
+fn receive_chunked_body(
+    reader: &mut TcpStream,
+    tmp_path: &std::path::Path,
+    expected_len: u64,
+    what: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut tmp_file = std::fs::File::create(tmp_path)?;
+        let mut received: u64 = 0;
+        let mut running_crc: u32 = 0;
+        loop {
+            let chunk_frame = read_frame(reader, MAX_DATA_FRAME)?;
+            match decode_primary_message(&chunk_frame)? {
+                PrimaryMessage::SnapshotChunk(data) => {
+                    std::io::Write::write_all(&mut tmp_file, &data)?;
+                    received += data.len() as u64;
+                    running_crc = crc32c::crc32c_append(running_crc, &data);
+                }
+                PrimaryMessage::SnapshotEnd {
+                    crc32c: expected_crc,
+                } => {
+                    tmp_file.sync_all()?;
+                    if received != expected_len {
+                        return Err(format!(
+                            "{what} length mismatch: expected {expected_len} bytes, \
+                             got {received}"
+                        )
+                        .into());
+                    }
+                    if running_crc != expected_crc {
+                        return Err(format!(
+                            "{what} CRC mismatch: expected {expected_crc:#x}, \
+                             got {running_crc:#x}"
+                        )
+                        .into());
+                    }
+                    return Ok(());
+                }
+                other => {
+                    return Err(format!("expected {what} SnapshotChunk/End, got {other:?}").into());
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        // Best-effort: a partial tmp file must not survive the failed
+        // transfer (it would shadow the next attempt's write).
+        let _ = std::fs::remove_file(tmp_path);
+    }
+    result
+}
+
 /// Outcome of `run_receiver`: `None` = clean shutdown, `Some` = promotion.
 pub type ReceiverResult<A, W> = Result<Option<(A, W)>, Box<dyn std::error::Error>>;
 
@@ -445,9 +502,20 @@ where
     // --- Outer reconnect loop ---
     loop {
         if let Some(p) = pipeline.as_ref() {
-            last_sequence = p.last_seq.load().get();
+            // The handshake pair (last_sequence, chain_hash) must come
+            // from ONE FsyncState snapshot — the journal stage keeps
+            // flushing while we reconnect, and the primary's handshake
+            // validation recomputes its chain at exactly the sequence
+            // we claim. Reading the sequence and the hash from two
+            // separate sources would tear under load, and a torn pair
+            // is indistinguishable from divergence (false resync of a
+            // healthy replica).
             if let Some(ref lock) = p.chain_hash_lock {
-                chain_hash = lock.load().chain_hash;
+                let fsync_state = lock.load();
+                last_sequence = fsync_state.journal_seq.get();
+                chain_hash = fsync_state.chain_hash;
+            } else {
+                last_sequence = p.last_seq.load().get();
             }
         }
 
@@ -645,53 +713,9 @@ where
                 info!(snap_sequence, snap_len, "receiving snapshot");
 
                 let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-                {
-                    let mut tmp_file = std::fs::File::create(&tmp_path)?;
-                    let mut received: u64 = 0;
-                    let mut running_crc: u32 = 0;
-                    loop {
-                        let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
-                        match decode_primary_message(&chunk_frame)? {
-                            PrimaryMessage::SnapshotChunk(data) => {
-                                std::io::Write::write_all(&mut tmp_file, &data)?;
-                                received += data.len() as u64;
-                                running_crc = crc32c::crc32c_append(running_crc, &data);
-                            }
-                            PrimaryMessage::SnapshotEnd {
-                                crc32c: expected_crc,
-                            } => {
-                                tmp_file.sync_all()?;
-                                drop(tmp_file);
-
-                                if received != snap_len {
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(format!(
-                                        "snapshot length mismatch: expected {snap_len} bytes, got {received}"
-                                    )
-                                    .into());
-                                }
-
-                                if running_crc != expected_crc {
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(format!(
-                                        "snapshot CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
-                                    )
-                                    .into());
-                                }
-
-                                std::fs::rename(&tmp_path, &snapshot_path)?;
-                                info!(snap_sequence, received, "snapshot received and verified");
-                                break;
-                            }
-                            other => {
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(
-                                    format!("expected SnapshotChunk/End, got {other:?}").into()
-                                );
-                            }
-                        }
-                    }
-                }
+                receive_chunked_body(&mut reader, &tmp_path, snap_len, "snapshot")?;
+                std::fs::rename(&tmp_path, &snapshot_path)?;
+                info!(snap_sequence, snap_len, "snapshot received and verified");
 
                 let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
                     melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
@@ -724,53 +748,22 @@ where
                     }
                 };
                 let seed_tmp = journal_path.with_extension("seed.tmp");
-                {
-                    let mut tmp_file = std::fs::File::create(&seed_tmp)?;
-                    let mut received: u64 = 0;
-                    let mut running_crc: u32 = 0;
-                    loop {
-                        let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
-                        match decode_primary_message(&chunk_frame)? {
-                            PrimaryMessage::SnapshotChunk(data) => {
-                                std::io::Write::write_all(&mut tmp_file, &data)?;
-                                received += data.len() as u64;
-                                running_crc = crc32c::crc32c_append(running_crc, &data);
-                            }
-                            PrimaryMessage::SnapshotEnd {
-                                crc32c: expected_crc,
-                            } => {
-                                tmp_file.sync_all()?;
-                                drop(tmp_file);
-                                if received != seed_len {
-                                    let _ = std::fs::remove_file(&seed_tmp);
-                                    return Err(format!(
-                                        "segment seed length mismatch: expected {seed_len} \
-                                         bytes, got {received}"
-                                    )
-                                    .into());
-                                }
-                                if running_crc != expected_crc {
-                                    let _ = std::fs::remove_file(&seed_tmp);
-                                    return Err(format!(
-                                        "segment seed CRC mismatch: expected \
-                                         {expected_crc:#x}, got {running_crc:#x}"
-                                    )
-                                    .into());
-                                }
-                                std::fs::rename(&seed_tmp, journal_path)?;
-                                melin_journal::segment::fsync_parent_dir(journal_path)?;
-                                break;
-                            }
-                            other => {
-                                let _ = std::fs::remove_file(&seed_tmp);
-                                return Err(format!(
-                                    "expected seed SnapshotChunk/End, got {other:?}"
-                                )
-                                .into());
-                            }
-                        }
-                    }
+                receive_chunked_body(&mut reader, &seed_tmp, seed_len, "segment seed")?;
+                // Structural check before installing: the CRC only
+                // proves transport integrity, not that the primary sent
+                // a well-formed prefix ending at the snapshot sequence.
+                // (With hash-chain on, the chain cross-check below
+                // subsumes this; without it, this is the only guard.)
+                if let Err(e) = melin_journal::segment::verify_segment_prefix(
+                    &seed_tmp,
+                    snap_sequence,
+                    seed_len,
+                ) {
+                    let _ = std::fs::remove_file(&seed_tmp);
+                    return Err(format!("segment seed failed structural verification: {e}").into());
                 }
+                std::fs::rename(&seed_tmp, journal_path)?;
+                melin_journal::segment::fsync_parent_dir(journal_path)?;
 
                 // Open the seeded segment for appending at the snapshot
                 // position — recovery's resume path: the chain rebuilds
@@ -876,6 +869,7 @@ where
             let input_producer = &mut p.input_producer;
             let journal_cursor = p.journal_cursor.as_ref();
             let stream_marks = &p.stream_marks;
+            let journal_failed = &p.journal_failed;
             std::thread::scope(|s| {
                 let handle = std::thread::Builder::new()
                     .name("replica-receiver".into())
@@ -903,6 +897,7 @@ where
                             Vec::with_capacity(MAX_DATA_FRAME + 4),
                             None,
                             stream_marks,
+                            journal_failed,
                         )
                     })
                     .expect("spawn replica-receiver thread");

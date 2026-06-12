@@ -8,7 +8,7 @@
 //! the journal stage catches up, and decide when a fresh ack frame
 //! needs to be sent on the wire.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use melin_pipeline::padding::Sequence;
 
@@ -112,37 +112,68 @@ impl PendingAckQueue {
     }
 
     /// Block until the oldest pending ack is durable, then pop all
-    /// ready entries. Returns the highest acked sequence.
-    pub fn pop_oldest_blocking(&mut self, journal_cursor: &Sequence, busy_spin: bool) -> u64 {
+    /// ready entries. Returns the highest acked sequence, or `None` if
+    /// `abort` flipped while waiting — the journal stage has died and
+    /// the cursor will never advance; the caller must tear the session
+    /// down instead of waiting forever.
+    pub fn pop_oldest_blocking(
+        &mut self,
+        journal_cursor: &Sequence,
+        busy_spin: bool,
+        abort: &AtomicBool,
+    ) -> Option<u64> {
         debug_assert!(!self.is_empty());
         let target = self.buf[self.head].journal_target;
-        wait_for_journal_cursor(journal_cursor, target, busy_spin);
+        if !wait_for_journal_cursor(journal_cursor, target, busy_spin, abort) {
+            return None;
+        }
         // The cursor advanced — pop this entry plus any others that
         // are now also durable.
-        self.pop_ready(journal_cursor)
-            .expect("at least one entry became ready after wait")
+        Some(
+            self.pop_ready(journal_cursor)
+                .expect("at least one entry became ready after wait"),
+        )
     }
 
-    /// Block until ALL pending acks are durable. Returns the highest
-    /// acked sequence, or `None` if the queue was already empty.
-    pub fn pop_all_blocking(&mut self, journal_cursor: &Sequence, busy_spin: bool) -> Option<u64> {
+    /// Block until ALL pending acks are durable (or `abort` flips).
+    /// Returns the highest acked sequence, or `None` if the queue was
+    /// already empty or the first wait aborted.
+    pub fn pop_all_blocking(
+        &mut self,
+        journal_cursor: &Sequence,
+        busy_spin: bool,
+        abort: &AtomicBool,
+    ) -> Option<u64> {
         let mut last = None;
         while !self.is_empty() {
-            last = Some(self.pop_oldest_blocking(journal_cursor, busy_spin));
+            match self.pop_oldest_blocking(journal_cursor, busy_spin, abort) {
+                Some(seq) => last = Some(seq),
+                None => break,
+            }
         }
         last
     }
 }
 
-/// Wait until the journal cursor crosses `target`. `busy_spin=true` keeps
-/// the wait on the CPU (production default — ack RTT is on the primary's
-/// response-gate critical path, where a `yield_now` scheduler tick adds
-/// ~1ms to client p99). `busy_spin=false` yields after a short spin so a
+/// Wait until the journal cursor crosses `target`, or `abort` flips
+/// (returns `false` — the cursor's owner has died and the wait would
+/// never complete). `busy_spin=true` keeps the wait on the CPU
+/// (production default — ack RTT is on the primary's response-gate
+/// critical path, where a `yield_now` scheduler tick adds ~1ms to
+/// client p99). `busy_spin=false` yields after a short spin so a
 /// stalled cursor doesn't peg a core under `--yield-idle` (tests / CI /
 /// shared boxes).
-pub fn wait_for_journal_cursor(journal_cursor: &Sequence, target: u64, busy_spin: bool) {
+pub fn wait_for_journal_cursor(
+    journal_cursor: &Sequence,
+    target: u64,
+    busy_spin: bool,
+    abort: &AtomicBool,
+) -> bool {
     let mut spins: u32 = 0;
     while journal_cursor.get().load(Ordering::Acquire) < target {
+        if abort.load(Ordering::Relaxed) {
+            return false;
+        }
         if busy_spin || spins < 1000 {
             spins = spins.wrapping_add(1);
             std::hint::spin_loop();
@@ -150,6 +181,7 @@ pub fn wait_for_journal_cursor(journal_cursor: &Sequence, target: u64, busy_spin
             std::thread::yield_now();
         }
     }
+    true
 }
 
 /// Build the next replica → primary [`Ack`] to fire under the

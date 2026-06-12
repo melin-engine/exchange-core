@@ -236,6 +236,13 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// pops and rotates at exactly those sequences. Replicas have no
     /// local rotation triggers.
     pub(super) stream_marks: melin_transport_core::pipeline::StreamMarkQueue,
+    /// Latched by the journal thread's spawn wrapper when the stage
+    /// exits with an error (chain divergence, journal I/O failure).
+    /// The streaming receiver checks it and tears the session down —
+    /// without this, a dead journal stage freezes the journal cursor
+    /// and the receiver wedges forever on ring backpressure or the
+    /// ack-durability wait.
+    pub(super) journal_failed: Arc<AtomicBool>,
     /// Per-pipeline shutdown flag — flipped only on a controlled teardown
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
@@ -295,11 +302,24 @@ where
     let stream_marks: melin_transport_core::pipeline::StreamMarkQueue =
         Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     journal_stage.set_stream_marks(Arc::clone(&stream_marks));
+    let journal_failed = Arc::new(AtomicBool::new(false));
+    let journal_failed_latch = Arc::clone(&journal_failed);
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("journal", journal_core);
-            journal_stage.run(&ps)
+            let result = journal_stage.run(&ps);
+            if let Err(ref e) = result {
+                // Latch before logging so the receiver reacts even if
+                // logging stalls. A dead journal stage freezes the
+                // journal cursor; every downstream wait on it (ring
+                // backpressure, ack durability) would spin forever —
+                // the streaming loop polls this latch and tears the
+                // session down instead.
+                journal_failed_latch.store(true, Ordering::Release);
+                tracing::error!(error = %e, "replica journal stage failed — session teardown");
+            }
+            result
         })
         .expect("spawn journal thread");
 
@@ -378,6 +398,7 @@ where
         last_seq: pipeline.cursors.durable_wire_seq(),
         chain_hash_lock: pipeline.chain_hash_lock,
         stream_marks,
+        journal_failed,
         pipeline_shutdown,
         journal_handle,
         matching_handle,
@@ -1796,10 +1817,25 @@ mod tests {
         // Cursor already past both targets — pop_oldest_blocking
         // returns immediately.
         let cursor = make_journal_cursor(25);
-        let seq = q.pop_oldest_blocking(&cursor, true);
+        let seq = q.pop_oldest_blocking(&cursor, true, &AtomicBool::new(false));
         // Should pop both (oldest + any others that became ready).
-        assert_eq!(seq, 200);
+        assert_eq!(seq, Some(200));
         assert!(q.is_empty());
+    }
+
+    /// A dead journal stage (abort latch set) must abort the blocking
+    /// wait instead of spinning forever on the frozen cursor.
+    #[test]
+    fn pending_ack_queue_blocking_wait_aborts_on_journal_failure() {
+        let mut q = PendingAckQueue::new(8);
+        q.push(10, 100);
+
+        // Cursor frozen BELOW the target; abort pre-latched.
+        let cursor = make_journal_cursor(5);
+        let abort = AtomicBool::new(true);
+        assert_eq!(q.pop_oldest_blocking(&cursor, true, &abort), None);
+        assert!(!q.is_empty(), "aborted wait must not pop the entry");
+        assert_eq!(q.pop_all_blocking(&cursor, true, &abort), None);
     }
 
     #[test]
@@ -1824,7 +1860,10 @@ mod tests {
     fn pending_ack_queue_pop_all_blocking_empty() {
         let mut q = PendingAckQueue::new(8);
         let cursor = make_journal_cursor(0);
-        assert!(q.pop_all_blocking(&cursor, true).is_none());
+        assert!(
+            q.pop_all_blocking(&cursor, true, &AtomicBool::new(false))
+                .is_none()
+        );
     }
 
     // --- try_flush_dual_track tests ---

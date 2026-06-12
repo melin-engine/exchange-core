@@ -324,17 +324,6 @@ pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<Inp
 ///
 /// Errors if the frame is too short, isn't an `InputBatch`, or carries
 /// no slots.
-/// Message tag of a length-prefixed frame (the byte right after the
-/// 4-byte length). Lets ring consumers distinguish `InputBatch` chunks
-/// from in-stream control frames (e.g. `Rotate`) before committing to
-/// an `InputBatch`-shaped parse.
-pub fn peek_frame_tag(frame: &[u8]) -> io::Result<u8> {
-    frame
-        .get(4)
-        .copied()
-        .ok_or_else(|| io::Error::other("frame too short for a message tag"))
-}
-
 pub fn peek_first_sequence(frame: &[u8]) -> io::Result<u64> {
     let (header, rest) = FrameHeader::ref_from_prefix(frame)
         .map_err(|_| io::Error::other("InputBatch frame too short for header"))?;
@@ -350,6 +339,17 @@ pub fn peek_first_sequence(frame: &[u8]) -> io::Result<u64> {
     let (slot, _) = SlotHeader::ref_from_prefix(rest)
         .map_err(|_| io::Error::other("InputBatch frame too short for first slot"))?;
     Ok(slot.sequence.get())
+}
+
+/// Message tag of a length-prefixed frame (the byte right after the
+/// 4-byte length). Lets ring consumers distinguish `InputBatch` chunks
+/// from in-stream control frames (e.g. `Rotate`) before committing to
+/// an `InputBatch`-shaped parse.
+pub fn peek_frame_tag(frame: &[u8]) -> io::Result<u8> {
+    frame
+        .get(4)
+        .copied()
+        .ok_or_else(|| io::Error::other("frame too short for a message tag"))
 }
 
 #[cfg(test)]

@@ -839,6 +839,15 @@ where
                 info!("replica promoted — transitioning to primary");
                 <A as Application>::prefault(&mut exchange);
 
+                // A ROTATE received while this node was a replica latched
+                // the flag but rotated nothing (rotation is primary-driven
+                // and replicas follow the primary's boundaries). Clear it
+                // so the stale latch can't fire a surprise rotation on the
+                // first post-promotion fsync.
+                if let Some(ref flag) = rotate_flag {
+                    flag.store(false, Ordering::Release);
+                }
+
                 return run_as_primary::<A, L, W>(
                     exchange,
                     writer,
@@ -1992,6 +2001,12 @@ where
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
                 <A as Application>::prefault(&mut exchange);
+
+                // Clear a ROTATE latched while this node was a replica —
+                // see the kernel-TCP promotion path.
+                if let Some(ref flag) = rotate_flag {
+                    flag.store(false, Ordering::Release);
+                }
 
                 // TODO: run_as_primary_dpdk — for now, fall back to
                 // kernel TCP primary after promotion.

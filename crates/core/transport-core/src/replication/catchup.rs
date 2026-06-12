@@ -183,16 +183,7 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
     // Treating it as missing caused an infinite NeedSnapshot loop: the
     // post-transfer replica sits exactly at the empty live's boundary.
     let next_needed = last_sequence.saturating_add(1);
-    let mut start_file_idx = None;
-    for (i, path) in files.iter().enumerate().rev() {
-        let info = melin_journal::segment::read_header_info(path)
-            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
-        if info.starting_sequence <= next_needed {
-            start_file_idx = Some(i);
-            break;
-        }
-    }
-    let Some(start_file_idx) = start_file_idx else {
+    let Some((start_file_idx, _)) = containing_segment(&files, next_needed)? else {
         // Even the oldest header starts past the replica's next needed
         // sequence — the history between is gone (archives purged).
         warn!(
@@ -214,7 +205,7 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
         "starting journal catch-up"
     );
 
-    for (file_idx, path) in files.iter().enumerate().skip(start_file_idx) {
+    for path in &files[start_file_idx..] {
         if shutdown.load(Ordering::Relaxed) {
             return Ok(CatchUpResult::Ok(end_sequence));
         }
@@ -223,15 +214,21 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
         // is a rotation the primary performed, and replicas must rotate
         // at the same sequence (primary-driven rotation). Emit it when
         // the stream position sits exactly on the segment's opening
-        // boundary and a predecessor segment exists (the lineage
-        // origin's opening is not a rotation). Covers both mid-walk
-        // transitions and a replica reconnecting exactly at a boundary
-        // whose Rotate frame it missed; a replica that already rotated
-        // there detects the duplicate announce and skips it.
-        if file_idx > 0 {
-            let info = melin_journal::segment::read_header_info(path)
-                .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
-            let boundary = info.starting_sequence.saturating_sub(1);
+        // boundary and that opening IS a boundary (`starting_sequence >
+        // 1`) — judged from the header, NOT from a predecessor file
+        // being present: the predecessor may have been pruned, and a
+        // replica that journaled through the boundary but missed its
+        // live `Rotate` frame must still learn it here. Covers mid-walk
+        // transitions and boundary-exact reconnects alike; a replica
+        // that already rotated there detects the duplicate announce and
+        // skips it. (A segment whose header starts past 1 without a
+        // rotation exists only on snapshot-seeded journals; replicas
+        // positioned at such an opening hold the identical segment
+        // identity and dedupe the announce the same way.)
+        let info = melin_journal::segment::read_header_info(path)
+            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
+        if info.starting_sequence > 1 {
+            let boundary = info.starting_sequence - 1;
             if end_sequence == boundary {
                 encode_rotate(boundary, &info.anchor_hash, &mut send_buf);
                 publisher(&send_buf)
@@ -290,6 +287,55 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
     Ok(CatchUpResult::Ok(end_sequence))
 }
 
+/// Newest on-disk segment whose header starts at or before `seq` — in a
+/// dense lineage, the segment containing `seq`. Returns the index into
+/// `files` plus the decoded header, or `None` when every surviving
+/// header starts past `seq` (history pruned). Shared by the catch-up
+/// start-file scan, the seed-segment lookup, and handshake validation.
+pub(crate) fn containing_segment(
+    files: &[std::path::PathBuf],
+    seq: u64,
+) -> io::Result<Option<(usize, melin_journal::FileHeaderInfo)>> {
+    for (idx, path) in files.iter().enumerate().rev() {
+        let info = melin_journal::segment::read_header_info(path)
+            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
+        if info.starting_sequence <= seq {
+            return Ok(Some((idx, info)));
+        }
+    }
+    Ok(None)
+}
+
+/// Ship `body` as `SnapshotChunk` frames (64 KiB each) terminated by a
+/// `SnapshotEnd` carrying the body's CRC32C — the framing shared by the
+/// snapshot payload and the segment seed. Returns `false` when shutdown
+/// interrupted the transfer.
+fn publish_chunked_body(
+    body: &[u8],
+    send_buf: &mut Vec<u8>,
+    publisher: CatchUpPublisher<'_>,
+    shutdown: &AtomicBool,
+) -> io::Result<bool> {
+    use super::protocol::{encode_snapshot_chunk, encode_snapshot_end};
+
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut offset = 0;
+    while offset < body.len() {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let end = (offset + CHUNK_SIZE).min(body.len());
+        encode_snapshot_chunk(&body[offset..end], send_buf);
+        publisher(send_buf)?;
+        send_buf.clear();
+        offset = end;
+    }
+    encode_snapshot_end(crc32c::crc32c(body), send_buf);
+    publisher(send_buf)?;
+    send_buf.clear();
+    Ok(true)
+}
+
 /// Transfer a snapshot to a replica, then catch up from journal.
 ///
 /// Reads the snapshot file, validates its header (magic, sequence,
@@ -306,8 +352,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
     use super::protocol::{
-        encode_need_snapshot, encode_segment_seed_begin, encode_snapshot_begin,
-        encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
+        encode_need_snapshot, encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start,
     };
 
     let snap_path = journal_path.with_extension("snapshot");
@@ -355,25 +400,10 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     publisher(&send_buf)?;
     send_buf.clear();
 
-    // Stream snapshot in 64 KiB chunks.
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let mut offset = 0;
-    while offset < snap_data.len() {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(CatchUpResult::Ok(snap_sequence));
-        }
-        let end = (offset + CHUNK_SIZE).min(snap_data.len());
-        encode_snapshot_chunk(&snap_data[offset..end], &mut send_buf);
-        publisher(&send_buf)?;
-        send_buf.clear();
-        offset = end;
+    // Stream the snapshot body (chunks + CRC trailer).
+    if !publish_chunked_body(&snap_data, &mut send_buf, &mut *publisher, shutdown)? {
+        return Ok(CatchUpResult::Ok(snap_sequence));
     }
-
-    // Send SnapshotEnd with CRC32C.
-    let transfer_crc = crc32c::crc32c(&snap_data);
-    encode_snapshot_end(transfer_crc, &mut send_buf);
-    publisher(&send_buf)?;
-    send_buf.clear();
 
     info!(snap_sequence, "snapshot transfer complete");
 
@@ -386,22 +416,14 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     // sits exactly on a rotation boundary; operators rotate before
     // seeding to keep it near that.
     let files = discover_journal_files(journal_path);
-    let mut seed = None;
-    for path in files.iter().rev() {
-        let info = melin_journal::segment::read_header_info(path)
-            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
-        if info.starting_sequence <= snap_sequence + 1 {
-            seed = Some((path, info));
-            break;
-        }
-    }
-    let Some((seed_path, seed_info)) = seed else {
+    let Some((seed_idx, seed_info)) = containing_segment(&files, snap_sequence + 1)? else {
         return Err(io::Error::other(format!(
             "no on-disk segment contains the snapshot boundary {} — archives pruned past \
              the serving snapshot; retain segments at least as far back as the snapshot",
             snap_sequence + 1
         )));
     };
+    let seed_path = &files[seed_idx];
     let seed_bytes = melin_journal::segment::read_segment_prefix(seed_path, snap_sequence)
         .map_err(|e| io::Error::other(format!("read seed prefix of {}: {e}", seed_path.display())))?
         .ok_or_else(|| {
@@ -415,20 +437,9 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     encode_segment_seed_begin(seed_bytes.len() as u64, &mut send_buf);
     publisher(&send_buf)?;
     send_buf.clear();
-    let mut offset = 0;
-    while offset < seed_bytes.len() {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(CatchUpResult::Ok(snap_sequence));
-        }
-        let end = (offset + CHUNK_SIZE).min(seed_bytes.len());
-        encode_snapshot_chunk(&seed_bytes[offset..end], &mut send_buf);
-        publisher(&send_buf)?;
-        send_buf.clear();
-        offset = end;
+    if !publish_chunked_body(&seed_bytes, &mut send_buf, &mut *publisher, shutdown)? {
+        return Ok(CatchUpResult::Ok(snap_sequence));
     }
-    encode_snapshot_end(crc32c::crc32c(&seed_bytes), &mut send_buf);
-    publisher(&send_buf)?;
-    send_buf.clear();
 
     info!(
         snap_sequence,
@@ -616,19 +627,22 @@ fn drain_into_contiguity(
             // the common case once the disk has drained the ring.)
             return Ok(());
         };
-        if meta.end_sequence <= sent.get() {
-            // Wholly covered by the bulk/residual pass — discard.
-            consumer.commit();
-            continue;
-        }
-        // Control frames (`Rotate`) ride the rings between `InputBatch`
-        // chunks. The journal back-fill re-emits rotations at segment
-        // transitions (the on-disk boundary exists by the time the
-        // frame is in the ring), so the held copy is redundant once the
-        // disk walk has covered its boundary: wait for coverage, then
-        // drop it — forwarding both copies would announce the same
-        // boundary twice.
+        // Control frames (`Rotate`, `ChainCheck`) ride the rings between
+        // `InputBatch` chunks. One strictly BEHIND the stream position is
+        // stale re-delivery (the disk walk already streamed past it) —
+        // drop it. One AT or AHEAD of the position is live and must be
+        // forwarded: a rotation that happened after the disk walk ran
+        // was never re-announced by it, and dropping the only copy here
+        // would leave the replica appending into the wrong segment
+        // forever (false divergence at the next chain check). When the
+        // back-fill DID also announce the boundary, the wire carries a
+        // duplicate — the receiver's exact-position rule and the journal
+        // stage's already-rotated check drop it deterministically.
         if peek_frame_tag(data)? != MSG_INPUT_BATCH {
+            if meta.end_sequence < sent.get() {
+                consumer.commit();
+                continue;
+            }
             while meta.end_sequence > sent.get() {
                 let end = refill(sent.get(), forward)?;
                 sent.advance(end);
@@ -644,6 +658,12 @@ fn drain_into_contiguity(
                     std::thread::yield_now();
                 }
             }
+            forward(data)?;
+            consumer.commit();
+            continue;
+        }
+        if meta.end_sequence <= sent.get() {
+            // Wholly covered by the bulk/residual pass — discard.
             consumer.commit();
             continue;
         }
@@ -801,11 +821,16 @@ mod tests {
     /// A replica sitting exactly at the boundary of an EMPTY live
     /// segment — the position every replica holds right after a
     /// snapshot transfer from a snapshot-only-restarted primary — is
-    /// contiguous with the on-disk history: catch-up has nothing to
+    /// contiguous with the on-disk history: catch-up has no ENTRIES to
     /// send, which is success. (Regression: the start-file scan read
     /// first *entries* instead of headers, so the empty live looked
     /// like missing history and the sender looped snapshot transfer →
     /// NeedSnapshot forever, never letting the replica register.)
+    ///
+    /// It does receive the opening-boundary announce: a replica whose
+    /// own live segment already starts at 34 dedupes it; one whose
+    /// segment still spans 33 adopts it and re-aligns with the
+    /// primary's segmentation from 34 onward.
     #[test]
     fn boundary_replica_of_empty_live_catches_up_with_nothing_to_send() {
         let dir = tempfile::tempdir().unwrap();
@@ -814,19 +839,16 @@ mod tests {
 
         assert!(can_catch_up_from_journal(&live, 33).unwrap());
 
-        let shutdown = std::sync::atomic::AtomicBool::new(false);
-        let mut published = 0usize;
-        let mut publish = |_: &[u8]| -> io::Result<()> {
-            published += 1;
-            Ok(())
-        };
-        let res =
-            catch_up_from_journal_with::<TestEvent>(&live, 33, &mut publish, &shutdown).unwrap();
+        let (res, frames) = collect_catchup_frames(&live, 33);
         assert!(
             matches!(res, CatchUpResult::Ok(33)),
             "boundary catch-up must succeed with nothing to send, got {res:?}"
         );
-        assert_eq!(published, 0, "no batches expected at the boundary");
+        assert_eq!(
+            frames,
+            vec![Frame::Rotate(33, [7u8; 32])],
+            "opening-boundary announce only — no entry batches"
+        );
     }
 
     /// Decoded view of a catch-up publisher's output: one entry per
@@ -1058,6 +1080,32 @@ mod tests {
         assert_eq!(replica_writer.chain_hash().unwrap(), chain_at_4);
         assert_eq!(replica_writer.segment_starting_sequence(), 3);
         assert_eq!(replica_writer.next_sequence(), 5);
+    }
+
+    /// The boundary re-announce must be judged from the segment header
+    /// (`starting_sequence > 1`), not from a predecessor file being
+    /// present on disk: after the primary prunes archives, a replica
+    /// sitting exactly on the pruned boundary still needs the Rotate.
+    /// (Regression: the guard was `file_idx > 0`, so the announce was
+    /// silently skipped when the walk started at the lineage's oldest
+    /// surviving file.)
+    #[test]
+    fn catchup_reannounces_boundary_after_predecessor_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+        // Prune everything before the live segment (which starts at 3).
+        std::fs::remove_file(dir.path().join("j.journal.000001")).unwrap();
+        std::fs::remove_file(dir.path().join("j.journal.000002")).unwrap();
+        let anchor_live = melin_journal::segment::read_header_info(&live)
+            .unwrap()
+            .anchor_hash;
+
+        let (res, frames) = collect_catchup_frames(&live, 2);
+        assert!(matches!(res, CatchUpResult::Ok(3)));
+        assert_eq!(
+            frames,
+            vec![Frame::Rotate(2, anchor_live), Frame::Batch(vec![3])]
+        );
     }
 
     /// A fresh replica must be routed to snapshot transfer whenever the
@@ -1395,18 +1443,31 @@ mod drain_into_contiguity_tests {
     /// the rotation at the segment transition, so forwarding the held
     /// copy would announce the same boundary twice.
     #[test]
-    fn uncovered_rotate_chunk_waits_for_backfill_then_drops() {
+    fn uncovered_rotate_chunk_waits_for_backfill_then_forwards() {
         let (mut producer, mut consumer) = ring();
         producer.publish(&rotate_chunk(102), 102); // ahead of sent=100
 
         let mut sent = super::super::sent::SentHighWater::seed(100, 100);
-        let forwarded = RefCell::new(Vec::<u64>::new());
+        #[derive(Debug, PartialEq)]
+        enum Fwd {
+            Batch(u64),
+            Control(u64),
+        }
+        let forwarded = RefCell::new(Vec::<Fwd>::new());
         let refill_calls = Cell::new(0usize);
 
         let mut forward = |data: &[u8]| -> io::Result<()> {
-            forwarded
-                .borrow_mut()
-                .push(peek_first_sequence(data).unwrap());
+            let fwd = if peek_frame_tag(data).unwrap() == MSG_INPUT_BATCH {
+                Fwd::Batch(peek_first_sequence(data).unwrap())
+            } else {
+                match super::super::protocol::decode_primary_message(&data[4..]).unwrap() {
+                    super::super::protocol::PrimaryMessage::Rotate { boundary_seq, .. } => {
+                        Fwd::Control(boundary_seq)
+                    }
+                    other => panic!("unexpected control frame: {other:?}"),
+                }
+            };
+            forwarded.borrow_mut().push(fwd);
             Ok(())
         };
         let mut refill =
@@ -1426,13 +1487,62 @@ mod drain_into_contiguity_tests {
         )
         .expect("rotate chunk resolves via back-fill");
 
+        // Entries back-filled first, then the rotate FORWARDED — the
+        // walk that produced the back-fill predates the rotation, so
+        // this ring copy may be the replica's only chance to learn the
+        // boundary. (When the back-fill did also announce it, the
+        // receiver's exact-position rule drops the duplicate.)
         assert_eq!(
             *forwarded.borrow(),
-            vec![101],
-            "entries back-filled, rotate dropped"
+            vec![Fwd::Batch(101), Fwd::Control(102)],
         );
         assert_eq!(sent.get(), 102);
         assert_eq!(refill_calls.get(), 1);
+    }
+
+    /// A rotate chunk sitting exactly at the handoff position (boundary
+    /// == sent) is live, not covered: the rotation happened at the
+    /// catch-up end after the disk walk ran, so nothing else will ever
+    /// re-announce it. It must be forwarded — without back-fill.
+    /// (Regression: the covered-chunk discard used `<=` and silently
+    /// dropped it, desynchronizing the replica's segmentation.)
+    #[test]
+    fn boundary_equal_rotate_chunk_is_forwarded() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&rotate_chunk(100), 100); // exactly at sent=100
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded_controls = Cell::new(0usize);
+
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            assert_ne!(
+                peek_frame_tag(data).unwrap(),
+                MSG_INPUT_BATCH,
+                "only the rotate chunk should be forwarded"
+            );
+            forwarded_controls.set(forwarded_controls.get() + 1);
+            Ok(())
+        };
+        let mut refill = |_: u64, _: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+            panic!("boundary-equal rotate must not back-fill")
+        };
+        let mut expired = || panic!("boundary-equal rotate must not consult the deadline");
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("boundary-equal rotate forwards cleanly");
+
+        assert_eq!(forwarded_controls.get(), 1, "rotate chunk forwarded");
+        assert_eq!(
+            sent.get(),
+            100,
+            "control frames do not advance the high-water"
+        );
     }
 
     /// Covered chunks are skipped until the ring drains to empty, then the

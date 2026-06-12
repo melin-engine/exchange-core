@@ -737,6 +737,11 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             }
 
             // Read entries WITHOUT advancing the cursor.
+            // Ring position before this read — the mark barrier computes
+            // its mid-batch commit target as `read_start + encoded slots`
+            // (publishing `next_read` there would over-commit; see
+            // `sync_point`).
+            let read_start = self.consumer.next_read();
             let remaining = MAX_JOURNAL_BATCH.saturating_sub(pending);
             let count = if remaining > 0 {
                 self.consumer.read_batch(&mut batch, remaining)
@@ -833,11 +838,13 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     // resolve against the encoded chain — no flush
                     // needed. A rotation requires the flush + commit
                     // first so the writer is quiesced exactly at the
-                    // boundary.
+                    // boundary. The commit target is the boundary slot's
+                    // ring position — NOT the whole read batch, whose
+                    // tail is not encoded yet.
                     self.apply_stream_marks(false)?;
                     if matches!(self.pending_mark, Some(StreamMark::Rotate(_))) {
                         if pending > 0 {
-                            self.sync_point(pending)?;
+                            self.sync_point(read_start + stop as u64)?;
                             pending = 0;
                             first_write_ts = None;
                         }
@@ -857,7 +864,9 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
 
                 if should_sync {
-                    self.sync_point(pending)?;
+                    // Everything read so far is encoded — committing to
+                    // `next_read` is exact here.
+                    self.sync_point(self.consumer.next_read())?;
                     self.maybe_publish_chain_check();
                     let _ = self.maybe_rotate();
                     // Replica mode: act on a mark that landed exactly at
@@ -1092,16 +1101,23 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// `record_slot_for_replication`), persist (`no-persist`: drop the
     /// buffer — "skip the write syscall," not "skip everything that
     /// follows"; the replication publish must still run or the response
-    /// stage's replication-cursor gate deadlocks), commit the consumed
-    /// slots, and publish fsync state.
+    /// stage's replication-cursor gate deadlocks), advance the journal
+    /// cursor to `progress`, and publish fsync state.
+    ///
+    /// `progress` is the ring position of the last slot the flush
+    /// covers — an explicit value, NOT `Consumer::commit`, because
+    /// `commit` publishes `next_read`, which after a `read_batch` spans
+    /// the WHOLE read batch. At the mid-batch mark barrier only a
+    /// prefix of the batch has been encoded; publishing `next_read`
+    /// there would let the replica ack entries past the boundary that
+    /// are not yet journaled (the ack path gates on this cursor —
+    /// persist-before-ack). The steady-state caller passes
+    /// `consumer.next_read()`, which is then equivalent to `commit`.
     ///
     /// A journal I/O failure is fatal: surface the error so the
     /// pipeline shuts down rather than spinning forever on a broken
     /// disk (e.g., ENOSPC).
-    ///
-    /// Shared by `run_sync`'s steady-state sync and the mid-batch
-    /// rotation barrier, which must quiesce the writer identically.
-    fn sync_point(&mut self, pending: usize) -> Result<(), JournalError> {
+    fn sync_point(&mut self, progress: u64) -> Result<(), JournalError> {
         if self.repl.any_producer() {
             let end_seq = self.writer.next_sequence() - 1;
             Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
@@ -1115,7 +1131,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         #[cfg(feature = "no-persist")]
         self.writer.discard_batch_buf();
 
-        self.consumer.commit(pending);
+        self.consumer.set_progress(progress);
         self.publish_fsync_state();
         Ok(())
     }
@@ -1138,6 +1154,26 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// slot, since the writer's fd has changed.
     #[inline]
     fn maybe_rotate(&mut self) -> bool {
+        let Some(manual) = self.local_rotation_armed() else {
+            return false;
+        };
+        let pre_size = self.writer.valid_end();
+        // Generic path: no fast (pre-staged) rotation. The
+        // `SectorWriter` specialization overrides this via
+        // `maybe_rotate_with_prepared` to consume a sidecar segment
+        // pre-allocated by the preparer thread; the buffered writer
+        // has no fast path (and no preparer).
+        let rotate_result = self.writer.rotate_segment();
+        self.finish_local_rotation(rotate_result, manual, false, pre_size)
+    }
+
+    /// Trigger/guard half of the local-rotation twins ([`maybe_rotate`]
+    /// and the sector path's `maybe_rotate_with_prepared`): consume the
+    /// manual flag (CAS so duplicate signals collapse into one
+    /// rotation), evaluate the size trigger and the failure backoff,
+    /// skip empty-live rotations, and pre-publish pending replication
+    /// bytes. Returns `Some(manual)` when the rotation should proceed.
+    fn local_rotation_armed(&mut self) -> Option<bool> {
         let manual = self
             .rotate_requested
             .as_ref()
@@ -1149,7 +1185,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         let size_triggered =
             self.max_journal_bytes > 0 && self.writer.valid_end() >= self.max_journal_bytes;
         if !(manual || size_triggered) {
-            return false;
+            return None;
         }
         // Suppress size-driven retries during the backoff window so a
         // permanent failure (ENOSPC, RO-FS) doesn't re-arm every batch
@@ -1160,7 +1196,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             && let Some(until) = self.rotation_backoff_until
             && Instant::now() < until
         {
-            return false;
+            return None;
         }
         // Never rotate an empty live segment: it would archive an
         // entry-less file the replicas have no reason to mirror, and a
@@ -1174,10 +1210,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     "manual rotation skipped: live segment is empty (already at a boundary)"
                 );
             }
-            return false;
+            return None;
         }
-        let pre_size = self.writer.valid_end();
-
         // Entries encoded for replication but not yet published belong
         // to the outgoing segment (`rotate_segment` flushes them to it),
         // so they must precede the Rotate frame on the rings.
@@ -1185,15 +1219,24 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
             let end_seq = self.writer.next_sequence() - 1;
             Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
         }
+        Some(manual)
+    }
 
-        // Generic path: no fast (pre-staged) rotation. The
-        // `SectorWriter` specialization overrides this via
-        // `maybe_rotate_with_prepared` to consume a sidecar segment
-        // pre-allocated by the preparer thread; the buffered writer
-        // has no fast path (and no preparer).
-        let used_fast_path = false;
-        let rotate_result = self.writer.rotate_segment();
-
+    /// Bookkeeping half of the local-rotation twins. On success:
+    /// counters, log, backoff reset, preparer re-arm, fsync-state
+    /// republish (rotation consumes no sequence and the chain value is
+    /// unchanged — the new segment's anchor *is* the old tail — but
+    /// observers need a state consistent with the new on-disk layout),
+    /// and the `Rotate` announce so replicas rotate at exactly the same
+    /// sequence. On failure: error log + retry backoff + preparer
+    /// re-arm. Returns whether a rotation happened.
+    fn finish_local_rotation(
+        &mut self,
+        rotate_result: Result<std::path::PathBuf, JournalError>,
+        manual: bool,
+        used_fast_path: bool,
+        pre_size: u64,
+    ) -> bool {
         match rotate_result {
             Ok(archived) => {
                 if used_fast_path {
@@ -1217,13 +1260,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 if let Some(p) = self.preparer.as_ref() {
                     p.arm();
                 }
-                // Rotation consumes no sequence and the chain value is
-                // unchanged (the new segment's anchor *is* the old
-                // tail), but republish so observers see a state that is
-                // consistent with the new on-disk layout.
                 self.publish_fsync_state();
-                // Announce the boundary to replicas so they rotate at
-                // exactly the same sequence (primary-driven rotation).
                 Self::publish_rotate_to_rings(&mut self.repl, &self.writer);
                 true
             }
@@ -1403,6 +1440,16 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     }
 
     /// Drain any remaining entries from the ring buffer on shutdown.
+    ///
+    /// Replica-mode caveat (accepted race): pending stream marks are
+    /// NOT applied here, so a shutdown racing a primary rotation can
+    /// journal post-boundary entries into the pre-boundary segment.
+    /// That misframes the local journal but loses nothing — the entries
+    /// are intact and the reconnect handshake detects the framing
+    /// mismatch (segment-scoped chains differ), archiving the journal
+    /// and re-seeding from the primary. Honoring marks here would need
+    /// the full barrier machinery on a path that must never fail;
+    /// self-healing via resync is the safer trade.
     fn drain_remaining(&mut self, batch: &mut [InputSlot<E>]) {
         loop {
             let count = self.consumer.read_batch(batch, MAX_JOURNAL_BATCH);
@@ -1537,49 +1584,15 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
 
     /// Rotate using the fast (pre-staged) path if a prepared segment is
     /// available; falls back to the synchronous rotate otherwise. Same
-    /// trigger logic as the generic [`JournalStage::maybe_rotate`] but
-    /// adopts the preparer's sidecar when it has one ready.
+    /// trigger logic as the generic [`JournalStage::maybe_rotate`]
+    /// (shared via `local_rotation_armed` / `finish_local_rotation`)
+    /// but adopts the preparer's sidecar when it has one ready.
     #[inline]
     fn maybe_rotate_with_prepared(&mut self) -> bool {
-        let manual = self
-            .rotate_requested
-            .as_ref()
-            .map(|f| {
-                f.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            })
-            .unwrap_or(false);
-        let size_triggered =
-            self.max_journal_bytes > 0 && self.writer.valid_end() >= self.max_journal_bytes;
-        if !(manual || size_triggered) {
+        let Some(manual) = self.local_rotation_armed() else {
             return false;
-        }
-        if !manual
-            && let Some(until) = self.rotation_backoff_until
-            && Instant::now() < until
-        {
-            return false;
-        }
-        // Never rotate an empty live segment — see `maybe_rotate`.
-        if self.writer.next_sequence() == self.writer.segment_starting_sequence() {
-            if manual {
-                tracing::info!(
-                    next_sequence = self.writer.next_sequence(),
-                    "manual rotation skipped: live segment is empty (already at a boundary)"
-                );
-            }
-            return false;
-        }
+        };
         let pre_size = self.writer.valid_end();
-
-        // Unpublished replication bytes belong to the outgoing segment —
-        // they must precede the Rotate frame on the rings. See
-        // `maybe_rotate`.
-        if self.repl.any_producer() {
-            let end_seq = self.writer.next_sequence() - 1;
-            Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
-        }
-
         // Fast path: adopt a sidecar segment pre-allocated by the
         // background preparer. Falls back to the synchronous
         // `rotate_segment` when no prepared segment is available.
@@ -1589,48 +1602,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             Some(p) => self.writer.rotate_segment_with_prepared(p),
             None => self.writer.rotate_segment(),
         };
-
-        match rotate_result {
-            Ok(archived) => {
-                if used_fast_path {
-                    self.rotations_fast_path += 1;
-                } else {
-                    self.rotations_sync_fallback += 1;
-                }
-                tracing::info!(
-                    archive = %archived.display(),
-                    pre_rotate_bytes = pre_size,
-                    next_sequence = self.writer.next_sequence(),
-                    trigger = if manual { "manual" } else { "size" },
-                    fast_path = used_fast_path,
-                    rotations_fast_path = self.rotations_fast_path,
-                    rotations_sync_fallback = self.rotations_sync_fallback,
-                    "journal segment rotated"
-                );
-                self.rotation_backoff_until = None;
-                if let Some(p) = self.preparer.as_ref() {
-                    p.arm();
-                }
-                self.publish_fsync_state();
-                // Announce the boundary to replicas — see `maybe_rotate`.
-                Self::publish_rotate_to_rings(&mut self.repl, &self.writer);
-                true
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    trigger = if manual { "manual" } else { "size" },
-                    fast_path = used_fast_path,
-                    backoff_secs = ROTATION_FAILURE_BACKOFF.as_secs(),
-                    "journal segment rotation failed; continuing with current segment"
-                );
-                self.rotation_backoff_until = Some(Instant::now() + ROTATION_FAILURE_BACKOFF);
-                if let Some(p) = self.preparer.as_ref() {
-                    p.arm();
-                }
-                false
-            }
-        }
+        self.finish_local_rotation(rotate_result, manual, used_fast_path, pre_size)
     }
 
     /// Apply pending stream marks using the preparer fast path for an
@@ -1869,11 +1841,15 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             if rotated_top {
                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
             }
-            // Replica mode: adopt a boundary reached at the previous
-            // submit (no later slot has arrived to trigger the mid-batch
-            // barrier). Quiesced only when nothing is buffered or in
-            // flight.
-            self.apply_stream_marks_uring(&ring, inflight.is_none() && pending == 0)?;
+            // Replica mode: act on a mark reached at the previous submit
+            // (no later slot has arrived to trigger the mid-batch
+            // barrier). Gated on a mark already being held locally —
+            // this runs every loop iteration, and an ungated call would
+            // take the queue mutex per busy-spin. Discovery happens at
+            // the batch-start refresh and the amortized idle hook.
+            if self.pending_mark.is_some() {
+                self.apply_stream_marks_uring(&ring, inflight.is_none() && pending == 0)?;
+            }
 
             // --- Read events from disruptor ---
             // Ring position before this read — the barrier path computes
@@ -2012,7 +1988,11 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
             if rotated_eager {
                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
             }
-            self.apply_stream_marks_uring(&ring, inflight.is_none() && pending == 0)?;
+            // Gated like the top-of-loop hook: per-iteration site, mutex
+            // only when a mark is already held.
+            if self.pending_mark.is_some() {
+                self.apply_stream_marks_uring(&ring, inflight.is_none() && pending == 0)?;
+            }
 
             // --- Decide whether to submit ---
             if pending > 0 {
@@ -3262,7 +3242,13 @@ where
         busy_spin,
     );
 
-    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, enable_shadow);
+    // Unconditional on replicas (not gated on shadow snapshots): the
+    // reconnect handshake reads (journal_seq, chain_hash) as one
+    // consistent FsyncState snapshot, and the primary validates the
+    // pair against its own chain — a replica without this lock would
+    // present a stale hash next to a fresh sequence and be falsely
+    // judged divergent.
+    let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, true);
 
     // Bundle the journal-progress cursors (mirrors the primary builder).
     // The durable cursor is always published on replicas: the orchestrator

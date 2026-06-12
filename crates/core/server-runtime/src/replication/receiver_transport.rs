@@ -106,6 +106,43 @@ pub(super) fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
 // Streaming frame processing
 // ---------------------------------------------------------------------------
 
+/// Exact-position rule shared by every stream-mark frame (`Rotate`,
+/// `ChainCheck`): queue the mark only when the stream position sits
+/// exactly on it — the queue push happens before any slot past the
+/// mark is committed to the input ring, which is the ordering the
+/// journal stage's split logic relies on. A mark strictly behind the
+/// position is redundant re-delivery (handoff overlap) and is dropped
+/// like a duplicate slot; one ahead implies missing entries — the same
+/// fatal contract as a slot-sequence gap.
+fn queue_stream_mark(
+    stream_marks: &StreamMarkQueue,
+    pending_accum: u64,
+    kind: &'static str,
+    mark: StreamMark,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let position = mark.sequence();
+    if position == pending_accum {
+        stream_marks
+            .lock()
+            .expect("stream-mark queue poisoned")
+            .push_back(mark);
+        Ok(())
+    } else if position < pending_accum {
+        debug!(
+            position,
+            accum = pending_accum,
+            kind,
+            "stale stream mark skipped"
+        );
+        Ok(())
+    } else {
+        Err(
+            format!("{kind} at {position} ahead of stream position {pending_accum} — sequence gap")
+                .into(),
+        )
+    }
+}
+
 /// Outcome of [`process_streaming_frames`] for one recv-cycle.
 pub(super) struct StreamingFrameOutcome {
     /// Bytes consumed from the recv buffer.
@@ -155,6 +192,7 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     accum_end_sequence: u64,
     slot_buf: &mut Vec<InputSlot<E>>,
     stream_marks: &StreamMarkQueue,
+    journal_failed: &AtomicBool,
 ) -> StreamingFrameOutcome {
     let mut consumed = 0;
     let mut last_target = 0u64;
@@ -165,6 +203,15 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
     let mut pending_accum = accum_end_sequence;
 
     loop {
+        // A dead journal stage freezes the ring's consumer cursor; with
+        // enough frames in one recv cycle the publishes below would
+        // fill the ring and spin forever inside the batch push. Bail
+        // per-frame so at most one frame's slots are published after
+        // the failure latch flips.
+        if journal_failed.load(Ordering::Relaxed) {
+            frame_err = Some("replica journal stage failed".into());
+            break;
+        }
         let remaining = &recv_buf[consumed..];
         match try_extract_frame(remaining, MAX_DATA_FRAME) {
             FrameResult::Complete(payload_start, frame_end) => {
@@ -210,38 +257,16 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                             boundary_seq,
                             tail_hash,
                         }) => {
-                            // Primary-announced rotation. Queue it for the
-                            // journal stage only when the stream position
-                            // sits exactly on the boundary — the queue push
-                            // happens before any slot past the boundary is
-                            // committed to the input ring, which is the
-                            // ordering the journal stage's split logic
-                            // relies on.
-                            if boundary_seq == pending_accum {
-                                stream_marks
-                                    .lock()
-                                    .expect("stream-mark queue poisoned")
-                                    .push_back(StreamMark::Rotate(AdoptedRotation {
-                                        boundary_seq,
-                                        tail_hash,
-                                    }));
-                            } else if boundary_seq < pending_accum {
-                                // Redundant re-delivery of a covered
-                                // boundary (handoff overlap) — drop it like
-                                // a duplicate slot.
-                                debug!(
+                            if let Err(e) = queue_stream_mark(
+                                stream_marks,
+                                pending_accum,
+                                "Rotate",
+                                StreamMark::Rotate(AdoptedRotation {
                                     boundary_seq,
-                                    accum = pending_accum,
-                                    "stale Rotate announce skipped"
-                                );
-                            } else {
-                                frame_err = Some(
-                                    format!(
-                                        "Rotate boundary {boundary_seq} ahead of stream \
-                                         position {pending_accum} — sequence gap"
-                                    )
-                                    .into(),
-                                );
+                                    tail_hash,
+                                }),
+                            ) {
+                                frame_err = Some(e);
                                 break;
                             }
                         }
@@ -249,27 +274,16 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                             sequence,
                             chain_hash,
                         }) => {
-                            // Same position rules as Rotate: queue only at
-                            // the exact stream position, drop covered
-                            // re-deliveries, treat ahead-of-stream as a gap.
-                            if sequence == pending_accum {
-                                stream_marks
-                                    .lock()
-                                    .expect("stream-mark queue poisoned")
-                                    .push_back(StreamMark::ChainCheck {
-                                        sequence,
-                                        chain_hash,
-                                    });
-                            } else if sequence < pending_accum {
-                                debug!(sequence, accum = pending_accum, "stale ChainCheck skipped");
-                            } else {
-                                frame_err = Some(
-                                    format!(
-                                        "ChainCheck at {sequence} ahead of stream \
-                                         position {pending_accum} — sequence gap"
-                                    )
-                                    .into(),
-                                );
+                            if let Err(e) = queue_stream_mark(
+                                stream_marks,
+                                pending_accum,
+                                "ChainCheck",
+                                StreamMark::ChainCheck {
+                                    sequence,
+                                    chain_hash,
+                                },
+                            ) {
+                                frame_err = Some(e);
                                 break;
                             }
                         }
@@ -441,6 +455,12 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     mut recv_buf: Vec<u8>,
     utilization: Option<&melin_transport_core::pipeline::StageUtilization>,
     stream_marks: &StreamMarkQueue,
+    // Latched when the journal stage exits with an error (e.g. chain
+    // divergence). Checked at the loop top and inside every blocking
+    // wait on the journal cursor — a dead journal stage means the
+    // cursor never advances, so waiting on it would wedge this thread
+    // forever instead of tearing down for the reconnect/resync path.
+    journal_failed: &AtomicBool,
 ) -> StreamingResult {
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
@@ -472,8 +492,20 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 accum_end_sequence,
                 busy_spin,
                 &mut recv_buf,
+                journal_failed,
             );
             break SessionExit::Shutdown;
+        }
+        if journal_failed.load(Ordering::Acquire) {
+            // The journal stage died (chain divergence, journal I/O
+            // failure). Its cursor is frozen, so no further slot can
+            // ever be journaled or acked — stop publishing and exit
+            // fatally; teardown + restart routes the node through the
+            // reconnect handshake, where divergence is repaired by
+            // snapshot resync.
+            break SessionExit::Fatal(
+                "replica journal stage failed — tearing down for reconnect/resync".into(),
+            );
         }
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered — stopping replication, transitioning to primary");
@@ -502,6 +534,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 accum_end_sequence,
                 busy_spin,
                 &mut recv_buf,
+                journal_failed,
             );
             break SessionExit::Promote;
         }
@@ -550,7 +583,15 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 }
             }
 
-            let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
+            let Some(seq) =
+                pending_acks.pop_oldest_blocking(journal_cursor, busy_spin, journal_failed)
+            else {
+                // Journal stage died mid-wait — the cursor will never
+                // reach the pending target.
+                break SessionExit::Fatal(
+                    "replica journal stage failed — tearing down for reconnect/resync".into(),
+                );
+            };
             let in_mem_now = accum_end_sequence;
             debug_assert!(
                 in_mem_now <= last_committed_primary_seq,
@@ -587,6 +628,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 accum_end_sequence,
                 busy_spin,
                 &mut recv_buf,
+                journal_failed,
             );
             break SessionExit::Disconnected;
         }
@@ -598,6 +640,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
             accum_end_sequence,
             &mut slot_buf,
             stream_marks,
+            journal_failed,
         );
         accum_end_sequence = outcome.accum_end_sequence;
         last_committed_primary_seq = accum_end_sequence;
@@ -640,7 +683,8 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
 
 /// Best-effort: wait for all pending batches to become durable, then
 /// send a final cumulative ack. Used on shutdown, promote, and
-/// disconnect exits.
+/// disconnect exits. `journal_failed` aborts the durability wait — a
+/// dead journal stage would otherwise hang the exit path forever.
 fn drain_pending_acks<T: ReceiverTransport>(
     transport: &mut T,
     pending_acks: &mut PendingAckQueue,
@@ -648,8 +692,9 @@ fn drain_pending_acks<T: ReceiverTransport>(
     accum_end_sequence: u64,
     busy_spin: bool,
     recv_buf: &mut Vec<u8>,
+    journal_failed: &AtomicBool,
 ) {
-    if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
+    if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin, journal_failed) {
         let ack = Ack {
             acked_sequence: seq,
             in_memory_sequence: accum_end_sequence,
@@ -846,6 +891,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -877,6 +923,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(matches!(result.exit, SessionExit::Promote));
@@ -906,6 +953,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -937,6 +985,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -980,6 +1029,7 @@ mod tests {
             initial,
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(result.received_data);
@@ -1021,6 +1071,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -1059,6 +1110,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(matches!(result.exit, SessionExit::Fatal(_)));
@@ -1105,6 +1157,7 @@ mod tests {
                 Vec::new(),
                 None,
                 &no_marks(),
+                &AtomicBool::new(false),
             );
 
             assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -1144,6 +1197,7 @@ mod tests {
             Vec::new(),
             Some(&utilization),
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         let busy = utilization.busy.load(Ordering::Relaxed);
@@ -1172,6 +1226,7 @@ mod tests {
             5,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_none(), "no fatal exit");
@@ -1206,6 +1261,7 @@ mod tests {
             5,
             &mut slot_buf,
             &rotations,
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_none(), "rotate at boundary is valid");
@@ -1235,8 +1291,14 @@ mod tests {
         append_input_batch_frame(&mut buf, &[slot(6, 0xE0)]);
         melin_transport_core::replication::protocol::encode_chain_check(6, &[0x77; 32], &mut buf);
 
-        let outcome =
-            process_streaming_frames::<TestEvent>(&buf, &mut producer, 5, &mut slot_buf, &marks);
+        let outcome = process_streaming_frames::<TestEvent>(
+            &buf,
+            &mut producer,
+            5,
+            &mut slot_buf,
+            &marks,
+            &AtomicBool::new(false),
+        );
 
         assert!(outcome.frame_err.is_none());
         assert_eq!(outcome.accum_end_sequence, 6);
@@ -1275,6 +1337,7 @@ mod tests {
             5,
             &mut slot_buf,
             &rotations,
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_none(), "stale rotate is not fatal");
@@ -1301,6 +1364,7 @@ mod tests {
             5,
             &mut slot_buf,
             &rotations,
+            &AtomicBool::new(false),
         );
 
         assert!(
@@ -1329,6 +1393,7 @@ mod tests {
             6,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_some(), "oversize => fatal");
@@ -1354,6 +1419,7 @@ mod tests {
             2,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_some(), "unknown primary msg => fatal");
@@ -1378,6 +1444,7 @@ mod tests {
             0,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_none());
@@ -1401,6 +1468,7 @@ mod tests {
             100,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_none());
@@ -1422,6 +1490,7 @@ mod tests {
             77,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(outcome.frame_err.is_none());
@@ -1473,6 +1542,7 @@ mod tests {
             9,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(
@@ -1507,6 +1577,7 @@ mod tests {
             9,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(
@@ -1541,6 +1612,7 @@ mod tests {
             9,
             &mut slot_buf,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(
@@ -1619,6 +1691,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(
@@ -1682,6 +1755,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(
@@ -1734,6 +1808,7 @@ mod tests {
             Vec::new(),
             None,
             &no_marks(),
+            &AtomicBool::new(false),
         );
 
         assert!(

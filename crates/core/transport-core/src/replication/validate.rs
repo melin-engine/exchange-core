@@ -68,22 +68,35 @@ enum ChainAtSequence {
 /// absorbing raw entry bytes up to `seq`.
 #[cfg(feature = "hash-chain")]
 fn chain_at_sequence(journal_path: &std::path::Path, seq: u64) -> io::Result<ChainAtSequence> {
+    use super::catchup::containing_segment;
+
     let files = discover_journal_files(journal_path);
-    let mut containing = None;
-    for path in files.iter().rev() {
-        let info = melin_journal::segment::read_header_info(path)
-            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
-        if info.starting_sequence == seq.saturating_add(1) {
-            return Ok(ChainAtSequence::Value(info.anchor_hash));
+    // Fast path: a segment opening at exactly `seq + 1` carries the
+    // chain value at `seq` as its header anchor — no scan. It is the
+    // successor of the containing segment, or the oldest survivor when
+    // the containing segment itself was pruned (a replica sitting
+    // exactly on the surviving lineage's opening boundary).
+    let opener = |idx: usize| -> io::Result<Option<[u8; 32]>> {
+        match files.get(idx) {
+            Some(path) => {
+                let info = melin_journal::segment::read_header_info(path).map_err(|e| {
+                    io::Error::other(format!("read header of {}: {e}", path.display()))
+                })?;
+                Ok((info.starting_sequence == seq + 1).then_some(info.anchor_hash))
+            }
+            None => Ok(None),
         }
-        if info.starting_sequence <= seq {
-            containing = Some(path);
-            break;
-        }
-    }
-    let Some(path) = containing else {
-        return Ok(ChainAtSequence::PredatesHistory);
     };
+    let Some((idx, _)) = containing_segment(&files, seq)? else {
+        return match opener(0)? {
+            Some(anchor) => Ok(ChainAtSequence::Value(anchor)),
+            None => Ok(ChainAtSequence::PredatesHistory),
+        };
+    };
+    if let Some(anchor) = opener(idx + 1)? {
+        return Ok(ChainAtSequence::Value(anchor));
+    }
+    let path = &files[idx];
     match melin_journal::segment::chain_value_at(path, seq)
         .map_err(|e| io::Error::other(format!("chain value at {seq} in {}: {e}", path.display())))?
     {
@@ -94,8 +107,43 @@ fn chain_at_sequence(journal_path: &std::path::Path, seq: u64) -> io::Result<Cha
     }
 }
 
+/// [`validate_replica_handshake`] with bounded revalidation before a
+/// `Divergent` verdict is final. Two transient effects can mimic
+/// divergence against a live journal:
+///
+/// - the journal stage publishes a batch to the replication rings
+///   BEFORE its own write is durable, so a fast-reconnecting replica
+///   can truthfully claim a sequence this node's files don't contain
+///   *yet* (a spurious `AheadOfTip`);
+/// - the raw scan races the writer's in-place partial-tail-sector
+///   rewrites, so a torn read near the tip can hash garbage (a
+///   spurious `ChainMismatch`).
+///
+/// Both clear within a flush; real divergence is permanent. The retry
+/// budget (~400 ms) is noise against the snapshot resync a false
+/// verdict would trigger.
+pub fn validate_replica_handshake_settled(
+    journal_path: &std::path::Path,
+    handshake: &Handshake,
+) -> io::Result<HandshakeValidation> {
+    const ATTEMPTS: u32 = 8;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut verdict = validate_replica_handshake(journal_path, handshake)?;
+    for _ in 1..ATTEMPTS {
+        if verdict == HandshakeValidation::Ok {
+            break;
+        }
+        std::thread::sleep(RETRY_DELAY);
+        verdict = validate_replica_handshake(journal_path, handshake)?;
+    }
+    Ok(verdict)
+}
+
 /// Validate a replica's handshake `(last_sequence, chain_hash)` against
-/// this node's journal. Shared by the kernel-TCP and DPDK senders.
+/// this node's journal. Shared by the kernel-TCP and DPDK senders —
+/// production callers use [`validate_replica_handshake_settled`], which
+/// retries transient false-divergence verdicts.
 ///
 /// A fresh replica (`last_sequence == 0`) has nothing to compare — its
 /// reported hash is zeros, not a chain value. With `hash-chain`

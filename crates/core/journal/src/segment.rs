@@ -270,6 +270,53 @@ pub fn read_segment_prefix(path: &Path, through_seq: u64) -> Result<Option<Vec<u
     }
 }
 
+/// Structural check of a received segment seed (see
+/// [`read_segment_prefix`]): the entries must end at exactly
+/// `through_seq`, occupy exactly `expected_len` bytes (header
+/// included), and nothing may follow. With `hash-chain` enabled the
+/// chain cross-check against the snapshot subsumes this; without it,
+/// this is the only guard against a buggy or mismatched primary
+/// seeding a torn or wrong-position segment that local recovery would
+/// reject much later, at the worst possible time.
+pub fn verify_segment_prefix(
+    path: &Path,
+    through_seq: u64,
+    expected_len: u64,
+) -> Result<(), JournalError> {
+    let info = read_header_info(path)?;
+    let mut scanner = crate::reader::RawJournalScanner::open(path)?;
+    let mut buf = Vec::with_capacity(1 << 20);
+    let mut last = info.starting_sequence.saturating_sub(1);
+    let mut bytes = codec::ENTRY_OFFSET;
+    loop {
+        buf.clear();
+        match scanner.read_raw_batch_until(&mut buf, 1 << 20, through_seq)? {
+            Some(end) => {
+                bytes += buf.len() as u64;
+                last = end;
+            }
+            None => break,
+        }
+    }
+    let fail = |reason: &'static str| {
+        Err(JournalError::CorruptEntry {
+            sequence: through_seq,
+            reason,
+        })
+    };
+    if last != through_seq {
+        return fail("segment seed does not end at the expected sequence");
+    }
+    if bytes != expected_len {
+        return fail("segment seed byte length does not match its entries");
+    }
+    buf.clear();
+    if scanner.read_raw_batch(&mut buf, 256)?.is_some() {
+        return fail("segment seed carries entries past the expected sequence");
+    }
+    Ok(())
+}
+
 /// Build the path for archive number `n`.
 pub fn archive_path(live: &Path, n: u32) -> PathBuf {
     PathBuf::from(format!(
@@ -493,6 +540,41 @@ mod tests {
         assert!(
             read_segment_prefix(&live, 4).unwrap().is_none(),
             "a sequence past the tail has no prefix"
+        );
+    }
+
+    /// `verify_segment_prefix` accepts exactly the prefixes
+    /// `read_segment_prefix` produces and rejects every structural lie:
+    /// wrong end sequence, wrong byte length, trailing entries.
+    #[test]
+    fn verify_segment_prefix_accepts_real_prefixes_and_rejects_lies() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("verify_prefix.journal");
+        build_lineage(&live, &[3]);
+
+        // A real prefix through seq 2, written verbatim (the seeded-
+        // replica shape), verifies.
+        let seed = read_segment_prefix(&live, 2).unwrap().unwrap();
+        let seeded = dir.path().join("seeded.journal");
+        std::fs::write(&seeded, &seed).unwrap();
+        verify_segment_prefix(&seeded, 2, seed.len() as u64).expect("real prefix verifies");
+
+        // Header-only prefix (snapshot exactly at the opening boundary).
+        let header_only = read_segment_prefix(&live, 0).unwrap().unwrap();
+        let seeded2 = dir.path().join("seeded2.journal");
+        std::fs::write(&seeded2, &header_only).unwrap();
+        verify_segment_prefix(&seeded2, 0, header_only.len() as u64)
+            .expect("header-only prefix verifies");
+
+        // Lies: wrong end sequence, wrong length, entries past the end.
+        assert!(verify_segment_prefix(&seeded, 3, seed.len() as u64).is_err());
+        assert!(verify_segment_prefix(&seeded, 2, seed.len() as u64 + 1).is_err());
+        let full = std::fs::read(&live).unwrap();
+        let seeded3 = dir.path().join("seeded3.journal");
+        std::fs::write(&seeded3, &full).unwrap();
+        assert!(
+            verify_segment_prefix(&seeded3, 2, seed.len() as u64).is_err(),
+            "trailing entries past the claimed end must be rejected"
         );
     }
 
