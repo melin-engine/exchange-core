@@ -204,7 +204,21 @@ streaming. A mismatch anywhere means the replica's journal holds
 failover with orders it journaled but never replicated.
 
 **Divergence repair is automatic.** A divergent replica is re-seeded
-from the primary through the snapshot path on the same connection. Its
+from the primary through the snapshot path on the same connection.
+Divergence detected *mid-stream* (a rotation announce or periodic
+chain check failing against the local journal) repairs the same way
+without a process restart: the replica tears its pipeline down,
+re-derives its position from disk, reconnects, and takes the same
+re-seed path — no supervisor required. Every divergence verdict —
+mid-stream or at handshake — increments the primary's
+`melin_replica_divergence_total` counter; alert on any growth, and
+treat growth outside an expected failover rejoin as a possible
+corruption event requiring immediate investigation. The in-process
+repair runs **once** per process lifetime: a second mid-stream
+divergence in the same process is systematic, and the replica exits
+instead of looping (each repair cycle archives a full journal copy,
+and recurrence at that rate means something upstream is seriously
+wrong). Either way, the replica's
 old journal and snapshot are **archived, never deleted** — moved to a
 sibling directory named `<journal>.divergent.<n>`. Under `local`
 durability that journal may hold acked orders that did not survive the

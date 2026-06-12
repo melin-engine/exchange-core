@@ -439,6 +439,9 @@ fn handle_replica_connection<A: Application>(
     let divergent = match validate_replica_handshake_settled(journal_path, &handshake)? {
         HandshakeValidation::Ok => false,
         HandshakeValidation::Divergent(kind) => {
+            // Alertable on /metrics: divergence outside an expected
+            // failover rejoin means corruption or a serious bug.
+            metrics.divergence_total.fetch_add(1, Ordering::Relaxed);
             warn!(
                 last_sequence = handshake.last_sequence,
                 ?kind,

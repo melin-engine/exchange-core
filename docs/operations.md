@@ -614,6 +614,7 @@ melin_trading_active 1
 | `melin_stage_busy_total{stage="..."}` | counter | Cumulative busy iterations per stage (journal/response: batches, matching: events) |
 | `melin_stage_idle_total{stage="..."}` | counter | Cumulative idle iterations per stage |
 | `melin_journal_rotations_total{path="..."}` | counter | Journal segment rotation attempts by outcome: `fast` adopted a pre-staged segment; `sync_fallback` allocated synchronously on the journal thread; `failed` left the current segment in place |
+| `melin_replica_divergence_total` | counter | Divergent replica handshakes on this primary (journal chain failed validation; replica routed through archive + re-seed). Alert on any growth — outside an expected failover rejoin it indicates possible data corruption |
 
 In `sector` mode, `melin_journal_rotations_total{path="sync_fallback"}` should stay flat in steady state — the first rotation after startup may take the synchronous path while the background staging warms up, but sustained growth means rotation stalls are landing on the order pipeline's critical path and is worth an alert. Any growth in `path="failed"` is alert-worthy on every configuration: rotation is failing (disk full, read-only filesystem) and the live segment keeps growing past its threshold.
 

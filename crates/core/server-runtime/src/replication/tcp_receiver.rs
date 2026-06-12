@@ -21,7 +21,8 @@ use melin_transport_core::pipeline::{InputSlot, JournalStage, JournalStageRun};
 use super::auth::authenticate_with_primary;
 use super::receiver_transport::{ReceiverTransport, SessionExit, streaming_loop};
 use super::{
-    ReplicaPipelineHandles, build_replica_pipeline_with_threads, sleep_checking_flags,
+    MAX_INPROCESS_DIVERGENCE_RESYNCS, ReplicaPipelineHandles, TeardownOutcome,
+    build_replica_pipeline_with_threads, recover_replica_state, sleep_checking_flags,
     teardown_replica_pipeline,
 };
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
@@ -462,39 +463,23 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    // Recover whenever any journal segment survives — live OR archived.
-    // A crash between rotation's rename and the new live file's creation
-    // leaves archives with no live segment; recovery handles that layout
-    // (replays the archives, synthesizes a fresh live). Treating it as a
-    // fresh replica would discard the local durable history and then
-    // fail `create_new` against the surviving archives' lineage.
-    let lineage_exists =
-        journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if lineage_exists {
-        let engine = if snapshot_path.exists() {
-            info!("recovering replica from snapshot + journal");
-            melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
-                &snapshot_path,
-                journal_path,
-            )?
-        } else {
-            melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
-        };
-        let next = engine.next_sequence();
-        let last = next.saturating_sub(1);
-        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-        // Seed the observed epoch from the replica's own recovered journal.
-        // Streaming `EpochBump`s and the snapshot-resync path raise it later.
-        fence_state.observe_epoch(engine.recovered_epoch());
-        let (mut exchange, writer) = engine.into_parts();
-        factory.apply_operator_policy(&mut exchange);
-        (Some(exchange), Some(writer), last, hash)
-    } else {
-        (None, None, 0u64, [0u8; 32])
-    };
+    // Recover whenever any journal segment survives — live OR archived;
+    // fresh replicas get `(None, None, 0, zeros)`. See
+    // `recover_replica_state` for the lineage rules.
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
+        recover_replica_state::<A, W>(
+            journal_path,
+            &snapshot_path,
+            factory.as_ref(),
+            &fence_state,
+        )?;
 
     let mut backoff = std::time::Duration::from_secs(1);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Consecutive mid-stream divergence resyncs this process has
+    // attempted — see `MAX_INPROCESS_DIVERGENCE_RESYNCS`.
+    let mut divergence_resyncs: u32 = 0;
 
     let mut send_buf = Vec::with_capacity(64);
     let mut pipeline: Option<ReplicaPipelineHandles<A, W>> = None;
@@ -532,7 +517,7 @@ where
             if let Some(mut p) = pipeline.take() {
                 p.input_producer
                     .publish(InputSlot::<A::Event>::shutdown_sentinel());
-                if let Some((e, w)) = teardown_replica_pipeline::<A, W>(p) {
+                if let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p) {
                     exchange = Some(e);
                     journal_writer = Some(w);
                 }
@@ -563,7 +548,7 @@ where
                     if let Some(mut p) = pipeline.take() {
                         p.input_producer
                             .publish(InputSlot::<A::Event>::shutdown_sentinel());
-                        if let Some((e, w)) = teardown_replica_pipeline::<A, W>(p) {
+                        if let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p) {
                             exchange = Some(e);
                             journal_writer = Some(w);
                         }
@@ -924,16 +909,64 @@ where
             SessionExit::Promote => {
                 return match pipeline.take() {
                     Some(p) => match teardown_replica_pipeline::<A, W>(p) {
-                        Some((e, w)) => Ok(Some((e, w))),
-                        None => Err("pipeline failed during promotion".into()),
+                        TeardownOutcome::Clean(e, w) => Ok(Some((e, w))),
+                        _ => Err("pipeline failed during promotion".into()),
                     },
                     None => Err("pipeline missing on promote".into()),
                 };
             }
 
             SessionExit::Fatal(e) => {
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
+                let outcome = match pipeline.take() {
+                    Some(p) => teardown_replica_pipeline::<A, W>(p),
+                    // Fatal implies a streaming session, which implies a
+                    // pipeline — but don't turn a missing one into a
+                    // resync decision.
+                    None => return Err(e),
+                };
+                // Mid-stream chain divergence is repairable in-process:
+                // the on-disk journal is self-consistent (merely forked
+                // from the primary's history), so re-derive the
+                // handshake state from disk and reconnect — the primary
+                // judges the recovered position divergent and the next
+                // session takes the HashMismatch → archive → reseed
+                // path above, no process restart or supervisor needed.
+                // Every other fatal exits as before: protocol
+                // violations and journal I/O death (ENOSPC, RO-FS)
+                // would fail the same way after a resync.
+                if let TeardownOutcome::JournalFailed(
+                    je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
+                ) = outcome
+                {
+                    divergence_resyncs += 1;
+                    if divergence_resyncs > MAX_INPROCESS_DIVERGENCE_RESYNCS {
+                        return Err(format!(
+                            "mid-stream chain divergence recurred {divergence_resyncs} times — \
+                             giving up on in-process resync (each cycle archives the local \
+                             journal and re-seeds from the primary; recurrence at this rate \
+                             means the primary keeps streaming history that forks from what \
+                             it announces): {je}"
+                        )
+                        .into());
+                    }
+                    warn!(
+                        error = %je,
+                        attempt = divergence_resyncs,
+                        max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
+                        "mid-stream chain divergence — re-deriving local state for \
+                         in-process resync"
+                    );
+                    let (ex, wr, seq, hash) = recover_replica_state::<A, W>(
+                        journal_path,
+                        &snapshot_path,
+                        factory.as_ref(),
+                        &fence_state,
+                    )?;
+                    exchange = ex;
+                    journal_writer = wr;
+                    last_sequence = seq;
+                    chain_hash = hash;
+                    continue;
                 }
                 return Err(e);
             }
@@ -1060,5 +1093,488 @@ mod tests {
         let acks = read_acks(&mut peer, 3);
         let seqs: Vec<u64> = acks.iter().map(|a| a.acked_sequence).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    // -----------------------------------------------------------------
+    // In-process divergence resync — end to end against a scripted
+    // primary. Needs hash-chain (divergence is a chain verdict) and
+    // real persistence (the resync re-derives state from disk).
+    // -----------------------------------------------------------------
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    mod divergence_resync {
+        use super::super::super::auth::authenticate_replica;
+        use super::*;
+        use melin_app::app_factory::AppFactory;
+        use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+        use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+        use melin_transport_core::cursors::WireSeq;
+        use melin_transport_core::replication::catchup::{lineage_origin, snapshot_transfer_with};
+        use melin_transport_core::replication::protocol::{
+            encode_hash_mismatch, encode_rotate, encode_stream_start,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct EvtAdd(u64);
+
+        impl AppEvent for EvtAdd {
+            fn encoded_size(&self) -> usize {
+                8
+            }
+            fn encode(&self, buf: &mut [u8]) -> usize {
+                buf[..8].copy_from_slice(&self.0.to_le_bytes());
+                8
+            }
+            fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+                if buf.len() < 8 {
+                    return Err(CodecError::Truncated);
+                }
+                Ok(EvtAdd(u64::from_le_bytes(buf[..8].try_into().expect("8"))))
+            }
+            fn is_query(&self) -> bool {
+                false
+            }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        struct Rpt;
+
+        struct App;
+
+        impl Application for App {
+            type Event = EvtAdd;
+            type Report = Rpt;
+            type QueryResponse = Rpt;
+            const APP_VERSION: u16 = 1;
+
+            fn apply(&mut self, _e: EvtAdd, _ctx: &ApplyCtx, _out: &mut Vec<Rpt>) -> Option<Rpt> {
+                None
+            }
+            fn tick(&mut self, _now_ns: u64, _out: &mut Vec<Rpt>) {}
+            fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
+                true
+            }
+            fn build_reject(_e: &EvtAdd, _r: RejectReason) -> Rpt {
+                Rpt
+            }
+            fn snapshot<W: std::io::Write>(&self, _w: &mut W) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn restore<R: std::io::Read>(_r: &mut R) -> std::io::Result<Self> {
+                Ok(App)
+            }
+        }
+
+        struct Factory;
+
+        impl AppFactory for Factory {
+            type App = App;
+            fn empty(&self) -> App {
+                App
+            }
+            fn prefault(&self, _app: &mut App) {}
+        }
+
+        /// Read one length-prefixed `ReplicaMessage` frame.
+        fn read_replica_msg(stream: &mut TcpStream) -> ReplicaMessage {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).expect("frame length");
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).expect("frame payload");
+            decode_replica_message(&payload).expect("decodable replica frame")
+        }
+
+        /// Skip frames until an `Ack` at or past `seq` arrives.
+        fn wait_for_ack(stream: &mut TcpStream, seq: u64) {
+            loop {
+                if let ReplicaMessage::Ack(a) = read_replica_msg(stream)
+                    && a.acked_sequence >= seq
+                {
+                    return;
+                }
+            }
+        }
+
+        /// Accept with a deadline so a replica that fails to (re)connect
+        /// fails the test instead of hanging it.
+        fn accept_within(listener: &std::net::TcpListener, secs: u64) -> TcpStream {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        s.set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("read timeout");
+                        return s;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "replica never connected");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+        }
+
+        /// A scripted primary brings a fresh replica up, streams one
+        /// event, then announces a rotation with a deliberately wrong
+        /// tail hash. The replica's journal stage detects divergence —
+        /// `run_receiver` must repair it WITHOUT exiting: tear the
+        /// pipeline down, re-derive its handshake position from disk,
+        /// reconnect, take the HashMismatch verdict, archive the forked
+        /// lineage, and complete the snapshot + segment-seed resync,
+        /// then resume streaming on the rebased lineage.
+        #[test]
+        fn mid_stream_divergence_resyncs_in_process() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // --- The scripted primary's journal + snapshot, served by
+            // the real sender-side transfer code in session 2. Entries
+            // 1..=5, rotation after 2, snapshot at 4 (mid-live-segment).
+            let primary_journal = dir.path().join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut chain_at_4 = [0u8; 32];
+            for v in 1..=5u64 {
+                w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
+                if v == 2 {
+                    w.rotate_segment().expect("rotate");
+                }
+                if v == 4 {
+                    chain_at_4 = w.chain_hash().expect("chain");
+                }
+            }
+            drop(w);
+            melin_transport_core::snapshot::save::<App>(
+                &App,
+                WireSeq::new(4),
+                chain_at_4,
+                0,
+                &primary_journal.with_extension("snapshot"),
+            )
+            .expect("save snapshot");
+            let (lineage_start, lineage_anchor) =
+                lineage_origin(&primary_journal).expect("lineage");
+
+            // --- Auth: one replica key, authorized.
+            let repl_key = ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]);
+            let pub_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                repl_key.verifying_key().to_bytes(),
+            );
+            let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&format!(
+                "replication {pub_b64} test-replica\n"
+            ))
+            .expect("parse keys");
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+
+            // --- Replica under test.
+            let replica_journal = dir.path().join("replica.journal");
+            let replica_snapshot = dir.path().join("replica.snapshot");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let promote = Arc::new(AtomicBool::new(false));
+            let cores = crate::server::PipelineCores {
+                // 0 = unpinned sentinel for every stage.
+                journal: 0,
+                matching: 0,
+                response: 0,
+                reader: 0,
+                repl_sender: 0,
+                event_publisher: 0,
+                shadow: 0,
+                repl_handler_0: 0,
+                repl_handler_1: 0,
+            };
+            let replica = {
+                let journal = replica_journal.clone();
+                let shutdown = Arc::clone(&shutdown);
+                let promote = Arc::clone(&promote);
+                std::thread::spawn(move || -> Result<bool, String> {
+                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
+                        &shutdown,
+                        &promote,
+                        3_600_000,
+                        replica_snapshot,
+                        cores,
+                        Duration::ZERO,
+                        64,
+                        false,
+                        Arc::new(Factory),
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                    )
+                    // ReceiverResult's error is !Send — stringify for join().
+                    .map(|state| state.is_none())
+                    .map_err(|e| e.to_string())
+                })
+            };
+
+            // --- Session 1: fresh sync, one event, then the poisoned
+            // rotation announce.
+            let mut s1 = accept_within(&listener, 30);
+            let mut s1r = s1.try_clone().expect("clone");
+            authenticate_replica(&mut s1r, &mut s1, &authorized_keys).expect("auth 1");
+            match read_replica_msg(&mut s1) {
+                ReplicaMessage::Handshake(h) => {
+                    assert_eq!(h.last_sequence, 0, "fresh replica handshake")
+                }
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            let mut buf = Vec::new();
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, &mut buf);
+            s1.write_all(&buf).expect("StreamStart 1");
+            buf.clear();
+            melin_transport_core::replication_wire::encode_input_batch(
+                &[InputSlot::<EvtAdd> {
+                    connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
+                    sequence: 1,
+                    timestamp_ns: 1,
+                    event: JournalEvent::App(EvtAdd(1)),
+                    // `()` without latency-trace, a timestamp with it.
+                    publish_ts: Default::default(),
+                    recv_ts: Default::default(),
+                }],
+                &mut buf,
+            );
+            s1.write_all(&buf).expect("InputBatch");
+            wait_for_ack(&mut s1, 1);
+
+            // Wrong tail hash at the announced boundary — the replica's
+            // local chain at sequence 1 cannot match this.
+            buf.clear();
+            encode_rotate(1, &[0xEE; 32], &mut buf);
+            s1.write_all(&buf).expect("Rotate");
+
+            // --- Session 2: the SAME process reconnects with its
+            // position re-derived from the forked on-disk journal.
+            let mut s2 = accept_within(&listener, 30);
+            let mut s2r = s2.try_clone().expect("clone");
+            authenticate_replica(&mut s2r, &mut s2, &authorized_keys).expect("auth 2");
+            match read_replica_msg(&mut s2) {
+                ReplicaMessage::Handshake(h) => assert_eq!(
+                    h.last_sequence, 1,
+                    "post-divergence handshake must carry the recovered journal position"
+                ),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            buf.clear();
+            encode_hash_mismatch(&mut buf);
+            s2.write_all(&buf).expect("HashMismatch");
+            let transfer_shutdown = AtomicBool::new(false);
+            let mut publish = |b: &[u8]| -> std::io::Result<()> {
+                s2.write_all(b)?;
+                s2.flush()
+            };
+            // Real sender-side resync: SnapshotBegin → chunks →
+            // SegmentSeedBegin → seed → StreamStart → catch-up (entry 5).
+            let end = snapshot_transfer_with::<EvtAdd>(
+                &primary_journal,
+                &mut publish,
+                &transfer_shutdown,
+            )
+            .expect("snapshot transfer");
+            assert_eq!(
+                end,
+                melin_transport_core::replication::catchup::CatchUpResult::Ok(5)
+            );
+            let mut s2_acks = s2.try_clone().expect("clone");
+            wait_for_ack(&mut s2_acks, 5);
+
+            // --- Clean shutdown; the receiver must return Ok(None) —
+            // the divergence never escaped as a process-fatal error.
+            shutdown.store(true, Ordering::Relaxed);
+            let result = replica.join().expect("replica thread panicked");
+            assert_eq!(result, Ok(true), "receiver must exit cleanly via shutdown");
+
+            // The forked lineage was archived (never deleted), and the
+            // live journal is the re-seeded one.
+            assert!(
+                dir.path().join("replica.journal.divergent.0").exists(),
+                "divergent lineage must be archived"
+            );
+            assert!(replica_journal.exists(), "re-seeded live journal");
+        }
+
+        /// The in-process repair budget is one per process lifetime: a
+        /// second mid-stream divergence is systematic (corruption or a
+        /// serious bug that the first re-seed did not cure) and the
+        /// receiver must exit hard instead of looping — each repair
+        /// cycle archives a full journal copy, and a repair loop would
+        /// fill the disk while masking the underlying fault.
+        #[test]
+        fn second_mid_stream_divergence_exits_hard() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            let primary_journal = dir.path().join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            let mut chain_at_4 = [0u8; 32];
+            for v in 1..=5u64 {
+                w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
+                if v == 2 {
+                    w.rotate_segment().expect("rotate");
+                }
+                if v == 4 {
+                    chain_at_4 = w.chain_hash().expect("chain");
+                }
+            }
+            drop(w);
+            melin_transport_core::snapshot::save::<App>(
+                &App,
+                WireSeq::new(4),
+                chain_at_4,
+                0,
+                &primary_journal.with_extension("snapshot"),
+            )
+            .expect("save snapshot");
+            let (lineage_start, lineage_anchor) =
+                lineage_origin(&primary_journal).expect("lineage");
+
+            let repl_key = ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]);
+            let pub_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                repl_key.verifying_key().to_bytes(),
+            );
+            let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&format!(
+                "replication {pub_b64} test-replica\n"
+            ))
+            .expect("parse keys");
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+
+            let replica_journal = dir.path().join("replica.journal");
+            let replica_snapshot = dir.path().join("replica.snapshot");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let promote = Arc::new(AtomicBool::new(false));
+            let cores = crate::server::PipelineCores {
+                journal: 0,
+                matching: 0,
+                response: 0,
+                reader: 0,
+                repl_sender: 0,
+                event_publisher: 0,
+                shadow: 0,
+                repl_handler_0: 0,
+                repl_handler_1: 0,
+            };
+            let replica = {
+                let journal = replica_journal.clone();
+                let shutdown = Arc::clone(&shutdown);
+                let promote = Arc::clone(&promote);
+                std::thread::spawn(move || -> Result<bool, String> {
+                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
+                        &shutdown,
+                        &promote,
+                        3_600_000,
+                        replica_snapshot,
+                        cores,
+                        Duration::ZERO,
+                        64,
+                        false,
+                        Arc::new(Factory),
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                    )
+                    .map(|state| state.is_none())
+                    .map_err(|e| e.to_string())
+                })
+            };
+
+            // Session 1: fresh sync, one event, poisoned rotation.
+            let mut s1 = accept_within(&listener, 30);
+            let mut s1r = s1.try_clone().expect("clone");
+            authenticate_replica(&mut s1r, &mut s1, &authorized_keys).expect("auth 1");
+            match read_replica_msg(&mut s1) {
+                ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 0),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            let mut buf = Vec::new();
+            encode_stream_start(0, lineage_start, lineage_anchor, 0, &mut buf);
+            s1.write_all(&buf).expect("StreamStart 1");
+            buf.clear();
+            melin_transport_core::replication_wire::encode_input_batch(
+                &[InputSlot::<EvtAdd> {
+                    connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
+                    sequence: 1,
+                    timestamp_ns: 1,
+                    event: JournalEvent::App(EvtAdd(1)),
+                    publish_ts: Default::default(),
+                    recv_ts: Default::default(),
+                }],
+                &mut buf,
+            );
+            s1.write_all(&buf).expect("InputBatch");
+            wait_for_ack(&mut s1, 1);
+            buf.clear();
+            encode_rotate(1, &[0xEE; 32], &mut buf);
+            s1.write_all(&buf).expect("Rotate 1");
+
+            // Session 2: in-process repair (the one allowed), then a
+            // SECOND poisoned rotation after streaming resumes.
+            let mut s2 = accept_within(&listener, 30);
+            let mut s2r = s2.try_clone().expect("clone");
+            authenticate_replica(&mut s2r, &mut s2, &authorized_keys).expect("auth 2");
+            match read_replica_msg(&mut s2) {
+                ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 1),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            buf.clear();
+            encode_hash_mismatch(&mut buf);
+            s2.write_all(&buf).expect("HashMismatch");
+            let transfer_shutdown = AtomicBool::new(false);
+            {
+                let mut publish = |b: &[u8]| -> std::io::Result<()> {
+                    s2.write_all(b)?;
+                    s2.flush()
+                };
+                snapshot_transfer_with::<EvtAdd>(
+                    &primary_journal,
+                    &mut publish,
+                    &transfer_shutdown,
+                )
+                .expect("snapshot transfer");
+            }
+            buf.clear();
+            melin_transport_core::replication_wire::encode_input_batch(
+                &[InputSlot::<EvtAdd> {
+                    connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
+                    sequence: 6,
+                    timestamp_ns: 6,
+                    event: JournalEvent::App(EvtAdd(6)),
+                    publish_ts: Default::default(),
+                    recv_ts: Default::default(),
+                }],
+                &mut buf,
+            );
+            s2.write_all(&buf).expect("InputBatch 6");
+            let mut s2_acks = s2.try_clone().expect("clone");
+            wait_for_ack(&mut s2_acks, 6);
+            buf.clear();
+            encode_rotate(6, &[0xEE; 32], &mut buf);
+            s2.write_all(&buf).expect("Rotate 2");
+
+            // No third connection: the receiver must give up and exit
+            // with an error naming the recurrence.
+            let result = replica.join().expect("replica thread panicked");
+            let err = result.expect_err("second divergence must exit hard");
+            assert!(
+                err.contains("divergence recurred"),
+                "error must name the recurrence: {err}"
+            );
+        }
     }
 }

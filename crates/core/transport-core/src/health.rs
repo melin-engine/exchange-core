@@ -157,6 +157,9 @@ struct HealthSnapshot {
     fastest_replica_cursor: u64,
     /// Total replica eviction count.
     evictions_total: u64,
+    /// Total divergent-replica handshake verdicts. Any growth outside
+    /// an expected failover rejoin warrants immediate investigation.
+    divergence_total: u64,
     /// Per-stage busy/idle iteration counters for utilization monitoring.
     /// Monotonic counters — Prometheus `rate()` gives utilization over any window.
     journal_busy: u64,
@@ -375,6 +378,10 @@ impl HealthSnapshot {
             per_replica_ring_depth,
             fastest_replica_cursor,
             evictions_total,
+            divergence_total: state
+                .replication_metrics
+                .as_ref()
+                .map_or(0, |rm| rm.divergence_total.load(Ordering::Relaxed)),
             journal_busy: state.journal_utilization.busy.load(Ordering::Relaxed),
             journal_idle: state.journal_utilization.idle.load(Ordering::Relaxed),
             matching_busy: state.matching_utilization.busy.load(Ordering::Relaxed),
@@ -500,6 +507,9 @@ impl HealthSnapshot {
              # HELP melin_replica_evictions_total Total replica evictions due to ring backpressure.\n\
              # TYPE melin_replica_evictions_total counter\n\
              melin_replica_evictions_total {}\n\
+             # HELP melin_replica_divergence_total Divergent replica handshakes (journal chain failed validation; replica routed through archive + re-seed). Growth outside an expected failover rejoin warrants immediate investigation.\n\
+             # TYPE melin_replica_divergence_total counter\n\
+             melin_replica_divergence_total {}\n\
              # HELP melin_replication_ring_depth Per-slot replication-ring depth (producer_cursor - consumer.processed).\n\
              # TYPE melin_replication_ring_depth gauge\n\
              melin_replication_ring_depth{{slot=\"0\"}} {}\n\
@@ -556,6 +566,7 @@ impl HealthSnapshot {
             catching_0,
             catching_1,
             self.evictions_total,
+            self.divergence_total,
             self.per_replica_ring_depth[0],
             self.per_replica_ring_depth[1],
             self.fastest_replica_cursor,
@@ -1703,6 +1714,7 @@ mod tests {
         metrics.catching_up[0].store(true, Ordering::Relaxed);
         metrics.catching_up[1].store(false, Ordering::Relaxed);
         metrics.evictions_total.store(7, Ordering::Relaxed);
+        metrics.divergence_total.store(3, Ordering::Relaxed);
 
         // journal_seq=1000 so per_replica_lag = 1000 - acked.
         let state = HealthState {
@@ -2004,6 +2016,10 @@ mod tests {
         assert!(
             body.contains("melin_replica_evictions_total 7\n"),
             "evictions: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_divergence_total 3\n"),
+            "divergence: {body}"
         );
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();

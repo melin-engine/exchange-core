@@ -44,6 +44,16 @@ pub struct ReplicationMetrics {
     /// Total eviction count (both slots combined). Incremented when
     /// the journal stage's backpressure timeout fires.
     pub evictions_total: AtomicU64,
+    /// Total divergent-replica handshake verdicts (both slots
+    /// combined): connections whose journal chain failed validation
+    /// and were routed through archive + snapshot re-seed. Every
+    /// divergence funnels through this counter — an ex-primary
+    /// rejoining after failover AND a replica that detected mid-stream
+    /// divergence and reconnected to repair in-process. Growth outside
+    /// an expected failover rejoin means data corruption or a serious
+    /// bug somewhere in the cluster and warrants immediate
+    /// investigation.
+    pub divergence_total: AtomicU64,
 }
 
 impl Default for ReplicationMetrics {
@@ -56,6 +66,7 @@ impl Default for ReplicationMetrics {
             acks_received: [AtomicU64::new(0), AtomicU64::new(0)],
             catching_up: [AtomicBool::new(false), AtomicBool::new(false)],
             evictions_total: AtomicU64::new(0),
+            divergence_total: AtomicU64::new(0),
         }
     }
 }

@@ -164,8 +164,25 @@ pub(super) fn sleep_checking_flags(
     }
 }
 
+/// Outcome of shutting down a replica pipeline. All stage threads are
+/// joined in every variant — by the time the caller sees this, no
+/// pipeline thread can still touch the journal or snapshot files.
+pub(super) enum TeardownOutcome<A, W> {
+    /// Clean exit: both stages returned their state, reusable for the
+    /// next pipeline build (post-snapshot) or promotion.
+    Clean(A, W),
+    /// The journal stage exited with an error — its writer is gone and
+    /// the matching stage's state is unusable (it may have applied
+    /// events the journal never persisted). Carries the error so the
+    /// orchestrator can distinguish repairable chain divergence
+    /// (in-process resync) from journal I/O death (exit).
+    JournalFailed(melin_journal::JournalError),
+    /// A stage thread panicked; no state survives.
+    Panicked,
+}
+
 /// Shut down the replica pipeline and extract Exchange + SectorWriter from
-/// the stage threads. Returns None if a thread panicked.
+/// the stage threads.
 ///
 /// Relies on the caller having published a `JournalEvent::Shutdown`
 /// sentinel to the input ring before invoking this — the journal and
@@ -178,13 +195,13 @@ pub(super) fn sleep_checking_flags(
 /// `drain_handle` and `shadow_handle` still observe `shutdown_flag`
 /// because they don't process the input ring (no sentinel reaches
 /// them); set the flag for them only.
-pub(super) fn shutdown_pipeline<A: Application + Send + 'static, W: Send + 'static>(
+pub(super) fn shutdown_pipeline<A: Send + 'static, W: Send + 'static>(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
     matching_handle: std::thread::JoinHandle<A>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
-) -> Option<(A, W)> {
+) -> TeardownOutcome<A, W> {
     // Defense-in-depth: set the flag before joining. The sentinel was
     // already published by `tcp_receiver` before this call, so no further
     // events can arrive in the input ring — setting the flag here cannot
@@ -192,21 +209,32 @@ pub(super) fn shutdown_pipeline<A: Application + Send + 'static, W: Send + 'stat
     // paths that don't observe the sentinel: `run_sync` in `no-persist`
     // builds, the drain consumer, the shadow stage, and any case where
     // the receiver thread panicked before publishing the sentinel.
+    //
+    // The flag is also what makes these joins safe when the journal
+    // stage is already dead: the matching stage's gate on the (frozen)
+    // journal cursor is a non-blocking spin that re-checks the flag
+    // every iteration, and its shutdown drain is `try_consume`-bounded.
     shutdown_flag.store(true, Ordering::Release);
-    let writer = match journal_handle.join() {
-        Ok(Ok(w)) => w,
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "replica journal stage returned error on shutdown");
-            return None;
-        }
-        Err(_) => return None,
-    };
-    let exchange = matching_handle.join().ok()?;
+    // Join EVERY thread before reporting the outcome, even on failure:
+    // the in-process divergence-resync path archives the journal and
+    // snapshot right after this returns, and a still-running shadow
+    // thread could be mid-snapshot-write during those renames.
+    let journal_result = journal_handle.join();
+    let matching_result = matching_handle.join();
     let _ = drain_handle.join();
     if let Some(h) = shadow_handle {
         let _ = h.join();
     }
-    Some((exchange, writer))
+    let writer = match journal_result {
+        Ok(Ok(w)) => w,
+        // Already error!-logged by the journal thread's spawn wrapper.
+        Ok(Err(e)) => return TeardownOutcome::JournalFailed(e),
+        Err(_) => return TeardownOutcome::Panicked,
+    };
+    match matching_result {
+        Ok(exchange) => TeardownOutcome::Clean(exchange, writer),
+        Err(_) => TeardownOutcome::Panicked,
+    }
 }
 
 /// Live replica pipeline — built once on first connect (or after a snapshot
@@ -412,7 +440,7 @@ where
 /// next pipeline build (e.g., post-snapshot) or pass them up on promotion.
 pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send + 'static>(
     handles: ReplicaPipelineHandles<A, W>,
-) -> Option<(A, W)> {
+) -> TeardownOutcome<A, W> {
     shutdown_pipeline::<A, W>(
         &handles.pipeline_shutdown,
         handles.journal_handle,
@@ -420,6 +448,70 @@ pub(super) fn teardown_replica_pipeline<A: Application + Send + 'static, W: Send
         handles.drain_handle,
         handles.shadow_handle,
     )
+}
+
+/// How many mid-stream divergence resyncs the receiver attempts
+/// in-process (per process lifetime) before giving up. Mid-stream
+/// divergence is never expected in a healthy cluster — it means
+/// corruption or a serious bug somewhere — so the budget is exactly
+/// one: the first occurrence repairs automatically (archive the local
+/// lineage as `.divergent.<n>`, re-seed from the primary) and pages
+/// the operator via `melin_replica_divergence_total`; a second in the
+/// same process lifetime is systematic, and continuing to repair
+/// would fill the disk with archives while masking the underlying
+/// fault. Exit hard instead.
+pub(super) const MAX_INPROCESS_DIVERGENCE_RESYNCS: u32 = 1;
+
+/// Recover replica boot state from disk.
+///
+/// Recovers whenever any journal segment survives — live OR archived
+/// (a crash between rotation's rename and the new live file's creation
+/// leaves archives with no live segment, and recovery handles that
+/// layout; treating it as a fresh replica would discard local durable
+/// history and then fail `create_new` against the surviving lineage).
+/// Returns `(None, None, 0, zeros)` for a genuinely fresh replica.
+/// Also seeds the fencing epoch from the recovered journal.
+///
+/// Called at receiver startup, and again after a mid-stream chain
+/// divergence tears the pipeline down: the on-disk journal is
+/// self-consistent (merely forked from the primary's history), so
+/// recovery re-derives a truthful handshake pair `(last_sequence,
+/// chain_hash)` and the next connection takes the primary's
+/// HashMismatch → archive → reseed path in-process.
+#[allow(clippy::type_complexity)]
+pub(super) fn recover_replica_state<A, W>(
+    journal_path: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
+    fence_state: &melin_transport_core::fence::FenceState,
+) -> Result<(Option<A>, Option<W>, u64, [u8; 32]), Box<dyn std::error::Error>>
+where
+    A: Application,
+    W: melin_journal::JournalWrite<A::Event>,
+{
+    let lineage_exists =
+        journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
+    if !lineage_exists {
+        return Ok((None, None, 0u64, [0u8; 32]));
+    }
+    let engine = if snapshot_path.exists() {
+        tracing::info!("recovering replica from snapshot + journal");
+        melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
+            snapshot_path,
+            journal_path,
+        )?
+    } else {
+        melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
+    };
+    let next = engine.next_sequence();
+    let last = next.saturating_sub(1);
+    let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+    // Seed the observed epoch from the replica's own recovered journal.
+    // Streaming `EpochBump`s and the snapshot-resync path raise it later.
+    fence_state.observe_epoch(engine.recovered_epoch());
+    let (mut exchange, writer) = engine.into_parts();
+    factory.apply_operator_policy(&mut exchange);
+    Ok((Some(exchange), Some(writer), last, hash))
 }
 
 #[cfg(test)]
@@ -1836,6 +1928,78 @@ mod tests {
         assert_eq!(q.pop_oldest_blocking(&cursor, true, &abort), None);
         assert!(!q.is_empty(), "aborted wait must not pop the entry");
         assert_eq!(q.pop_all_blocking(&cursor, true, &abort), None);
+    }
+
+    /// `shutdown_pipeline` must surface the journal stage's error kind —
+    /// the orchestrator routes `ReplicaChainDivergence` into in-process
+    /// resync and everything else into process exit, so collapsing the
+    /// error into a None (the old behavior) breaks that dispatch. It
+    /// must also join EVERY thread in the failure arms: the resync path
+    /// archives journal + snapshot right after teardown, and a
+    /// still-running shadow thread mid-snapshot-write would race the
+    /// renames.
+    #[test]
+    fn shutdown_pipeline_surfaces_journal_error_kind() {
+        let flag = AtomicBool::new(false);
+        let matching_joined = Arc::new(AtomicBool::new(false));
+        let mj = Arc::clone(&matching_joined);
+
+        let journal = std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> {
+            Err(melin_journal::JournalError::ReplicaChainDivergence {
+                sequence: 42,
+                expected: [1u8; 32],
+                actual: [2u8; 32],
+            })
+        });
+        let matching = std::thread::spawn(move || {
+            mj.store(true, Ordering::Release);
+            7u64
+        });
+        let drain = std::thread::spawn(|| {});
+
+        let outcome = shutdown_pipeline::<u64, u32>(&flag, journal, matching, drain, None);
+        assert!(flag.load(Ordering::Acquire), "shutdown flag must be set");
+        assert!(
+            matching_joined.load(Ordering::Acquire),
+            "matching thread must be joined even when the journal failed"
+        );
+        match outcome {
+            TeardownOutcome::JournalFailed(
+                melin_journal::JournalError::ReplicaChainDivergence { sequence, .. },
+            ) => assert_eq!(sequence, 42),
+            _ => panic!("expected JournalFailed(ReplicaChainDivergence)"),
+        }
+    }
+
+    #[test]
+    fn shutdown_pipeline_clean_returns_both_states() {
+        let flag = AtomicBool::new(false);
+        let journal =
+            std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> { Ok(11u32) });
+        let matching = std::thread::spawn(|| 7u64);
+        let drain = std::thread::spawn(|| {});
+
+        match shutdown_pipeline::<u64, u32>(&flag, journal, matching, drain, None) {
+            TeardownOutcome::Clean(app, writer) => {
+                assert_eq!(app, 7);
+                assert_eq!(writer, 11);
+            }
+            _ => panic!("expected Clean"),
+        }
+    }
+
+    #[test]
+    fn shutdown_pipeline_panicked_stage_reports_panicked() {
+        let flag = AtomicBool::new(false);
+        let journal =
+            std::thread::spawn(|| -> Result<u32, melin_journal::JournalError> { Ok(11u32) });
+        let matching = std::thread::spawn(|| -> u64 { panic!("matching stage died") });
+        let drain = std::thread::spawn(|| {});
+
+        assert!(matches!(
+            shutdown_pipeline::<u64, u32>(&flag, journal, matching, drain, None),
+            TeardownOutcome::Panicked
+        ));
     }
 
     #[test]

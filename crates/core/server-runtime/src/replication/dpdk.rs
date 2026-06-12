@@ -23,8 +23,9 @@ use super::receiver_transport::{
     try_extract_frame,
 };
 use super::{
-    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics, SentHighWater,
-    build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
+    MAX_INPROCESS_DIVERGENCE_RESYNCS, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
+    ReplicationMetrics, SentHighWater, TeardownOutcome, build_replica_pipeline_with_threads,
+    recover_replica_state, sleep_checking_flags, teardown_replica_pipeline,
 };
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::catchup::{
@@ -389,6 +390,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     ) {
                                         Ok(HandshakeValidation::Ok) => false,
                                         Ok(HandshakeValidation::Divergent(kind)) => {
+                                            // Alertable on /metrics: divergence
+                                            // outside an expected failover rejoin
+                                            // means corruption or a serious bug.
+                                            metrics
+                                                .divergence_total
+                                                .fetch_add(1, Ordering::Relaxed);
                                             warn!(
                                                 slot = slot_idx,
                                                 last_sequence = h.last_sequence,
@@ -837,42 +844,25 @@ where
     W: JournalWrite<A::Event> + Send + 'static,
     JournalStage<A::Event, W>: JournalStageRun<A::Event, Writer = W>,
 {
-    // Recover local state from journal (if any). On first call this may
-    // be (None, None) for a fresh replica. After a reconnect, the pipeline
-    // shutdown returns the App + writer directly.
-    //
-    // Recover whenever any journal segment survives — live OR archived;
-    // a post-rotation crash leaves archives with no live segment, and
-    // recovery handles that layout (see the kernel-TCP receiver).
-    let lineage_exists =
-        journal_path.exists() || !melin_journal::segment::list_archives(journal_path)?.is_empty();
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if lineage_exists {
-        let engine = if snapshot_path.exists() {
-            info!("recovering replica from snapshot + journal (DPDK)");
-            melin_transport_core::JournaledApp::<A, W>::recover_from_snapshot(
-                &snapshot_path,
-                journal_path,
-            )?
-        } else {
-            melin_transport_core::JournaledApp::<A, W>::recover(factory.empty(), journal_path)?
-        };
-        let next = engine.next_sequence();
-        let last = next.saturating_sub(1);
-        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-        // Seed the observed epoch from the replica's own recovered journal
-        // (mirrors the kernel-TCP receiver).
-        fence_state.observe_epoch(engine.recovered_epoch());
-        let (mut exchange, writer) = engine.into_parts();
-        factory.apply_operator_policy(&mut exchange);
-        (Some(exchange), Some(writer), last, hash)
-    } else {
-        (None, None, 0u64, [0u8; 32])
-    };
+    // Recover local state from journal whenever any segment survives —
+    // live OR archived; fresh replicas get `(None, None, 0, zeros)`.
+    // See `recover_replica_state` for the lineage rules.
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
+        recover_replica_state::<A, W>(
+            journal_path,
+            &snapshot_path,
+            factory.as_ref(),
+            &fence_state,
+        )?;
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
     // Reset to 1s on successful streaming (first InputBatch received).
     let mut backoff = std::time::Duration::from_secs(1);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Mid-stream divergence resyncs this process has attempted — see
+    // `MAX_INPROCESS_DIVERGENCE_RESYNCS`.
+    let mut divergence_resyncs: u32 = 0;
 
     // Reusable buffers — survive across reconnections.
     let mut send_buf = Vec::with_capacity(64);
@@ -922,7 +912,7 @@ where
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered while disconnected (DPDK)");
             if let Some(p) = pipeline.take()
-                && let Some((e, w)) = teardown_replica_pipeline::<A, W>(p)
+                && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
             {
                 exchange = Some(e);
                 journal_writer = Some(w);
@@ -1010,7 +1000,7 @@ where
             if promote.load(Ordering::Acquire) {
                 info!("promotion triggered during reconnect backoff (DPDK)");
                 if let Some(p) = pipeline.take()
-                    && let Some((e, w)) = teardown_replica_pipeline::<A, W>(p)
+                    && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
                 {
                     exchange = Some(e);
                     journal_writer = Some(w);
@@ -1378,15 +1368,51 @@ where
             SessionExit::Promote => {
                 return match pipeline.take() {
                     Some(p) => match teardown_replica_pipeline::<A, W>(p) {
-                        Some((ex, wr)) => Ok(Some((ex, wr))),
-                        None => Err("pipeline thread panicked during promotion (DPDK)".into()),
+                        TeardownOutcome::Clean(ex, wr) => Ok(Some((ex, wr))),
+                        _ => Err("pipeline failed during promotion (DPDK)".into()),
                     },
                     None => Err("pipeline missing on promote (DPDK)".into()),
                 };
             }
             SessionExit::Fatal(e) => {
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
+                let outcome = match pipeline.take() {
+                    Some(p) => teardown_replica_pipeline::<A, W>(p),
+                    None => return Err(e),
+                };
+                // Mid-stream chain divergence is repairable in-process —
+                // re-derive handshake state from disk and reconnect; the
+                // next session takes the HashMismatch → archive → reseed
+                // path above. Mirrors the kernel-TCP receiver.
+                if let TeardownOutcome::JournalFailed(
+                    je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
+                ) = outcome
+                {
+                    divergence_resyncs += 1;
+                    if divergence_resyncs > MAX_INPROCESS_DIVERGENCE_RESYNCS {
+                        return Err(format!(
+                            "mid-stream chain divergence recurred {divergence_resyncs} times — \
+                             giving up on in-process resync: {je}"
+                        )
+                        .into());
+                    }
+                    warn!(
+                        error = %je,
+                        attempt = divergence_resyncs,
+                        max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
+                        "mid-stream chain divergence — re-deriving local state for \
+                         in-process resync (DPDK)"
+                    );
+                    let (ex, wr, seq, hash) = recover_replica_state::<A, W>(
+                        journal_path,
+                        &snapshot_path,
+                        factory.as_ref(),
+                        &fence_state,
+                    )?;
+                    exchange = ex;
+                    journal_writer = wr;
+                    last_sequence = seq;
+                    chain_hash = hash;
+                    continue;
                 }
                 return Err(e);
             }
