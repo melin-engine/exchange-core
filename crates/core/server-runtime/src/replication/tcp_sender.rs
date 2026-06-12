@@ -22,7 +22,7 @@ use melin_transport_core::replication::catchup::{
 };
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_hash_mismatch,
-    encode_heartbeat, encode_stream_start, read_frame,
+    encode_heartbeat, encode_need_snapshot, encode_stream_start, read_frame,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
@@ -459,12 +459,6 @@ fn handle_replica_connection<A: Application>(
         writer.flush()
     };
 
-    if divergent {
-        encode_hash_mismatch(&mut send_buf);
-        publish(&send_buf)?;
-        send_buf.clear();
-    }
-
     // Cursor/stream floor for everything downstream. A divergent
     // replica's claimed position is meaningless (its history forked —
     // possibly ahead of our tip); the resync rebases it, so seed from 0
@@ -506,6 +500,19 @@ fn handle_replica_connection<A: Application>(
             }
         }
     } else {
+        // Resync verdict precedes the snapshot data: `HashMismatch`
+        // tells the replica its journal is divergent (it archives its
+        // local lineage on receipt); plain `NeedSnapshot` is the
+        // too-far-behind rebase. The receiver expects `SnapshotBegin`
+        // as the very next frame after the verdict, so
+        // `snapshot_transfer_with` must follow immediately.
+        if divergent {
+            encode_hash_mismatch(&mut send_buf);
+        } else {
+            encode_need_snapshot(&mut send_buf);
+        }
+        publish(&send_buf)?;
+        send_buf.clear();
         match snapshot_transfer_with::<A::Event>(journal_path, &mut publish, shutdown)? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {

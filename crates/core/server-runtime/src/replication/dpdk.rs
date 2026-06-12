@@ -34,7 +34,7 @@ use melin_transport_core::replication::catchup::{
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
     decode_primary_message, decode_replica_message, encode_ack, encode_handshake,
-    encode_hash_mismatch, encode_heartbeat, encode_stream_start,
+    encode_hash_mismatch, encode_heartbeat, encode_need_snapshot, encode_stream_start,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
@@ -458,25 +458,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         Ok(())
                                     };
 
-                                    // Divergence verdict goes out before any
-                                    // resync data — the replica archives its
-                                    // local journal on receipt.
-                                    if divergent {
-                                        slot.send_buf.clear();
-                                        encode_hash_mismatch(&mut slot.send_buf);
-                                        if let Err(e) = dpdk_publish(&slot.send_buf) {
-                                            warn!(slot = slot_idx, error = %e, "HashMismatch send failed — disconnecting");
-                                            transport.close(handle);
-                                            slot.state = SlotState::Idle;
-                                            slot.recv_buf.clear();
-                                            metrics.catching_up[slot_idx]
-                                                .store(false, Ordering::Relaxed);
-                                            replicas_connected.fetch_sub(1, Ordering::Release);
-                                            cursors.clear_on_disconnect(slot_idx);
-                                            continue;
-                                        }
-                                    }
-
                                     // Highest sequence streamed during catch-up /
                                     // snapshot transfer — monotonic from the
                                     // stream floor. Seeds the slot's sent
@@ -518,11 +499,26 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         })
                                         .err()
                                     } else {
-                                        match snapshot_transfer_with::<A::Event>(
-                                            journal_path,
-                                            &mut dpdk_publish,
-                                            shutdown,
-                                        ) {
+                                        // Resync verdict precedes the snapshot
+                                        // data — `HashMismatch` makes the
+                                        // replica archive its local lineage;
+                                        // plain `NeedSnapshot` is the
+                                        // too-far-behind rebase. The receiver
+                                        // expects `SnapshotBegin` as the very
+                                        // next frame after the verdict.
+                                        slot.send_buf.clear();
+                                        if divergent {
+                                            encode_hash_mismatch(&mut slot.send_buf);
+                                        } else {
+                                            encode_need_snapshot(&mut slot.send_buf);
+                                        }
+                                        match dpdk_publish(&slot.send_buf).and_then(|()| {
+                                            snapshot_transfer_with::<A::Event>(
+                                                journal_path,
+                                                &mut dpdk_publish,
+                                                shutdown,
+                                            )
+                                        }) {
                                             Ok(CatchUpResult::Ok(end)) => {
                                                 catchup_end = end;
                                                 None

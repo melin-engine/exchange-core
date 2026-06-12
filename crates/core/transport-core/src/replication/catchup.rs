@@ -339,9 +339,17 @@ fn publish_chunked_body(
 /// Transfer a snapshot to a replica, then catch up from journal.
 ///
 /// Reads the snapshot file, validates its header (magic, sequence,
-/// chain hash), and streams the bytes as `NeedSnapshot → SnapshotBegin
-/// → SnapshotChunk* → SnapshotEnd → StreamStart` followed by journal
-/// catch-up from the snapshot's sequence.
+/// chain hash), and streams the bytes as `SnapshotBegin →
+/// SnapshotChunk* → SnapshotEnd → SegmentSeedBegin → seed chunks →
+/// StreamStart` followed by journal catch-up from the snapshot's
+/// sequence.
+///
+/// The caller must have sent the resync *verdict* frame — plain
+/// `NeedSnapshot` or the divergence verdict `HashMismatch` — directly
+/// before calling: the receiver acts on the verdict (archiving its
+/// local lineage on `HashMismatch`) and then expects `SnapshotBegin`
+/// as the very next frame. Emitting `NeedSnapshot` here would inject
+/// a stray frame into the divergent flow.
 ///
 /// `publisher` is called for each encoded control/chunk frame. The TCP
 /// path passes `write_all+flush`; the DPDK path passes
@@ -351,9 +359,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
-    use super::protocol::{
-        encode_need_snapshot, encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start,
-    };
+    use super::protocol::{encode_segment_seed_begin, encode_snapshot_begin, encode_stream_start};
 
     let snap_path = journal_path.with_extension("snapshot");
     if !snap_path.exists() {
@@ -364,11 +370,6 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     }
 
     let mut send_buf = Vec::with_capacity(64 * 1024 + 128);
-
-    // Send NeedSnapshot.
-    encode_need_snapshot(&mut send_buf);
-    publisher(&send_buf)?;
-    send_buf.clear();
 
     // Read and validate snapshot. The shared header parser enforces the
     // magic *and* the transport-version gate — serving a file the replica's
@@ -1010,11 +1011,10 @@ mod tests {
         // Walk the frame sequence, reassembling the two chunked bodies.
         use super::super::protocol::{PrimaryMessage, decode_primary_message};
         let decode = |f: &Vec<u8>| decode_primary_message(&f[4..]).unwrap();
+        // The verdict frame (NeedSnapshot/HashMismatch) is the caller's
+        // responsibility — the transfer itself must open with
+        // SnapshotBegin.
         let mut it = frames.iter();
-        assert!(matches!(
-            decode(it.next().unwrap()),
-            PrimaryMessage::NeedSnapshot
-        ));
         let snap_len = match decode(it.next().unwrap()) {
             PrimaryMessage::SnapshotBegin {
                 snapshot_len,
