@@ -1711,5 +1711,76 @@ mod tests {
                 "error must name the recurrence: {err}"
             );
         }
+
+        // -------------------------------------------------------------
+        // Promotion teardown helper (`take_pipeline_for_promotion`) — the
+        // no-live-pipeline decision branches. With no pipeline to tear
+        // down it hands back the warm state held in the receiver's locals
+        // (a clean promotion) or errors when none is present. Colocated
+        // here for the `App` + `BufferedWriter` fixtures above; the
+        // Clean-pipeline branch needs a live pipeline (failover IT).
+        // -------------------------------------------------------------
+        type PromoteHandles =
+            crate::replication::ReplicaPipelineHandles<App, BufferedWriter<EvtAdd>>;
+
+        #[test]
+        fn promotion_hands_back_local_state_when_present() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut pipeline: Option<PromoteHandles> = None;
+            let mut exchange = Some(App);
+            let mut journal_writer =
+                Some(BufferedWriter::<EvtAdd>::create(&dir.path().join("p.journal")).unwrap());
+
+            let result = crate::replication::take_pipeline_for_promotion(
+                &mut pipeline,
+                &mut exchange,
+                &mut journal_writer,
+            );
+
+            assert!(matches!(result, Ok(Some(_))), "warm state must be promoted");
+            assert!(
+                exchange.is_none() && journal_writer.is_none(),
+                "state must be moved into the result"
+            );
+        }
+
+        #[test]
+        fn promotion_errs_when_no_local_state() {
+            let mut pipeline: Option<PromoteHandles> = None;
+            let mut exchange: Option<App> = None;
+            let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
+
+            let result = crate::replication::take_pipeline_for_promotion(
+                &mut pipeline,
+                &mut exchange,
+                &mut journal_writer,
+            );
+
+            // Not `expect_err` — the Ok payload (App) isn't `Debug`.
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("a promote with nothing to promote must error"),
+            };
+            assert!(
+                err.to_string().contains("no local state available"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn promotion_errs_on_partial_state() {
+            // Exchange present, writer missing — not a usable hand-off.
+            let mut pipeline: Option<PromoteHandles> = None;
+            let mut exchange = Some(App);
+            let mut journal_writer: Option<BufferedWriter<EvtAdd>> = None;
+
+            let result = crate::replication::take_pipeline_for_promotion(
+                &mut pipeline,
+                &mut exchange,
+                &mut journal_writer,
+            );
+
+            assert!(result.is_err(), "partial state is not a valid promotion");
+        }
     }
 }
