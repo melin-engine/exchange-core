@@ -65,6 +65,8 @@ use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use melin_app::Application;
 use melin_transport_core::pipeline::{InputSlot, OutputSlot};
+use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
+use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
 
 mod auth;
 #[cfg(feature = "dpdk")]
@@ -73,7 +75,7 @@ mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
 
-use receiver_transport::{SessionExit, StreamingResult};
+use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
 
 // Wire-protocol types, auth, catch-up, ack queueing, dual-track
 // cursor management, and per-replica metrics now live in
@@ -725,6 +727,246 @@ where
     match (exchange.take(), journal_writer.take()) {
         (Some(e), Some(w)) => Ok(Some((e, w))),
         _ => Err("promotion requested but no local state available".into()),
+    }
+}
+
+/// The four facts a successful snapshot + segment-seed transfer yields:
+/// `(snapshot App, snapshot sequence, snapshot chain hash, seed length)`.
+type ResyncTransfer<A> = (A, u64, [u8; 32], u64);
+
+/// What [`handle_resync_verdict`] resolved a `NeedSnapshot` /
+/// `HashMismatch` verdict to.
+pub(in crate::replication) enum ResyncDecision {
+    /// Resync complete — resume streaming from `resume_sequence` on the
+    /// re-seeded lineage `(segment_start_sequence, anchor_hash)`. The
+    /// recovered App + writer are left in the receiver's `exchange` /
+    /// `journal_writer` locals.
+    Ready {
+        segment_start_sequence: u64,
+        anchor_hash: [u8; 32],
+        resume_sequence: u64,
+    },
+    /// The transfer failed network-shaped (drop / restart mid-body); the
+    /// caller backs off and reconnects. The pre-resync lineage is already
+    /// archived and half-applied transfer state has been cleaned up.
+    Retry,
+}
+
+/// Receive the snapshot + segment-seed transfer that follows a resync
+/// verdict, installing both (snapshot → `snapshot_path`, seed →
+/// `journal_path`). Returns the snapshot App, its sequence + chain hash,
+/// and the seed length (the journal's `valid_end`). Shared by both
+/// receivers via [`ControlFrameSource`].
+///
+/// Errors here are network-shaped — the caller retries (see
+/// [`ResyncDecision::Retry`]); the post-transfer install in
+/// [`handle_resync_verdict`] is what's fatal.
+fn receive_resync_transfer<A, S>(
+    source: &mut S,
+    snapshot_path: &std::path::Path,
+    journal_path: &std::path::Path,
+    fence_state: &melin_transport_core::fence::FenceState,
+) -> Result<ResyncTransfer<A>, Box<dyn std::error::Error + Send + Sync>>
+where
+    A: Application,
+    S: ControlFrameSource,
+{
+    let (snap_len, snap_sequence, snap_chain_hash) =
+        match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
+            PrimaryMessage::SnapshotBegin {
+                snapshot_len,
+                snap_sequence,
+                snap_chain_hash,
+            } => (snapshot_len, snap_sequence, snap_chain_hash),
+            other => return Err(format!("expected SnapshotBegin, got {other:?}").into()),
+        };
+
+    tracing::info!(snap_sequence, snap_len, "receiving snapshot");
+    let tmp_path = snapshot_path.with_extension("snapshot.tmp");
+    receive_chunked_body(source, &tmp_path, snap_len, "snapshot")?;
+    std::fs::rename(&tmp_path, snapshot_path)?;
+    tracing::info!(snap_sequence, snap_len, "snapshot received and verified");
+
+    let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
+        melin_transport_core::snapshot::load::<A>(snapshot_path)?;
+    if snap_hash != snap_chain_hash {
+        return Err(format!(
+            "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
+             loaded snapshot has {snap_hash:02x?}"
+        )
+        .into());
+    }
+    // Adopt the primary's snapshot epoch — the resync rebases this replica
+    // onto the primary's lineage, including its epoch.
+    fence_state.observe_epoch(snap_epoch);
+
+    // Segment seed: the raw byte prefix of the primary's segment
+    // containing `snap_sequence`. Written verbatim as our live segment, it
+    // makes our segmentation a byte-copy of the primary's from birth —
+    // chain values comparable and `Rotate` verification valid immediately.
+    let seed_len = match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
+        PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
+        other => {
+            return Err(format!("expected SegmentSeedBegin after snapshot, got {other:?}").into());
+        }
+    };
+    let seed_tmp = journal_path.with_extension("seed.tmp");
+    receive_chunked_body(source, &seed_tmp, seed_len, "segment seed")?;
+    // Structural check before installing: the CRC only proves transport
+    // integrity, not that the primary sent a well-formed prefix ending at
+    // the snapshot sequence. (With hash-chain on, the chain cross-check in
+    // `handle_resync_verdict` subsumes this; without it, this is the only
+    // guard.)
+    if let Err(e) =
+        melin_journal::segment::verify_segment_prefix(&seed_tmp, snap_sequence, seed_len)
+    {
+        let _ = std::fs::remove_file(&seed_tmp);
+        return Err(format!("segment seed failed structural verification: {e}").into());
+    }
+    std::fs::rename(&seed_tmp, journal_path)?;
+    melin_journal::segment::fsync_parent_dir(journal_path)?;
+    Ok((snap_exchange, snap_sequence, snap_chain_hash, seed_len))
+}
+
+/// Handle a `NeedSnapshot` / `HashMismatch` resync verdict — shared by
+/// both receivers. Tears the pipeline down, archives the local lineage
+/// (never deleted), resets the handshake position, receives + installs
+/// the snapshot and segment seed via `source`, opens the re-seeded
+/// segment and ties its chain to the snapshot, then validates the
+/// post-snapshot `StreamStart` inline before resuming.
+///
+/// On success the recovered App + writer are left in `exchange` /
+/// `journal_writer` and [`ResyncDecision::Ready`] carries the resume
+/// lineage. A network-shaped transfer failure yields
+/// [`ResyncDecision::Retry`] (the caller backs off and reconnects). An
+/// inconsistent primary or a local install failure is fatal (`Err`).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::replication) fn handle_resync_verdict<A, W, S>(
+    divergent: bool,
+    source: &mut S,
+    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
+    exchange: &mut Option<A>,
+    journal_writer: &mut Option<W>,
+    journal_path: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    fence_state: &melin_transport_core::fence::FenceState,
+    last_sequence: &mut u64,
+    chain_hash: &mut [u8; 32],
+) -> Result<ResyncDecision, Box<dyn std::error::Error + Send + Sync>>
+where
+    A: Application + Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+    S: ControlFrameSource,
+{
+    // HashMismatch is NeedSnapshot plus the verdict that our local journal
+    // holds divergent history (forked from the primary's — e.g. an
+    // ex-primary rejoining after failover with an acked-but-unreplicated
+    // suffix).
+    if divergent {
+        tracing::warn!(
+            last_sequence = *last_sequence,
+            "primary reports chain divergence — archiving local journal, resyncing from snapshot"
+        );
+    } else {
+        tracing::info!("primary requires snapshot transfer — receiving snapshot");
+    }
+
+    if let Some(mut p) = pipeline.take() {
+        p.input_producer
+            .publish(InputSlot::<A::Event>::shutdown_sentinel());
+        let _ = teardown_replica_pipeline::<A, W>(p);
+    }
+
+    // Invalidate the in-memory App + writer before moving their backing
+    // files aside. On the in-process divergence repair path these still
+    // hold the recovered handles; a transfer failure returns `Retry`, and
+    // without this reset the stale writer — now pointing at an
+    // archived-away journal — would survive the fresh-replica create gate
+    // and get rebuilt into the next pipeline.
+    *exchange = None;
+    *journal_writer = None;
+
+    // Move the local lineage aside — never delete. Divergent journals are
+    // audit-trail material; stale ones may be the last copy of pruned
+    // history.
+    let reason = if divergent {
+        ArchiveReason::Divergent
+    } else {
+        ArchiveReason::Resync
+    };
+    archive_local_lineage(journal_path, snapshot_path, reason)?;
+    // Archived — a retried handshake must present as a fresh replica.
+    *last_sequence = 0;
+    *chain_hash = [0u8; 32];
+
+    let (snap_exchange, snap_sequence, snap_chain_hash, seed_len) =
+        match receive_resync_transfer::<A, S>(source, snapshot_path, journal_path, fence_state) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot transfer failed — retrying");
+                // Half-applied resync state, not audit material — drop it
+                // so the retry starts clean (the pre-resync lineage is
+                // already archived; this is not it).
+                let _ = std::fs::remove_file(snapshot_path);
+                return Ok(ResyncDecision::Retry);
+            }
+        };
+    *exchange = Some(snap_exchange);
+
+    // Open the seeded segment for appending at the snapshot position —
+    // recovery's resume path: the chain rebuilds from the seeded bytes and
+    // its value at `snap_sequence` must equal the (verified) snapshot's
+    // chain hash. `chain_hash()` is `None` only with `hash-chain` disabled
+    // (nothing to tie); an all-zeros snapshot hash means the primary runs
+    // without `hash-chain` (also nothing to tie).
+    let writer = W::open_append(journal_path, snap_sequence, seed_len)?;
+    let seeded_chain = writer.chain_hash().unwrap_or(snap_chain_hash);
+    if snap_chain_hash != [0u8; 32] && seeded_chain != snap_chain_hash {
+        return Err(format!(
+            "segment seed chain at {snap_sequence} disagrees with the transferred snapshot's \
+             hash — inconsistent primary"
+        )
+        .into());
+    }
+    let seeded_info = melin_journal::segment::read_header_info(journal_path)?;
+    *journal_writer = Some(writer);
+
+    // Validate the post-snapshot StreamStart inline before resuming — its
+    // lineage must agree with the seed the primary just transferred.
+    match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
+        PrimaryMessage::StreamStart {
+            start_sequence,
+            segment_start_sequence,
+            anchor_hash,
+            epoch,
+        } => {
+            if segment_start_sequence != seeded_info.starting_sequence
+                || anchor_hash != seeded_info.anchor_hash
+            {
+                return Err(format!(
+                    "post-snapshot StreamStart lineage (start {segment_start_sequence}) \
+                     disagrees with the transferred segment seed (start {}) — inconsistent \
+                     primary",
+                    seeded_info.starting_sequence
+                )
+                .into());
+            }
+            // We just rebased onto this primary's snapshot, so adopt its
+            // epoch wholesale (no stale-primary refusal — our prior state
+            // was discarded).
+            fence_state.observe_epoch(epoch);
+            tracing::info!(
+                start_sequence,
+                epoch,
+                "streaming resumed after snapshot transfer"
+            );
+            Ok(ResyncDecision::Ready {
+                segment_start_sequence,
+                anchor_hash,
+                resume_sequence: snap_sequence,
+            })
+        }
+        other => Err(format!("expected StreamStart after snapshot, got {other:?}").into()),
     }
 }
 
