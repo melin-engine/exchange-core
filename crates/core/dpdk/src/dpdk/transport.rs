@@ -216,7 +216,6 @@ unsafe impl Sync for DpdkShared {}
 ///
 /// All methods must be called from the owning poll thread.
 pub struct DpdkTransport {
-    _shared: Arc<DpdkShared>,
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -246,6 +245,15 @@ pub struct DpdkTransport {
     /// Total pending TX bytes across all connections. Avoids iterating
     /// tx_queues.values().any() on every poll cycle.
     pending_tx_bytes: usize,
+    /// Shared EAL/mempool/ports. MUST be the last field so it drops LAST:
+    /// Rust drops fields in declaration order, and `device`/`sockets`/
+    /// `tx_queues` return their in-flight mbufs to the mempool when they
+    /// drop. Dropping `_shared` first (when this is the last `Arc` holder)
+    /// would free the mempool and run `rte_eal_cleanup` while those mbufs
+    /// are still outstanding — a use-after-free that segfaults on any clean
+    /// teardown (e.g. an error-exit from the receiver loop, or graceful
+    /// shutdown). Keep it pinned to the end.
+    _shared: Arc<DpdkShared>,
 }
 
 /// Per-connection TX queue with cursor to avoid drain() memmoves.

@@ -126,6 +126,7 @@ fn generate_bindings() {
         .allowlist_function("rte_eth_dev_info_get")
         .allowlist_function("rte_eth_dev_start")
         .allowlist_function("rte_eth_dev_stop")
+        .allowlist_function("rte_eth_dev_close")
         .allowlist_function("rte_eth_rx_queue_setup")
         .allowlist_function("rte_eth_tx_queue_setup")
         .allowlist_function("rte_eth_dev_socket_id")

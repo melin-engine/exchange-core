@@ -263,7 +263,7 @@ impl Port {
     ///
     /// The flow handle returned by `rte_flow_create` is intentionally
     /// dropped — the rule lives for the lifetime of the port and is
-    /// torn down by `rte_eth_dev_stop` in `Port::drop`.
+    /// torn down when `Port::drop` stops and closes the device.
     pub fn install_src_ipv4_steering(
         &mut self,
         src_ipv4: std::net::Ipv4Addr,
@@ -309,6 +309,22 @@ impl Drop for Port {
                 ffi::rte_eth_dev_stop(self.port_id);
             }
             tracing::info!(port_id = self.port_id, "DPDK port stopped");
+        }
+        // Close the port (after stop) to release its RX/TX queues and, for
+        // vdev PMDs like net_tap, the backing kernel device — BEFORE EAL
+        // teardown. `rte_eal_cleanup()` walks the vdev bus and removes every
+        // device; a port left merely *stopped* (not closed) makes the tap
+        // PMD's remove path dereference freed queue state and segfault. The
+        // contract is stop → close → cleanup. Closing is valid on any
+        // configured port (a `Port` always represents one), started or not.
+        let ret = unsafe { ffi::rte_eth_dev_close(self.port_id) };
+        if ret != 0 {
+            // Best-effort: we are tearing down and have nowhere to propagate.
+            tracing::warn!(
+                port_id = self.port_id,
+                ret,
+                "rte_eth_dev_close returned non-zero"
+            );
         }
     }
 }
