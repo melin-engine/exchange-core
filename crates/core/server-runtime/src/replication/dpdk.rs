@@ -18,6 +18,7 @@ use melin_journal::JournalWrite;
 use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
+use super::auth::authenticate_with_primary;
 use super::receiver_transport::{
     ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop,
     try_extract_frame,
@@ -911,6 +912,7 @@ pub fn run_receiver_dpdk<A, W>(
     mut transport: melin_dpdk::DpdkTransport,
     primary_ip: std::net::Ipv4Addr,
     primary_port: u16,
+    signing_key: &ed25519_dalek::SigningKey,
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
@@ -1089,6 +1091,50 @@ where
             continue;
         }
         info!("connected to primary (DPDK)");
+
+        // Authenticate BEFORE the handshake — mirrors the kernel-TCP receiver.
+        // The primary issues a Challenge first and will not accept our
+        // Handshake until it verifies our signature. Runs the SHARED
+        // `authenticate_with_primary` over a blocking adapter that drives the
+        // smoltcp poll loop, so TCP and DPDK can never diverge on the auth flow.
+        const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        recv_buf.clear();
+        let auth_result = {
+            let mut auth_stream = DpdkAuthStream {
+                transport: &mut transport,
+                handle,
+                recv_buf: &mut recv_buf,
+                shutdown,
+                deadline: std::time::Instant::now() + AUTH_TIMEOUT,
+            };
+            authenticate_with_primary(&mut auth_stream, signing_key)
+        };
+        if let Err(e) = auth_result {
+            warn!(
+                error = %e,
+                backoff_secs = backoff.as_secs(),
+                "authentication failed (DPDK) — retrying"
+            );
+            transport.close(handle);
+            sleep_checking_flags(backoff, shutdown, promote);
+            if shutdown.load(Ordering::Relaxed) {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline::<A, W>(p);
+                }
+                return Ok(None);
+            }
+            if promote.load(Ordering::Acquire) {
+                info!("promotion triggered during reconnect backoff");
+                return take_pipeline_for_promotion(
+                    &mut pipeline,
+                    &mut exchange,
+                    &mut journal_writer,
+                );
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            continue;
+        }
+        info!("authenticated with primary (DPDK)");
 
         // Send handshake. Advertise our fencing epoch so a stale primary
         // self-demotes when it sees we are ahead (see `crate::fence`).
@@ -1372,6 +1418,74 @@ where
 /// framing shared by the snapshot payload and the segment seed. The
 /// tmp file is removed on any failure, so callers never see a partial
 /// file. Leaves any bytes past the trailer in `recv_buf`.
+/// Blocking `Read`/`Write` adapter over the DPDK transport so the SHARED
+/// [`authenticate_with_primary`] (written against blocking `Read`/`Write`)
+/// can run over the non-blocking smoltcp poll loop. `read` polls until bytes
+/// arrive then drains them from the front of `recv_buf`; `write` queues a
+/// frame and `flush` (or the next `read`) drives `poll()` to push it onto the
+/// wire. Shares the receiver's `recv_buf`, so any bytes that arrive past the
+/// auth exchange are carried into the handshake loop. Bounded by `deadline`
+/// so a silent primary cannot hang the receiver.
+struct DpdkAuthStream<'a> {
+    transport: &'a mut melin_dpdk::DpdkTransport,
+    handle: melin_dpdk::SocketHandle,
+    recv_buf: &'a mut Vec<u8>,
+    shutdown: &'a AtomicBool,
+    deadline: std::time::Instant,
+}
+
+impl io::Read for DpdkAuthStream<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if !self.recv_buf.is_empty() {
+                let n = self.recv_buf.len().min(out.len());
+                out[..n].copy_from_slice(&self.recv_buf[..n]);
+                // Drain consumed bytes from the front; anything past the auth
+                // frames stays for the handshake loop (same shared buffer).
+                self.recv_buf.drain(..n);
+                return Ok(n);
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(io::Error::other("shutdown during auth"));
+            }
+            if std::time::Instant::now() >= self.deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "auth timed out"));
+            }
+            self.transport.poll();
+            self.transport.recv_into_vec(self.handle, self.recv_buf);
+            // Only treat an empty read as a disconnect; a frame arriving in the
+            // same poll as the FIN is drained above before we get here.
+            if self.recv_buf.is_empty() && !self.transport.is_active(self.handle) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "primary disconnected during auth",
+                ));
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl io::Write for DpdkAuthStream<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // queue_send copies into the per-connection TX queue; poll() (flush
+        // below, or the next read) pushes it onto the wire. Returns false only
+        // when the queue is full — never expected for the tiny auth frames on a
+        // fresh connection, but surface it rather than silently drop.
+        if self.transport.queue_send(self.handle, data) {
+            Ok(data.len())
+        } else {
+            Err(io::Error::other("DPDK TX queue full during auth"))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Drive egress so the queued frame leaves before we block on a read.
+        self.transport.poll();
+        Ok(())
+    }
+}
+
 /// DPDK control-frame source: polls the smoltcp transport and extracts
 /// one length-prefixed frame per call. Drives the shared
 /// [`receive_chunked_body`] and the resync prologue reads
