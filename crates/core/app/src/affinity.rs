@@ -28,15 +28,19 @@
 //! callers (e.g. the bench progress thread that pins to core 0 on
 //! purpose to stay off the bench cores) keep the old semantics.
 
-/// Pin the calling thread to the specified logical CPU core and set
-/// `SCHED_FIFO` real-time scheduling priority.
+/// Pin the calling thread to the specified logical CPU core, and grant it
+/// `SCHED_FIFO` real-time scheduling priority when the core is isolated.
 ///
 /// Must be called from within the target thread (uses tid 0 = "self").
 /// Returns the core ID on success for logging convenience.
 ///
-/// `SCHED_FIFO` is only set on non-zero cores. Core 0 is the shared
-/// housekeeping core — RT priority there starves the kernel and other
-/// processes.
+/// Affinity is always set. `SCHED_FIFO` is granted only on a non-zero core
+/// that the kernel reports isolated (listed in
+/// `/sys/devices/system/cpu/isolated`, i.e. booted with `isolcpus=`) — see
+/// [`core_is_isolated`]. On a shared core a busy-spinning RT thread would
+/// starve every `SCHED_OTHER` thread co-located with it, so RT priority is
+/// withheld there (the thread keeps plain affinity). Core 0 is the shared
+/// housekeeping core and never gets RT priority regardless.
 ///
 /// `SCHED_FIFO` failure is non-fatal: the thread continues with default
 /// scheduling. This allows running without `CAP_SYS_NICE` during
@@ -82,10 +86,11 @@ pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
     if core_id > 0 && core_is_isolated(core_id) {
         set_realtime_fifo(1);
     } else if core_id > 0 {
-        tracing::debug!(
+        tracing::warn!(
             core = core_id,
             "core not isolated (no isolcpus); pinned affinity only, no SCHED_FIFO \
-             (real-time busy-spin on a shared core would starve co-located threads)"
+             (real-time busy-spin on a shared core would starve co-located threads). \
+             Boot with isolcpus on the pipeline cores for lowest tail latency."
         );
     }
 
