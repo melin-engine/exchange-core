@@ -130,18 +130,31 @@ echo ""
 echo "=== Auth keys ==="
 cd "$TMPDIR"
 "$PROJECT_DIR/target/release/melin-keygen" repl_key trader
-echo "trader $(cat repl_key.pub | tr -d '\n') repl" > authorized_keys
+# The DPDK primary now authenticates connecting replicas: the key must carry
+# Replication permission (the primary rejects Trader/Operator/etc.).
+echo "replication $(cat repl_key.pub | tr -d '\n') repl" > authorized_keys
 echo "  Generated repl_key.key + authorized_keys"
 echo ""
 
 # --- 4. Create veth pair ---
 echo "=== Creating veth pair ==="
 ip link add "$VETH_REPLICA" type veth peer name "$VETH_PRIMARY"
+# The DPDK replica skips ARP and addresses the primary by the synthetic
+# 02:00:<ip-octets> MAC (the SR-IOV VF convention from dpdk-setup.sh;
+# replication/dpdk.rs seeds it into smoltcp's neighbor cache). The af_packet
+# PMD reports the veth iface's MAC to smoltcp as its own hardware address, so
+# each end must OWN its synthetic MAC — otherwise smoltcp drops the peer's
+# frames (promiscuous mode delivers them to the PMD, but smoltcp rejects a
+# frame not addressed to its hardware address). Set the MAC while down.
+IFS=. read -r o1 o2 o3 o4 <<< "$PRIMARY_IP"
+ip link set "$VETH_PRIMARY" address "$(printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4")"
+IFS=. read -r o1 o2 o3 o4 <<< "$REPLICA_IP"
+ip link set "$VETH_REPLICA" address "$(printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4")"
 ip link set "$VETH_REPLICA" up
 ip link set "$VETH_PRIMARY" up
 ethtool -K "$VETH_REPLICA" tx off rx off 2>/dev/null || true
 ethtool -K "$VETH_PRIMARY" tx off rx off 2>/dev/null || true
-echo "  $VETH_REPLICA <-> $VETH_PRIMARY (up)"
+echo "  $VETH_REPLICA <-> $VETH_PRIMARY (up, synthetic 02:00:<ip> MACs)"
 echo ""
 
 # --- 5. Start primary ---
@@ -192,8 +205,9 @@ echo "=== Starting DPDK replica ==="
 RUST_LOG=info \
 "$PROJECT_DIR/target/release/melin-server" \
     --journal "$TMPDIR/replica.journal" \
-    --snapshot-interval-secs 0 \
+    --snapshot-interval-ms 0 \
     --replica-of "$PRIMARY_IP:$REPL_PORT" \
+    --replication-key "$TMPDIR/repl_key.key" \
     --dpdk-eal-args="--vdev=net_af_packet0,iface=$VETH_REPLICA --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=replica" \
     --dpdk-ip "$REPLICA_IP" \
     --dpdk-prefix-len "$PREFIX" \
