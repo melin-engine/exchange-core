@@ -2394,6 +2394,7 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
+            Arc::clone(&authorized_keys),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary
