@@ -161,12 +161,17 @@ pub(super) struct AuthChallenge {
     pub(super) deadline: std::time::Instant,
 }
 
-/// The transport surface the non-blocking sender-side auth step needs.
-/// Abstracted behind a trait so [`step_authentication`] can be exercised by a
-/// mock in unit tests — the concrete (DPDK) poll loop is otherwise only
-/// reachable through the DPDK smoke test. The associated `Handle` keeps tests
-/// off the real (non-constructible) `SocketHandle`; the impl for the DPDK
-/// transport lives in the `dpdk` module.
+/// The transport I/O surface the non-blocking auth code needs — the sender-side
+/// [`step_authentication`] and the receiver-side [`PolledAuthStream`].
+/// Abstracted behind a trait so both can be exercised by a mock in unit tests —
+/// the concrete (DPDK) poll loop is otherwise only reachable through the DPDK
+/// smoke test. The associated `Handle` keeps tests off the real
+/// (non-constructible) `SocketHandle`; the impl for the DPDK transport lives in
+/// the `dpdk` module.
+///
+/// Deliberately *I/O only* — no `close`. Connection teardown is the slot
+/// lifecycle's job (the DPDK driver's `go_idle`), so the auth step can never be
+/// the thing that does (or forgets) the close.
 #[cfg(any(feature = "dpdk", test))]
 pub(super) trait AuthTransport {
     type Handle: Copy;
@@ -178,8 +183,6 @@ pub(super) trait AuthTransport {
     fn queue_send(&mut self, handle: Self::Handle, data: &[u8]) -> bool;
     /// Drive the poll loop once (push queued egress, pull ingress).
     fn poll(&mut self);
-    /// Close the connection.
-    fn close(&mut self, handle: Self::Handle);
 }
 
 /// Outcome of one [`step_authentication`] call. The caller maps these onto its
@@ -193,8 +196,8 @@ pub(super) enum AuthOutcome {
     /// Verified; AuthOk has been queued. Advance to the handshake.
     Authenticated,
     /// Rejected: bad signature/permission, timeout, oversized frame, or a
-    /// mid-auth disconnect. The connection has been closed (idempotently, so a
-    /// replica that already vanished is fine) — the caller resets the slot.
+    /// mid-auth disconnect. Any AuthFailed notice has already been queued and
+    /// flushed; the caller tears the slot down, which closes the connection.
     Rejected,
 }
 
@@ -215,14 +218,12 @@ pub(super) fn step_authentication<T: AuthTransport>(
     authorized_keys: &melin_app::auth::AuthorizedKeys,
     slot_idx: usize,
 ) -> AuthOutcome {
-    // Replica gone mid-auth. `is_active` reads false both for an
-    // already-removed handle and for a socket still pinned in the smoltcp
-    // SocketSet in a Closed/TimeWait state — and `close` (idempotent) is the
-    // only path that reclaims the latter, so call it unconditionally rather
-    // than leak the entry.
+    // Replica gone mid-auth. The caller's teardown (`go_idle`) closes the
+    // handle — which `is_active` reads as false both for an already-removed
+    // handle and for a socket still pinned in the SocketSet in Closed/TimeWait,
+    // and `close` (idempotent) is the only path that reclaims the latter.
     if !transport.is_active(handle) {
         warn!(slot = slot_idx, "replica disconnected during auth (DPDK)");
-        transport.close(handle);
         return AuthOutcome::Rejected;
     }
 
@@ -234,7 +235,6 @@ pub(super) fn step_authentication<T: AuthTransport>(
             slot = slot_idx,
             "replica auth timed out (DPDK) — disconnecting"
         );
-        transport.close(handle);
         return AuthOutcome::Rejected;
     }
 
@@ -263,12 +263,11 @@ pub(super) fn step_authentication<T: AuthTransport>(
                 }
                 Err(e) => {
                     warn!(slot = slot_idx, error = %e, "replica auth failed (DPDK) — disconnecting");
-                    // Best-effort AuthFailed notice, pushed before we drop the
-                    // connection.
+                    // Best-effort AuthFailed notice, flushed (poll) before the
+                    // caller's teardown closes the connection.
                     encode_auth_failed(send_buf);
                     let _ = transport.queue_send(handle, send_buf);
                     transport.poll();
-                    transport.close(handle);
                     AuthOutcome::Rejected
                 }
             }
@@ -278,7 +277,6 @@ pub(super) fn step_authentication<T: AuthTransport>(
                 slot = slot_idx,
                 "oversized auth frame (DPDK) — disconnecting"
             );
-            transport.close(handle);
             AuthOutcome::Rejected
         }
         // Wait for more data next tick.
@@ -437,9 +435,10 @@ mod tests {
     // ---- Non-blocking sender step (`step_authentication`) ----
 
     /// In-memory [`AuthTransport`]: scripts the bytes successive
-    /// `recv_into_vec` calls deliver and captures what was sent and whether the
-    /// connection was closed. `Handle = ()` keeps the test off the real
-    /// (non-constructible) `SocketHandle`.
+    /// `recv_into_vec` calls deliver and captures what was sent. `Handle = ()`
+    /// keeps the test off the real (non-constructible) `SocketHandle`. There is
+    /// no `close` — teardown is the slot lifecycle's job, not the transport
+    /// surface's (see the trait doc).
     struct MockAuthTransport {
         active: bool,
         /// Chunks delivered one per `recv_into_vec` call, in order — models a
@@ -452,7 +451,6 @@ mod tests {
         close_when_drained: bool,
         /// Concatenation of every `queue_send` payload.
         sent: Vec<u8>,
-        closed: bool,
         /// `queue_send` reports the TX queue full (returns false) when set.
         tx_full: bool,
     }
@@ -466,13 +464,12 @@ mod tests {
                 recv_rounds: VecDeque::from([incoming]),
                 close_when_drained: false,
                 sent: Vec::new(),
-                closed: false,
                 tx_full: false,
             }
         }
 
         /// Deliver `rounds` one chunk per poll, then report the connection
-        /// closed — used by the receiver-adapter tests, where it guarantees a
+        /// inactive — used by the receiver-adapter tests, where it guarantees a
         /// `PolledAuthStream` read loop terminates instead of spinning.
         fn scripted(rounds: Vec<Vec<u8>>) -> Self {
             Self {
@@ -480,7 +477,6 @@ mod tests {
                 recv_rounds: rounds.into(),
                 close_when_drained: true,
                 sent: Vec::new(),
-                closed: false,
                 tx_full: false,
             }
         }
@@ -507,10 +503,6 @@ mod tests {
             true
         }
         fn poll(&mut self) {}
-        fn close(&mut self, _: ()) {
-            self.closed = true;
-            self.active = false;
-        }
     }
 
     /// Full wire frame (4-byte LE length prefix + body) of a `ChallengeResponse`
@@ -532,7 +524,7 @@ mod tests {
     }
 
     /// Run one auth step against `incoming`, returning the outcome and the mock
-    /// so the caller can assert on close / queued bytes.
+    /// so the caller can assert on the queued bytes.
     fn run_step(
         incoming: Vec<u8>,
         challenge: &AuthChallenge,
@@ -553,7 +545,6 @@ mod tests {
         let challenge = challenge_at(nonce, far_future());
         let (outcome, tx) = run_step(response_frame(&key, &nonce), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Authenticated));
-        assert!(!tx.closed, "a verified replica's connection stays open");
         assert!(
             decode_auth_result(&tx.sent[4..]).expect("AuthOk frame"),
             "AuthOk should be queued on success"
@@ -561,17 +552,17 @@ mod tests {
     }
 
     #[test]
-    fn step_rejects_and_closes_on_bad_signature() {
+    fn step_rejects_and_signals_failure_on_bad_signature() {
         let key = SigningKey::from_bytes(&[0x11; 32]);
         let keys = keys_for(&key, "replication");
         // Replica signs a different nonce than the one we challenged with.
         let challenge = challenge_at([0x42; 32], far_future());
         let (outcome, tx) = run_step(response_frame(&key, &[0x01; 32]), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(tx.closed, "a rejected replica is disconnected");
+        // AuthFailed queued + flushed; the caller's teardown then closes.
         assert!(
             !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
-            "AuthFailed should be queued before close"
+            "AuthFailed should be queued for a verification failure"
         );
     }
 
@@ -584,7 +575,10 @@ mod tests {
         let challenge = challenge_at(nonce, far_future());
         let (outcome, tx) = run_step(response_frame(&signer, &nonce), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(tx.closed);
+        assert!(
+            !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+            "an unknown key is told AuthFailed"
+        );
     }
 
     #[test]
@@ -595,7 +589,10 @@ mod tests {
         let challenge = challenge_at(nonce, far_future());
         let (outcome, tx) = run_step(response_frame(&key, &nonce), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(tx.closed);
+        assert!(
+            !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+            "a wrong-permission key is told AuthFailed"
+        );
     }
 
     #[test]
@@ -607,10 +604,6 @@ mod tests {
         let challenge = challenge_at([0x42; 32], std::time::Instant::now());
         let (outcome, tx) = run_step(Vec::new(), &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(
-            tx.closed,
-            "a silent replica past its deadline is disconnected"
-        );
         assert!(
             tx.sent.is_empty(),
             "no AuthFailed on timeout — nothing to say"
@@ -626,7 +619,7 @@ mod tests {
         let oversized = ((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes().to_vec();
         let (outcome, tx) = run_step(oversized, &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(tx.closed);
+        assert!(tx.sent.is_empty(), "no AuthFailed on a malformed frame");
     }
 
     #[test]
@@ -640,14 +633,11 @@ mod tests {
         partial.truncate(3);
         let (outcome, tx) = run_step(partial, &challenge, &keys);
         assert!(matches!(outcome, AuthOutcome::Pending));
-        assert!(
-            !tx.closed,
-            "an incomplete frame waits, it does not disconnect"
-        );
+        assert!(tx.sent.is_empty(), "an incomplete frame just waits");
     }
 
     #[test]
-    fn step_closes_on_disconnect_to_reclaim_socket() {
+    fn step_rejects_on_disconnect() {
         let key = SigningKey::from_bytes(&[0x11; 32]);
         let keys = keys_for(&key, "replication");
         let challenge = challenge_at([0x42; 32], far_future());
@@ -656,14 +646,10 @@ mod tests {
         let mut recv = Vec::new();
         let mut send = Vec::new();
         let outcome = step_authentication(&mut tx, (), &challenge, &mut recv, &mut send, &keys, 0);
+        // Rejected with nothing said; the caller's `go_idle` reclaims the
+        // (possibly still SocketSet-pinned) handle.
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        // `is_active` is false both for an already-removed handle and for a
-        // socket still pinned in the SocketSet (Closed/TimeWait); `close` is
-        // idempotent, so we call it unconditionally to reclaim the latter.
-        assert!(
-            tx.closed,
-            "a disconnected replica's socket entry is reclaimed"
-        );
+        assert!(tx.sent.is_empty());
     }
 
     // ---- Receiver-side blocking adapter (`PolledAuthStream`) ----

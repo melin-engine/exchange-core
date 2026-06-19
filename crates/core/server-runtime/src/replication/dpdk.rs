@@ -181,30 +181,55 @@ impl AuthTransport for melin_dpdk::DpdkTransport {
     fn poll(&mut self) {
         self.poll();
     }
-    fn close(&mut self, handle: Self::Handle) {
-        self.close(handle);
-    }
 }
 
-/// Reset a slot to `Idle` after an auth rejection (bad signature, timeout,
-/// oversized frame, or mid-auth disconnect). An `Authenticating` slot has not
-/// engaged the journal ring yet (auth precedes the handshake), so — unlike the
-/// eviction path — there is no `active_flag`/ring teardown to do; the `Idle`
-/// arm drains any residual ring entries. The transport handle is already
-/// closed by [`step_authentication`] where applicable.
-fn reset_authenticating_slot_to_idle(
-    slot: &mut DpdkReplicaSlot,
-    slot_idx: usize,
-    cursors: &ReplicaCursors,
-    metrics: &ReplicationMetrics,
-    replicas_connected: &AtomicU32,
-) {
-    slot.state = SlotState::Idle;
-    slot.recv_buf.clear();
-    slot.auth = None;
-    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-    replicas_connected.fetch_sub(1, Ordering::Release);
-    cursors.clear_on_disconnect(slot_idx);
+impl DpdkReplicaSlot {
+    /// The single transition back to `Idle` from a connected state
+    /// (`Authenticating` / `Handshaking` / `Streaming`). Every
+    /// disconnect / reject / eviction path funnels through here so none can
+    /// leak the smoltcp handle or desync the bookkeeping:
+    ///
+    /// - **Closes the socket** (idempotent) — reclaims it whether the handle is
+    ///   already removed *or* still pinned in the `SocketSet` in
+    ///   `Closed`/`TimeWait`. Making the close part of "go Idle" (rather than a
+    ///   step each arm must remember) is what prevents the
+    ///   leak-on-disconnect class of bug.
+    /// - Disengages the shared cursors **before** releasing the journal-stage
+    ///   gate — ordering contract B2 (a frozen shared-min would otherwise stop
+    ///   the primary acking client requests even with a healthy peer).
+    /// - Decrements the connected count and warns if the last replica just
+    ///   left (trading is now unprotected).
+    /// - Clears per-connection scratch (recv buffer, in-flight challenge,
+    ///   pending handshake validation).
+    ///
+    /// Callers never assign `SlotState::Idle` directly; they call this and keep
+    /// only their state-specific extras (e.g. eviction's ring skip).
+    fn go_idle(
+        &mut self,
+        slot_idx: usize,
+        transport: &mut melin_dpdk::DpdkTransport,
+        cursors: &ReplicaCursors,
+        metrics: &ReplicationMetrics,
+        replicas_connected: &AtomicU32,
+    ) {
+        if let SlotState::Authenticating(h) | SlotState::Handshaking(h) | SlotState::Streaming(h) =
+            self.state
+        {
+            transport.close(h);
+            // Disengage cursors before the active_flag Release — contract B2.
+            cursors.clear_on_disconnect(slot_idx);
+            self.active_flag.store(false, Ordering::Release);
+            metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+            // fetch_sub returns the prior count; == 1 means we just hit zero.
+            if replicas_connected.fetch_sub(1, Ordering::Release) == 1 {
+                warn!("all replicas disconnected — trading halted");
+            }
+        }
+        self.state = SlotState::Idle;
+        self.recv_buf.clear();
+        self.auth = None;
+        self.pending_validation = None;
+    }
 }
 
 /// Step-able DPDK replication state. Owns both slot state machines and the
@@ -404,38 +429,14 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 slot = i,
                 "evicting slow replica (ring backpressure timeout, DPDK)"
             );
-            if let SlotState::Streaming(h)
-            | SlotState::Handshaking(h)
-            | SlotState::Authenticating(h) = slot.state
-            {
-                transport.close(h);
-            }
-            // Disengage the slot's cursors BEFORE the active_flag
-            // Release — see `ReplicaCursors` for the ordering contract
-            // (B2) and why the shared min must be recomputed from the
-            // surviving slot (a frozen min stops the primary from
-            // acking client requests even though the surviving replica
-            // is healthy).
-            cursors.clear_on_disconnect(i);
-            metrics.catching_up[i].store(false, Ordering::Relaxed);
-            slot.active_flag.store(false, Ordering::Release);
-            slot.evict_flag.store(false, Ordering::Release);
-            slot.recv_buf.clear();
-            // Abandon any in-flight validation; the thread's send into a
-            // dropped channel is ignored.
-            slot.pending_validation = None;
-            // Abandon any in-flight auth challenge.
-            slot.auth = None;
-            // Drop any unread ring entries so a reconnecting replica
-            // on this slot doesn't replay pre-eviction data and stall
-            // the primary's replication cursor. See kernel-TCP path
-            // in tcp_sender.rs for the detailed rationale.
+            // Eviction-specific: drop any unread ring entries so a reconnecting
+            // replica on this slot doesn't replay pre-eviction data and stall
+            // the primary's replication cursor (see tcp_sender.rs), and clear
+            // the latch that fired this eviction. The close + cursor/gate/count
+            // teardown is the shared `go_idle`.
             slot.consumer.skip_to_producer();
-            slot.state = SlotState::Idle;
-            replicas_connected.fetch_sub(1, Ordering::Release);
-            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                warn!("all replicas disconnected — trading halted");
-            }
+            slot.evict_flag.store(false, Ordering::Release);
+            slot.go_idle(i, transport, cursors, metrics, replicas_connected);
         }
 
         let mut any_active = false;
@@ -479,13 +480,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot.auth = None;
                             slot.state = SlotState::Handshaking(handle);
                         }
-                        AuthOutcome::Rejected => reset_authenticating_slot_to_idle(
-                            slot,
-                            slot_idx,
-                            cursors,
-                            metrics,
-                            replicas_connected,
-                        ),
+                        AuthOutcome::Rejected => {
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected)
+                        }
                     }
                     continue;
                 }
@@ -499,17 +496,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot = slot_idx,
                             "replica disconnected during handshake (DPDK)"
                         );
-                        // `is_active` is false for a Closed/TimeWait socket
-                        // still in the SocketSet too; `close` (idempotent)
-                        // reclaims it rather than leaking the handle.
-                        transport.close(handle);
-                        slot.state = SlotState::Idle;
-                        slot.recv_buf.clear();
-                        // The handshake may have been mid-validation.
-                        slot.pending_validation = None;
-                        metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        cursors.clear_on_disconnect(slot_idx);
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         continue;
                     }
 
@@ -531,12 +518,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     slot = slot_idx,
                                     "handshake validation thread died — disconnecting"
                                 );
-                                transport.close(handle);
-                                slot.state = SlotState::Idle;
-                                slot.recv_buf.clear();
-                                metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                                replicas_connected.fetch_sub(1, Ordering::Release);
-                                cursors.clear_on_disconnect(slot_idx);
+                                slot.go_idle(
+                                    slot_idx,
+                                    transport,
+                                    cursors,
+                                    metrics,
+                                    replicas_connected,
+                                );
                                 continue;
                             }
                             Ok(res) => res,
@@ -565,12 +553,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             }
                             Err(e) => {
                                 warn!(slot = slot_idx, error = %e, "handshake validation failed — disconnecting");
-                                transport.close(handle);
-                                slot.state = SlotState::Idle;
-                                slot.recv_buf.clear();
-                                metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                                replicas_connected.fetch_sub(1, Ordering::Release);
-                                cursors.clear_on_disconnect(slot_idx);
+                                slot.go_idle(
+                                    slot_idx,
+                                    transport,
+                                    cursors,
+                                    metrics,
+                                    replicas_connected,
+                                );
                                 continue;
                             }
                         };
@@ -588,12 +577,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 Ok(v) => v,
                                 Err(e) => {
                                     warn!(slot = slot_idx, error = %e, "catch-up probe failed — disconnecting");
-                                    transport.close(handle);
-                                    slot.state = SlotState::Idle;
-                                    slot.recv_buf.clear();
-                                    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                                    replicas_connected.fetch_sub(1, Ordering::Release);
-                                    cursors.clear_on_disconnect(slot_idx);
+                                    slot.go_idle(
+                                        slot_idx,
+                                        transport,
+                                        cursors,
+                                        metrics,
+                                        replicas_connected,
+                                    );
                                     continue;
                                 }
                             }
@@ -696,12 +686,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                         if let Some(e) = catchup_err {
                             warn!(slot = slot_idx, error = %e, "catch-up/snapshot failed — disconnecting");
-                            transport.close(handle);
-                            slot.state = SlotState::Idle;
-                            slot.recv_buf.clear();
-                            metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                            replicas_connected.fetch_sub(1, Ordering::Release);
-                            cursors.clear_on_disconnect(slot_idx);
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                             continue;
                         }
 
@@ -739,15 +724,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             Ok(sent) => slot.sent = sent,
                             Err(e) => {
                                 warn!(slot = slot_idx, error = %e, "catch-up handoff failed — disconnecting");
-                                transport.close(handle);
-                                slot.state = SlotState::Idle;
-                                slot.recv_buf.clear();
-                                metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                                replicas_connected.fetch_sub(1, Ordering::Release);
-                                // Disengage cursors before clearing
-                                // active — ordering contract B2.
-                                cursors.clear_on_disconnect(slot_idx);
-                                slot.active_flag.store(false, Ordering::Release);
+                                slot.go_idle(
+                                    slot_idx,
+                                    transport,
+                                    cursors,
+                                    metrics,
+                                    replicas_connected,
+                                );
                                 continue;
                             }
                         }
@@ -794,11 +777,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                                  and shutting down (DPDK)"
                                             );
                                         }
-                                        transport.close(handle);
-                                        slot.state = SlotState::Idle;
-                                        slot.recv_buf.clear();
-                                        replicas_connected.fetch_sub(1, Ordering::Release);
-                                        cursors.clear_on_disconnect(slot_idx);
+                                        slot.go_idle(
+                                            slot_idx,
+                                            transport,
+                                            cursors,
+                                            metrics,
+                                            replicas_connected,
+                                        );
                                         continue;
                                     }
 
@@ -838,13 +823,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         }
                                         Err(e) => {
                                             warn!(slot = slot_idx, error = %e, "failed to spawn handshake validation thread — disconnecting");
-                                            transport.close(handle);
-                                            slot.state = SlotState::Idle;
-                                            slot.recv_buf.clear();
-                                            metrics.catching_up[slot_idx]
-                                                .store(false, Ordering::Relaxed);
-                                            replicas_connected.fetch_sub(1, Ordering::Release);
-                                            cursors.clear_on_disconnect(slot_idx);
+                                            slot.go_idle(
+                                                slot_idx,
+                                                transport,
+                                                cursors,
+                                                metrics,
+                                                replicas_connected,
+                                            );
                                         }
                                     }
                                 }
@@ -853,29 +838,29 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         slot = slot_idx,
                                         "expected Handshake, got Ack — disconnecting"
                                     );
-                                    transport.close(handle);
-                                    slot.state = SlotState::Idle;
-                                    slot.recv_buf.clear();
-                                    replicas_connected.fetch_sub(1, Ordering::Release);
-                                    cursors.clear_on_disconnect(slot_idx);
+                                    slot.go_idle(
+                                        slot_idx,
+                                        transport,
+                                        cursors,
+                                        metrics,
+                                        replicas_connected,
+                                    );
                                 }
                                 Err(e) => {
                                     warn!(slot = slot_idx, error = %e, "failed to decode handshake — disconnecting");
-                                    transport.close(handle);
-                                    slot.state = SlotState::Idle;
-                                    slot.recv_buf.clear();
-                                    replicas_connected.fetch_sub(1, Ordering::Release);
-                                    cursors.clear_on_disconnect(slot_idx);
+                                    slot.go_idle(
+                                        slot_idx,
+                                        transport,
+                                        cursors,
+                                        metrics,
+                                        replicas_connected,
+                                    );
                                 }
                             }
                         }
                         FrameResult::Oversized => {
                             warn!(slot = slot_idx, "oversized handshake frame — disconnecting");
-                            transport.close(handle);
-                            slot.state = SlotState::Idle;
-                            slot.recv_buf.clear();
-                            replicas_connected.fetch_sub(1, Ordering::Release);
-                            cursors.clear_on_disconnect(slot_idx);
+                            slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         }
                         FrameResult::Incomplete => {} // Wait for more data.
                     }
@@ -918,16 +903,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     }
                     compact_recv_buf(&mut slot.recv_buf, consumed);
                     if ack_error {
-                        transport.close(handle);
-                        // Disengage cursors before the active_flag Release — see B2.
-                        cursors.clear_on_disconnect(slot_idx);
-                        slot.active_flag.store(false, Ordering::Release);
-                        slot.recv_buf.clear();
-                        slot.state = SlotState::Idle;
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            warn!("all replicas disconnected — trading halted");
-                        }
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         continue;
                     }
 
@@ -994,16 +970,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot = slot_idx,
                             "TX overflow on replica socket — disconnecting"
                         );
-                        transport.close(handle);
-                        // Disengage cursors before the active_flag Release — see B2.
-                        cursors.clear_on_disconnect(slot_idx);
-                        slot.active_flag.store(false, Ordering::Release);
-                        slot.recv_buf.clear();
-                        slot.state = SlotState::Idle;
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            warn!("all replicas disconnected — trading halted");
-                        }
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         continue;
                     }
                     if !slot.send_buf.is_empty() {
@@ -1028,19 +995,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 4. Check for disconnect.
                     if !transport.is_active(handle) {
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
-                        // `is_active` is false for a Closed/TimeWait socket
-                        // still in the SocketSet too; `close` (idempotent)
-                        // reclaims it rather than leaking the handle.
-                        transport.close(handle);
-                        // Disengage cursors before the active_flag Release — see B2.
-                        cursors.clear_on_disconnect(slot_idx);
-                        slot.active_flag.store(false, Ordering::Release);
-                        slot.recv_buf.clear();
-                        slot.state = SlotState::Idle;
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            warn!("all replicas disconnected — trading halted");
-                        }
+                        slot.go_idle(slot_idx, transport, cursors, metrics, replicas_connected);
                         continue;
                     }
 
