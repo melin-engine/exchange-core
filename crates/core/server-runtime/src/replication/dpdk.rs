@@ -18,7 +18,10 @@ use melin_journal::JournalWrite;
 use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
-use super::auth::{authenticate_with_primary, generate_challenge_nonce, verify_challenge_response};
+use super::auth::{
+    AuthChallenge, AuthOutcome, AuthTransport, authenticate_with_primary, generate_challenge_nonce,
+    step_authentication,
+};
 use super::receiver_transport::{
     ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop,
     try_extract_frame,
@@ -36,9 +39,8 @@ use melin_transport_core::replication::catchup::{
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, PrimaryMessage, ReplicaMessage, decode_primary_message,
-    decode_replica_message, encode_ack, encode_auth_failed, encode_auth_ok, encode_challenge,
-    encode_handshake, encode_hash_mismatch, encode_heartbeat, encode_need_snapshot,
-    encode_stream_start,
+    decode_replica_message, encode_ack, encode_challenge, encode_handshake, encode_hash_mismatch,
+    encode_heartbeat, encode_need_snapshot, encode_stream_start,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
@@ -116,17 +118,6 @@ enum SlotState {
     Streaming(melin_dpdk::SocketHandle),
 }
 
-/// In-flight challenge state while a slot is `Authenticating`. Holds the
-/// nonce we issued (verified against the replica's signature) and the
-/// deadline by which a valid response must arrive — a silent or malicious
-/// replica must not occupy a slot forever, but unlike the kernel-TCP
-/// blocking auth it also must not stall the shared poll thread, so the
-/// timeout is enforced across ticks rather than as a blocking read timeout.
-struct AuthChallenge {
-    nonce: [u8; 32],
-    deadline: std::time::Instant,
-}
-
 /// Deadline for one side of the DPDK auth exchange to make progress. On the
 /// sender it bounds how long a connected-but-silent replica may hold a slot
 /// before we reclaim it; on the receiver it bounds the wait for the
@@ -167,6 +158,53 @@ struct DpdkReplicaSlot {
     /// `Some` while this slot is `Authenticating` — the challenge we issued
     /// and its deadline. Cleared on transition out of `Authenticating`.
     auth: Option<AuthChallenge>,
+}
+
+// The sender-side auth-step machinery — the `AuthTransport` surface,
+// `AuthOutcome`, `AuthChallenge`, and `step_authentication` — lives in
+// `super::auth` so the protocol step is shared with the kernel-TCP path,
+// transport-agnostic, and unit-testable without the `dpdk` feature. Only the
+// concrete transport impl belongs here.
+impl AuthTransport for melin_dpdk::DpdkTransport {
+    type Handle = melin_dpdk::SocketHandle;
+    // Each method forwards to the inherent method of the same name (inherent
+    // resolution wins, so there is no recursion).
+    fn is_active(&mut self, handle: Self::Handle) -> bool {
+        self.is_active(handle)
+    }
+    fn recv_into_vec(&mut self, handle: Self::Handle, dest: &mut Vec<u8>) {
+        self.recv_into_vec(handle, dest);
+    }
+    fn queue_send(&mut self, handle: Self::Handle, data: &[u8]) -> bool {
+        self.queue_send(handle, data)
+    }
+    fn poll(&mut self) {
+        self.poll();
+    }
+    fn close(&mut self, handle: Self::Handle) {
+        self.close(handle);
+    }
+}
+
+/// Reset a slot to `Idle` after an auth rejection (bad signature, timeout,
+/// oversized frame, or mid-auth disconnect). An `Authenticating` slot has not
+/// engaged the journal ring yet (auth precedes the handshake), so — unlike the
+/// eviction path — there is no `active_flag`/ring teardown to do; the `Idle`
+/// arm drains any residual ring entries. The transport handle is already
+/// closed by [`step_authentication`] where applicable.
+fn reset_authenticating_slot_to_idle(
+    slot: &mut DpdkReplicaSlot,
+    slot_idx: usize,
+    cursors: &ReplicaCursors,
+    metrics: &ReplicationMetrics,
+    replicas_connected: &AtomicU32,
+) {
+    slot.state = SlotState::Idle;
+    slot.recv_buf.clear();
+    slot.auth = None;
+    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+    replicas_connected.fetch_sub(1, Ordering::Release);
+    cursors.clear_on_disconnect(slot_idx);
 }
 
 /// Step-able DPDK replication state. Owns both slot state machines and the
@@ -416,105 +454,38 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 SlotState::Authenticating(handle) => {
                     any_active = true;
 
-                    // Replica vanished mid-auth — already gone, nothing to
-                    // close.
-                    if !transport.is_active(handle) {
-                        warn!(slot = slot_idx, "replica disconnected during auth (DPDK)");
-                        slot.state = SlotState::Idle;
-                        slot.recv_buf.clear();
-                        slot.auth = None;
-                        metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        cursors.clear_on_disconnect(slot_idx);
-                        continue;
-                    }
+                    // `auth` is always `Some` here — set in `accept_connection`
+                    // and cleared only on transition out of `Authenticating`.
+                    // The shared borrow of `slot.auth` coexists with the two
+                    // `&mut` buffer borrows below because they are disjoint
+                    // fields.
+                    let challenge = slot
+                        .auth
+                        .as_ref()
+                        .expect("auth challenge present while Authenticating");
 
-                    // Copy the challenge out so the slot is free to mutate
-                    // below (the nonce + deadline are `Copy`).
-                    let (nonce, deadline) = {
-                        let ch = slot
-                            .auth
-                            .as_ref()
-                            .expect("auth challenge present while Authenticating");
-                        (ch.nonce, ch.deadline)
-                    };
-
-                    // Deadline enforced across ticks: a connected-but-silent
-                    // replica frees its slot without ever blocking the poll
-                    // thread (cf. the kernel-TCP sender's blocking read
-                    // timeout, which it can afford on its per-replica thread).
-                    if std::time::Instant::now() >= deadline {
-                        warn!(
-                            slot = slot_idx,
-                            "replica auth timed out (DPDK) — disconnecting"
-                        );
-                        transport.close(handle);
-                        slot.state = SlotState::Idle;
-                        slot.recv_buf.clear();
-                        slot.auth = None;
-                        metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        cursors.clear_on_disconnect(slot_idx);
-                        continue;
-                    }
-
-                    // Accumulate the ChallengeResponse frame.
-                    transport.recv_into_vec(handle, &mut slot.recv_buf);
-                    match try_extract_frame(&slot.recv_buf, MAX_CONTROL_FRAME) {
-                        FrameResult::Complete(payload_start, frame_end) => {
-                            // Shared verification with the kernel-TCP path —
-                            // the security-critical step (decode, authorized-
-                            // keys lookup, Replication-permission check,
-                            // Ed25519 verify over the nonce).
-                            let verdict = verify_challenge_response(
-                                &nonce,
-                                &slot.recv_buf[payload_start..frame_end],
-                                authorized_keys,
-                            );
-                            compact_recv_buf(&mut slot.recv_buf, frame_end);
-                            slot.send_buf.clear();
-                            match verdict {
-                                Ok(()) => {
-                                    // Best-effort AuthOk; the tiny frame
-                                    // flushes on the next poll. A full TX
-                                    // queue surfaces as a disconnect next tick.
-                                    encode_auth_ok(&mut slot.send_buf);
-                                    let _ = transport.queue_send(handle, &slot.send_buf);
-                                    info!(slot = slot_idx, "replica authenticated (DPDK)");
-                                    slot.auth = None;
-                                    slot.state = SlotState::Handshaking(handle);
-                                }
-                                Err(e) => {
-                                    warn!(slot = slot_idx, error = %e, "replica auth failed (DPDK) — disconnecting");
-                                    // Best-effort AuthFailed notice, pushed
-                                    // before we drop the connection.
-                                    encode_auth_failed(&mut slot.send_buf);
-                                    let _ = transport.queue_send(handle, &slot.send_buf);
-                                    transport.poll();
-                                    transport.close(handle);
-                                    slot.state = SlotState::Idle;
-                                    slot.recv_buf.clear();
-                                    slot.auth = None;
-                                    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                                    replicas_connected.fetch_sub(1, Ordering::Release);
-                                    cursors.clear_on_disconnect(slot_idx);
-                                }
-                            }
-                        }
-                        FrameResult::Oversized => {
-                            warn!(
-                                slot = slot_idx,
-                                "oversized auth frame (DPDK) — disconnecting"
-                            );
-                            transport.close(handle);
-                            slot.state = SlotState::Idle;
-                            slot.recv_buf.clear();
+                    match step_authentication(
+                        transport,
+                        handle,
+                        challenge,
+                        &mut slot.recv_buf,
+                        &mut slot.send_buf,
+                        authorized_keys,
+                        slot_idx,
+                    ) {
+                        // Frame not yet complete — wait for more data next tick.
+                        AuthOutcome::Pending => {}
+                        AuthOutcome::Authenticated => {
                             slot.auth = None;
-                            metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-                            replicas_connected.fetch_sub(1, Ordering::Release);
-                            cursors.clear_on_disconnect(slot_idx);
+                            slot.state = SlotState::Handshaking(handle);
                         }
-                        FrameResult::Incomplete => {} // Wait for more data next tick.
+                        AuthOutcome::Rejected => reset_authenticating_slot_to_idle(
+                            slot,
+                            slot_idx,
+                            cursors,
+                            metrics,
+                            replicas_connected,
+                        ),
                     }
                     continue;
                 }

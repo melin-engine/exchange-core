@@ -11,10 +11,18 @@
 
 use std::io::{self, Read, Write};
 
+// Used by the non-blocking `step_authentication` below, which only exists for
+// the DPDK sender (and tests) — hence the matching cfg gate.
+#[cfg(any(feature = "dpdk", test))]
+use tracing::{info, warn};
+
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, decode_auth_result, decode_challenge, decode_challenge_response,
     encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response, read_frame,
 };
+
+#[cfg(any(feature = "dpdk", test))]
+use super::receiver_transport::{FrameResult, compact_recv_buf, try_extract_frame};
 
 /// Generate a fresh 32-byte challenge nonce.
 ///
@@ -136,6 +144,138 @@ pub(super) fn authenticate_with_primary<S: Read + Write>(
     }
 }
 
+/// In-flight challenge state while a sender slot is authenticating. Holds the
+/// nonce we issued (verified against the replica's signature) and the deadline
+/// by which a valid response must arrive — a silent or malicious replica must
+/// not occupy a slot forever, but unlike the blocking [`authenticate_replica`]
+/// it also must not stall the shared poll thread, so the timeout is enforced
+/// across ticks rather than as a blocking read timeout.
+#[cfg(any(feature = "dpdk", test))]
+pub(super) struct AuthChallenge {
+    pub(super) nonce: [u8; 32],
+    pub(super) deadline: std::time::Instant,
+}
+
+/// The transport surface the non-blocking sender-side auth step needs.
+/// Abstracted behind a trait so [`step_authentication`] can be exercised by a
+/// mock in unit tests — the concrete (DPDK) poll loop is otherwise only
+/// reachable through the DPDK smoke test. The associated `Handle` keeps tests
+/// off the real (non-constructible) `SocketHandle`; the impl for the DPDK
+/// transport lives in the `dpdk` module.
+#[cfg(any(feature = "dpdk", test))]
+pub(super) trait AuthTransport {
+    type Handle: Copy;
+    /// Whether the connection is still open.
+    fn is_active(&mut self, handle: Self::Handle) -> bool;
+    /// Append any bytes received on `handle` to `dest`.
+    fn recv_into_vec(&mut self, handle: Self::Handle, dest: &mut Vec<u8>);
+    /// Queue `data` for send; `false` if the per-connection TX queue is full.
+    fn queue_send(&mut self, handle: Self::Handle, data: &[u8]) -> bool;
+    /// Drive the poll loop once (push queued egress, pull ingress).
+    fn poll(&mut self);
+    /// Close the connection.
+    fn close(&mut self, handle: Self::Handle);
+}
+
+/// Outcome of one [`step_authentication`] call. The caller maps these onto its
+/// slot bookkeeping; the protocol/transport work — reading the response, the
+/// shared signature verification, and queuing AuthOk/AuthFailed — happens
+/// inside the step so it can be unit-tested over a mock transport.
+#[cfg(any(feature = "dpdk", test))]
+pub(super) enum AuthOutcome {
+    /// Response frame not yet complete — remain authenticating.
+    Pending,
+    /// Verified; AuthOk has been queued. Advance to the handshake.
+    Authenticated,
+    /// Rejected: bad signature/permission, timeout, oversized frame, or a
+    /// mid-auth disconnect. The connection has been closed (unless the replica
+    /// was already gone) — the caller resets the slot.
+    Rejected,
+}
+
+/// Advance one slot's challenge/response by one poll tick — the non-blocking
+/// analog of [`authenticate_replica`] for a poll-driven sender. Touches only
+/// the transport, the receive/send buffers, and the key table (no slot/cursor/
+/// metric state), so the security-critical failure paths — timeout, oversized
+/// frame, mid-auth disconnect, bad signature — are unit-testable with a mock
+/// [`AuthTransport`]. Shares [`verify_challenge_response`] with the blocking
+/// path so the two transports cannot diverge.
+#[cfg(any(feature = "dpdk", test))]
+pub(super) fn step_authentication<T: AuthTransport>(
+    transport: &mut T,
+    handle: T::Handle,
+    challenge: &AuthChallenge,
+    recv_buf: &mut Vec<u8>,
+    send_buf: &mut Vec<u8>,
+    authorized_keys: &melin_app::auth::AuthorizedKeys,
+    slot_idx: usize,
+) -> AuthOutcome {
+    // Replica vanished mid-auth — already gone, nothing to close.
+    if !transport.is_active(handle) {
+        warn!(slot = slot_idx, "replica disconnected during auth (DPDK)");
+        return AuthOutcome::Rejected;
+    }
+
+    // Deadline enforced across ticks: a connected-but-silent replica frees its
+    // slot without ever blocking the poll thread (cf. the blocking sender's
+    // read timeout, which it can afford on its per-replica thread).
+    if std::time::Instant::now() >= challenge.deadline {
+        warn!(
+            slot = slot_idx,
+            "replica auth timed out (DPDK) — disconnecting"
+        );
+        transport.close(handle);
+        return AuthOutcome::Rejected;
+    }
+
+    // Accumulate the ChallengeResponse frame.
+    transport.recv_into_vec(handle, recv_buf);
+    match try_extract_frame(recv_buf, MAX_CONTROL_FRAME) {
+        FrameResult::Complete(payload_start, frame_end) => {
+            // Shared verification with the kernel-TCP path — the
+            // security-critical step (decode, authorized-keys lookup,
+            // Replication-permission check, Ed25519 verify over the nonce).
+            let verdict = verify_challenge_response(
+                &challenge.nonce,
+                &recv_buf[payload_start..frame_end],
+                authorized_keys,
+            );
+            compact_recv_buf(recv_buf, frame_end);
+            send_buf.clear();
+            match verdict {
+                Ok(()) => {
+                    // Best-effort AuthOk; the tiny frame flushes on the next
+                    // poll. A full TX queue surfaces as a disconnect next tick.
+                    encode_auth_ok(send_buf);
+                    let _ = transport.queue_send(handle, send_buf);
+                    info!(slot = slot_idx, "replica authenticated (DPDK)");
+                    AuthOutcome::Authenticated
+                }
+                Err(e) => {
+                    warn!(slot = slot_idx, error = %e, "replica auth failed (DPDK) — disconnecting");
+                    // Best-effort AuthFailed notice, pushed before we drop the
+                    // connection.
+                    encode_auth_failed(send_buf);
+                    let _ = transport.queue_send(handle, send_buf);
+                    transport.poll();
+                    transport.close(handle);
+                    AuthOutcome::Rejected
+                }
+            }
+        }
+        FrameResult::Oversized => {
+            warn!(
+                slot = slot_idx,
+                "oversized auth frame (DPDK) — disconnecting"
+            );
+            transport.close(handle);
+            AuthOutcome::Rejected
+        }
+        // Wait for more data next tick.
+        FrameResult::Incomplete => AuthOutcome::Pending,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +343,197 @@ mod tests {
         let err = verify_challenge_response(&challenge, &response_payload(&key, &signed), &keys)
             .unwrap_err();
         assert!(err.to_string().contains("signature"));
+    }
+
+    // ---- Non-blocking sender step (`step_authentication`) ----
+
+    /// In-memory [`AuthTransport`]: scripts the bytes the next `recv_into_vec`
+    /// delivers and captures what was sent and whether the connection was
+    /// closed. `Handle = ()` keeps the test off the real (non-constructible)
+    /// `SocketHandle`.
+    struct MockAuthTransport {
+        active: bool,
+        /// Delivered (and drained) by the next `recv_into_vec`.
+        incoming: Vec<u8>,
+        /// Concatenation of every `queue_send` payload.
+        sent: Vec<u8>,
+        closed: bool,
+    }
+
+    impl MockAuthTransport {
+        fn with_incoming(incoming: Vec<u8>) -> Self {
+            Self {
+                active: true,
+                incoming,
+                sent: Vec::new(),
+                closed: false,
+            }
+        }
+    }
+
+    impl AuthTransport for MockAuthTransport {
+        type Handle = ();
+        fn is_active(&mut self, _: ()) -> bool {
+            self.active
+        }
+        fn recv_into_vec(&mut self, _: (), dest: &mut Vec<u8>) {
+            dest.append(&mut self.incoming);
+        }
+        fn queue_send(&mut self, _: (), data: &[u8]) -> bool {
+            self.sent.extend_from_slice(data);
+            true
+        }
+        fn poll(&mut self) {}
+        fn close(&mut self, _: ()) {
+            self.closed = true;
+            self.active = false;
+        }
+    }
+
+    /// Full wire frame (4-byte LE length prefix + body) of a `ChallengeResponse`
+    /// signing `nonce` with `key` — exactly what the replica puts on the wire
+    /// (cf. `response_payload`, which strips the prefix).
+    fn response_frame(key: &SigningKey, nonce: &[u8; 32]) -> Vec<u8> {
+        let sig = key.sign(nonce);
+        let mut frame = Vec::new();
+        encode_challenge_response(&sig.to_bytes(), key.verifying_key().as_bytes(), &mut frame);
+        frame
+    }
+
+    fn challenge_at(nonce: [u8; 32], deadline: std::time::Instant) -> AuthChallenge {
+        AuthChallenge { nonce, deadline }
+    }
+
+    fn far_future() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    /// Run one auth step against `incoming`, returning the outcome and the mock
+    /// so the caller can assert on close / queued bytes.
+    fn run_step(
+        incoming: Vec<u8>,
+        challenge: &AuthChallenge,
+        keys: &melin_app::auth::AuthorizedKeys,
+    ) -> (AuthOutcome, MockAuthTransport) {
+        let mut tx = MockAuthTransport::with_incoming(incoming);
+        let mut recv = Vec::new();
+        let mut send = Vec::new();
+        let outcome = step_authentication(&mut tx, (), challenge, &mut recv, &mut send, keys, 0);
+        (outcome, tx)
+    }
+
+    #[test]
+    fn step_authenticates_valid_response() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        let nonce = [0x42; 32];
+        let challenge = challenge_at(nonce, far_future());
+        let (outcome, tx) = run_step(response_frame(&key, &nonce), &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Authenticated));
+        assert!(!tx.closed, "a verified replica's connection stays open");
+        assert!(
+            decode_auth_result(&tx.sent[4..]).expect("AuthOk frame"),
+            "AuthOk should be queued on success"
+        );
+    }
+
+    #[test]
+    fn step_rejects_and_closes_on_bad_signature() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        // Replica signs a different nonce than the one we challenged with.
+        let challenge = challenge_at([0x42; 32], far_future());
+        let (outcome, tx) = run_step(response_frame(&key, &[0x01; 32]), &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(tx.closed, "a rejected replica is disconnected");
+        assert!(
+            !decode_auth_result(&tx.sent[4..]).expect("AuthFailed frame"),
+            "AuthFailed should be queued before close"
+        );
+    }
+
+    #[test]
+    fn step_rejects_unknown_key() {
+        let signer = SigningKey::from_bytes(&[0x22; 32]);
+        let listed = SigningKey::from_bytes(&[0x33; 32]);
+        let keys = keys_for(&listed, "replication"); // table lists a different key
+        let nonce = [0x42; 32];
+        let challenge = challenge_at(nonce, far_future());
+        let (outcome, tx) = run_step(response_frame(&signer, &nonce), &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(tx.closed);
+    }
+
+    #[test]
+    fn step_rejects_non_replication_permission() {
+        let key = SigningKey::from_bytes(&[0x44; 32]);
+        let keys = keys_for(&key, "trader"); // valid key, wrong permission
+        let nonce = [0x42; 32];
+        let challenge = challenge_at(nonce, far_future());
+        let (outcome, tx) = run_step(response_frame(&key, &nonce), &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(tx.closed);
+    }
+
+    #[test]
+    fn step_times_out_past_deadline() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        // Deadline = now; the monotonic clock read inside the step is `>=` it,
+        // so the timeout trips. No data delivered.
+        let challenge = challenge_at([0x42; 32], std::time::Instant::now());
+        let (outcome, tx) = run_step(Vec::new(), &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(
+            tx.closed,
+            "a silent replica past its deadline is disconnected"
+        );
+        assert!(
+            tx.sent.is_empty(),
+            "no AuthFailed on timeout — nothing to say"
+        );
+    }
+
+    #[test]
+    fn step_rejects_oversized_frame() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        let challenge = challenge_at([0x42; 32], far_future());
+        // A length prefix declaring more than MAX_CONTROL_FRAME bytes.
+        let oversized = ((MAX_CONTROL_FRAME + 1) as u32).to_le_bytes().to_vec();
+        let (outcome, tx) = run_step(oversized, &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(tx.closed);
+    }
+
+    #[test]
+    fn step_pending_on_partial_frame() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        let nonce = [0x42; 32];
+        let challenge = challenge_at(nonce, far_future());
+        // Deliver fewer than the 4-byte length prefix.
+        let mut partial = response_frame(&key, &nonce);
+        partial.truncate(3);
+        let (outcome, tx) = run_step(partial, &challenge, &keys);
+        assert!(matches!(outcome, AuthOutcome::Pending));
+        assert!(
+            !tx.closed,
+            "an incomplete frame waits, it does not disconnect"
+        );
+    }
+
+    #[test]
+    fn step_rejects_disconnect_without_closing() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let keys = keys_for(&key, "replication");
+        let challenge = challenge_at([0x42; 32], far_future());
+        let mut tx = MockAuthTransport::with_incoming(Vec::new());
+        tx.active = false; // replica already gone
+        let mut recv = Vec::new();
+        let mut send = Vec::new();
+        let outcome = step_authentication(&mut tx, (), &challenge, &mut recv, &mut send, &keys, 0);
+        assert!(matches!(outcome, AuthOutcome::Rejected));
+        assert!(!tx.closed, "an already-gone replica needs no close");
     }
 }
