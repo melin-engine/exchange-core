@@ -1258,12 +1258,21 @@ where
             authenticate_with_primary(&mut auth_stream, signing_key)
         };
         if let Err(e) = auth_result {
-            warn!(
-                error = %e,
-                backoff_secs = backoff.as_secs(),
-                "authentication failed (DPDK) — retrying"
-            );
             transport.close(handle);
+            // A shutdown racing the auth window surfaces here as an auth error
+            // — that is a clean exit, not degraded operation, so don't warn
+            // (the loop falls through to the shutdown check after the backoff
+            // sleep). Promotion never aborts the auth stream, so it can't reach
+            // this path spuriously; only shutdown can.
+            if shutdown.load(Ordering::Relaxed) {
+                debug!("authentication aborted — shutting down (DPDK)");
+            } else {
+                warn!(
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "authentication failed (DPDK) — retrying"
+                );
+            }
             sleep_checking_flags(backoff, shutdown, promote);
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
