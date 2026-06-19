@@ -1937,6 +1937,31 @@ where
             "loaded authorized keys (DPDK replica mode)"
         );
 
+        // Load the replication signing key — the replica signs the primary's
+        // challenge with it. Mirrors the kernel-TCP replica path.
+        let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
+            std::io::Error::other("--replication-key is required in replica mode (--replica-of)")
+        })?;
+        let signing_key = {
+            let seed = std::fs::read(replication_key_path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "failed to read replication key {}: {e}",
+                    replication_key_path.display()
+                ))
+            })?;
+            if seed.len() != 32 {
+                return Err(format!(
+                    "replication key must be 32 bytes, got {} ({})",
+                    seed.len(),
+                    replication_key_path.display()
+                )
+                .into());
+            }
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&seed);
+            ed25519_dalek::SigningKey::from_bytes(&bytes)
+        };
+
         // Shared admin flags, same shape as the kernel TCP replica path
         // — see `run` for the rationale on lifetime.
         let promote_flag = Arc::new(AtomicBool::new(false));
@@ -1984,6 +2009,7 @@ where
             repl_transport,
             primary_ipv4,
             primary_addr.port(),
+            &signing_key,
             &config.journal,
             &shutdown,
             &promote_flag,
@@ -2368,6 +2394,7 @@ where
             batch_size,
             heartbeat_secs,
             Arc::clone(&fence_state),
+            Arc::clone(&authorized_keys),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary
