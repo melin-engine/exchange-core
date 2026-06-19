@@ -125,6 +125,17 @@ pub fn run_sender<A: Application>(
         Arc::clone(&metrics),
     ));
 
+    // Per-slot "this connection authenticated" latch. The trading-halt gate
+    // (`replicas_connected`) is lifted by the handler thread only after auth
+    // succeeds, so the main loop must lower it on teardown only when the
+    // handler got that far — a connection that drops mid-auth never counted.
+    // Per-slot `Arc<AtomicBool>` mirrors `active_flags`/`evict_flags`; shared
+    // with the handler thread, which flips it true post-auth.
+    let authenticated_flags: [Arc<AtomicBool>; 2] = [
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ];
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replication sender shutting down");
@@ -187,7 +198,15 @@ pub fn run_sender<A: Application>(
                         // live-streaming loop starts with a clean ring.
                         consumer.skip_to_producer();
                         slot.consumer = Some(consumer);
-                        replicas_connected.fetch_sub(1, Ordering::Release);
+                        // Lower the trading-halt gate only if this connection
+                        // authenticated (and so lifted it). `swap` reads and
+                        // resets the latch in one op; the prior `join()` already
+                        // ordered the handler's post-auth writes before here.
+                        let was_authenticated =
+                            authenticated_flags[i].swap(false, Ordering::AcqRel);
+                        if was_authenticated {
+                            replicas_connected.fetch_sub(1, Ordering::Release);
+                        }
                         // Disengage the slot's cursors BEFORE clearing the
                         // active flag — see `ReplicaCursors` for the
                         // ordering contract (B2).
@@ -203,7 +222,7 @@ pub fn run_sender<A: Application>(
                         } else {
                             warn!(slot = i, "replica disconnected");
                         }
-                        if replicas_connected.load(Ordering::Relaxed) == 0 {
+                        if was_authenticated && replicas_connected.load(Ordering::Relaxed) == 0 {
                             warn!("all replicas disconnected — trading halted");
                         }
                     }
@@ -241,7 +260,9 @@ pub fn run_sender<A: Application>(
                         debug!(error = %e, "failed to set SO_BUSY_POLL on replica connection");
                     }
 
-                    replicas_connected.fetch_add(1, Ordering::Release);
+                    // The trading-halt gate is NOT lifted here — a bare connect
+                    // hasn't proven a Replication key. The handler lifts it after
+                    // auth succeeds (see `handle_replica_connection`).
 
                     // Take the consumer out of the slot for the handler thread.
                     // The slot's consumer becomes None while the thread owns it.
@@ -257,9 +278,11 @@ pub fn run_sender<A: Application>(
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let slot_fence = Arc::clone(&fence_state);
+                    let slot_authenticated = Arc::clone(&authenticated_flags[slot_idx]);
                     let handler_core = handler_cores[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
+                    let connected_flag = replicas_connected as *const AtomicU32 as usize;
                     let handle = std::thread::Builder::new()
                         .name(format!("repl-{slot_idx}"))
                         .spawn(move || {
@@ -287,6 +310,10 @@ pub fn run_sender<A: Application>(
                             // during shutdown).
                             let shutdown_ref = unsafe { &*(shutdown_flag as *const AtomicBool) };
                             let ready_ref = unsafe { &*(ready_flag as *const AtomicBool) };
+                            // Safety: replicas_connected outlives this thread —
+                            // same lifetime argument as shutdown/replica_ready
+                            // above (the parent blocks on join during shutdown).
+                            let connected_ref = unsafe { &*(connected_flag as *const AtomicU32) };
                             let ctx = SlotContext {
                                 cursors: &slot_cursors,
                                 journal_path: &jpath,
@@ -301,6 +328,8 @@ pub fn run_sender<A: Application>(
                                 batch_size,
                                 heartbeat_secs,
                                 busy_spin,
+                                replicas_connected: connected_ref,
+                                authenticated: &slot_authenticated,
                             };
                             run_replica_slot::<A>(stream, consumer, &ctx)
                         })
@@ -340,6 +369,12 @@ struct SlotContext<'a> {
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
+    /// Trading-halt gate. The handler lifts it (`fetch_add`) only after auth
+    /// succeeds; the main loop lowers it on teardown, gated by `authenticated`.
+    replicas_connected: &'a AtomicU32,
+    /// Per-slot latch the handler sets true once this connection passes auth,
+    /// so the main loop knows whether this slot lifted the gate.
+    authenticated: &'a AtomicBool,
 }
 
 /// Handle a single replica connection on a dedicated thread.
@@ -375,6 +410,8 @@ fn handle_replica_connection<A: Application>(
         batch_size: _,
         heartbeat_secs,
         busy_spin: _,
+        replicas_connected,
+        authenticated,
     } = ctx;
     let slot_idx = *slot_idx;
     let heartbeat_secs = *heartbeat_secs;
@@ -391,6 +428,13 @@ fn handle_replica_connection<A: Application>(
     // read timeout set above.
     authenticate_replica(&mut reader, authorized_keys)?;
     info!("replica authenticated");
+
+    // Auth passed — only now lift the trading-halt gate. The main loop lowers
+    // it on slot teardown, reading `authenticated` to know this connection
+    // lifted it. Set the latch after the increment so a post-join read of the
+    // latch implies the increment is visible too.
+    replicas_connected.fetch_add(1, Ordering::Release);
+    authenticated.store(true, Ordering::Release);
 
     // Read handshake.
     let handshake_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -621,6 +665,8 @@ fn live_stream_uring(
         active_flag: _,
         heartbeat_secs: _,
         fence_state: _,
+        replicas_connected: _,
+        authenticated: _,
     } = ctx;
     let slot_idx = *slot_idx;
     let batch_size = *batch_size;

@@ -197,8 +197,11 @@ impl DpdkReplicaSlot {
     /// - Disengages the shared cursors **before** releasing the journal-stage
     ///   gate — ordering contract B2 (a frozen shared-min would otherwise stop
     ///   the primary acking client requests even with a healthy peer).
-    /// - Decrements the connected count and warns if the last replica just
-    ///   left (trading is now unprotected).
+    /// - Decrements the trading-halt gate **only if the replica was past auth**
+    ///   (`Handshaking`/`Streaming`) — an `Authenticating` connection never
+    ///   lifted it (the gate is lifted on auth success, not on connect), so it
+    ///   must not lower it. Warns if the last authenticated replica just left
+    ///   (trading is now unprotected).
     /// - Clears per-connection scratch (recv buffer, in-flight challenge,
     ///   pending handshake validation).
     ///
@@ -215,13 +218,20 @@ impl DpdkReplicaSlot {
         if let SlotState::Authenticating(h) | SlotState::Handshaking(h) | SlotState::Streaming(h) =
             self.state
         {
+            // The gate is lifted only once a replica authenticates (see the
+            // `Authenticated` arm); an `Authenticating` connection that drops
+            // here never lifted it, so it must not lower it.
+            let was_authenticated = matches!(
+                self.state,
+                SlotState::Handshaking(_) | SlotState::Streaming(_)
+            );
             transport.close(h);
             // Disengage cursors before the active_flag Release — contract B2.
             cursors.clear_on_disconnect(slot_idx);
             self.active_flag.store(false, Ordering::Release);
             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
             // fetch_sub returns the prior count; == 1 means we just hit zero.
-            if replicas_connected.fetch_sub(1, Ordering::Release) == 1 {
+            if was_authenticated && replicas_connected.fetch_sub(1, Ordering::Release) == 1 {
                 warn!("all replicas disconnected — trading halted");
             }
         }
@@ -386,7 +396,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
             return;
         }
         info!(peer = ?peer, slot = idx, "replica connected via DPDK — authenticating");
-        self.replicas_connected.fetch_add(1, Ordering::Release);
+        // The trading-halt gate is NOT lifted here: a bare connection hasn't
+        // proven a Replication key. It's lifted on auth success (the
+        // `Authenticated` arm) so an unauthenticated peer can't re-enable order
+        // matching.
         slot.auth = Some(AuthChallenge {
             nonce,
             deadline: std::time::Instant::now() + AUTH_TIMEOUT,
@@ -478,6 +491,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         AuthOutcome::Pending => {}
                         AuthOutcome::Authenticated => {
                             slot.auth = None;
+                            // Proven a Replication key — only now does this
+                            // connection lift the trading-halt gate (lowered by
+                            // `go_idle` on teardown).
+                            replicas_connected.fetch_add(1, Ordering::Release);
                             slot.state = SlotState::Handshaking(handle);
                         }
                         AuthOutcome::Rejected => {
