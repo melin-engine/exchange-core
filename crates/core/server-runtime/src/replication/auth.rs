@@ -16,6 +16,11 @@ use std::io::{self, Read, Write};
 #[cfg(any(feature = "dpdk", test))]
 use tracing::{info, warn};
 
+// Used by `PolledAuthStream` (the receiver-side blocking adapter) below — same
+// DPDK-or-test gate as the sender step.
+#[cfg(any(feature = "dpdk", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, decode_auth_result, decode_challenge, decode_challenge_response,
     encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response, read_frame,
@@ -276,10 +281,89 @@ pub(super) fn step_authentication<T: AuthTransport>(
     }
 }
 
+/// Blocking `Read`/`Write` adapter over a poll-driven (non-blocking) transport,
+/// so the SHARED blocking [`authenticate_with_primary`] can run over a
+/// smoltcp-style poll loop without a transport-specific copy of the replica's
+/// auth flow. `read` polls until bytes arrive then hands them out from the
+/// front of the shared `recv_buf`; `write` queues a frame and `flush` (or the
+/// next `read`) drives `poll()` to push it onto the wire. The receiver shares
+/// its streaming `recv_buf`, so any bytes that arrive past the auth exchange
+/// are carried into the handshake loop. Bounded by `deadline` and the
+/// `shutdown` flag so a silent or vanished primary cannot hang the receiver.
+///
+/// Generic over [`AuthTransport`] — the same surface the sender-side
+/// [`step_authentication`] uses — so the adapter's edge cases (deadline,
+/// shutdown, disconnect-vs-frame-in-the-same-poll, full TX queue) are
+/// unit-testable over a mock without the `dpdk` feature. The concrete DPDK
+/// construction lives in the `dpdk` module.
+#[cfg(any(feature = "dpdk", test))]
+pub(super) struct PolledAuthStream<'a, T: AuthTransport> {
+    pub(super) transport: &'a mut T,
+    pub(super) handle: T::Handle,
+    pub(super) recv_buf: &'a mut Vec<u8>,
+    pub(super) shutdown: &'a AtomicBool,
+    pub(super) deadline: std::time::Instant,
+}
+
+#[cfg(any(feature = "dpdk", test))]
+impl<T: AuthTransport> Read for PolledAuthStream<'_, T> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if !self.recv_buf.is_empty() {
+                let n = self.recv_buf.len().min(out.len());
+                out[..n].copy_from_slice(&self.recv_buf[..n]);
+                // Drain consumed bytes from the front; anything past the auth
+                // frames stays for the handshake loop (same shared buffer).
+                self.recv_buf.drain(..n);
+                return Ok(n);
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(io::Error::other("shutdown during auth"));
+            }
+            if std::time::Instant::now() >= self.deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "auth timed out"));
+            }
+            self.transport.poll();
+            self.transport.recv_into_vec(self.handle, self.recv_buf);
+            // Only treat an empty read as a disconnect; a frame arriving in the
+            // same poll as the FIN is drained above before we get here.
+            if self.recv_buf.is_empty() && !self.transport.is_active(self.handle) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "primary disconnected during auth",
+                ));
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(any(feature = "dpdk", test))]
+impl<T: AuthTransport> Write for PolledAuthStream<'_, T> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // queue_send copies into the per-connection TX queue; poll() (flush
+        // below, or the next read) pushes it onto the wire. Returns false only
+        // when the queue is full — never expected for the tiny auth frames on a
+        // fresh connection, but surface it rather than silently drop.
+        if self.transport.queue_send(self.handle, data) {
+            Ok(data.len())
+        } else {
+            Err(io::Error::other("TX queue full during auth"))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Drive egress so the queued frame leaves before we block on a read.
+        self.transport.poll();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use std::collections::VecDeque;
 
     /// Build an `AuthorizedKeys` table granting `permission` to `key`.
     fn keys_for(key: &SigningKey, permission: &str) -> melin_app::auth::AuthorizedKeys {
@@ -347,26 +431,52 @@ mod tests {
 
     // ---- Non-blocking sender step (`step_authentication`) ----
 
-    /// In-memory [`AuthTransport`]: scripts the bytes the next `recv_into_vec`
-    /// delivers and captures what was sent and whether the connection was
-    /// closed. `Handle = ()` keeps the test off the real (non-constructible)
-    /// `SocketHandle`.
+    /// In-memory [`AuthTransport`]: scripts the bytes successive
+    /// `recv_into_vec` calls deliver and captures what was sent and whether the
+    /// connection was closed. `Handle = ()` keeps the test off the real
+    /// (non-constructible) `SocketHandle`.
     struct MockAuthTransport {
         active: bool,
-        /// Delivered (and drained) by the next `recv_into_vec`.
-        incoming: Vec<u8>,
+        /// Chunks delivered one per `recv_into_vec` call, in order — models a
+        /// transport that yields bytes across successive polls. An empty (or
+        /// exhausted) queue means "this poll produced nothing."
+        recv_rounds: VecDeque<Vec<u8>>,
+        /// When `recv_rounds` empties (the final chunk was just delivered, or
+        /// there was none), flip `active` to false — models the primary's FIN
+        /// riding with or arriving just after the last data.
+        close_when_drained: bool,
         /// Concatenation of every `queue_send` payload.
         sent: Vec<u8>,
         closed: bool,
+        /// `queue_send` reports the TX queue full (returns false) when set.
+        tx_full: bool,
     }
 
     impl MockAuthTransport {
+        /// One-shot delivery of `incoming` on the first `recv_into_vec` — the
+        /// shape the sender-step tests use.
         fn with_incoming(incoming: Vec<u8>) -> Self {
             Self {
                 active: true,
-                incoming,
+                recv_rounds: VecDeque::from([incoming]),
+                close_when_drained: false,
                 sent: Vec::new(),
                 closed: false,
+                tx_full: false,
+            }
+        }
+
+        /// Deliver `rounds` one chunk per poll, then report the connection
+        /// closed — used by the receiver-adapter tests, where it guarantees a
+        /// `PolledAuthStream` read loop terminates instead of spinning.
+        fn scripted(rounds: Vec<Vec<u8>>) -> Self {
+            Self {
+                active: true,
+                recv_rounds: rounds.into(),
+                close_when_drained: true,
+                sent: Vec::new(),
+                closed: false,
+                tx_full: false,
             }
         }
     }
@@ -377,9 +487,17 @@ mod tests {
             self.active
         }
         fn recv_into_vec(&mut self, _: (), dest: &mut Vec<u8>) {
-            dest.append(&mut self.incoming);
+            if let Some(mut chunk) = self.recv_rounds.pop_front() {
+                dest.append(&mut chunk);
+            }
+            if self.recv_rounds.is_empty() && self.close_when_drained {
+                self.active = false;
+            }
         }
         fn queue_send(&mut self, _: (), data: &[u8]) -> bool {
+            if self.tx_full {
+                return false;
+            }
             self.sent.extend_from_slice(data);
             true
         }
@@ -535,5 +653,140 @@ mod tests {
         let outcome = step_authentication(&mut tx, (), &challenge, &mut recv, &mut send, &keys, 0);
         assert!(matches!(outcome, AuthOutcome::Rejected));
         assert!(!tx.closed, "an already-gone replica needs no close");
+    }
+
+    // ---- Receiver-side blocking adapter (`PolledAuthStream`) ----
+
+    /// Run `body` over a `PolledAuthStream` wrapping `tx` with the given
+    /// `shutdown` flag and `deadline`. Keeps the recv-buf / borrow plumbing out
+    /// of each test; `tx` is free to inspect once this returns.
+    fn with_stream<R>(
+        tx: &mut MockAuthTransport,
+        shutdown: &AtomicBool,
+        deadline: std::time::Instant,
+        body: impl FnOnce(&mut PolledAuthStream<'_, MockAuthTransport>) -> R,
+    ) -> R {
+        let mut recv = Vec::new();
+        let mut stream = PolledAuthStream {
+            transport: tx,
+            handle: (),
+            recv_buf: &mut recv,
+            shutdown,
+            deadline,
+        };
+        body(&mut stream)
+    }
+
+    #[test]
+    fn polled_read_times_out_past_deadline() {
+        let mut tx = MockAuthTransport::scripted(vec![]);
+        let shutdown = AtomicBool::new(false);
+        // Deadline = now; the monotonic clock read inside the adapter is `>=`
+        // it, so the timeout trips before any disconnect/EOF handling.
+        let err = with_stream(&mut tx, &shutdown, std::time::Instant::now(), |s| {
+            std::io::Read::read(s, &mut [0u8; 8]).unwrap_err()
+        });
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn polled_read_errors_on_shutdown() {
+        let mut tx = MockAuthTransport::scripted(vec![]);
+        let shutdown = AtomicBool::new(true);
+        let err = with_stream(&mut tx, &shutdown, far_future(), |s| {
+            std::io::Read::read(s, &mut [0u8; 8]).unwrap_err()
+        });
+        assert!(err.to_string().contains("shutdown"));
+    }
+
+    #[test]
+    fn polled_read_reports_disconnect_as_eof() {
+        // No data and the transport reports closed → a clean EOF, not a hang.
+        let mut tx = MockAuthTransport::scripted(vec![]);
+        let shutdown = AtomicBool::new(false);
+        let err = with_stream(&mut tx, &shutdown, far_future(), |s| {
+            std::io::Read::read(s, &mut [0u8; 8]).unwrap_err()
+        });
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn polled_read_returns_bytes_arriving_with_fin() {
+        // The frame and the FIN land in the same poll: the bytes must be handed
+        // out, not swallowed as EOF (the property the adapter's comment calls
+        // out). A subsequent read then sees the closed transport → EOF.
+        let mut tx = MockAuthTransport::scripted(vec![vec![1, 2, 3, 4]]);
+        let shutdown = AtomicBool::new(false);
+        with_stream(&mut tx, &shutdown, far_future(), |s| {
+            let mut out = [0u8; 8];
+            let n = std::io::Read::read(s, &mut out)
+                .expect("bytes delivered with the FIN are returned");
+            assert_eq!(&out[..n], &[1, 2, 3, 4]);
+            let err = std::io::Read::read(s, &mut out).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
+    }
+
+    #[test]
+    fn polled_write_errors_when_tx_queue_full() {
+        let mut tx = MockAuthTransport::scripted(vec![]);
+        tx.tx_full = true;
+        let shutdown = AtomicBool::new(false);
+        let err = with_stream(&mut tx, &shutdown, far_future(), |s| {
+            std::io::Write::write(s, b"auth-frame").unwrap_err()
+        });
+        assert!(err.to_string().contains("TX queue full"));
+    }
+
+    #[test]
+    fn polled_write_queues_frame_then_flush_polls() {
+        let mut tx = MockAuthTransport::scripted(vec![]);
+        let shutdown = AtomicBool::new(false);
+        with_stream(&mut tx, &shutdown, far_future(), |s| {
+            assert_eq!(std::io::Write::write(s, b"hello").unwrap(), 5);
+            std::io::Write::flush(s).unwrap();
+        });
+        assert_eq!(tx.sent, b"hello", "the queued frame reaches the TX queue");
+    }
+
+    #[test]
+    fn polled_stream_drives_authenticate_with_primary_to_ok() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let nonce = [0x42; 32];
+        // Primary plays Challenge, then (after our response) AuthOk.
+        let mut challenge = Vec::new();
+        encode_challenge(&nonce, &mut challenge);
+        let mut authok = Vec::new();
+        encode_auth_ok(&mut authok);
+        let mut tx = MockAuthTransport::scripted(vec![challenge, authok]);
+        let shutdown = AtomicBool::new(false);
+
+        let result = with_stream(&mut tx, &shutdown, far_future(), |s| {
+            authenticate_with_primary(s, &key)
+        });
+        result.expect("auth succeeds when the primary sends AuthOk");
+
+        // The adapter put a well-formed ChallengeResponse on the wire: a valid
+        // signature over the nonce by `key`, which an authorized table accepts.
+        let keys = keys_for(&key, "replication");
+        verify_challenge_response(&nonce, &tx.sent[4..], &keys)
+            .expect("the response the adapter wrote verifies");
+    }
+
+    #[test]
+    fn polled_stream_surfaces_auth_failed() {
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let nonce = [0x42; 32];
+        let mut challenge = Vec::new();
+        encode_challenge(&nonce, &mut challenge);
+        let mut authfailed = Vec::new();
+        encode_auth_failed(&mut authfailed);
+        let mut tx = MockAuthTransport::scripted(vec![challenge, authfailed]);
+        let shutdown = AtomicBool::new(false);
+
+        let err = with_stream(&mut tx, &shutdown, far_future(), |s| {
+            authenticate_with_primary(s, &key).unwrap_err()
+        });
+        assert!(err.to_string().contains("rejected"));
     }
 }

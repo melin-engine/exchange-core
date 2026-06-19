@@ -19,8 +19,8 @@ use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use super::auth::{
-    AuthChallenge, AuthOutcome, AuthTransport, authenticate_with_primary, generate_challenge_nonce,
-    step_authentication,
+    AuthChallenge, AuthOutcome, AuthTransport, PolledAuthStream, authenticate_with_primary,
+    generate_challenge_nonce, step_authentication,
 };
 use super::receiver_transport::{
     ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop,
@@ -1248,7 +1248,7 @@ where
         // smoltcp poll loop, so TCP and DPDK can never diverge on the auth flow.
         recv_buf.clear();
         let auth_result = {
-            let mut auth_stream = DpdkAuthStream {
+            let mut auth_stream = PolledAuthStream {
                 transport: &mut transport,
                 handle,
                 recv_buf: &mut recv_buf,
@@ -1566,74 +1566,6 @@ where
             }
             AfterSession::Reconnect => {}
         }
-    }
-}
-
-/// Blocking `Read`/`Write` adapter over the DPDK transport so the SHARED
-/// [`authenticate_with_primary`] (written against blocking `Read`/`Write`)
-/// can run over the non-blocking smoltcp poll loop. `read` polls until bytes
-/// arrive then drains them from the front of `recv_buf`; `write` queues a
-/// frame and `flush` (or the next `read`) drives `poll()` to push it onto the
-/// wire. Shares the receiver's `recv_buf`, so any bytes that arrive past the
-/// auth exchange are carried into the handshake loop. Bounded by `deadline`
-/// so a silent primary cannot hang the receiver.
-struct DpdkAuthStream<'a> {
-    transport: &'a mut melin_dpdk::DpdkTransport,
-    handle: melin_dpdk::SocketHandle,
-    recv_buf: &'a mut Vec<u8>,
-    shutdown: &'a AtomicBool,
-    deadline: std::time::Instant,
-}
-
-impl io::Read for DpdkAuthStream<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if !self.recv_buf.is_empty() {
-                let n = self.recv_buf.len().min(out.len());
-                out[..n].copy_from_slice(&self.recv_buf[..n]);
-                // Drain consumed bytes from the front; anything past the auth
-                // frames stays for the handshake loop (same shared buffer).
-                self.recv_buf.drain(..n);
-                return Ok(n);
-            }
-            if self.shutdown.load(Ordering::Relaxed) {
-                return Err(io::Error::other("shutdown during auth"));
-            }
-            if std::time::Instant::now() >= self.deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "auth timed out"));
-            }
-            self.transport.poll();
-            self.transport.recv_into_vec(self.handle, self.recv_buf);
-            // Only treat an empty read as a disconnect; a frame arriving in the
-            // same poll as the FIN is drained above before we get here.
-            if self.recv_buf.is_empty() && !self.transport.is_active(self.handle) {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "primary disconnected during auth",
-                ));
-            }
-            std::thread::yield_now();
-        }
-    }
-}
-
-impl io::Write for DpdkAuthStream<'_> {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        // queue_send copies into the per-connection TX queue; poll() (flush
-        // below, or the next read) pushes it onto the wire. Returns false only
-        // when the queue is full — never expected for the tiny auth frames on a
-        // fresh connection, but surface it rather than silently drop.
-        if self.transport.queue_send(self.handle, data) {
-            Ok(data.len())
-        } else {
-            Err(io::Error::other("DPDK TX queue full during auth"))
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        // Drive egress so the queued frame leaves before we block on a read.
-        self.transport.poll();
-        Ok(())
     }
 }
 
