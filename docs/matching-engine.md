@@ -141,12 +141,12 @@ The original order's `time_in_force`, `stp` (self-trade prevention mode), and `q
 
 ### 2. Trigger check
 
-After every `execute()` call (including fills from other orders), `check_triggers()` runs:
+After every `execute()` call (including fills from other orders), `check_triggers()` runs. Each pass:
 
 - **Stop buys**: iterates `stop_buys` keys in ascending order, collecting all trigger prices <= `last_trade_price`.
 - **Stop sells**: iterates `stop_sells` keys in descending order, collecting all trigger prices >= `last_trade_price`.
 
-All matching stops are removed from the BTreeMaps and `stop_index`.
+All matching stops are removed from the BTreeMaps and `stop_index`, then executed (step 3). Because those executions can move `last_trade_price` past further trigger prices, the pass then **repeats** against the updated price, until a pass collects nothing. See "Triggered stop cascade" below.
 
 ### 3. Conversion and execution
 
@@ -155,7 +155,7 @@ Each triggered stop emits a `Triggered` report, then is converted:
 - `PendingStop` with `limit_price: None` becomes `OrderType::Market` and calls `execute_market()`.
 - `PendingStop` with `limit_price: Some(p)` becomes `OrderType::Limit { price: p }` and calls `execute_limit()`.
 
-Triggered orders re-enter the matching pipeline (including FOK pre-checks and TIF handling) but **skip** `check_triggers()` to avoid recursion, since the converted order is always a market or limit type and will never re-add a stop.
+Triggered orders re-enter the matching pipeline (including FOK pre-checks and TIF handling) but do not recursively re-invoke `check_triggers()` — stops made marketable by their fills are picked up by the next pass of the trigger-check loop (step 2). The loop always terminates: a converted order is always a market or limit type and can never re-add a stop, so the pending-stop set strictly shrinks each pass.
 
 ### 4. Cancellation
 
