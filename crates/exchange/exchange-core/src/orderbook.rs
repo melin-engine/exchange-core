@@ -981,112 +981,129 @@ impl OrderBook {
     /// Check if the last trade price triggers any pending stop orders.
     /// Triggered stops are converted to market/limit orders and executed.
     ///
+    /// Runs to a fixed point: executing a triggered stop can move
+    /// `last_trade_price` past further stop triggers (a cascade), so the
+    /// scan repeats until a pass fires nothing. The loop is bounded —
+    /// triggered stops become market/limit orders that never re-register
+    /// stops, so the pending set strictly shrinks on every pass that
+    /// doesn't terminate.
+    ///
     /// Uses pre-allocated buffers (`trigger_price_buf`, `triggered_buf`) to
     /// avoid per-order heap allocations on the hot path. Buffers grow to
     /// high-water mark and stay — no per-call allocation after warmup.
     fn check_triggers(&mut self, reports: &mut Vec<ExecutionReport>) {
-        let Some(trade_price) = self.last_trade_price else {
-            return;
-        };
-
-        // Fast path: skip all BTreeMap iteration when no stops are pending.
-        // Stops are ~3% of order flow; the other 97% of orders pay zero cost.
-        if self.stop_buys.is_empty() && self.stop_sells.is_empty() {
-            return;
-        }
-
-        // Stop buys: trigger when trade price >= trigger price.
-        // Collect all triggers at or below the trade price (ascending order).
-        self.trigger_price_buf.clear();
-        self.trigger_price_buf.extend(
-            self.stop_buys
-                .prices_ascending()
-                .take_while(|&p| p <= trade_price),
-        );
-
-        self.triggered_buf.clear();
-        for &price in &self.trigger_price_buf {
-            let before = self.triggered_buf.len();
-            self.stop_buys.drain_level(price, &mut self.triggered_buf);
-            for stop in &self.triggered_buf[before..] {
-                self.stop_index.remove(&(stop.account, stop.id));
-            }
-        }
-
-        // Stop sells: trigger when trade price <= trigger price.
-        // Collect all triggers at or above the trade price (descending order).
-        self.trigger_price_buf.clear();
-        self.trigger_price_buf.extend(
-            self.stop_sells
-                .prices_ascending()
-                .rev()
-                .take_while(|&p| p >= trade_price),
-        );
-
-        for &price in &self.trigger_price_buf {
-            let before = self.triggered_buf.len();
-            self.stop_sells.drain_level(price, &mut self.triggered_buf);
-            for stop in &self.triggered_buf[before..] {
-                self.stop_index.remove(&(stop.account, stop.id));
-            }
-        }
-
-        // Execute triggered stops as market/limit orders.
-        // Take the buffer to avoid borrowing `self` while calling `execute_*`.
-        // `std::mem::take` swaps in an empty Vec (no allocation) and returns
-        // the populated one. After the loop, swap it back to retain capacity.
-        let mut triggered = std::mem::take(&mut self.triggered_buf);
-        for stop in triggered.drain(..) {
-            reports.push(ExecutionReport::Triggered {
-                order_id: stop.id,
-                symbol: self.symbol,
-                account: stop.account,
-                trigger_price: stop.trigger_price,
-            });
-
-            // Triggered stops become regular limit/market orders — never post-only,
-            // since the intent is to execute when the trigger fires.
-            let order_type = match stop.limit_price {
-                Some(price) => OrderType::Limit {
-                    price,
-                    post_only: false,
-                },
-                None => OrderType::Market,
+        loop {
+            let Some(trade_price) = self.last_trade_price else {
+                return;
             };
 
-            let order = Order {
-                id: stop.id,
-                account: stop.account,
-                side: stop.side,
-                order_type,
-                time_in_force: stop.time_in_force,
-                quantity: stop.quantity,
-                stp: stop.stp,
-                expiry_ns: stop.expiry_ns,
-            };
+            // Fast path: skip all BTreeMap iteration when no stops are pending.
+            // Stops are ~3% of order flow; the other 97% of orders pay zero cost.
+            if self.stop_buys.is_empty() && self.stop_sells.is_empty() {
+                return;
+            }
 
-            // Re-enter execute but skip check_triggers to avoid recursion —
-            // triggered orders are market/limit, so they won't re-add stops.
-            match order.order_type {
-                OrderType::Limit { price, .. } => {
-                    self.execute_limit(order, price, stop.reservation, reports);
-                }
-                OrderType::Market => {
-                    self.execute_market(order, stop.quote_budget, stop.reservation, reports);
-                }
-                OrderType::Stop { .. } | OrderType::StopLimit { .. } => {
-                    unreachable!("triggered stops become market or limit orders")
+            // Stop buys: trigger when trade price >= trigger price.
+            // Collect all triggers at or below the trade price (ascending order).
+            self.trigger_price_buf.clear();
+            self.trigger_price_buf.extend(
+                self.stop_buys
+                    .prices_ascending()
+                    .take_while(|&p| p <= trade_price),
+            );
+
+            self.triggered_buf.clear();
+            for &price in &self.trigger_price_buf {
+                let before = self.triggered_buf.len();
+                self.stop_buys.drain_level(price, &mut self.triggered_buf);
+                for stop in &self.triggered_buf[before..] {
+                    self.stop_index.remove(&(stop.account, stop.id));
                 }
             }
 
-            // If the triggered order didn't rest on the book (fully filled
-            // or cancelled), record its slot so the Exchange can free it.
-            if !self.order_index.contains_key(&(stop.account, stop.id)) {
-                self.consumed_slots
-                    .push((stop.account, stop.id, stop.side, stop.reservation));
+            // Stop sells: trigger when trade price <= trigger price.
+            // Collect all triggers at or above the trade price (descending order).
+            self.trigger_price_buf.clear();
+            self.trigger_price_buf.extend(
+                self.stop_sells
+                    .prices_ascending()
+                    .rev()
+                    .take_while(|&p| p >= trade_price),
+            );
+
+            for &price in &self.trigger_price_buf {
+                let before = self.triggered_buf.len();
+                self.stop_sells.drain_level(price, &mut self.triggered_buf);
+                for stop in &self.triggered_buf[before..] {
+                    self.stop_index.remove(&(stop.account, stop.id));
+                }
             }
+
+            // Nothing newly marketable at this trade price — the cascade
+            // (if any) has converged.
+            if self.triggered_buf.is_empty() {
+                return;
+            }
+
+            // Execute triggered stops as market/limit orders.
+            // Take the buffer to avoid borrowing `self` while calling `execute_*`.
+            // `std::mem::take` swaps in an empty Vec (no allocation) and returns
+            // the populated one. After the loop, swap it back to retain capacity.
+            let mut triggered = std::mem::take(&mut self.triggered_buf);
+            for stop in triggered.drain(..) {
+                reports.push(ExecutionReport::Triggered {
+                    order_id: stop.id,
+                    symbol: self.symbol,
+                    account: stop.account,
+                    trigger_price: stop.trigger_price,
+                });
+
+                // Triggered stops become regular limit/market orders — never post-only,
+                // since the intent is to execute when the trigger fires.
+                let order_type = match stop.limit_price {
+                    Some(price) => OrderType::Limit {
+                        price,
+                        post_only: false,
+                    },
+                    None => OrderType::Market,
+                };
+
+                let order = Order {
+                    id: stop.id,
+                    account: stop.account,
+                    side: stop.side,
+                    order_type,
+                    time_in_force: stop.time_in_force,
+                    quantity: stop.quantity,
+                    stp: stop.stp,
+                    expiry_ns: stop.expiry_ns,
+                };
+
+                // Re-enter execute but skip check_triggers to avoid recursion —
+                // triggered orders are market/limit, so they won't re-add stops.
+                // Any stops these executions newly make marketable are picked
+                // up by the next pass of the enclosing loop.
+                match order.order_type {
+                    OrderType::Limit { price, .. } => {
+                        self.execute_limit(order, price, stop.reservation, reports);
+                    }
+                    OrderType::Market => {
+                        self.execute_market(order, stop.quote_budget, stop.reservation, reports);
+                    }
+                    OrderType::Stop { .. } | OrderType::StopLimit { .. } => {
+                        unreachable!("triggered stops become market or limit orders")
+                    }
+                }
+
+                // If the triggered order didn't rest on the book (fully filled
+                // or cancelled), record its slot so the Exchange can free it.
+                if !self.order_index.contains_key(&(stop.account, stop.id)) {
+                    self.consumed_slots
+                        .push((stop.account, stop.id, stop.side, stop.reservation));
+                }
+            }
+            self.triggered_buf = triggered;
         }
-        self.triggered_buf = triggered;
     }
 
     #[allow(clippy::too_many_arguments)]

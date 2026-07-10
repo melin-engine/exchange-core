@@ -3043,6 +3043,233 @@ fn stop_trigger_cascade() {
     );
 }
 
+/// A triggered stop's own executions can move the last trade price past
+/// further stop triggers. Every stop made marketable that way must fire
+/// within the same matching event — a cascaded stop must not wait for the
+/// next inbound order (issue #2).
+///
+/// Three-hop buy cascade: a trade at 100 triggers stop 10 (limit 120),
+/// whose fill at 120 triggers stop 11 (limit 140), whose fill at 140
+/// triggers stop 12.
+#[test]
+fn stop_buy_cascade_fires_within_same_event() {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_B, USD, 10_000);
+    exchange.deposit(ACCT_B, BTC, 1_000);
+
+    let mut reports = Vec::new();
+
+    // Ask ladder from ACCT_B: each cascade hop consumes one level and
+    // prints a strictly higher trade price.
+    for (id, p, q) in [(1, 100, 1), (2, 120, 1), (3, 140, 10)] {
+        exchange.execute(
+            Symbol(1),
+            limit_order(id, ACCT_B, Side::Sell, p, q, TimeInForce::GTC),
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    // ACCT_A's stop-limit buys, chained so each fires only after the
+    // previous one's fill: trigger 100 → (fill@120) → trigger 115 →
+    // (fill@140) → trigger 130. Stop-limits (not stop-markets) so each
+    // reserves limit×qty instead of the whole quote balance.
+    for (id, trigger, limit) in [(10, 100, 120), (11, 115, 140), (12, 130, 140)] {
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(id),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(trigger),
+                    limit_price: price(limit),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    // Set off the cascade: ACCT_B buys 1@100 against its own ask
+    // (STP Allow), printing last_trade=100.
+    exchange.execute(
+        Symbol(1),
+        limit_order(4, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    let triggered: Vec<OrderId> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        triggered,
+        vec![OrderId(10), OrderId(11), OrderId(12)],
+        "all three stops must fire within the same event, in cascade order"
+    );
+
+    let fills = reports
+        .iter()
+        .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+        .count();
+    assert_eq!(fills, 4, "trigger fill plus one fill per cascaded stop");
+}
+
+/// Downward cascade with stop-market sells: a falling print triggers a
+/// stop whose sale prints lower still, which must fire the next stop in
+/// the same event (the classic stop-loss cascade).
+#[test]
+fn stop_sell_cascade_fires_within_same_event() {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, BTC, 1_000);
+    exchange.deposit(ACCT_B, USD, 1_000_000);
+    exchange.deposit(ACCT_B, BTC, 1_000);
+
+    let mut reports = Vec::new();
+
+    // Bid ladder from ACCT_B: 1@100 (consumed by the trigger print),
+    // then 10@80 for the cascading sells to hit.
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        Symbol(1),
+        limit_order(2, ACCT_B, Side::Buy, 80, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    // ACCT_A's stop-market sells: trigger 100 fires on the first print;
+    // its fill at 80 must fire trigger 90 in the same event.
+    for (id, trigger) in [(10, 100), (11, 90)] {
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(id),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Stop {
+                    trigger_price: price(trigger),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    // Set off the cascade: ACCT_B sells 1@100 into its own bid
+    // (STP Allow), printing last_trade=100.
+    exchange.execute(
+        Symbol(1),
+        limit_order(3, ACCT_B, Side::Sell, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    let triggered: Vec<OrderId> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        triggered,
+        vec![OrderId(10), OrderId(11)],
+        "both stops must fire within the same event, in cascade order"
+    );
+
+    let fills = reports
+        .iter()
+        .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+        .count();
+    assert_eq!(fills, 3, "trigger fill plus one fill per cascaded stop");
+}
+
+/// A triggered stop-limit that rests on the book without trading doesn't
+/// move the last trade price — the cascade rescan must terminate and
+/// leave the order resting.
+#[test]
+fn stop_cascade_terminates_when_triggered_order_rests() {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_B, USD, 10_000);
+    exchange.deposit(ACCT_B, BTC, 1_000);
+
+    let mut reports = Vec::new();
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_B, Side::Sell, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    // Marketable trigger (100), non-marketable limit (95): the stop fires
+    // on the print at 100 but its limit order can't trade.
+    exchange.execute(
+        Symbol(1),
+        Order {
+            id: OrderId(10),
+            account: ACCT_A,
+            side: Side::Buy,
+            order_type: OrderType::StopLimit {
+                trigger_price: price(100),
+                limit_price: price(95),
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(1),
+            stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
+        },
+        &mut reports,
+    );
+    reports.clear();
+
+    exchange.execute(
+        Symbol(1),
+        limit_order(2, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    assert!(
+        reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Triggered { order_id, .. } if *order_id == OrderId(10)
+        )),
+        "stop must trigger on the print at 100"
+    );
+    assert!(
+        reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Placed { order_id, price: p, .. }
+                if *order_id == OrderId(10) && *p == price(95)
+        )),
+        "triggered stop-limit must rest at its limit price"
+    );
+    let fills = reports
+        .iter()
+        .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+        .count();
+    assert_eq!(fills, 1, "only the trigger print trades");
+}
+
 /// Cancel-replace preserves time priority when price unchanged and qty decreases.
 #[test]
 fn cancel_replace_preserves_priority_on_qty_decrease() {

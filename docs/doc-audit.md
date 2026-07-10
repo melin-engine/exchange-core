@@ -92,13 +92,9 @@ Logical errors, security gaps, and design concerns found during review of all do
 
 ## Minor
 
-### 8. Stop order cascade limited to one level deep
+### ~~8. Stop order cascade limited to one level deep~~
 
-**Location**: `docs/matching-engine.md`, line 303
-
-**Description**: "Stops whose trigger conditions are met by fills from other triggered stops will fire on the next incoming order." This is correctly documented as behavior, but the operational consequence is not called out: stop B's execution may be delayed by milliseconds or seconds (until the next order arrives), creating a gap between the trigger condition being met and the stop actually executing.
-
-**Impact**: In fast-moving markets, this delay could cause stop orders to execute at significantly worse prices than expected. Operators and traders relying on stop cascades for risk management should be aware of this limitation.
+**Status**: **FIXED** — trigger evaluation now repeats after each triggered stop executes, so a full stop cascade completes within the same matching event. A stop whose trigger condition is met by another stop's fill executes immediately instead of waiting for the next incoming order. See `docs/matching-engine.md` ("Triggered stop cascade").
 
 ---
 
@@ -143,7 +139,7 @@ Logical errors, security gaps, and design concerns found during review of all do
 | 5 | Important | Operations | No global halt command (must halt instruments one by one) |
 | 6 | Important | Security | Keys can't be revoked without restart |
 | 7 | ~~Important~~ | ~~Security~~ | ~~Large IDs cause unbounded memory allocation~~ FIXED — sparse HashMap storage |
-| 8 | Minor | Logic | Stop cascade depth=1 delays secondary triggers |
+| 8 | ~~Minor~~ | ~~Logic~~ | ~~Stop cascade depth=1 delays secondary triggers~~ FIXED — cascades complete within the same event |
 | 9 | Minor | Logic | FOK + CancelOldest STP overly conservative |
 | 10 | Minor | Efficiency | Response stage spin-wait during journal stalls |
 | 11 | Minor | Doc accuracy | Throughput includes warmup (misleading for short runs) |

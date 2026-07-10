@@ -496,6 +496,37 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
         orphan_res.is_empty(),
         "After action #{action_idx} ({action_desc}): orphan reservations: {orphan_res:?}"
     );
+
+    // No pending stop may be marketable against the last trade price:
+    // `check_triggers` cascades to a fixed point within each event, so a
+    // stop whose trigger is satisfied must already have fired.
+    for (sym, book) in exchange.books() {
+        let Some(last) = book.last_trade_price() else {
+            continue;
+        };
+        book.stop_buys().for_each_stop(|stop| {
+            assert!(
+                stop.trigger_price() > last,
+                "After action #{action_idx} ({action_desc}): pending stop-buy \
+                 ({:?}, {:?}) on {sym:?} has trigger {:?} <= last trade {last:?} \
+                 — it should have fired",
+                stop.account(),
+                stop.id(),
+                stop.trigger_price(),
+            );
+        });
+        book.stop_sells().for_each_stop(|stop| {
+            assert!(
+                stop.trigger_price() < last,
+                "After action #{action_idx} ({action_desc}): pending stop-sell \
+                 ({:?}, {:?}) on {sym:?} has trigger {:?} >= last trade {last:?} \
+                 — it should have fired",
+                stop.account(),
+                stop.id(),
+                stop.trigger_price(),
+            );
+        });
+    }
 }
 
 /// Return type for `run_exchange_actions`:

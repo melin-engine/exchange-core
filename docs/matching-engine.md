@@ -352,4 +352,6 @@ The Exchange tracks the set of currently-live `(account, order_id)` pairs and re
 
 ### Triggered stop cascade
 
-When a fill updates `last_trade_price`, `check_triggers()` may fire multiple stops. Each triggered stop re-enters the matching pipeline and may itself produce fills that update `last_trade_price`. However, `check_triggers()` is called only once per top-level `execute()` call -- triggered orders call `execute_limit` / `execute_market` directly without re-invoking `check_triggers()`. This means a cascade of stop triggers within a single `execute()` call is limited to one level deep. Stops whose trigger conditions are met by fills from other triggered stops will fire on the next incoming order.
+When a fill updates the last trade price, every pending stop whose trigger condition is met fires and executes within the same matching event. If a triggered stop's own executions move the last trade price past further stop triggers, those stops fire too: trigger evaluation repeats until no pending stop is marketable, so an entire stop cascade completes within the event that set it off. A stop never waits for the next incoming order to fire.
+
+The cascade always terminates: triggered stops execute as market or limit orders and can never register new stops, so each round of the cascade strictly shrinks the set of pending stops. All trigger and fill reports from a cascade are emitted in the same event's output, in cascade order.
