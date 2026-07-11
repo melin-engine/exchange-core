@@ -48,15 +48,15 @@ pub struct OrderBook {
     /// - `ReservationSlot` — so cancel/amend release balance without an
     ///   extra HashMap lookup
     /// - `u32` — the slab index, making `BookSide::remove_node` O(1)
-    ///   instead of an O(level_depth) `VecDeque` scan
+    ///   instead of an O(level_depth) walk of the level's FIFO list
     order_index: SlabMap<(Side, Price, ReservationSlot, u32)>,
-    /// BTreeMap keyed by trigger price so we can efficiently find all stops
-    /// that should fire at a given trade price. Stop buys trigger when price
-    /// rises (iterate from lowest trigger up), stop sells when price falls
-    /// (iterate from highest trigger down).
     /// Pending stop orders keyed by trigger price, mirroring the
     /// limit-side `BookSide`: a slab + intrusive FIFO per trigger so
-    /// individual cancel is O(1) regardless of level depth.
+    /// individual cancel is O(1) regardless of level depth. Levels are
+    /// sorted by trigger price so `check_triggers` can range-scan every
+    /// stop marketable at a trade price: stop buys trigger when the
+    /// price rises (iterate from lowest trigger up), stop sells when it
+    /// falls (iterate from highest trigger down).
     stop_buys: StopSide,
     stop_sells: StopSide,
     /// Tracks which order IDs are pending stops, for cancel support.
@@ -260,7 +260,7 @@ impl OrderBook {
     }
 
     /// Look up a resting order's location and reservation slot from the index.
-    /// O(1) HashMap lookup — no VecDeque scan. Returns `None` if the order is
+    /// O(1) HashMap lookup — no book traversal. Returns `None` if the order is
     /// not on the book.
     pub(crate) fn peek_order_location(
         &self,

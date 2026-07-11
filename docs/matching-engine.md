@@ -47,7 +47,7 @@ A dormant order that becomes a **market order** when the `last_trade_price` reac
 - **Stop buy**: triggers when `last_trade_price >= trigger_price`.
 - **Stop sell**: triggers when `last_trade_price <= trigger_price`.
 
-Stop orders are stored in the `PendingStop` struct and indexed in `stop_buys` / `stop_sells` BTreeMaps keyed by `trigger_price`. They do not appear on the visible bid/ask book.
+Stop orders are stored in the `PendingStop` struct and indexed in `stop_buys` / `stop_sells`, sorted by trigger price. They do not appear on the visible bid/ask book.
 
 The `quote_budget` from the original reservation is preserved in the `PendingStop` so that the triggered market order respects the same cost cap.
 
@@ -106,14 +106,14 @@ The engine implements strict **price-time priority** (also called FIFO matching)
 
 ### Book data structure
 
-Each side of the book (`BookSide`) uses a **sorted `Vec<(Price, VecDeque<RestingOrder>)>`** with binary search:
+Each side of the book keeps its price levels in a **sorted array** with binary search:
 
-- **Sorted `Vec`** keeps price levels in sorted order. Typical books have 10-100 active price levels; at ~16 bytes per level entry, the entire Vec fits in L1/L2 cache. Binary search for a price level is O(log n). Insert and remove shift entries but are fast for small n -- the shift is a single `memcpy` in L1. `BTreeMap`'s node-per-entry layout scatters across heap pages and incurs cache misses on traversal.
-- **`VecDeque`** at each price level maintains FIFO ordering. `push_back` for new orders and `pop_front` for fills are both O(1).
+- **Sorted levels**: typical books have 10-100 active price levels; at ~16 bytes per level entry, the entire level array fits in L1/L2 cache. Binary search for a price level is O(log n). Insert and remove shift entries but are fast for small n -- the shift is a single `memcpy` in L1. A node-per-entry tree would scatter across heap pages and incur cache misses on traversal.
+- **FIFO within a level**: new orders join the back of the level's queue, fills consume from the front, and a cancelled order is unlinked in O(1) regardless of its position in the queue.
 
-An auxiliary **`HashMap<OrderId, (Side, Price)>`** (`order_index`) provides O(1) amortized lookup for cancel operations, avoiding a linear scan of the book.
+An auxiliary index, keyed by `(account, order_id)`, points directly at the resting order, so cancels and amendments are O(1) and never scan a price level.
 
-Stop orders use **`BTreeMap<Price, Vec<PendingStop>>`** for `stop_buys` and `stop_sells`, keyed by trigger price. BTreeMap is appropriate here because stop books can have many more price levels (no consolidation at inside prices) and are not on the matching hot path.
+Stop orders are stored the same way, keyed by trigger price. The stop ladder is on the matching hot path -- the trigger check runs after every trade -- so it shares the visible book's cache-friendly layout. One caveat: stop triggers are not consolidated toward the inside the way resting quotes are, so a stop ladder can hold more price levels than the 10-100 typical for the visible book, making level insert/remove shifts proportionally larger.
 
 ### Matching walk
 
@@ -122,7 +122,7 @@ The `match_against` method collects all matchable price levels into a `Vec<Price
 - For a **buy** taker: asks are visited in ascending price order, stopping at the first price above the taker's limit (if any).
 - For a **sell** taker: bids are visited in descending price order, stopping at the first price below the taker's limit (if any).
 
-At each price level, the front of the `VecDeque` (oldest order) is matched first. The fill quantity is `min(taker_remaining, maker_remaining)`, further constrained by the `quote_budget` for market buys. A `Fill` report is emitted for each match. The `last_trade_price` is updated after every fill.
+At each price level, the oldest resting order is matched first. The fill quantity is `min(taker_remaining, maker_remaining)`, further constrained by the `quote_budget` for market buys. A `Fill` report is emitted for each match. The `last_trade_price` is updated after every fill.
 
 ---
 
@@ -132,10 +132,10 @@ At each price level, the front of the `VecDeque` (oldest order) is matched first
 
 When a `Stop` or `StopLimit` order arrives at `OrderBook::execute()`, it is **not** matched. Instead, `add_stop()` creates a `PendingStop` and inserts it into:
 
-- `stop_buys` (BTreeMap keyed by `trigger_price`) for buy stops.
-- `stop_sells` (BTreeMap keyed by `trigger_price`) for sell stops.
+- `stop_buys` (sorted by `trigger_price`) for buy stops.
+- `stop_sells` (sorted by `trigger_price`) for sell stops.
 
-The `stop_index` HashMap tracks `OrderId -> (Side, trigger_price)` for O(1) cancel lookup.
+The `stop_index` map tracks `(account, order_id) -> (side, trigger price, node handle)` for O(1) cancel lookup — the node handle lets a cancel unlink the stop directly, without scanning its trigger level.
 
 The original order's `time_in_force`, `stp` (self-trade prevention mode), and `quote_budget` are all preserved in the `PendingStop`.
 
@@ -146,7 +146,7 @@ After every `execute()` call (including fills from other orders), `check_trigger
 - **Stop buys**: iterates `stop_buys` keys in ascending order, collecting all trigger prices <= `last_trade_price`.
 - **Stop sells**: iterates `stop_sells` keys in descending order, collecting all trigger prices >= `last_trade_price`.
 
-All matching stops are removed from the BTreeMaps and `stop_index`, then executed (step 3). Because those executions can move `last_trade_price` past further trigger prices, the pass then **repeats** against the updated price, until a pass collects nothing. See "Triggered stop cascade" below.
+All matching stops are removed from the stop books and `stop_index`, then executed (step 3). Because those executions can move `last_trade_price` past further trigger prices, the pass then **repeats** against the updated price, until a pass collects nothing. See "Triggered stop cascade" below.
 
 ### 3. Conversion and execution
 
@@ -185,7 +185,7 @@ Implemented in `OrderBook::replace_order()`:
 | Scenario | Priority |
 |---|---|
 | Same price, quantity decrease (or unchanged) | **Preserved** -- in-place update at current queue position |
-| Same price, quantity increase | **Lost** -- removed from current position and pushed to back of the price level's VecDeque |
+| Same price, quantity increase | **Lost** -- removed from current position and pushed to the back of the price level's queue |
 | Price change (any direction) | **Lost** -- removed from old price level, added to back of new price level |
 
 ### Output

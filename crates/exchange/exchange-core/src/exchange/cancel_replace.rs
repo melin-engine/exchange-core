@@ -71,7 +71,7 @@ impl Exchange {
 
         // 1. Order must exist as a resting limit order.
         // Use peek_order_location (O(1) index lookup) for validation —
-        // the VecDeque scan for old_remaining is deferred to replace_order.
+        // fetching old_remaining is deferred to replace_order.
         let Some((side, _old_price, slot)) = inst.book.peek_order_location(account, order_id)
         else {
             reports.push(ExecutionReport::Rejected {
@@ -186,8 +186,8 @@ impl Exchange {
             return;
         }
 
-        // 6. All checks passed — perform the book replacement (single VecDeque
-        // scan). This returns (old_price, old_remaining).
+        // 6. All checks passed — perform the book replacement (O(1) node
+        // removal via the slab index). This returns (old_price, old_remaining).
         // Cannot fail since we verified the order exists above and matching is
         // single-threaded (no concurrent removal possible).
         // Note: `live_order_ids` is intentionally not touched. The order keeps
