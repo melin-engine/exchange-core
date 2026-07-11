@@ -1506,10 +1506,11 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12e691b1bdd5e270d2c44ba70adebb90f10a59f044321deab146359da322adbc"
 dependencies = [
  "base64 0.22.1",
  "libc",
- "tempfile",
  "tracing",
 ]
 
@@ -1565,6 +1566,8 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd8cb9c06c6ce3dd04699a4ccb809ec5df7656f1aec99a0a577fc39c8795fea1"
 dependencies = [
  "bindgen",
  "cc",
@@ -1573,20 +1576,6 @@ dependencies = [
  "pkg-config",
  "rustc-hash",
  "tracing",
-]
-
-[[package]]
-name = "melin-example-counter"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "ed25519-dalek",
- "melin-app",
- "melin-server-runtime",
- "melin-wire-protocol",
- "tempfile",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1613,6 +1602,8 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fc9f4b31c98d331c40f88f8c5c29c0652ca08cbc6b00dcfcaf9f2b685460932"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1623,7 +1614,6 @@ dependencies = [
  "melin-pipeline",
  "memmap2",
  "rustix",
- "tempfile",
  "tracing",
  "zerocopy",
 ]
@@ -1680,9 +1670,8 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.11.0"
-dependencies = [
- "libc",
-]
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d202bf8263183ab21bfd4d393732e9840cf2ef83e53d135d1ae8f2d2b0d6ec6"
 
 [[package]]
 name = "melin-protocol"
@@ -1733,6 +1722,8 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf2bbfc0063fe305354310cce301f83cf7194f1c64ad7e0d02d35a97dd241be"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1744,16 +1735,12 @@ dependencies = [
  "libc",
  "melin-app",
  "melin-dpdk",
- "melin-example-counter",
  "melin-journal",
  "melin-pipeline",
  "melin-transport-core",
  "melin-wire-protocol",
- "proptest",
  "rand 0.10.1",
  "rustc-hash",
- "serial_test",
- "tempfile",
  "tracing",
  "zerocopy",
 ]
@@ -1769,6 +1756,8 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c50293061e162a0d3c9177c53ef737370c7c7f0cf37040d9a12c18ddd943b5a"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1777,8 +1766,6 @@ dependencies = [
  "melin-app",
  "melin-journal",
  "melin-pipeline",
- "proptest",
- "tempfile",
  "tracing",
  "zerocopy",
 ]
@@ -1811,9 +1798,8 @@ version = "0.11.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.11.0"
-dependencies = [
- "tempfile",
-]
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eaf70bda3508eb66f4ee86b0337d088f60b1017b6b7a0fda5c318dc7620050b"
 
 [[package]]
 name = "memchr"

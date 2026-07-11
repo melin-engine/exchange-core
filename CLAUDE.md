@@ -4,7 +4,7 @@
 
 ## Project
 
-**Melin** — sub-millisecond, production-grade exchange core targeting **10M orders/sec**, built on the **LMAX architecture** (single-threaded business logic, event sourcing, mechanical sympathy). Rust (edition 2024). Handles order matching, account management, risk controls, circuit breakers, fee schedules, authentication, journaling, and replication.
+**Melin Exchange Core** — sub-millisecond, production-grade exchange core targeting **10M orders/sec**, built on the **Melin sequencer** (LMAX architecture: single-threaded business logic, event sourcing, mechanical sympathy). Rust (edition 2024). Handles order matching, account management, risk controls, circuit breakers, fee schedules, and authentication. Journaling, replication, transport, and the pipeline come from the sequencer crates (`melin-app`, `melin-pipeline`, `melin-journal`, `melin-wire-protocol`, `melin-transport-core`, `melin-server-runtime`, `melin-dpdk`), consumed as crates.io dependencies and maintained in the separate sequencer repository.
 
 **Commercial product** — Every feature decision should be evaluated through the lens of "does this make the product more appealing to an exchange operator?"
 

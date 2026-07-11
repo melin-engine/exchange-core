@@ -1,92 +1,87 @@
-# Melin
+# Melin Exchange Core
 
-[![Crates.io](https://img.shields.io/crates/v/melin-app)](https://crates.io/crates/melin-app)
-[![docs.rs](https://img.shields.io/docsrs/melin-app)](https://docs.rs/melin-app)
-[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+An exchange core built on the [Melin sequencer](https://github.com/melin-engine/melin). Handles order matching, account balances, risk controls, circuit breakers, fee schedules, and market data. The full critical path from order ingestion to durable execution.
 
-Melin is a deterministic, replicated sequencer for latency-critical applications. It provides a multi-threaded, event-sourced processing pipeline with durable journaling, synchronous replication, and sub-millisecond tail latency under load. The infrastructure layer for systems where every event must be persisted, ordered, and replayed exactly.
+**Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel-run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
-Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: a lock-free disruptor pipeline, io_uring I/O, and mechanical sympathy throughout.
+## Performance
 
-## Features
+The single-threaded exchange core (order matching, risk checks, balance updates, fee calculation) with no network, journal, or replication. Measures the `Exchange::execute()` hot path on a single core under realistic order flow; 30 s measurement window after 10 s warmup. Single AMD EPYC 9255 (24C Zen 5, SMT off).
 
-**Deterministic replay.** Given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it as long as it stays pure (no I/O, no non-deterministic state).
+| Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 | p99.9999 | p99.99999 |
+|------------|-----|-----|-------|--------|---------|----------|-----------|
+| 4.60M/s | 0.10 µs | 0.42 µs | 0.58 µs | 0.77 µs | 0.99 µs | 1.17 µs | 1.35 µs |
 
-**Durable and replicated.** Every event is persisted to the journal and synchronously replicated via lock-free ring buffer before the client sees a response. CRC32C integrity checks and BLAKE3 hash chain for tamper evidence. Journal catch-up, snapshot transfer, and sub-second switchover upon promotion. Configurable durability modes let you trade latency for stronger guarantees:
-- **Hybrid** (default): one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
-- **Durably replicated**: two on-disk copies on separate nodes before ack, for stricter compliance regimes.
+End-to-end numbers (including journal, replication, and network) are in the [sequencer README](https://github.com/melin-engine/melin#benchmarks).
 
-**Fast.** p99 ~ 520 µs at 1M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 27 µs p99.
+## Correctness
 
-## Architecture
+- Strict price-time priority verified by property-based tests across thousands of random order sequences
+- Cross-validated against independent matching engine implementations and real market data
+- Deterministic replay guarantees identical state from the same journal
+- Property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests: more than a thousand test scenarios in total
 
-Melin runs a fixed set of pinned threads connected by lock-free disruptor rings:
+## Order Types
 
-- **Reader**: single thread multiplexing all client connections. Sole producer into the input ring.
-- **Journal**: consumes from the input ring, batch-encodes events, and writes them durably. Pushes encoded batches to replicas. Advances its cursor only after the write completes.
-- **Application**: consumes from the same input ring *in parallel with the journal* (not chained). Executes your single-threaded business logic and publishes results to an output ring. Never waits on disk.
-- **Replication senders**: stream journal batches to replicas over TCP.
-- **Event publisher**: broadcasts application output to subscribers (market data, audit, analytics).
-- **Response**: drains the output ring but gates on the journal and replication cursors before sending to clients, enforcing persist-before-ack without stalling the application.
-- **Shadow**: third consumer on the input ring, gated on the journal cursor. Takes periodic snapshots without pausing the application.
+- Market, Limit, Stop (stop-loss), Stop-Limit
+- Time-in-force: GTC, IOC, FOK, Day, GTD (Good-Til-Date)
+- Post-Only (maker-only, reject if would take)
 
-## Building an application on Melin
+## [Matching Engine](docs/matching-engine.md)
 
-Melin's core crates form a generic sequencer. Your application plugs in via four traits:
+- Strict price-time priority
+- Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced, InstrumentStatusChanged
+- Multi-instrument exchange with shared account balances
+- Cancel-replace / order amendment (atomic price/qty modify; preserves queue priority when price unchanged, loses priority on price change)
+- Circuit breakers (price bands, trading halts, configurable per instrument)
+- Instrument lifecycle management (disable/enable/remove; disable cancels all resting orders atomically, remove reclaims memory)
 
-| Trait | Role |
-|-------|------|
-| `Application` | Your business logic: receives events, produces output. No I/O, no syscalls. Determinism is required for replay. |
-| `AppFactory` | Constructs your application, deserializes snapshots, seeds initial state |
-| `RequestDecoder` | Deserializes wire bytes into your domain request type |
-| `ResponseEncoder` | Serializes your domain response type into wire bytes |
+## [Fees](docs/fee-model.md)
 
-The runtime handles transport, journaling, replication, signal handling, memory locking, and CPU pinning. Your binary becomes pure composition:
+- Maker/taker fee model (per-instrument, in basis points, configurable via admin API)
+- Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds)
+- Collected fees credited to a dedicated fee account. Operators can withdraw via admin API; balance conservation enforced across all accounts
 
-```rust
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServerConfig::parse();
-    let factory = MyAppFactory::new(/* ... */);
-    server::run(config, factory, MyDecoder, MyEncoder, None)
-}
-```
+## [Risk & Accounting](docs/risk-checks.md)
 
-See [`crates/examples/counter`](crates/examples/counter) for a complete working example.
+- Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
+- Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
+- Fat finger checks (max order size, max notional value, configurable per instrument)
+- Kill switch (cancel all resting orders and pending stops for an account across all instruments)
+- Per-account order ID high-water mark (prevents double-execution on crash-recovery retry)
+- Price band checks (static lower/upper bounds, per-instrument)
+- Withdraw (debit funds, auto-evict zero-balance entries)
 
-## Benchmarks
+## [FIX Gateway (OE)](docs/oe-gateway.md)
 
-All numbers are **full round-trip** (client sends → server persists + replicates → application executes → response arrives at client) against [the Melin Exchange Core](crates/exchange/README.md). Measured over LAN with four AMD EPYC 9275F servers (24C Zen 5, SMT off, 768 GB DDR5-6400, Micron 7450 PRO PLP NVMe, Intel E810-XXV 25 Gb/s NIC; 1 benchmark client, 1 primary, 2 replicas).
+- Single-threaded io_uring event loop terminating many concurrent FIX 4.4 sessions
+- Stateless session model: each connection starts at MsgSeqNum 1; cross-reconnect recovery is handled by the output event channel
+- Standard FIX 4.4 gap recovery (ResendRequest, SequenceReset-GapFill) on both directions
+- Bounded per-session outbound store with automatic GapFill for evicted ranges
+- TargetCompID validation, heartbeat / TestRequest liveness, configurable per-session message rate limits
 
-### Latency under load (1M/s)
+## [Authentication & Authorization](docs/admin-guide.md)
 
-| Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
-|------------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 1M/s | 103 µs | 522 µs | 597 µs | 667 µs |
+- Ed25519 challenge-response handshake
+- Four permission roles: Operator (exchange configuration), Trader (order submission/cancellation), Custodian (deposit/withdraw), ReadOnly (heartbeats)
+- Operator API (instrument management and lifecycle, circuit breakers, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
+- Per-key idempotency (sequence numbers with duplicate rejection; safe to retry on timeout without double-applying)
 
-### Single-event latency (1 client, window 1)
+## [Operations](docs/operations.md)
 
-| Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
-|-----------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 45K/s | 22 µs | 27 µs | 30 µs | 36 µs |
+- Structured logging with disciplined error levels (`error!` reserved for server malfunctions, never client-induced)
+- Health/liveness endpoint with Prometheus metrics (active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
+- Admin TUI dashboard (live connection count, events processed, throughput, journal sequence)
+- Sparse account storage to reduce memory usage, see [account lifecycle](docs/account-lifecycle.md)
 
-See [replication](docs/replication.md) for the full durability-mode menu, [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md) for tuning guidance.
+## License
 
-DPDK integration is well under way and should bring these figures noticeably lower, especially for the tail under load.
+Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. Contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
 
-## Melin Exchange Core
-
-Melin ships with an exchange core built on the sequencer: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [the exchange core README](crates/exchange/README.md).
+Each version of the Licensed Work converts to Apache License, Version 2.0 on the fourth anniversary of its first public distribution.
 
 ## Contributing
 
 Bug fixes and correctness improvements are welcome. Feature PRs will likely be closed.
 
 By submitting a pull request, you agree to the terms of our [Contributor License Agreement](CLA.md).
-
-## License
-
-Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. Contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
-
-**Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity (internal crossing, a new instrument, a parallel-run alongside an existing engine) in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
-
-Each version of the Licensed Work converts to Apache License, Version 2.0 on the fourth anniversary of its first public distribution.

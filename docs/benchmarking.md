@@ -431,7 +431,7 @@ Symptoms you will see on ext4 at this floor:
 
 ## Reproducing Published Benchmarks
 
-See the [README](../README.md#benchmarks) for the current hardware setup, benchmark parameters, and performance numbers. All LAN benchmarks are reproducible via `scripts/lan-bench-suite.sh`.
+See the [sequencer README](https://github.com/melin-engine/melin#benchmarks) for the current hardware setup, benchmark parameters, and end-to-end performance numbers, and the [README](../README.md#performance) here for the exchange-core hot-path numbers. All LAN benchmarks are reproducible via `scripts/lan-bench-suite.sh`.
 
 ### Peak-load with full durability
 
