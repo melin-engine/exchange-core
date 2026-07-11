@@ -82,6 +82,135 @@ fn non_gtd_order_rejected_with_nonzero_expiry() {
     ));
 }
 
+/// A GTD order whose expiry is at or before the event clock is rejected
+/// at submission. Without this, the head-of-event expiry drain (which
+/// already ran for this timestamp) can't reap it, and the already-dead
+/// order would rest — and could trade as maker — until a later event.
+#[test]
+fn gtd_order_expired_at_submission_rejected() {
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+
+    let gtd_buy = |id: u64, expiry_ns: u64| Order {
+        id: OrderId(id),
+        account: ACCT_A,
+        side: Side::Buy,
+        order_type: OrderType::Limit {
+            price: price(100),
+            post_only: false,
+        },
+        time_in_force: TimeInForce::GTD,
+        quantity: qty(10),
+        stp: SelfTradeProtection::Allow,
+        expiry_ns,
+    };
+
+    // Expiry strictly before the clock: rejected.
+    let mut reports = Vec::new();
+    execute_at(&mut exchange, 5_000, btc, gtd_buy(1, 4_000), &mut reports);
+    assert_eq!(reports.len(), 1);
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::InvalidExpiry,
+            ..
+        }
+    ));
+
+    // Expiry exactly at the clock: also rejected — the scheduler's due
+    // condition is `fire_ns <= now`, so this deadline is already due.
+    reports.clear();
+    execute_at(&mut exchange, 5_000, btc, gtd_buy(2, 5_000), &mut reports);
+    assert_eq!(reports.len(), 1);
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::InvalidExpiry,
+            ..
+        }
+    ));
+
+    // Rejection happens before reservation — no balance may be touched.
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 10_000);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+
+    // Expiry one nanosecond in the future: accepted and rests.
+    reports.clear();
+    execute_at(&mut exchange, 5_000, btc, gtd_buy(3, 5_001), &mut reports);
+    assert!(
+        reports
+            .iter()
+            .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+        "future-dated GTD must rest"
+    );
+}
+
+/// An already-expired GTD stop whose trigger is already satisfied by the
+/// last trade price must be rejected at submission — not registered and
+/// instantly fired by the same event's trigger check.
+#[test]
+fn gtd_stop_expired_at_submission_rejected_before_trigger() {
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_B, USD, 100_000);
+    exchange.deposit(ACCT_B, BTC, 1_000);
+
+    // Print last_trade=100 (ACCT_B self-cross, STP Allow) and leave an
+    // ask resting for the stop to hit if it were wrongly accepted.
+    let mut reports = Vec::new();
+    exchange.execute(
+        btc,
+        limit_order(1, ACCT_B, Side::Sell, 100, 2, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        btc,
+        limit_order(2, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    // Expired GTD stop-buy, trigger already satisfied (100 <= 100).
+    execute_at(
+        &mut exchange,
+        5_000,
+        btc,
+        Order {
+            id: OrderId(10),
+            account: ACCT_A,
+            side: Side::Buy,
+            order_type: OrderType::Stop {
+                trigger_price: price(100),
+            },
+            time_in_force: TimeInForce::GTD,
+            quantity: qty(1),
+            stp: SelfTradeProtection::Allow,
+            expiry_ns: 4_000,
+        },
+        &mut reports,
+    );
+
+    assert_eq!(reports.len(), 1);
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::InvalidExpiry,
+            ..
+        }
+    ));
+    assert!(
+        !reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Triggered { .. } | ExecutionReport::Fill { .. }
+        )),
+        "an expired stop must not fire or trade"
+    );
+}
+
 // -- Scheduler-driven GTD expiry --
 
 /// Submitting a GTD limit that rests on the book schedules exactly one

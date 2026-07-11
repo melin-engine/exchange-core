@@ -166,9 +166,15 @@ impl Exchange {
             }
         }
 
-        // GTD validation: GTD orders must have a non-zero expiry, and
-        // non-GTD orders must not carry an expiry timestamp.
-        if order.time_in_force == TimeInForce::GTD && order.expiry_ns == 0 {
+        // GTD validation: GTD orders must carry an expiry strictly in the
+        // future of the event clock; zero ("no expiry set") is covered by
+        // the same comparison. An expiry at or before the clock has no
+        // valid lifetime — the head-of-event expiry drain already ran for
+        // this timestamp, so an accepted order would rest (or, for a stop
+        // whose trigger is already satisfied, even fire and trade) despite
+        // being past its deadline, until some later event reaps it. `<=`
+        // matches the scheduler's due condition (`fire_ns <= now`).
+        if order.time_in_force == TimeInForce::GTD && order.expiry_ns <= self.current_event_ts_ns {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
                 symbol,

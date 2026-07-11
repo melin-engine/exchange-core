@@ -143,7 +143,7 @@ If any check fails, the original order remains untouched on the book with its or
 | `HasRestingOrders` | Withdrawal rejected — account has resting orders (must CancelAll first). |
 | `DuplicateRequest` | Per-key request sequence already processed (idempotency dedup). |
 | `ReplicaDisconnected` | Replication is enabled but all replicas are disconnected — state-mutating operations blocked. |
-| `InvalidExpiry` | GTD order with missing expiry, or non-GTD order with unexpected expiry. |
+| `InvalidExpiry` | GTD order with missing expiry or an expiry already at/past the venue clock at submission, or non-GTD order with unexpected expiry. |
 | `InstrumentDisabled` | Instrument is disabled — no new orders or amendments accepted. |
 
 ## Configuration
@@ -154,5 +154,7 @@ Risk controls are configured per-instrument through admin commands, journaled fo
 - **`SetCircuitBreaker { symbol, config }`** -- sets or updates `CircuitBreakerConfig` (price_band_lower, price_band_upper, halted) for an instrument.
 
 Both commands are available through the admin CLI and the wire protocol. They take effect immediately on the next order submission -- no restart required. Changes are persisted in the journal and restored on recovery.
+
+Note that pending stop orders are validated against the limits and price bands in force **at submission time** and are grandfathered across later configuration changes: tightening the limits or narrowing the bands does not re-validate stops already pending, so a stop accepted under the old configuration will still execute (and may rest) under its original terms when it triggers. Cancel and re-submit stops if they must conform to a new configuration.
 
 Unconfigured instruments (no `SetRiskLimits` or `SetCircuitBreaker` issued) pass all risk checks by default. There are no global/exchange-wide risk limits; all controls are per-instrument.
