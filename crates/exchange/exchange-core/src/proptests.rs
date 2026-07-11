@@ -496,6 +496,37 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
         orphan_res.is_empty(),
         "After action #{action_idx} ({action_desc}): orphan reservations: {orphan_res:?}"
     );
+
+    // No pending stop may be marketable against the last trade price:
+    // `check_triggers` cascades to a fixed point within each event, so a
+    // stop whose trigger is satisfied must already have fired.
+    for (sym, book) in exchange.books() {
+        let Some(last) = book.last_trade_price() else {
+            continue;
+        };
+        book.stop_buys().for_each_stop(|stop| {
+            assert!(
+                stop.trigger_price() > last,
+                "After action #{action_idx} ({action_desc}): pending stop-buy \
+                 ({:?}, {:?}) on {sym:?} has trigger {:?} <= last trade {last:?} \
+                 — it should have fired",
+                stop.account(),
+                stop.id(),
+                stop.trigger_price(),
+            );
+        });
+        book.stop_sells().for_each_stop(|stop| {
+            assert!(
+                stop.trigger_price() < last,
+                "After action #{action_idx} ({action_desc}): pending stop-sell \
+                 ({:?}, {:?}) on {sym:?} has trigger {:?} >= last trade {last:?} \
+                 — it should have fired",
+                stop.account(),
+                stop.id(),
+                stop.trigger_price(),
+            );
+        });
+    }
 }
 
 /// Return type for `run_exchange_actions`:
@@ -1836,4 +1867,348 @@ proptest! {
             reports_b.clear();
         }
     }
+}
+
+// ===========================================================================
+// Cascade pressure
+// ===========================================================================
+//
+// The general `arb_exchange_actions` generator draws prices from a wide
+// range with stops at a low action weight, so multi-hop stop cascades are
+// rare in its runs and the `check_triggers` fixed-point loop is mostly
+// sampled in its trivial one-pass form. This section confines all prices
+// to a narrow band with thin levels and stop-heavy flow, making cascades
+// the common case rather than the exception.
+
+/// Seeds sized so band-priced orders rarely exhaust balances. A
+/// stop-market buy still reserves the account's entire quote balance, so
+/// insufficient-budget cascade hops occur naturally whenever several buy
+/// stops are pending at once.
+const CASCADE_SEED_USD: u64 = 1_000_000;
+const CASCADE_SEED_BTC: u64 = 10_000;
+
+/// Price confined to a narrow band so liquidity, stop triggers, and
+/// prints cluster: a triggered stop's fill then routinely lands past
+/// another stop's trigger, driving `check_triggers` through multiple
+/// firing passes.
+fn arb_band_price() -> impl Strategy<Value = Price> {
+    (80u64..=120).prop_map(|p| Price(NonZeroU64::new(p).unwrap()))
+}
+
+/// Small quantities keep price levels thin, so aggressive orders and
+/// triggered stops gap through several levels in one sweep.
+fn arb_thin_quantity() -> impl Strategy<Value = Quantity> {
+    (1u64..=3).prop_map(|q| Quantity(NonZeroU64::new(q).unwrap()))
+}
+
+/// Stop-heavy action mix inside the band. No deposits (runs are
+/// pre-seeded), no withdrawals, no fee changes — so final balances must
+/// exactly conserve the seeds.
+fn arb_cascade_action() -> impl Strategy<Value = ExchangeAction> {
+    prop_oneof![
+        // Resting GTC liquidity for prints and triggered stops to hit.
+        4 => (arb_account(), arb_side(), arb_band_price(), arb_thin_quantity(), arb_stp())
+            .prop_map(|(account, side, price, quantity, stp)| ExchangeAction::Limit {
+                account, side, price, quantity,
+                tif: TimeInForce::GTC, stp, post_only: false, expiry_ns: 0,
+            }),
+        // Stop-markets in both directions: they always trade on trigger,
+        // which is what extends a cascade another hop.
+        4 => (arb_account(), arb_side(), arb_band_price(), arb_thin_quantity(), arb_stp())
+            .prop_map(|(account, side, trigger_price, quantity, stp)| ExchangeAction::Stop {
+                account, side, trigger_price, quantity, stp,
+            }),
+        // Stop-limits with band limit prices: most are marketable on
+        // trigger, some rest — covering cascade-terminates-on-rest.
+        2 => (arb_account(), arb_side(), arb_band_price(), arb_band_price(), arb_thin_quantity(), arb_stp())
+            .prop_map(|(account, side, trigger_price, limit_price, quantity, stp)| {
+                ExchangeAction::StopLimit {
+                    account, side, trigger_price, limit_price, quantity,
+                    tif: TimeInForce::GTC, stp, expiry_ns: 0,
+                }
+            }),
+        // Prints: market orders that sweep thin levels and move the last
+        // trade price onto pending triggers.
+        3 => (arb_account(), arb_side(), 1u64..=5, arb_stp())
+            .prop_map(|(account, side, q, stp)| ExchangeAction::Market {
+                account, side,
+                quantity: Quantity(NonZeroU64::new(q).expect("q >= 1")), stp,
+            }),
+        // Occasional cancel churns the pending-stop set mid-ladder.
+        1 => (0usize..250).prop_map(|target_idx| ExchangeAction::Cancel { target_idx }),
+    ]
+}
+
+/// Seed both accounts with fixed balances, then run the stop-heavy mix.
+fn arb_cascade_actions() -> impl Strategy<Value = Vec<ExchangeAction>> {
+    proptest::collection::vec(arb_cascade_action(), 1..=250).prop_map(|actions| {
+        let mut seeded = Vec::with_capacity(actions.len() + 4);
+        for account in [ACCT_A, ACCT_B] {
+            seeded.push(ExchangeAction::Deposit {
+                account,
+                currency: USD,
+                amount: CASCADE_SEED_USD,
+            });
+            seeded.push(ExchangeAction::Deposit {
+                account,
+                currency: BTC,
+                amount: CASCADE_SEED_BTC,
+            });
+        }
+        seeded.extend(actions);
+        seeded
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// Stop-heavy flow in a narrow band with thin levels: triggered stops
+    /// routinely move the last trade price past further triggers, forcing
+    /// `check_triggers` through multiple firing passes.
+    /// `run_exchange_actions` audits full consistency after every action
+    /// (order/reservation indexes and the no-marketable-pending-stop
+    /// invariant). With no withdrawals and zero fees, final balances must
+    /// conserve the seeded deposits exactly.
+    #[test]
+    fn cascade_pressure(actions in arb_cascade_actions()) {
+        let (exchange, _, _, _) = run_exchange_actions(&actions);
+
+        for (currency, seed) in [(USD, CASCADE_SEED_USD), (BTC, CASCADE_SEED_BTC)] {
+            let total: u64 = [ACCT_A, ACCT_B]
+                .iter()
+                .map(|&a| {
+                    let b = exchange.accounts().balance(a, currency);
+                    b.available + b.reserved
+                })
+                .sum();
+            prop_assert_eq!(total, seed * 2, "currency {:?} not conserved", currency);
+        }
+    }
+}
+
+/// Does one event's report stream show a stop fired beyond pass 1 of the
+/// trigger scan? Pass 1 fires exactly the stops marketable against the
+/// trade price at scan start — the incoming order's own last fill (every
+/// `Fill` before the first `Triggered` belongs to the taker), or the
+/// previous event's last trade if the taker didn't trade. A `Triggered`
+/// whose trigger is NOT marketable against that price (buy: trigger >
+/// scan, sell: trigger < scan) can only have been fired by a later pass,
+/// after another triggered stop's fills moved the price — the public
+/// signature of a multi-pass cascade, needing no engine instrumentation.
+fn event_fired_beyond_pass_one(
+    reports: &[ExecutionReport],
+    stop_sides: &HashMap<(AccountId, OrderId), Side>,
+    prev_last_trade: Option<Price>,
+) -> bool {
+    let Some(first_triggered) = reports
+        .iter()
+        .position(|r| matches!(r, ExecutionReport::Triggered { .. }))
+    else {
+        return false;
+    };
+    let scan_price = reports[..first_triggered]
+        .iter()
+        .rev()
+        .find_map(|r| match r {
+            ExecutionReport::Fill { price, .. } => Some(*price),
+            _ => None,
+        })
+        .or(prev_last_trade);
+    let Some(scan_price) = scan_price else {
+        // A stop cannot trigger without a last trade price.
+        return false;
+    };
+    reports[first_triggered..].iter().any(|r| match r {
+        ExecutionReport::Triggered {
+            order_id,
+            account,
+            trigger_price,
+            ..
+        } => match stop_sides.get(&(*account, *order_id)) {
+            Some(Side::Buy) => *trigger_price > scan_price,
+            Some(Side::Sell) => *trigger_price < scan_price,
+            None => false,
+        },
+        _ => false,
+    })
+}
+
+/// Drive `actions` through a fresh exchange, keeping per-event report
+/// boundaries, and return whether any event fired a multi-pass cascade.
+/// Handles exactly the action kinds `arb_cascade_actions` emits.
+fn drives_multi_pass_cascade(actions: &[ExchangeAction]) -> bool {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    let sym = Symbol(1);
+    let mut reports = Vec::new();
+    let mut next_id_per_account: HashMap<AccountId, u64> = HashMap::new();
+    let mut action_order_ids: Vec<Option<(OrderId, AccountId)>> = Vec::new();
+    // Side of every stop placed, to classify its later `Triggered`
+    // report. Ids never repeat (counters only increment), so entries
+    // can't go stale.
+    let mut stop_sides: HashMap<(AccountId, OrderId), Side> = HashMap::new();
+    let mut last_trade: Option<Price> = None;
+
+    for action in actions {
+        let action_idx = action_order_ids.len();
+        reports.clear();
+        let mut next_id = |account: AccountId| {
+            let counter = next_id_per_account.entry(account).or_insert(0);
+            *counter += 1;
+            OrderId(*counter)
+        };
+        match action {
+            ExchangeAction::Deposit {
+                account,
+                currency,
+                amount,
+            } => {
+                action_order_ids.push(None);
+                exchange.deposit(*account, *currency, *amount);
+            }
+            ExchangeAction::Limit {
+                account,
+                side,
+                price,
+                quantity,
+                tif,
+                stp,
+                post_only,
+                expiry_ns,
+            } => {
+                let id = next_id(*account);
+                action_order_ids.push(Some((id, *account)));
+                let order = Order {
+                    id,
+                    account: *account,
+                    side: *side,
+                    order_type: OrderType::Limit {
+                        price: *price,
+                        post_only: *post_only,
+                    },
+                    time_in_force: *tif,
+                    quantity: *quantity,
+                    stp: *stp,
+                    expiry_ns: *expiry_ns,
+                };
+                exchange.execute(sym, order, &mut reports);
+            }
+            ExchangeAction::Market {
+                account,
+                side,
+                quantity,
+                stp,
+            } => {
+                let id = next_id(*account);
+                action_order_ids.push(Some((id, *account)));
+                let order = Order {
+                    id,
+                    account: *account,
+                    side: *side,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::IOC,
+                    quantity: *quantity,
+                    stp: *stp,
+                    expiry_ns: 0,
+                };
+                exchange.execute(sym, order, &mut reports);
+            }
+            ExchangeAction::Stop {
+                account,
+                side,
+                trigger_price,
+                quantity,
+                stp,
+            } => {
+                let id = next_id(*account);
+                action_order_ids.push(Some((id, *account)));
+                stop_sides.insert((*account, id), *side);
+                let order = Order {
+                    id,
+                    account: *account,
+                    side: *side,
+                    order_type: OrderType::Stop {
+                        trigger_price: *trigger_price,
+                    },
+                    time_in_force: TimeInForce::GTC,
+                    quantity: *quantity,
+                    stp: *stp,
+                    expiry_ns: 0,
+                };
+                exchange.execute(sym, order, &mut reports);
+            }
+            ExchangeAction::StopLimit {
+                account,
+                side,
+                trigger_price,
+                limit_price,
+                quantity,
+                tif,
+                stp,
+                expiry_ns,
+            } => {
+                let id = next_id(*account);
+                action_order_ids.push(Some((id, *account)));
+                stop_sides.insert((*account, id), *side);
+                let order = Order {
+                    id,
+                    account: *account,
+                    side: *side,
+                    order_type: OrderType::StopLimit {
+                        trigger_price: *trigger_price,
+                        limit_price: *limit_price,
+                    },
+                    time_in_force: *tif,
+                    quantity: *quantity,
+                    stp: *stp,
+                    expiry_ns: *expiry_ns,
+                };
+                exchange.execute(sym, order, &mut reports);
+            }
+            ExchangeAction::Cancel { target_idx } => {
+                action_order_ids.push(None);
+                if *target_idx < action_idx
+                    && let Some((id, account)) = action_order_ids[*target_idx]
+                {
+                    exchange.cancel(sym, account, id, &mut reports);
+                }
+            }
+            other => unreachable!("arb_cascade_actions never emits {other:?}"),
+        }
+
+        if event_fired_beyond_pass_one(&reports, &stop_sides, last_trade) {
+            return true;
+        }
+        for r in &reports {
+            if let ExecutionReport::Fill { price, .. } = r {
+                last_trade = Some(*price);
+            }
+        }
+    }
+    false
+}
+
+/// The cascade-pressure generator must actually produce multi-pass
+/// cascades — otherwise `cascade_pressure` silently degrades to testing
+/// one-hop triggers. Sampled with a fixed proptest RNG so it cannot
+/// flake; if generator tuning ever regresses cascade frequency, this
+/// fails instead of the coverage quietly evaporating.
+#[test]
+fn cascade_generator_reaches_multi_pass_cascades() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::deterministic();
+    let found = (0..64).any(|_| {
+        let actions = arb_cascade_actions()
+            .new_tree(&mut runner)
+            .expect("strategy generation is infallible")
+            .current();
+        drives_multi_pass_cascade(&actions)
+    });
+    assert!(
+        found,
+        "64 deterministic samples never produced a multi-pass cascade"
+    );
 }
