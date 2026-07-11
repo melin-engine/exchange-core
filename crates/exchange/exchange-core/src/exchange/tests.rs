@@ -3202,6 +3202,196 @@ fn stop_sell_cascade_fires_within_same_event() {
     assert_eq!(fills, 3, "trigger fill plus one fill per cascaded stop");
 }
 
+/// One print can make a buy stop and a sell stop marketable at once
+/// (buy trigger <= print <= sell trigger). Both must fire in the same
+/// pass — buys first, then sells — even though the buy stop's own fill
+/// moves the price before the sell stop executes.
+#[test]
+fn stop_buy_and_sell_fire_from_same_print() {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_A, BTC, 1_000);
+    exchange.deposit(ACCT_B, USD, 1_000_000);
+    exchange.deposit(ACCT_B, BTC, 1_000);
+
+    let mut reports = Vec::new();
+
+    // ACCT_B's book: ask 1@100 (the print), ask 1@120 (for the buy
+    // stop), bid 1@80 (for the sell stop).
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_B, Side::Sell, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        Symbol(1),
+        limit_order(2, ACCT_B, Side::Sell, 120, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        Symbol(1),
+        limit_order(3, ACCT_B, Side::Buy, 80, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    // ACCT_A's stop-markets: buy trigger 90 and sell trigger 110 are
+    // both satisfied by a print at 100.
+    for (id, side, trigger) in [(10, Side::Buy, 90), (11, Side::Sell, 110)] {
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(id),
+                account: ACCT_A,
+                side,
+                order_type: OrderType::Stop {
+                    trigger_price: price(trigger),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    // The print: ACCT_B buys 1@100 against its own ask (STP Allow).
+    exchange.execute(
+        Symbol(1),
+        limit_order(4, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    let triggered: Vec<OrderId> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        triggered,
+        vec![OrderId(10), OrderId(11)],
+        "both sides must fire from the same print, buys before sells"
+    );
+
+    // Print @100, buy stop fills @120, sell stop fills @80.
+    let fill_prices: Vec<Price> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Fill { price, .. } => Some(*price),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fill_prices, vec![price(100), price(120), price(80)]);
+}
+
+/// A cascaded stop whose quote budget can't afford a single lot is
+/// cancelled instead of filling. The cascade must still process it
+/// (Triggered + Cancelled), terminate, and release every reservation —
+/// including the filled first hop's surplus.
+#[test]
+fn cascaded_stop_without_budget_is_cancelled_and_released() {
+    // Third account so each stop-market buy reserves its own balance
+    // (a buy stop-market reserves the account's entire quote balance).
+    const ACCT_C: AccountId = AccountId(3);
+
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 1_000);
+    exchange.deposit(ACCT_C, USD, 100);
+    exchange.deposit(ACCT_B, USD, 1_000_000);
+    exchange.deposit(ACCT_B, BTC, 1_000);
+
+    let mut reports = Vec::new();
+
+    // Asks from ACCT_B: 1@100 (the print), 2@150 (first hop fills one;
+    // the second remains so the broke stop meets liquidity, not an
+    // empty book — exercising the budget-cancel path, not NoLiquidity).
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_B, Side::Sell, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        Symbol(1),
+        limit_order(2, ACCT_B, Side::Sell, 150, 2, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    // Hop 1: ACCT_A stop-market buy, trigger 100, budget 1000 — fills
+    // 1@150. Hop 2: ACCT_C stop-market buy, trigger 120, budget 100 —
+    // fires off hop 1's fill but can't afford one lot at 150.
+    for (id, account, trigger) in [(10, ACCT_A, 100), (11, ACCT_C, 120)] {
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(id),
+                account,
+                side: Side::Buy,
+                order_type: OrderType::Stop {
+                    trigger_price: price(trigger),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    // The print: ACCT_B buys 1@100 against its own ask (STP Allow).
+    exchange.execute(
+        Symbol(1),
+        limit_order(3, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    let triggered: Vec<OrderId> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(triggered, vec![OrderId(10), OrderId(11)]);
+
+    let fills = reports
+        .iter()
+        .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+        .count();
+    assert_eq!(
+        fills, 2,
+        "the print and hop 1 — the broke stop must not fill"
+    );
+
+    assert!(
+        reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Cancelled { order_id, remaining_quantity, .. }
+                if *order_id == OrderId(11) && *remaining_quantity == qty(1)
+        )),
+        "the unaffordable cascaded stop must be cancelled in full"
+    );
+
+    // Reservations must be fully released across cascade passes:
+    // ACCT_A reserved 1000, spent 150 on the fill; ACCT_C reserved 100,
+    // spent nothing.
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 850);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 1);
+    assert_eq!(exchange.accounts().balance(ACCT_C, USD).available, 100);
+    assert_eq!(exchange.accounts().balance(ACCT_C, USD).reserved, 0);
+    assert_eq!(exchange.open_order_count(ACCT_A), 0);
+    assert_eq!(exchange.open_order_count(ACCT_C), 0);
+}
+
 /// A triggered stop-limit that rests on the book without trading doesn't
 /// move the last trade price — the cascade rescan must terminate and
 /// leave the order resting.
