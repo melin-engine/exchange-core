@@ -273,13 +273,23 @@ impl OrderBook {
     }
 
     /// Best bid price (highest), or `None` if the bid side is empty.
-    pub(crate) fn best_bid(&self) -> Option<Price> {
+    pub fn best_bid(&self) -> Option<Price> {
         self.bids.last_price()
     }
 
     /// Best ask price (lowest), or `None` if the ask side is empty.
-    pub(crate) fn best_ask(&self) -> Option<Price> {
+    pub fn best_ask(&self) -> Option<Price> {
         self.asks.first_price()
+    }
+
+    /// Total resting quantity at one exact price level on the given side,
+    /// or 0 if the level does not exist. Read-only book introspection
+    /// (market-data / audit queries); not on the matching hot path.
+    pub fn depth_at(&self, price: Price, side: Side) -> u64 {
+        match side {
+            Side::Buy => self.bids.depth_at(price),
+            Side::Sell => self.asks.depth_at(price),
+        }
     }
 
     /// Replace a resting order's price and/or quantity in-place.

@@ -463,6 +463,23 @@ impl BookSide {
         self.levels.last().map(|(p, _)| *p)
     }
 
+    /// Total resting quantity at one exact price level, or 0 if the level
+    /// does not exist. Read-only book introspection (market-data / audit
+    /// queries); not on the matching hot path.
+    pub(super) fn depth_at(&self, price: Price) -> u64 {
+        let Ok(idx) = self.search(price) else {
+            return 0;
+        };
+        let mut total: u64 = 0;
+        let mut cur = self.levels[idx].1.head;
+        while cur != INVALID_NODE {
+            let n = &self.nodes[cur as usize];
+            total = total.saturating_add(n.order.remaining.get());
+            cur = n.next;
+        }
+        total
+    }
+
     /// Total available quantity at prices that would match the given limit.
     /// If `exclude_account` is `Some`, orders from that account are skipped
     /// (used for FOK pre-check with STP CancelNewest/CancelBoth).

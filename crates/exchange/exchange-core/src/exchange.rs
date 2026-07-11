@@ -14,7 +14,7 @@ mod instrument;
 mod snapshot_methods;
 mod token_bucket;
 
-use self::instrument::inst_mut;
+use self::instrument::{inst_mut, inst_ref};
 use self::token_bucket::TokenBucket;
 // Re-exported so existing crate paths (`crate::exchange::InstrumentState`,
 // used by `crate::snapshot`) keep working after the move.
@@ -24,8 +24,8 @@ use crate::orderbook::OrderBook;
 use crate::scheduler::{ScheduledTask, ScheduledTaskHeap, ScheduledTaskKind};
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, FxHashSet, HashMap,
-    HashMap4, InstrumentSpec, InstrumentStatus, OrderId, RejectReason, ReservationSlot, RiskLimits,
-    Side, Symbol,
+    HashMap4, InstrumentSpec, InstrumentStatus, OrderId, Price, RejectReason, ReservationSlot,
+    RiskLimits, Side, Symbol,
 };
 
 /// Top-level exchange managing multiple instruments.
@@ -872,6 +872,25 @@ impl Exchange {
             self.live_order_ids.remove(&(account, order_id));
             self.release_open_order(account);
         }
+    }
+
+    /// Best (highest) bid on `symbol`'s book, or `None` if the bid side is
+    /// empty or the symbol is not registered. Read-only book introspection
+    /// (market-data / audit queries); not on the matching hot path.
+    pub fn best_bid(&self, symbol: Symbol) -> Option<Price> {
+        inst_ref(&self.instruments, symbol).and_then(|inst| inst.book.best_bid())
+    }
+
+    /// Best (lowest) ask on `symbol`'s book, or `None` if the ask side is
+    /// empty or the symbol is not registered.
+    pub fn best_ask(&self, symbol: Symbol) -> Option<Price> {
+        inst_ref(&self.instruments, symbol).and_then(|inst| inst.book.best_ask())
+    }
+
+    /// Total resting quantity at one exact price level on `symbol`'s book,
+    /// or 0 if the level does not exist or the symbol is not registered.
+    pub fn depth_at(&self, symbol: Symbol, price: Price, side: Side) -> u64 {
+        inst_ref(&self.instruments, symbol).map_or(0, |inst| inst.book.depth_at(price, side))
     }
 
     /// Withdraw funds from an account. Rejects if the account has resting
