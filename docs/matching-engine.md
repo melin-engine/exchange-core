@@ -91,7 +91,7 @@ The unfilled remainder is placed on the book like GTC. However, when the operato
 
 The unfilled remainder is placed on the book like GTC, but carries an `expiry_ns` timestamp (nanoseconds since Unix epoch). When the operator sends an `ExpireOrders { timestamp_ns }` event, all GTD orders with `expiry_ns <= timestamp_ns` are cancelled. The operator is responsible for sending `ExpireOrders` at the appropriate time (e.g., via a periodic timer).
 
-GTD orders must have a non-zero `expiry_ns`; non-GTD orders must have `expiry_ns == 0`. Violations are rejected with `InvalidExpiry`.
+GTD orders must carry an `expiry_ns` strictly in the future of the venue's event clock at submission — an order that is missing its expiry or already at/past its deadline is rejected with `InvalidExpiry`, never placed. Non-GTD orders must have `expiry_ns == 0`; violations are also rejected with `InvalidExpiry`.
 
 ---
 
@@ -287,7 +287,7 @@ Rejection reasons:
 - `HasRestingOrders` -- withdrawal rejected because the account has resting orders.
 - `DuplicateRequest` -- per-key request sequence already processed.
 - `ReplicaDisconnected` -- replication enabled but replica disconnected; state-mutating operations blocked.
-- `InvalidExpiry` -- GTD order missing expiry, or non-GTD order with unexpected expiry.
+- `InvalidExpiry` -- GTD order missing expiry or already expired at submission, or non-GTD order with unexpected expiry.
 - `InstrumentDisabled` -- instrument is disabled; no new orders accepted.
 
 ### `Replaced`
