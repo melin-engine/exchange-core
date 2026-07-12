@@ -838,7 +838,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     /// After any sequence of operations, the order_index HashMap and the
-    /// BookSide BTreeMap levels must agree on which orders are resting.
+    /// BookSide price levels must agree on which orders are resting.
     /// Same for stop_index vs stop_buys/stop_sells.
     #[test]
     fn book_index_consistency(actions in arb_book_actions()) {

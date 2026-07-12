@@ -96,6 +96,19 @@ impl RestingOrder {
 /// `(AccountId, OrderId)` directly to its node — making cancel and amend
 /// O(1) instead of O(level_depth).
 ///
+/// **Level ordering — the BEST level lives at the Vec TAIL on both sides.**
+/// Levels are sorted ascending by the side-relative key
+/// `price ^ key_mask` (`key_mask` = 0 for bids, `u64::MAX` for asks; XOR
+/// with all-ones is a monotonically order-reversing bijection on `u64`,
+/// so asks are physically stored in descending price order). Matching
+/// exhausts levels at the best price and new levels overwhelmingly appear
+/// at or near the best price, so keeping the best at the tail makes the
+/// common level birth/death a shift-free `Vec` push/pop. Profiling the
+/// benchmark harness's swing scenarios (500+ live levels) showed the
+/// previous both-sides-ascending layout spent ~24% of engine work
+/// memmoving the ask array, whose best level sat at index 0. The mask is
+/// one XOR per binary-search probe — branchless and effectively free.
+///
 /// **Why per-side and not a `BTreeMap`:** typical books have 5-20 active
 /// levels — the sorted `Vec` fits in 1-3 L1 cache lines and binary search
 /// has zero pointer-chasing. A `BTreeMap` would allocate a node per level.
@@ -105,26 +118,22 @@ impl RestingOrder {
 /// orders splice onto `tail`.
 #[derive(Debug)]
 pub(crate) struct BookSide {
-    /// Sorted ascending by Price. Binary search for all lookups.
+    /// Sorted ascending by `price ^ key_mask` — best level at the tail
+    /// (see the struct doc). Binary search on the key for all lookups.
     levels: Vec<(Price, LevelHead)>,
     /// Slab of order nodes. Indices are stable; freed slots are recycled
     /// via the `free_head` free list.
     nodes: Vec<OrderNode>,
     /// Head of the free list, or `INVALID_NODE` if empty. Free nodes
     /// chain through `OrderNode::next`. `Default` on `u32` would give 0,
-    /// which is a valid node index — so we hand-implement `Default` to
-    /// initialize this to `INVALID_NODE`.
+    /// which is a valid node index — so constructors initialize this to
+    /// `INVALID_NODE` explicitly.
     free_head: u32,
-}
-
-impl Default for BookSide {
-    fn default() -> Self {
-        Self {
-            levels: Vec::new(),
-            nodes: Vec::new(),
-            free_head: INVALID_NODE,
-        }
-    }
+    /// Sort-key mask: 0 for bids (ascending by price, best = highest =
+    /// tail), `u64::MAX` for asks (descending by price, best = lowest =
+    /// tail). XORed into every comparison key; never changes after
+    /// construction.
+    key_mask: u64,
 }
 
 /// Per-price-level head/tail of the intrusive list.
@@ -164,15 +173,50 @@ pub(crate) struct OrderNode {
 }
 
 impl BookSide {
+    /// Sort-key mask for a side: bids ascend by price, asks descend, so
+    /// both keep their best level at the Vec tail.
+    #[inline]
+    fn mask_for(side: Side) -> u64 {
+        match side {
+            Side::Buy => 0,
+            Side::Sell => u64::MAX,
+        }
+    }
+
+    /// Side-relative sort key. Levels are stored ascending by this key;
+    /// a higher key is a better (closer to the top of book) price.
+    #[inline]
+    fn key(&self, price: Price) -> u64 {
+        price.get() ^ self.key_mask
+    }
+
+    /// True if `price` is at or better than `limit` from this side's
+    /// perspective (bids: `price >= limit`; asks: `price <= limit`).
+    #[inline]
+    pub(crate) fn at_or_better(&self, price: Price, limit: Price) -> bool {
+        self.key(price) >= self.key(limit)
+    }
+
+    /// An empty side for the given book side.
+    pub(super) fn new(side: Side) -> Self {
+        Self {
+            levels: Vec::new(),
+            nodes: Vec::new(),
+            free_head: INVALID_NODE,
+            key_mask: Self::mask_for(side),
+        }
+    }
+
     /// Pre-allocate the slab. Used by `with_capacity` to avoid resize stalls
     /// once warm. The free list is left empty — `alloc_node` will push fresh
     /// entries until the Vec reaches its capacity, at which point freed
     /// nodes get reused in LIFO order.
-    pub(super) fn with_capacity(node_capacity: usize) -> Self {
+    pub(super) fn with_capacity(side: Side, node_capacity: usize) -> Self {
         Self {
             levels: Vec::with_capacity(64),
             nodes: Vec::with_capacity(node_capacity),
             free_head: INVALID_NODE,
+            key_mask: Self::mask_for(side),
         }
     }
 
@@ -217,11 +261,14 @@ impl BookSide {
         self.free_head = INVALID_NODE;
     }
 
-    /// Binary search for a price level. Returns `Ok(index)` if found,
-    /// `Err(index)` for the insertion point.
+    /// Binary search for a price level (by side-relative key — see the
+    /// struct doc). Returns `Ok(index)` if found, `Err(index)` for the
+    /// insertion point.
     #[inline]
     fn search(&self, price: Price) -> Result<usize, usize> {
-        self.levels.binary_search_by_key(&price, |(p, _)| *p)
+        let target = self.key(price);
+        self.levels
+            .binary_search_by_key(&target, |(p, _)| self.key(*p))
     }
 
     /// Allocate a slab slot for `order`. Reuses a freed node if available,
@@ -370,16 +417,31 @@ impl BookSide {
         &mut self.nodes[idx as usize]
     }
 
+    /// Physical level index for the i-th level in ascending PRICE order.
+    /// Identity for bids; reversed for asks (stored descending). Keeps
+    /// every externally observable walk (snapshots, bulk cancels) in the
+    /// same canonical ascending order regardless of the side's physical
+    /// layout. Cold paths only.
+    #[inline]
+    fn ascending_idx(&self, i: usize) -> usize {
+        if self.key_mask == 0 {
+            i
+        } else {
+            self.levels.len() - 1 - i
+        }
+    }
+
     /// Iterate every order on this side, calling `f` with the price level
     /// and a reference to each order. Walks levels in ascending price
-    /// order, and within a level walks oldest→newest. Used by snapshot,
-    /// fee-schedule re-reservation, and bulk-cancel paths.
+    /// order, and within a level walks oldest→newest. Used by snapshot
+    /// and bulk-cancel paths.
     pub(crate) fn for_each_order<F: FnMut(Price, &RestingOrder)>(&self, mut f: F) {
-        for (price, head) in &self.levels {
+        for i in 0..self.levels.len() {
+            let (price, head) = self.levels[self.ascending_idx(i)];
             let mut cur = head.head;
             while cur != INVALID_NODE {
                 let n = &self.nodes[cur as usize];
-                f(*price, &n.order);
+                f(price, &n.order);
                 cur = n.next;
             }
         }
@@ -388,32 +450,37 @@ impl BookSide {
     /// Mutable variant of `for_each_order`. Used by snapshot-restore slot
     /// injection to patch reservation slots in place.
     pub(crate) fn for_each_order_mut<F: FnMut(Price, &mut RestingOrder)>(&mut self, mut f: F) {
-        for (price, head) in &self.levels {
+        for i in 0..self.levels.len() {
+            let (price, head) = self.levels[self.ascending_idx(i)];
             let mut cur = head.head;
             while cur != INVALID_NODE {
                 // Split borrow: read links before handing &mut order to `f`.
                 let next = self.nodes[cur as usize].next;
-                f(*price, &mut self.nodes[cur as usize].order);
+                f(price, &mut self.nodes[cur as usize].order);
                 cur = next;
             }
         }
     }
 
-    /// Iterate price levels (ascending) yielding only prices. Used by the
-    /// matching engine to collect a snapshot of prices to visit before
+    /// Iterate price levels from best to worst (bids: highest→lowest,
+    /// asks: lowest→highest) yielding only prices. Physical reverse
+    /// order on both sides — the best level lives at the tail. Used by
+    /// the matching engine to collect the prices to visit before
     /// mutating the book.
-    pub(crate) fn prices_ascending(&self) -> impl DoubleEndedIterator<Item = Price> + '_ {
-        self.levels.iter().map(|(p, _)| *p)
+    pub(crate) fn prices_best_to_worst(&self) -> impl Iterator<Item = Price> + '_ {
+        self.levels.iter().rev().map(|(p, _)| *p)
     }
 
-    /// Snapshot: walk every level in ascending order, yielding
-    /// `(price, ordered_orders)` where `ordered_orders` preserves time
-    /// priority (oldest first). Used by the snapshot codec — not on the
-    /// hot path, so the per-level `Vec` allocation is fine.
+    /// Snapshot: walk every level in ascending PRICE order (canonical —
+    /// independent of the side's physical layout, keeping the snapshot
+    /// format stable), yielding `(price, ordered_orders)` where
+    /// `ordered_orders` preserves time priority (oldest first). Used by
+    /// the snapshot codec — not on the hot path, so the per-level `Vec`
+    /// allocation is fine.
     pub(crate) fn levels_snapshot(&self) -> Vec<(Price, Vec<RestingOrder>)> {
-        self.levels
-            .iter()
-            .map(|(price, head)| {
+        (0..self.levels.len())
+            .map(|i| {
+                let (price, head) = self.levels[self.ascending_idx(i)];
                 let mut v = Vec::with_capacity(head.len as usize);
                 let mut cur = head.head;
                 while cur != INVALID_NODE {
@@ -421,30 +488,39 @@ impl BookSide {
                     v.push(n.order);
                     cur = n.next;
                 }
-                (*price, v)
+                (price, v)
             })
             .collect()
     }
 
-    /// Reconstruct a `BookSide` from pre-sorted snapshot levels.
-    /// Returns `(side, mapping)` where `mapping` records the slab index
-    /// assigned to each `(account, order_id)` so the caller can populate
-    /// `OrderBook::order_index` with valid node indices.
+    /// Reconstruct a `BookSide` from snapshot levels (canonical ascending
+    /// price order). Returns `(side, mapping)` where `mapping` records the
+    /// slab index assigned to each `(account, order_id)` so the caller can
+    /// populate `OrderBook::order_index` with valid node indices.
     pub(crate) fn from_levels_snapshot(
-        levels: Vec<(Price, Vec<RestingOrder>)>,
+        side: Side,
+        mut levels: Vec<(Price, Vec<RestingOrder>)>,
     ) -> (Self, SnapshotNodeMapping) {
         // Pre-size the slab to the total order count to avoid re-allocations.
         let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
-        let mut side = Self::with_capacity(total.max(64));
+        let mut out = Self::with_capacity(side, total.max(64));
         let mut mapping = Vec::with_capacity(total);
+        // Insert levels in this side's physical order (worst first) so
+        // every level append lands at the Vec tail — O(1) instead of a
+        // front-shifting O(n²) restore for the descending side. In-place
+        // reverse of the level Vec, not the orders within a level (FIFO
+        // time priority is per-level and must be preserved).
+        if out.key_mask != 0 {
+            levels.reverse();
+        }
         for (price, orders) in levels {
             for order in orders {
                 let key = (order.account, order.id);
-                let idx = side.add(price, order);
+                let idx = out.add(price, order);
                 mapping.push((key, idx));
             }
         }
-        (side, mapping)
+        (out, mapping)
     }
 
     /// True if no resting orders remain on this side.
@@ -452,14 +528,10 @@ impl BookSide {
         self.levels.is_empty()
     }
 
-    /// Best price on this side: highest for bids, lowest for asks. Since
-    /// `levels` is sorted ascending, callers pick `last()` for bids and
-    /// `first()` for asks.
-    pub(super) fn first_price(&self) -> Option<Price> {
-        self.levels.first().map(|(p, _)| *p)
-    }
-
-    pub(super) fn last_price(&self) -> Option<Price> {
+    /// Best price on this side: highest for bids, lowest for asks. The
+    /// best level lives at the tail on both sides (see the struct doc),
+    /// so this is `last()` unconditionally.
+    pub(super) fn best_price(&self) -> Option<Price> {
         self.levels.last().map(|(p, _)| *p)
     }
 
@@ -484,52 +556,183 @@ impl BookSide {
     /// If `exclude_account` is `Some`, orders from that account are skipped
     /// (used for FOK pre-check with STP CancelNewest/CancelBoth).
     ///
-    /// Walks levels from best→worst until `limit` is exceeded; within a
-    /// level, walks the linked list head→tail (which is order-agnostic
-    /// for summing).
+    /// Walks levels from best→worst (physical tail→front on both sides)
+    /// until the level no longer satisfies `limit`; within a level, walks
+    /// the linked list head→tail (which is order-agnostic for summing).
     pub(super) fn available_quantity(
         &self,
-        side: Side,
         limit: Option<Price>,
         exclude_account: Option<AccountId>,
     ) -> u64 {
         let mut total: u64 = 0;
-        // Closure: walk one level's intrusive list and accumulate qty.
-        // Captured outside the match so it isn't duplicated.
-        let walk = |head_idx: u32, total: &mut u64| {
-            let mut cur = head_idx;
+        for (price, head) in self.levels.iter().rev() {
+            if let Some(limit) = limit
+                && !self.at_or_better(*price, limit)
+            {
+                break;
+            }
+            let mut cur = head.head;
             while cur != INVALID_NODE {
                 let n = &self.nodes[cur as usize];
                 if exclude_account.is_none_or(|acct| acct != n.order.account) {
-                    *total = total.saturating_add(n.order.remaining.get());
+                    total = total.saturating_add(n.order.remaining.get());
                 }
                 cur = n.next;
             }
-        };
-        match side {
-            Side::Buy => {
-                // Bids: iterate from highest price downward.
-                for (price, head) in self.levels.iter().rev() {
-                    if let Some(limit) = limit
-                        && *price < limit
-                    {
-                        break;
-                    }
-                    walk(head.head, &mut total);
-                }
-            }
-            Side::Sell => {
-                // Asks: iterate from lowest price upward.
-                for (price, head) in &self.levels {
-                    if let Some(limit) = limit
-                        && *price > limit
-                    {
-                        break;
-                    }
-                    walk(head.head, &mut total);
-                }
-            }
         }
         total
+    }
+}
+
+/// Direct tests for the side-relative level ordering contracts. The
+/// matching/snapshot behavior built on top is covered by the orderbook
+/// tests and proptests; these pin the layout invariants themselves so a
+/// regression fails here with a precise message rather than surfacing as
+/// a changed snapshot byte stream or report order.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(v: u64) -> Price {
+        Price(NonZeroU64::new(v).unwrap())
+    }
+
+    fn order(id: u64, qty: u64, side: Side) -> RestingOrder {
+        RestingOrder {
+            id: OrderId(id),
+            account: AccountId(1),
+            remaining: Quantity(NonZeroU64::new(qty).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            expiry_ns: 0,
+            side,
+            reservation: ReservationSlot::DUMMY,
+        }
+    }
+
+    /// Build a side with levels at 100/90/110 (inserted out of order),
+    /// one unit-qty order per level.
+    fn three_level_side(side: Side) -> BookSide {
+        let mut s = BookSide::new(side);
+        for (id, price) in [(1, 100), (2, 90), (3, 110)] {
+            s.add(p(price), order(id, 1, side));
+        }
+        s
+    }
+
+    /// The physical `levels` Vec must be sorted ascending by the
+    /// side-relative key — every search/insert/best-at-tail property
+    /// rests on this.
+    fn assert_key_sorted(s: &BookSide) {
+        let keys: Vec<u64> = s.levels.iter().map(|(price, _)| s.key(*price)).collect();
+        assert!(keys.is_sorted(), "levels not sorted by side key: {keys:?}");
+    }
+
+    #[test]
+    fn best_level_lives_at_the_tail_on_both_sides() {
+        let bids = three_level_side(Side::Buy);
+        assert_key_sorted(&bids);
+        assert_eq!(bids.best_price(), Some(p(110)));
+        assert_eq!(bids.levels.last().map(|(price, _)| *price), Some(p(110)));
+
+        let asks = three_level_side(Side::Sell);
+        assert_key_sorted(&asks);
+        assert_eq!(asks.best_price(), Some(p(90)));
+        assert_eq!(asks.levels.last().map(|(price, _)| *price), Some(p(90)));
+    }
+
+    #[test]
+    fn best_price_advances_to_next_level_after_exhaustion() {
+        let mut bids = three_level_side(Side::Buy);
+        bids.pop_front(p(110)).unwrap();
+        assert_eq!(bids.best_price(), Some(p(100)));
+
+        let mut asks = three_level_side(Side::Sell);
+        asks.pop_front(p(90)).unwrap();
+        assert_eq!(asks.best_price(), Some(p(100)));
+        assert_key_sorted(&asks);
+    }
+
+    #[test]
+    fn at_or_better_polarity() {
+        let bids = BookSide::new(Side::Buy);
+        assert!(bids.at_or_better(p(110), p(100)));
+        assert!(bids.at_or_better(p(100), p(100)));
+        assert!(!bids.at_or_better(p(90), p(100)));
+
+        let asks = BookSide::new(Side::Sell);
+        assert!(asks.at_or_better(p(90), p(100)));
+        assert!(asks.at_or_better(p(100), p(100)));
+        assert!(!asks.at_or_better(p(110), p(100)));
+    }
+
+    #[test]
+    fn prices_best_to_worst_ordering() {
+        let bids = three_level_side(Side::Buy);
+        let walked: Vec<Price> = bids.prices_best_to_worst().collect();
+        assert_eq!(walked, vec![p(110), p(100), p(90)]);
+
+        let asks = three_level_side(Side::Sell);
+        let walked: Vec<Price> = asks.prices_best_to_worst().collect();
+        assert_eq!(walked, vec![p(90), p(100), p(110)]);
+    }
+
+    #[test]
+    fn canonical_walks_are_ascending_by_price_on_both_sides() {
+        for side in [Side::Buy, Side::Sell] {
+            let s = three_level_side(side);
+
+            let snapshot_prices: Vec<Price> = s
+                .levels_snapshot()
+                .into_iter()
+                .map(|(price, _)| price)
+                .collect();
+            assert_eq!(snapshot_prices, vec![p(90), p(100), p(110)], "{side:?}");
+
+            let mut walked = Vec::new();
+            s.for_each_order(|price, _| walked.push(price));
+            assert_eq!(walked, vec![p(90), p(100), p(110)], "{side:?}");
+        }
+    }
+
+    #[test]
+    fn from_levels_snapshot_round_trips_both_sides() {
+        for side in [Side::Buy, Side::Sell] {
+            // Two orders per level so FIFO order within a level is observable.
+            let mut original = BookSide::new(side);
+            let mut id = 0;
+            for price in [90, 100, 110] {
+                for _ in 0..2 {
+                    id += 1;
+                    original.add(p(price), order(id, id, side));
+                }
+            }
+
+            let snapshot = original.levels_snapshot();
+            let (restored, mapping) = BookSide::from_levels_snapshot(side, snapshot.clone());
+
+            assert_key_sorted(&restored);
+            assert_eq!(restored.levels_snapshot(), snapshot, "{side:?}");
+            assert_eq!(restored.best_price(), original.best_price(), "{side:?}");
+
+            // Every mapping entry must point at the slab node holding
+            // that exact order.
+            assert_eq!(mapping.len(), 6, "{side:?}");
+            for ((account, order_id), idx) in mapping {
+                let node = restored.node(idx);
+                assert_eq!((node.order.account, node.order.id), (account, order_id));
+            }
+        }
+    }
+
+    #[test]
+    fn available_quantity_stops_at_the_limit_on_both_sides() {
+        // Levels 90/100/110 with qty 1 each (from three_level_side).
+        let bids = three_level_side(Side::Buy);
+        assert_eq!(bids.available_quantity(Some(p(100)), None), 2); // 110 + 100
+        assert_eq!(bids.available_quantity(None, None), 3);
+
+        let asks = three_level_side(Side::Sell);
+        assert_eq!(asks.available_quantity(Some(p(100)), None), 2); // 90 + 100
+        assert_eq!(asks.available_quantity(None, None), 3);
     }
 }

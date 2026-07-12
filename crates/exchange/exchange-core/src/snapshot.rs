@@ -1577,7 +1577,7 @@ impl OrderBook {
                     (price, restored)
                 })
                 .collect();
-            crate::orderbook::BookSide::from_levels_snapshot(materialized)
+            crate::orderbook::BookSide::from_levels_snapshot(side, materialized)
         };
 
         let restore_stops = |levels: Vec<(Price, Vec<PendingStopSnapshot>)>| {

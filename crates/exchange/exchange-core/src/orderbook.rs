@@ -1,6 +1,8 @@
 //! Order book with price-time priority matching.
 //!
-//! Bids are stored in descending price order, asks in ascending.
+//! Each side keeps its BEST price level at the tail of its level array
+//! (bids stored ascending by price, asks descending — see `BookSide`),
+//! so matching-driven level exhaustion never shifts memory.
 //! Within a price level, orders are matched FIFO.
 
 use std::num::NonZeroU64;
@@ -87,8 +89,8 @@ impl OrderBook {
     pub fn new(symbol: Symbol) -> Self {
         Self {
             symbol,
-            bids: BookSide::default(),
-            asks: BookSide::default(),
+            bids: BookSide::new(Side::Buy),
+            asks: BookSide::new(Side::Sell),
             order_index: SlabMap::new(),
             stop_buys: StopSide::default(),
             stop_sells: StopSide::default(),
@@ -121,8 +123,8 @@ impl OrderBook {
         // slab during the warmup phase of a hot book.
         Self {
             symbol,
-            bids: BookSide::with_capacity(2_048),
-            asks: BookSide::with_capacity(2_048),
+            bids: BookSide::with_capacity(Side::Buy, 2_048),
+            asks: BookSide::with_capacity(Side::Sell, 2_048),
             // One entry per resting order for O(1) cancel lookups. 4096
             // slots covers typical book depth (100-2000 orders) without
             // hot-path resize. `SlabMap` keeps the structure bounded by
@@ -274,12 +276,12 @@ impl OrderBook {
 
     /// Best bid price (highest), or `None` if the bid side is empty.
     pub fn best_bid(&self) -> Option<Price> {
-        self.bids.last_price()
+        self.bids.best_price()
     }
 
     /// Best ask price (lowest), or `None` if the ask side is empty.
     pub fn best_ask(&self) -> Option<Price> {
-        self.asks.first_price()
+        self.asks.best_price()
     }
 
     /// Total resting quantity at one exact price level on the given side,
@@ -605,8 +607,7 @@ impl OrderBook {
                 SelfTradeProtection::Allow => None,
                 _ => Some(order.account),
             };
-            let available =
-                opposite.available_quantity(Self::opposite(order.side), Some(price), exclude);
+            let available = opposite.available_quantity(Some(price), exclude);
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -689,7 +690,7 @@ impl OrderBook {
                 SelfTradeProtection::Allow => None,
                 _ => Some(order.account),
             };
-            let available = opposite.available_quantity(Self::opposite(order.side), None, exclude);
+            let available = opposite.available_quantity(None, exclude);
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -763,29 +764,19 @@ impl OrderBook {
         };
 
         // Collect the prices we need to visit into a reusable buffer. We can't
-        // iterate the BTreeMap and mutate it simultaneously (filled makers are
-        // removed), so prices are collected first. The buffer lives on OrderBook
-        // to avoid a heap allocation on every aggressive order.
+        // iterate the level array and mutate it simultaneously (filled makers
+        // are removed), so prices are collected first. The buffer lives on
+        // OrderBook to avoid a heap allocation on every aggressive order.
+        // Both sides keep their best level at the tail, so best→worst
+        // iteration and the "still crosses the limit" test are
+        // side-agnostic (asks: p <= limit; bids: p >= limit — both are
+        // `at_or_better` on the opposite side).
         self.match_price_buf.clear();
-        match taker_side {
-            Side::Buy => {
-                // Buy matches against asks (lowest first).
-                self.match_price_buf.extend(
-                    opposite
-                        .prices_ascending()
-                        .take_while(|&p| price_limit.is_none_or(|limit| p <= limit)),
-                );
-            }
-            Side::Sell => {
-                // Sell matches against bids (highest first).
-                self.match_price_buf.extend(
-                    opposite
-                        .prices_ascending()
-                        .rev()
-                        .take_while(|&p| price_limit.is_none_or(|limit| p >= limit)),
-                );
-            }
-        };
+        self.match_price_buf.extend(
+            opposite
+                .prices_best_to_worst()
+                .take_while(|&p| price_limit.is_none_or(|limit| opposite.at_or_better(p, limit))),
+        );
 
         let mut stp_cancelled = false;
 
@@ -1194,13 +1185,6 @@ impl OrderBook {
         match side {
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
-        }
-    }
-
-    fn opposite(side: Side) -> Side {
-        match side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
         }
     }
 
