@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/*/*"]
+# Explicit subtree rather than `crates/*/*`: leftover ignored files from
+# other branches (e.g. artifacts under crates/core on the sequencer branch)
+# can leave stray directories under crates/ that a bare glob would pick up.
+members = ["crates/exchange/*"]
 resolver = "3"
 
 [workspace.package]
