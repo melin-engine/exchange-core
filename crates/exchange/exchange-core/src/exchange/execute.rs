@@ -8,6 +8,64 @@ use super::instrument::{inst_mut, inst_ref};
 use super::token_bucket::TokenBucket;
 use crate::types::{ExecutionReport, Order, OrderType, RejectReason, Side, Symbol, TimeInForce};
 
+/// Basis-point denominator (1 bp = 0.01%). The split identity in
+/// `fee_from_bps` is only valid when every division and modulus in the
+/// function uses this same value — a named const ties them together.
+/// u64: the base type of the fast-path arithmetic; widened at use sites.
+const BPS_DENOM: u64 = 10_000;
+
+/// `value * bps / 10_000` with the exact truncating semantics of the
+/// naive i128 expression, but without a 128-bit division on the hot
+/// path: LLVM does not strength-reduce `i128 / 10_000` and emits a
+/// `__divti3` library call (~2.5% of the matching thread in profiles).
+///
+/// Splitting `value = q·10_000 + r` gives
+/// `value·bps/10_000 == q·bps + (r·bps)/10_000` exactly — the first
+/// term is an integer and `trunc(k + x) == k + trunc(x)` for integer
+/// `k` — and the two remaining divisions are 64-bit by-constant, which
+/// compile to multiply-shift. The `q·bps` multiply still widens to
+/// i128 (`q` can reach `u64::MAX/10_000` and `|bps|` up to `i16::MAX`);
+/// 128-bit *multiplication* is cheap, only division is a library call.
+/// `r·bps` fits i64 comfortably (`r < 10_000`).
+#[inline]
+fn fee_from_bps(value: u128, bps: i16) -> i64 {
+    match u64::try_from(value) {
+        Ok(v) => {
+            let q = (v / BPS_DENOM) as i128;
+            let r = (v % BPS_DENOM) as i64;
+            let head = q * bps as i128;
+            let tail = (r * bps as i64) / BPS_DENOM as i64;
+            (head + tail as i128) as i64
+        }
+        Err(_) => {
+            // Unreachable through order flow: buy reservations bound
+            // notional to u64 (`AccountManager::required_reserve`'s
+            // `u64::try_from(cost)`), market/stop buys are clamped to
+            // the quote budget in `OrderBook::execute_market`, and
+            // `fill` clamps its own cost the same way. Loud in checked
+            // builds; in release the fallback matches the old
+            // expression bit-for-bit (both wrap the >i128::MAX product
+            // identically under release semantics).
+            debug_assert!(
+                false,
+                "fee_from_bps: cost {value} exceeds u64::MAX — a notional bound upstream is broken"
+            );
+            fee_from_bps_slow(value, bps)
+        }
+    }
+}
+
+/// Naive i128-division fallback for `fee_from_bps`, outlined so the
+/// `__divti3` call sequence stays out of the fill path's instruction
+/// stream and the fast path compiles to a branch-free fall-through
+/// (`#[cold]`/`#[inline(never)]`, same convention as the account
+/// module's `log_underflow`/`log_overflow`).
+#[cold]
+#[inline(never)]
+fn fee_from_bps_slow(value: u128, bps: i16) -> i64 {
+    ((value as i128) * (bps as i128) / BPS_DENOM as i128) as i64
+}
+
 impl Exchange {
     /// Submit an order to the matching engine for the given instrument.
     ///
@@ -391,8 +449,7 @@ impl Exchange {
                     // Internally, fill() takes the buyer fee in base
                     // units and the seller fee in quote units (each
                     // deducted from that side's received asset).
-                    let cost_i128 = price.get() as i128 * quantity.get() as i128;
-                    let qty_i128 = quantity.get() as i128;
+                    let cost = price.get() as u128 * quantity.get() as u128;
                     let (buyer_slot, seller_slot, buyer_fee_bps, seller_fee_bps) = match maker_side
                     {
                         Side::Buy => (
@@ -408,10 +465,9 @@ impl Exchange {
                             fee_schedule.maker_fee_bps,
                         ),
                     };
-                    let buyer_quote_fee_report =
-                        (cost_i128 * buyer_fee_bps as i128 / 10_000) as i64;
-                    let seller_quote_fee = (cost_i128 * seller_fee_bps as i128 / 10_000) as i64;
-                    let buyer_base_fee = (qty_i128 * buyer_fee_bps as i128 / 10_000) as i64;
+                    let buyer_quote_fee_report = fee_from_bps(cost, buyer_fee_bps);
+                    let seller_quote_fee = fee_from_bps(cost, seller_fee_bps);
+                    let buyer_base_fee = fee_from_bps(quantity.get() as u128, buyer_fee_bps);
                     // Update the report fields (quote-denominated).
                     match maker_side {
                         Side::Buy => {
@@ -532,5 +588,113 @@ impl Exchange {
         freed.clear();
         self.scratch_consumed = consumed;
         self.scratch_freed = freed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fee_from_bps, fee_from_bps_slow};
+    use proptest::prelude::*;
+
+    /// The naive expression `fee_from_bps` must match exactly. Written
+    /// independently of production code (including its own `10_000`
+    /// literal) so it can serve as a differential oracle.
+    fn naive(value: u128, bps: i16) -> i64 {
+        ((value as i128) * (bps as i128) / 10_000) as i64
+    }
+
+    proptest! {
+        /// Full-domain differential check: the split-division fast path
+        /// must agree with the naive oracle for every representable
+        /// (value, bps) pair, not just the hand-picked grid below.
+        #[test]
+        fn fee_from_bps_matches_naive_for_any_input(v in any::<u64>(), b in any::<i16>()) {
+            prop_assert_eq!(fee_from_bps(v as u128, b), naive(v as u128, b));
+        }
+    }
+
+    #[test]
+    fn fee_from_bps_matches_naive_division_across_edge_grid() {
+        // Cross product of boundary-heavy values and fee/rebate rates,
+        // including the split points around multiples of 10_000 where
+        // the q/r decomposition changes, and u64::MAX where the i128
+        // wrapping cast engages.
+        let values: &[u128] = &[
+            0,
+            1,
+            9_999,
+            10_000,
+            10_001,
+            19_999,
+            20_000,
+            123_456_789,
+            u64::MAX as u128 - 1,
+            u64::MAX as u128,
+        ];
+        let rates: &[i16] = &[
+            i16::MIN,
+            -10_000,
+            -9_999,
+            -20,
+            -1,
+            0,
+            1,
+            20,
+            9_999,
+            10_000,
+            i16::MAX,
+        ];
+        for &v in values {
+            for &b in rates {
+                assert_eq!(
+                    fee_from_bps(v, b),
+                    naive(v, b),
+                    "fee mismatch for value={v} bps={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fee_from_bps_slow_path_above_u64_matches_naive() {
+        // Defensive corner: cost = price × quantity can exceed u64 only
+        // through paths the notional bounds block. The outlined fallback
+        // must still agree with the naive expression. Tested directly —
+        // the `fee_from_bps` wrapper debug_asserts before reaching it.
+        let values: &[u128] = &[
+            u64::MAX as u128 + 1,
+            (u64::MAX as u128) * 2,
+            u64::MAX as u128 * u64::MAX as u128,
+        ];
+        for &v in values {
+            for &b in &[-10_000i16, -1, 1, 20, 10_000] {
+                assert_eq!(
+                    fee_from_bps_slow(v, b),
+                    naive(v, b),
+                    "fee mismatch for value={v} bps={b}"
+                );
+            }
+        }
+    }
+
+    // debug_assert-based: only fires in debug builds, so the test is
+    // meaningless (and would fail) under --release.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "notional bound upstream is broken")]
+    fn fee_from_bps_panics_in_debug_above_u64() {
+        // In debug builds a >u64 cost must fail loudly at the fee
+        // helper rather than silently computing from a wrapped value.
+        let _ = fee_from_bps(u64::MAX as u128 + 1, 1);
+    }
+
+    #[test]
+    fn fee_from_bps_truncates_toward_zero_for_rebates() {
+        // trunc semantics: -0.5 bp of 5_000 is 0, not -1 — sign must not
+        // leak into the rounding direction.
+        assert_eq!(fee_from_bps(5_000, -1), 0);
+        assert_eq!(fee_from_bps(5_000, 1), 0);
+        assert_eq!(fee_from_bps(19_999, -3), -5);
+        assert_eq!(fee_from_bps(19_999, 3), 5);
     }
 }
