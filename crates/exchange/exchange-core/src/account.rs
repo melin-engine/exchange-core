@@ -71,6 +71,82 @@ fn log_overflow(
     u64::MAX
 }
 
+/// Log a fill conservation violation. `#[cold]`/`#[inline(never)]` keep
+/// the error-formatting machinery out of `fill`'s hot instruction stream
+/// (only the residual comparison stays inline), matching the
+/// `log_underflow`/`log_overflow` convention above.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)] // flat forensic context for one log call; a struct would obscure it
+fn log_conservation_violation(
+    buyer_account: AccountId,
+    seller_account: AccountId,
+    spec: &InstrumentSpec,
+    price: Price,
+    quantity: u64,
+    buyer_base_fee: i64,
+    seller_quote_fee: i64,
+    quote_delta: i128,
+    base_delta: i128,
+) {
+    tracing::error!(
+        buyer_account = buyer_account.0,
+        seller_account = seller_account.0,
+        base = spec.base.0,
+        quote = spec.quote.0,
+        price = price.get(),
+        quantity,
+        buyer_base_fee,
+        seller_quote_fee,
+        quote_delta = %quote_delta,
+        base_delta = %base_delta,
+        "balance conservation violated in fill — applied deltas do not sum to zero across (buyer, seller, fee)"
+    );
+}
+
+/// Checked add on a balance field that reports the signed delta actually
+/// written. On overflow the field clamps to `u64::MAX` via [`log_overflow`]
+/// and the returned delta reflects the clamped write, not the requested
+/// amount — reporting requested amounts to the conservation check would
+/// mask exactly the saturations it exists to catch. Every balance mutation
+/// on the fill path must go through this or [`checked_sub_delta`] so the
+/// old/new snapshot and the written field can never diverge.
+///
+/// Returns `i128`: a single `u64` field can move by up to ±`u64::MAX`,
+/// which exceeds `i64` range. `#[must_use]` so a call site cannot silently
+/// drop the delta out of the conservation accounting.
+#[must_use]
+fn checked_add_delta(
+    field: &mut u64,
+    amount: u64,
+    op: &'static str,
+    account: AccountId,
+    currency: CurrencyId,
+) -> i128 {
+    let old = *field;
+    *field = old
+        .checked_add(amount)
+        .unwrap_or_else(|| log_overflow(op, account, currency, old, amount));
+    *field as i128 - old as i128
+}
+
+/// Checked-sub counterpart of [`checked_add_delta`]: clamps to 0 via
+/// [`log_underflow`] and reports the applied (post-clamp) signed delta.
+#[must_use]
+fn checked_sub_delta(
+    field: &mut u64,
+    amount: u64,
+    op: &'static str,
+    account: AccountId,
+    currency: CurrencyId,
+) -> i128 {
+    let old = *field;
+    *field = old
+        .checked_sub(amount)
+        .unwrap_or_else(|| log_underflow(op, account, currency, old, amount));
+    *field as i128 - old as i128
+}
+
 /// Reserved account for collected trading fees. Fees deducted from traders
 /// are credited here so they remain in the system (balance conservation).
 /// The exchange operator can withdraw from this account via the admin API.
@@ -493,6 +569,7 @@ impl AccountManager {
     /// values written post-clamp — if a checked_* fallback fired, the
     /// returned delta reflects the clamped write, not the requested
     /// amount. `fill` sums these for its O(1) conservation check.
+    #[must_use]
     fn settle_fee_leg(
         &mut self,
         trader: AccountId,
@@ -527,11 +604,8 @@ impl AccountManager {
             let mut applied: i128 = 0;
             if credit > 0 {
                 let bal = self.balances.entry((trader, currency)).or_default();
-                let old = bal.available;
-                bal.available = bal.available.checked_add(credit).unwrap_or_else(|| {
-                    log_overflow(op_prefix, trader, currency, bal.available, credit)
-                });
-                applied += bal.available as i128 - old as i128;
+                applied +=
+                    checked_add_delta(&mut bal.available, credit, op_prefix, trader, currency);
             }
             applied + self.credit_fee_account(currency, actual_fee)
         } else {
@@ -541,11 +615,8 @@ impl AccountManager {
             let credit = u64::try_from(credit_i128)
                 .unwrap_or_else(|_| log_overflow(op_prefix, trader, currency, gross, rebate));
             let bal = self.balances.entry((trader, currency)).or_default();
-            let old = bal.available;
-            bal.available = bal.available.checked_add(credit).unwrap_or_else(|| {
-                log_overflow(op_prefix, trader, currency, bal.available, credit)
-            });
-            let trader_delta = bal.available as i128 - old as i128;
+            let trader_delta =
+                checked_add_delta(&mut bal.available, credit, op_prefix, trader, currency);
             trader_delta + self.debit_fee_account(currency, rebate)
         }
     }
@@ -556,13 +627,21 @@ impl AccountManager {
     /// Returns the signed delta actually applied to the fee account's
     /// signed total (`available - deficit`), post-clamp. Normally
     /// `+amount`; less if the `available` add saturated.
+    #[must_use]
     fn credit_fee_account(&mut self, currency: CurrencyId, amount: u64) -> i128 {
         if amount == 0 {
             return 0;
         }
         let mut remaining = amount;
         let mut applied: i128 = 0;
-        if let Some(deficit) = self.fee_account_deficits.get_mut(&currency) {
+        // Deficits only exist after a rebate has drained the fee account
+        // (`debit_fee_account` is the sole writer), so in normal
+        // positive-fee operation the map is permanently empty and the
+        // `get_mut` would be a guaranteed hash+miss on every settle leg.
+        // `is_empty` is a single length load — skip the probe.
+        if !self.fee_account_deficits.is_empty()
+            && let Some(deficit) = self.fee_account_deficits.get_mut(&currency)
+        {
             let pay = (*deficit).min(remaining);
             *deficit -= pay;
             remaining -= pay;
@@ -575,17 +654,13 @@ impl AccountManager {
         }
         if remaining > 0 {
             let fee_bal = self.balances.entry((FEE_ACCOUNT, currency)).or_default();
-            let old = fee_bal.available;
-            fee_bal.available = fee_bal.available.checked_add(remaining).unwrap_or_else(|| {
-                log_overflow(
-                    "fee.available",
-                    FEE_ACCOUNT,
-                    currency,
-                    fee_bal.available,
-                    remaining,
-                )
-            });
-            applied += fee_bal.available as i128 - old as i128;
+            applied += checked_add_delta(
+                &mut fee_bal.available,
+                remaining,
+                "fee.available",
+                FEE_ACCOUNT,
+                currency,
+            );
         }
         applied
     }
@@ -597,6 +672,7 @@ impl AccountManager {
     /// Returns the signed delta actually applied to the fee account's
     /// signed total (`available - deficit`), post-clamp. Normally
     /// `-amount`; smaller in magnitude if the deficit add saturated.
+    #[must_use]
     fn debit_fee_account(&mut self, currency: CurrencyId, amount: u64) -> i128 {
         if amount == 0 {
             return 0;
@@ -609,12 +685,8 @@ impl AccountManager {
         let mut applied = -(from_avail as i128);
         if rebate > 0 {
             let deficit = self.fee_account_deficits.entry(currency).or_insert(0);
-            let old = *deficit;
-            *deficit = deficit.checked_add(rebate).unwrap_or_else(|| {
-                log_overflow("fee.deficit", FEE_ACCOUNT, currency, *deficit, rebate)
-            });
-            // Deficit growth lowers the signed total.
-            applied -= *deficit as i128 - old as i128;
+            // Deficit growth lowers the signed total, hence the negation.
+            applied -= checked_add_delta(deficit, rebate, "fee.deficit", FEE_ACCOUNT, currency);
         }
         applied
     }
@@ -689,13 +761,25 @@ impl AccountManager {
         // Conservation is verified from applied deltas: every balance
         // mutation below reports the signed change it actually wrote
         // (post-clamp), accumulated per currency and checked against zero
-        // after the last mutation. Equivalent to re-reading totals —
-        // totals only change through these writes — but O(1): profiling
-        // showed the previous pre/post `account_signed_total` snapshots
-        // (up to 16 HashMap probes per fill) costing ~8% of the matching
-        // thread at peak load. Account aliasing (buyer == seller, or
-        // either == FEE_ACCOUNT) needs no dedup here: deltas add
-        // linearly no matter which map entry they land on.
+        // after the last mutation. O(1) by design — profiling showed the
+        // previous pre/post `account_signed_total` snapshots (up to 16
+        // HashMap probes per fill) costing ~8% of the matching thread at
+        // peak load.
+        //
+        // Scope of the guarantee: this detects clamped writes (checked_*
+        // fallbacks) and mis-accumulated deltas among the writes below.
+        // Unlike the old state re-read it cannot see an uninstrumented
+        // future mutation, nor a write that lands on the wrong (account,
+        // currency) key — such a delta self-cancels. Every new mutation
+        // on this path must go through the #[must_use] `checked_*_delta`
+        // helpers and feed these accumulators; the conservation tests
+        // re-derive totals from state and cross-check this arithmetic
+        // independently. Account aliasing (buyer == seller, or either ==
+        // FEE_ACCOUNT) needs no dedup: deltas add linearly no matter
+        // which map entry they land on.
+        //
+        // i128: one u64 field can move by ±u64::MAX, exceeding i64 range,
+        // and the accumulator must absorb several such moves per fill.
         let mut quote_delta: i128 = 0;
         let mut base_delta: i128 = 0;
 
@@ -720,17 +804,13 @@ impl AccountManager {
                 .balances
                 .entry((buyer_account, spec.quote))
                 .or_default();
-            let old = quote_bal.reserved;
-            quote_bal.reserved = quote_bal.reserved.checked_sub(cost_u64).unwrap_or_else(|| {
-                log_underflow(
-                    "buyer.quote.reserved",
-                    buyer_account,
-                    spec.quote,
-                    quote_bal.reserved,
-                    cost_u64,
-                )
-            });
-            quote_delta += quote_bal.reserved as i128 - old as i128;
+            quote_delta += checked_sub_delta(
+                &mut quote_bal.reserved,
+                cost_u64,
+                "buyer.quote.reserved",
+                buyer_account,
+                spec.quote,
+            );
         }
 
         // Seller reservation: deduct quantity (no fee). Same construction
@@ -750,17 +830,13 @@ impl AccountManager {
                 .balances
                 .entry((seller_account, spec.base))
                 .or_default();
-            let old = base_bal.reserved;
-            base_bal.reserved = base_bal.reserved.checked_sub(qty).unwrap_or_else(|| {
-                log_underflow(
-                    "seller.base.reserved",
-                    seller_account,
-                    spec.base,
-                    base_bal.reserved,
-                    qty,
-                )
-            });
-            base_delta += base_bal.reserved as i128 - old as i128;
+            base_delta += checked_sub_delta(
+                &mut base_bal.reserved,
+                qty,
+                "seller.base.reserved",
+                seller_account,
+                spec.base,
+            );
         }
 
         // Settle the buyer's leg: credit `qty` base, deduct
@@ -784,23 +860,25 @@ impl AccountManager {
         // when every write applied exactly what was requested. A non-zero
         // residual means a saturating fallback in one of the checked_*
         // calls above fired (e.g., reservation underflow from a fee
-        // schedule change), or the cost_u64 clamp lost precision, or a
-        // future bug introduced a balance leak. The rebate path conserves
-        // by construction — the overage lands on the fee deficit, which
-        // `debit_fee_account` reports in its returned delta.
+        // schedule change) or a delta was mis-accumulated. The rebate
+        // path conserves by construction — the overage lands on the fee
+        // deficit, which `debit_fee_account` reports in its returned
+        // delta. Accepted gap: when `cost_u64` itself clamped to
+        // u64::MAX above, the clamped flow is internally self-consistent
+        // (the same clamped amount is debited and credited), so the
+        // residual can legitimately read zero — the unconditional
+        // `error!` at the clamp site is the signal for that case.
         if quote_delta != 0 || base_delta != 0 {
-            tracing::error!(
-                buyer_account = buyer_account.0,
-                seller_account = seller_account.0,
-                base = spec.base.0,
-                quote = spec.quote.0,
-                price = price.get(),
-                quantity = qty,
+            log_conservation_violation(
+                buyer_account,
+                seller_account,
+                spec,
+                price,
+                qty,
                 buyer_base_fee,
                 seller_quote_fee,
-                quote_delta = %quote_delta,
-                base_delta = %base_delta,
-                "balance conservation violated in fill — applied deltas do not sum to zero across (buyer, seller, fee)"
+                quote_delta,
+                base_delta,
             );
             debug_assert_eq!(
                 quote_delta, 0,
@@ -1474,18 +1552,20 @@ mod tests {
 
     // -- Conservation invariant (SEC-07 follow-up) --
     //
-    // The fill path runs a post-mutation check that total quote across
-    // {buyer, seller, fee} and total base across {buyer, seller} are
-    // unchanged. The proptests cover this indirectly; the tests below
-    // exercise it explicitly, including the dedup branches for
-    // buyer == seller and trader == FEE_ACCOUNT collisions. If the check
+    // The fill path checks that the applied balance deltas cancel per
+    // currency (O(1), no state re-reads). The tests below cross-check
+    // that arithmetic independently by re-deriving signed totals from
+    // state before and after fill, including the aliasing cases
+    // buyer == seller and trader == FEE_ACCOUNT (which fill handles
+    // with plain linear delta sums — no dedup). If the in-fill check
     // fails, `debug_assert_eq!` in `fill()` will panic in test builds.
 
     /// Helper: returns (signed total quote, signed total base) across
-    /// {buyer, seller, fee}, matching what `fill()` snapshots. Both are
-    /// signed because the fee account is a per-currency signed ledger,
-    /// and under A it holds balances in both quote (seller fees) and
-    /// base (buyer fees).
+    /// {buyer, seller, fee}, re-derived from state — the independent
+    /// counterpart of the applied-delta accounting inside `fill()`. Both
+    /// are signed because the fee account is a per-currency signed
+    /// ledger, and under A it holds balances in both quote (seller
+    /// fees) and base (buyer fees).
     fn conserved_totals(mgr: &AccountManager, buyer: AccountId, seller: AccountId) -> (i128, i128) {
         let mut q = mgr.account_signed_total(buyer, USD);
         let mut b = mgr.account_signed_total(buyer, BTC);
@@ -1561,9 +1641,9 @@ mod tests {
 
     #[test]
     fn fill_conserves_totals_self_trade() {
-        // buyer == seller: the dedup branch must not double-count, and
-        // conservation must still hold (zero-sum on the trader, with the
-        // fee account absorbing the net fee in each currency).
+        // buyer == seller: both legs' deltas land on the same account's
+        // entries and must still cancel (zero-sum on the trader, with
+        // the fee account absorbing the net fee in each currency).
         let mut mgr = AccountManager::new();
         mgr.deposit(ACCT_A, USD, 10_000);
         mgr.deposit(ACCT_A, BTC, 100);
@@ -1586,9 +1666,9 @@ mod tests {
     #[test]
     fn fill_conserves_totals_when_trader_is_fee_account() {
         // Pathological: a trader collides with FEE_ACCOUNT. Nothing in
-        // `fill()` itself prevents this, and the dedup branch
-        // `fee_distinct = false` must keep the conservation check correct
-        // by counting the shared balance only once.
+        // `fill()` itself prevents this; the applied-delta accounting
+        // must stay correct because trader-leg and fee-leg deltas on the
+        // shared balance sum linearly.
         let mut mgr = AccountManager::new();
         mgr.deposit(FEE_ACCOUNT, USD, 10_000); // FEE_ACCOUNT acting as buyer
         mgr.deposit(ACCT_B, BTC, 100);
@@ -1610,6 +1690,65 @@ mod tests {
             post_b, pre_b,
             "base conservation under FEE_ACCOUNT collision"
         );
+    }
+
+    // -- Applied-delta semantics on clamp paths --
+    //
+    // The conservation check is only as good as the deltas the helpers
+    // report when a checked_* fallback fires: they must reflect the
+    // clamped write, not the requested amount. These tests force each
+    // clamp directly.
+
+    #[test]
+    fn checked_add_delta_reports_applied_not_requested_on_overflow() {
+        let mut field = u64::MAX - 5;
+        let applied = checked_add_delta(&mut field, 100, "test.add", ACCT_A, USD);
+        assert_eq!(field, u64::MAX, "overflow clamps to u64::MAX");
+        assert_eq!(applied, 5, "delta is the applied 5, not the requested 100");
+    }
+
+    #[test]
+    fn checked_sub_delta_reports_applied_not_requested_on_underflow() {
+        let mut field = 3;
+        let applied = checked_sub_delta(&mut field, 100, "test.sub", ACCT_A, USD);
+        assert_eq!(field, 0, "underflow clamps to zero");
+        assert_eq!(
+            applied, -3,
+            "delta is the applied -3, not the requested -100"
+        );
+    }
+
+    #[test]
+    fn settle_fee_leg_delta_reflects_clamped_credit() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, u64::MAX - 10);
+        // Crediting 100 gross overflows available; only 10 lands.
+        let applied = mgr.settle_fee_leg(ACCT_A, USD, 100, 0, "test.leg");
+        assert_eq!(mgr.balance(ACCT_A, USD).available, u64::MAX);
+        assert_eq!(applied, 10, "leg delta reflects the clamped write");
+    }
+
+    // debug_assert-based: the in-fill check only panics in debug builds,
+    // so this test is meaningless (and would fail) under --release.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "balance conservation")]
+    fn fill_conservation_check_fires_when_credit_saturates() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+        // Pre-load the seller's quote balance so the fill's cost credit
+        // (1000 USD) overflows `available` and clamps: the applied delta
+        // (500) then differs from the requested credit and the residual
+        // is non-zero.
+        mgr.deposit(ACCT_B, USD, u64::MAX - 500);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec()).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec()).unwrap();
+
+        mgr.fill(bs, ss, price(100), qty(10), 0, 0, &spec());
     }
 
     // -- Fee-account signed ledger (D) --
