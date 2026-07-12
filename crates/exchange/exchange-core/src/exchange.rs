@@ -620,13 +620,37 @@ impl Exchange {
     /// - Pending stop-market buys: `quote_budget` recalculated so the
     ///   fill leaves room for the new fee.
     ///
-    /// No-op if the instrument doesn't exist.
+    /// No-op if the instrument doesn't exist, or if either rate is
+    /// outside the documented ±10_000 bps range (±100%) — see below.
     pub fn set_fee_schedule(
         &mut self,
         symbol: Symbol,
         schedule: FeeSchedule,
         reports: &mut Vec<ExecutionReport>,
     ) {
+        // Range-validate here, at the single choke point every path
+        // (wire request, journal replay) goes through — the admin TUI
+        // validates client-side but nothing else on the decode path
+        // does. Out-of-range bps are dangerous, not just nonsensical:
+        // with extreme cost the fee math's final `as i64` narrowing can
+        // wrap a huge fee into an arbitrary-sign value that settles as
+        // a phantom rebate. Deterministic ignore (not clamp): journal
+        // replay of a bad event must reproduce exactly this no-op.
+        // `contains` rather than `.abs()` — `i16::MIN.abs()` overflows.
+        // warn!: an operator's schedule change silently not applying
+        // needs attention, and a valid client can never trigger this.
+        const VALID_BPS: std::ops::RangeInclusive<i16> = -10_000..=10_000;
+        if !VALID_BPS.contains(&schedule.maker_fee_bps)
+            || !VALID_BPS.contains(&schedule.taker_fee_bps)
+        {
+            tracing::warn!(
+                symbol = symbol.0,
+                maker_fee_bps = schedule.maker_fee_bps,
+                taker_fee_bps = schedule.taker_fee_bps,
+                "fee schedule outside ±10000 bps ignored — client-side validation bypassed"
+            );
+            return;
+        }
         let Some(inst) = inst_mut(&mut self.instruments, symbol) else {
             return;
         };

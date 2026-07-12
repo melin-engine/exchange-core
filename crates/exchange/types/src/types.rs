@@ -124,8 +124,16 @@ pub struct CircuitBreakerConfig {
 /// Example: `maker_fee_bps = -10, taker_fee_bps = 20` means the maker
 /// receives a 0.10% rebate while the taker pays 0.20%.
 ///
-/// Uses `i16` to support the range -10000..10000, covering both fees
-/// and rebates within basis-point precision.
+/// Uses `i16` to support the range -10000..=10000, covering both fees
+/// and rebates within basis-point precision. The engine rejects
+/// schedules outside that range (`Exchange::set_fee_schedule`).
+///
+/// The executable form of the formula lives in `fee_from_bps` in the
+/// exchange-core crate's execute module — it is deliberately written
+/// without a 128-bit division (hot-path cost) and with exact truncating
+/// semantics. Any new fee-computing site must call it (or replicate its
+/// truncation exactly): a floor-based or wider reimplementation would
+/// diverge by one unit on rebates and break fee reconciliation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FeeSchedule {
     /// Maker fee in basis points (-10000..10000). Negative = rebate.

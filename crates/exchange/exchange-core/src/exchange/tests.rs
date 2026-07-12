@@ -1145,6 +1145,79 @@ fn fee_deducted_from_fill_proceeds() {
 }
 
 #[test]
+fn out_of_range_fee_schedule_is_ignored() {
+    // Wire/journal decoders pass raw i16 bps with no client-side TUI
+    // validation in the loop — the engine must deterministically ignore
+    // schedules outside ±10_000 bps (see set_fee_schedule). Verified
+    // through observable fill fees: the last valid schedule stays in
+    // effect.
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 50_000);
+    exchange.deposit(ACCT_B, BTC, 100);
+
+    let mut reports = Vec::new();
+    exchange.set_fee_schedule(
+        btc,
+        FeeSchedule {
+            maker_fee_bps: 10,
+            taker_fee_bps: 20,
+        },
+        &mut reports,
+    );
+
+    // Each out-of-range schedule must be rejected wholesale — including
+    // the i16 extremes that would wrap the fee math at large cost.
+    for (maker, taker) in [
+        (i16::MIN, 0),
+        (0, i16::MAX),
+        (10_001, 0),
+        (0, -10_001),
+        (i16::MIN, i16::MAX),
+    ] {
+        exchange.set_fee_schedule(
+            btc,
+            FeeSchedule {
+                maker_fee_bps: maker,
+                taker_fee_bps: taker,
+            },
+            &mut reports,
+        );
+    }
+
+    // Same trade as fee_deducted_from_fill_proceeds: cost = 10_000, so
+    // fees must still be 10 (maker) / 20 (taker) from the valid schedule.
+    exchange.execute(
+        btc,
+        limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+    exchange.execute(
+        btc,
+        limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    let fill = reports
+        .iter()
+        .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+        .unwrap();
+    if let ExecutionReport::Fill {
+        maker_fee,
+        taker_fee,
+        ..
+    } = fill
+    {
+        assert_eq!(*maker_fee, 10, "valid schedule must remain in effect");
+        assert_eq!(*taker_fee, 20, "valid schedule must remain in effect");
+    } else {
+        panic!("expected Fill");
+    }
+}
+
+#[test]
 fn zero_fees_produce_no_deduction() {
     let mut exchange = Exchange::new();
     let btc = Symbol(1);
