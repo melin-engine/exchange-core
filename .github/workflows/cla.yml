@@ -23,11 +23,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path-to-document: "https://github.com/melin-engine/melin/blob/main/CLA.md"
+          path-to-document: "https://github.com/melin-engine/exchange-core/blob/main/CLA.md"
           path-to-signatures: "signatures/cla.json"
           branch: "main"
           custom-notsigned-prcomment: |
-            Thank you for your pull request. Before we can review it, you need to sign the [Contributor License Agreement](https://github.com/melin-engine/melin/blob/main/CLA.md).
+            Thank you for your pull request. Before we can review it, you need to sign the [Contributor License Agreement](https://github.com/melin-engine/exchange-core/blob/main/CLA.md).
 
             To sign, please comment below with:
 
