@@ -1663,6 +1663,9 @@ where
     // Wait for pipeline threads to finish and print trace reports.
     let _ = journal_handle.join();
     let _ = matching_handle.join();
+    // No embedded server in pipeline mode, so nothing else dumps the
+    // stage registry — print it here (no-op without `latency-trace`).
+    melin_transport_core::trace::print_report_all();
 }
 
 // ===========================================================================
