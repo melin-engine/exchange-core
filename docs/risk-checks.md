@@ -78,8 +78,8 @@ After all risk checks pass, the engine attempts to reserve funds via `AccountMan
 
 | Side | Order Type | Reserved Currency | Reserved Amount |
 |---|---|---|---|
-| Buy | Limit | Quote | `price * quantity` (plus fee cushion) |
-| Buy | StopLimit | Quote | `limit_price * quantity` (plus fee cushion) |
+| Buy | Limit | Quote | `price * quantity` |
+| Buy | StopLimit | Quote | `limit_price * quantity` |
 | Buy | Market | Quote | Entire available quote balance |
 | Buy | Stop | Quote | Entire available quote balance |
 | Sell | Limit | Base | `quantity` |
@@ -87,13 +87,13 @@ After all risk checks pass, the engine attempts to reserve funds via `AccountMan
 | Sell | Market | Base | `quantity` |
 | Sell | Stop | Base | `quantity` |
 
-**Buy limit/stop-limit** reservations include a fee cushion: `cost * max_fee_bps / 10_000`, where `max_fee_bps` is the higher of the instrument's maker and taker fee rates. This guarantees fees can always be charged from the reservation even when filling at the exact limit price.
+**Buy limit/stop-limit** reservations lock pure notional — no fee cushion. Fees are charged from the fill's received asset (see the fee model document), so a reservation is always sufficient to settle its fills, by construction.
 
 **Buy market/stop** orders reserve the entire available quote balance because the final fill price is unknown at submission time. The unused portion is released after execution.
 
 **Sell** orders always reserve the order quantity in base currency, regardless of order type.
 
-If `price * quantity` overflows `u64` (after fee cushion), the order is rejected with `InsufficientBalance`.
+If `price * quantity` overflows `u64`, the order is rejected with `InsufficientBalance`.
 
 ## Kill Switch (CancelAll)
 
@@ -112,7 +112,7 @@ This is the account-level emergency kill switch. It iterates over every order bo
 3. **Circuit breaker** -- the new price is checked against `halted` and price bands, same rules as new order submission.
 4. **Risk limits** -- the new quantity and new notional (`new_price * new_quantity`) are checked against `max_order_qty` and `max_order_notional`.
 5. **Cross-price check** -- reject with `PriceWouldCross` if the new price would cross the opposite best price (buy price >= best ask, or sell price <= best bid). To aggress, the client must cancel and submit a new order.
-6. **Reservation adjustment** -- the new required reserve amount is computed (including fee cushion for buys). If the new amount exceeds the old reservation and the account has insufficient available balance for the delta, reject with `InsufficientBalance`. If the new amount is less than or equal to the old amount, the excess is released back to available balance.
+6. **Reservation adjustment** -- the new required reserve amount is computed (pure notional). If the new amount exceeds the old reservation and the account has insufficient available balance for the delta, reject with `InsufficientBalance`. If the new amount is less than or equal to the old amount, the excess is released back to available balance.
 
 If any check fails, the original order remains untouched on the book with its original price, quantity, and queue priority.
 

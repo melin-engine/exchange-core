@@ -1,6 +1,6 @@
 # Maker/Taker Fee Model
 
-Fees are configured per instrument in basis points (bps, where 100 bps = 1%). Both maker and taker fees are signed (`i16`, range -10000 to 10000): positive values are fees charged to the trader, negative values are rebates paid by the exchange. If no fee schedule is set, both rates default to zero. Fee schedules can be changed at runtime via `SetFeeSchedule`; changes apply to all subsequent fills, including fills on orders placed before the change.
+Fees are configured per instrument in basis points (bps, where 100 bps = 1%). Both maker and taker fees are signed (`i16`, range -10000 to 10000): positive values are fees charged to the trader, negative values are rebates paid by the exchange. Schedules outside the ±10000 bps range are rejected by the engine and ignored with a warning in the server log — the requested change does not take effect. If no fee schedule is set, both rates default to zero. Fee schedules can be changed at runtime via `SetFeeSchedule`; changes apply to all subsequent fills, including fills on orders placed before the change.
 
 Collected fees are credited to a dedicated **fee collection account** (`AccountId(0)`). This account is never evicted and always exists. Operators can withdraw accumulated fees via the Withdraw command.
 
@@ -11,23 +11,21 @@ Collected fees are credited to a dedicated **fee collection account** (`AccountI
 
 ## Fee Currency
 
-Both maker and taker fees are charged in the **quote currency**, matching the standard centralized exchange model:
+Fees are charged in the **received asset**, matching common practice on major venues:
 
-- **Buyer** pays `cost + fee` in quote currency.
-- **Seller** receives `cost - fee` in quote currency.
+- **Buyer** pays their fee in **base** currency, deducted from the base amount they receive in the fill.
+- **Seller** pays their fee in **quote** currency, deducted from the quote proceeds they receive.
 
-## Fee Cushion (Buy-Side Reservation)
+Execution reports state both legs' fees in **quote currency** (the fee's economic value at the fill price), regardless of which asset the fee was settled in.
 
-When a buy limit order is placed, the engine reserves `price * quantity` in quote currency. But the fee is also charged in quote currency at fill time. If the order fills at the exact limit price, there would be no room for the fee.
+Because each fee is deducted from what the trader *receives* in that fill, a fee can never exceed the trader's receipt: fees are capped at the received amount. A fee that hits this cap indicates a fee-schedule misconfiguration (for example a rate set to 100%) and is flagged in the server log.
 
-The reservation therefore includes a fee cushion computed at `max(maker_fee_bps, taker_fee_bps)` — the maximum is used because the engine doesn't know at placement time whether the order will rest (maker) or match immediately (taker). This guarantees the reservation covers the fee regardless of role.
+## No Reservation Cushion
 
-The cushion uses the same truncating integer division as fee computation, so `cushion >= actual_fee` is guaranteed for any fill at or below the limit price.
-
-**Market buys** don't need a cushion — they reserve the entire available quote balance. **Sell orders** don't need one either — their fee is deducted from quote proceeds, not from a base currency reservation.
+Order reservations lock **pure notional** only — `price * quantity` in quote for limit buys, quantity in base for sells, the full available quote balance for market buys. No fee cushion is added at placement time: since fees come out of the fill's proceeds rather than the reservation, a reservation is always sufficient to settle its fills, by construction.
 
 ## Dynamic Fee Schedule Changes
 
-Because the fee cushion is computed at order placement using the fee schedule active at that moment, a fee schedule increase could cause a resting buy order's cushion to be insufficient for the new fee. The exchange absorbs the shortfall via saturating arithmetic — the buyer pays `min(actual_fee, cushion_at_placement_time)` rather than the full configured fee rate. There is no log or audit trail entry for the shortfall.
+Because reservations don't depend on the fee schedule, a schedule change simply takes effect on all subsequent fills — including fills of orders that were already resting when the schedule changed. There is no reservation recalculation, no shortfall, and no restriction on when schedules may be changed.
 
-**Recommendation**: To avoid silent fee shortfalls, increase fee schedules only when no resting buy orders exist for the instrument (e.g., after a trading halt and CancelAll).
+Rebates (negative fees) are funded from the fee collection account. If rebates exceed the account's accumulated fees, the account's balance for that currency goes negative on a signed ledger; subsequent fee revenue pays the deficit down first. Operators can monitor the fee account's signed balance to know when it needs funding.
