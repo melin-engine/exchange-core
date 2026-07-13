@@ -264,11 +264,30 @@ impl BookSide {
     /// Binary search for a price level (by side-relative key — see the
     /// struct doc). Returns `Ok(index)` if found, `Err(index)` for the
     /// insertion point.
+    ///
+    /// **Neighbor-aware fast path:** the tail (best) level is checked
+    /// before falling back to binary search. Matching consumes the best
+    /// level, cancels and placements cluster at the top of book, and
+    /// improving quotes insert past the tail — so most lookups resolve
+    /// in one comparison. Non-tail lookups pay one extra compare before
+    /// binary-searching the remaining prefix.
     #[inline]
     fn search(&self, price: Price) -> Result<usize, usize> {
         let target = self.key(price);
-        self.levels
-            .binary_search_by_key(&target, |(p, _)| self.key(*p))
+        let Some(&(last, _)) = self.levels.last() else {
+            return Err(0);
+        };
+        let last_key = self.key(last);
+        if target >= last_key {
+            return if target == last_key {
+                Ok(self.levels.len() - 1)
+            } else {
+                Err(self.levels.len())
+            };
+        }
+        // Prefix excludes the tail we just rejected; indices returned by
+        // the prefix search are valid for the full array (all < len - 1).
+        self.levels[..self.levels.len() - 1].binary_search_by_key(&target, |(p, _)| self.key(*p))
     }
 
     /// Allocate a slab slot for `order`. Reuses a freed node if available,
@@ -382,25 +401,28 @@ impl BookSide {
         Some(self.unlink_node_at_level(level_idx, node_idx))
     }
 
-    /// Pop the front (oldest, highest-priority) order at `price`.
-    /// Frees the slab slot and removes the level if it becomes empty.
-    /// Used by the matching loop and STP `CancelOldest`/`CancelBoth`.
+    /// Price and front (oldest, highest-priority) node of the BEST level,
+    /// or `None` if the side is empty. O(1) tail peek — the matching
+    /// loop's outer guard, replacing the old price-keyed
+    /// `front_node_idx` and its per-maker binary search.
+    #[inline]
+    pub(crate) fn best_front(&self) -> Option<(Price, u32)> {
+        self.levels.last().map(|&(price, head)| (price, head.head))
+    }
+
+    /// Pop the front (oldest) order of the BEST level. Frees the slab
+    /// slot and removes the level if it becomes empty. O(1) — no price
+    /// search (the best level is the tail) and a shift-free `Vec::pop`
+    /// on level death. Matching only ever consumes the best level, so
+    /// this replaces the old price-keyed `pop_front` there; when the
+    /// level empties, the next-best level becomes the new tail.
     /// Returns `(node_idx, order)` so callers can clean up auxiliary
-    /// state. Shares `unlink_node_at_level` with `remove_node` so we
-    /// only do one binary search.
-    pub(crate) fn pop_front(&mut self, price: Price) -> Option<(u32, RestingOrder)> {
-        let level_idx = self.search(price).ok()?;
+    /// state.
+    pub(crate) fn pop_front_best(&mut self) -> Option<(u32, RestingOrder)> {
+        let level_idx = self.levels.len().checked_sub(1)?;
         let head_idx = self.levels[level_idx].1.head;
         let order = self.unlink_node_at_level(level_idx, head_idx);
         Some((head_idx, order))
-    }
-
-    /// Index of the front (oldest) node at `price`, or `None` if no level.
-    /// Cheap query used by the matching loop's outer guard.
-    #[inline]
-    pub(crate) fn front_node_idx(&self, price: Price) -> Option<u32> {
-        let level_idx = self.search(price).ok()?;
-        Some(self.levels[level_idx].1.head)
     }
 
     /// Borrow a node by slab index. Used by the matching loop to read the
@@ -460,15 +482,6 @@ impl BookSide {
                 cur = next;
             }
         }
-    }
-
-    /// Iterate price levels from best to worst (bids: highest→lowest,
-    /// asks: lowest→highest) yielding only prices. Physical reverse
-    /// order on both sides — the best level lives at the tail. Used by
-    /// the matching engine to collect the prices to visit before
-    /// mutating the book.
-    pub(crate) fn prices_best_to_worst(&self) -> impl Iterator<Item = Price> + '_ {
-        self.levels.iter().rev().map(|(p, _)| *p)
     }
 
     /// Snapshot: walk every level in ascending PRICE order (canonical —
@@ -643,13 +656,92 @@ mod tests {
     #[test]
     fn best_price_advances_to_next_level_after_exhaustion() {
         let mut bids = three_level_side(Side::Buy);
-        bids.pop_front(p(110)).unwrap();
+        bids.pop_front_best().unwrap();
         assert_eq!(bids.best_price(), Some(p(100)));
 
         let mut asks = three_level_side(Side::Sell);
-        asks.pop_front(p(90)).unwrap();
+        asks.pop_front_best().unwrap();
         assert_eq!(asks.best_price(), Some(p(100)));
         assert_key_sorted(&asks);
+    }
+
+    /// `pop_front_best` must drain FIFO within the best level (oldest
+    /// first), then advance to the next-best level, on both sides —
+    /// this is the exact walk the matching loop performs.
+    #[test]
+    fn pop_front_best_drains_best_to_worst_fifo() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut s = BookSide::new(side);
+            // Two orders per level; ids encode (price, arrival) so the
+            // expected pop order is fully determined.
+            let mut id = 0;
+            for price in [90, 100, 110] {
+                for _ in 0..2 {
+                    id += 1;
+                    s.add(p(price), order(id, 1, side));
+                }
+            }
+            let expected_prices: Vec<u64> = match side {
+                Side::Buy => vec![110, 110, 100, 100, 90, 90],
+                Side::Sell => vec![90, 90, 100, 100, 110, 110],
+            };
+            let expected_ids: Vec<u64> = match side {
+                Side::Buy => vec![5, 6, 3, 4, 1, 2],
+                Side::Sell => vec![1, 2, 3, 4, 5, 6],
+            };
+            let mut popped_prices = Vec::new();
+            let mut popped_ids = Vec::new();
+            while let Some((price, _)) = s.best_front() {
+                let (_, o) = s.pop_front_best().unwrap();
+                popped_prices.push(price.get());
+                popped_ids.push(o.id.0);
+            }
+            assert_eq!(popped_prices, expected_prices, "{side:?}");
+            assert_eq!(popped_ids, expected_ids, "{side:?}");
+            assert!(s.is_empty(), "{side:?}");
+            assert_eq!(s.pop_front_best(), None, "{side:?}");
+        }
+    }
+
+    #[test]
+    fn best_front_returns_oldest_order_at_best_level() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut s = BookSide::new(side);
+            s.add(p(100), order(1, 1, side));
+            s.add(p(100), order(2, 1, side));
+            let (price, front_idx) = s.best_front().unwrap();
+            assert_eq!(price, p(100), "{side:?}");
+            assert_eq!(s.node(front_idx).order.id, OrderId(1), "{side:?}");
+        }
+        assert_eq!(BookSide::new(Side::Buy).best_front(), None);
+    }
+
+    /// The `search` tail fast path must agree with the fallback binary
+    /// search for every relative position: better than best (new tail),
+    /// equal to best, existing inner level, and missing inner/worst
+    /// levels. Regressions here would corrupt level ordering silently.
+    #[test]
+    fn search_fast_path_and_fallback_agree() {
+        for side in [Side::Buy, Side::Sell] {
+            // Levels at 90/100/110; probe every price in and around them
+            // by exercising `add` (search is private — `add` hits both
+            // the Ok and Err paths) and checking the resulting order.
+            let mut s = three_level_side(side);
+            for probe in [80, 85, 95, 100, 105, 110, 115, 120] {
+                s.add(p(probe), order(1000 + probe, 1, side));
+            }
+            assert_key_sorted(&s);
+            let snapshot_prices: Vec<u64> = s
+                .levels_snapshot()
+                .into_iter()
+                .map(|(price, _)| price.get())
+                .collect();
+            assert_eq!(
+                snapshot_prices,
+                vec![80, 85, 90, 95, 100, 105, 110, 115, 120],
+                "{side:?}"
+            );
+        }
     }
 
     #[test]
@@ -663,17 +755,6 @@ mod tests {
         assert!(asks.at_or_better(p(90), p(100)));
         assert!(asks.at_or_better(p(100), p(100)));
         assert!(!asks.at_or_better(p(110), p(100)));
-    }
-
-    #[test]
-    fn prices_best_to_worst_ordering() {
-        let bids = three_level_side(Side::Buy);
-        let walked: Vec<Price> = bids.prices_best_to_worst().collect();
-        assert_eq!(walked, vec![p(110), p(100), p(90)]);
-
-        let asks = three_level_side(Side::Sell);
-        let walked: Vec<Price> = asks.prices_best_to_worst().collect();
-        assert_eq!(walked, vec![p(90), p(100), p(110)]);
     }
 
     #[test]

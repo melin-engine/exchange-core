@@ -73,11 +73,6 @@ pub struct OrderBook {
     /// Cleared and reused each call. Capacity grows to high-water mark and stays.
     trigger_price_buf: Vec<Price>,
     triggered_buf: Vec<PendingStop>,
-    /// Reusable buffer for `match_against()` to collect matchable price levels.
-    /// We can't iterate the BTreeMap and mutate it simultaneously (filled makers
-    /// are removed during matching), so prices are collected first. This buffer
-    /// avoids a heap allocation on every aggressive order.
-    match_price_buf: Vec<Price>,
     /// Reservation slots from orders consumed during the last `execute()` or
     /// `cancel()` call. Filled makers and STP-cancelled makers push their
     /// slots here so the Exchange can release reservations without a HashMap
@@ -98,13 +93,11 @@ impl OrderBook {
             last_trade_price: None,
             // Hot-path scratch buffers reused across orders (cleared at
             // the top of each match). 64 capacity covers the typical
-            // sweep width — an aggressive order that crosses more than
-            // 64 levels (or fills more than 64 makers) is rare. Pre-sizing
-            // here means a fresh book never reallocates during its first
-            // burst of activity.
+            // sweep width — an aggressive order that fills more than 64
+            // makers is rare. Pre-sizing here means a fresh book never
+            // reallocates during its first burst of activity.
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
-            match_price_buf: Vec::with_capacity(64),
             consumed_slots: Vec::with_capacity(64),
         }
     }
@@ -141,8 +134,6 @@ impl OrderBook {
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
-            // Typical aggressive order sweeps a handful of price levels.
-            match_price_buf: Vec::with_capacity(64),
             consumed_slots: Vec::with_capacity(64),
         }
     }
@@ -214,7 +205,6 @@ impl OrderBook {
             // `new()` for the capacity rationale.
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
-            match_price_buf: Vec::with_capacity(64),
             consumed_slots: Vec::with_capacity(64),
         }
     }
@@ -763,160 +753,54 @@ impl OrderBook {
             Side::Sell => &mut self.bids,
         };
 
-        // Collect the prices we need to visit into a reusable buffer. We can't
-        // iterate the level array and mutate it simultaneously (filled makers
-        // are removed), so prices are collected first. The buffer lives on
-        // OrderBook to avoid a heap allocation on every aggressive order.
-        // Both sides keep their best level at the tail, so best→worst
-        // iteration and the "still crosses the limit" test are
-        // side-agnostic (asks: p <= limit; bids: p >= limit — both are
-        // `at_or_better` on the opposite side).
-        self.match_price_buf.clear();
-        self.match_price_buf.extend(
-            opposite
-                .prices_best_to_worst()
-                .take_while(|&p| price_limit.is_none_or(|limit| opposite.at_or_better(p, limit))),
-        );
-
         let mut stp_cancelled = false;
 
-        // Iterate from a index to avoid borrowing self.match_price_buf while
-        // mutating self through opposite. The buffer won't be modified during
-        // the loop, so index-based access is safe and equivalent to iter().
-        let mut price_idx = 0;
-        'outer: while price_idx < self.match_price_buf.len() {
-            let price = self.match_price_buf[price_idx];
-            price_idx += 1;
+        // Tail-native matching loop. Both sides keep their best level at
+        // the Vec tail, and matching only ever consumes the best level —
+        // when it empties, `pop_front_best` pops it (shift-free) and the
+        // next-best level becomes the new tail. So the loop reads the
+        // front maker straight off the tail: no per-maker price search
+        // and no pre-collected price buffer. The "still crosses the
+        // limit" test is side-agnostic (asks: p <= limit; bids:
+        // p >= limit — both are `at_or_better` on the opposite side).
+        while let Some((price, maker_idx)) = opposite.best_front() {
+            if let Some(limit) = price_limit
+                && !opposite.at_or_better(price, limit)
+            {
+                break;
+            }
 
-            // Walk this price level's intrusive FIFO from the head. `pop_front`
-            // already removes the level when it empties, so we don't need a
-            // separate `remove_level` after the inner loop exits.
-            while let Some(maker_idx) = opposite.front_node_idx(price) {
-                // Snapshot the maker fields we need; releasing the borrow so
-                // we can mutate via `pop_front`/`node_mut` on subsequent
-                // branches without aliasing.
-                let maker_node = opposite.node(maker_idx);
-                let maker_account = maker_node.order.account;
-                let maker_id = maker_node.order.id;
-                let maker_remaining = maker_node.order.remaining;
-                let maker_side = maker_node.order.side;
-                let maker_reservation = maker_node.order.reservation;
+            // Snapshot the maker fields we need; releasing the borrow so
+            // we can mutate via `pop_front_best`/`node_mut` on subsequent
+            // branches without aliasing.
+            let maker_node = opposite.node(maker_idx);
+            let maker_account = maker_node.order.account;
+            let maker_id = maker_node.order.id;
+            let maker_remaining = maker_node.order.remaining;
+            let maker_side = maker_node.order.side;
+            let maker_reservation = maker_node.order.reservation;
 
-                // Self-trade prevention: check if taker and maker belong to
-                // the same account before generating a fill.
-                if stp != SelfTradeProtection::Allow && maker_account == taker_account {
-                    match stp {
-                        SelfTradeProtection::Allow => unreachable!(),
-                        SelfTradeProtection::CancelNewest => {
-                            // Cancel the taker, leave the maker on the book.
-                            stp_cancelled = true;
-                            break 'outer;
-                        }
-                        SelfTradeProtection::CancelOldest => {
-                            // Cancel the maker, continue matching the taker.
-                            // Safe: this iteration was entered via the
-                            // `while let Some(_) = opposite.front_node_idx(price)`
-                            // guard above and `opposite` has not been mutated
-                            // since (we only read maker fields). An empty pop
-                            // here would indicate a serious bookkeeping bug —
-                            // a panic surfaces it instead of silently dropping
-                            // a fill, which would corrupt balances.
-                            opposite.pop_front(price).expect("front existed");
-                            self.order_index.remove(&(maker_account, maker_id));
-                            self.consumed_slots.push((
-                                maker_account,
-                                maker_id,
-                                maker_side,
-                                maker_reservation,
-                            ));
-                            reports.push(ExecutionReport::Cancelled {
-                                order_id: maker_id,
-                                symbol: self.symbol,
-                                account: maker_account,
-                                remaining_quantity: maker_remaining,
-                            });
-                            continue;
-                        }
-                        SelfTradeProtection::CancelBoth => {
-                            // Cancel the maker and the taker.
-                            // Same invariant as the CancelOldest arm above:
-                            // front was just read via `front_node_idx`, no
-                            // intervening mutation. A panic here would catch
-                            // a slab/level desync rather than silently leaking
-                            // a reservation.
-                            opposite.pop_front(price).expect("front existed");
-                            self.order_index.remove(&(maker_account, maker_id));
-                            self.consumed_slots.push((
-                                maker_account,
-                                maker_id,
-                                maker_side,
-                                maker_reservation,
-                            ));
-                            reports.push(ExecutionReport::Cancelled {
-                                order_id: maker_id,
-                                symbol: self.symbol,
-                                account: maker_account,
-                                remaining_quantity: maker_remaining,
-                            });
-                            return (Some(quantity), true);
-                        }
+            // Self-trade prevention: check if taker and maker belong to
+            // the same account before generating a fill.
+            if stp != SelfTradeProtection::Allow && maker_account == taker_account {
+                match stp {
+                    SelfTradeProtection::Allow => unreachable!(),
+                    SelfTradeProtection::CancelNewest => {
+                        // Cancel the taker, leave the maker on the book.
+                        stp_cancelled = true;
+                        break;
                     }
-                }
-
-                let mut fill_qty = quantity.min(maker_remaining);
-
-                // Enforce quote budget: limit fill to what the taker can afford.
-                if let Some(budget) = quote_budget {
-                    let cost = (price.get() as u128) * (fill_qty.get() as u128);
-                    if cost > budget as u128 {
-                        // Can only afford a partial fill at this price.
-                        let affordable = budget / price.get();
-                        if affordable == 0 {
-                            // Can't afford even 1 lot — stop matching.
-                            break 'outer;
-                        }
-                        // Safety: affordable > 0 checked above.
-                        fill_qty = Quantity(NonZeroU64::new(affordable).expect("affordable > 0"))
-                            .min(fill_qty);
-                    }
-                }
-
-                // Fees are zero here — the Exchange computes and sets
-                // them after matching, before balance updates.
-                reports.push(ExecutionReport::Fill {
-                    maker_order_id: maker_id,
-                    taker_order_id: taker_id,
-                    symbol: self.symbol,
-                    maker_account,
-                    taker_account,
-                    price,
-                    quantity: fill_qty,
-                    maker_fee: 0,
-                    taker_fee: 0,
-                });
-                self.last_trade_price = Some(price);
-
-                // Deduct cost from budget after the fill.
-                if let Some(budget) = &mut quote_budget {
-                    let cost = price.get().saturating_mul(fill_qty.get());
-                    *budget = budget.saturating_sub(cost);
-                }
-
-                match maker_remaining.checked_sub(fill_qty) {
-                    Some(new_remaining) => {
-                        // Partial maker fill — update remaining in place.
-                        opposite.node_mut(maker_idx).order.remaining = new_remaining;
-                    }
-                    None => {
-                        // Maker fully filled — remove from book and record
-                        // the slot so the Exchange can release the reservation.
-                        // Safe: same invariant as the STP arms above — we
-                        // entered this iteration via `front_node_idx(price)`
-                        // and `opposite` has not been mutated since (we only
-                        // read maker fields and computed the fill locally;
-                        // the `Some` arm that calls `node_mut` is a sibling,
-                        // not a predecessor, of this branch).
-                        opposite.pop_front(price).expect("front existed");
+                    SelfTradeProtection::CancelOldest => {
+                        // Cancel the maker, continue matching the taker.
+                        // Safe: this iteration was entered via the
+                        // `best_front()` guard above and `opposite` has
+                        // not been mutated since (we only read maker
+                        // fields), so the popped front is `maker_idx`.
+                        // An empty pop here would indicate a serious
+                        // bookkeeping bug — a panic surfaces it instead
+                        // of silently dropping a fill, which would
+                        // corrupt balances.
+                        opposite.pop_front_best().expect("front existed");
                         self.order_index.remove(&(maker_account, maker_id));
                         self.consumed_slots.push((
                             maker_account,
@@ -924,21 +808,115 @@ impl OrderBook {
                             maker_side,
                             maker_reservation,
                         ));
+                        reports.push(ExecutionReport::Cancelled {
+                            order_id: maker_id,
+                            symbol: self.symbol,
+                            account: maker_account,
+                            remaining_quantity: maker_remaining,
+                        });
+                        continue;
+                    }
+                    SelfTradeProtection::CancelBoth => {
+                        // Cancel the maker and the taker.
+                        // Same invariant as the CancelOldest arm above:
+                        // front was just read via `best_front`, no
+                        // intervening mutation. A panic here would catch
+                        // a slab/level desync rather than silently leaking
+                        // a reservation.
+                        opposite.pop_front_best().expect("front existed");
+                        self.order_index.remove(&(maker_account, maker_id));
+                        self.consumed_slots.push((
+                            maker_account,
+                            maker_id,
+                            maker_side,
+                            maker_reservation,
+                        ));
+                        reports.push(ExecutionReport::Cancelled {
+                            order_id: maker_id,
+                            symbol: self.symbol,
+                            account: maker_account,
+                            remaining_quantity: maker_remaining,
+                        });
+                        return (Some(quantity), true);
                     }
                 }
+            }
 
-                match quantity.checked_sub(fill_qty) {
-                    Some(new_qty) => {
-                        quantity = new_qty;
-                        // If budget is exhausted, stop matching.
-                        if quote_budget == Some(0) {
-                            break 'outer;
-                        }
+            let mut fill_qty = quantity.min(maker_remaining);
+
+            // Enforce quote budget: limit fill to what the taker can afford.
+            if let Some(budget) = quote_budget {
+                let cost = (price.get() as u128) * (fill_qty.get() as u128);
+                if cost > budget as u128 {
+                    // Can only afford a partial fill at this price.
+                    let affordable = budget / price.get();
+                    if affordable == 0 {
+                        // Can't afford even 1 lot — stop matching.
+                        break;
                     }
-                    None => {
-                        // Taker fully filled.
-                        return (None, false);
+                    // Safety: affordable > 0 checked above.
+                    fill_qty = Quantity(NonZeroU64::new(affordable).expect("affordable > 0"))
+                        .min(fill_qty);
+                }
+            }
+
+            // Fees are zero here — the Exchange computes and sets
+            // them after matching, before balance updates.
+            reports.push(ExecutionReport::Fill {
+                maker_order_id: maker_id,
+                taker_order_id: taker_id,
+                symbol: self.symbol,
+                maker_account,
+                taker_account,
+                price,
+                quantity: fill_qty,
+                maker_fee: 0,
+                taker_fee: 0,
+            });
+            self.last_trade_price = Some(price);
+
+            // Deduct cost from budget after the fill.
+            if let Some(budget) = &mut quote_budget {
+                let cost = price.get().saturating_mul(fill_qty.get());
+                *budget = budget.saturating_sub(cost);
+            }
+
+            match maker_remaining.checked_sub(fill_qty) {
+                Some(new_remaining) => {
+                    // Partial maker fill — update remaining in place.
+                    opposite.node_mut(maker_idx).order.remaining = new_remaining;
+                }
+                None => {
+                    // Maker fully filled — remove from book and record
+                    // the slot so the Exchange can release the reservation.
+                    // Safe: same invariant as the STP arms above — we
+                    // entered this iteration via `best_front()` and
+                    // `opposite` has not been mutated since (we only
+                    // read maker fields and computed the fill locally;
+                    // the `Some` arm that calls `node_mut` is a sibling,
+                    // not a predecessor, of this branch).
+                    opposite.pop_front_best().expect("front existed");
+                    self.order_index.remove(&(maker_account, maker_id));
+                    self.consumed_slots.push((
+                        maker_account,
+                        maker_id,
+                        maker_side,
+                        maker_reservation,
+                    ));
+                }
+            }
+
+            match quantity.checked_sub(fill_qty) {
+                Some(new_qty) => {
+                    quantity = new_qty;
+                    // If budget is exhausted, stop matching.
+                    if quote_budget == Some(0) {
+                        break;
                     }
+                }
+                None => {
+                    // Taker fully filled.
+                    return (None, false);
                 }
             }
         }
