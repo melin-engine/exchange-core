@@ -77,11 +77,11 @@ Fill as much as possible immediately. Any unfilled remainder is cancelled. Produ
 
 ### FOK (Fill-Or-Kill)
 
-The order must fill **entirely** or not at all. Before any matching occurs, the engine performs a pre-check by calling `BookSide::available_quantity()` on the opposite side, summing all resting quantity at matchable prices. If the available quantity is less than the order's `quantity`, the order is rejected with `RejectReason::FOKCannotFill`.
+The order must fill **entirely** or not at all. Before any matching occurs, the engine performs a pre-check that sums the resting quantity the order could actually fill on the opposite side. If that quantity is less than the order's `quantity`, the order is rejected with `RejectReason::FOKCannotFill` and no fills occur.
 
 When self-trade prevention is active (any mode other than `Allow`), the FOK pre-check counts only the quantity the order can actually reach under its STP mode: same-account orders never produce fills, and under `CancelNewest`/`CancelBoth` matching stops at the first same-account order, so resting liquidity queued behind it does not count either. See "Interaction with FOK pre-check" under Self-Trade Prevention.
 
-FOK applies to both market and limit orders. A FOK limit buy checks available ask quantity at prices <= the limit price. A FOK market order checks total opposite-side quantity with no price bound.
+FOK applies to both market and limit orders. A FOK limit buy checks available ask quantity at prices <= the limit price. A FOK market order checks total opposite-side quantity with no price bound. For a FOK market **buy**, the pre-check additionally verifies the account's available quote balance covers the cost of the full quantity at the prices it would fill; if the balance cannot afford the full fill, the order is rejected with `FOKCannotFill` rather than partially filled up to the balance.
 
 ### Day
 
@@ -340,13 +340,13 @@ A market order submitted when the opposite side has no resting orders is rejecte
 
 ### FOK pre-check
 
-The FOK pre-check sums `available_quantity()` across all matchable price levels on the opposite side. For limit FOK, only prices within the limit are counted. For market FOK, all prices are counted. If the sum is less than the order's `quantity`, the order is rejected with `FOKCannotFill` and no fills or cancellations occur.
+The FOK pre-check computes the quantity the order could actually fill on the opposite side. For limit FOK, only prices within the limit are counted. For market FOK, all prices are counted, and for market buys the account's available quote balance must also cover the cost of the full quantity at the prices it would fill. If the fillable quantity is less than the order's `quantity`, the order is rejected with `FOKCannotFill` and no fills or cancellations occur.
 
-The pre-check accounts for STP by excluding same-account orders when STP is anything other than `Allow`.
+The pre-check counts only quantity reachable under the order's STP mode (see "Interaction with FOK pre-check" under Self-Trade Prevention).
 
 ### Market order budget exhaustion
 
-A buy-side market order may exhaust its `quote_budget` mid-sweep. At each fill, the matcher checks whether the budget can afford the fill quantity at the current price level. If `affordable == 0` (cannot buy even 1 lot), matching stops. The unfilled remainder is cancelled. The Exchange layer releases any leftover reservation after execution.
+A buy-side market order may exhaust its quote budget mid-sweep. At each fill, the matcher checks whether the budget can afford the fill quantity at the current price level. If it cannot buy even 1 lot, matching stops. The unfilled remainder is cancelled. The Exchange layer releases any leftover reservation after execution. FOK market buys never reach this path: an unaffordable FOK is rejected by the pre-check before any matching occurs.
 
 ### Price bands on market and stop orders
 

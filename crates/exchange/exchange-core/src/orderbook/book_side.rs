@@ -139,8 +139,8 @@ pub(crate) struct BookSide {
 }
 
 /// Per-price-level head/tail of the intrusive list.
-/// `len` lets `available_quantity` and balance audits skip walking
-/// dead levels and gives O(1) "is this level empty?" checks.
+/// `len` gives O(1) "did this level just empty?" detection on unlink
+/// and lets snapshotting pre-size its per-level buffers.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LevelHead {
     /// Index of the oldest order (front of FIFO). `INVALID_NODE` only
@@ -159,7 +159,7 @@ pub(super) struct LevelHead {
 /// **Layout:** `RestingOrder` is 40 bytes plus two `u32` links — 48 bytes
 /// total. Forcing 64-byte alignment was tested and *regressed* throughput
 /// ~4% on the realistic-flow bench because sequential level walks
-/// (`available_quantity`, `for_each_order`) lost cache density that
+/// (`fillable_quantity`, `for_each_order`) lost cache density that
 /// outweighed the per-node single-line read on cancel. The 48-byte
 /// natural layout wins on this workload.
 #[derive(Debug, Clone, Copy)]
@@ -554,9 +554,9 @@ impl BookSide {
         total
     }
 
-    /// Total quantity *reachable* by a taker at prices that would match the
-    /// given limit, honoring the taker's STP mode (used for the FOK
-    /// pre-check, which must mirror `match_against` exactly):
+    /// Quantity a taker could actually fill (clamped to `needed`), honoring
+    /// the taker's STP mode and, for market buys, the quote budget. Used for
+    /// the FOK pre-check, which must mirror `match_against` exactly:
     ///
     /// - `Allow`: every resting order counts, including the taker's own.
     /// - `CancelOldest`: the taker's own orders are cancelled during
@@ -566,15 +566,28 @@ impl BookSide {
     ///   self-order encountered, so counting stops there — non-self
     ///   liquidity queued behind a self-order is unreachable.
     ///
+    /// `quote_budget` replays the market-buy cost clamp with the same
+    /// integer arithmetic as matching: each counted fill consumes
+    /// `price × quantity` of budget, an over-budget fill is clamped to the
+    /// `budget / price` whole lots still affordable, and counting stops
+    /// when not even one lot is affordable (or the budget hits zero).
+    ///
+    /// Counting returns as soon as `needed` is reached — the caller only
+    /// asks "can at least `needed` fill?", and stopping early is exact:
+    /// if `needed` is covered by the walked prefix, matching completes on
+    /// that same prefix without ever reaching the nodes we skipped.
+    ///
     /// Walks levels from best→worst (physical tail→front on both sides)
     /// until the level no longer satisfies `limit`; within a level, walks
     /// the linked list head→tail (FIFO) — the same traversal order as
-    /// `match_against`, which the termination rule above depends on.
-    pub(super) fn available_quantity(
+    /// `match_against`, which the termination rules above depend on.
+    pub(super) fn fillable_quantity(
         &self,
         limit: Option<Price>,
         taker_account: AccountId,
         stp: SelfTradeProtection,
+        needed: u64,
+        mut quote_budget: Option<u64>,
     ) -> u64 {
         let mut total: u64 = 0;
         for (price, head) in self.levels.iter().rev() {
@@ -586,13 +599,11 @@ impl BookSide {
             let mut cur = head.head;
             while cur != INVALID_NODE {
                 let n = &self.nodes[cur as usize];
-                if n.order.account == taker_account {
+                let counts = if n.order.account == taker_account {
                     match stp {
-                        SelfTradeProtection::Allow => {
-                            total = total.saturating_add(n.order.remaining.get());
-                        }
+                        SelfTradeProtection::Allow => true,
                         // Maker gets cancelled, matching continues: skip.
-                        SelfTradeProtection::CancelOldest => {}
+                        SelfTradeProtection::CancelOldest => false,
                         // Matching stops dead at the first self-order:
                         // everything beyond this node is unreachable.
                         SelfTradeProtection::CancelNewest | SelfTradeProtection::CancelBoth => {
@@ -600,7 +611,41 @@ impl BookSide {
                         }
                     }
                 } else {
-                    total = total.saturating_add(n.order.remaining.get());
+                    true
+                };
+                if counts {
+                    // Mirror of `fill_qty = quantity.min(maker_remaining)`:
+                    // the taker never takes more than it still needs.
+                    // `total < needed` holds here (we return the moment
+                    // total reaches needed), so the subtraction is safe.
+                    let mut take = n.order.remaining.get().min(needed - total);
+                    if let Some(budget) = &mut quote_budget {
+                        // u128: max price × max qty overflows u64, same as
+                        // the cost check in `match_against`.
+                        let cost = (price.get() as u128) * (take as u128);
+                        if cost > *budget as u128 {
+                            // Same integer clamp as matching: whole lots
+                            // the remaining budget affords at this price.
+                            take = take.min(*budget / price.get());
+                            if take == 0 {
+                                // Can't afford one lot — matching breaks.
+                                return total;
+                            }
+                        }
+                        // Post-clamp `price × take <= budget`, so the u64
+                        // product cannot overflow.
+                        *budget -= price.get() * take;
+                    }
+                    // Can't overflow: take <= needed - total.
+                    total += take;
+                    if total >= needed {
+                        return total;
+                    }
+                    if quote_budget == Some(0) {
+                        // Budget exhausted with quantity still needed —
+                        // matching breaks here too.
+                        return total;
+                    }
                 }
                 cur = n.next;
             }
@@ -750,22 +795,29 @@ mod tests {
     }
 
     #[test]
-    fn available_quantity_stops_at_the_limit_on_both_sides() {
+    fn fillable_quantity_stops_at_the_limit_on_both_sides() {
         // Levels 90/100/110 with qty 1 each (from three_level_side).
-        // Taker account 99 owns nothing on the book, so STP is inert here.
+        // Taker account 99 owns nothing on the book, so STP is inert here;
+        // needed = MAX so clamping is inert too.
         let taker = AccountId(99);
         let stp = SelfTradeProtection::CancelNewest;
         let bids = three_level_side(Side::Buy);
-        assert_eq!(bids.available_quantity(Some(p(100)), taker, stp), 2); // 110 + 100
-        assert_eq!(bids.available_quantity(None, taker, stp), 3);
+        assert_eq!(
+            bids.fillable_quantity(Some(p(100)), taker, stp, u64::MAX, None),
+            2 // 110 + 100
+        );
+        assert_eq!(bids.fillable_quantity(None, taker, stp, u64::MAX, None), 3);
 
         let asks = three_level_side(Side::Sell);
-        assert_eq!(asks.available_quantity(Some(p(100)), taker, stp), 2); // 90 + 100
-        assert_eq!(asks.available_quantity(None, taker, stp), 3);
+        assert_eq!(
+            asks.fillable_quantity(Some(p(100)), taker, stp, u64::MAX, None),
+            2 // 90 + 100
+        );
+        assert_eq!(asks.fillable_quantity(None, taker, stp, u64::MAX, None), 3);
     }
 
     #[test]
-    fn available_quantity_honors_stp_reachability() {
+    fn fillable_quantity_honors_stp_reachability() {
         // Asks at a single price, FIFO queue: acct 2 (qty 5), acct 1 (qty 5),
         // acct 3 (qty 5). Taker is acct 1.
         let mut asks = BookSide::new(Side::Sell);
@@ -777,23 +829,70 @@ mod tests {
         let taker = AccountId(1);
         // Allow: everything counts, own orders included.
         assert_eq!(
-            asks.available_quantity(None, taker, SelfTradeProtection::Allow),
+            asks.fillable_quantity(None, taker, SelfTradeProtection::Allow, u64::MAX, None),
             15
         );
         // CancelOldest: own order is skipped but matching continues past it.
         assert_eq!(
-            asks.available_quantity(None, taker, SelfTradeProtection::CancelOldest),
+            asks.fillable_quantity(
+                None,
+                taker,
+                SelfTradeProtection::CancelOldest,
+                u64::MAX,
+                None
+            ),
             10
         );
         // CancelNewest/CancelBoth: matching terminates at the self-order, so
         // acct 3's quantity behind it is unreachable.
         assert_eq!(
-            asks.available_quantity(None, taker, SelfTradeProtection::CancelNewest),
+            asks.fillable_quantity(
+                None,
+                taker,
+                SelfTradeProtection::CancelNewest,
+                u64::MAX,
+                None
+            ),
             5
         );
         assert_eq!(
-            asks.available_quantity(None, taker, SelfTradeProtection::CancelBoth),
+            asks.fillable_quantity(None, taker, SelfTradeProtection::CancelBoth, u64::MAX, None),
             5
         );
+    }
+
+    #[test]
+    fn fillable_quantity_clamps_at_needed() {
+        // Levels 90/100/110 with qty 1 each; the walk must stop as soon as
+        // `needed` is covered, returning exactly `needed`.
+        let taker = AccountId(99);
+        let stp = SelfTradeProtection::CancelNewest;
+        let asks = three_level_side(Side::Sell);
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 2, None), 2);
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 3, None), 3);
+        // Asking for more than the book holds returns what's there.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 4, None), 3);
+    }
+
+    #[test]
+    fn fillable_quantity_honors_quote_budget() {
+        // Asks: 5 @ 100, 5 @ 200. Mirrors the market-buy budget clamp in
+        // `match_against` (integer lots, best price first).
+        let mut asks = BookSide::new(Side::Sell);
+        asks.add(p(100), order(1, 5, Side::Sell));
+        asks.add(p(200), order(2, 5, Side::Sell));
+        let taker = AccountId(99);
+        let stp = SelfTradeProtection::CancelNewest;
+
+        // Exactly affordable: 5×100 + 5×200 = 1500.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(1500)), 10);
+        // 1000 buys 5 @ 100 then 500/200 = 2 whole lots @ 200.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(1000)), 7);
+        // Budget exhausted exactly at the level boundary: 5 @ 100 only.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(500)), 5);
+        // Can't afford even one lot at the best price.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(99)), 0);
+        // Budget doesn't bind when `needed` is covered before it runs out.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 5, Some(500)), 5);
     }
 }

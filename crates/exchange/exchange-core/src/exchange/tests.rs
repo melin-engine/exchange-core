@@ -284,6 +284,136 @@ fn fok_rejection_releases_reservation() {
     assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
 }
 
+/// `market_order` with FOK instead of its default IOC.
+fn market_fok(id: u64, account: AccountId, side: Side, q: u64) -> Order {
+    Order {
+        time_in_force: TimeInForce::FOK,
+        ..market_order(id, account, side, q)
+    }
+}
+
+#[test]
+fn fok_market_buy_insufficient_quote_balance_rejected() {
+    // A market buy's quote budget is the account's entire available quote
+    // balance; matching clamps fills to it. The FOK pre-check must apply
+    // the same clamp — enough base liquidity on the book does NOT mean the
+    // taker can afford it, and FOK is all-or-nothing.
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_B, BTC, 50);
+    exchange.deposit(ACCT_A, USD, 500); // affords only 5 lots @ 100
+
+    let mut reports = Vec::new();
+    exchange.execute(
+        btc,
+        limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    exchange.execute(btc, market_fok(2, ACCT_A, Side::Buy, 10), &mut reports);
+
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::FOKCannotFill,
+            ..
+        }
+    ));
+    assert!(
+        !reports
+            .iter()
+            .any(|r| matches!(r, ExecutionReport::Fill { .. })),
+        "FOK market buy partially filled past its quote budget: {reports:?}"
+    );
+    // Maker untouched, taker's reservation fully released.
+    assert_eq!(exchange.accounts().balance(ACCT_B, BTC).reserved, 10);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 500);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
+
+#[test]
+fn fok_market_buy_multi_level_budget_shortfall_rejected() {
+    // Budget shortfall that only appears past the best level: 5 @ 100 is
+    // affordable, but the walk into 200s exhausts the budget at 7 of 10.
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_B, BTC, 50);
+    exchange.deposit(ACCT_A, USD, 1_000); // full fill costs 1_500
+
+    let mut reports = Vec::new();
+    exchange.execute(
+        btc,
+        limit_order(1, ACCT_B, Side::Sell, 100, 5, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        btc,
+        limit_order(2, ACCT_B, Side::Sell, 200, 5, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    exchange.execute(btc, market_fok(3, ACCT_A, Side::Buy, 10), &mut reports);
+
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::FOKCannotFill,
+            ..
+        }
+    ));
+    assert!(
+        !reports
+            .iter()
+            .any(|r| matches!(r, ExecutionReport::Fill { .. }))
+    );
+    assert_eq!(exchange.accounts().balance(ACCT_B, BTC).reserved, 10);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 1_000);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
+
+#[test]
+fn fok_market_buy_exact_quote_balance_fills() {
+    // Boundary guard against over-restriction: a budget that covers the
+    // fill exactly (5×100 + 5×200 = 1_500) must pass the pre-check and
+    // fill in full.
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_B, BTC, 50);
+    exchange.deposit(ACCT_A, USD, 1_500);
+
+    let mut reports = Vec::new();
+    exchange.execute(
+        btc,
+        limit_order(1, ACCT_B, Side::Sell, 100, 5, TimeInForce::GTC),
+        &mut reports,
+    );
+    exchange.execute(
+        btc,
+        limit_order(2, ACCT_B, Side::Sell, 200, 5, TimeInForce::GTC),
+        &mut reports,
+    );
+    reports.clear();
+
+    exchange.execute(btc, market_fok(3, ACCT_A, Side::Buy, 10), &mut reports);
+
+    let filled: u64 = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Fill { quantity, .. } => Some(quantity.get()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(filled, 10, "exactly-affordable FOK must fill in full");
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 10);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
+
 // --- Client dedup tests ---
 
 #[test]

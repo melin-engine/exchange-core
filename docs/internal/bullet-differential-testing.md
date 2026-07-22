@@ -66,6 +66,7 @@ Legend: ✅ behaviors should agree · ⚠️ documented divergence expected · �
 | FOK-03 | Sufficient liquidity only beyond limit price | reject | reject/cancel | ✅🔎 |
 | FOK-04 | Liquidity sufficient only via own resting order (STP active) | reject (`stp_tests.rs`: `stp_cancel_newest_fok_mixed_book_no_partial_fill`) | n/a — no STP; would self-fill | ⚠️ |
 | FOK-05 | Non-self liquidity sufficient but partly queued *behind* own order, STP `CancelNewest`/`CancelBoth` | reject, zero fills (`stp_tests.rs`: `stp_cancel_newest_fok_liquidity_behind_self_order_no_partial_fill`) | n/a | **found Melin bug — fixed** (see Findings) |
+| FOK-06 | FOK market buy, base liquidity sufficient but quote balance can't afford it | reject, zero fills (`tests.rs`: `fok_market_buy_insufficient_quote_balance_rejected`) | n/a — margin model | **found Melin bug — fixed** (see Findings) |
 
 ### IOC
 
@@ -118,6 +119,7 @@ Legend: ✅ behaviors should agree · ⚠️ documented divergence expected · �
 | ID | Date | Outcome |
 |---|---|---|
 | FOK-05 | 2026-07-22 | **Melin bug confirmed and fixed.** FOK pre-check (`BookSide::available_quantity`) excluded own resting quantity but still counted non-self liquidity queued behind a self-order; under `CancelNewest`/`CancelBoth` matching terminates at the self-order, so a FOK could partially fill then be cancelled. Fix: STP-aware reachability in `available_quantity`. Regression tests: `stp_cancel_newest_fok_liquidity_behind_self_order_no_partial_fill`, `stp_cancel_both_fok_liquidity_behind_self_order_no_partial_fill`, `available_quantity_honors_stp_reachability`. |
+| FOK-06 | 2026-07-22 | **Melin bug confirmed and fixed** (found reviewing FOK-05 — same class, different termination condition). A market buy's quote budget (the account's entire available quote balance) clamps matching, but the FOK pre-check only counted base quantity — a FOK market buy the account couldn't afford would partially fill then cancel. Fix: `BookSide::fillable_quantity` (renamed from `available_quantity`) replays the budget clamp with matching's integer arithmetic. Regression tests: `fok_market_buy_insufficient_quote_balance_rejected`, `fok_market_buy_multi_level_budget_shortfall_rejected`, `fok_market_buy_exact_quote_balance_fills`, `fillable_quantity_honors_quote_budget`. |
 
 ## Running the Bullet legs
 

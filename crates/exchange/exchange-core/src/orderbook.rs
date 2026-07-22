@@ -600,12 +600,19 @@ impl OrderBook {
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely before doing anything.
-        // `available_quantity` mirrors the matching traversal under the
+        // `fillable_quantity` mirrors the matching traversal under the
         // taker's STP mode — self-orders are skipped (CancelOldest) or stop
         // the count (CancelNewest/CancelBoth terminate matching, making
-        // liquidity behind a self-order unreachable).
+        // liquidity behind a self-order unreachable). No quote budget:
+        // limit buys reserve exact notional, so cost can never bind.
         if order.time_in_force == TimeInForce::FOK {
-            let available = opposite.available_quantity(Some(price), order.account, order.stp);
+            let available = opposite.fillable_quantity(
+                Some(price),
+                order.account,
+                order.stp,
+                order.quantity.get(),
+                None,
+            );
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -683,9 +690,17 @@ impl OrderBook {
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely. Same STP-aware reachability
-        // rules as the limit-order pre-check above.
+        // rules as the limit-order pre-check above, plus the quote budget
+        // for buys: matching stops when the budget can't afford another
+        // lot, so an unaffordable FOK must reject here, not partial-fill.
         if order.time_in_force == TimeInForce::FOK {
-            let available = opposite.available_quantity(None, order.account, order.stp);
+            let available = opposite.fillable_quantity(
+                None,
+                order.account,
+                order.stp,
+                order.quantity.get(),
+                quote_budget,
+            );
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
