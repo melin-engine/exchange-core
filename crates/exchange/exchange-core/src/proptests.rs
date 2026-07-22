@@ -166,6 +166,9 @@ enum ExchangeAction {
         account: AccountId,
         side: Side,
         quantity: Quantity,
+        /// IOC or FOK — FOK market buys exercise the quote-budget-aware
+        /// FOK pre-check under randomized balances.
+        tif: TimeInForce,
         stp: SelfTradeProtection,
     },
     Stop {
@@ -228,9 +231,9 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
             .prop_map(|(account, side, price, quantity, (tif, expiry_ns), stp, post_only)| ExchangeAction::Limit {
                 account, side, price, quantity, tif, stp, post_only, expiry_ns,
             }),
-        2 => (arb_account(), arb_side(), arb_quantity(), arb_stp())
-            .prop_map(|(account, side, quantity, stp)| ExchangeAction::Market {
-                account, side, quantity, stp,
+        2 => (arb_account(), arb_side(), arb_quantity(), prop_oneof![Just(TimeInForce::IOC), Just(TimeInForce::FOK)], arb_stp())
+            .prop_map(|(account, side, quantity, tif, stp)| ExchangeAction::Market {
+                account, side, quantity, tif, stp,
             }),
         1 => (arb_account(), arb_side(), arb_price(), arb_quantity(), arb_stp())
             .prop_map(|(account, side, trigger_price, quantity, stp)| ExchangeAction::Stop {
@@ -599,6 +602,7 @@ fn run_exchange_actions(actions: &[ExchangeAction]) -> ExchangeActionResult {
                 account,
                 side,
                 quantity,
+                tif,
                 stp,
             } => {
                 let counter = next_id_per_account.entry(*account).or_insert(0);
@@ -610,7 +614,7 @@ fn run_exchange_actions(actions: &[ExchangeAction]) -> ExchangeActionResult {
                     account: *account,
                     side: *side,
                     order_type: OrderType::Market,
-                    time_in_force: TimeInForce::IOC,
+                    time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
                     expiry_ns: 0,
@@ -1932,7 +1936,8 @@ fn arb_cascade_action() -> impl Strategy<Value = ExchangeAction> {
         3 => (arb_account(), arb_side(), 1u64..=5, arb_stp())
             .prop_map(|(account, side, q, stp)| ExchangeAction::Market {
                 account, side,
-                quantity: Quantity(NonZeroU64::new(q).expect("q >= 1")), stp,
+                quantity: Quantity(NonZeroU64::new(q).expect("q >= 1")),
+                tif: TimeInForce::IOC, stp,
             }),
         // Occasional cancel churns the pending-stop set mid-ladder.
         1 => (0usize..250).prop_map(|target_idx| ExchangeAction::Cancel { target_idx }),
@@ -2098,6 +2103,7 @@ fn drives_multi_pass_cascade(actions: &[ExchangeAction]) -> bool {
                 account,
                 side,
                 quantity,
+                tif,
                 stp,
             } => {
                 let id = next_id(*account);
@@ -2107,7 +2113,7 @@ fn drives_multi_pass_cascade(actions: &[ExchangeAction]) -> bool {
                     account: *account,
                     side: *side,
                     order_type: OrderType::Market,
-                    time_in_force: TimeInForce::IOC,
+                    time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
                     expiry_ns: 0,
@@ -2211,4 +2217,140 @@ fn cascade_generator_reaches_multi_pass_cascades() {
         found,
         "64 deterministic samples never produced a multi-pass cascade"
     );
+}
+
+// ===========================================================================
+// 11. FOK All-or-Nothing
+// ===========================================================================
+
+/// Shared check for the FOK all-or-nothing properties below: run the
+/// actions, then verify every FOK order's fills sum to zero or its full
+/// quantity.
+fn check_fok_all_or_nothing(actions: &[ExchangeAction]) -> Result<(), TestCaseError> {
+    let (_exchange, action_order_ids, all_reports, _withdrawn) = run_exchange_actions(actions);
+
+    for (action, slot) in actions.iter().zip(&action_order_ids) {
+        let Some((id, account)) = slot else { continue };
+        let (tif, quantity) = match action {
+            ExchangeAction::Limit { tif, quantity, .. } => (*tif, *quantity),
+            ExchangeAction::Market { tif, quantity, .. } => (*tif, *quantity),
+            ExchangeAction::StopLimit { tif, quantity, .. } => (*tif, *quantity),
+            _ => continue,
+        };
+        if tif != TimeInForce::FOK {
+            continue;
+        }
+        let filled: u64 = all_reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill {
+                    taker_order_id,
+                    taker_account,
+                    quantity,
+                    ..
+                } if taker_order_id == id && taker_account == account => Some(quantity.get()),
+                _ => None,
+            })
+            .sum();
+        prop_assert!(
+            filled == 0 || filled == quantity.get(),
+            "FOK order {:?} (account {:?}) partially filled: {} of {}",
+            id,
+            account,
+            filled,
+            quantity.get()
+        );
+    }
+    Ok(())
+}
+
+/// Shaped generator for the dense-band FOK property: a narrow price band
+/// and small quantities make the failure shapes of the FOK bug class
+/// common instead of vanishingly rare — same-price FIFO queues holding
+/// both accounts' orders (self-order between other-account liquidity, the
+/// FOK-05 shape) and FOK market buys against tight quote balances (the
+/// FOK-06 shape). The broad `arb_exchange_actions` property keeps general
+/// coverage; this one exists so a reintroduced overcount actually fails
+/// within a few hundred cases.
+fn arb_fok_pressure_actions() -> impl Strategy<Value = Vec<ExchangeAction>> {
+    let band_price = || (100u64..=103).prop_map(|n| Price(NonZeroU64::new(n).expect("n >= 1")));
+    let maker_qty = (1u64..=10).prop_map(|n| Quantity(NonZeroU64::new(n).expect("n >= 1")));
+    // FOK quantities up to a few makers' worth, so takers regularly span
+    // several queue positions and price levels.
+    let fok_qty = || (1u64..=25).prop_map(|n| Quantity(NonZeroU64::new(n).expect("n >= 1")));
+    let action = prop_oneof![
+        // Resting makers from both accounts build interleaved FIFO queues.
+        4 => (arb_account(), arb_side(), band_price(), maker_qty, arb_stp())
+            .prop_map(|(account, side, price, quantity, stp)| ExchangeAction::Limit {
+                account, side, price, quantity, tif: TimeInForce::GTC, stp,
+                post_only: false, expiry_ns: 0,
+            }),
+        // FOK limit takers under every STP mode.
+        3 => (arb_account(), arb_side(), band_price(), fok_qty(), arb_stp())
+            .prop_map(|(account, side, price, quantity, stp)| ExchangeAction::Limit {
+                account, side, price, quantity, tif: TimeInForce::FOK, stp,
+                post_only: false, expiry_ns: 0,
+            }),
+        // FOK market takers — the quote-budget leg under tight balances.
+        2 => (arb_account(), arb_side(), fok_qty(), arb_stp())
+            .prop_map(|(account, side, quantity, stp)| ExchangeAction::Market {
+                account, side, quantity, tif: TimeInForce::FOK, stp,
+            }),
+        // Small deposits keep balances tight rather than saturated.
+        1 => (arb_account(), prop_oneof![Just(BTC), Just(USD)], 1u64..=2_000)
+            .prop_map(|(account, currency, amount)| ExchangeAction::Deposit {
+                account, currency, amount,
+            }),
+        // Cancels churn queue positions between the makers.
+        1 => (0usize..120).prop_map(|target_idx| ExchangeAction::Cancel { target_idx }),
+    ];
+    proptest::collection::vec(action, 1..=120).prop_map(|actions| {
+        // Seed modest balances: enough to rest a handful of makers, small
+        // enough that FOK market buys frequently brush the quote budget.
+        let mut seeded = Vec::with_capacity(actions.len() + 4);
+        for account in [ACCT_A, ACCT_B] {
+            seeded.push(ExchangeAction::Deposit {
+                account,
+                currency: USD,
+                amount: 3_000,
+            });
+            seeded.push(ExchangeAction::Deposit {
+                account,
+                currency: BTC,
+                amount: 30,
+            });
+        }
+        seeded.extend(actions);
+        seeded
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// A FOK order either fills its full quantity or produces no fills at
+    /// all — under every STP mode, order type, book shape, and balance
+    /// state. This is the invariant the FOK pre-check exists to uphold: it
+    /// must count exactly the quantity matching can reach (STP termination,
+    /// market-buy quote-budget clamp), never more.
+    ///
+    /// Guards the bug class behind findings FOK-05 and FOK-06 (see
+    /// docs/internal/bullet-differential-testing.md): a pre-check that
+    /// overcounts reachable liquidity lets a FOK partially fill and then
+    /// cancel its remainder.
+    #[test]
+    fn fok_never_partially_fills(actions in arb_exchange_actions()) {
+        check_fok_all_or_nothing(&actions)?;
+    }
+
+    /// Same invariant on the shaped dense-band generator (see
+    /// `arb_fok_pressure_actions`): concentrates the action mix on the
+    /// interleaved-queue and tight-balance shapes where an overcounting
+    /// pre-check actually produces a partial fill. Mutation-tested:
+    /// reintroducing either the FOK-05 STP overcount or the FOK-06
+    /// budget-blindness fails this property within a few hundred cases.
+    #[test]
+    fn fok_never_partially_fills_dense_band(actions in arb_fok_pressure_actions()) {
+        check_fok_all_or_nothing(&actions)?;
+    }
 }
