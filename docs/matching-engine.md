@@ -79,7 +79,7 @@ Fill as much as possible immediately. Any unfilled remainder is cancelled. Produ
 
 The order must fill **entirely** or not at all. Before any matching occurs, the engine performs a pre-check by calling `BookSide::available_quantity()` on the opposite side, summing all resting quantity at matchable prices. If the available quantity is less than the order's `quantity`, the order is rejected with `RejectReason::FOKCannotFill`.
 
-When self-trade prevention is active (any mode other than `Allow`), the FOK pre-check excludes orders from the same account via the `exclude_account` parameter, since those orders would not produce fills.
+When self-trade prevention is active (any mode other than `Allow`), the FOK pre-check counts only the quantity the order can actually reach under its STP mode: same-account orders never produce fills, and under `CancelNewest`/`CancelBoth` matching stops at the first same-account order, so resting liquidity queued behind it does not count either. See "Interaction with FOK pre-check" under Self-Trade Prevention.
 
 FOK applies to both market and limit orders. A FOK limit buy checks available ask quantity at prices <= the limit price. A FOK market order checks total opposite-side quantity with no price bound.
 
@@ -222,7 +222,13 @@ Both the resting maker and the incoming taker are cancelled. The maker is remove
 
 ### Interaction with FOK pre-check
 
-When STP is active (any mode except `Allow`), the FOK pre-check passes `exclude_account: Some(order.account)` to `available_quantity()`. This excludes same-account orders from the quantity tally, since they would not produce fills. Without this adjustment, a FOK order could pass the pre-check but then fail to fill due to STP cancellations.
+The FOK pre-check mirrors the matching traversal under the order's STP mode, counting only quantity the order can actually reach:
+
+- **`Allow`** -- all resting quantity counts, including the account's own orders (they would fill).
+- **`CancelOldest`** -- same-account orders are cancelled during matching and matching continues past them, so they are excluded but liquidity behind them still counts.
+- **`CancelNewest` / `CancelBoth`** -- matching terminates at the first same-account order encountered, so counting stops there: liquidity queued behind a same-account order (at the same or a worse price) is unreachable and does not count.
+
+Without this reachability rule, a FOK order could pass the pre-check and then be cut short by an STP cancellation mid-match, producing a partial fill -- violating the all-or-nothing guarantee.
 
 ### Interaction with partial fills
 

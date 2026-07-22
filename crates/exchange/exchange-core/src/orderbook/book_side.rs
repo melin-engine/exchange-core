@@ -4,7 +4,9 @@
 
 use std::num::NonZeroU64;
 
-use crate::types::{AccountId, OrderId, Price, Quantity, ReservationSlot, Side, TimeInForce};
+use crate::types::{
+    AccountId, OrderId, Price, Quantity, ReservationSlot, SelfTradeProtection, Side, TimeInForce,
+};
 
 /// Sentinel for "no node" in the intrusive doubly-linked lists used by
 /// `BookSide`. `u32::MAX` saves 4 bytes vs `Option<u32>` and keeps `OrderNode`
@@ -552,17 +554,27 @@ impl BookSide {
         total
     }
 
-    /// Total available quantity at prices that would match the given limit.
-    /// If `exclude_account` is `Some`, orders from that account are skipped
-    /// (used for FOK pre-check with STP CancelNewest/CancelBoth).
+    /// Total quantity *reachable* by a taker at prices that would match the
+    /// given limit, honoring the taker's STP mode (used for the FOK
+    /// pre-check, which must mirror `match_against` exactly):
+    ///
+    /// - `Allow`: every resting order counts, including the taker's own.
+    /// - `CancelOldest`: the taker's own orders are cancelled during
+    ///   matching and matching continues past them, so they are skipped
+    ///   but everything behind them still counts.
+    /// - `CancelNewest` / `CancelBoth`: matching *terminates* at the first
+    ///   self-order encountered, so counting stops there — non-self
+    ///   liquidity queued behind a self-order is unreachable.
     ///
     /// Walks levels from best→worst (physical tail→front on both sides)
     /// until the level no longer satisfies `limit`; within a level, walks
-    /// the linked list head→tail (which is order-agnostic for summing).
+    /// the linked list head→tail (FIFO) — the same traversal order as
+    /// `match_against`, which the termination rule above depends on.
     pub(super) fn available_quantity(
         &self,
         limit: Option<Price>,
-        exclude_account: Option<AccountId>,
+        taker_account: AccountId,
+        stp: SelfTradeProtection,
     ) -> u64 {
         let mut total: u64 = 0;
         for (price, head) in self.levels.iter().rev() {
@@ -574,7 +586,20 @@ impl BookSide {
             let mut cur = head.head;
             while cur != INVALID_NODE {
                 let n = &self.nodes[cur as usize];
-                if exclude_account.is_none_or(|acct| acct != n.order.account) {
+                if n.order.account == taker_account {
+                    match stp {
+                        SelfTradeProtection::Allow => {
+                            total = total.saturating_add(n.order.remaining.get());
+                        }
+                        // Maker gets cancelled, matching continues: skip.
+                        SelfTradeProtection::CancelOldest => {}
+                        // Matching stops dead at the first self-order:
+                        // everything beyond this node is unreachable.
+                        SelfTradeProtection::CancelNewest | SelfTradeProtection::CancelBoth => {
+                            return total;
+                        }
+                    }
+                } else {
                     total = total.saturating_add(n.order.remaining.get());
                 }
                 cur = n.next;
@@ -727,12 +752,48 @@ mod tests {
     #[test]
     fn available_quantity_stops_at_the_limit_on_both_sides() {
         // Levels 90/100/110 with qty 1 each (from three_level_side).
+        // Taker account 99 owns nothing on the book, so STP is inert here.
+        let taker = AccountId(99);
+        let stp = SelfTradeProtection::CancelNewest;
         let bids = three_level_side(Side::Buy);
-        assert_eq!(bids.available_quantity(Some(p(100)), None), 2); // 110 + 100
-        assert_eq!(bids.available_quantity(None, None), 3);
+        assert_eq!(bids.available_quantity(Some(p(100)), taker, stp), 2); // 110 + 100
+        assert_eq!(bids.available_quantity(None, taker, stp), 3);
 
         let asks = three_level_side(Side::Sell);
-        assert_eq!(asks.available_quantity(Some(p(100)), None), 2); // 90 + 100
-        assert_eq!(asks.available_quantity(None, None), 3);
+        assert_eq!(asks.available_quantity(Some(p(100)), taker, stp), 2); // 90 + 100
+        assert_eq!(asks.available_quantity(None, taker, stp), 3);
+    }
+
+    #[test]
+    fn available_quantity_honors_stp_reachability() {
+        // Asks at a single price, FIFO queue: acct 2 (qty 5), acct 1 (qty 5),
+        // acct 3 (qty 5). Taker is acct 1.
+        let mut asks = BookSide::new(Side::Sell);
+        for (id, acct, qty) in [(1, 2, 5), (2, 1, 5), (3, 3, 5)] {
+            let mut o = order(id, qty, Side::Sell);
+            o.account = AccountId(acct);
+            asks.add(p(100), o);
+        }
+        let taker = AccountId(1);
+        // Allow: everything counts, own orders included.
+        assert_eq!(
+            asks.available_quantity(None, taker, SelfTradeProtection::Allow),
+            15
+        );
+        // CancelOldest: own order is skipped but matching continues past it.
+        assert_eq!(
+            asks.available_quantity(None, taker, SelfTradeProtection::CancelOldest),
+            10
+        );
+        // CancelNewest/CancelBoth: matching terminates at the self-order, so
+        // acct 3's quantity behind it is unreachable.
+        assert_eq!(
+            asks.available_quantity(None, taker, SelfTradeProtection::CancelNewest),
+            5
+        );
+        assert_eq!(
+            asks.available_quantity(None, taker, SelfTradeProtection::CancelBoth),
+            5
+        );
     }
 }

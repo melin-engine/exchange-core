@@ -600,14 +600,12 @@ impl OrderBook {
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely before doing anything.
-        // With STP enabled, same-account orders won't fill (they get cancelled
-        // or block matching), so exclude them from the available quantity check.
+        // `available_quantity` mirrors the matching traversal under the
+        // taker's STP mode — self-orders are skipped (CancelOldest) or stop
+        // the count (CancelNewest/CancelBoth terminate matching, making
+        // liquidity behind a self-order unreachable).
         if order.time_in_force == TimeInForce::FOK {
-            let exclude = match order.stp {
-                SelfTradeProtection::Allow => None,
-                _ => Some(order.account),
-            };
-            let available = opposite.available_quantity(Some(price), exclude);
+            let available = opposite.available_quantity(Some(price), order.account, order.stp);
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -684,13 +682,10 @@ impl OrderBook {
     ) {
         let opposite = self.opposite_side(order.side);
 
-        // FOK: check if we can fill entirely.
+        // FOK: check if we can fill entirely. Same STP-aware reachability
+        // rules as the limit-order pre-check above.
         if order.time_in_force == TimeInForce::FOK {
-            let exclude = match order.stp {
-                SelfTradeProtection::Allow => None,
-                _ => Some(order.account),
-            };
-            let available = opposite.available_quantity(None, exclude);
+            let available = opposite.available_quantity(None, order.account, order.stp);
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,

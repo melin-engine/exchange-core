@@ -1512,3 +1512,127 @@ fn stp_triggered_stop_with_cancel_newest() {
         }
     )));
 }
+
+#[test]
+fn stp_cancel_newest_fok_liquidity_behind_self_order_no_partial_fill() {
+    // The FOK pre-check excludes the account's own resting quantity, but
+    // CancelNewest STP *terminates* matching at the first self-order —
+    // non-self liquidity queued BEHIND the self-order at the same price
+    // is unreachable and must not count toward the FOK availability.
+    // Book (all sells @ 100, FIFO order): ACCT_B 5, ACCT_A 5, ACCT_C 5.
+    // ACCT_A FOK buy 10 @ 100 CancelNewest: pre-check sees 10 non-self
+    // lots, but matching fills 5 from B then hits the self-order and
+    // stops. FOK is all-or-nothing — no partial fill may occur.
+    const ACCT_C: AccountId = AccountId(3);
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_A, BTC, 50);
+    exchange.deposit(ACCT_B, BTC, 50);
+    exchange.deposit(ACCT_C, BTC, 50);
+
+    let mut reports = Vec::new();
+
+    for (id, acct) in [(1, ACCT_B), (2, ACCT_A), (3, ACCT_C)] {
+        exchange.execute(
+            btc,
+            limit_order_stp(
+                id,
+                acct,
+                Side::Sell,
+                100,
+                5,
+                TimeInForce::GTC,
+                SelfTradeProtection::Allow,
+            ),
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    exchange.execute(
+        btc,
+        limit_order_stp(
+            4,
+            ACCT_A,
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::FOK,
+            SelfTradeProtection::CancelNewest,
+        ),
+        &mut reports,
+    );
+
+    // No fills should have occurred — FOK is all-or-nothing.
+    assert!(
+        !reports
+            .iter()
+            .any(|r| matches!(r, ExecutionReport::Fill { .. })),
+        "FOK partially filled despite STP termination: {reports:?}"
+    );
+    // ACCT_B's and ACCT_C's resting orders must still be on the book.
+    assert_eq!(exchange.accounts().balance(ACCT_B, BTC).reserved, 5);
+    assert_eq!(exchange.accounts().balance(ACCT_C, BTC).reserved, 5);
+    // ACCT_A's buy reservation must be fully released.
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
+
+#[test]
+fn stp_cancel_both_fok_liquidity_behind_self_order_no_partial_fill() {
+    // Same shape as the CancelNewest variant above: CancelBoth also
+    // terminates matching at the self-order (cancelling both sides), so
+    // liquidity behind the self-order is unreachable for the taker.
+    const ACCT_C: AccountId = AccountId(3);
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_A, BTC, 50);
+    exchange.deposit(ACCT_B, BTC, 50);
+    exchange.deposit(ACCT_C, BTC, 50);
+
+    let mut reports = Vec::new();
+
+    for (id, acct) in [(1, ACCT_B), (2, ACCT_A), (3, ACCT_C)] {
+        exchange.execute(
+            btc,
+            limit_order_stp(
+                id,
+                acct,
+                Side::Sell,
+                100,
+                5,
+                TimeInForce::GTC,
+                SelfTradeProtection::Allow,
+            ),
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    exchange.execute(
+        btc,
+        limit_order_stp(
+            4,
+            ACCT_A,
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::FOK,
+            SelfTradeProtection::CancelBoth,
+        ),
+        &mut reports,
+    );
+
+    // No fills should have occurred — FOK is all-or-nothing.
+    assert!(
+        !reports
+            .iter()
+            .any(|r| matches!(r, ExecutionReport::Fill { .. })),
+        "FOK partially filled despite STP termination: {reports:?}"
+    );
+    // ACCT_A's buy reservation must be fully released.
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
