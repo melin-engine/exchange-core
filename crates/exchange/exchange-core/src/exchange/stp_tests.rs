@@ -1565,6 +1565,14 @@ fn stp_cancel_newest_fok_liquidity_behind_self_order_no_partial_fill() {
         &mut reports,
     );
 
+    // The pre-check must reject outright — not fill, not silently drop.
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::FOKCannotFill,
+            ..
+        }
+    ));
     // No fills should have occurred — FOK is all-or-nothing.
     assert!(
         !reports
@@ -1572,8 +1580,10 @@ fn stp_cancel_newest_fok_liquidity_behind_self_order_no_partial_fill() {
             .any(|r| matches!(r, ExecutionReport::Fill { .. })),
         "FOK partially filled despite STP termination: {reports:?}"
     );
-    // ACCT_B's and ACCT_C's resting orders must still be on the book.
+    // All three resting sells must still be on the book, including
+    // ACCT_A's own (the reject happened before matching touched it).
     assert_eq!(exchange.accounts().balance(ACCT_B, BTC).reserved, 5);
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).reserved, 5);
     assert_eq!(exchange.accounts().balance(ACCT_C, BTC).reserved, 5);
     // ACCT_A's buy reservation must be fully released.
     assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
@@ -1626,6 +1636,14 @@ fn stp_cancel_both_fok_liquidity_behind_self_order_no_partial_fill() {
         &mut reports,
     );
 
+    // The pre-check must reject outright — not fill, not silently drop.
+    assert!(matches!(
+        reports[0],
+        ExecutionReport::Rejected {
+            reason: RejectReason::FOKCannotFill,
+            ..
+        }
+    ));
     // No fills should have occurred — FOK is all-or-nothing.
     assert!(
         !reports
@@ -1633,6 +1651,154 @@ fn stp_cancel_both_fok_liquidity_behind_self_order_no_partial_fill() {
             .any(|r| matches!(r, ExecutionReport::Fill { .. })),
         "FOK partially filled despite STP termination: {reports:?}"
     );
+    // All three resting sells must still be on the book, including
+    // ACCT_A's own (the reject happened before matching touched it).
+    assert_eq!(exchange.accounts().balance(ACCT_B, BTC).reserved, 5);
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).reserved, 5);
+    assert_eq!(exchange.accounts().balance(ACCT_C, BTC).reserved, 5);
     // ACCT_A's buy reservation must be fully released.
     assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
+
+#[test]
+fn stp_cancel_oldest_fok_liquidity_behind_self_order_fills_fully() {
+    // Positive-case guard against an over-conservative pre-check: under
+    // CancelOldest, matching cancels the self-order and continues past
+    // it, so liquidity behind it IS reachable — the same book that
+    // rejects under CancelNewest must fill fully here.
+    // Book (all sells @ 100, FIFO order): ACCT_B 5, ACCT_A 5, ACCT_C 5.
+    // ACCT_A FOK buy 10 @ 100 CancelOldest: fills 5 from B, cancels own
+    // maker, fills 5 from C.
+    const ACCT_C: AccountId = AccountId(3);
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_A, BTC, 50);
+    exchange.deposit(ACCT_B, BTC, 50);
+    exchange.deposit(ACCT_C, BTC, 50);
+
+    let mut reports = Vec::new();
+
+    for (id, acct) in [(1, ACCT_B), (2, ACCT_A), (3, ACCT_C)] {
+        exchange.execute(
+            btc,
+            limit_order_stp(
+                id,
+                acct,
+                Side::Sell,
+                100,
+                5,
+                TimeInForce::GTC,
+                SelfTradeProtection::Allow,
+            ),
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    exchange.execute(
+        btc,
+        limit_order_stp(
+            4,
+            ACCT_A,
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::FOK,
+            SelfTradeProtection::CancelOldest,
+        ),
+        &mut reports,
+    );
+
+    let filled: u64 = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Fill { quantity, .. } => Some(quantity.get()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        filled, 10,
+        "CancelOldest FOK must fill in full: {reports:?}"
+    );
+    // The self-order was cancelled by STP, not filled.
+    assert!(reports.iter().any(|r| matches!(
+        r,
+        ExecutionReport::Cancelled {
+            order_id: OrderId(2),
+            ..
+        }
+    )));
+    // ACCT_A: bought 10, own 5-lot sell reservation returned.
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 60);
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).reserved, 0);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+}
+
+#[test]
+fn stp_cancel_newest_fok_exact_fill_before_self_order() {
+    // Boundary guard against over-restriction: a CancelNewest FOK whose
+    // quantity is covered entirely by liquidity queued BEFORE the
+    // self-order fills in full — matching completes without ever
+    // reaching the self-order, so STP never triggers.
+    // Book (sells @ 100, FIFO order): ACCT_B 5, ACCT_A 5.
+    let mut exchange = Exchange::new();
+    let btc = Symbol(1);
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 10_000);
+    exchange.deposit(ACCT_A, BTC, 50);
+    exchange.deposit(ACCT_B, BTC, 50);
+
+    let mut reports = Vec::new();
+
+    for (id, acct) in [(1, ACCT_B), (2, ACCT_A)] {
+        exchange.execute(
+            btc,
+            limit_order_stp(
+                id,
+                acct,
+                Side::Sell,
+                100,
+                5,
+                TimeInForce::GTC,
+                SelfTradeProtection::Allow,
+            ),
+            &mut reports,
+        );
+    }
+    reports.clear();
+
+    exchange.execute(
+        btc,
+        limit_order_stp(
+            3,
+            ACCT_A,
+            Side::Buy,
+            100,
+            5,
+            TimeInForce::FOK,
+            SelfTradeProtection::CancelNewest,
+        ),
+        &mut reports,
+    );
+
+    let filled: u64 = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecutionReport::Fill { quantity, .. } => Some(quantity.get()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(filled, 5, "exactly-covered FOK must fill: {reports:?}");
+    // Nothing was cancelled — the taker filled fully and the self-order
+    // was never reached.
+    assert!(
+        !reports
+            .iter()
+            .any(|r| matches!(r, ExecutionReport::Cancelled { .. })),
+        "unexpected cancellation: {reports:?}"
+    );
+    // ACCT_A's own resting sell is untouched.
+    assert_eq!(exchange.accounts().balance(ACCT_A, BTC).reserved, 5);
 }
