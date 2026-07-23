@@ -890,6 +890,9 @@ mod tests {
         assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(1000)), 7);
         // Budget exhausted exactly at the level boundary: 5 @ 100 only.
         assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(500)), 5);
+        // Mid-walk break: 5 @ 100 fills, but the 50 left over can't afford
+        // one lot at 200 — the walk stops with a nonzero total.
+        assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(550)), 5);
         // Can't afford even one lot at the best price.
         assert_eq!(asks.fillable_quantity(None, taker, stp, 10, Some(99)), 0);
         // Budget doesn't bind when `needed` is covered before it runs out.
