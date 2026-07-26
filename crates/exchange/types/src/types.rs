@@ -399,9 +399,10 @@ pub enum RejectReason {
     /// Self-trade prevention triggered — order would match against
     /// the same account.
     SelfTradePrevented,
-    /// Duplicate order ID — an order with this ID (or a higher one) was
-    /// already submitted by this account. Prevents double-execution on
-    /// crash-recovery retry.
+    /// Duplicate order ID — another order with this ID is currently live
+    /// (resting or pending) for this account. Cancel/replace look up by
+    /// `(account, order_id)`, so two live orders sharing it would be
+    /// ambiguous. Reusing an ID after its original closes is permitted.
     DuplicateOrderId,
     /// Order quantity exceeds the instrument's configured maximum.
     ExceedsMaxOrderQty,
