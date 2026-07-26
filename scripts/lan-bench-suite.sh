@@ -12,7 +12,7 @@
 #     dpdk-dual-repl  DPDK + 2 synchronous replicas (e2e DPDK)
 #
 #   Workloads (what the bench runs):
-#     throughput      Peak throughput — 8 clients, window 128
+#     throughput      Sustained throughput — 4 clients, window 56 (~1M/s)
 #     single          Single-order latency — 1 client, window 1
 #     engine-only     Matching engine only — no journal, no network (local)
 #     pipeline-only   Journal + matching — no network (local)
@@ -42,8 +42,11 @@
 #   RUN_PLOTS=0|1       Generate plots from results (default: 0)
 #   THROUGHPUT_DURATION=T  Measured-phase duration for throughput workload
 #                          (humantime, default: 60s)
-#   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 8)
-#   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 128)
+#   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 4)
+#   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 56).
+#                          Default clients × window targets ~1M orders/sec,
+#                          below the saturation knee. For peak throughput
+#                          use THROUGHPUT_CLIENTS=8 THROUGHPUT_WINDOW=128.
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #   SINGLE_DURATION=T      Measured-phase duration for single-order workload
@@ -229,15 +232,22 @@ BENCH_RUST_LOG="${RUST_LOG:-info}"
 
 # Order counts — override for quick smoke tests.
 THROUGHPUT_DURATION="${THROUGHPUT_DURATION:-60s}"
-# 8 connections models a gateway-fronted matching core: gateways aggregate
+# 4 connections models a gateway-fronted matching core: gateways aggregate
 # clients, so the core sees one connection per gateway — single digits to
-# low dozens, not thousands. 8 still saturates the engine for peak
-# throughput (the single matching thread is the limiter, not connection
-# count — 4/8/16 conns all peak at ~2.4-2.9M/s), while keeping the paced
-# latency number representative of real client fan-in rather than the
-# inflated figure from 16 saturated connections.
-THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-8}"
-THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-128}"
+# low dozens, not thousands. Connection count is not the throughput
+# limiter (the single matching thread is — 4/8/16 conns all peak at
+# ~2.4-2.9M/s), so it is chosen for representative client fan-in.
+#
+# 4 × 56 puts ~224 requests in flight, which lands at ~1M orders/sec — an
+# operating point below the saturation knee rather than at peak. Beyond it
+# the queue, not the engine, sets latency: measured on tcp-dual-repl,
+# in-flight 224 → 1024 buys +115% throughput for +127% p50 (207 → 470 µs)
+# and a worst case that degrades 2.7× (790 µs → 2.13 ms, with the deep
+# tail turning bimodal). Latency here is smooth out to p99.9999 at
+# ~1.15× per nine, so the reported numbers describe steady-state
+# behaviour instead of queueing backlog. Override both to measure peak.
+THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-4}"
+THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-56}"
 SINGLE_DURATION="${SINGLE_DURATION:-30s}"
 # Account / instrument cardinality for the throughput + single
 # workloads. Higher account counts spread Zipf-distributed order flow
