@@ -1,6 +1,6 @@
 [package]
 name = "melin-bench"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -75,15 +75,15 @@ name = "journal_writer_bench"
 path = "src/journal_writer_bench.rs"
 
 [dependencies]
-melin-exchange-core = { path = "../exchange-core", version = "0.11.0" }
-melin-trading = { path = "../trading", version = "0.11.0" }
-melin-types = { path = "../types", version = "0.11.0" }
+melin-exchange-core = { path = "../exchange-core", version = "0.12.0" }
+melin-trading = { path = "../trading", version = "0.12.0" }
+melin-types = { path = "../types", version = "0.12.0" }
 melin-journal = "0.12.0"
 melin-pipeline = "0.12.0"
-melin-protocol = { path = "../protocol", version = "0.11.0" }
+melin-protocol = { path = "../protocol", version = "0.12.0" }
 melin-wire-protocol = "0.12.0"
 melin-server-runtime = "0.12.0"
-melin-server = { path = "../server", version = "0.11.0", default-features = false }
+melin-server = { path = "../server", version = "0.12.0", default-features = false }
 melin-app = "0.12.0"
 melin-transport-core = "0.12.0"
 base64 = { workspace = true }
