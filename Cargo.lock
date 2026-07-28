@@ -1506,8 +1506,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b686baef3aac1dfc224877f9c7f7a97d37fd190acb27f5b11b25b315f00b3eb5"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1566,8 +1565,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9387d150f742ed05702697d1a18a86ba08ffd4fdc1b3f42670adab4be70b4f04"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 dependencies = [
  "bindgen",
  "cc",
@@ -1602,8 +1600,7 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbd1e27efb8c29752d97e7f371b1e754331961db25b454a04182f0d196f6836f"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1670,8 +1667,7 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7f5e9ce9a569e17384aae94080bfa5644bceadd90a5c22c21c121aa9812b7b5"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 
 [[package]]
 name = "melin-protocol"
@@ -1722,8 +1718,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e54ce0bbf1dbf8294e8ac1e885377c2fa3c85c4d88e1b213383fe94c613a871"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1756,8 +1751,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7930d3f214bef2733bacd033440a5c0432dd9856333ed2048d16afb32e4380c5"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1798,8 +1792,7 @@ version = "0.12.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fd3b7480fe17200749261849dd9b2a0a28caecc90f85702060200ba400ecacf"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
 
 [[package]]
 name = "memchr"
