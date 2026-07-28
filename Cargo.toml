@@ -46,22 +46,26 @@ opt-level = 2
 # BENCHMARK BRANCH ONLY — do not merge into main.
 #
 # Redirects every sequencer crate from the published 0.12.0 releases to the
-# `perf/response-flush-before-gate-wait` branch of the sequencer repository, so
-# a LAN benchmark run measures that branch against the 0.12.0 baseline (which
-# is what plain `main` builds). All seven crates move together: mixing a
-# patched crate with published siblings would link two copies of the same
-# types. `melin-raft` is deliberately absent — it is unpublished and nothing in
-# this workspace depends on it.
+# `perf/hash-chain-batch-absorb` branch of the sequencer repository. All seven
+# crates move together: mixing a patched crate with published siblings would
+# link two copies of the same types. `melin-raft` is deliberately absent — it
+# is unpublished and nothing in this workspace depends on it.
+#
+# Note on what this measures: `perf/hash-chain-batch-absorb` is stacked on top
+# of `perf/response-flush-before-gate-wait` — it carries those four commits
+# plus the per-batch hash-chain absorb. Benchmarked against plain `main` the
+# delta is both changes together; to isolate the hash-chain commit, compare
+# against the response-flush numbers instead.
 #
 # HTTPS rather than SSH so bench hosts need no deploy key. The exact commit is
 # pinned in `Cargo.lock`; run `cargo update -p melin-app` (or any of them) to
 # pick up new commits on the branch.
 [patch.crates-io]
-melin-app = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
-melin-dpdk = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
-melin-journal = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
-melin-pipeline = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
-melin-server-runtime = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
-melin-transport-core = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
-melin-wire-protocol = { git = "https://github.com/melin-engine/melin", branch = "perf/response-flush-before-gate-wait" }
+melin-app = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
+melin-journal = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin", branch = "perf/hash-chain-batch-absorb" }
 

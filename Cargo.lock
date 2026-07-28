@@ -1506,7 +1506,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1565,7 +1565,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 dependencies = [
  "bindgen",
  "cc",
@@ -1600,7 +1600,7 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1667,7 +1667,7 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 
 [[package]]
 name = "melin-protocol"
@@ -1718,7 +1718,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1751,7 +1751,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1792,7 +1792,7 @@ version = "0.12.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.12.0"
-source = "git+https://github.com/melin-engine/melin?branch=perf%2Fresponse-flush-before-gate-wait#7d558a8204a8124ce7cd31ae232b2de42aba856e"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Fhash-chain-batch-absorb#4bc7b46f34bb056b7370908d4673ffac85244634"
 
 [[package]]
 name = "memchr"
