@@ -43,3 +43,30 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
+# BENCHMARK BRANCH ONLY — do not merge into main.
+#
+# Redirects every sequencer crate from the published 0.12.0 releases to the
+# `fix/io-uring-audit` branch of the sequencer repository. All seven crates
+# move together: mixing a patched crate with published siblings would link
+# two copies of the same types. `melin-raft` is deliberately absent — it is
+# unpublished and nothing in this workspace depends on it.
+#
+# Note on what this measures: `fix/io-uring-audit` is a standalone branch off
+# the sequencer `main` (not stacked on the earlier perf/response-flush or
+# hash-chain branches) carrying the io_uring/disruptor audit fixes: response
+# flush hardening, reader buf_ring recycling, journal WriteFixed pinning, and
+# server-runtime egress/teardown fixes. Benchmarked against the published
+# 0.12.0 baseline the delta is the audit fixes alone.
+#
+# HTTPS rather than SSH so bench hosts need no deploy key. The exact commit is
+# pinned in `Cargo.lock`; run `cargo update -p melin-app` (or any of them) to
+# pick up new commits on the branch.
+[patch.crates-io]
+melin-app = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+melin-journal = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin", branch = "fix/io-uring-audit" }
+
