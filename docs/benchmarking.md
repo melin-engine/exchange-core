@@ -131,7 +131,7 @@ samples count without further coordination.
 | `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. With `--target-rate` set, this acts as a hard inflight cap on top of the schedule. |
 | `--target-rate <ops/s>` | 0 (disabled) | Open-loop send rate in orders per second. When set, the bench schedules sends at fixed intervals and records latency from the *scheduled* tick — the standard fix for coordinated omission. `0` keeps the historical closed-loop (window-filling) behaviour. See [Target rate / open-loop pacing](#target-rate--open-loop-pacing). |
 | `--bench-threads` | 4 | Number of bench client threads. Each runs its own io_uring ring and manages a subset of connections. |
-| `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see [roadmap deferred section](roadmap.md#deferred)). |
+| `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP, where pipelining already hides fsync latency. |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
 | `--accounts` | 10,000 | Number of trading accounts in the generator. |
 | `--instruments` | 100 | Number of instruments. |
