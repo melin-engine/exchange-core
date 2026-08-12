@@ -54,9 +54,14 @@ opt-level = 2
 # Note on what this measures: `fix/io-uring-audit` is a standalone branch off
 # the sequencer `main` (not stacked on the earlier perf/response-flush or
 # hash-chain branches) carrying the io_uring/disruptor audit fixes: response
-# flush hardening, reader buf_ring recycling, journal WriteFixed pinning, and
-# server-runtime egress/teardown fixes. Benchmarked against the published
-# 0.12.0 baseline the delta is the audit fixes alone.
+# flush hardening, reader buf_ring recycling, journal WriteFixed pinning and
+# rotation fixes, and server-runtime egress/teardown fixes. The branch was
+# rebased (2026-08) onto a sequencer `main` that is ~59 commits past v0.12.0,
+# including the control-plane raft merge (server-runtime now depends on
+# melin-raft) and replication hardening — so benchmarked against the
+# published 0.12.0 baseline the delta is the audit fixes PLUS that base
+# drift, not the audit fixes alone. For an isolated read of the audit fixes,
+# compare against a build pinned to the branch's merge-base instead.
 #
 # HTTPS rather than SSH so bench hosts need no deploy key. The exact commit is
 # pinned in `Cargo.lock`; run `cargo update -p melin-app` (or any of them) to
