@@ -1808,7 +1808,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1867,7 +1867,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 dependencies = [
  "bindgen",
  "cc",
@@ -1902,7 +1902,7 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1969,7 +1969,7 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 
 [[package]]
 name = "melin-protocol"
@@ -1984,7 +1984,7 @@ dependencies = [
 [[package]]
 name = "melin-raft"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -2037,7 +2037,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2071,7 +2071,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2112,7 +2112,7 @@ version = "0.12.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.13.0"
-source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#99320ba6b33f1ba098340393b75285f87712eaf0"
+source = "git+https://github.com/melin-engine/melin?branch=feat%2Fjournal-writer-thread#8cc1fed0a80d7d40be049ad74edc0581cdb849da"
 
 [[package]]
 name = "memchr"

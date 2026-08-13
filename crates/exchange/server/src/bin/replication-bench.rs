@@ -313,11 +313,12 @@ fn main() {
             repl_handler_0: 0,
             repl_handler_1: 0,
             journal_prep: 0,
-            // Journal flush executor — the thread running fdatasync off
-            // the journal thread. Unpinned like every other stage here:
-            // this bench measures replication plumbing, and pinning one
-            // stage while the rest float would skew that.
-            journal_flush: 0,
+            // Journal writer — the thread running both the pwrite and
+            // the fdatasync off the journal thread. Unpinned like every
+            // other stage here: this bench measures replication
+            // plumbing, and pinning one stage while the rest float
+            // would skew that.
+            journal_write: 0,
         };
         let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
         let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
