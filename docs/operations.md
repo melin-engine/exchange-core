@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,4,5,6,7,8,9` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1` (comma-separated). Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
+| `--cores` | `1,2,3,4,5,6,7,8,9` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1` (comma-separated), plus an optional tenth entry for `journal-prep`. Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -438,13 +438,16 @@ The recommended core assignment for a production server:
 | 7 | Shadow exchange (scheduled snapshots) | 7th |
 | 8 | Replication handler 0 | 8th |
 | 9 | Replication handler 1 | 9th |
-| 10+ | Available for other work (benchmarks, monitoring) | -- |
+| 10 | Journal segment preparer | 10th (optional) |
+| 11+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
 `--cores 1,2,3,4,5,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, repl-sender→5, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. Use `0` for any position to leave that thread unpinned (OS-scheduled).
+
+A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage: `--cores 1,2,3,4,5,6,7,8,9,10`. The entry is optional — a nine-value list leaves the preparer unpinned, so existing configurations keep their exact behaviour.
 
 ### Kernel Boot Parameters (GRUB)
 
