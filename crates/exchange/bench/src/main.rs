@@ -552,15 +552,6 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
-    /// Journal writer mode (`buffered` | `sector`). Defaults to
-    /// `buffered`. `sector` is experimental — see
-    /// docs/journal-writer-modes.md before benchmarking with it.
-    #[arg(
-        long,
-        default_value_t = melin_journal::JournalWriterMode::default(),
-        value_parser = melin_journal::JournalWriterMode::parse,
-    )]
-    journal_writer: melin_journal::JournalWriterMode,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -715,7 +706,6 @@ fn main() {
                 args.journal,
                 json_path,
                 args.max_journal_batch,
-                args.journal_writer,
                 args.target_rate,
                 args.max_reject_pct,
             );
@@ -1252,12 +1242,10 @@ fn run_pipeline_bench(
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
-    journal_writer_mode: melin_journal::JournalWriterMode,
     target_rate: u64,
     max_reject_pct: f64,
 ) {
-    use melin_journal::JournalWriterMode;
-    use melin_journal::{BufferedWriter, SectorWriter};
+    use melin_journal::BufferedWriter;
 
     // Set up exchange with one instrument and funded account.
     let mut app = ServerApp(melin_exchange_core::exchange::Exchange::with_capacity());
@@ -1283,28 +1271,17 @@ fn run_pipeline_bench(
         max_reject_pct,
     };
 
-    // The two arms are forced by monomorphisation — each writer has
-    // its own journal-stage loop (`run_sync` for buffered,
-    // `run_uring` for sector), so we cannot construct a single
-    // `dyn` writer and call once.
-    match journal_writer_mode {
-        JournalWriterMode::Buffered => run_pipeline_inner(
-            app,
-            BufferedWriter::create(&effective_journal).expect("create journal"),
-            cfg,
-        ),
-        JournalWriterMode::Sector => run_pipeline_inner(
-            app,
-            SectorWriter::create(&effective_journal).expect("create journal"),
-            cfg,
-        ),
-    }
+    run_pipeline_inner(
+        app,
+        BufferedWriter::create(&effective_journal).expect("create journal"),
+        cfg,
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Non-writer args for [`run_pipeline_inner`]. Bundled so the two
-/// monomorphised call sites in [`run_pipeline_bench`] stay one-liners.
+/// Non-writer args for [`run_pipeline_inner`]. Bundled so the call site
+/// in [`run_pipeline_bench`] stays a one-liner.
 struct PipelineInnerCfg<'a> {
     group_commit_us: u64,
     max_journal_batch: usize,
@@ -1316,18 +1293,14 @@ struct PipelineInnerCfg<'a> {
 }
 
 use melin_trading::trading_event::TradingEvent;
-/// Pipeline-mode body, generic over the journal writer so we get a
-/// statically-dispatched `run_sync` or `run_uring` per writer.
-// Module-scope imports for `run_pipeline_inner`'s where clause —
-// the bound has to name `TradingEvent` / `JournalStage` /
-// `JournalStageRun` in the signature scope, not the body scope.
-use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
-
-fn run_pipeline_inner<W>(app: ServerApp, writer: W, cfg: PipelineInnerCfg<'_>)
-where
-    W: melin_journal::JournalWrite<TradingEvent> + Send + 'static,
-    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
-{
+/// Pipeline-mode body. No longer generic over the writer: the sequencer
+/// retired the O_DIRECT sector writer, so the journal stage is concrete
+/// over `BufferedWriter` and there is one loop to run.
+fn run_pipeline_inner(
+    app: ServerApp,
+    writer: melin_journal::BufferedWriter<TradingEvent>,
+    cfg: PipelineInnerCfg<'_>,
+) {
     use melin_journal::JournalEvent;
     use melin_transport_core::pipeline::OutputPayload;
     use melin_transport_core::pipeline::{InputSlot, build_pipeline_with_replication};

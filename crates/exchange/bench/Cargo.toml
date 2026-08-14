@@ -28,11 +28,9 @@ skip-order-exec = [
     "release-tracing",
 ]
 no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persist"]
-no-o-direct = [
-    "melin-journal/no-o-direct",
-    "melin-transport-core/no-o-direct",
-    "melin-server-runtime/no-o-direct",
-]
+## BENCHMARK BRANCH ONLY — empty passthrough; see the `melin-server`
+## feature of the same name for why.
+no-o-direct = []
 latency-trace = [
     "melin-transport-core/latency-trace",
     "melin-server-runtime/latency-trace",

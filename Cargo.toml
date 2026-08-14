@@ -43,3 +43,27 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
+# BENCHMARK BRANCH ONLY — do not merge into main.
+#
+# Redirects every sequencer crate from the published 0.13.0 releases to the
+# `feat/journal-disk-thread` branch of the sequencer repository. All eight
+# crates move together: mixing a patched crate with published siblings
+# would link two copies of the same types. Note this list includes
+# `melin-raft`, which earlier bench branches deliberately omitted — it was
+# unpublished then and resolved within the git source. It ships on
+# crates.io as of 0.13.0, so leaving it unpatched would now pull a
+# published raft against patched siblings.
+#
+# HTTPS rather than SSH so bench hosts need no deploy key. The exact commit
+# is pinned in `Cargo.lock`; run `cargo update -p melin-app` (or any of
+# them) to pick up new commits on the branch.
+[patch.crates-io]
+melin-app = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-journal = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-raft = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin", branch = "feat/journal-disk-thread" }
+
