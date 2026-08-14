@@ -80,6 +80,16 @@
 #                       with NO_PERSIST. Use e.g. `no-o-direct` to bench
 #                       the journal without `O_DIRECT` (consumer NVMe
 #                       drives without Power Loss Protection).
+#   PIPELINE_CORES=<list>
+#                       `--cores` value for the primary and every replica.
+#                       Defaults to the 11-entry list
+#                       `1,2,3,4,5,6,7,8,9,10,11`, which pins the journal
+#                       segment preparer and the journal disk thread in
+#                       addition to the nine core stages. Set empty
+#                       (`PIPELINE_CORES=`) to pass no `--cores` at all and
+#                       take the server's own 9-entry default — required
+#                       when benching a build that predates the journal
+#                       split, since those reject an 11-entry list.
 #   SKIP_ORDER_EXEC=1   Build `melin-server` with the matching hot path
 #                       bypassed (--no-default-features
 #                       --features skip-order-exec) so the run isolates
@@ -221,6 +231,36 @@ SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-${BENCH_DEFAULT_RATE_ARGS}}"
 # trip than figures previously published with `--async-replica-ack`
 # enabled, until that follow-up ships.
 REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS:-${BENCH_DEFAULT_RATE_ARGS}}"
+
+# Pipeline core assignment, applied to the primary and every replica.
+# Kept separate from the *_EXTRA_ARGS overrides above so setting those
+# doesn't silently drop the pinning (or vice versa).
+#
+# Eleven entries: journal,matching,response,reader,repl-sender,
+# event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,
+# journal-disk. The last two are optional in the server, but leaving
+# journal-disk unpinned lets it float onto the non-isolated set — which
+# is core 0, where `pin_irqs` has just parked 60 interrupt handlers.
+# That thread busy-spins and publishes the durability cursors every ack
+# gates on, so it wants an isolated core of its own.
+#
+# The fleet boots `isolcpus=nohz,domain,1-15`, so 10 and 11 are isolated
+# and idle. Note 11 sits on the other CCD from the journal stage on
+# core 1: the hand-off bounces a cache line between them on every batch,
+# which costs ~100ns more across CCDs than within one. CCD0 (1-7) is
+# fully allocated, so closing that gap means displacing another stage —
+# worth trying if the journal hand-off shows up in a profile.
+#
+# Set empty (`PIPELINE_CORES= ./lan-bench-suite.sh ...`) to fall back to
+# the server's own 9-entry default, which leaves journal-prep and
+# journal-disk unpinned. Older servers reject an 11-entry list at
+# startup, so use that form when benching a branch that predates the
+# journal split.
+PIPELINE_CORES="${PIPELINE_CORES-1,2,3,4,5,6,7,8,9,10,11}"
+CORES_ARG=""
+if [[ -n "${PIPELINE_CORES}" ]]; then
+    CORES_ARG="--cores ${PIPELINE_CORES}"
+fi
 
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
@@ -971,6 +1011,7 @@ transport_start_tcp() {
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${CORES_ARG} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1002,6 +1043,7 @@ transport_start_tcp_repl() {
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+            ${CORES_ARG} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1014,6 +1056,7 @@ transport_start_tcp_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${CORES_ARG} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1054,6 +1097,7 @@ transport_start_tcp_dual_repl() {
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+            ${CORES_ARG} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1066,6 +1110,7 @@ transport_start_tcp_dual_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${CORES_ARG} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1076,6 +1121,7 @@ transport_start_tcp_dual_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${CORES_ARG} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1441,6 +1487,7 @@ transport_start_dpdk() {
             --dpdk-ports ${SERVER_DPDK_PORT} \
             ${vlan_arg} \
             ${server_l3_args} \
+            ${CORES_ARG} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1526,6 +1573,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${CORES_ARG} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1542,6 +1590,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${CORES_ARG} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1635,6 +1684,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${CORES_ARG} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1651,6 +1701,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${CORES_ARG} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1665,6 +1716,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${REPLICA2_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA2_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA2_DPDK_PORT} \
+            ${CORES_ARG} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
