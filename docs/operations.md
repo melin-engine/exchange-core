@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,4,5,6,7,8,9` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1` (comma-separated), plus an optional tenth entry for `journal-prep`. Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep` (comma-separated). The tenth entry (`journal-prep`) is optional; a nine-value list leaves the preparer unpinned. Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -92,7 +92,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9 \
+    --cores 1,2,3,4,5,6,7,8,9,10 \
     --max-journal-mib 512 \
     --standalone
 ```
@@ -106,14 +106,14 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9 \
+    --cores 1,2,3,4,5,6,7,8,9,10 \
     --max-journal-mib 512 \
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
-    --cores 1,2,3,4,5,6,7,8,9 \
+    --cores 1,2,3,4,5,6,7,8,9,10 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
 ```
@@ -129,7 +129,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9 \
+    --cores 1,2,3,4,5,6,7,8,9,10 \
     --standalone
 ```
 
@@ -307,7 +307,7 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
     --journal /mnt/nvme/melin.journal \
     --snapshot-path /var/lib/melin/melin.snapshot \
     --snapshot-interval-ms 60000 \
-    --cores 1,2,3,4,5,6,7,8,9 \
+    --cores 1,2,3,4,5,6,7,8,9,10 \
     ...
 ```
 
@@ -447,7 +447,9 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 
 `--cores 1,2,3,4,5,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, repl-sender→5, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. Use `0` for any position to leave that thread unpinned (OS-scheduled).
 
-A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage: `--cores 1,2,3,4,5,6,7,8,9,10`. The entry is optional — a nine-value list leaves the preparer unpinned, so existing configurations keep their exact behaviour.
+A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage: `--cores 1,2,3,4,5,6,7,8,9,10`. This is the default, so a server started without `--cores` pins the preparer to core 10 — budget for it when planning the layout.
+
+The entry is optional — a nine-value list leaves the preparer unpinned, so existing configurations keep their exact behaviour. If you carry over a nine-value `--cores` from a previous release you keep that older behaviour, and the preparer runs wherever the scheduler puts it (typically core 0, alongside the OS and IRQs).
 
 ### Kernel Boot Parameters (GRUB)
 
@@ -519,11 +521,11 @@ systemctl disable --now irqbalance
 
 ### Compact Layout for Smaller Hosts
 
-The default core layout above assumes 10+ logical CPUs — i.e., a box where cores 1-9 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 7-9 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
+The default core layout above assumes 11+ logical CPUs — i.e., a box where cores 1-10 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 7-9 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
 
 For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal=1, matching=2, response=3, reader=4, event-publisher=5, shadow=6, bench client=7. Replication-sender and handler cores are left unpinned (replication is not used in embedded bench mode).
 
-For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,7,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
+For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,7,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. The nine-value form is deliberate here: it also leaves the journal segment preparer unpinned, which is what you want when there is no spare core to give it. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
 
 ---
 
@@ -891,7 +893,9 @@ The default ring (256 slots × 512 KiB = 128 MiB) buffers approximately `256 × 
 
 Increasing `--replication-ring-size` only helps with **transient** slowness. If the replica is persistently slower than the primary, no buffer size prevents backpressure — the replica must keep up at steady state.
 
-Note: when a replica **disconnects**, the replication cursor resets to `u64::MAX` and the pipeline degrades to fsync-gated durability (if fewer than 2 replicas remain connected) with no backpressure from the ring.
+Note: when a replica **disconnects**, its acknowledgement slot is parked and the quorum position degrades to the *remaining* connected replica rather than resetting — the departed replica stops applying backpressure from the ring, and durability degrades to fsync-gated (if fewer than 2 replicas remain connected). Only when no replica at all is connected does the quorum report no acknowledged position.
+
+This matters for alerting: losing one of two replicas does **not** stall or reset the quorum position, which keeps advancing on the survivor's acks. Alert on `melin_replicas_connected` (and on `melin_durability_policy_degraded`), not on the quorum position stalling — a single-replica loss is invisible in the latter.
 
 ### Throughput vs. Disk Bandwidth
 
