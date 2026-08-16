@@ -15,12 +15,23 @@ default-run = "melin-bench"
 ## features with `--no-default-features --features=...` to benchmark
 ## without hash-chain or release-tracing.
 default = ["hash-chain", "release-tracing"]
+## The `melin-server/...` entries below are redundant today: `melin-server`
+## is taken with `default-features = false` and its own `hash-chain` /
+## `release-tracing` features only forward to the same leaf crates already
+## listed here. They are forwarded anyway so that the day someone gates
+## server code on one of these directly, bench builds pick it up instead of
+## silently measuring a server built without it.
 hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
     "melin-server-runtime/hash-chain",
+    "melin-server/hash-chain",
 ]
-release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-tracing"]
+release-tracing = [
+    "tracing/max_level_info",
+    "melin-server-runtime/release-tracing",
+    "melin-server/release-tracing",
+]
 skip-order-exec = [
     "melin-exchange-core/skip-order-exec",
     "melin-server/skip-order-exec",
