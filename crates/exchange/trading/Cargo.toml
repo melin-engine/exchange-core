@@ -1,6 +1,6 @@
 [package]
 name = "melin-trading"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -14,4 +14,4 @@ path = "src/lib.rs"
 
 [dependencies]
 melin-app = "0.13.0"
-melin-types = { path = "../types", version = "0.12.0" }
+melin-types = { path = "../types", version = "0.13.0" }
