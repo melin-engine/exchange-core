@@ -621,7 +621,11 @@ struct BenchArgs {
     /// 1-6). For remote benchmarks on a dedicated machine, use 1 with
     /// isolcpus for tighter measurements. In engine mode this pins the
     /// (single) bench thread to `bench_cores` and sets SCHED_FIFO (when
-    /// run as root) to bypass CFS load-balancer scans.
+    /// run as root) to bypass CFS load-balancer scans. In pipeline mode
+    /// the publisher goes on `bench_cores` and the drain thread on
+    /// `bench_cores + 1` (the journal/matching stages are always on
+    /// cores 1/2, so use 3); leaving it unset warns, because an unpinned
+    /// drain thread on the IRQ core inflates the reported tail.
     #[arg(long)]
     bench_cores: Option<usize>,
     /// Health endpoint address to poll for server metrics during the run
@@ -718,6 +722,7 @@ fn main() {
                 args.journal_writer,
                 args.target_rate,
                 args.max_reject_pct,
+                args.bench_cores,
             );
         }
         "roundtrip" => {
@@ -829,11 +834,15 @@ fn run_engine_bench(
     // (matching/journal/response/etc.) already run under in production
     // when started as root. Failure to set RT (no root, no CAP_SYS_NICE)
     // is logged but non-fatal.
-    if let Some(core) = bench_cores {
-        match melin_app::affinity::pin_to_core(core) {
+    match bench_cores {
+        Some(core) => match melin_app::affinity::pin_to_core(core) {
             Ok(_) => eprintln!("bench thread pinned to core {core} (SCHED_FIFO if root)"),
             Err(e) => eprintln!("warning: pin_to_core({core}) failed: {e}"),
-        }
+        },
+        None => eprintln!(
+            "warning: bench thread unpinned (no --bench-cores); if it lands on the IRQ/housekeeping \
+             core, kernel-worker preemptions are reported as engine tail latency"
+        ),
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1255,6 +1264,7 @@ fn run_pipeline_bench(
     journal_writer_mode: melin_journal::JournalWriterMode,
     target_rate: u64,
     max_reject_pct: f64,
+    bench_cores: Option<usize>,
 ) {
     use melin_journal::JournalWriterMode;
     use melin_journal::{BufferedWriter, SectorWriter};
@@ -1281,6 +1291,7 @@ fn run_pipeline_bench(
         json_path,
         target_rate,
         max_reject_pct,
+        bench_cores,
     };
 
     // The two arms are forced by monomorphisation — each writer has
@@ -1313,6 +1324,9 @@ struct PipelineInnerCfg<'a> {
     json_path: Option<&'a std::path::Path>,
     target_rate: u64,
     max_reject_pct: f64,
+    /// `--bench-cores`: first core for the two bench threads (publisher,
+    /// then drainer). `None` leaves both unpinned (with a warning).
+    bench_cores: Option<usize>,
 }
 
 use melin_trading::trading_event::TradingEvent;
@@ -1341,7 +1355,27 @@ where
         json_path,
         target_rate,
         max_reject_pct,
+        bench_cores,
     } = cfg;
+
+    // Bench thread placement (only with `--bench-cores N`): publisher on
+    // N, drainer (this thread) on N+1. Both must stay off core 0 — on a
+    // bench host core 0 is the housekeeping core (all IRQs, unbound
+    // kworkers, fsync completions), and an unpinned drainer landing
+    // there gets preempted for milliseconds at a time; since `inflight`
+    // only decrements on drain, every in-flight order absorbs the stall
+    // and the tail is reported as pipeline latency. Unpinned is still
+    // the default (dev machines shouldn't get an unrequested SCHED_FIFO
+    // spinner), so warn loudly instead.
+    let pub_core = bench_cores;
+    let drain_core = bench_cores.map(|c| c + 1);
+    if bench_cores.is_none() {
+        eprintln!(
+            "warning: bench threads unpinned (no --bench-cores); an unpinned drain thread \
+             sharing core 0 with IRQs/kworkers inflates the latency tail — pass \
+             --bench-cores N to pin publisher/drainer to cores N/N+1"
+        );
+    }
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -1431,8 +1465,10 @@ where
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
         .spawn(move || {
-            if let Err(e) = melin_app::affinity::pin_to_core(3) {
-                eprintln!("warning: could not pin pipeline-pub to core 3: {e}");
+            if let Some(core) = pub_core
+                && let Err(e) = melin_app::affinity::pin_to_core(core)
+            {
+                eprintln!("warning: could not pin pipeline-pub to core {core}: {e}");
             }
             // Pacer is built inside the thread so its TSC start aligns
             // with the publisher's pinned-core clock. Pipeline mode has
@@ -1531,6 +1567,17 @@ where
         .expect("spawn pipeline publish thread");
 
     // Drain thread (this thread): consume output SPSC and record latency.
+    //
+    // Pin *after* every child thread has been spawned: `pin_to_core`
+    // also switches the caller to SCHED_FIFO (when root), and threads
+    // spawned afterwards would inherit that policy + affinity — a
+    // spinning FIFO parent then starves a child on the same core
+    // before it can re-pin itself.
+    if let Some(core) = drain_core
+        && let Err(e) = melin_app::affinity::pin_to_core(core)
+    {
+        eprintln!("warning: could not pin pipeline drain thread to core {core}: {e}");
+    }
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut measured_orders: u64 = 0;

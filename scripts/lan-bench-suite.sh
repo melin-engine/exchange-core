@@ -1891,6 +1891,13 @@ workload_single() {
     collect_result "${transport}-single"
 }
 
+# Local (server-host) workloads pin the bench's own threads with
+# `--bench-cores 3`: no server runs during these, and cores 1/2 are
+# taken by pipeline mode's journal/matching stages. Left unpinned, the
+# bench thread (engine) or the drain thread (pipeline) lands on core 0
+# with every IRQ and unbound kworker and its preemptions — fsync
+# completions run at ~20k wakeups/s — are reported as engine/pipeline
+# tail latency (ms-scale max, 100s of µs at p99.999).
 workload_engine_only() {
     echo ""
     echo "============================================================"
@@ -1902,6 +1909,7 @@ workload_engine_only() {
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --mode engine \
+            --bench-cores 3 \
             --json /tmp/bench-results.json \
             --duration ${LOCAL_DURATION}"
 
@@ -1923,6 +1931,7 @@ workload_pipeline_only() {
         ./target/release/melin-bench \
             --mode pipeline \
             --window 256 \
+            --bench-cores 3 \
             --journal ${JOURNAL_PATH} \
             --json /tmp/bench-results.json \
             --duration ${LOCAL_DURATION}"

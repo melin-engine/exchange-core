@@ -137,7 +137,7 @@ samples count without further coordination.
 | `--instruments` | 100 | Number of instruments. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
 | `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
-| `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). Use 7 for local benchmarks (avoids server cores 1-6). Use 1 for remote benchmarks on a dedicated machine with `isolcpus`. |
+| `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). Use 7 for local benchmarks (avoids server cores 1-6). Use 1 for remote benchmarks on a dedicated machine with `isolcpus`. In pipeline mode the journal/matching stages are always on cores 1/2 and the bench's publisher/drain threads go on N/N+1 — use 3. Engine and pipeline mode print a warning when it is unset: an unpinned bench thread that lands on the IRQ/housekeeping core gets preempted by kernel workers and those stalls are reported as engine/pipeline tail latency. |
 
 ### Feature flags
 
