@@ -401,6 +401,40 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 # packets during bursts at high throughput. 10000 adds headroom with no
 # latency cost in the common case.
 net.core.netdev_max_backlog = 10000
+# Per-CPU vmstat counters are folded into the global counters by a deferred
+# work item that fires every second by default. `nohz_full` suppresses the
+# tick on isolated cores but does not stop this vmstat updater, so it stays
+# a periodic jitter source on pipeline cores. 120s makes it effectively
+# invisible; the cost is that /proc/vmstat and the page-allocator's
+# watermark heuristics see staler per-CPU deltas, which matters for
+# monitoring accuracy, not for correctness.
+vm.stat_interval = 120
+EOF
+# Appended separately from the block above because the value is derived from
+# this host's RAM, so the heredoc has to interpolate.
+MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+MIN_FREE_KB=8388608
+if (( MEM_TOTAL_KB == 0 )); then
+    echo "  warning: could not read MemTotal from /proc/meminfo; applying the"
+    echo "           unclamped ${MIN_FREE_KB} kB reserve. Check it against this"
+    echo "           host's RAM before trusting the run."
+elif (( MEM_TOTAL_KB / 8 < MIN_FREE_KB )); then
+    MIN_FREE_KB=$(( MEM_TOTAL_KB / 8 ))
+    echo "  note: clamping vm.min_free_kbytes to ${MIN_FREE_KB} kB (1/8 of $(( MEM_TOTAL_KB / 1024 )) MiB RAM)"
+fi
+cat >> "$SYSCTL_FILE" << EOF
+# The watermark kswapd works to keep free. Set too low, an allocation on a
+# hot thread can fall into *direct* reclaim, where the allocating thread
+# itself synchronously scans and frees pages — a multi-millisecond stall
+# landing wherever the allocation happened, which on a pipeline core is a
+# p99.99 event. A large reserve keeps kswapd far enough ahead that the hot
+# path never reaches that fallback.
+#
+# 8 GiB is the ceiling, clamped to 1/8 of RAM: on a small host an
+# unconditional 8 GiB reserve is a large fraction of memory, and the
+# allocator will OOM rather than dip below the watermark. Value below is for
+# a host with $(( MEM_TOTAL_KB / 1024 )) MiB of RAM.
+vm.min_free_kbytes = ${MIN_FREE_KB}
 EOF
 # Raise the system-wide max file descriptor limit. The default (1024) is
 # too low for client-sweep benchmarks: 512 clients × 2 fds (stream +
@@ -415,7 +449,7 @@ root hard nofile 65536
 EOF
 echo "  Written $LIMITS_FILE (nofile=65536)"
 sysctl --system --quiet
-echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0, kernel.watchdog=0, net.core.rmem_max=32MiB, net.core.netdev_max_backlog=10000)"
+echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0, kernel.watchdog=0, net.core.rmem_max=32MiB, net.core.netdev_max_backlog=10000, vm.stat_interval=120, vm.min_free_kbytes=${MIN_FREE_KB})"
 
 echo ""
 
