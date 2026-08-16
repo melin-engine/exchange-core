@@ -296,6 +296,7 @@ cleanup() {
         ssh -O exit $SSH_OPTS "$host" 2>/dev/null || true
     done
     rm -rf "$SSH_CONTROL_DIR" 2>/dev/null || true
+    rm -rf "${VMSTAT_DIR:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -907,9 +908,106 @@ clean_eal_lockfiles() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# Kernel stall counters
+# ---------------------------------------------------------------------------
+# These vmstat entries all count *stalls* — paths where a thread blocks in
+# the kernel long enough to show up in a latency histogram. A non-zero delta
+# across a run is a direct explanation for a tail outlier; a zero delta rules
+# the mechanism out entirely, which is the more common and more useful
+# outcome. Sampling costs one `grep` per host per run, versus the many paired
+# benchmark runs it takes to test the same hypothesis statistically — `max`
+# has a >20x run-to-run spread and cannot be A/B'd with one run per arm.
+#
+#   allocstall_* / pgscan_direct / pgsteal_direct — direct reclaim: the
+#       allocating thread synchronously scans and frees pages (ms-scale).
+#   pgscan_direct_throttle — direct reclaim additionally throttled.
+#   compact_stall — synchronous memory compaction (ms-scale).
+#   pgmajfault — major fault, i.e. a page had to come off disk.
+VMSTAT_STALL_COUNTERS='^(allocstall_|pgscan_direct|pgsteal_direct|pgscan_direct_throttle|compact_stall|pgmajfault)'
+VMSTAT_DIR="$(mktemp -d -t melin-vmstat.XXXXXX)"
+
+vmstat_hosts() {
+    echo "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}
+}
+
+# Snapshot the stall counters on every host into $VMSTAT_DIR/<phase>.<host>.
+# Best-effort by design: an unreachable host must never abort a benchmark, so
+# a failed sample leaves the file absent and the delta is reported as null
+# rather than as a wrong zero — silence here would be worse than noise, since
+# the whole point is to distinguish "no stalls" from "not measured".
+vmstat_snapshot() {
+    local phase="$1" host
+    for host in $(vmstat_hosts); do
+        ssh $SSH_OPTS "$host" "grep -E '${VMSTAT_STALL_COUNTERS}' /proc/vmstat" \
+            > "${VMSTAT_DIR}/${phase}.${host}" 2>/dev/null || true
+    done
+}
+
+# Fold the before/after deltas into the results JSON under `kernel_stalls`
+# and print a one-line summary.
+merge_vmstat_delta() {
+    local json="$1"
+    VMSTAT_DIR="$VMSTAT_DIR" VMSTAT_HOSTS="$(vmstat_hosts)" python3 - "$json" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+vmdir = os.environ["VMSTAT_DIR"]
+hosts = os.environ["VMSTAT_HOSTS"].split()
+
+
+def read(phase, host):
+    try:
+        with open(os.path.join(vmdir, "%s.%s" % (phase, host))) as f:
+            return {k: int(v) for k, v in (ln.split() for ln in f if ln.split())}
+    except (OSError, ValueError):
+        return None
+
+
+per_host, total, complete = {}, 0, True
+for host in hosts:
+    before, after = read("before", host), read("after", host)
+    if before is None or after is None:
+        per_host[host] = None
+        complete = False
+        continue
+    delta = {k: v - before.get(k, 0) for k, v in after.items()}
+    per_host[host] = delta
+    total += sum(v for v in delta.values() if v > 0)
+
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except (OSError, ValueError) as exc:
+    print("  kernel stalls: results JSON unreadable (%s)" % exc)
+    sys.exit(0)
+
+doc["kernel_stalls"] = {"per_host": per_host, "total": total, "complete": complete}
+with open(path, "w") as f:
+    json.dump(doc, f, indent=1)
+
+if not complete:
+    missing = [h for h, d in per_host.items() if d is None]
+    print("  kernel stalls: NOT MEASURED on %s (counters incomplete)" % ", ".join(missing))
+elif total == 0:
+    print("  kernel stalls: none (reclaim/compaction/major-fault counters all flat)")
+else:
+    hot = sorted(
+        ((h, k, v) for h, d in per_host.items() for k, v in d.items() if v > 0),
+        key=lambda t: -t[2],
+    )
+    print("  kernel stalls: %d total — %s" % (
+        total, ", ".join("%s %s=%d" % (h.split("@")[-1], k, v) for h, k, v in hot[:4])))
+PY
+}
+
 # Run the bench client against an already-running server.
 # Usage: run_bench <server_addr> <health_addr> <duration> <extra_bench_args...>
 # `duration` is the measured-phase duration (humantime, e.g. `30s`).
+#
+# Brackets the run with kernel stall samples. Hooked here rather than at the
+# ~5 call sites so every workload — including each sweep point — is covered
+# without the callers having to remember.
 run_bench() {
     local server_addr="$1" health_addr="$2" duration="$3"
     shift 3
@@ -925,6 +1023,11 @@ run_bench() {
     if [[ -n "${BENCH_THREADS:-}" ]]; then
         threads_arg="--bench-threads ${BENCH_THREADS}"
     fi
+    vmstat_snapshot before
+    # `rc` rather than letting a bench failure propagate directly: the `after`
+    # sample has to be taken either way, otherwise a failed run silently
+    # reports its stall delta against a stale baseline on the next run.
+    local rc=0
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${server_addr} \
@@ -934,7 +1037,9 @@ run_bench() {
             --bench-cores 1 \
             --duration ${duration} \
             ${warmup_arg} ${cooldown_arg} ${threads_arg} \
-            $*"
+            $*" || rc=$?
+    vmstat_snapshot after
+    return $rc
 }
 
 collect_result() {
@@ -944,7 +1049,11 @@ collect_result() {
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
         name="${name}-no-persist"
     fi
-    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/${name}.json" 2>/dev/null || true
+    local out="${RESULTS_DIR}/${name}.json"
+    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "$out" 2>/dev/null || true
+    if [[ -f "$out" ]]; then
+        merge_vmstat_delta "$out"
+    fi
 }
 
 # ---------------------------------------------------------------------------
