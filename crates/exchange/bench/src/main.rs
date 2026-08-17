@@ -650,8 +650,11 @@ struct BenchArgs {
     dpdk_core: usize,
     /// First CPU core for bench thread pinning. Thread i is pinned to core
     /// bench_cores + i. When omitted, bench threads are not pinned (OS
-    /// scheduler decides). For local benchmarks use 7 (avoids server cores
-    /// 1-6). For remote benchmarks on a dedicated machine, use 1 with
+    /// scheduler decides). For local benchmarks against the embedded
+    /// server use 12 — it has to clear every core in the server's
+    /// `--cores` list, and a bench thread sharing a core with a server
+    /// thread is starved by it (both are SCHED_FIFO, so they do not
+    /// timeshare). For remote benchmarks on a dedicated machine, use 1 with
     /// isolcpus for tighter measurements. In engine mode this pins the
     /// (single) bench thread to `bench_cores` and sets SCHED_FIFO (when
     /// run as root) to bypass CFS load-balancer scans. In pipeline mode
