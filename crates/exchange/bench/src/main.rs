@@ -428,7 +428,10 @@ impl PaceClock {
         self.period_ticks
     }
 
-    #[cfg(test)]
+    /// TSC tick of the next scheduled send. Lets an event loop bound its
+    /// blocking wait so a quiescent connection is woken by its schedule
+    /// rather than by unrelated traffic.
+    #[inline]
     pub(crate) fn next_due_ticks(&self) -> u64 {
         self.next_due_ticks
     }
@@ -2703,10 +2706,58 @@ fn run_uring_loop(
         if Instant::now() >= deadlines.cooldown_end {
             break;
         }
-        match ring.submit_and_wait(1) {
-            Ok(_) => {}
+        // Wait for completions — but never past the next paced send.
+        //
+        // With `--target-rate`, `uring_fill_windows` only queues sends
+        // whose slot is already due, so a connection can be completely
+        // quiescent (nothing sent, nothing to receive) until its next
+        // slot. Once every connection on this thread is in that state an
+        // unconditional `submit_and_wait(1)` sleeps until *anything*
+        // wakes it — in practice the server's 10 s heartbeat — and then
+        // bursts the whole backlog. Below the rate where a thread's
+        // connections stop overlapping in flight (~4 conns × RTT) that
+        // turned every paced run into seconds of self-inflicted latency.
+        //
+        // So: when the thread is completely idle (no send pending, no
+        // response outstanding on any connection) and a pacer has a
+        // future slot, flush the SQ non-blocking and spin until that slot
+        // is due instead of blocking. While anything is in flight we
+        // still block for the next CQE exactly as before: several due
+        // frames then coalesce into one send, which is what keeps a
+        // loopback TCP send (several µs of in-kernel work each)
+        // affordable at 1M+ orders/s — waking on every due slot (spin or
+        // io_uring timeout) was tried and made the bench thread itself
+        // the bottleneck at 1M/s. The cost of this policy is that a due
+        // slot on one connection may wait up to one RTT for another
+        // connection's CQE; the latency histogram is keyed off the
+        // *scheduled* tick, so that delay is measured, not hidden.
+        let idle = connections
+            .iter()
+            .all(|c| c.inflight_ts.is_empty() && !c.send_pending);
+        let next_due = if idle {
+            connections
+                .iter()
+                .filter_map(|c| c.pacer.as_ref().map(PaceClock::next_due_ticks))
+                .min()
+        } else {
+            None
+        };
+        let wait = match next_due {
+            Some(due) => {
+                let flushed = ring.submit().map(|_| ());
+                if flushed.is_ok() {
+                    while ring.completion().is_empty() && rdtscp() < due {
+                        std::hint::spin_loop();
+                    }
+                }
+                flushed
+            }
+            None => ring.submit_and_wait(1).map(|_| ()),
+        };
+        match wait {
+            Ok(()) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => panic!("io_uring submit_and_wait: {e}"),
+            Err(e) => panic!("io_uring submit/wait: {e}"),
         }
 
         // Sample the wall clock *after* the blocking wait and reuse it
