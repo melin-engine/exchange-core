@@ -30,7 +30,7 @@ cargo build --release
 ./target/release/melin-server [OPTIONS]
 ```
 
-The server uses jemalloc by default (thread-local caches eliminate allocator lock contention).
+The server uses jemalloc by default (thread-local caches eliminate allocator lock contention), tuned for tail-latency stability: freed memory is returned to the OS by a dedicated background thread rather than on the matching/journal threads, and only after ~53–57 s of inactivity. The server logs the effective allocator settings at startup (`jemalloc tuning applied ...`); a `WARN` there means the tuning is not in effect (for example when overridden through the `_RJEM_MALLOC_CONF` environment variable) and purge work may land on the hot path.
 
 ### CLI Flags
 

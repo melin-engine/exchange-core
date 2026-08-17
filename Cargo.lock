@@ -2033,6 +2033,7 @@ dependencies = [
  "rustc-hash",
  "serial_test",
  "tempfile",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",

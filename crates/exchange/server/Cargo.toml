@@ -98,6 +98,7 @@ libc = { workspace = true }
 rand = { workspace = true }
 rustc-hash = "2"
 tikv-jemallocator = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
