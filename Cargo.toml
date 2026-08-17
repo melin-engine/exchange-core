@@ -88,3 +88,25 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
+
+# BENCHMARK BRANCH ONLY — do not merge into main.
+#
+# Redirects every sequencer crate from the published 0.13.0 releases to
+# the `perf/loaded-tail-audit-2026-08` branch of the sequencer repository
+# (6 commits on top of its main: bounded response buffering age, per-frame
+# replication commit/ack with bounded receive work, non-blocking replica
+# ack queue, egress hygiene, idle-clock masking only under sustained
+# idle). All seven crates move together: mixing a patched crate with
+# published siblings would link two copies of the same types.
+#
+# HTTPS rather than SSH so bench hosts need no deploy key. The exact
+# commit is pinned in `Cargo.lock`; run `cargo update -p melin-app` (or
+# any of them) to pick up new commits on the branch.
+[patch.crates-io]
+melin-app = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }
+melin-journal = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin", branch = "perf/loaded-tail-audit-2026-08" }

@@ -51,7 +51,7 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_types::types::QueryResponse,
 >;
 use melin_transport_core::JournaledApp;
-use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
+use melin_transport_core::pipeline::build_pipeline_with_replication;
 use melin_transport_core::trace::mono_trace_ns;
 use melin_types::types::{AccountId, CurrencyId};
 
@@ -313,6 +313,11 @@ fn main() {
             repl_handler_0: 0,
             repl_handler_1: 0,
             journal_prep: 0,
+            // Journal disk thread — the half of the split journal stage
+            // that owns the pwrite and the fdatasync. Unpinned like every
+            // other stage here: this bench measures replication plumbing,
+            // and pinning one stage while the rest float would skew that.
+            journal_disk: 0,
         };
         let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
         let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
@@ -325,7 +330,7 @@ fn main() {
         let handle = std::thread::Builder::new()
             .name(format!("bench-repl-receiver-{i}"))
             .spawn(move || {
-                let _ = run_receiver::<ServerApp, melin_journal::BufferedWriter<_>>(
+                let _ = run_receiver::<ServerApp>(
                     bind_addr,
                     &replica_journal,
                     &replica_key,

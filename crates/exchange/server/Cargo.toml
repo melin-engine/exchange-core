@@ -50,13 +50,12 @@ hash-chain = [
     "melin-transport-core/hash-chain",
     "melin-server-runtime/hash-chain",
 ]
-## Open the journal without `O_DIRECT`. Passthrough — see the
-## `melin-journal` feature of the same name. Benchmarking only.
-no-o-direct = [
-    "melin-journal/no-o-direct",
-    "melin-transport-core/no-o-direct",
-    "melin-server-runtime/no-o-direct",
-]
+## BENCHMARK BRANCH ONLY — `no-o-direct` is gone. The sequencer retired
+## the O_DIRECT sector writer upstream of this branch, so there is no
+## longer an O_DIRECT open to opt out of and the passthrough targets no
+## longer exist. Kept as an empty feature so existing bench invocations
+## and scripts that pass it keep building.
+no-o-direct = []
 
 [lib]
 name = "melin_server"

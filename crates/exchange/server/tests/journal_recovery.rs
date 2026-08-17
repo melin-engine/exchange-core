@@ -541,7 +541,7 @@ mod tests {
 
         // Write journal entries with key_hash + request_seq.
         {
-            let mut writer = melin_journal::SectorWriter::<
+            let mut writer = melin_journal::BufferedWriter::<
                 melin_trading::trading_event::TradingEvent,
             >::create(&path)
             .unwrap();
@@ -599,7 +599,7 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer = melin_journal::SectorWriter::<
+            let mut writer = melin_journal::BufferedWriter::<
                 melin_trading::trading_event::TradingEvent,
             >::create(&journal_path)
             .unwrap();

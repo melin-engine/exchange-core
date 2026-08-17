@@ -1808,8 +1808,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c90782a5bac58cdf9afaccb3849387910fecde4b1ea1d15fd8f9dcbfcc434bc8"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1868,8 +1867,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3457b3ddc29e008299d3de94614e4ea29b8f080d47fd98703078467190209460"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 dependencies = [
  "bindgen",
  "cc",
@@ -1904,13 +1902,11 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "217dcb2a20acac3f59004c95b84f314a74b28e33debc4ed68b1f908edcb84d15"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 dependencies = [
  "blake3",
  "crc32c",
  "getrandom 0.4.2",
- "io-uring",
  "libc",
  "melin-app",
  "melin-pipeline",
@@ -1972,8 +1968,7 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97b9011a9465b0669db3b6f58b82aa26353c8a248868c400fabbe400a25b4523"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 
 [[package]]
 name = "melin-protocol"
@@ -1988,8 +1983,7 @@ dependencies = [
 [[package]]
 name = "melin-raft"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5accd73a3834596d6f97441a1b5e7031444ebb822cd480c8ea49d801daf7ada9"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -2043,8 +2037,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "073be2eac2882fb922f66f05185bcf8d44210cd529714782918f29f6c2019373"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2078,8 +2071,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f31f1bc5fde9bd75d3e93caac9a9f87684ac49c5f1c4d8a5563c01a40188ca"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2120,8 +2112,7 @@ version = "0.13.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7cc3cffd70eba85fe9c93a36bab7cb1ced6a875f7e9f17a9fb226585da7f817"
+source = "git+https://github.com/melin-engine/melin?branch=perf%2Floaded-tail-audit-2026-08#749541ef2b8754fc6a16bda657aaee077e1bda78"
 
 [[package]]
 name = "memchr"
@@ -3441,7 +3432,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
