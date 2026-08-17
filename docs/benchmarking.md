@@ -137,7 +137,7 @@ samples count without further coordination.
 | `--instruments` | 100 | Number of instruments. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
 | `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
-| `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). Use 7 for local benchmarks (avoids server cores 1-6). Use 1 for remote benchmarks on a dedicated machine with `isolcpus`. |
+| `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). For roundtrip runs against the embedded server, N must be higher than every core in the server's `--cores` list, which is the authoritative layout — use 12. Use 1 for remote benchmarks on a dedicated machine with `isolcpus`, where no server shares the host. |
 
 ### Feature flags
 
@@ -333,17 +333,26 @@ Use closed-loop (target-rate unset) for peak-throughput exploration where coordi
 
 ### CPU core pinning
 
-All threads are pinned to specific CPU cores via `sched_setaffinity`. The layout is hardcoded (not CLI-configurable) for the benchmark:
+All threads are pinned to specific CPU cores via `sched_setaffinity`. The server side of the layout comes from its `--cores` flag; the bench side from `--bench-cores`. With both left at their recommended values the result is:
 
 | Cores | Threads |
 |-------|---------|
 | 0 | OS, IRQ handling, RCU callbacks |
 | 1-3 | Pipeline (journal, matching, response) — set by server's `--cores` flag |
-| 4 | Reader thread |
-| 6 | Replication sender — set by server's `--cores` flag (4th value) |
-| 7+ | Bench client threads (when `--bench-cores 7` is passed) |
+| 4 | Reader thread (io_uring reader, or the DPDK poll thread) |
+| 5 | Replication sender |
+| 6 | Event publisher (with `--event-bind`) |
+| 7 | Shadow stage (with `--snapshot-interval-ms`) |
+| 8-9 | Replica TCP handlers |
+| 10 | Journal preparation |
+| 11 | Journal disk writes, on sequencer builds that run the journal stage on two threads |
+| 12+ | Bench client threads (when `--bench-cores 12` is passed) |
 
-Bench thread `i` is pinned to core `N + i` where N is the `--bench-cores` value. Without the flag, threads are unpinned. For local benchmarks, use `--bench-cores 7` to avoid server cores. For remote benchmarks on a dedicated machine, use `--bench-cores 1` with `isolcpus` for tighter measurements.
+Every core from 1 up to the end of that list belongs to the server, and the server's `--cores` flag is what actually sets it — read that flag's default before choosing a bench core rather than trusting the table above, because the list has grown as the pipeline gained threads.
+
+Bench thread `i` is pinned to core `N + i` where N is the `--bench-cores` value. Without the flag, threads are unpinned. For local benchmarks against the embedded server, use `--bench-cores 12` so the client threads start above the server's cores. For remote benchmarks on a dedicated machine, use `--bench-cores 1` with `isolcpus` for tighter measurements — no server shares that host.
+
+Getting this wrong is quiet and expensive: server threads and bench threads both run `SCHED_FIFO`, so two of them on one core do not share it. The server thread spins, the bench thread gets almost no CPU, and the result is a run that reports lower throughput and a distorted tail — or never finishes at all, because a starved client thread never drains its in-flight orders. Confirm placement with `ps -L -o comm,psr,rtprio,policy,pcpu -p <pid>` during a run: two threads showing the same `PSR`, one at ~100% CPU and one near 0%, is the signature.
 
 ### IRQ affinity (`bench-isolate.sh`)
 

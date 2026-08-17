@@ -13,8 +13,11 @@
 #   4. irqbalance → stopped (prevents daemon from redistributing IRQs)
 #
 # Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response),
-# 4-5=reader threads (or DPDK poll threads), 6=repl-sender, 7=event-publisher, 8=shadow, 9-10=repl-handlers, 11+=bench threads.
-# All pinned via sched_setaffinity.
+# 4=reader thread (or DPDK poll thread), 5=repl-sender, 6=event-publisher,
+# 7=shadow, 8-9=repl-handlers, 10=journal-prep, 11=journal-disk,
+# 12+=bench threads. All pinned via sched_setaffinity. The server side is
+# the server's `--cores` default; keep bench threads above its last core,
+# or the two SCHED_FIFO spinners share a core and starve each other.
 # All settings are saved and restored on exit (including Ctrl-C / errors).
 # Kernel dmesg is captured before/after to correlate spikes with kernel events.
 
@@ -236,8 +239,8 @@ echo "=== Running benchmark ==="
 echo ""
 
 # Run as the invoking user (SUDO_USER), not root.
-# No taskset — all threads self-pin via sched_setaffinity:
-# cores 1-3 pipeline, 4=DPDK poll (or 4-5 TCP readers), 6=repl-sender, 7=event-publisher, 8=shadow, 9+ bench threads.
+# No taskset — all threads self-pin via sched_setaffinity; see the core
+# layout at the top of this file.
 #
 # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only emits .debug_line so
 # perf can map sample addresses back to function + source line under
