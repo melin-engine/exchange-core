@@ -387,6 +387,16 @@ fn main() {
     let output_consumer_0 = output_consumers.remove(0);
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    // Replication stops on its own flag, ahead of the pipeline's. One flag
+    // for everything tears the replication session and the primary
+    // pipeline down at the same instant, and the two teardown paths race
+    // over the state they share (replication ring, slot cursors, the
+    // per-slot flags): the heap ends up corrupted and the process dies in
+    // `free()` — reliably under core pinning, intermittently without it.
+    // Stopping replication first and joining it before the pipeline is
+    // told to stop keeps the two apart. See the teardown at the end of
+    // `main`.
+    let repl_shutdown = Arc::new(AtomicBool::new(false));
 
     // --- Spawn primary pipeline stages ---
     let s = Arc::clone(&shutdown);
@@ -466,7 +476,7 @@ fn main() {
         fence_state: Arc::clone(&primary_fence),
     };
 
-    let s = Arc::clone(&shutdown);
+    let s = Arc::clone(&repl_shutdown);
     let r = Arc::clone(&ready_flag);
     let c = Arc::clone(&connected_counter);
     let sender_core = primary_cores.repl_sender;
@@ -513,7 +523,7 @@ fn main() {
         };
         let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
         let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
-        let s = Arc::clone(&shutdown);
+        let s = Arc::clone(&repl_shutdown);
         // Fresh handles: nothing promoted, tip not yet trustworthy, link
         // down until the handshake completes. The bench never files a
         // promotion — it measures steady-state streaming, not failover.
@@ -561,6 +571,7 @@ fn main() {
                 connected_counter.load(Ordering::Acquire)
             );
             shutdown.store(true, Ordering::Release);
+            repl_shutdown.store(true, Ordering::Release);
             std::process::exit(1);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -686,14 +697,25 @@ fn main() {
     );
 
     // --- Shutdown ---
-    shutdown.store(true, Ordering::Release);
-    let _ = journal_handle.join();
-    let _ = matching_handle.join();
-    let _ = drain_handle.join();
+    // Two phases, and the order matters: the replication session goes
+    // first and is fully joined before the pipeline is asked to stop.
+    // Signalling both at once lets the sender's teardown run concurrently
+    // with the journal stage's, and they race over the replication ring
+    // and slot cursors they share — the heap gets corrupted and the
+    // process dies in `free()` on the way out.
+    //
+    // Join results are dropped rather than inspected: this is a bench, the
+    // numbers are already printed, and a stage that failed on the way down
+    // has nothing left to report.
+    repl_shutdown.store(true, Ordering::Release);
     let _ = sender_handle.join();
     for handle in receiver_handles {
         let _ = handle.join();
     }
+    shutdown.store(true, Ordering::Release);
+    let _ = journal_handle.join();
+    let _ = matching_handle.join();
+    let _ = drain_handle.join();
 }
 
 #[cfg(test)]
