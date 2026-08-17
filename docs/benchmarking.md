@@ -135,6 +135,8 @@ samples count without further coordination.
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
 | `--accounts` | 10,000 | Number of trading accounts in the generator. |
 | `--instruments` | 100 | Number of instruments. |
+| `--max-orders-per-second` | 10,000,000 | Per-account order rate cap (SEC-04) applied to the *embedded* server (roundtrip mode without `--addr`). The server's production default of 1,000/s rejects ~45% of a Zipf-distributed bench load as `ExceedsOrderRate` before it reaches the matcher; the bench default lifts it the same way the LAN suite does for a standalone server. Ignored with `--addr`. |
+| `--max-orders-burst` | 50,000,000 | Per-account burst allowance (SEC-04) for the embedded server. Ignored with `--addr`. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
 | `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
 | `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). Use 7 for local benchmarks (avoids server cores 1-6). Use 1 for remote benchmarks on a dedicated machine with `isolcpus`. In pipeline mode the journal/matching stages are always on cores 1/2 and the bench's publisher/drain threads go on N/N+1 — use 3. Engine and pipeline mode print a warning when it is unset: an unpinned bench thread that lands on the IRQ/housekeeping core gets preempted by kernel workers and those stalls are reported as engine/pipeline tail latency. |

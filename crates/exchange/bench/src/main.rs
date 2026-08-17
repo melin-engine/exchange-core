@@ -110,6 +110,27 @@ const DEFAULT_WINDOW: usize = 64;
 /// Default number of concurrent client connections.
 const DEFAULT_CLIENTS: usize = 16;
 
+/// Per-account rate limits handed to the embedded server in roundtrip
+/// mode. The server's production defaults (1000 orders/s, burst 5000)
+/// are a sensible operator ceiling, but the bench's Zipf generator
+/// concentrates load: the head account alone sees a fixed fraction of
+/// the aggregate rate regardless of `--accounts`, so at 1M orders/s
+/// tens of thousands of orders/s hit one account and ~45% of all orders
+/// are rejected with `ExceedsOrderRate` at the gate before reaching the
+/// matcher — hiding engine latency and tripping `--max-reject-pct`. The
+/// defaults below mirror what `lan-bench-suite.sh` passes to a
+/// standalone bench server (`BENCH_DEFAULT_RATE_ARGS`).
+#[derive(Clone, Copy)]
+struct EmbeddedLimits {
+    max_orders_per_second: u32,
+    max_orders_burst: u32,
+}
+
+impl EmbeddedLimits {
+    const DEFAULT_MAX_ORDERS_PER_SECOND: u32 = 10_000_000;
+    const DEFAULT_MAX_ORDERS_BURST: u32 = 50_000_000;
+}
+
 /// Default number of bench client threads. Each thread manages a subset of
 /// connections via io_uring. Pinned to cores 7-10 (2 physical + 2 HT siblings
 /// on 8C/16T). With 4 bench + 6 server (3 pipeline + 2 reader + 1 repl-sender)
@@ -567,6 +588,15 @@ struct BenchArgs {
     /// Number of instruments.
     #[arg(long, default_value_t = 100)]
     instruments: u32,
+    /// Per-account order rate cap (SEC-04) for the embedded server
+    /// (roundtrip mode without `--addr`; ignored otherwise). Same
+    /// default the LAN suite gives a standalone bench server — see
+    /// `EmbeddedLimits`.
+    #[arg(long, default_value_t = EmbeddedLimits::DEFAULT_MAX_ORDERS_PER_SECOND)]
+    max_orders_per_second: u32,
+    /// Per-account burst allowance (SEC-04) for the embedded server.
+    #[arg(long, default_value_t = EmbeddedLimits::DEFAULT_MAX_ORDERS_BURST)]
+    max_orders_burst: u32,
     /// Write results to a JSON file. Useful for building saturation curves
     /// from multiple runs with different load levels.
     #[arg(long)]
@@ -794,6 +824,10 @@ fn main() {
                     args.health_addr,
                     args.target_rate,
                     args.max_reject_pct,
+                    EmbeddedLimits {
+                        max_orders_per_second: args.max_orders_per_second,
+                        max_orders_burst: args.max_orders_burst,
+                    },
                 );
             }
         }
@@ -1743,6 +1777,7 @@ fn run_roundtrip_bench(
     health_addr: Option<std::net::SocketAddr>,
     target_rate: u64,
     max_reject_pct: f64,
+    limits: EmbeddedLimits,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -1822,6 +1857,10 @@ fn run_roundtrip_bench(
         // `in_memory>=2` replica acks that never arrive when nothing else
         // is connected, which would stall every response.
         durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
+        // Per-account rate limits: see `EmbeddedLimits` for why the
+        // production defaults are unusable under bench load.
+        max_orders_per_second: limits.max_orders_per_second,
+        max_orders_burst: limits.max_orders_burst,
         ..ServerConfig::default()
     };
     // Wire the trading AppFactory: replication / seed paths take it
