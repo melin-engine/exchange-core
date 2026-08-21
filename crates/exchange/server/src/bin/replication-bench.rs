@@ -51,7 +51,7 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_types::types::QueryResponse,
 >;
 use melin_transport_core::JournaledApp;
-use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
+use melin_transport_core::pipeline::build_pipeline_with_replication;
 use melin_transport_core::trace::mono_trace_ns;
 use melin_types::types::{AccountId, CurrencyId};
 
@@ -80,32 +80,36 @@ struct Args {
     #[arg(long, default_value = "hybrid")]
     durability: DurabilityArg,
 
-    /// Primary-side core assignment, seven comma-separated IDs in the
-    /// order `generator,journal,matching,drain,repl-sender,handler-0,handler-1`.
+    /// Primary-side core assignment, comma-separated IDs in the order
+    /// `generator,journal,matching,drain,repl-sender,handler-0,handler-1`
+    /// plus an optional eighth `journal-disk` entry for the journal's disk
+    /// thread (omitted = unpinned, same rule as the server's `--cores`).
     /// 0 leaves an entry unpinned, and omitting the flag leaves every
     /// primary thread unpinned — which is only sane on a host without
     /// isolated cores. Under `isolcpus` the scheduler will not migrate a
     /// thread onto or between isolated cores, so unpinned threads all
     /// inherit whichever core the process started on and the whole bench
     /// measures one core's worth of contention. Suggested on a 16-core
-    /// host: `--cores 1,2,3,4,5,6,7`.
+    /// host: `--cores 1,2,3,4,5,6,7,8`.
     #[arg(long, value_delimiter = ',')]
     cores: Option<Vec<usize>>,
 
     /// First core of each replica's own pipeline, one entry per replica.
-    /// Replica `i` takes `base..=base+3` for its journal, matching, drain
-    /// and receiver threads; its shadow stage stays unpinned because this
-    /// bench never snapshots. 0 leaves that replica unpinned. Suggested
-    /// alongside the `--cores` example above: `--replica-cores 8,12`.
+    /// Replica `i` takes `base..=base+4` for its journal, matching, drain,
+    /// receiver and journal-disk threads; its shadow stage stays unpinned
+    /// because this bench never snapshots. 0 leaves that replica unpinned.
+    /// Suggested alongside the `--cores` example above:
+    /// `--replica-cores 9,14`.
     #[arg(long, value_delimiter = ',')]
     replica_cores: Option<Vec<usize>>,
 }
 
 /// Threads a replica pins out of its `--replica-cores` base.
-const CORES_PER_REPLICA: usize = 4;
+const CORES_PER_REPLICA: usize = 5;
 
-/// Entries `--cores` expects: generator, journal, matching, drain,
-/// repl-sender, handler-0, handler-1.
+/// Required `--cores` entries: generator, journal, matching, drain,
+/// repl-sender, handler-0, handler-1. The optional eighth entry is the
+/// journal-disk core.
 const PRIMARY_CORE_SLOTS: usize = 7;
 
 /// Primary-side core assignment, resolved from `--cores`. All-zero (every
@@ -120,6 +124,7 @@ struct PrimaryCores {
     repl_sender: usize,
     handler_0: usize,
     handler_1: usize,
+    journal_disk: usize,
 }
 
 /// Pin the calling thread to `core`, or leave it where it is when `core`
@@ -148,19 +153,25 @@ fn resolve_cores(
 ) -> Result<(PrimaryCores, Vec<usize>), String> {
     let primary = match cores {
         None => PrimaryCores::default(),
-        Some(v) if v.len() == PRIMARY_CORE_SLOTS => PrimaryCores {
-            generator: v[0],
-            journal: v[1],
-            matching: v[2],
-            drain: v[3],
-            repl_sender: v[4],
-            handler_0: v[5],
-            handler_1: v[6],
-        },
+        Some(v) if v.len() == PRIMARY_CORE_SLOTS || v.len() == PRIMARY_CORE_SLOTS + 1 => {
+            PrimaryCores {
+                generator: v[0],
+                journal: v[1],
+                matching: v[2],
+                drain: v[3],
+                repl_sender: v[4],
+                handler_0: v[5],
+                handler_1: v[6],
+                // Optional trailing entry; omitted leaves the disk thread
+                // unpinned so seven-entry invocations keep their layout.
+                journal_disk: v.get(PRIMARY_CORE_SLOTS).copied().unwrap_or(0),
+            }
+        }
         Some(v) => {
             return Err(format!(
                 "--cores expects {PRIMARY_CORE_SLOTS} comma-separated IDs \
-                 (generator,journal,matching,drain,repl-sender,handler-0,handler-1), got {}",
+                 (generator,journal,matching,drain,repl-sender,handler-0,handler-1), \
+                 optionally followed by journal-disk, got {}",
                 v.len()
             ));
         }
@@ -187,12 +198,13 @@ fn resolve_cores(
         (primary.repl_sender, "repl-sender".to_string()),
         (primary.handler_0, "handler-0".to_string()),
         (primary.handler_1, "handler-1".to_string()),
+        (primary.journal_disk, "journal-disk".to_string()),
     ];
     for (i, base) in bases.iter().enumerate() {
         if *base == 0 {
             continue;
         }
-        for (offset, role) in ["journal", "matching", "drain", "receiver"]
+        for (offset, role) in ["journal", "matching", "drain", "receiver", "journal-disk"]
             .iter()
             .enumerate()
         {
@@ -285,7 +297,7 @@ fn main() {
     } else {
         eprintln!(
             "  primary: generator={} journal={} matching={} drain={} repl-sender={} \
-             handlers={},{}",
+             handlers={},{} journal-disk={}",
             primary_cores.generator,
             primary_cores.journal,
             primary_cores.matching,
@@ -293,6 +305,7 @@ fn main() {
             primary_cores.repl_sender,
             primary_cores.handler_0,
             primary_cores.handler_1,
+            primary_cores.journal_disk,
         );
         for (i, base) in replica_bases.iter().enumerate() {
             if *base == 0 {
@@ -368,7 +381,10 @@ fn main() {
     );
 
     let mut input_producer = pipeline.input_producer;
-    let journal_stage = pipeline.journal_stage;
+    let mut journal_stage = pipeline.journal_stage;
+    // The stage spawns its disk thread itself, from the journal thread,
+    // so the core has to be handed over before `run`.
+    journal_stage.set_disk_core(primary_cores.journal_disk);
     let matching_stage = pipeline.matching_stage;
     let mut output_consumers = pipeline.output_consumers;
     // Per-replica ack slots. `quorum_acked()` is the min over engaged
@@ -501,10 +517,10 @@ fn main() {
     // Vec: count is the runtime `--replicas` value; see `replica_keys`.
     let mut receiver_handles = Vec::with_capacity(n_replicas);
     for (i, replica_key) in replica_keys.into_iter().enumerate() {
-        // `base + 0..3` — journal, matching, drain, receiver — matching the
-        // order documented on `--replica-cores`. A base of 0 leaves the
-        // whole replica unpinned, since 0 is the unpinned sentinel and
-        // `0 + offset` would otherwise claim cores 1-3.
+        // `base + 0..4` — journal, matching, drain, receiver, journal-disk
+        // — matching the order documented on `--replica-cores`. A base of
+        // 0 leaves the whole replica unpinned, since 0 is the unpinned
+        // sentinel and `0 + offset` would otherwise claim cores 1-4.
         let base = replica_bases[i];
         let replica_core = |offset: usize| if base == 0 { 0 } else { base + offset };
         let cores = PipelineCores {
@@ -520,6 +536,7 @@ fn main() {
             repl_handler_0: 0,
             repl_handler_1: 0,
             journal_prep: 0,
+            journal_disk: replica_core(4),
         };
         let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
         let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
@@ -532,7 +549,7 @@ fn main() {
         let handle = std::thread::Builder::new()
             .name(format!("bench-repl-receiver-{i}"))
             .spawn(move || {
-                let _ = run_receiver::<ServerApp, melin_journal::BufferedWriter<_>>(
+                let _ = run_receiver::<ServerApp>(
                     bind_addr,
                     &replica_journal,
                     &replica_key,
@@ -741,6 +758,32 @@ mod tests {
         assert_eq!(primary.repl_sender, 5);
         assert_eq!(primary.handler_0, 6);
         assert_eq!(primary.handler_1, 7);
+        assert_eq!(primary.journal_disk, 0, "omitted journal-disk = unpinned");
+    }
+
+    #[test]
+    fn optional_eighth_entry_pins_the_journal_disk_thread() {
+        let cores = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let (primary, _) = resolve_cores(Some(&cores), None, 2).unwrap();
+        assert_eq!(primary.journal_disk, 8);
+    }
+
+    #[test]
+    fn journal_disk_colliding_with_a_primary_core_is_rejected() {
+        let cores = vec![1, 2, 3, 4, 5, 6, 7, 2];
+        let err = resolve_cores(Some(&cores), None, 2).unwrap_err();
+        assert!(err.contains("core 2"), "{err}");
+        assert!(err.contains("journal-disk"), "{err}");
+    }
+
+    #[test]
+    fn replica_span_covers_five_cores() {
+        // One core short of adjacent: replica 1's journal lands on
+        // replica 0's journal-disk core, the fifth of its span.
+        let bases = vec![9, 13];
+        let err = resolve_cores(None, Some(&bases), 2).unwrap_err();
+        assert!(err.contains("core 13"), "{err}");
+        assert!(err.contains("journal-disk"), "{err}");
     }
 
     #[test]
@@ -765,7 +808,7 @@ mod tests {
         assert!(err.contains("journal") && err.contains("matching"), "{err}");
     }
 
-    /// The overlap that actually bites: a replica's four-core span running
+    /// The overlap that actually bites: a replica's five-core span running
     /// into a primary thread's core.
     #[test]
     fn replica_span_overlapping_the_primary_is_rejected() {
@@ -786,10 +829,12 @@ mod tests {
 
     #[test]
     fn adjacent_replica_spans_are_accepted() {
-        let cores = vec![1, 2, 3, 4, 5, 6, 7];
-        let bases = vec![8, 12];
+        // The documented 16-core layout: primary on 1-8, replicas on
+        // 9..=13 and 14..=18.
+        let cores = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let bases = vec![9, 14];
         let (_, resolved) = resolve_cores(Some(&cores), Some(&bases), 2).unwrap();
-        assert_eq!(resolved, vec![8, 12]);
+        assert_eq!(resolved, vec![9, 14]);
     }
 
     /// A zero base means "leave this replica alone" — it must not be read

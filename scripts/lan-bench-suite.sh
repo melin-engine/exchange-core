@@ -77,9 +77,7 @@
 #   MAIN_EXTRA_FEATURES=<list>
 #                       Comma-separated cargo features appended to the
 #                       kernel-TCP main build. Composes
-#                       with NO_PERSIST. Use e.g. `no-o-direct` to bench
-#                       the journal without `O_DIRECT` (consumer NVMe
-#                       drives without Power Loss Protection).
+#                       with NO_PERSIST.
 #   SKIP_ORDER_EXEC=1   Build `melin-server` with the matching hot path
 #                       bypassed (--no-default-features
 #                       --features skip-order-exec) so the run isolates

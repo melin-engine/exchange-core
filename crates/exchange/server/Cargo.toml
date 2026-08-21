@@ -50,13 +50,6 @@ hash-chain = [
     "melin-transport-core/hash-chain",
     "melin-server-runtime/hash-chain",
 ]
-## Open the journal without `O_DIRECT`. Passthrough — see the
-## `melin-journal` feature of the same name. Benchmarking only.
-no-o-direct = [
-    "melin-journal/no-o-direct",
-    "melin-transport-core/no-o-direct",
-    "melin-server-runtime/no-o-direct",
-]
 
 [lib]
 name = "melin_server"
