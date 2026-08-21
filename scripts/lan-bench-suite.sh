@@ -471,9 +471,9 @@ _transport_replica_count() {
 # reject them at startup.
 _mode_min_replicas() {
     case "$1" in
-        local)                          echo 0 ;;
-        hybrid|durably-replicated)      echo 1 ;;
-        *)                              echo 0 ;;
+        local)                                      echo 0 ;;
+        replicated|hybrid|durably-replicated)       echo 1 ;;
+        *)                                          echo 0 ;;
     esac
 }
 

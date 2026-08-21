@@ -77,8 +77,8 @@ struct Args {
     /// heartbeat. This bench drains the output ring with a no-op instead of
     /// running the response gate, so the mode does not throttle the
     /// generator — it only sets what replicas judge auto-promotion against.
-    #[arg(long, default_value = "hybrid")]
-    durability: DurabilityArg,
+    #[arg(long, value_enum, default_value_t = DurabilityMode::Hybrid)]
+    durability: DurabilityMode,
 
     /// Primary-side core assignment, comma-separated IDs in the order
     /// `generator,journal,matching,drain,repl-sender,handler-0,handler-1`
@@ -227,25 +227,6 @@ fn resolve_cores(
     Ok((primary, bases))
 }
 
-/// Mirrors [`DurabilityMode`] as a clap-parsable value. The runtime enum
-/// isn't `ValueEnum`, and deriving it here keeps the dependency one-way.
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum DurabilityArg {
-    Local,
-    Hybrid,
-    DurablyReplicated,
-}
-
-impl From<DurabilityArg> for DurabilityMode {
-    fn from(arg: DurabilityArg) -> Self {
-        match arg {
-            DurabilityArg::Local => DurabilityMode::Local,
-            DurabilityArg::Hybrid => DurabilityMode::Hybrid,
-            DurabilityArg::DurablyReplicated => DurabilityMode::DurablyReplicated,
-        }
-    }
-}
-
 const PRIMARY_REPL_ADDR: &str = "127.0.0.1:39877";
 const RUN_SECS: u64 = 10;
 const MAX_JOURNAL_BATCH: usize = 4096;
@@ -260,7 +241,7 @@ const HEARTBEAT_SECS: u64 = 5;
 fn main() {
     let args = Args::parse();
     let busy_spin = !args.no_busy_spin;
-    let durability: DurabilityMode = args.durability.into();
+    let durability = args.durability;
 
     let n_replicas = args.replicas;
     if n_replicas == 0 || n_replicas > melin_transport_core::ReplicaSlotCursors::SLOTS {
