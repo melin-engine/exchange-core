@@ -5,6 +5,25 @@
 //! matching engine overhead. Useful to isolate the raw disk cost of a
 //! batch from the sequencing work in front of it.
 //!
+//! # What this does and does not model
+//!
+//! In production the journal is split in two: the sequencer encodes into
+//! a hand-off ring, and a separate disk thread drains it. That thread
+//! writes *every batch it finds staged* with one `pwritev` and then
+//! issues a single `fdatasync` for the whole backlog. So:
+//!
+//! * While the disk keeps up, each drain finds exactly one batch, and
+//!   the syscall shape is the same one measured here — this bench is a
+//!   fair read of per-batch cost in the steady state.
+//! * Once the disk falls behind, production amortises one `fdatasync`
+//!   across the whole backlog while this bench keeps paying one per
+//!   batch. The numbers here are then an upper bound, and the gap widens
+//!   with the backlog.
+//!
+//! Read a result as "what one batch costs when the disk is keeping up",
+//! not as a prediction of journal cost under load. For the latter, run
+//! `melin-bench --mode pipeline`, which exercises the real hand-off.
+//!
 //! Usage:
 //!     cargo run --release -p melin-bench --bin journal_writer_bench -- [OPTIONS]
 //!
@@ -98,8 +117,10 @@ fn report(num_events: usize, elapsed_us: u128, journal_path: &Path) {
 }
 
 /// `flush_batch_sync` path — encodes a batch into the writer's internal
-/// buffer, then issues a single sync. Same path the journal's disk
-/// thread runs per batch in production.
+/// buffer, then issues a single sync. This is the combined writer call,
+/// not the split sequencer/disk-thread pair production runs; it matches
+/// production's syscall shape only while the disk keeps up. See the
+/// module docs.
 fn run_sync_mode<W: JournalWrite<TradingEvent>>(
     mut writer: W,
     num_events: usize,
