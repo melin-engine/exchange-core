@@ -450,7 +450,7 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 
 A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage. An eleventh pins the journal disk thread — the half of the journal that writes each batch, syncs it, and publishes the durability position every acknowledgement waits on. It busy-spins like the other stages, so give it a dedicated core, and keep it on the same CCD as the journal stage: the two exchange a cache line on every batch. `--cores 1,2,3,4,5,6,7,8,9,10,11` is the default, so a server started without `--cores` takes cores 1-11 — budget for it when planning the layout.
 
-The entry is optional — a nine-value list leaves the preparer unpinned, so existing configurations keep their exact behaviour. If you carry over a nine-value `--cores` from a previous release you keep that older behaviour, and the preparer runs wherever the scheduler puts it (typically core 0, alongside the OS and IRQs).
+Both trailing entries are optional, and a short list leaves the threads it omits unpinned: a nine-value `--cores` leaves both the preparer and the disk thread unpinned, a ten-value one leaves the disk thread unpinned. Configurations carried over from a previous release therefore keep their exact behaviour, with the omitted threads running wherever the scheduler puts them (typically core 0, alongside the OS and IRQs). Leaving the disk thread there is the more costly of the two: it busy-spins and syncs on every batch, so sharing a core with the OS puts that contention directly under the durability position clients wait on.
 
 ### Kernel Boot Parameters (GRUB)
 

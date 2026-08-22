@@ -169,9 +169,10 @@ fn resolve_cores(
         }
         Some(v) => {
             return Err(format!(
-                "--cores expects {PRIMARY_CORE_SLOTS} comma-separated IDs \
-                 (generator,journal,matching,drain,repl-sender,handler-0,handler-1), \
-                 optionally followed by journal-disk, got {}",
+                "--cores expects {PRIMARY_CORE_SLOTS} or {} comma-separated IDs \
+                 (generator,journal,matching,drain,repl-sender,handler-0,handler-1, \
+                 then optionally journal-disk), got {}",
+                PRIMARY_CORE_SLOTS + 1,
                 v.len()
             ));
         }
