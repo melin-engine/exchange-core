@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Tests for server-setup.sh's kernel-parameter verification.
+#
+# This is the half of the setup script that has no other safety net: it
+# is what stands between "the params were applied" and the silent no-op
+# that shipped before it (a `sed` for `GRUB_CMDLINE_LINUX_DEFAULT` on an
+# image that only defines `GRUB_CMDLINE_LINUX` matched nothing, yet the
+# script still ran update-grub and announced success). A verifier that
+# is itself wrong would re-introduce exactly that failure, so it gets
+# tested directly.
+#
+# The function bodies are extracted from server-setup.sh and sourced, so
+# these tests exercise the shipping code rather than a copy of it.
+#
+# Usage: ./scripts/test-server-setup.sh
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETUP_SCRIPT="${SCRIPT_DIR}/server-setup.sh"
+
+if [[ ! -f "$SETUP_SCRIPT" ]]; then
+    echo "error: cannot find server-setup.sh at $SETUP_SCRIPT" >&2
+    exit 1
+fi
+
+TMP_ROOT=$(mktemp -d)
+trap 'rm -rf "$TMP_ROOT"' EXIT
+
+# Pull the two verification functions out of the setup script. Sourcing
+# the whole script is not an option: it is a root-only provisioner that
+# would start installing packages. Anchoring on `^name() {` .. `^}` works
+# because the file is shfmt-shaped — the closing brace of a top-level
+# function is the only `}` in column 0 within its range.
+extract_fn() {
+    awk "/^$1\(\) \{/,/^\}/" "$SETUP_SCRIPT"
+}
+
+FN_FILE="${TMP_ROOT}/fns.sh"
+{
+    extract_fn kernel_param_live
+    extract_fn kernel_param_in_cfg
+    extract_fn kernel_param_values_in_cfg
+    extract_fn verify_kernel_params
+} > "$FN_FILE"
+
+for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg verify_kernel_params; do
+    if ! grep -q "^${fn}() {" "$FN_FILE"; then
+        echo "error: failed to extract ${fn} from server-setup.sh — has it been" >&2
+        echo "  renamed or reformatted? These tests are now vacuous; fix the" >&2
+        echo "  extraction before trusting a pass." >&2
+        exit 1
+    fi
+done
+
+# shellcheck source=/dev/null
+source "$FN_FILE"
+
+PASS=0
+FAIL=0
+
+ok() {
+    PASS=$((PASS + 1))
+    echo "  ok — $1"
+}
+
+bad() {
+    FAIL=$((FAIL + 1))
+    echo "  FAIL — $1" >&2
+    [[ -n "${2:-}" ]] && echo "         $2" >&2
+}
+
+# Build a fake grub.cfg carrying `params` on a linux line, and a fake
+# /proc/cmdline carrying `live`. Sets the globals the functions read.
+setup_case() {
+    local params="$1" live="$2" name="$3"
+    GRUB_CFG="${TMP_ROOT}/${name}.cfg"
+    CMDLINE_SOURCE="${TMP_ROOT}/${name}.cmdline"
+    REBOOT_FLAG="${TMP_ROOT}/${name}.reboot"
+    GRUB_DROPIN="${TMP_ROOT}/${name}.dropin"
+    printf '\tlinux\t/boot/vmlinuz-test root=UUID=abc ro %s\n' "$params" > "$GRUB_CFG"
+    printf 'BOOT_IMAGE=/boot/vmlinuz-test root=UUID=abc ro %s\n' "$live" > "$CMDLINE_SOURCE"
+    rm -f "$REBOOT_FLAG"
+}
+
+echo "=== server-setup.sh kernel-param verification ==="
+
+# ---------------------------------------------------------------------
+# The regression that motivated this whole change: update-grub ran, but
+# the params never reached the generated config. Must be a hard failure.
+# ---------------------------------------------------------------------
+KERNEL_PARAMS=("isolcpus=nohz,domain,1-5" "nosmt" "iommu=pt")
+setup_case "quiet splash" "quiet splash" "silent-noop"
+if out=$(verify_kernel_params 2>&1); then
+    bad "a config missing every param must fail" "verify_kernel_params returned 0"
+else
+    if grep -q "did not reach" <<< "$out"; then
+        ok "params absent from grub.cfg → hard failure"
+    else
+        bad "failure message should name the problem" "$out"
+    fi
+fi
+if [[ -f "$REBOOT_FLAG" ]]; then
+    bad "a hard failure must not claim a reboot would fix it"
+else
+    ok "no reboot flag written on a hard failure"
+fi
+
+# ---------------------------------------------------------------------
+# Partial application — the subtler version of the same bug.
+# ---------------------------------------------------------------------
+setup_case "isolcpus=nohz,domain,1-5 nosmt" "isolcpus=nohz,domain,1-5 nosmt" "partial"
+if out=$(verify_kernel_params 2>&1); then
+    bad "a config missing one param must still fail" "$out"
+elif grep -q "iommu=pt" <<< "$out"; then
+    ok "a single missing param is caught and named"
+else
+    bad "the missing param should be named" "$out"
+fi
+
+# ---------------------------------------------------------------------
+# Staged but not booted — the legitimate "reboot required" state.
+# ---------------------------------------------------------------------
+setup_case "isolcpus=nohz,domain,1-5 nosmt iommu=pt" "quiet" "pending"
+if out=$(verify_kernel_params 2>&1); then
+    if grep -q "REBOOT REQUIRED" <<< "$out"; then
+        ok "in grub.cfg but not live → reboot required"
+    else
+        bad "should announce a pending reboot" "$out"
+    fi
+else
+    bad "a staged-but-not-live config is not an error" "$out"
+fi
+if [[ -f "$REBOOT_FLAG" ]]; then
+    ok "reboot flag written when a reboot is genuinely needed"
+else
+    bad "reboot flag missing"
+fi
+
+# ---------------------------------------------------------------------
+# Fully applied and booted — the steady state a re-run should report.
+# ---------------------------------------------------------------------
+setup_case "isolcpus=nohz,domain,1-5 nosmt iommu=pt" \
+    "isolcpus=nohz,domain,1-5 nosmt iommu=pt" "active"
+if out=$(verify_kernel_params 2>&1); then
+    if grep -q "are active on the running kernel" <<< "$out"; then
+        ok "fully applied → reported active"
+    else
+        bad "should report all params active" "$out"
+    fi
+else
+    bad "a fully applied config must not fail" "$out"
+fi
+if [[ -f "$REBOOT_FLAG" ]]; then
+    bad "no reboot should be requested when everything is live"
+else
+    ok "no reboot flag when everything is already active"
+fi
+
+# ---------------------------------------------------------------------
+# Exact-token matching. A substring test would call `nosmt` live when
+# only `nosmtfoo` is present, or match a param inside another's value —
+# both would report a tuned host that is not tuned.
+# ---------------------------------------------------------------------
+KERNEL_PARAMS=("nosmt")
+setup_case "nosmt" "nosmtfoo" "substring"
+if out=$(verify_kernel_params 2>&1); then
+    if grep -q "REBOOT REQUIRED" <<< "$out"; then
+        ok "'nosmtfoo' on the cmdline does not satisfy 'nosmt'"
+    else
+        bad "substring must not count as a live param" "$out"
+    fi
+else
+    bad "grub.cfg carries the param, so this is reboot-pending" "$out"
+fi
+
+# A trailing-substring value must not satisfy a shorter param either.
+KERNEL_PARAMS=("iommu=pt")
+setup_case "iommu=pt" "intel_iommu=pt" "prefix"
+if out=$(verify_kernel_params 2>&1); then
+    if grep -q "REBOOT REQUIRED" <<< "$out"; then
+        ok "'intel_iommu=pt' does not satisfy 'iommu=pt'"
+    else
+        bad "prefix match must not count" "$out"
+    fi
+else
+    bad "grub.cfg carries the param, so this is reboot-pending" "$out"
+fi
+
+# The same exactness is required on the grub.cfg side. Without it a
+# `nosmtfoo` in the generated config would be read as `nosmt` having
+# landed, turning a hard failure into an endless "reboot required".
+KERNEL_PARAMS=("nosmt")
+setup_case "nosmtfoo" "nosmtfoo" "cfg-substring"
+if out=$(verify_kernel_params 2>&1); then
+    bad "'nosmtfoo' in grub.cfg must not satisfy 'nosmt'" "$out"
+elif grep -q "did not reach" <<< "$out"; then
+    ok "'nosmtfoo' in grub.cfg does not satisfy 'nosmt'"
+else
+    bad "expected a hard failure naming the config" "$out"
+fi
+
+# Only kernel command lines count. A param appearing in a comment or a
+# menu title is not a param the kernel will see.
+KERNEL_PARAMS=("nosmt")
+GRUB_CFG="${TMP_ROOT}/non-linux-line.cfg"
+CMDLINE_SOURCE="${TMP_ROOT}/non-linux-line.cmdline"
+REBOOT_FLAG="${TMP_ROOT}/non-linux-line.reboot"
+rm -f "$REBOOT_FLAG"
+printf '# a comment mentioning nosmt\nmenuentry "nosmt build" {\n\tlinux\t/boot/vmlinuz ro quiet\n}\n' > "$GRUB_CFG"
+printf 'BOOT_IMAGE=/boot/vmlinuz ro quiet\n' > "$CMDLINE_SOURCE"
+if out=$(verify_kernel_params 2>&1); then
+    bad "a param only in a comment must not count" "$out"
+elif grep -q "did not reach" <<< "$out"; then
+    ok "params are only counted on kernel lines, not comments/titles"
+else
+    bad "expected a hard failure" "$out"
+fi
+
+# ---------------------------------------------------------------------
+# Migration hazard: a host set up by the older script has the params in
+# /etc/default/grub already, so the drop-in adds a second copy. With a
+# stale core range that silently changes which cores get isolated.
+# ---------------------------------------------------------------------
+KERNEL_PARAMS=("isolcpus=nohz,domain,1-5")
+setup_case "isolcpus=nohz,domain,1-10 isolcpus=nohz,domain,1-5" \
+    "isolcpus=nohz,domain,1-10 isolcpus=nohz,domain,1-5" "dup-conflict"
+if out=$(verify_kernel_params 2>&1); then
+    bad "a param set twice with different values must fail" "$out"
+elif grep -q "set more than once" <<< "$out" \
+    && grep -q "1-10" <<< "$out" && grep -q "1-5" <<< "$out"; then
+    ok "conflicting duplicate is caught and both values shown"
+else
+    bad "should name the conflict and both values" "$out"
+fi
+
+# The identical param appearing on several menu entries (normal +
+# recovery) is how a correct grub.cfg always looks — not a conflict.
+KERNEL_PARAMS=("isolcpus=nohz,domain,1-5")
+GRUB_CFG="${TMP_ROOT}/multi-entry.cfg"
+CMDLINE_SOURCE="${TMP_ROOT}/multi-entry.cmdline"
+REBOOT_FLAG="${TMP_ROOT}/multi-entry.reboot"
+rm -f "$REBOOT_FLAG"
+{
+    printf '\tlinux\t/boot/vmlinuz ro isolcpus=nohz,domain,1-5\n'
+    printf '\tlinux\t/boot/vmlinuz ro single isolcpus=nohz,domain,1-5\n'
+} > "$GRUB_CFG"
+printf 'BOOT_IMAGE=/boot/vmlinuz ro isolcpus=nohz,domain,1-5\n' > "$CMDLINE_SOURCE"
+if out=$(verify_kernel_params 2>&1); then
+    ok "same value on several menu entries is not a conflict"
+else
+    bad "repeating one value across entries is normal, not an error" "$out"
+fi
+
+echo ""
+echo "=== ${PASS} passed, ${FAIL} failed ==="
+[[ "$FAIL" -eq 0 ]]
