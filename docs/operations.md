@@ -454,17 +454,26 @@ Both trailing entries are optional, and a short list leaves the threads it omits
 
 ### Kernel Boot Parameters (GRUB)
 
-For lowest latency, configure kernel boot parameters. Edit `/etc/default/grub` and append to `GRUB_CMDLINE_LINUX_DEFAULT`:
+For lowest latency, configure kernel boot parameters. Add them through a drop-in rather than by editing `/etc/default/grub` directly — `grub-mkconfig` sources every `.cfg` in `/etc/default/grub.d` after the vendor file, so a drop-in survives image updates and cannot be silently lost:
 
+```sh
+sudo mkdir -p /etc/default/grub.d
+printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} isolcpus=nohz,domain,1-9 nohz_full=1-9 rcu_nocbs=1-9"\n' | sudo tee /etc/default/grub.d/99-melin-bench.cfg
 ```
-isolcpus=nohz,domain,1-9 nohz_full=1-9 rcu_nocbs=1-9
-```
+
+Append to `GRUB_CMDLINE_LINUX`, not `GRUB_CMDLINE_LINUX_DEFAULT`. Only the former is guaranteed to be defined — several hosting images ship without a `GRUB_CMDLINE_LINUX_DEFAULT` line at all, so an edit targeting it silently does nothing — and `GRUB_CMDLINE_LINUX` applies to the recovery entry too.
 
 Then apply:
 
 ```sh
 sudo update-grub
 sudo reboot
+```
+
+Confirm the parameters actually reached the generated config *before* rebooting — this is the step that catches a lost edit:
+
+```sh
+grep -c isolcpus /boot/grub/grub.cfg    # must be non-zero
 ```
 
 What each parameter does:
@@ -481,10 +490,10 @@ cat /sys/devices/system/cpu/nohz_full     # should print: 1-9
 grep rcu_nocbs /proc/cmdline              # should show rcu_nocbs=1-9
 ```
 
-To revert:
+To revert, remove the drop-in — the vendor's `/etc/default/grub` was never modified:
 
 ```sh
-sudo cp /etc/default/grub.bak /etc/default/grub && sudo update-grub && sudo reboot
+sudo rm /etc/default/grub.d/99-melin-bench.cfg && sudo update-grub && sudo reboot
 ```
 
 ### Runtime Tuning (bench-isolate.sh)
@@ -500,10 +509,10 @@ The `scripts/bench-isolate.sh` script applies runtime tuning that does not requi
 sudo ./scripts/bench-isolate.sh [bench args]
 ```
 
-For production, apply these settings permanently:
+For production, apply these settings permanently. `scripts/server-setup.sh` installs the governor and IRQ pinning as `systemd` oneshot units (`melin-cpu-governor`, `melin-irq-pin`) so they survive reboots; the equivalent by hand is:
 
 ```sh
-# CPU governor (add to /etc/rc.local or systemd unit)
+# CPU governor (install as a systemd unit, not a one-off shell loop)
 for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     echo performance > "$gov"
 done
@@ -519,6 +528,8 @@ done
 # Disable irqbalance
 systemctl disable --now irqbalance
 ```
+
+Set the governor at runtime even when `cpufreq.default_governor=performance` is on the kernel command line. That parameter only applies to policies created after it is parsed, and it does nothing at all on a host that has not yet rebooted into the tuned command line — so the two mechanisms cover each other. Check what is actually in effect with `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`; on `amd-pstate-epp` and `intel_pstate` hosts also confirm `energy_performance_preference` reads `performance`.
 
 ### Compact Layout for Smaller Hosts
 
