@@ -523,6 +523,13 @@ run_sriov_bond_setup() {
     VF1_PCI=$(readlink -f "/sys/bus/pci/devices/${PF1_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 
     # Save DPDK config for use by dpdk-server.sh and dpdk-lan-bench.sh.
+    #
+    # DPDK_MAC duplicates VF_MAC deliberately: every mode writes the
+    # address a peer must send to under the same key, so consumers read
+    # one name instead of branching on mode. VF_MAC stays for existing
+    # readers. Anything that derives the 02:00:<ip> form itself is
+    # working around this key being absent — the derivation belongs here
+    # and nowhere else.
     DPDK_CONF="/etc/melin-dpdk.conf"
     cat > "$DPDK_CONF" <<EOF
 DPDK_IP=${DPDK_IP%%/*}
@@ -532,6 +539,7 @@ DPDK_MODE=sriov
 HUGE_DIR=/mnt/huge_2m
 MTU=${MTU}
 VF_MAC=${VF_MAC}
+DPDK_MAC=${VF_MAC}
 VLAN_ID=${VLAN_ID}
 EOF
     echo "  Config written to ${DPDK_CONF}"
