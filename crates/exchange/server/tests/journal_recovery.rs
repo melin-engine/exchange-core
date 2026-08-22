@@ -541,10 +541,9 @@ mod tests {
 
         // Write journal entries with key_hash + request_seq.
         {
-            let mut writer = melin_journal::SectorWriter::<
-                melin_trading::trading_event::TradingEvent,
-            >::create(&path)
-            .unwrap();
+            let mut writer =
+                BufferedWriter::<melin_trading::trading_event::TradingEvent>::create(&path)
+                    .unwrap();
             let ts = melin_app::unix_epoch_nanos();
             // Deposit with seq=1
             writer
@@ -599,10 +598,9 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer = melin_journal::SectorWriter::<
-                melin_trading::trading_event::TradingEvent,
-            >::create(&journal_path)
-            .unwrap();
+            let mut writer =
+                BufferedWriter::<melin_trading::trading_event::TradingEvent>::create(&journal_path)
+                    .unwrap();
             let ts = melin_app::unix_epoch_nanos();
             writer
                 .batch_append_with_ts(

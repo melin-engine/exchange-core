@@ -1,32 +1,37 @@
-//! Minimal benchmark for the journal writer stage.
+//! Minimal benchmark for the journal writer.
 //!
-//! Tests journal writing and syncing directly, without any pipeline or
-//! matching engine overhead — useful to isolate journal-stage cost when
-//! diagnosing roadmap item #1 (1 Hz / ~500 ms p99.99 under O_DIRECT).
+//! Drives `flush_batch_sync` directly — encode a batch into the writer's
+//! buffer, then one `pwrite + fdatasync` — without any pipeline or
+//! matching engine overhead. Useful to isolate the raw disk cost of a
+//! batch from the sequencing work in front of it.
 //!
-//! Two `--mode`s, named for the *syscall path* under measurement rather
-//! than the production role that exercises it:
+//! # What this does and does not model
 //!
-//! * `sync` — drives `flush_batch_sync`. In production this is the
-//!   primary's write path (both writer types) and the replica's write
-//!   path when `--journal-writer=buffered`. Works with either writer.
-//! * `iouring` — drives io_uring async submit + CQE poll directly
-//!   against the writer's fd. In production this is the replica's write
-//!   path when `--journal-writer=sector`. Sector-only: `BufferedWriter`
-//!   has no fd-driven async path.
+//! In production the journal is split in two: the sequencer encodes into
+//! a hand-off ring, and a separate disk thread drains it. That thread
+//! writes *every batch it finds staged* with one `pwritev` and then
+//! issues a single `fdatasync` for the whole backlog. So:
+//!
+//! * While the disk keeps up, each drain finds exactly one batch, and
+//!   the syscall shape is the same one measured here — this bench is a
+//!   fair read of per-batch cost in the steady state.
+//! * Once the disk falls behind, production amortises one `fdatasync`
+//!   across the whole backlog while this bench keeps paying one per
+//!   batch. The numbers here are then an upper bound, and the gap widens
+//!   with the backlog.
+//!
+//! Read a result as "what one batch costs when the disk is keeping up",
+//! not as a prediction of journal cost under load. For the latter, run
+//! `melin-bench --mode pipeline`, which exercises the real hand-off.
 //!
 //! Usage:
 //!     cargo run --release -p melin-bench --bin journal_writer_bench -- [OPTIONS]
 //!
 //! Options:
-//!     --mode <sync|iouring>      Syscall path to benchmark (default: sync)
-//!     --writer <sector|buffered> Writer implementation (default: sector)
 //!     --events <N>               Events to write (default: 1_000_000)
 //!     --batch-size <N>           Events per fsync batch (default: 1_024)
-//!     --warmup <N>               Warmup events, not measured (default: 100_000)
 
 use clap::Parser;
-use io_uring::IoUring;
 use std::num::NonZero;
 use std::path::Path;
 use std::time::Instant;
@@ -34,19 +39,10 @@ use std::time::Instant;
 use melin_journal::BufferedWriter;
 use melin_journal::JournalEvent;
 use melin_journal::JournalWrite;
-use melin_journal::SectorWriter;
 use melin_trading::trading_event::TradingEvent;
 
 #[derive(Parser)]
 struct Args {
-    /// Syscall path to benchmark.
-    #[arg(long, default_value = "sync")]
-    mode: String,
-
-    /// Writer implementation.
-    #[arg(long, default_value = "sector")]
-    writer: String,
-
     /// Total events to write.
     #[arg(long, default_value_t = 1_000_000)]
     events: usize,
@@ -54,56 +50,22 @@ struct Args {
     /// Events per fsync batch.
     #[arg(long, default_value_t = 1_024)]
     batch_size: usize,
-
-    /// Warmup events (not included in measurements).
-    #[arg(long, default_value_t = 100_000)]
-    warmup: usize,
 }
 
 fn main() {
     let args = Args::parse();
 
     println!("=== Journal Writer Benchmark ===");
-    println!("Mode: {}", args.mode);
-    println!("Writer: {}", args.writer);
     println!("Events: {}", args.events);
     println!("Batch size: {}", args.batch_size);
-    println!("Warmup: {}", args.warmup);
     println!();
 
     let journal_path = std::path::PathBuf::from("/tmp/journal_writer_bench.journal");
+    // A missing file is the expected state on a fresh run.
     let _ = std::fs::remove_file(&journal_path);
 
-    match (args.mode.as_str(), args.writer.as_str()) {
-        ("sync", "sector") => {
-            let writer = SectorWriter::create(&journal_path).expect("create journal");
-            run_sync_mode(writer, args.events, args.batch_size, &journal_path);
-        }
-        ("sync", "buffered") => {
-            let writer = BufferedWriter::create(&journal_path).expect("create journal");
-            run_sync_mode(writer, args.events, args.batch_size, &journal_path);
-        }
-        ("iouring", "sector") => {
-            let writer = SectorWriter::create(&journal_path).expect("create journal");
-            run_iouring_mode(writer, args.events, args.batch_size, &journal_path);
-        }
-        ("iouring", "buffered") => {
-            eprintln!(
-                "error: --mode=iouring requires --writer=sector. \
-                 BufferedWriter has no fd-driven async path; in production a \
-                 buffered replica uses --mode=sync. Either pick \
-                 --writer=sector or --mode=sync."
-            );
-            std::process::exit(2);
-        }
-        (mode, writer) => {
-            eprintln!(
-                "error: unknown --mode={mode} --writer={writer}. \
-                 Modes: sync, iouring. Writers: sector, buffered."
-            );
-            std::process::exit(2);
-        }
-    }
+    let writer = BufferedWriter::create(&journal_path).expect("create journal");
+    run_sync_mode(writer, args.events, args.batch_size, &journal_path);
 }
 
 /// Build a `SubmitOrder` event for slot `i`. Alternates Buy/Sell so the
@@ -155,8 +117,10 @@ fn report(num_events: usize, elapsed_us: u128, journal_path: &Path) {
 }
 
 /// `flush_batch_sync` path — encodes a batch into the writer's internal
-/// buffer, then issues a single sync. Same path the journal stage runs
-/// in `run_sync`.
+/// buffer, then issues a single sync. This is the combined writer call,
+/// not the split sequencer/disk-thread pair production runs; it matches
+/// production's syscall shape only while the disk keeps up. See the
+/// module docs.
 fn run_sync_mode<W: JournalWrite<TradingEvent>>(
     mut writer: W,
     num_events: usize,
@@ -182,92 +146,6 @@ fn run_sync_mode<W: JournalWrite<TradingEvent>>(
             }
         }
         writer.flush_batch_sync().expect("sync");
-    }
-
-    report(num_events, start.elapsed().as_micros(), journal_path);
-}
-
-/// io_uring async submit + CQE poll path. Drives the writer's fd
-/// directly the way `run_uring` does in production on a sector replica.
-/// Sector-only; gated at the dispatch site in `main`.
-fn run_iouring_mode(
-    mut writer: SectorWriter<TradingEvent>,
-    num_events: usize,
-    batch_size: usize,
-    journal_path: &Path,
-) {
-    let mut io_uring = IoUring::new(256).expect("create io_uring ring");
-    let rw_flags = writer.io_uring_rw_flags();
-
-    println!("Measurement phase...");
-    let start = Instant::now();
-
-    let num_batches = num_events.div_ceil(batch_size);
-    let mut events_written = 0;
-    let mut inflight_count: usize = 0;
-    let inflight_limit = 32;
-
-    for batch_idx in 0..num_batches {
-        let batch_start = batch_idx * batch_size;
-        let batch_end = std::cmp::min(batch_start + batch_size, num_events);
-
-        for i in batch_start..batch_end {
-            let event = make_event(i);
-            writer
-                .batch_append_with_ts(&event, 0, 0, 0)
-                .expect("batch_append_with_ts");
-            events_written += 1;
-        }
-
-        match writer.take_batch_for_async_write() {
-            Ok(Some(async_batch)) => {
-                let sqe = io_uring::opcode::Write::new(
-                    io_uring::types::Fd(writer.fd()),
-                    async_batch.buf.as_ptr(),
-                    async_batch.len as u32,
-                )
-                .offset(async_batch.offset)
-                .rw_flags(rw_flags)
-                .build()
-                .user_data(1);
-
-                unsafe {
-                    io_uring.submission().push(&sqe).expect("SQ full");
-                }
-                inflight_count += 1;
-            }
-            Ok(None) => return,
-            Err(e) => panic!("take_batch_for_async_write failed: {:?}", e),
-        }
-
-        if inflight_count >= inflight_limit {
-            while let Some(cqe) = io_uring.completion().next() {
-                if cqe.result() < 0 {
-                    panic!("io_uring write failed: {}", -cqe.result());
-                }
-                inflight_count -= 1;
-                if inflight_count == 0 {
-                    break;
-                }
-            }
-        }
-
-        if inflight_count > 0 {
-            io_uring.submit().expect("io_uring submit");
-        }
-
-        while inflight_count > 0 {
-            while let Some(cqe) = io_uring.completion().next() {
-                if cqe.result() < 0 {
-                    panic!("io_uring write failed: {}", -cqe.result());
-                }
-                inflight_count -= 1;
-            }
-        }
-
-        if events_written % 10_000 == 0 {
-            println!("  Written {} events", events_written);
-        }
     }
 
     report(num_events, start.elapsed().as_micros(), journal_path);

@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,4,5,6,7,8,9,10` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep` (comma-separated). The tenth entry (`journal-prep`) is optional; a nine-value list leaves the preparer unpinned. Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk` (comma-separated). The tenth (`journal-prep`) and eleventh (`journal-disk`) entries are optional; a shorter list leaves those threads unpinned. Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -59,7 +59,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 
 The server supports synchronous replication. Exactly one of `--replication-bind`, `--standalone`, or `--replica-of` determines the replication mode. If none is specified, the server runs in implicit standalone mode (replication cursor at `u64::MAX`, responses gated only by the journal).
 
-With quorum durability (default), when 2 replicas are connected the response stage gates on replication acks alone — the local journal still writes but does not block responses. This removes NVMe fsync tail variance from the critical path. When fewer than 2 replicas are connected, responses are automatically gated on both journal and replication.
+Under the default `hybrid` durability mode the response stage releases an acknowledgement once the event is synced to the journal on at least one node — whichever of the primary or a replica finishes first — and held in memory on at least two. `replicated` drops the sync requirement, taking NVMe fsync tail variance off the critical path entirely; `durably-replicated` requires a sync on two nodes. See `--durability-mode` below for the full menu.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -70,7 +70,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
 | `--replication-batch-size` | `32` | Maximum replication ring batches to coalesce into a single TCP write+flush. Higher values reduce syscall overhead but increase per-write latency. |
 | `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
 | `--replication-ring-size` | `256` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 256 (128 MiB). See [Replication Ring Sizing](#replication-ring-sizing). |
-| `--durability-policy` | `persisted>=2 best_effort` | Policy that gates client responses. Syntax: one or more `<level>>=<n>[ best_effort]` clauses joined with `&&`. Levels are `persisted` (event written to NVMe via `O_DIRECT`, durable behind power-loss-protection capacitors) and `in_memory` (event accepted into the node's pipeline). The optional `best_effort` keyword marks the clause as degrade-friendly: the count clamps to the connected cluster shape rather than failing closed. Common values: `persisted>=1` (single-node durability), `persisted>=2` (strict two-node quorum; gate stalls if a replica disconnects), `persisted>=2 best_effort` (default; degrades to surviving cluster on a partial failure), `in_memory>=2` (weaker durability, removes fsync latency from the critical path). Active degradation surfaces on `/healthz` as `melin_durability_policy_degraded`. See the sequencer's [replication guide](https://github.com/melin-engine/melin/blob/main/docs/replication.md#durability-policy) for full grammar and worked examples. |
+| `--durability-mode` | `hybrid` | What a client acknowledgement guarantees. `local`: synced to the journal on one node; single-node durability, required with `--standalone`. `replicated`: held in memory on two nodes before the ack, with every journal sync trailing off the ack path (the journal still syncs every batch); lowest ack latency, survives any single node failure via failover, loses only the un-synced tail on a whole-cluster power loss — for slow-sync storage such as cloud volumes. `hybrid` (default): synced on one node — whichever finishes first — **and** held in memory on two; single-failure-safe with a brief RAM-only window on the second copy, ~50–80 µs per fill faster than `durably-replicated`. `durably-replicated`: synced on two nodes before the ack; no RAM-only window — compliance-driven venues. In every mode but `local` the gate stalls while no replica is connected. See the sequencer's [replication guide](https://github.com/melin-engine/melin/blob/main/docs/replication.md) for the operational menu. |
 | `--admin-bind` | (none) | Address for the operator admin endpoint. Authenticated with operator keys; accepts `PROMOTE\n` (replica → primary, replica nodes only) and `ROTATE\n` (archive the live journal segment — primaries only; replicas rotate where the primary announces). |
 
 ### Startup Sequence
@@ -80,7 +80,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
 3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
 4. Build the disruptor pipeline (input ring + output ring).
 5. Spawn I/O thread: in TCP mode, one io_uring reader thread that multiplexes every connection via multishot RECV; in DPDK mode, one poll thread per NIC queue.
-6. Spawn 3-6 pipeline OS threads: journal, matching, response, optionally repl-sender, optionally event-publisher, optionally shadow exchange -- each pinned to its `--cores` value.
+6. Spawn 4-7 pipeline OS threads: journal, journal-disk, matching, response, optionally repl-sender, optionally event-publisher, optionally shadow exchange -- each pinned to its `--cores` value.
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
 
@@ -92,7 +92,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9,10,11 \
     --max-journal-mib 512 \
     --standalone
 ```
@@ -106,14 +106,14 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9,10,11 \
     --max-journal-mib 512 \
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
-    --cores 1,2,3,4,5,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9,10,11 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
 ```
@@ -129,7 +129,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9,10,11 \
     --standalone
 ```
 
@@ -225,9 +225,9 @@ Recovery time is proportional to the number of journal entries replayed. With th
 
 ## Journal Management
 
-### Writer Mode
+### How Writes Reach Disk
 
-The `--journal-writer` flag picks how the journal stage writes batches to disk. The default `buffered` mode (`pwrite + fdatasync` per batch) is the production-ready writer and is safe on any drive. The `sector` mode (`O_DIRECT`, no `fdatasync`) is **experimental** — it's faster on enterprise NVMe with capacitor-backed PLP but **silently loses acknowledged writes on power loss without PLP**, and has an unresolved ~1 Hz tail-latency spike on some NVMe firmware. Do not run `sector` in production. See the sequencer's [Journal Writer Modes](https://github.com/melin-engine/melin/blob/main/docs/journal-writer-modes.md) guide for the full status, decision guide, verification commands, and migration procedure.
+The journal writes each batch with `pwrite` followed by `fdatasync`, so an acknowledged event is durable on any drive, with or without power-loss protection. The work is split across two threads: the journal stage orders and encodes events and feeds replicas, while a dedicated disk thread writes, syncs, and publishes the durable position that client responses wait on. The split keeps device latency off the sequencing thread; it does not change what "durable" means.
 
 ### How Rotation Works
 
@@ -307,7 +307,7 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
     --journal /mnt/nvme/melin.journal \
     --snapshot-path /var/lib/melin/melin.snapshot \
     --snapshot-interval-ms 60000 \
-    --cores 1,2,3,4,5,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9,10,11 \
     ...
 ```
 
@@ -439,7 +439,8 @@ The recommended core assignment for a production server:
 | 8 | Replication handler 0 | 8th |
 | 9 | Replication handler 1 | 9th |
 | 10 | Journal segment preparer | 10th (optional) |
-| 11+ | Available for other work (benchmarks, monitoring) | -- |
+| 11 | Journal disk thread (writes, syncs, publishes durability) | 11th (optional) |
+| 12+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`)
 
@@ -447,9 +448,9 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 
 `--cores 1,2,3,4,5,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, repl-sender→5, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. Use `0` for any position to leave that thread unpinned (OS-scheduled).
 
-A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage: `--cores 1,2,3,4,5,6,7,8,9,10`. This is the default, so a server started without `--cores` pins the preparer to core 10 — budget for it when planning the layout.
+A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage. An eleventh pins the journal disk thread — the half of the journal that writes each batch, syncs it, and publishes the durability position every acknowledgement waits on. It busy-spins like the other stages, so give it a dedicated core, and keep it on the same CCD as the journal stage: the two exchange a cache line on every batch. `--cores 1,2,3,4,5,6,7,8,9,10,11` is the default, so a server started without `--cores` takes cores 1-11 — budget for it when planning the layout.
 
-The entry is optional — a nine-value list leaves the preparer unpinned, so existing configurations keep their exact behaviour. If you carry over a nine-value `--cores` from a previous release you keep that older behaviour, and the preparer runs wherever the scheduler puts it (typically core 0, alongside the OS and IRQs).
+Both trailing entries are optional, and a short list leaves the threads it omits unpinned: a nine-value `--cores` leaves both the preparer and the disk thread unpinned, a ten-value one leaves the disk thread unpinned. Configurations carried over from a previous release therefore keep their exact behaviour, with the omitted threads running wherever the scheduler puts them (typically core 0, alongside the OS and IRQs). Leaving the disk thread there is the more costly of the two: it busy-spins and syncs on every batch, so sharing a core with the OS puts that contention directly under the durability position clients wait on.
 
 ### Kernel Boot Parameters (GRUB)
 
@@ -621,7 +622,7 @@ melin_trading_active 1
 | `melin_journal_rotations_total{path="..."}` | counter | Journal segment rotation attempts by outcome: `fast` adopted a pre-staged segment; `sync_fallback` allocated synchronously on the journal thread; `failed` left the current segment in place |
 | `melin_replica_divergence_total` | counter | Divergent replica handshakes on this primary (journal chain failed validation; replica routed through archive + re-seed). Alert on any growth — outside an expected failover rejoin it indicates possible data corruption |
 
-In `sector` mode, `melin_journal_rotations_total{path="sync_fallback"}` should stay flat in steady state — the first rotation after startup may take the synchronous path while the background staging warms up, but sustained growth means rotation stalls are landing on the order pipeline's critical path and is worth an alert. Any growth in `path="failed"` is alert-worthy on every configuration: rotation is failing (disk full, read-only filesystem) and the live segment keeps growing past its threshold. On a replica, a rotation that fails at a primary-announced boundary stalls the journal stage *at* that boundary and retries on the same backoff — the replica stops acking until the rotation succeeds (under `hybrid`/`durably-replicated` gating the primary feels that as durability backpressure), but it does not exit and recovers without intervention once the disk condition clears.
+`melin_journal_rotations_total{path="sync_fallback"}` should stay flat in steady state — the first rotation after startup may take the synchronous path while the background staging warms up, but sustained growth means rotation stalls are landing on the order pipeline's critical path and is worth an alert. Any growth in `path="failed"` is alert-worthy on every configuration: rotation is failing (disk full, read-only filesystem) and the live segment keeps growing past its threshold. On a replica, a rotation that fails at a primary-announced boundary stalls the journal stage *at* that boundary and retries on the same backoff — the replica stops acking until the rotation succeeds (under `hybrid`/`durably-replicated` gating the primary feels that as durability backpressure), but it does not exit and recovers without intervention once the disk condition clears.
 
 Use `rate(melin_stage_busy_total) / (rate(melin_stage_busy_total) + rate(melin_stage_idle_total))` for per-stage utilization percentage. The matching stage counts events (not batches), so its utilization is directly proportional to throughput.
 
@@ -760,7 +761,7 @@ The journal uses CRC32C checksums on every entry. If the server crashes during a
 
 - The partially written entry will fail CRC validation on recovery.
 - The `JournalReader` detects the truncated/corrupt entry and stops replaying at the last valid entry.
-- The `SectorWriter` reopens the file for appending at the valid data boundary, effectively truncating the garbage.
+- The journal reopens the file for appending at the valid data boundary, effectively truncating the garbage.
 - **One event may be lost** (the one being written at crash time). All prior events are intact.
 
 This is handled automatically. No manual intervention required.
