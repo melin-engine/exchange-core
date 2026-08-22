@@ -138,6 +138,7 @@ samples count without further coordination.
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
 | `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
 | `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). For roundtrip runs against the embedded server, N must be higher than every core in the server's `--cores` list, which is the authoritative layout — use 12. Use 1 for remote benchmarks on a dedicated machine with `isolcpus`, where no server shares the host. |
+| `--pipeline-cores <LIST>` | `1,2,3,4,5` | Pipeline-mode core assignment: `journal,matching,publisher,journal-disk,drain`. Applies to `--mode pipeline` only, which runs its own in-process pipeline rather than talking to a server. All five threads busy-spin, so a duplicate entry is rejected before anything is spawned. Use `0` to leave an entry unpinned. Keep `journal` and `journal-disk` on the same CCD — they exchange a cache line on every batch. |
 
 ### Feature flags
 

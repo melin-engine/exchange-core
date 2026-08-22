@@ -552,6 +552,15 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
+    /// Pipeline-mode core assignment, five comma-separated IDs in the
+    /// order `journal,matching,publisher,journal-disk,drain`. 0 leaves
+    /// an entry unpinned. Every one of these threads busy-spins, so two
+    /// on one core starve each other — the values are checked for
+    /// duplicates before anything is spawned. Keep `journal` and
+    /// `journal-disk` on the same CCD: they exchange a cache line on
+    /// every batch. Ignored outside `--mode pipeline`.
+    #[arg(long, value_delimiter = ',', default_value = "1,2,3,4,5")]
+    pipeline_cores: Vec<usize>,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -702,6 +711,13 @@ fn main() {
             );
         }
         "pipeline" => {
+            let cores = match resolve_pipeline_cores(&args.pipeline_cores) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
             run_pipeline_bench(
                 phases,
                 args.window,
@@ -711,6 +727,7 @@ fn main() {
                 args.max_journal_batch,
                 args.target_rate,
                 args.max_reject_pct,
+                cores,
             );
         }
         "roundtrip" => {
@@ -1233,6 +1250,66 @@ fn run_engine_bench(
 // Pipeline benchmark (disruptor + journal + matching, no network)
 // ===========================================================================
 
+/// Entries `--pipeline-cores` expects: journal, matching, publisher,
+/// journal-disk, drain.
+const PIPELINE_CORE_SLOTS: usize = 5;
+
+/// Pipeline-mode core assignment, resolved from `--pipeline-cores`. A
+/// field of 0 leaves that thread unpinned (OS-scheduled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PipelineBenchCores {
+    journal: usize,
+    matching: usize,
+    publisher: usize,
+    journal_disk: usize,
+    drain: usize,
+}
+
+/// Parse `--pipeline-cores` and reject any layout that would put two
+/// busy-spinning threads on one core. That collision does not announce
+/// itself: `pin_to_core` promotes to SCHED_FIFO on an isolated core, so
+/// one thread spins and the other starves, and the run reports a
+/// plausible-looking but meaningless number.
+fn resolve_pipeline_cores(v: &[usize]) -> Result<PipelineBenchCores, String> {
+    if v.len() != PIPELINE_CORE_SLOTS {
+        return Err(format!(
+            "--pipeline-cores expects {PIPELINE_CORE_SLOTS} comma-separated IDs \
+             (journal,matching,publisher,journal-disk,drain), got {}",
+            v.len()
+        ));
+    }
+    let cores = PipelineBenchCores {
+        journal: v[0],
+        matching: v[1],
+        publisher: v[2],
+        journal_disk: v[3],
+        drain: v[4],
+    };
+    // (core, owner) so a duplicate can name both sides of the clash
+    // rather than just the number.
+    let claimed = [
+        (cores.journal, "journal"),
+        (cores.matching, "matching"),
+        (cores.publisher, "publisher"),
+        (cores.journal_disk, "journal-disk"),
+        (cores.drain, "drain"),
+    ];
+    for i in 0..claimed.len() {
+        for j in (i + 1)..claimed.len() {
+            // 0 is the unpinned sentinel, not a core — any number of
+            // threads may share it.
+            if claimed[i].0 != 0 && claimed[i].0 == claimed[j].0 {
+                return Err(format!(
+                    "core {} claimed by both {} and {} — two pinned spinners on one core \
+                     starve each other",
+                    claimed[i].0, claimed[i].1, claimed[j].1
+                ));
+            }
+        }
+    }
+    Ok(cores)
+}
+
 /// Pipeline benchmark. Builds the full disruptor pipeline (journal stage +
 /// matching stage) but bypasses TCP/UDS transport. The bench thread publishes
 /// InputSlots directly to the input Producer and drains OutputSlots from the
@@ -1247,6 +1324,7 @@ fn run_pipeline_bench(
     max_journal_batch: usize,
     target_rate: u64,
     max_reject_pct: f64,
+    cores: PipelineBenchCores,
 ) {
     use melin_journal::BufferedWriter;
 
@@ -1272,6 +1350,7 @@ fn run_pipeline_bench(
         json_path,
         target_rate,
         max_reject_pct,
+        cores,
     };
 
     run_pipeline_inner(
@@ -1293,12 +1372,15 @@ struct PipelineInnerCfg<'a> {
     json_path: Option<&'a std::path::Path>,
     target_rate: u64,
     max_reject_pct: f64,
+    cores: PipelineBenchCores,
 }
 
 use melin_trading::trading_event::TradingEvent;
 
-/// Pipeline-mode body: builds the pipeline around `writer`, runs the
-/// stages on cores 1-4, and drives the load from the calling thread.
+/// Pipeline-mode body: builds the pipeline around `writer`, spawns the
+/// journal, matching and publisher threads, and drains from the calling
+/// thread. Every one of those threads plus the journal's disk thread is
+/// pinned per `cfg.cores` — see `--pipeline-cores`.
 fn run_pipeline_inner(
     app: ServerApp,
     writer: melin_journal::BufferedWriter<TradingEvent>,
@@ -1317,7 +1399,14 @@ fn run_pipeline_inner(
         json_path,
         target_rate,
         max_reject_pct,
+        cores,
     } = cfg;
+
+    eprintln!(
+        "  Pipeline cores: journal={} matching={} publisher={} journal-disk={} drain={} \
+         (0 = unpinned)",
+        cores.journal, cores.matching, cores.publisher, cores.journal_disk, cores.drain,
+    );
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -1347,15 +1436,17 @@ fn run_pipeline_inner(
     // and publishes the durability cursors. Unpinned it is OS-scheduled
     // like any other thread, which on an isolcpus host means it lands
     // on a housekeeping core and its jitter shows up as journal tail.
-    // Pin it like the other stages: core 4 is the next one after the
-    // stage cores 1-3 and on the same CCD, which keeps the per-batch
-    // hand-off cache line local.
-    journal_stage.set_disk_core(4);
+    // The stage spawns it itself, from the journal thread, so the core
+    // has to be handed over before `run`.
+    journal_stage.set_disk_core(cores.journal_disk);
+    let journal_core = cores.journal;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            if let Err(e) = melin_app::affinity::pin_to_core(1) {
-                eprintln!("warning: could not pin journal to core 1: {e}");
+            if journal_core != 0
+                && let Err(e) = melin_app::affinity::pin_to_core(journal_core)
+            {
+                eprintln!("warning: could not pin journal to core {journal_core}: {e}");
             }
             journal_stage.run(&shutdown_j)
         })
@@ -1363,11 +1454,14 @@ fn run_pipeline_inner(
 
     let shutdown_m = Arc::clone(&shutdown);
     let matching_stage = out.matching_stage;
+    let matching_core = cores.matching;
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            if let Err(e) = melin_app::affinity::pin_to_core(2) {
-                eprintln!("warning: could not pin matching to core 2: {e}");
+            if matching_core != 0
+                && let Err(e) = melin_app::affinity::pin_to_core(matching_core)
+            {
+                eprintln!("warning: could not pin matching to core {matching_core}: {e}");
             }
             matching_stage.run(&shutdown_m)
         })
@@ -1412,11 +1506,14 @@ fn run_pipeline_inner(
     let pub_stop_p = Arc::clone(&pub_stop);
     let pace_stats = Arc::new(PaceStats::default());
     let pace_stats_pub = Arc::clone(&pace_stats);
+    let publisher_core = cores.publisher;
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
         .spawn(move || {
-            if let Err(e) = melin_app::affinity::pin_to_core(3) {
-                eprintln!("warning: could not pin pipeline-pub to core 3: {e}");
+            if publisher_core != 0
+                && let Err(e) = melin_app::affinity::pin_to_core(publisher_core)
+            {
+                eprintln!("warning: could not pin pipeline-pub to core {publisher_core}: {e}");
             }
             // Pacer is built inside the thread so its TSC start aligns
             // with the publisher's pinned-core clock. Pipeline mode has
@@ -1515,6 +1612,16 @@ fn run_pipeline_inner(
         .expect("spawn pipeline publish thread");
 
     // Drain thread (this thread): consume output SPSC and record latency.
+    // It busy-spins on `try_consume` exactly like the stages do, so it
+    // needs a core of its own. Left unpinned it inherits whatever the
+    // process started on — core 0 on an isolcpus host, alongside the OS
+    // and IRQs — and the resulting scheduling jitter lands directly in
+    // the measured histogram as a millisecond-scale tail.
+    if cores.drain != 0
+        && let Err(e) = melin_app::affinity::pin_to_core(cores.drain)
+    {
+        eprintln!("warning: could not pin drain to core {}: {e}", cores.drain);
+    }
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut measured_orders: u64 = 0;
@@ -3381,6 +3488,60 @@ fn tempdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("melin-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+#[cfg(test)]
+mod pipeline_core_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn five_entries_map_in_documented_order() {
+        let cores = resolve_pipeline_cores(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(
+            cores,
+            PipelineBenchCores {
+                journal: 1,
+                matching: 2,
+                publisher: 3,
+                journal_disk: 4,
+                drain: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn the_default_flag_value_parses() {
+        // Guards the `default_value` string on `--pipeline-cores` against
+        // drifting out of sync with `PIPELINE_CORE_SLOTS`.
+        let parsed = BenchArgs::parse_from(["melin-bench"]).pipeline_cores;
+        assert!(resolve_pipeline_cores(&parsed).is_ok(), "{parsed:?}");
+    }
+
+    #[test]
+    fn wrong_arity_is_rejected() {
+        let err = resolve_pipeline_cores(&[1, 2, 3, 4]).unwrap_err();
+        assert!(err.contains("expects 5"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_core_names_both_claimants() {
+        // The collision the old hardcoded layout invited: the drain
+        // thread landing on the journal's disk core.
+        let err = resolve_pipeline_cores(&[1, 2, 3, 4, 4]).unwrap_err();
+        assert!(err.contains("core 4"), "{err}");
+        assert!(err.contains("journal-disk"), "{err}");
+        assert!(err.contains("drain"), "{err}");
+    }
+
+    #[test]
+    fn zero_is_an_unpinned_sentinel_not_a_core() {
+        // Several threads may be left unpinned at once; 0 must not read
+        // as a duplicate claim on core 0.
+        let cores = resolve_pipeline_cores(&[1, 0, 0, 0, 0]).unwrap();
+        assert_eq!(cores.journal, 1);
+        assert_eq!(cores.drain, 0);
+    }
 }
 
 #[cfg(test)]
