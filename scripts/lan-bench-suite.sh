@@ -1222,11 +1222,16 @@ load_dpdk_config() {
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
-        local vlan_id gateway gateway_mac peer_ip
+        local vlan_id gateway gateway_mac peer_ip dpdk_mac
         vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
         gateway=$(echo "$conf" | grep "^DPDK_GATEWAY=" | cut -d= -f2 || true)
         gateway_mac=$(echo "$conf" | grep "^DPDK_GATEWAY_MAC=" | cut -d= -f2 || true)
         peer_ip=$(echo "$conf" | grep "^DPDK_PEER_IP=" | cut -d= -f2 || true)
+        # The port's own hardware MAC (mlx5 bifurcated writes it). Peers
+        # that must address this host before any ARP exchange read it
+        # from here — an SR-IOV VF's MAC is derivable from its IP, a real
+        # one is not.
+        dpdk_mac=$(echo "$conf" | grep "^DPDK_MAC=" | cut -d= -f2 || true)
         # Strip surrounding double quotes from multi-word values (mlx5
         # writes `DPDK_EAL_ARGS="…"` so `source` / `eval` consumers
         # don't misparse it; we have to undo the quoting on the
@@ -1242,7 +1247,31 @@ load_dpdk_config() {
         eval "${prefix}_DPDK_GATEWAY=${gateway:-}"
         eval "${prefix}_DPDK_GATEWAY_MAC=${gateway_mac:-}"
         eval "${prefix}_DPDK_PEER_IP=${peer_ip:-}"
+        eval "${prefix}_DPDK_MAC=${dpdk_mac:-}"
     fi
+}
+
+# `--dpdk-vlan <id>`, or empty when the host's conf carries no VLAN_ID.
+#
+# Every DPDK launch site must route through this. The VLAN flag was
+# previously built inline at the standalone site only, so the replicated
+# transports silently ran untagged: on a fabric that expects 802.1Q the
+# switch drops those frames without an error on either side, which looks
+# exactly like a client that connects and then hangs.
+_dpdk_vlan_arg() {
+    local id="${1:-}"
+    [[ -n "$id" ]] && printf -- '--dpdk-vlan %s' "$id"
+    return 0
+}
+
+# `--dpdk-peer-mac <mac>`, or empty when the peer's conf carries no
+# DPDK_MAC. Needed wherever the peer keeps a real hardware address
+# instead of the SR-IOV `02:00:<ip>` convention the client would
+# otherwise derive — i.e. every mlx5 bifurcated setup.
+_dpdk_peer_mac_arg() {
+    local mac="${1:-}"
+    [[ -n "$mac" ]] && printf -- '--dpdk-peer-mac %s' "$mac"
+    return 0
 }
 
 DPDK_SRIOV_DONE=0
@@ -1518,10 +1547,8 @@ transport_start_dpdk() {
     local server_eal
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
 
-    local vlan_arg=""
-    if [[ -n "${SERVER_DPDK_VLAN:-}" ]]; then
-        vlan_arg="--dpdk-vlan ${SERVER_DPDK_VLAN}"
-    fi
+    local vlan_arg
+    vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
 
     # L3 bifurcated mode: smoltcp talks over the public NIC, so it needs
     # the gateway IP + MAC (for default route) and the peer IP (for the
@@ -1563,11 +1590,14 @@ transport_start_dpdk() {
     else
         local bench_eal
         bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
-        local bench_vlan_arg=""
-        if [[ -n "${BENCH_DPDK_VLAN:-}" && "$DPDK_MODE" != "l3" ]]; then
-            bench_vlan_arg="--dpdk-vlan ${BENCH_DPDK_VLAN}"
+        local bench_vlan_arg="" bench_peer_mac_arg=""
+        if [[ "$DPDK_MODE" != "l3" ]]; then
+            # L3 seeds the peer via --dpdk-gateway-mac below and carries
+            # no VLAN, so both of these belong to the non-L3 paths only.
+            bench_vlan_arg=$(_dpdk_vlan_arg "${BENCH_DPDK_VLAN:-}")
+            bench_peer_mac_arg=$(_dpdk_peer_mac_arg "${SERVER_DPDK_MAC:-}")
         fi
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg}"
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg} ${bench_peer_mac_arg}"
         if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
             BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
         fi
@@ -1619,9 +1649,11 @@ transport_start_dpdk_repl() {
         REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
     fi
 
-    local server_eal replica_eal
+    local server_eal replica_eal server_vlan_arg replica_vlan_arg
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
     replica_eal=$(_resolve_dpdk_eal_args "${REPLICA_DPDK_EAL_ARGS:-}")
+    server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
+    replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
 
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
@@ -1634,6 +1666,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${server_vlan_arg} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1650,6 +1683,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${replica_vlan_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1661,9 +1695,11 @@ transport_start_dpdk_repl() {
         add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
         BENCH_DPDK_ARGS=""
     else
-        local bench_eal
+        local bench_eal bench_vlan_arg bench_peer_mac_arg
         bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+        bench_vlan_arg=$(_dpdk_vlan_arg "${BENCH_DPDK_VLAN:-}")
+        bench_peer_mac_arg=$(_dpdk_peer_mac_arg "${SERVER_DPDK_MAC:-}")
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg} ${bench_peer_mac_arg}"
         if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
             BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
         fi
@@ -1728,9 +1764,13 @@ transport_start_dpdk_dual_repl() {
     fi
 
     local server_eal replica_eal replica2_eal
+    local server_vlan_arg replica_vlan_arg replica2_vlan_arg
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
     replica_eal=$(_resolve_dpdk_eal_args "${REPLICA_DPDK_EAL_ARGS:-}")
     replica2_eal=$(_resolve_dpdk_eal_args "${REPLICA2_DPDK_EAL_ARGS:-}")
+    server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
+    replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
+    replica2_vlan_arg=$(_dpdk_vlan_arg "${REPLICA2_DPDK_VLAN:-}")
 
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
@@ -1743,6 +1783,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${server_vlan_arg} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1759,6 +1800,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${replica_vlan_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1773,7 +1815,8 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${REPLICA2_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA2_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA2_DPDK_PORT} \
-            ${REPLICA_EXTRA_ARGS:-} \
+            ${replica2_vlan_arg} \
+            ${REPLICA2_EXTRA_ARGS:-${REPLICA_EXTRA_ARGS:-}} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
@@ -1784,9 +1827,11 @@ transport_start_dpdk_dual_repl() {
         add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
         BENCH_DPDK_ARGS=""
     else
-        local bench_eal
+        local bench_eal bench_vlan_arg bench_peer_mac_arg
         bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+        bench_vlan_arg=$(_dpdk_vlan_arg "${BENCH_DPDK_VLAN:-}")
+        bench_peer_mac_arg=$(_dpdk_peer_mac_arg "${SERVER_DPDK_MAC:-}")
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg} ${bench_peer_mac_arg}"
         if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
             BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
         fi
