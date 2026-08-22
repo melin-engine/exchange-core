@@ -153,6 +153,16 @@ echo ""
 # ---------------------------------------------------------------------------
 # Core isolation, tick suppression, and latency tuning — all persistent
 # across reboots via GRUB.
+#
+# These are applied through a drop-in at /etc/default/grub.d rather than by
+# editing /etc/default/grub, and every one is verified against the generated
+# grub.cfg and /proc/cmdline afterwards. Both choices are deliberate: the
+# previous version `sed`-ed `GRUB_CMDLINE_LINUX_DEFAULT`, which some vendor
+# images (latitude.sh Debian 13 among them) do not define at all. The
+# substitution matched nothing, `update-grub` ran over an unchanged file, and
+# the script still printed "REBOOT REQUIRED" — so hosts booted completely
+# untuned while looking configured, and every re-run repeated the no-op
+# because its guard was "does /etc/default/grub mention isolcpus".
 #   isolcpus/nohz_full/rcu_nocbs: isolate cores 1..N-1 from scheduler/timers/RCU,
 #     where N is the number of physical cores (detected at setup time so the
 #     same script works on a 16-core 9950X and a 24-core EPYC 9255). Only
@@ -182,6 +192,15 @@ echo ""
 #     cadence in `perf record -e timer:timer_start` disappears and the bench's
 #     p99.99999 drops ~79% (102µs → 21µs).
 GRUB_FILE="/etc/default/grub"
+# Debian's grub-mkconfig sources /etc/default/grub, then every *.cfg in
+# this directory. Owning a file here means never editing the vendor's.
+GRUB_DROPIN_DIR="/etc/default/grub.d"
+GRUB_DROPIN="${GRUB_DROPIN_DIR}/99-melin-bench.cfg"
+# What update-grub generates, and therefore what the next boot reads.
+GRUB_CFG="/boot/grub/grub.cfg"
+# Dropped on a reboot, which is exactly the lifetime we want: its presence
+# means "staged but not yet live". Overridable for tests.
+REBOOT_FLAG="${REBOOT_FLAG:-/tmp/.server-needs-reboot}"
 
 # Count unique physical cores. `lscpu -p=CORE` lists one row per logical CPU
 # with its physical core ID; sort -u collapses SMT siblings. nosmt is set
@@ -195,92 +214,171 @@ LAST_ISOLATED=$((PHYSICAL_CORES - 1))
 ISOLATED_RANGE="1-${LAST_ISOLATED}"
 echo "  detected $PHYSICAL_CORES physical cores → isolating ${ISOLATED_RANGE}"
 
-BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt tsc=nowatchdog"
+# Every kernel parameter this script manages, one array element each so
+# the verification pass below can check them independently rather than
+# trusting that a single string edit landed.
+KERNEL_PARAMS=(
+    "isolcpus=nohz,domain,${ISOLATED_RANGE}"
+    "nohz_full=${ISOLATED_RANGE}"
+    "rcu_nocbs=${ISOLATED_RANGE}"
+    "nowatchdog"
+    "transparent_hugepage=never"
+    "cpufreq.default_governor=performance"
+    "processor.max_cstate=1"
+    "skew_tick=1"
+    "nosmt"
+    "tsc=nowatchdog"
+)
 # IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
 # bypasses IOMMU translation for performance. intel_iommu=on is
 # Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
 # automatically when iommu=pt is set.
 if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
-    IOMMU_PARAMS="iommu=pt"
+    KERNEL_PARAMS+=("iommu=pt")
 else
-    IOMMU_PARAMS="intel_iommu=on iommu=pt"
+    KERNEL_PARAMS+=("intel_iommu=on" "iommu=pt")
 fi
+BENCH_PARAMS="${KERNEL_PARAMS[*]}"
 
-if [[ -f "$GRUB_FILE" ]]; then
-    NEEDS_UPDATE=0
-    NEEDS_RANGE_REWRITE=0
+# Is `param` present on the running kernel's command line? Exact token
+# match against a split /proc/cmdline — a substring test would accept
+# `nosmt` inside an unrelated value, and miss nothing we care about.
+# `CMDLINE_SOURCE` is a seam for scripts/test-server-setup.sh; in a real
+# run it is always /proc/cmdline.
+kernel_param_live() {
+    local needle="$1" item
+    for item in $(cat "${CMDLINE_SOURCE:-/proc/cmdline}"); do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
 
-    if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
-        echo "=== Adding kernel boot parameters ==="
-        echo "  Adding: $BENCH_PARAMS"
-        NEEDS_UPDATE=1
+# Is `param` on a kernel line of the generated grub config? Tokenises the
+# `linux` lines and compares whole words, for the same reason the live
+# check does: a substring test would let `nosmtfoo` satisfy `nosmt`, and
+# report a host as tuned when it is not.
+kernel_param_in_cfg() {
+    awk -v want="$1" '
+        /^[[:space:]]*linux(16|efi)?[[:space:]]/ {
+            for (i = 2; i <= NF; i++) if ($i == want) found = 1
+        }
+        END { exit !found }
+    ' "$GRUB_CFG" 2>/dev/null
+}
+
+# List the distinct values a `key=` parameter takes on the generated
+# kernel lines. More than one means the same knob is set twice with
+# different settings, and which one wins is not something to leave to
+# chance. The case that produces it: a host provisioned by the older
+# script, whose params were baked into /etc/default/grub directly, now
+# also getting them from the drop-in — e.g. a stale `isolcpus=...,1-10`
+# from a previous host size alongside this run's `1-5`.
+kernel_param_values_in_cfg() {
+    awk -v key="$1" '
+        /^[[:space:]]*linux(16|efi)?[[:space:]]/ {
+            for (i = 2; i <= NF; i++) {
+                if (index($i, key) == 1) seen[$i] = 1
+            }
+        }
+        END { for (v in seen) print v }
+    ' "$GRUB_CFG" 2>/dev/null | sort -u
+}
+
+# Report which managed params are missing from a generated grub.cfg and
+# from the running kernel, then classify the outcome. This exists because
+# the previous implementation could not tell "wrote the params" from
+# "wrote nothing": it `sed`-ed a line that some vendor images don't have,
+# ran update-grub over the unchanged file, and still announced success.
+verify_kernel_params() {
+    local missing_cfg=() missing_live=() p key values
+
+    # Conflicting duplicates first: a param that is present twice would
+    # otherwise pass the "did it land" check below while leaving the
+    # effective setting ambiguous.
+    for p in "${KERNEL_PARAMS[@]}"; do
+        [[ "$p" == *=* ]] || continue
+        key="${p%%=*}="
+        values=$(kernel_param_values_in_cfg "$key")
+        if [[ $(wc -l <<< "$values") -gt 1 ]]; then
+            echo "error: '${key%=}' is set more than once in $GRUB_CFG:" >&2
+            # Unquoted on purpose: $values is newline-separated and kernel
+            # parameters cannot contain whitespace, so this splits into one
+            # argument per value.
+            # shellcheck disable=SC2086
+            printf '         %s\n' $values >&2
+            echo "  This host was probably provisioned by an older version of this" >&2
+            echo "  script, which wrote the parameters into $GRUB_FILE directly." >&2
+            echo "  Remove them from that file's GRUB_CMDLINE_LINUX* lines and re-run;" >&2
+            echo "  the drop-in at $GRUB_DROPIN is now the only place they belong." >&2
+            return 1
+        fi
+    done
+
+    for p in "${KERNEL_PARAMS[@]}"; do
+        kernel_param_in_cfg "$p" || missing_cfg+=("$p")
+        kernel_param_live "$p" || missing_live+=("$p")
+    done
+
+    if [[ "${#missing_cfg[@]}" -gt 0 ]]; then
+        echo "error: these parameters did not reach $GRUB_CFG:" >&2
+        printf '         %s\n' "${missing_cfg[@]}" >&2
+        echo "  The drop-in at $GRUB_DROPIN was written and update-grub ran," >&2
+        echo "  but the generated config does not carry the parameters. Do not" >&2
+        echo "  benchmark this host: it will boot untuned while looking configured." >&2
+        return 1
+    fi
+
+    if [[ "${#missing_live[@]}" -gt 0 ]]; then
+        touch "$REBOOT_FLAG"
+        echo "  In $GRUB_CFG but not yet on the running kernel:"
+        printf '    %s\n' "${missing_live[@]}"
+        echo "  *** REBOOT REQUIRED for these to take effect ***"
     else
-        # isolcpus is present — check whether the range matches what this
-        # host actually needs. A 9950X-tuned config (1-10) on a 24-core
-        # 9255 leaves cores 11-23 unisolated, which is exactly the bug
-        # this script is meant to prevent.
-        CURRENT_RANGE=$(grep -oE 'isolcpus=nohz,domain,[0-9-]+' "$GRUB_FILE" | sed 's/^isolcpus=nohz,domain,//')
-        if [[ -n "$CURRENT_RANGE" && "$CURRENT_RANGE" != "$ISOLATED_RANGE" ]]; then
-            echo "=== Updating isolcpus range ==="
-            echo "  Current: $CURRENT_RANGE → Desired: $ISOLATED_RANGE"
-            NEEDS_RANGE_REWRITE=1
-        fi
+        echo "  All ${#KERNEL_PARAMS[@]} parameters are active on the running kernel."
     fi
+    return 0
+}
 
-    if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
-        echo "  Adding IOMMU passthrough for DPDK: $IOMMU_PARAMS"
-        NEEDS_UPDATE=1
-    fi
-
-    # tsc=nowatchdog is checked independently of `isolcpus` so it can be
-    # backfilled onto already-set-up boxes whose grub line predates this
-    # parameter (the original BENCH_PARAMS bundle is only re-emitted in
-    # the "isolcpus missing" path).
-    if ! grep -q "tsc=nowatchdog" "$GRUB_FILE" 2>/dev/null; then
-        echo "  Adding tsc=nowatchdog (disables the clocksource watchdog)"
-        NEEDS_UPDATE=1
-    fi
-
-    if [[ "$NEEDS_UPDATE" -eq 1 || "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
-        cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-
-        if [[ "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
-            # Rewrite the three core-range parameters in place. We match
-            # the parameter name + value so unrelated numeric ranges
-            # elsewhere on the line are unaffected.
-            sed -i -E "s/isolcpus=nohz,domain,[0-9-]+/isolcpus=nohz,domain,${ISOLATED_RANGE}/" "$GRUB_FILE"
-            sed -i -E "s/nohz_full=[0-9-]+/nohz_full=${ISOLATED_RANGE}/" "$GRUB_FILE"
-            sed -i -E "s/rcu_nocbs=[0-9-]+/rcu_nocbs=${ISOLATED_RANGE}/" "$GRUB_FILE"
-        fi
-
-        if [[ "$NEEDS_UPDATE" -eq 1 ]]; then
-            # Append any missing parameter blocks (initial install path).
-            ADD_PARAMS=""
-            if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
-                ADD_PARAMS="$BENCH_PARAMS"
-            fi
-            if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
-                ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
-            fi
-            # Backfill tsc=nowatchdog onto boxes whose grub already has
-            # isolcpus (so BENCH_PARAMS wasn't re-applied above).
-            if ! grep -q "tsc=nowatchdog" "$GRUB_FILE" 2>/dev/null; then
-                ADD_PARAMS="$ADD_PARAMS tsc=nowatchdog"
-            fi
-            if [[ -n "$ADD_PARAMS" ]]; then
-                sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
-            fi
-        fi
-
-        update-grub
-        touch /tmp/.server-needs-reboot
-        echo "  *** REBOOT REQUIRED for new kernel params to take effect ***"
-    else
-        echo "=== Kernel boot params already configured ==="
-        grep "GRUB_CMDLINE_LINUX_DEFAULT" "$GRUB_FILE"
-    fi
-else
+if [[ ! -f "$GRUB_FILE" ]]; then
     echo "=== No GRUB config found, skipping kernel boot params ==="
+elif ! grep -q "default/grub\.d" /usr/sbin/grub-mkconfig 2>/dev/null; then
+    # Bail loudly rather than fall back to editing the vendor file. The
+    # fallback is what produced the silent no-op this rewrite fixes.
+    echo "error: this host's grub-mkconfig does not source /etc/default/grub.d," >&2
+    echo "  so the drop-in would be ignored. Kernel tuning cannot be applied" >&2
+    echo "  safely here — configure $GRUB_FILE by hand." >&2
+    exit 1
+else
+    echo "=== Configuring kernel boot parameters ==="
+    # The drop-in is regenerated on every run and owned entirely by this
+    # script, which is what makes the step idempotent: there is no
+    # in-place edit to detect, re-detect, or accidentally apply twice, and
+    # a changed core count simply rewrites the file.
+    #
+    # It appends to GRUB_CMDLINE_LINUX rather than GRUB_CMDLINE_LINUX_DEFAULT
+    # because only the former is guaranteed to exist — the latitude.sh
+    # Debian 13 image ships GRUB_CMDLINE_LINUX alone, and the old
+    # `sed` targeting `_DEFAULT` silently matched nothing there. Debian's
+    # grub-mkconfig puts GRUB_CMDLINE_LINUX on both the normal and the
+    # recovery entry, so this also covers a recovery boot.
+    mkdir -p "$GRUB_DROPIN_DIR"
+    cat > "$GRUB_DROPIN" << EOF
+# Melin benchmark tuning — generated by scripts/server-setup.sh.
+# Do not edit: this file is overwritten on every setup run. Change the
+# KERNEL_PARAMS array in that script instead.
+GRUB_CMDLINE_LINUX="\${GRUB_CMDLINE_LINUX} ${BENCH_PARAMS}"
+EOF
+    echo "  Wrote $GRUB_DROPIN"
+    echo "  Params: $BENCH_PARAMS"
+
+    update-grub
+
+    # Explicit rather than leaning on `set -e`: a host whose params did
+    # not land must stop the run, not continue into the rest of setup
+    # looking healthy.
+    if ! verify_kernel_params; then
+        exit 1
+    fi
 fi
 
 echo ""
@@ -355,6 +453,70 @@ systemctl enable melin-irq-pin.service
 # Apply now too so we don't need to wait for a reboot.
 /usr/local/sbin/melin-irq-pin
 echo "  IRQ pin service installed and applied"
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 3b''. Force the performance CPU governor
+# ---------------------------------------------------------------------------
+# `cpufreq.default_governor=performance` is on the kernel cmdline, but that
+# only applies to policies created after the parameter is parsed — and it
+# does nothing at all on a host that has not yet rebooted into the tuned
+# cmdline. Set the governor directly as well, so a box is correct either
+# way and the two mechanisms cover each other.
+echo "=== Forcing the performance CPU governor ==="
+cat > /usr/local/sbin/melin-cpu-governor << 'EOF'
+#!/usr/bin/env bash
+# Pin every CPU to the performance governor (Melin bench tuning).
+set -u
+applied=0
+skipped=0
+for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    if [ -w "$gov" ] && printf 'performance' > "$gov" 2>/dev/null; then
+        applied=$((applied + 1))
+    else
+        skipped=$((skipped + 1))
+    fi
+done
+# amd-pstate-epp and intel_pstate in active mode take a second hint beyond
+# the governor: the energy/performance preference. Selecting the
+# performance governor normally drives EPP to `performance` too, so this
+# is belt-and-braces for a driver that decouples them. Best-effort by
+# design — not every driver exposes or accepts a write here, and the
+# governor above is the setting that actually decides frequency.
+for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+    [ -w "$epp" ] && printf 'performance' > "$epp" 2>/dev/null
+done
+logger -t melin-cpu-governor "applied=${applied} skipped=${skipped}"
+EOF
+chmod +x /usr/local/sbin/melin-cpu-governor
+
+cat > /etc/systemd/system/melin-cpu-governor.service << 'EOF'
+[Unit]
+Description=Force the performance CPU governor (Melin bench tuning)
+After=multi-user.target
+# Debian's ondemand.service sets a governor at boot on some releases.
+# Order after it so we are the last writer if it is ever present.
+After=ondemand.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/melin-cpu-governor
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable melin-cpu-governor.service
+# Apply now too so we don't need to wait for a reboot.
+/usr/local/sbin/melin-cpu-governor
+GOVERNOR_NOW=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unavailable")
+echo "  Governor service installed and applied (cpu0 now: ${GOVERNOR_NOW})"
+if [[ "$GOVERNOR_NOW" != "performance" && "$GOVERNOR_NOW" != "unavailable" ]]; then
+    echo "  warning: cpu0 governor is '${GOVERNOR_NOW}', not 'performance' — frequency"
+    echo "           scaling transitions will show up in the latency tail."
+fi
 
 echo ""
 
@@ -725,10 +887,17 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Reboot if kernel boot params were added (isolcpus)"
+if [[ -f "$REBOOT_FLAG" ]]; then
+    echo "  1. REBOOT — kernel params are staged but not yet active (see above)"
+else
+    echo "  1. No reboot needed — every kernel param is already active"
+fi
 echo "  2. Verify after reboot:"
-echo "     cat /sys/devices/system/cpu/isolated   # should show: 1-10"
-echo "     cat /sys/devices/system/cpu/nohz_full  # should show: 1-10"
+echo "     cat /sys/devices/system/cpu/isolated   # should show: ${ISOLATED_RANGE}"
+echo "     cat /sys/devices/system/cpu/nohz_full  # should show: ${ISOLATED_RANGE}"
+echo "     cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor  # performance"
+echo "     Re-running this script is the fastest full check: it re-verifies"
+echo "     every managed param against /proc/cmdline and fails loudly on a gap."
 echo ""
 echo "  3. Run the LAN benchmark from your local machine:"
 echo "     ./scripts/lan-bench.sh <server-pub-ip> <bench-pub-ip> <server-vlan-ip>"
