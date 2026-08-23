@@ -13,6 +13,12 @@
 # Usage:
 #   sudo ./scripts/dpdk/dpdk-replication-smoke-test.sh
 #   sudo REAL_MACS=1 ./scripts/dpdk/dpdk-replication-smoke-test.sh
+#   sudo YIELD_IDLE=1 ./scripts/dpdk/dpdk-replication-smoke-test.sh
+#
+# Primary and replica are given disjoint core sets when the host has
+# enough cores, because both busy-spin by default and sharing a core makes
+# one starve the other. YIELD_IDLE=1 forces the small-host fallback
+# (shared cores, --yield-idle on both) so that path can be tested anywhere.
 #
 # REAL_MACS=1 leaves the veth pair on its kernel-assigned MACs and passes
 # the primary's real address as --dpdk-peer-mac, instead of arranging for
@@ -279,6 +285,73 @@ if command -v tcpdump >/dev/null 2>&1; then
 fi
 echo ""
 
+# --- 4b. Core assignment ---
+#
+# Two full servers share this machine, and every pipeline stage busy-spins
+# under SCHED_FIFO unless --yield-idle is given. On melin's default
+# `--cores 1,...,11` both processes pin to identical cores; two spinners on
+# one core means one never runs. The observed symptom is the replica
+# authenticating in the first millisecond and then going silent until the
+# harness gives up with "Replica not streaming after 15s" — which reads as
+# a transport failure and is nothing of the sort.
+#
+# Prefer disjoint sets, since that keeps the production busy-spin
+# behaviour. `--cores` takes 9 to 11 entries, so two sets need 18 cores at
+# minimum and 22 to give each server a full pipeline. Below that there is
+# no way to separate them and --yield-idle is the only thing that stops
+# them starving each other. YIELD_IDLE=1 forces the fallback so the
+# low-core path can be exercised on a large machine.
+expand_cpu_list() {
+    local spec="${1:-}" part lo hi out=()
+    local -a parts
+    IFS=',' read -ra parts <<< "$spec"
+    for part in "${parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        if [[ "$part" == *-* ]]; then
+            lo="${part%%-*}"; hi="${part##*-}"
+            for ((c = lo; c <= hi; c++)); do out+=("$c"); done
+        else
+            out+=("$part")
+        fi
+    done
+    echo "${out[@]}"
+}
+
+# Isolated cores if the host has isolcpus, else every online core except 0
+# — core 0 carries the OS and IRQs and must not host a spinning stage.
+read -ra USABLE_CORES <<< "$(expand_cpu_list "$(cat /sys/devices/system/cpu/isolated 2>/dev/null || true)")"
+if [[ ${#USABLE_CORES[@]} -eq 0 ]]; then
+    read -ra ALL_CORES <<< "$(expand_cpu_list "$(cat /sys/devices/system/cpu/online)")"
+    USABLE_CORES=("${ALL_CORES[@]:1}")
+    CORE_SOURCE="online minus core 0"
+else
+    CORE_SOURCE="isolcpus"
+fi
+
+PRIMARY_CORE_ARG=""
+REPLICA_CORE_ARG=""
+YIELD_ARG=""
+echo "=== Core assignment ==="
+echo "  ${#USABLE_CORES[@]} usable cores (${CORE_SOURCE})"
+if [[ "${YIELD_IDLE:-0}" == "1" ]]; then
+    YIELD_ARG="--yield-idle"
+    echo "  YIELD_IDLE=1 — forcing the shared-core fallback"
+elif [[ ${#USABLE_CORES[@]} -ge 22 ]]; then
+    PRIMARY_CORE_ARG="--cores $(IFS=,; echo "${USABLE_CORES[*]:0:11}")"
+    REPLICA_CORE_ARG="--cores $(IFS=,; echo "${USABLE_CORES[*]:11:11}")"
+    echo "  disjoint, full pipelines: primary ${PRIMARY_CORE_ARG#--cores }"
+    echo "                            replica ${REPLICA_CORE_ARG#--cores }"
+elif [[ ${#USABLE_CORES[@]} -ge 18 ]]; then
+    PRIMARY_CORE_ARG="--cores $(IFS=,; echo "${USABLE_CORES[*]:0:9}")"
+    REPLICA_CORE_ARG="--cores $(IFS=,; echo "${USABLE_CORES[*]:9:9}")"
+    echo "  disjoint, minimal 9-entry sets: primary ${PRIMARY_CORE_ARG#--cores }"
+    echo "                                  replica ${REPLICA_CORE_ARG#--cores }"
+else
+    YIELD_ARG="--yield-idle"
+    echo "  too few cores for two disjoint sets (need 18) — falling back to --yield-idle"
+fi
+echo ""
+
 # --- 5. Start primary ---
 echo "=== Starting DPDK primary ==="
 RUST_LOG=info RUST_BACKTRACE=1 \
@@ -290,6 +363,8 @@ RUST_LOG=info RUST_BACKTRACE=1 \
     --accounts 100 \
     --instruments 10 \
     --replication-bind "0.0.0.0:$REPL_PORT" \
+    ${PRIMARY_CORE_ARG} \
+    ${YIELD_ARG} \
     --dpdk-eal-args="--vdev=net_af_packet0,iface=$VETH_PRIMARY --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=primary" \
     --dpdk-ip "$PRIMARY_IP" \
     --dpdk-prefix-len "$PREFIX" \
@@ -330,6 +405,8 @@ RUST_LOG=info RUST_BACKTRACE=1 \
     --snapshot-interval-ms 0 \
     --replica-of "$PRIMARY_IP:$REPL_PORT" \
     --replication-key "$TMPDIR/repl_key.key" \
+    ${REPLICA_CORE_ARG} \
+    ${YIELD_ARG} \
     --dpdk-eal-args="--vdev=net_af_packet0,iface=$VETH_REPLICA --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=replica" \
     --dpdk-ip "$REPLICA_IP" \
     --dpdk-prefix-len "$PREFIX" \
