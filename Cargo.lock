@@ -1769,7 +1769,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1828,7 +1828,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "bindgen",
  "cc",
@@ -1863,7 +1863,7 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1929,7 +1929,7 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 
 [[package]]
 name = "melin-protocol"
@@ -1944,7 +1944,7 @@ dependencies = [
 [[package]]
 name = "melin-raft"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -1997,7 +1997,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2031,7 +2031,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2072,7 +2072,7 @@ version = "0.13.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.14.0"
-source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
+source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 
 [[package]]
 name = "memchr"

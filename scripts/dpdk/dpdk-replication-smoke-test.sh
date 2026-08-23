@@ -12,10 +12,19 @@
 #
 # Usage:
 #   sudo ./scripts/dpdk/dpdk-replication-smoke-test.sh
+#   sudo REAL_MACS=1 ./scripts/dpdk/dpdk-replication-smoke-test.sh
+#
+# REAL_MACS=1 leaves the veth pair on its kernel-assigned MACs and passes
+# the primary's real address as --dpdk-peer-mac, instead of arranging for
+# the replica's derived 02:00:<ip> guess to be correct. That reproduces
+# the mlx5 condition — a hardware MAC that cannot be derived — on a single
+# machine with no ConnectX NIC, so it is the mode that actually tests peer
+# MAC handling rather than assuming it.
 #
 # Prerequisites:
 #   - DPDK >= 22.11 installed
 #   - Must run as root (hugepages + veth creation)
+#   - REAL_MACS=1 additionally needs a melin build carrying --dpdk-peer-mac
 
 set -euo pipefail
 
@@ -216,22 +225,48 @@ echo ""
 # --- 4. Create veth pair ---
 echo "=== Creating veth pair ==="
 ip link add "$VETH_REPLICA" type veth peer name "$VETH_PRIMARY"
-# The DPDK replica skips ARP and addresses the primary by the synthetic
-# 02:00:<ip-octets> MAC (the SR-IOV VF convention from dpdk-setup.sh;
-# replication/dpdk.rs seeds it into smoltcp's neighbor cache). The af_packet
+# The DPDK replica skips ARP and addresses the primary by whatever MAC was
+# seeded into smoltcp's neighbour cache (replication/dpdk.rs). The af_packet
 # PMD reports the veth iface's MAC to smoltcp as its own hardware address, so
-# each end must OWN its synthetic MAC — otherwise smoltcp drops the peer's
-# frames (promiscuous mode delivers them to the PMD, but smoltcp rejects a
-# frame not addressed to its hardware address). Set the MAC while down.
-IFS=. read -r o1 o2 o3 o4 <<< "$PRIMARY_IP"
-ip link set "$VETH_PRIMARY" address "$(printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4")"
-IFS=. read -r o1 o2 o3 o4 <<< "$REPLICA_IP"
-ip link set "$VETH_REPLICA" address "$(printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4")"
-ip link set "$VETH_REPLICA" up
-ip link set "$VETH_PRIMARY" up
+# each end must OWN the MAC the other addresses it by — otherwise smoltcp
+# drops the peer's frames (promiscuous mode delivers them to the PMD, but
+# smoltcp rejects a frame not addressed to its hardware address).
+#
+# Two modes:
+#
+#   default        Give each end the synthetic 02:00:<ip-octets> address, the
+#                  SR-IOV VF convention that dpdk-setup.sh assigns and that
+#                  the replica falls back to deriving. Exercises the
+#                  replication path but says nothing about MAC handling,
+#                  because the derived guess is made true by construction.
+#
+#   REAL_MACS=1    Leave the kernel's random MACs in place and pass the
+#                  primary's actual address via --dpdk-peer-mac. This is the
+#                  mlx5 condition — a real hardware MAC that cannot be
+#                  derived from the IP — reproduced without a ConnectX NIC.
+#                  Without the flag (or on a build predating it) the replica
+#                  addresses a MAC nobody owns and never connects, which is
+#                  exactly the failure seen on the NYC fleet.
+if [[ "${REAL_MACS:-0}" == "1" ]]; then
+    ip link set "$VETH_REPLICA" up
+    ip link set "$VETH_PRIMARY" up
+    PRIMARY_MAC=$(cat "/sys/class/net/$VETH_PRIMARY/address")
+    PEER_MAC_ARG="--dpdk-peer-mac $PRIMARY_MAC"
+    echo "  $VETH_REPLICA <-> $VETH_PRIMARY (up, real kernel MACs)"
+    echo "  primary MAC $PRIMARY_MAC passed to the replica as --dpdk-peer-mac"
+    echo "  (derivation would have guessed $(IFS=. read -r o1 o2 o3 o4 <<< "$PRIMARY_IP"; printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4"))"
+else
+    IFS=. read -r o1 o2 o3 o4 <<< "$PRIMARY_IP"
+    ip link set "$VETH_PRIMARY" address "$(printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4")"
+    IFS=. read -r o1 o2 o3 o4 <<< "$REPLICA_IP"
+    ip link set "$VETH_REPLICA" address "$(printf '02:00:%02x:%02x:%02x:%02x' "$o1" "$o2" "$o3" "$o4")"
+    ip link set "$VETH_REPLICA" up
+    ip link set "$VETH_PRIMARY" up
+    PEER_MAC_ARG=""
+    echo "  $VETH_REPLICA <-> $VETH_PRIMARY (up, synthetic 02:00:<ip> MACs)"
+fi
 ethtool -K "$VETH_REPLICA" tx off rx off 2>/dev/null || true
 ethtool -K "$VETH_PRIMARY" tx off rx off 2>/dev/null || true
-echo "  $VETH_REPLICA <-> $VETH_PRIMARY (up, synthetic 02:00:<ip> MACs)"
 
 # Capture the wire so a failure shows whether ARP resolves and the replica's
 # SYNs reach the primary with the right dst MAC (the synthetic 02:00:<ip>).
@@ -298,6 +333,7 @@ RUST_LOG=info RUST_BACKTRACE=1 \
     --dpdk-eal-args="--vdev=net_af_packet0,iface=$VETH_REPLICA --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=replica" \
     --dpdk-ip "$REPLICA_IP" \
     --dpdk-prefix-len "$PREFIX" \
+    ${PEER_MAC_ARG} \
     > "$TMPDIR/replica.log" 2>&1 &
 REPLICA_PID=$!
 echo "  Replica PID: $REPLICA_PID"

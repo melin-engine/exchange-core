@@ -53,13 +53,19 @@ melin-types = { path = "crates/exchange/types", version = "0.13.0" }
 # `"<version>"` once that lands in a release — a git dependency does not
 # participate in semver resolution, so leaving it here silently freezes
 # the sequencer at one branch commit.
-melin-app = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
-melin-dpdk = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
-melin-journal = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
-melin-pipeline = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
-melin-server-runtime = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
-melin-transport-core = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
-melin-wire-protocol = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+#
+# https, not ssh: bench hosts are provisioned with an authorized_keys file
+# and no private key of their own, so an `ssh://` remote fails their build
+# at fetch time with "Host key verification failed" and no amount of cargo
+# configuration helps. Anonymous https read works from a bare host, which
+# is also how the hosts clone this repo.
+melin-app = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-journal = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
 
 base64 = "0.22"
 blake3 = "1"
