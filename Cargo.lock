@@ -1089,8 +1089,7 @@ dependencies = [
 [[package]]
 name = "fastcp"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d19e9b63761f5e09e8836bcc1480569e05f4c75f688f35ebc5e9de142a774d"
+source = "git+https://github.com/melin-engine/fastcp.git?branch=feat%2Fzc-rx-window-and-index-eviction#d105f1fca98b623126457b4f5255e35b0a6a0502"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
@@ -1770,8 +1769,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20662990c9eab1e4fe4379d6d0041b7ba9c09d5b6449b9c4821cf9acd9f121d4"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1830,8 +1828,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41b8830728434e46899708f3193f3fbab6a268e021ddfe42b540f3ecd0d00bfe"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "bindgen",
  "cc",
@@ -1866,8 +1863,7 @@ dependencies = [
 [[package]]
 name = "melin-journal"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385fa90758a680e43f132707d7f13f94211774f269ecb65a1e59a97b2564a382"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1933,8 +1929,7 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cde34d416f0fa072e689b47160c26031de7b020d4f957fe718bd7cec25cfc438"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 
 [[package]]
 name = "melin-protocol"
@@ -1949,8 +1944,7 @@ dependencies = [
 [[package]]
 name = "melin-raft"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb663709ca7b7f9f09cbd46afb33ddba7071e73b7ba5dc526ced031d2a4469a"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -2003,8 +1997,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b125c6007d037ec56d95c2025c7c89cb5fcbc77771f2dcbe7d6cff46c9f3620"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2038,8 +2031,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0961a399ed803cf020eec1f04446d91db1d3aff981f1223309c5ad95b149ea57"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2080,8 +2072,7 @@ version = "0.13.0"
 [[package]]
 name = "melin-wire-protocol"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7207386ee3a9edb9630329d7045edde6c99804578da9b63af47fb183f5d65eb"
+source = "git+ssh://git@github.com/melin-engine/melin.git?branch=feat%2Fdpdk-peer-mac#f97f45e8cc4a169eedde069f40f3d5be357bc2b3"
 
 [[package]]
 name = "memchr"

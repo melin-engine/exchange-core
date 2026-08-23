@@ -40,19 +40,26 @@ melin-server = { path = "crates/exchange/server", version = "0.13.0", default-fe
 melin-trading = { path = "crates/exchange/trading", version = "0.13.0" }
 melin-types = { path = "crates/exchange/types", version = "0.13.0" }
 
-# Melin sequencer crates, consumed from crates.io and released from the
-# separate sequencer repository. Kept as a group distinct from the exchange
-# crates above: the sequencer moves on its own schedule and the two version
-# numbers only happen to coincide today. All seven must be bumped together —
+# Melin sequencer crates, released from the separate sequencer repository.
+# Kept as a group distinct from the exchange crates above: the sequencer
+# moves on its own schedule and the two version numbers only happen to
+# coincide today. All seven must be pointed at the same source together —
 # a straggler mixes journal/wire formats across the pipeline rather than
 # just looking untidy.
-melin-app = "0.14.0"
-melin-dpdk = "0.14.0"
-melin-journal = "0.14.0"
-melin-pipeline = "0.14.0"
-melin-server-runtime = "0.14.0"
-melin-transport-core = "0.14.0"
-melin-wire-protocol = "0.14.0"
+#
+# TEMPORARILY pinned to the `feat/dpdk-peer-mac` branch instead of the
+# crates.io 0.14.0 release, to pick up the replica-side peer-MAC work that
+# unblocks replicated DPDK on mlx5 ports. Revert every one of these to
+# `"<version>"` once that lands in a release — a git dependency does not
+# participate in semver resolution, so leaving it here silently freezes
+# the sequencer at one branch commit.
+melin-app = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-dpdk = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-journal = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-pipeline = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-server-runtime = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-transport-core = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
+melin-wire-protocol = { git = "ssh://git@github.com/melin-engine/melin.git", branch = "feat/dpdk-peer-mac" }
 
 base64 = "0.22"
 blake3 = "1"
@@ -64,6 +71,21 @@ rand = "0.10"
 tikv-jemallocator = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# TEMPORARY, paired with the git-pinned melin crates above.
+#
+# The `feat/dpdk-peer-mac` branch takes `fastcp` from git rather than
+# crates.io. Our bench takes it from crates.io. Cargo treats one crate
+# from two sources as two unrelated crates even at the identical version,
+# so `fastcp::phy::Device` from the registry copy does not satisfy the
+# bound on the git copy's `Interface::poll` — the build fails with a
+# trait mismatch that names the same trait twice. Patching the registry
+# source to the branch melin uses collapses them back into one crate.
+#
+# Remove together with the git pins above when the sequencer work lands
+# in a release, so the release's own fastcp requirement governs again.
+[patch.crates-io]
+fastcp = { git = "https://github.com/melin-engine/fastcp.git", branch = "feat/zc-rx-window-and-index-eviction" }
 
 [profile.release]
 # Full cross-crate LTO: allows LLVM to inline across crate boundaries

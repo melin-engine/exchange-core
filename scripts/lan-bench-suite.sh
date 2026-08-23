@@ -1361,28 +1361,6 @@ _build_bench_dpdk_args() {
     fi
 }
 
-# Refuse mlx5 + replicated transports before anything is launched.
-#
-# The replica's DPDK connect derives the primary's MAC as 02:00:<ip>
-# (melin-server-runtime replication/dpdk.rs), the SR-IOV convention.
-# mlx5 bifurcated keeps the port's real hardware MAC, and melin-server
-# exposes no override, so the replica's SYN goes to an address nobody
-# owns and the run stalls in wait_for_log until it times out. Fail here
-# instead: the symptom is otherwise indistinguishable from a slow build.
-_assert_dpdk_mode_supports_replication() {
-    local transport="$1"
-    [[ "$DPDK_MODE" == "mlx5" ]] || return 0
-    echo "" >&2
-    echo "  ERROR: transport '${transport}' cannot run on an mlx5 bifurcated port." >&2
-    echo "         The replica derives the primary's MAC as 02:00:<ip> (the SR-IOV" >&2
-    echo "         convention). mlx5 keeps the NIC's real MAC and melin-server has" >&2
-    echo "         no --dpdk-peer-mac, so replicas can never reach the primary." >&2
-    echo "         Fixing this needs a change in the sequencer repo." >&2
-    echo "         Use TRANSPORTS=dpdk (standalone) or a kernel-TCP transport." >&2
-    echo "" >&2
-    return 1
-}
-
 DPDK_SRIOV_DONE=0
 # Set to "tap" when TAP mode detected — controls routing setup.
 DPDK_MODE="sriov"
@@ -1725,7 +1703,6 @@ transport_stop_dpdk() {
 
 transport_start_dpdk_repl() {
     dpdk_sriov_setup
-    _assert_dpdk_mode_supports_replication dpdk-repl
     local replica_journal="${REPLICA_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
     clean_journal "$REPLICA" "$replica_journal"
@@ -1744,11 +1721,16 @@ transport_start_dpdk_repl() {
         REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
     fi
 
-    local server_eal replica_eal server_vlan_arg replica_vlan_arg
+    local server_eal replica_eal server_vlan_arg replica_vlan_arg primary_mac_arg
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
     replica_eal=$(_resolve_dpdk_eal_args "${REPLICA_DPDK_EAL_ARGS:-}")
     server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
     replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
+    # The replica connects out, so it must address the primary before any
+    # ARP exchange — hence the *primary's* MAC on the replica's command
+    # line. The primary needs no equivalent: it accepts, and learns each
+    # peer's MAC from the inbound frame.
+    primary_mac_arg=$(_dpdk_peer_mac_arg "${SERVER_DPDK_MAC:-}")
 
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
@@ -1779,6 +1761,7 @@ transport_start_dpdk_repl() {
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
             ${replica_vlan_arg} \
+            ${primary_mac_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1819,7 +1802,6 @@ transport_stop_dpdk_repl() {
 
 transport_start_dpdk_dual_repl() {
     dpdk_sriov_setup
-    _assert_dpdk_mode_supports_replication dpdk-dual-repl
     local replica_journal="${REPLICA_JOURNAL}"
     local replica2_journal="${REPLICA2_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
@@ -1853,13 +1835,17 @@ transport_start_dpdk_dual_repl() {
     fi
 
     local server_eal replica_eal replica2_eal
-    local server_vlan_arg replica_vlan_arg replica2_vlan_arg
+    local server_vlan_arg replica_vlan_arg replica2_vlan_arg primary_mac_arg
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
     replica_eal=$(_resolve_dpdk_eal_args "${REPLICA_DPDK_EAL_ARGS:-}")
     replica2_eal=$(_resolve_dpdk_eal_args "${REPLICA2_DPDK_EAL_ARGS:-}")
     server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
     replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
     replica2_vlan_arg=$(_dpdk_vlan_arg "${REPLICA2_DPDK_VLAN:-}")
+    # Both replicas connect to the same primary, so both are told the same
+    # MAC — the primary's. See the note in transport_start_dpdk_repl for
+    # why only the initiating side needs this.
+    primary_mac_arg=$(_dpdk_peer_mac_arg "${SERVER_DPDK_MAC:-}")
 
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
@@ -1890,6 +1876,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
             ${replica_vlan_arg} \
+            ${primary_mac_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1905,6 +1892,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-prefix-len ${REPLICA2_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA2_DPDK_PORT} \
             ${replica2_vlan_arg} \
+            ${primary_mac_arg} \
             ${REPLICA2_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
