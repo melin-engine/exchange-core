@@ -1913,6 +1913,31 @@ transport_stop_dpdk_dual_repl() {
 # Workload functions
 # ---------------------------------------------------------------------------
 
+# Launch melin-bench on the bench host over DPDK.
+#
+# Runs under ${SUDO} deliberately: EAL maps the hugetlbfs segments from
+# the root-owned /mnt/huge_2m and reads /proc/self/pagemap, neither of
+# which the cap_sys_nice grant covers. Without root, EAL aborts at init
+# with "get_seg_fd(): open '/mnt/huge_2m/rtemap_0' failed: Permission
+# denied" before a single packet moves.
+#
+# Every DPDK workload routes through here rather than hand-rolling the
+# command: the throughput and single-order sites previously carried
+# separate copies and silently drifted apart on exactly this flag.
+_run_bench_dpdk() {
+    local duration="$1"
+    shift
+    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        ${SUDO} ./target/release/melin-bench \
+            --addr ${CURRENT_BIND} \
+            --health-addr ${CURRENT_HEALTH} \
+            --key bench.key \
+            --json /tmp/bench-results.json \
+            --duration ${duration} \
+            --accounts ${BENCH_ACCOUNTS} \
+            ${BENCH_DPDK_ARGS} $*"
+}
+
 workload_throughput() {
     local transport="$1"
     echo ""
@@ -1932,16 +1957,9 @@ workload_throughput() {
     if [[ "${TARGET_RATE}" != "0" ]]; then rate_arg="--target-rate ${TARGET_RATE}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
-        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ${SUDO} ./target/release/melin-bench \
-                --addr ${CURRENT_BIND} \
-                --health-addr ${CURRENT_HEALTH} \
-                --key bench.key \
-                --json /tmp/bench-results.json \
-                --duration ${THROUGHPUT_DURATION} \
-                --accounts ${BENCH_ACCOUNTS} \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} ${rate_arg} \
-                --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
+        _run_bench_dpdk "${THROUGHPUT_DURATION}" \
+            ${warmup_arg} ${cooldown_arg} ${threads_arg} ${rate_arg} \
+            --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     elif [[ -n "${rate_arg}" ]]; then
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}" --target-rate "${TARGET_RATE}"
     else
@@ -1965,16 +1983,9 @@ workload_single() {
     if [[ -n "${COOLDOWN_DURATION}" ]]; then cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
-        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
-                --addr ${CURRENT_BIND} \
-                --health-addr ${CURRENT_HEALTH} \
-                --key bench.key \
-                --json /tmp/bench-results.json \
-                --duration ${SINGLE_DURATION} \
-                --accounts ${BENCH_ACCOUNTS} \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} \
-                --clients 1 --window 1"
+        _run_bench_dpdk "${SINGLE_DURATION}" \
+            ${warmup_arg} ${cooldown_arg} \
+            --clients 1 --window 1
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients 1 --window 1
     fi
