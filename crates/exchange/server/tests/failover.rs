@@ -256,7 +256,7 @@ fn fetch_replica_cursors(addr: SocketAddr) -> Option<[(u64, u64); 2]> {
     Some([(in_mem[0], acked[0]), (in_mem[1], acked[1])])
 }
 
-/// Fetch the `melin_durability_policy_degraded` gauge from the
+/// Fetch the `melin_ack_policy_degraded` gauge from the
 /// Prometheus metrics endpoint. Returns `None` if the metric is
 /// missing (older binary, parse error, etc).
 fn fetch_policy_degraded(addr: SocketAddr) -> Option<u32> {
@@ -267,14 +267,14 @@ fn fetch_policy_degraded(addr: SocketAddr) -> Option<u32> {
     stream.read_to_end(&mut body).ok()?;
     let text = std::str::from_utf8(&body).ok()?;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("melin_durability_policy_degraded ") {
+        if let Some(rest) = line.strip_prefix("melin_ack_policy_degraded ") {
             return rest.trim().parse().ok();
         }
     }
     None
 }
 
-/// Poll the metrics endpoint until `melin_durability_policy_degraded`
+/// Poll the metrics endpoint until `melin_ack_policy_degraded`
 /// equals `expected`, or timeout. Panics on timeout. The 1-second
 /// flap-hold + 1-second idle re-eval mean transitions can take up to
 /// ~2 s to surface, so callers should pass a comfortable timeout.
@@ -455,17 +455,21 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
     assert!(response == "OK", "promotion failed: {response}");
 }
 
-/// Send `DURABILITY <mode>` to a node's admin endpoint and assert it
-/// succeeds. Used by tests that drive runtime mode swaps (e.g. the
-/// promoted-replica-without-replicas case where Hybrid is structurally
-/// unsatisfiable and the operator must downgrade to Local for the gate
-/// to open).
-fn set_durability_mode(addr: SocketAddr, operator_key: &SigningKey, mode: &str) {
-    let cmd = format!("DURABILITY {mode}");
+/// Send `ACK-POLICY <policy>` to a node's admin endpoint and assert it
+/// succeeds. Used by tests that drive runtime policy swaps (e.g. the
+/// promoted-replica-without-replicas case where `disk+ram` is
+/// structurally unsatisfiable and the operator must downgrade to `disk`
+/// for the gate to open).
+fn set_ack_policy(addr: SocketAddr, operator_key: &SigningKey, policy: &str) {
+    // `ACK-POLICY` since melin 0.15. The old `DURABILITY` verb still works
+    // — it is kept for one release and maps the legacy policy names — but
+    // exercising the deprecated spelling here would mean these tests stop
+    // covering the command operators are actually told to use.
+    let cmd = format!("ACK-POLICY {policy}");
     let response = admin_command(addr, operator_key, &cmd);
     assert!(
         response == "OK",
-        "set durability {mode} on {addr} failed: {response}"
+        "set ack policy {policy} on {addr} failed: {response}"
     );
 }
 
@@ -832,15 +836,15 @@ impl TestCluster {
         let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.admin_port).parse().unwrap();
         promote(promote_addr, &self.operator_key);
         // The promoted node was a replica running with the cluster
-        // default (`hybrid`); standalone it can't satisfy
+        // default (`disk+ram`); standalone it can't satisfy
         // `in_memory>=2`, so the response gate would stall forever.
-        // Downgrade to `local` via the admin DURABILITY command — the
+        // Downgrade to `disk` via the admin ACK-POLICY command — the
         // production failover playbook for a freshly-promoted node
         // without peers. A separate test
         // (`dual_replication_promote_then_durability_swap`) covers the
         // same path on the dual-cluster shape so we know the runtime
         // swap works under both topologies.
-        set_durability_mode(promote_addr, &self.operator_key, "local");
+        set_ack_policy(promote_addr, &self.operator_key, "disk");
 
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
@@ -1303,8 +1307,8 @@ fn crashed_primary_recovers_from_journal() {
                 "--health-bind",
                 &format!("127.0.0.1:{recovered_health_port}"),
                 "--standalone",
-                "--durability-mode",
-                "local",
+                "--ack-policy",
+                "disk",
                 "--journal",
                 primary_journal.to_str().expect("valid path"),
                 "--authorized-keys",
@@ -1472,7 +1476,7 @@ fn same_key_request_seq_hwm_survives_failover() {
     }
     let _ = cluster.primary.child.wait();
     promote(promote_addr, &cluster.operator_key);
-    set_durability_mode(promote_addr, &cluster.operator_key, "local");
+    set_ack_policy(promote_addr, &cluster.operator_key, "disk");
     wait_ready(cluster.replica.health_addr, Duration::from_secs(30));
 
     // Reconnect with the SAME key. `Client::connect` auto-syncs against
@@ -1638,7 +1642,7 @@ impl DualCluster {
         // Downgrade the promoted standalone to `local` so its gate can
         // open without peers. See `TestCluster::kill_and_promote` for
         // the full rationale.
-        set_durability_mode(addr, &self.operator_key, "local");
+        set_ack_policy(addr, &self.operator_key, "disk");
         wait_ready(self.replica1.health_addr, Duration::from_secs(30));
         connect_with_timeout(self.replica1.client_addr, &self.key2)
     }
@@ -1648,7 +1652,7 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
-        set_durability_mode(addr, &self.operator_key, "local");
+        set_ack_policy(addr, &self.operator_key, "disk");
         wait_ready(self.replica2.health_addr, Duration::from_secs(30));
         connect_with_timeout(self.replica2.client_addr, &self.key2)
     }
@@ -2025,7 +2029,7 @@ fn replacement_replica_catches_up_from_journal() {
 
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
-    set_durability_mode(promote_addr, &cluster.operator_key, "local");
+    set_ack_policy(promote_addr, &cluster.operator_key, "disk");
     let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
     wait_ready(r3_health_addr, Duration::from_secs(30));
 
@@ -2145,7 +2149,7 @@ fn catchup_with_fills_during_gap() {
     cluster.kill_primary();
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
-    set_durability_mode(promote_addr, &cluster.operator_key, "local");
+    set_ack_policy(promote_addr, &cluster.operator_key, "disk");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2263,7 +2267,7 @@ fn catchup_then_immediate_failover() {
     cluster.kill_primary();
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
-    set_durability_mode(promote_addr, &cluster.operator_key, "local");
+    set_ack_policy(promote_addr, &cluster.operator_key, "disk");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2382,7 +2386,7 @@ fn fresh_replica_full_catchup() {
     cluster.kill_primary();
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
-    set_durability_mode(promote_addr, &cluster.operator_key, "local");
+    set_ack_policy(promote_addr, &cluster.operator_key, "disk");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2470,8 +2474,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
                 "--standalone",
-                "--durability-mode",
-                "local",
+                "--ack-policy",
+                "disk",
                 "--snapshot-interval-ms",
                 "100",
             ])
@@ -2666,7 +2670,7 @@ fn snapshot_transfer_when_archives_purged() {
 
     let promote_addr: SocketAddr = format!("127.0.0.1:{replica_admin_port}").parse().unwrap();
     promote(promote_addr, &operator_key);
-    set_durability_mode(promote_addr, &operator_key, "local");
+    set_ack_policy(promote_addr, &operator_key, "disk");
     wait_ready(
         format!("127.0.0.1:{replica_health_port}").parse().unwrap(),
         Duration::from_secs(30),
@@ -3006,14 +3010,14 @@ fn rotation_soak_under_load() {
     // ----- Restart and verify recovered state matches -----
     // primary2 is brought up alone — no replica is spawned alongside it
     // because this phase only validates journal recovery, not
-    // replication. Run with `--durability-mode local` so the recovered
+    // replication. Run with `--ack-policy disk` so the recovered
     // primary is fully operational without a replica (same pattern the
     // other "recovered primary, no replica" tests use); default policy
     // would leave it halted and unable to service client requests.
     let primary2_extra: Vec<&str> = primary_extra
         .iter()
         .copied()
-        .chain(["--durability-mode", "local"])
+        .chain(["--ack-policy", "disk"])
         .collect();
     let mut primary2 = spawn_primary_with_extra_env(
         &bin,
@@ -3132,7 +3136,7 @@ fn policy_degraded_gauge_transitions_with_cluster_shape() {
 #[test]
 #[serial]
 fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
-    let cluster = DualCluster::start_with_primary_args(&["--durability-mode", "hybrid"]);
+    let cluster = DualCluster::start_with_primary_args(&["--ack-policy", "disk+ram"]);
     let primary_health = cluster.primary.health_addr;
     let mut client = cluster.connect_primary();
 
@@ -3684,7 +3688,7 @@ fn higher_epoch_handshake_fences_stale_primary() {
     // without peers (it left the primary on promotion).
     let prom_admin_addr: SocketAddr = format!("127.0.0.1:{prom_admin}").parse().unwrap();
     promote(prom_admin_addr, &operator_key);
-    set_durability_mode(prom_admin_addr, &operator_key, "local");
+    set_ack_policy(prom_admin_addr, &operator_key, "disk");
     wait_ready(prom.health_addr, Duration::from_secs(30));
 
     // Force the EpochBump durable: an acked order can only return once every

@@ -46,13 +46,13 @@ melin-types = { path = "crates/exchange/types", version = "0.14.0" }
 # numbers only happen to coincide today. All seven must be bumped together —
 # a straggler mixes journal/wire formats across the pipeline rather than
 # just looking untidy.
-melin-app = "0.14.0"
-melin-dpdk = "0.14.0"
-melin-journal = "0.14.0"
-melin-pipeline = "0.14.0"
-melin-server-runtime = "0.14.0"
-melin-transport-core = "0.14.0"
-melin-wire-protocol = "0.14.0"
+melin-app = "0.15.0"
+melin-dpdk = "0.15.0"
+melin-journal = "0.15.0"
+melin-pipeline = "0.15.0"
+melin-server-runtime = "0.15.0"
+melin-transport-core = "0.15.0"
+melin-wire-protocol = "0.15.0"
 
 base64 = "0.22"
 blake3 = "1"

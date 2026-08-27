@@ -135,6 +135,33 @@ pub enum TradingEvent {
 }
 
 impl AppEvent for TradingEvent {
+    /// Upper bound on `encoded_size` across every variant, required by
+    /// `AppEvent` since melin 0.15 — the journal computes its downstream
+    /// reservations from it, so a value below the true maximum is not
+    /// something it can recover from.
+    ///
+    /// The largest variant is `SubmitOrder` carrying a `StopLimit` order
+    /// with `GTD` time-in-force:
+    ///
+    /// ```text
+    ///   tag                                        1
+    ///   symbol                                     4
+    ///   order  id 8 + account 4 + side 1
+    ///          + order_type tag 1                 14
+    ///          + StopLimit (stop px + limit px)   16
+    ///          + tif 1 + quantity 8 + stp 1       10
+    ///          + GTD expiry_ns                     8
+    ///                                           ----
+    ///                                             53
+    /// ```
+    ///
+    /// `max_encoded_size_bounds_every_variant` pins this against the real
+    /// encoder, so adding a field or a wider variant fails a test rather
+    /// than silently under-reserving. Keep that test exhaustive — it is
+    /// the only thing standing between a new variant and a bound that no
+    /// longer holds.
+    const MAX_ENCODED_SIZE: usize = 53;
+
     fn encoded_size(&self) -> usize {
         // 1 byte tag + per-variant payload size.
         1 + match self {
@@ -695,6 +722,166 @@ mod tests {
         assert_eq!(n, ev.encoded_size(), "encoded_size disagrees with encode");
         let decoded = TradingEvent::decode(&buf[..n]).expect("decode");
         assert_eq!(ev, decoded);
+    }
+
+    /// Every variant, each built at the widest its encoding can get:
+    /// `Option` fields present rather than absent, since each `Some`
+    /// costs 8 bytes over a `None`.
+    fn all_variants_at_their_widest(widest_order: Order) -> Vec<TradingEvent> {
+        vec![
+            TradingEvent::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(1),
+                    base: CurrencyId(1),
+                    quote: CurrencyId(2),
+                },
+            },
+            TradingEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: u64::MAX,
+            },
+            TradingEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: widest_order,
+            },
+            TradingEvent::CancelOrder {
+                symbol: Symbol(1),
+                account: AccountId(1),
+                order_id: OrderId(1),
+            },
+            TradingEvent::SetRiskLimits {
+                symbol: Symbol(1),
+                limits: RiskLimits {
+                    max_order_qty: Some(qty(1)),
+                    max_order_notional: Some(u64::MAX),
+                },
+            },
+            TradingEvent::CancelAll {
+                account: AccountId(1),
+            },
+            TradingEvent::SetCircuitBreaker {
+                symbol: Symbol(1),
+                config: CircuitBreakerConfig {
+                    price_band_lower: Some(price(1)),
+                    price_band_upper: Some(price(2)),
+                    halted: true,
+                },
+            },
+            TradingEvent::CancelReplace {
+                symbol: Symbol(1),
+                account: AccountId(1),
+                order_id: OrderId(1),
+                new_price: price(1),
+                new_quantity: qty(1),
+            },
+            TradingEvent::SetFeeSchedule {
+                symbol: Symbol(1),
+                schedule: FeeSchedule {
+                    maker_fee_bps: -10_000,
+                    taker_fee_bps: 10_000,
+                },
+            },
+            TradingEvent::ProvisionAccount {
+                account: AccountId(1),
+                amount: u64::MAX,
+            },
+            TradingEvent::Withdraw {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: u64::MAX,
+            },
+            TradingEvent::EndOfDay,
+            TradingEvent::DisableInstrument { symbol: Symbol(1) },
+            TradingEvent::EnableInstrument { symbol: Symbol(1) },
+            TradingEvent::RemoveInstrument { symbol: Symbol(1) },
+            TradingEvent::QueryStats,
+            TradingEvent::QueryPosition {
+                account: AccountId(1),
+            },
+            TradingEvent::QueryRequestSeq,
+        ]
+    }
+
+    /// `MAX_ENCODED_SIZE` is a promise the journal builds its reservations
+    /// on, and nothing recomputes it from the encoder at runtime — an
+    /// under-declared bound is refused per event at encode time, i.e. in
+    /// production, on whichever event first exceeds it.
+    ///
+    /// So enumerate every variant at its widest and check the bound holds,
+    /// then assert the maximum is *reached*: a bound that drifts far above
+    /// the truth wastes journal reservation on every entry, and one that
+    /// silently stops being tight is a sign the encoder moved.
+    ///
+    /// This list must stay exhaustive. `every_variant_is_covered_above`
+    /// below fails if a variant is added without extending it.
+    #[test]
+    fn max_encoded_size_bounds_every_variant() {
+        let widest_order = Order {
+            id: OrderId(1),
+            account: AccountId(2),
+            side: Side::Buy,
+            // StopLimit is the widest order_type (two prices, 16 bytes)
+            // and GTD is the only tif carrying an expiry.
+            order_type: OrderType::StopLimit {
+                trigger_price: price(90),
+                limit_price: price(95),
+            },
+            time_in_force: TimeInForce::GTD,
+            quantity: qty(10),
+            stp: SelfTradeProtection::CancelNewest,
+            expiry_ns: 1,
+        };
+
+        let mut largest = 0;
+        for ev in all_variants_at_their_widest(widest_order) {
+            let n = ev.encoded_size();
+            assert!(
+                n <= TradingEvent::MAX_ENCODED_SIZE,
+                "{ev:?} encodes to {n} bytes, above the declared bound of {}",
+                TradingEvent::MAX_ENCODED_SIZE,
+            );
+            // encode() must agree, or the bound is guarding the wrong number.
+            let mut buf = [0u8; 256];
+            assert_eq!(ev.encode(&mut buf), n, "encode disagrees for {ev:?}");
+            largest = largest.max(n);
+        }
+
+        assert_eq!(
+            largest,
+            TradingEvent::MAX_ENCODED_SIZE,
+            "the bound is no longer tight — largest variant now encodes to {largest}",
+        );
+    }
+
+    /// Compile-time exhaustiveness guard for the list above. Adding a
+    /// variant makes this match fail to build, which is the only reliable
+    /// reminder to widen `max_encoded_size_bounds_every_variant`.
+    #[test]
+    fn every_variant_is_covered_above() {
+        fn assert_covered(ev: &TradingEvent) {
+            match ev {
+                TradingEvent::AddInstrument { .. }
+                | TradingEvent::Deposit { .. }
+                | TradingEvent::SubmitOrder { .. }
+                | TradingEvent::CancelOrder { .. }
+                | TradingEvent::SetRiskLimits { .. }
+                | TradingEvent::CancelAll { .. }
+                | TradingEvent::SetCircuitBreaker { .. }
+                | TradingEvent::CancelReplace { .. }
+                | TradingEvent::SetFeeSchedule { .. }
+                | TradingEvent::ProvisionAccount { .. }
+                | TradingEvent::Withdraw { .. }
+                | TradingEvent::EndOfDay
+                | TradingEvent::DisableInstrument { .. }
+                | TradingEvent::EnableInstrument { .. }
+                | TradingEvent::RemoveInstrument { .. }
+                | TradingEvent::QueryStats
+                | TradingEvent::QueryPosition { .. }
+                | TradingEvent::QueryRequestSeq => {}
+            }
+        }
+        assert_covered(&TradingEvent::EndOfDay);
     }
 
     #[test]

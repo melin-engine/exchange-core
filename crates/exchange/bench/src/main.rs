@@ -1871,10 +1871,14 @@ fn run_roundtrip_bench(
         connection_timeout_secs: 0,
         authorized_keys: keys_path,
         // Single-node durability for the embedded bench server: ack on
-        // local persistence alone. The default `Hybrid` mode waits for
-        // `in_memory>=2` replica acks that never arrive when nothing else
-        // is connected, which would stall every response.
-        durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
+        // local persistence alone. The default `DiskAndRam` policy also
+        // requires `in_memory>=2`, i.e. a replica ack that never arrives
+        // when nothing else is connected, which would stall every response.
+        //
+        // `AckPolicy::Disk` is melin 0.15's name for what was
+        // `DurabilityMode::Local`; the guarantee (`persisted>=1`) is
+        // unchanged.
+        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         ..ServerConfig::default()
     };
     // Wire the trading AppFactory: replication / seed paths take it

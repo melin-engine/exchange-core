@@ -469,31 +469,36 @@ echo "============================================================"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Validate durability mode vs. replica count
+# Validate ack policy vs. replica count
 # ---------------------------------------------------------------------------
-# The server's default `--durability-mode` is `hybrid`, which gates
-# client acks on `persisted>=1 && in_memory>=2` — i.e. needs at least
-# one connected replica. Launching a non-replicated transport (tcp,
-# dpdk) under the default mode wedges the ack gate and the bench
-# appears to hang. Catch the mismatch up front so the operator sees a
-# clear error instead of staring at a frozen run.
+# The server's default `--ack-policy` is `disk+ram`, which gates client
+# acks on `persisted>=1 && in_memory>=2` — i.e. needs at least one
+# connected replica. Launching a non-replicated transport (tcp, dpdk)
+# under the default policy wedges the ack gate and the bench appears to
+# hang. Catch the mismatch up front so the operator sees a clear error
+# instead of staring at a frozen run.
+#
+# melin 0.15 renamed the flag and its values: `--durability-mode` became
+# `--ack-policy`, and local/replicated/hybrid/durably-replicated became
+# disk/ram/disk+ram/two-disks. The guarantees behind each are unchanged.
 
-# Effective `--durability-mode` parsed from `SERVER_EXTRA_ARGS`. The
-# server treats `--standalone` as forcing `local` (it rejects any
-# other pairing), so we apply the same rule here. Falls back to the
-# server's clap default (`hybrid`) when nothing is set.
-_effective_durability_mode() {
+# Effective `--ack-policy` parsed from `SERVER_EXTRA_ARGS`. The server
+# treats `--standalone` as forcing `disk` (it rejects any other
+# pairing), so we apply the same rule here. Falls back to the server's
+# clap default (`disk+ram`) when nothing is set.
+_effective_ack_policy() {
     local args="${SERVER_EXTRA_ARGS:-}"
     if [[ " ${args} " == *" --standalone "* ]]; then
-        echo "local"
+        echo "disk"
         return
     fi
-    # Matches `--durability-mode <X>` and `--durability-mode=<X>`.
-    if [[ "${args}" =~ --durability-mode[[:space:]=]+([a-zA-Z-]+) ]]; then
+    # Matches `--ack-policy <X>` and `--ack-policy=<X>`. The character
+    # class has to admit `+` for `disk+ram`.
+    if [[ "${args}" =~ --ack-policy[[:space:]=]+([a-zA-Z+-]+) ]]; then
         echo "${BASH_REMATCH[1]}"
         return
     fi
-    echo "hybrid"
+    echo "disk+ram"
 }
 
 # Number of replicas a given transport label launches.
@@ -507,25 +512,25 @@ _transport_replica_count() {
 }
 
 # Minimum connected replicas needed for the ack gate to advance under
-# the given mode. `hybrid` needs >=1 replica for the in_memory>=2
-# clause; `durably-replicated` needs >=1 replica for the persisted>=2
-# clause. Unknown modes are not validated here — the server will
-# reject them at startup.
-_mode_min_replicas() {
+# the given policy. `disk+ram` needs >=1 replica for the in_memory>=2
+# clause; `two-disks` needs >=1 replica for the persisted>=2 clause.
+# Unknown policies are not validated here — the server will reject them
+# at startup.
+_policy_min_replicas() {
     case "$1" in
-        local)                                      echo 0 ;;
-        replicated|hybrid|durably-replicated)       echo 1 ;;
-        *)                                          echo 0 ;;
+        disk)                       echo 0 ;;
+        ram|disk+ram|two-disks)     echo 1 ;;
+        *)                          echo 0 ;;
     esac
 }
 
-EFFECTIVE_DURABILITY_MODE="$(_effective_durability_mode)"
-REQUIRED_REPLICAS="$(_mode_min_replicas "$EFFECTIVE_DURABILITY_MODE")"
+EFFECTIVE_ACK_POLICY="$(_effective_ack_policy)"
+REQUIRED_REPLICAS="$(_policy_min_replicas "$EFFECTIVE_ACK_POLICY")"
 
 # Walk the unique transports in MATRIX and flag any that can't satisfy
 # the mode. LOCAL_MATRIX entries (engine-only, pipeline-only) bypass
 # the response gate entirely and are not affected.
-INVALID_DURABILITY=()
+INVALID_ACK_POLICY=()
 declare -A _VALIDATED
 for item in "${MATRIX[@]+"${MATRIX[@]}"}"; do
     _t="${item%%:*}"
@@ -533,16 +538,16 @@ for item in "${MATRIX[@]+"${MATRIX[@]}"}"; do
     _VALIDATED[$_t]=1
     _have="$(_transport_replica_count "$_t")"
     if (( _have < REQUIRED_REPLICAS )); then
-        INVALID_DURABILITY+=("${_t} (launches ${_have} replica(s))")
+        INVALID_ACK_POLICY+=("${_t} (launches ${_have} replica(s))")
     fi
 done
 
-if (( ${#INVALID_DURABILITY[@]} > 0 )); then
+if (( ${#INVALID_ACK_POLICY[@]} > 0 )); then
     echo "================================================================" >&2
-    echo "  ERROR: durability mode '${EFFECTIVE_DURABILITY_MODE}' requires at least"        >&2
+    echo "  ERROR: ack policy '${EFFECTIVE_ACK_POLICY}' requires at least"   >&2
     echo "         ${REQUIRED_REPLICAS} connected replica(s), but the following transport(s)"  >&2
     echo "         in the plan launch with fewer:"                            >&2
-    for combo in "${INVALID_DURABILITY[@]}"; do
+    for combo in "${INVALID_ACK_POLICY[@]}"; do
         echo "             - ${combo}"                                       >&2
     done
     echo ""                                                                  >&2
@@ -553,7 +558,7 @@ if (( ${#INVALID_DURABILITY[@]} > 0 )); then
     echo "    * Run a replicated transport instead (TRANSPORTS=tcp-repl"     >&2
     echo "      or tcp-dual-repl) and pass the replica host args."          >&2
     echo "    * Declare the cluster standalone:"                             >&2
-    echo "        SERVER_EXTRA_ARGS='--durability-mode local' ..."          >&2
+    echo "        SERVER_EXTRA_ARGS='--ack-policy disk' ..."                >&2
     echo "      (add --standalone for an explicit single-node deployment)." >&2
     echo "================================================================" >&2
     exit 1
