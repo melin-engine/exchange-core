@@ -36,7 +36,9 @@
 # Prerequisites:
 #   - SSH access to both machines (as root by default, or as [user])
 #   - Both machines have been set up via server-deploy.sh (or server-setup.sh)
-#   - A VLAN/private network between the two machines
+#   - A VLAN/private network between the two machines. On bare metal the
+#     provider's private port ships unconfigured; scripts/private-net-setup.sh
+#     configures and verifies it (see docs/operations.md, "Private Network").
 #   - The bench machine can reach <server-vlan-ip> over the private network
 
 set -euo pipefail
