@@ -854,6 +854,14 @@ impl MdGateway {
         self.dirty_fix.sort_unstable();
         self.dirty_fix.dedup();
 
+        // `drain(..)`, not `mem::take`, which is what clippy's
+        // `drain_collect` suggests: draining empties the vec but leaves its
+        // capacity in place, so this per-iteration scratch buffer never
+        // reallocates. `mem::take` would hand the allocation away and force
+        // a fresh one on the next `push`, i.e. a malloc per event-loop
+        // iteration on the send path. The collect into a temp is what lets
+        // the loop body below take `&mut self`.
+        #[allow(clippy::drain_collect)]
         let fix_dirty: Vec<usize> = self.dirty_fix.drain(..).collect();
         for idx in fix_dirty {
             let session = match self.sessions.get_mut(idx) {
@@ -931,6 +939,9 @@ impl MdGateway {
     /// io_uring SEND SQEs in flight (their inflight buffers are
     /// non-empty and the kernel may still be reading from them).
     fn drain_removals(&mut self) {
+        // Drained, not taken — see `flush_dirty_sends`: `to_remove` is a
+        // reused scratch buffer whose capacity must survive the call.
+        #[allow(clippy::drain_collect)]
         let pending: Vec<usize> = self.to_remove.drain(..).collect();
         for idx in pending {
             let can_remove = self

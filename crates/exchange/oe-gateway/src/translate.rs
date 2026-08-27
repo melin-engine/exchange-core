@@ -463,11 +463,7 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::TEXT, &taker_fee.to_string())
                 .build(sender, target, seq)
         }
-        ExecutionReport::Cancelled {
-            order_id,
-            remaining_quantity: _,
-            ..
-        } => {
+        ExecutionReport::Cancelled { order_id, .. } => {
             let clord_id = resolve_clord_id(id_map, *order_id, "Cancelled");
             FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
                 .str_tag(tags::ORDER_ID, &order_id.0.to_string())
