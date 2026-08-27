@@ -189,6 +189,13 @@ JOURNAL_DIR="$(dirname "$JOURNAL_PATH")"
 REPLICA_JOURNAL="${JOURNAL_DIR}/replica.journal"
 REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
+# Where melin-bench drops its result JSON on whichever host ran it. Fixed
+# path, so ownership matters: the DPDK bench runs under sudo and leaves the
+# file owned by root, and /tmp is sticky, so a later non-root run on the
+# same host can neither overwrite nor unlink it — it dies with
+# "create json file: PermissionDenied". Always clear it through
+# `_reset_bench_json` before a launch rather than trusting the writer.
+BENCH_JSON="/tmp/bench-results.json"
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
 # Open-loop target rate in orders/sec for the throughput workload.
@@ -1034,12 +1041,13 @@ run_bench() {
     # sample has to be taken either way, otherwise a failed run silently
     # reports its stall delta against a stale baseline on the next run.
     local rc=0
+    _reset_bench_json "$BENCH"
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${server_addr} \
             --health-addr ${health_addr} \
             --key bench.key \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --bench-cores 1 \
             --duration ${duration} \
             ${warmup_arg} ${cooldown_arg} ${threads_arg} \
@@ -1056,7 +1064,7 @@ collect_result() {
         name="${name}-no-persist"
     fi
     local out="${RESULTS_DIR}/${name}.json"
-    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "$out" 2>/dev/null || true
+    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:${BENCH_JSON}" "$out" 2>/dev/null || true
     if [[ -f "$out" ]]; then
         merge_vmstat_delta "$out"
     fi
@@ -1914,6 +1922,17 @@ transport_stop_dpdk_dual_repl() {
 # Workload functions
 # ---------------------------------------------------------------------------
 
+# Clear a stale result JSON on `host` before a bench launch.
+#
+# Runs under ${SUDO} because the file may be root-owned from a previous
+# DPDK run on that host, and /tmp's sticky bit means only its owner can
+# unlink it. Cheap and idempotent, so every launch path calls it rather
+# than reasoning about which transport ran last.
+_reset_bench_json() {
+    local host="$1"
+    ssh $SSH_OPTS "$host" "${SUDO} rm -f ${BENCH_JSON} 2>/dev/null; true" 2>/dev/null || true
+}
+
 # Launch melin-bench on the bench host over DPDK.
 #
 # Runs under ${SUDO} deliberately: EAL maps the hugetlbfs segments from
@@ -1928,12 +1947,13 @@ transport_stop_dpdk_dual_repl() {
 _run_bench_dpdk() {
     local duration="$1"
     shift
+    _reset_bench_json "$BENCH"
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ${SUDO} ./target/release/melin-bench \
             --addr ${CURRENT_BIND} \
             --health-addr ${CURRENT_HEALTH} \
             --key bench.key \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --duration ${duration} \
             --accounts ${BENCH_ACCOUNTS} \
             ${BENCH_DPDK_ARGS} $*"
@@ -2001,13 +2021,14 @@ workload_engine_only() {
     echo "============================================================"
     echo ""
 
+    _reset_bench_json "$SERVER"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --mode engine \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --duration ${LOCAL_DURATION}"
 
-    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:${BENCH_JSON}" \
         "${RESULTS_DIR}/local-engine-only.json" 2>/dev/null || true
 }
 
@@ -2021,15 +2042,16 @@ workload_pipeline_only() {
 
     clean_journal "$SERVER" "$JOURNAL_PATH"
 
+    _reset_bench_json "$SERVER"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --mode pipeline \
             --window 256 \
             --journal ${JOURNAL_PATH} \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --duration ${LOCAL_DURATION}"
 
-    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:${BENCH_JSON}" \
         "${RESULTS_DIR}/local-pipeline-only.json" 2>/dev/null || true
 }
 
