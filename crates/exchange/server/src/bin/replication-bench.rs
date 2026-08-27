@@ -39,7 +39,7 @@ use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_server::exchange_app::ServerApp;
-use melin_server_runtime::durability_policy::DurabilityMode;
+use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::replication::{
     ReplicaControlPlane, ReplicationListener, ReplicationMetrics, Sender, run_receiver, run_sender,
 };
@@ -73,12 +73,16 @@ struct Args {
     #[arg(long, default_value_t = melin_transport_core::ReplicaSlotCursors::SLOTS)]
     replicas: usize,
 
-    /// Durability mode advertised to replicas on `StreamStart` and every
+    /// Ack policy advertised to replicas on `StreamStart` and every
     /// heartbeat. This bench drains the output ring with a no-op instead of
-    /// running the response gate, so the mode does not throttle the
+    /// running the response gate, so the policy does not throttle the
     /// generator — it only sets what replicas judge auto-promotion against.
-    #[arg(long, value_enum, default_value_t = DurabilityMode::Hybrid)]
-    durability: DurabilityMode,
+    ///
+    /// Renamed from `--durability` in melin 0.15, along with the variants:
+    /// `hybrid` is now `disk+ram`. The guarantees are unchanged, so a
+    /// saved invocation only needs its flag and value retyped.
+    #[arg(long, value_enum, default_value_t = AckPolicy::DiskAndRam)]
+    ack_policy: AckPolicy,
 
     /// Primary-side core assignment, comma-separated IDs in the order
     /// `generator,journal,matching,drain,repl-sender,handler-0,handler-1`
@@ -242,7 +246,7 @@ const HEARTBEAT_SECS: u64 = 5;
 fn main() {
     let args = Args::parse();
     let busy_spin = !args.no_busy_spin;
-    let durability = args.durability;
+    let ack_policy = args.ack_policy;
 
     let n_replicas = args.replicas;
     if n_replicas == 0 || n_replicas > melin_transport_core::ReplicaSlotCursors::SLOTS {
@@ -454,14 +458,14 @@ fn main() {
     let metrics = Arc::new(ReplicationMetrics::default());
     let ready_flag = Arc::new(AtomicBool::new(false));
     let connected_counter = Arc::new(AtomicU32::new(0));
-    let durability_mode = Arc::new(std::sync::atomic::AtomicU8::new(durability.as_u8()));
+    let ack_policy_bits = Arc::new(std::sync::atomic::AtomicU8::new(ack_policy.as_u8()));
 
     let sender_config = Sender {
         listener,
         repl_consumer_1,
         repl_consumer_2,
         replica_slots: Arc::clone(&replica_slots),
-        durability_mode: Arc::clone(&durability_mode),
+        ack_policy: Arc::clone(&ack_policy_bits),
         journal_path: primary_journal.clone(),
         authorized_keys: Arc::clone(&authorized_keys),
         evict_flags: replication_ring_progress.evict_flags.clone(),
@@ -575,7 +579,7 @@ fn main() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    eprintln!("{n_replicas} replica(s) connected, durability={durability:?}");
+    eprintln!("{n_replicas} replica(s) connected, ack_policy={ack_policy:?}");
 
     // Seed: register one account so subsequent Deposit events
     // succeed under any future App that validates them.
@@ -682,7 +686,7 @@ fn main() {
     let final_cur = quorum();
     let final_lead = fastest();
     eprintln!();
-    eprintln!("final ({total_wall:.2}s wall, {n_replicas} replica(s), durability={durability:?}):");
+    eprintln!("final ({total_wall:.2}s wall, {n_replicas} replica(s), ack_policy={ack_policy:?}):");
     eprintln!("  total events published:  {total_published}");
     eprintln!("  quorum acked:            {final_cur}");
     eprintln!("  fastest replica acked:   {final_lead}");
