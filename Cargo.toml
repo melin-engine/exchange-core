@@ -11,7 +11,7 @@ resolver = "3"
 # plus the exchange-crate pins in `[workspace.dependencies]` below, all in
 # this file. Keep the two in lockstep: a member's inherited version and the
 # version requirement its dependents resolve against must always match.
-version = "0.13.0"
+version = "0.14.0"
 license-file = "LICENSE"
 repository = "https://github.com/melin-engine/exchange-core"
 homepage = "https://github.com/melin-engine/exchange-core"
@@ -26,19 +26,19 @@ authors = ["P.L.S.C."]
 # Only crates that something else depends on are listed. The leaf binaries
 # (melin-admin, melin-bench, the two gateways, the two TUIs) inherit the
 # workspace version but are nobody's dependency, so they need no pin.
-melin-client = { path = "crates/exchange/client", version = "0.13.0" }
-melin-exchange-core = { path = "crates/exchange/exchange-core", version = "0.13.0" }
-melin-gateway-core = { path = "crates/exchange/gateway-core", version = "0.13.0" }
-melin-market-data = { path = "crates/exchange/market-data", version = "0.13.0" }
-melin-protocol = { path = "crates/exchange/protocol", version = "0.13.0" }
+melin-client = { path = "crates/exchange/client", version = "0.14.0" }
+melin-exchange-core = { path = "crates/exchange/exchange-core", version = "0.14.0" }
+melin-gateway-core = { path = "crates/exchange/gateway-core", version = "0.14.0" }
+melin-market-data = { path = "crates/exchange/market-data", version = "0.14.0" }
+melin-protocol = { path = "crates/exchange/protocol", version = "0.14.0" }
 # `default-features = false` lives here rather than on the consumer: a member
 # cannot override an inherited `default-features`, and melin-bench — the only
 # crate that depends on the server — re-declares the server's feature set and
 # enables the pieces it wants explicitly. A future consumer that does want the
 # stock build must ask for `features = ["hash-chain", "release-tracing"]`.
-melin-server = { path = "crates/exchange/server", version = "0.13.0", default-features = false }
-melin-trading = { path = "crates/exchange/trading", version = "0.13.0" }
-melin-types = { path = "crates/exchange/types", version = "0.13.0" }
+melin-server = { path = "crates/exchange/server", version = "0.14.0", default-features = false }
+melin-trading = { path = "crates/exchange/trading", version = "0.14.0" }
+melin-types = { path = "crates/exchange/types", version = "0.14.0" }
 
 # Melin sequencer crates, consumed from crates.io and released from the
 # separate sequencer repository. Kept as a group distinct from the exchange
