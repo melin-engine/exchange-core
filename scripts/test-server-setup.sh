@@ -41,12 +41,13 @@ FN_FILE="${TMP_ROOT}/fns.sh"
     extract_fn kernel_param_live
     extract_fn kernel_param_in_cfg
     extract_fn kernel_param_values_in_cfg
+    extract_fn resolve_physical_cores
     extract_fn write_grub_dropin
     extract_fn verify_kernel_params
 } > "$FN_FILE"
 
 for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg \
-    write_grub_dropin verify_kernel_params; do
+    resolve_physical_cores write_grub_dropin verify_kernel_params; do
     if ! grep -q "^${fn}() {" "$FN_FILE"; then
         echo "error: failed to extract ${fn} from server-setup.sh — has it been" >&2
         echo "  renamed or reformatted? These tests are now vacuous; fix the" >&2
@@ -106,6 +107,91 @@ source_dropin() {
     GRUB_CMDLINE_LINUX="$vendor" bash -c '. "$1"; printf "%s" "$GRUB_CMDLINE_LINUX"' _ "$file"
 }
 
+echo "=== server-setup.sh core detection ==="
+
+# ---------------------------------------------------------------------
+# The normal path: lscpu collapses SMT siblings and its answer is used
+# as-is. 12 cores on a 24-thread host means isolating 1-11.
+# ---------------------------------------------------------------------
+if got=$(resolve_physical_cores 12 24 2>/dev/null) && [[ "$got" == "12" ]]; then
+    ok "lscpu's count is used when it is usable"
+else
+    bad "expected 12 from a working lscpu" "got: [${got}]"
+fi
+
+# ---------------------------------------------------------------------
+# Fallback. This must be `nproc --all`, never plain `nproc`: on a host
+# already tuned by this script, isolcpus pins default affinity to core 0
+# and plain `nproc` answers 1 (measured: 1 vs 24 on a 12-core box booted
+# with isolcpus=1-11). The caller passes --all; this checks the value is
+# actually taken.
+# ---------------------------------------------------------------------
+if got=$(resolve_physical_cores 0 24 2>/dev/null) && [[ "$got" == "24" ]]; then
+    ok "a failed lscpu falls back to the nproc --all count"
+else
+    bad "expected the fallback count of 24" "got: [${got}]"
+fi
+
+if err=$(resolve_physical_cores 0 24 2>&1 >/dev/null) && grep -q "nproc --all" <<< "$err"; then
+    ok "the fallback warns, and names the source it used"
+else
+    bad "falling back silently hides a detection failure" "stderr: [${err}]"
+fi
+
+# ---------------------------------------------------------------------
+# The bug this guard exists for. One core means LAST_ISOLATED=0 and an
+# `isolcpus=nohz,domain,1-0` that the kernel cannot act on — and that
+# verify_kernel_params would pass, since the malformed token does reach
+# grub.cfg and /proc/cmdline verbatim. Refuse instead.
+# ---------------------------------------------------------------------
+if out=$(resolve_physical_cores 1 1 2>&1); then
+    bad "a single-core host must be refused, not isolated" "got: [${out}]"
+elif grep -q "at least two" <<< "$out"; then
+    ok "a single usable core is refused rather than isolated"
+else
+    bad "the refusal should explain the two-core minimum" "$out"
+fi
+
+# The refusal has to survive both sources disagreeing, since that is the
+# shape a genuinely tiny host takes: lscpu says 1, nproc --all agrees.
+for pair in "0 1" "1 0" "0 0"; do
+    # shellcheck disable=SC2086
+    if resolve_physical_cores $pair >/dev/null 2>&1; then
+        bad "resolve_physical_cores($pair) must fail, not return a count"
+    fi
+done
+ok "every sub-two combination is refused"
+
+# The `--all` is chosen at the call site, which the tests above cannot
+# reach — they hand the function numbers directly. Pin it in the source
+# instead: every `nproc` command substitution in the setup script must
+# carry `--all`, or a tuned host silently reports one core again. This
+# asserts on text rather than behaviour, which is weak, but a top-level
+# command choice has nowhere else to be caught.
+nproc_calls=$(grep -c '\$(nproc' "$SETUP_SCRIPT")
+nproc_all_calls=$(grep -c '\$(nproc --all' "$SETUP_SCRIPT")
+if [[ "$nproc_calls" -gt 0 && "$nproc_calls" -eq "$nproc_all_calls" ]]; then
+    ok "every nproc call in server-setup.sh passes --all"
+else
+    bad "a bare \$(nproc) reports 1 on an isolcpus host" \
+        "\$(nproc: ${nproc_calls}, \$(nproc --all: ${nproc_all_calls})"
+fi
+
+# The property behind all of the above: whatever comes back is never a
+# count that would build a reversed range.
+range_ok=1
+for pair in "12 24" "0 24" "2 2" "4 8"; do
+    # shellcheck disable=SC2086
+    got=$(resolve_physical_cores $pair 2>/dev/null) || continue
+    [[ $((got - 1)) -ge 1 ]] || range_ok=0
+done
+if [[ "$range_ok" -eq 1 ]]; then
+    ok "an accepted count never yields a reversed isolcpus range"
+else
+    bad "some accepted count produces 1-0 or narrower"
+fi
+
+echo ""
 echo "=== server-setup.sh drop-in generation ==="
 
 # ---------------------------------------------------------------------

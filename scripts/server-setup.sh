@@ -217,15 +217,52 @@ GRUB_CFG="/boot/grub/grub.cfg"
 # means "staged but not yet live". Overridable for tests.
 REBOOT_FLAG="${REBOOT_FLAG:-/tmp/.server-needs-reboot}"
 
-# Count unique physical cores. `lscpu -p=CORE` lists one row per logical CPU
-# with its physical core ID; sort -u collapses SMT siblings. nosmt is set
-# below in BENCH_PARAMS, so this matches the post-reboot online CPU count.
-PHYSICAL_CORES=$(lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -un | wc -l)
-# `wc -l` always prints a number, so a failed lscpu shows up as 0, not as
-# an empty string — one numeric test covers both.
-if [[ "$PHYSICAL_CORES" -lt 2 ]]; then
-    PHYSICAL_CORES=$(nproc 2>/dev/null || echo 16)
-    echo "  warning: lscpu core detection failed, falling back to nproc=$PHYSICAL_CORES"
+# Decide how many cores to isolate, given lscpu's distinct-physical-core
+# count and `nproc --all`. Kept free of the commands that produce those
+# numbers so scripts/test-server-setup.sh can drive every branch.
+#
+# The second argument must come from `nproc --all`, never plain `nproc`.
+# isolcpus confines a process's default affinity to the housekeeping core,
+# so on a host this script has already tuned, plain `nproc` reports 1 —
+# measured on a 12-core box booted with isolcpus=1-11: `nproc` said 1,
+# `nproc --all` said 24. Falling back to 1 would set LAST_ISOLATED=0 and
+# emit `isolcpus=nohz,domain,1-0`, a reversed range the kernel cannot act
+# on, which the verification below would then wave through: the malformed
+# token does reach grub.cfg and /proc/cmdline verbatim.
+resolve_physical_cores() {
+    local lscpu_count="$1" nproc_all="$2" count="$1"
+    # `wc -l` always prints a number, so a failed lscpu arrives as 0 rather
+    # than an empty string — one numeric test covers both.
+    if [[ "$count" -lt 2 ]]; then
+        count="$nproc_all"
+        echo "  warning: lscpu core detection failed, falling back to nproc --all=${count}" >&2
+    fi
+    # Refuse rather than emit a range that cannot mean anything. Every
+    # range here is 1..N-1, so at N=1 that is "1-0" — not a narrower
+    # isolation but a malformed one, and isolating nothing is the correct
+    # reading of a single-core host anyway.
+    if [[ "$count" -lt 2 ]]; then
+        echo "error: detected only ${count} usable core(s) (lscpu: ${lscpu_count}," >&2
+        echo "  nproc --all: ${nproc_all}). Core isolation needs at least two —" >&2
+        echo "  core 0 for the OS and IRQs, and one or more for pinned threads." >&2
+        echo "  Refusing to write a malformed isolcpus range." >&2
+        return 1
+    fi
+    printf '%s' "$count"
+}
+
+# `lscpu -p=CORE` lists one row per logical CPU with its physical core ID;
+# sort -u collapses SMT siblings. nosmt is set below in BENCH_PARAMS, and
+# this count is stable across that reboot: lscpu lists only online CPUs, so
+# it sees N cores whether SMT is on (2N rows, N distinct) or off (N rows,
+# N distinct). Verified on a 12-core/24-thread host across a reboot.
+LSCPU_CORES=$(lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -un | wc -l)
+NPROC_ALL=$(nproc --all 2>/dev/null || echo 16)
+if ! PHYSICAL_CORES=$(resolve_physical_cores "$LSCPU_CORES" "$NPROC_ALL"); then
+    echo "  Setup stops here: kernel params, sysctl tuning, IRQ pinning, the CPU" >&2
+    echo "  governor, hugepages, vfio-pci and the journal disk have NOT been" >&2
+    echo "  configured." >&2
+    exit 1
 fi
 LAST_ISOLATED=$((PHYSICAL_CORES - 1))
 ISOLATED_RANGE="1-${LAST_ISOLATED}"
@@ -589,8 +626,14 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable melin-cpu-governor.service
-# Apply now too so we don't need to wait for a reboot.
-/usr/local/sbin/melin-cpu-governor
+# Apply now too, so a reboot isn't needed — but through systemd rather than
+# by running the binary directly. With RemainAfterExit=yes, `start` leaves
+# the unit `active (exited)`, which is the same state it reaches on every
+# subsequent boot. Invoking the script by hand sets the governor just as
+# well but leaves the unit `inactive (dead)`, so an operator who checks
+# `systemctl status melin-cpu-governor` straight after provisioning sees
+# what looks like a unit that failed to run.
+systemctl start melin-cpu-governor.service
 GOVERNOR_NOW=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unavailable")
 echo "  Governor service installed and applied (cpu0 now: ${GOVERNOR_NOW})"
 if [[ "$GOVERNOR_NOW" != "performance" && "$GOVERNOR_NOW" != "unavailable" ]]; then
