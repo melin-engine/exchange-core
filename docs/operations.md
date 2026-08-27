@@ -458,10 +458,12 @@ For lowest latency, configure kernel boot parameters. Add them through a drop-in
 
 ```sh
 sudo mkdir -p /etc/default/grub.d
-printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} isolcpus=nohz,domain,1-9 nohz_full=1-9 rcu_nocbs=1-9"\n' | sudo tee /etc/default/grub.d/99-melin-bench.cfg
+printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} isolcpus=nohz,domain,1-9 nohz_full=1-9 rcu_nocbs=1-9"\n' | sudo tee /etc/default/grub.d/99-melin-manual.cfg
 ```
 
 Append to `GRUB_CMDLINE_LINUX`, not `GRUB_CMDLINE_LINUX_DEFAULT`. Only the former is guaranteed to be defined — several hosting images ship without a `GRUB_CMDLINE_LINUX_DEFAULT` line at all, so an edit targeting it silently does nothing — and `GRUB_CMDLINE_LINUX` applies to the recovery entry too.
+
+Note the filename. `scripts/server-setup.sh` owns `99-melin-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
 
 Then apply:
 
@@ -493,8 +495,10 @@ grep rcu_nocbs /proc/cmdline              # should show rcu_nocbs=1-9
 To revert, remove the drop-in — the vendor's `/etc/default/grub` was never modified:
 
 ```sh
-sudo rm /etc/default/grub.d/99-melin-bench.cfg && sudo update-grub && sudo reboot
+sudo rm /etc/default/grub.d/99-melin-manual.cfg && sudo update-grub && sudo reboot
 ```
+
+On a host provisioned by `scripts/server-setup.sh`, remove `99-melin-bench.cfg` the same way to undo the parameters it applied.
 
 ### Runtime Tuning (bench-isolate.sh)
 

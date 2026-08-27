@@ -152,17 +152,11 @@ echo ""
 # 3. Kernel boot parameters
 # ---------------------------------------------------------------------------
 # Core isolation, tick suppression, and latency tuning — all persistent
-# across reboots via GRUB.
+# across reboots via GRUB. Applied through a drop-in at /etc/default/grub.d
+# and then verified against both the generated grub.cfg and /proc/cmdline;
+# see the GRUB_DROPIN assignment below for why neither half is optional.
 #
-# These are applied through a drop-in at /etc/default/grub.d rather than by
-# editing /etc/default/grub, and every one is verified against the generated
-# grub.cfg and /proc/cmdline afterwards. Both choices are deliberate: the
-# previous version `sed`-ed `GRUB_CMDLINE_LINUX_DEFAULT`, which some vendor
-# images (latitude.sh Debian 13 among them) do not define at all. The
-# substitution matched nothing, `update-grub` ran over an unchanged file, and
-# the script still printed "REBOOT REQUIRED" — so hosts booted completely
-# untuned while looking configured, and every re-run repeated the no-op
-# because its guard was "does /etc/default/grub mention isolcpus".
+# What each parameter does:
 #   isolcpus/nohz_full/rcu_nocbs: isolate cores 1..N-1 from scheduler/timers/RCU,
 #     where N is the number of physical cores (detected at setup time so the
 #     same script works on a 16-core 9950X and a 24-core EPYC 9255). Only
@@ -192,8 +186,29 @@ echo ""
 #     cadence in `perf record -e timer:timer_start` disappears and the bench's
 #     p99.99999 drops ~79% (102µs → 21µs).
 GRUB_FILE="/etc/default/grub"
+# Resolved rather than assumed to be /usr/sbin/grub-mkconfig: the guard
+# below reads this script to confirm it sources our drop-in directory, and
+# a path that happens to be wrong would fail that check — and abort the
+# run — on a host where nothing is actually wrong.
+GRUB_MKCONFIG="$(command -v grub-mkconfig || true)"
 # Debian's grub-mkconfig sources /etc/default/grub, then every *.cfg in
 # this directory. Owning a file here means never editing the vendor's.
+#
+# That ownership, and the verification pass further down, both exist because
+# of the same incident. The previous version of this script `sed`-ed
+# `GRUB_CMDLINE_LINUX_DEFAULT`, which some vendor images (latitude.sh
+# Debian 13 among them) do not define at all. The substitution matched
+# nothing, `update-grub` ran over an unchanged file, and the script still
+# printed "REBOOT REQUIRED" — so hosts booted completely untuned while
+# looking configured, and every re-run repeated the no-op because its guard
+# was "does /etc/default/grub mention isolcpus". Writing a file we own
+# removes the failure mode; checking the result afterwards is what catches
+# the next one.
+#
+# This exact path is also named in docs/operations.md, which tells operators
+# to hand-write a *differently named* drop-in for manual tuning — because
+# this one is regenerated wholesale on every run and would silently discard
+# their edits.
 GRUB_DROPIN_DIR="/etc/default/grub.d"
 GRUB_DROPIN="${GRUB_DROPIN_DIR}/99-melin-bench.cfg"
 # What update-grub generates, and therefore what the next boot reads.
@@ -206,7 +221,9 @@ REBOOT_FLAG="${REBOOT_FLAG:-/tmp/.server-needs-reboot}"
 # with its physical core ID; sort -u collapses SMT siblings. nosmt is set
 # below in BENCH_PARAMS, so this matches the post-reboot online CPU count.
 PHYSICAL_CORES=$(lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -un | wc -l)
-if [[ -z "$PHYSICAL_CORES" || "$PHYSICAL_CORES" -lt 2 ]]; then
+# `wc -l` always prints a number, so a failed lscpu shows up as 0, not as
+# an empty string — one numeric test covers both.
+if [[ "$PHYSICAL_CORES" -lt 2 ]]; then
     PHYSICAL_CORES=$(nproc 2>/dev/null || echo 16)
     echo "  warning: lscpu core detection failed, falling back to nproc=$PHYSICAL_CORES"
 fi
@@ -247,7 +264,12 @@ BENCH_PARAMS="${KERNEL_PARAMS[*]}"
 # run it is always /proc/cmdline.
 kernel_param_live() {
     local needle="$1" item
-    for item in $(cat "${CMDLINE_SOURCE:-/proc/cmdline}"); do
+    local -a tokens
+    # `read -ra` splits on IFS without the quoting hazards of an unquoted
+    # command substitution. /proc/cmdline is a single line, so one read
+    # takes the whole thing.
+    read -ra tokens < "${CMDLINE_SOURCE:-/proc/cmdline}"
+    for item in "${tokens[@]}"; do
         [[ "$item" == "$needle" ]] && return 0
     done
     return 1
@@ -267,7 +289,11 @@ kernel_param_in_cfg() {
 }
 
 # List the distinct values a `key=` parameter takes on the generated
-# kernel lines. More than one means the same knob is set twice with
+# kernel lines. The awk `seen[]` map does the deduplicating; the trailing
+# `sort` is only for stable ordering, since awk's `for (v in ...)` makes no
+# promises about it and these values end up in an error message.
+#
+# More than one value means the same knob is set twice with
 # different settings, and which one wins is not something to leave to
 # chance. The case that produces it: a host provisioned by the older
 # script, whose params were baked into /etc/default/grub directly, now
@@ -281,7 +307,39 @@ kernel_param_values_in_cfg() {
             }
         }
         END { for (v in seen) print v }
-    ' "$GRUB_CFG" 2>/dev/null | sort -u
+    ' "$GRUB_CFG" 2>/dev/null | sort
+}
+
+# Write the drop-in carrying every managed parameter, at `target`.
+#
+# Regenerated wholesale on each run rather than edited in place, which is
+# what makes the step idempotent: there is nothing to detect, re-detect, or
+# apply twice, and a changed core count simply rewrites the file.
+#
+# It appends to GRUB_CMDLINE_LINUX rather than GRUB_CMDLINE_LINUX_DEFAULT
+# because only the former is guaranteed to exist — the latitude.sh Debian 13
+# image ships GRUB_CMDLINE_LINUX alone, and the old `sed` targeting
+# `_DEFAULT` silently matched nothing there. Debian's grub-mkconfig puts
+# GRUB_CMDLINE_LINUX on both the normal and the recovery entry, so this
+# also covers a recovery boot.
+#
+# The `\${GRUB_CMDLINE_LINUX}` escape is load-bearing and easy to lose: it
+# must reach the file literally, so that grub-mkconfig expands it when it
+# sources the drop-in and our params are *appended* to the vendor's. Expand
+# it here instead and the generated line replaces the vendor's command line
+# with ours, discarding whatever it held — on hosting images, typically the
+# serial console settings that are the only way back into a remote box.
+# scripts/test-server-setup.sh covers this.
+write_grub_dropin() {
+    local target="$1"
+    mkdir -p "$(dirname "$target")"
+    cat > "$target" << EOF
+# Melin benchmark tuning — generated by scripts/server-setup.sh.
+# Do not edit: this file is overwritten on every setup run. Change the
+# KERNEL_PARAMS array in that script instead. For tuning of your own, use
+# a separate drop-in — see docs/operations.md.
+GRUB_CMDLINE_LINUX="\${GRUB_CMDLINE_LINUX} ${BENCH_PARAMS}"
+EOF
 }
 
 # Report which managed params are missing from a generated grub.cfg and
@@ -289,6 +347,12 @@ kernel_param_values_in_cfg() {
 # the previous implementation could not tell "wrote the params" from
 # "wrote nothing": it `sed`-ed a line that some vendor images don't have,
 # ran update-grub over the unchanged file, and still announced success.
+#
+# The check is one-directional: it asks whether everything in KERNEL_PARAMS
+# is present, never whether something present is unwanted. Drop a parameter
+# from the array and the running kernel keeps it until the next reboot while
+# this still reports all-clear — which is the honest answer, since the
+# drop-in no longer sets it.
 verify_kernel_params() {
     local missing_cfg=() missing_live=() p key values
 
@@ -359,33 +423,24 @@ verify_kernel_params() {
 
 if [[ ! -f "$GRUB_FILE" ]]; then
     echo "=== No GRUB config found, skipping kernel boot params ==="
-elif ! grep -q "default/grub\.d" /usr/sbin/grub-mkconfig 2>/dev/null; then
+elif [[ -z "$GRUB_MKCONFIG" ]] || ! grep -q "default/grub\.d" "$GRUB_MKCONFIG"; then
     # Bail loudly rather than fall back to editing the vendor file. The
     # fallback is what produced the silent no-op this rewrite fixes.
-    echo "error: this host's grub-mkconfig does not source /etc/default/grub.d," >&2
-    echo "  so the drop-in would be ignored. Kernel tuning cannot be applied" >&2
-    echo "  safely here — configure $GRUB_FILE by hand." >&2
+    if [[ -z "$GRUB_MKCONFIG" ]]; then
+        echo "error: $GRUB_FILE exists but grub-mkconfig is not installed," >&2
+        echo "  so there is no way to regenerate the boot config." >&2
+    else
+        echo "error: this host's grub-mkconfig ($GRUB_MKCONFIG) does not source" >&2
+        echo "  /etc/default/grub.d, so the drop-in would be ignored." >&2
+    fi
+    echo "  Kernel tuning cannot be applied safely here — configure" >&2
+    echo "  $GRUB_FILE by hand." >&2
+    echo "  Setup stops here: sysctl tuning, IRQ pinning, the CPU governor," >&2
+    echo "  hugepages, vfio-pci and the journal disk have NOT been configured." >&2
     exit 1
 else
     echo "=== Configuring kernel boot parameters ==="
-    # The drop-in is regenerated on every run and owned entirely by this
-    # script, which is what makes the step idempotent: there is no
-    # in-place edit to detect, re-detect, or accidentally apply twice, and
-    # a changed core count simply rewrites the file.
-    #
-    # It appends to GRUB_CMDLINE_LINUX rather than GRUB_CMDLINE_LINUX_DEFAULT
-    # because only the former is guaranteed to exist — the latitude.sh
-    # Debian 13 image ships GRUB_CMDLINE_LINUX alone, and the old
-    # `sed` targeting `_DEFAULT` silently matched nothing there. Debian's
-    # grub-mkconfig puts GRUB_CMDLINE_LINUX on both the normal and the
-    # recovery entry, so this also covers a recovery boot.
-    mkdir -p "$GRUB_DROPIN_DIR"
-    cat > "$GRUB_DROPIN" << EOF
-# Melin benchmark tuning — generated by scripts/server-setup.sh.
-# Do not edit: this file is overwritten on every setup run. Change the
-# KERNEL_PARAMS array in that script instead.
-GRUB_CMDLINE_LINUX="\${GRUB_CMDLINE_LINUX} ${BENCH_PARAMS}"
-EOF
+    write_grub_dropin "$GRUB_DROPIN"
     echo "  Wrote $GRUB_DROPIN"
     echo "  Params: $BENCH_PARAMS"
 
@@ -395,6 +450,8 @@ EOF
     # not land must stop the run, not continue into the rest of setup
     # looking healthy.
     if ! verify_kernel_params; then
+        echo "  Setup stops here: sysctl tuning, IRQ pinning, the CPU governor," >&2
+        echo "  hugepages, vfio-pci and the journal disk have NOT been configured." >&2
         exit 1
     fi
 fi
@@ -402,7 +459,7 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3b. Disable noisy background services
+# 3a. Disable noisy background services
 # ---------------------------------------------------------------------------
 # These services wake up periodically on random cores, causing latency
 # spikes via context switches, IPI interrupts, or disk I/O on pipeline
@@ -424,7 +481,7 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3b'. Pin device IRQs to core 0
+# 3b. Pin device IRQs to core 0
 # ---------------------------------------------------------------------------
 # `isolcpus` keeps the scheduler off the engine cores, but it does NOT
 # steer hardware IRQs. Boot-time defaults spread NIC/NVMe/etc. interrupts
@@ -475,7 +532,7 @@ echo "  IRQ pin service installed and applied"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3b''. Force the performance CPU governor
+# 3c. Force the performance CPU governor
 # ---------------------------------------------------------------------------
 # `cpufreq.default_governor=performance` is on the kernel cmdline, but that
 # only applies to policies created after the parameter is parsed — and it
@@ -544,7 +601,7 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3c. Sysctl tuning (persistent via /etc/sysctl.d/)
+# 3d. Sysctl tuning (persistent via /etc/sysctl.d/)
 # ---------------------------------------------------------------------------
 echo "=== Configuring sysctl ==="
 SYSCTL_FILE="/etc/sysctl.d/99-melin-bench.conf"
@@ -639,7 +696,7 @@ echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0, kernel.w
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3d. Hugepages for DPDK
+# 3e. Hugepages for DPDK
 # ---------------------------------------------------------------------------
 # DPDK uses 2 MiB hugepages for packet buffers and memory pools. Allocate
 # persistently via sysctl so they survive reboots. 1024 pages = 2 GiB.
@@ -658,7 +715,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3e. vfio-pci module (DPDK NIC binding)
+# 3f. vfio-pci module (DPDK NIC binding)
 # ---------------------------------------------------------------------------
 # Ensure vfio-pci is loaded at boot for DPDK to bind NICs via IOMMU.
 if ! grep -q "vfio-pci" /etc/modules-load.d/*.conf 2>/dev/null; then
@@ -885,7 +942,7 @@ echo ""
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Clone the repo
+# 6. Clone the repo
 # ---------------------------------------------------------------------------
 echo "=== Cloning the repo ==="
 

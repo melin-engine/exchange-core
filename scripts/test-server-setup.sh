@@ -41,10 +41,12 @@ FN_FILE="${TMP_ROOT}/fns.sh"
     extract_fn kernel_param_live
     extract_fn kernel_param_in_cfg
     extract_fn kernel_param_values_in_cfg
+    extract_fn write_grub_dropin
     extract_fn verify_kernel_params
 } > "$FN_FILE"
 
-for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg verify_kernel_params; do
+for fn in kernel_param_live kernel_param_in_cfg kernel_param_values_in_cfg \
+    write_grub_dropin verify_kernel_params; do
     if ! grep -q "^${fn}() {" "$FN_FILE"; then
         echo "error: failed to extract ${fn} from server-setup.sh — has it been" >&2
         echo "  renamed or reformatted? These tests are now vacuous; fix the" >&2
@@ -96,6 +98,71 @@ setup_case() {
     printf 'BOOT_IMAGE=/boot/vmlinuz-test root=UUID=abc ro %s\n' "$live" > "$CMDLINE_SOURCE"
 }
 
+# Source `file` in a child shell with GRUB_CMDLINE_LINUX preset to
+# `vendor`, and print what the variable ends up as — exactly what
+# grub-mkconfig does when it reaches the drop-in.
+source_dropin() {
+    local file="$1" vendor="$2"
+    GRUB_CMDLINE_LINUX="$vendor" bash -c '. "$1"; printf "%s" "$GRUB_CMDLINE_LINUX"' _ "$file"
+}
+
+echo "=== server-setup.sh drop-in generation ==="
+
+# ---------------------------------------------------------------------
+# The escape in `\${GRUB_CMDLINE_LINUX}` has to survive into the file so
+# that grub-mkconfig expands it and our params are appended. Lose the
+# backslash and the drop-in replaces the vendor's command line instead —
+# on hosting images that discards the serial console settings, which on a
+# remote box is the way back in. Nothing else in this file would notice.
+# ---------------------------------------------------------------------
+BENCH_PARAMS="isolcpus=nohz,domain,1-5 nosmt iommu=pt"
+DROPIN="${TMP_ROOT}/dropin.d/99-melin-bench.cfg"
+write_grub_dropin "$DROPIN"
+
+if [[ -f "$DROPIN" ]]; then
+    ok "drop-in written, creating its directory on the way"
+else
+    bad "write_grub_dropin did not create $DROPIN"
+fi
+
+got=$(source_dropin "$DROPIN" "quiet console=ttyS0,115200")
+if [[ "$got" == "quiet console=ttyS0,115200 ${BENCH_PARAMS}" ]]; then
+    ok "vendor command line is preserved and the params appended"
+else
+    bad "the drop-in must append, not replace" "got: [${got}]"
+fi
+
+# A vendor file that never defines the variable is the case that broke the
+# old script. Appending to nothing is fine; silently doing nothing is not.
+got=$(source_dropin "$DROPIN" "")
+if [[ "$got" == *"isolcpus=nohz,domain,1-5"* && "$got" == *"nosmt"* ]]; then
+    ok "params still land when the vendor defines no command line"
+else
+    bad "an undefined GRUB_CMDLINE_LINUX must still yield the params" "got: [${got}]"
+fi
+
+# Regenerating is what makes the setup step idempotent: a second run must
+# rewrite the file, never append a second copy of the parameters.
+before=$(cat "$DROPIN")
+write_grub_dropin "$DROPIN"
+if [[ "$(cat "$DROPIN")" == "$before" ]]; then
+    ok "rewriting the drop-in is idempotent"
+else
+    bad "a second write changed the file — params are accumulating"
+fi
+
+# A changed core count has to be reflected, since the whole point of
+# regenerating is that a resized host re-isolates the right range.
+BENCH_PARAMS="isolcpus=nohz,domain,1-11 nosmt"
+write_grub_dropin "$DROPIN"
+got=$(source_dropin "$DROPIN" "quiet")
+if [[ "$got" == "quiet ${BENCH_PARAMS}" ]]; then
+    ok "a changed parameter set replaces the previous one"
+else
+    bad "regenerating must pick up the new params" "got: [${got}]"
+fi
+
+echo ""
 echo "=== server-setup.sh kernel-param verification ==="
 
 # ---------------------------------------------------------------------
