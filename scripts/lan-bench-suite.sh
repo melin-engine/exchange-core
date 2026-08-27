@@ -131,7 +131,8 @@
 # Prerequisites:
 #   - SSH access to all machines (as root by default)
 #   - server-deploy.sh or server-setup.sh completed on all machines
-#   - VLAN/private network between machines
+#   - VLAN/private network between machines — scripts/private-net-setup.sh
+#     configures and verifies one (docs/operations.md, "Private Network")
 #   - bench-isolate.sh run on all machines for stable numbers
 
 set -euo pipefail

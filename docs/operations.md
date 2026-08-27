@@ -543,6 +543,27 @@ For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-det
 
 For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,7,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. The nine-value form is deliberate here: it also leaves the journal segment preparer unpinned, which is what you want when there is no spare core to give it. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
 
+### Private Network (802.1Q VLAN)
+
+Replication and the LAN benchmarks expect a private network between hosts, separate from the public interface. On bare metal that network is usually a customer VLAN: the provider attaches each server's second NIC port to it and leaves the port link-up but unconfigured, carrying no traffic until the OS is told to tag frames. The addresses inside the VLAN are yours to choose.
+
+`scripts/private-net-setup.sh` configures and then verifies one:
+
+```sh
+sudo ./scripts/private-net-setup.sh --vlan-id 2025 --address 10.8.0.1/24 --peer 10.8.0.2
+```
+
+Run it on each host with a different `--address` in the same prefix. `--peer` is what makes the run meaningful — without it only the local half is checked, and a VLAN that is configured correctly on this host but not carried by the switch looks identical to one that works.
+
+Notes:
+
+- **`--vlan-id` is the numeric 802.1Q tag**, not the `vlan_xxx` resource id the provider dashboard also displays.
+- **The parent defaults to `eno2`**, the second port on Latitude.sh hosts. Use `--link` elsewhere. The script refuses to build on the interface holding the default route, since that is the public port and reconfiguring it would eventually cut your own SSH session.
+- **Only pass `--mtu` if the switch passes jumbo frames.** A switch that does not blackholes large frames silently rather than reporting an error, so the script probes at full frame size with DF set and tells you which of the two is happening. The parent is raised to `--mtu` plus 4 for the tag.
+- **Changing the MTU resets the adapter**, and 10GBASE-T copper can take 15-30 seconds to retrain. The script waits for carrier rather than reporting a dead peer.
+- Configuration is persisted to `/etc/netplan/60-melin-private-<vlan>.yaml` and validated with `netplan generate`, so the host keeps its private network across reboots. It is deliberately not written into `50-cloud-init.yaml`, which cloud-init owns and may rewrite.
+- `--down --vlan-id <n>` tears the interface down, removes the persisted file, and returns the parent MTU to 1500.
+
 ---
 
 ## Monitoring
