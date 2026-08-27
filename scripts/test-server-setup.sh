@@ -70,17 +70,30 @@ bad() {
     [[ -n "${2:-}" ]] && echo "         $2" >&2
 }
 
-# Build a fake grub.cfg carrying `params` on a linux line, and a fake
-# /proc/cmdline carrying `live`. Sets the globals the functions read.
-setup_case() {
-    local params="$1" live="$2" name="$3"
+# Point every global the extracted functions read at this case's temp
+# files. All five matter, not just the ones a given case exercises: the
+# error paths interpolate GRUB_FILE and GRUB_DROPIN into their closing
+# lines, and under `set -u` an unset one kills the function mid-message.
+# That aborts before the `return 1` the case means to be checking, while
+# still emitting enough of the text for a lenient grep to pass — a green
+# test for a function that crashed.
+case_globals() {
+    local name="$1"
     GRUB_CFG="${TMP_ROOT}/${name}.cfg"
     CMDLINE_SOURCE="${TMP_ROOT}/${name}.cmdline"
     REBOOT_FLAG="${TMP_ROOT}/${name}.reboot"
     GRUB_DROPIN="${TMP_ROOT}/${name}.dropin"
+    GRUB_FILE="${TMP_ROOT}/${name}.default-grub"
+    rm -f "$REBOOT_FLAG"
+}
+
+# Build a fake grub.cfg carrying `params` on a linux line, and a fake
+# /proc/cmdline carrying `live`. Sets the globals the functions read.
+setup_case() {
+    local params="$1" live="$2" name="$3"
+    case_globals "$name"
     printf '\tlinux\t/boot/vmlinuz-test root=UUID=abc ro %s\n' "$params" > "$GRUB_CFG"
     printf 'BOOT_IMAGE=/boot/vmlinuz-test root=UUID=abc ro %s\n' "$live" > "$CMDLINE_SOURCE"
-    rm -f "$REBOOT_FLAG"
 }
 
 echo "=== server-setup.sh kernel-param verification ==="
@@ -94,10 +107,15 @@ setup_case "quiet splash" "quiet splash" "silent-noop"
 if out=$(verify_kernel_params 2>&1); then
     bad "a config missing every param must fail" "verify_kernel_params returned 0"
 else
-    if grep -q "did not reach" <<< "$out"; then
+    # The closing line as well as the opening one: an error path that
+    # dies partway through its own message (an unset global under
+    # `set -u`, say) still returns non-zero and still prints enough for a
+    # first-line grep to match.
+    if grep -q "did not reach" <<< "$out" \
+        && grep -q "looking configured" <<< "$out"; then
         ok "params absent from grub.cfg → hard failure"
     else
-        bad "failure message should name the problem" "$out"
+        bad "failure message should name the problem, in full" "$out"
     fi
 fi
 if [[ -f "$REBOOT_FLAG" ]]; then
@@ -203,10 +221,7 @@ fi
 # Only kernel command lines count. A param appearing in a comment or a
 # menu title is not a param the kernel will see.
 KERNEL_PARAMS=("nosmt")
-GRUB_CFG="${TMP_ROOT}/non-linux-line.cfg"
-CMDLINE_SOURCE="${TMP_ROOT}/non-linux-line.cmdline"
-REBOOT_FLAG="${TMP_ROOT}/non-linux-line.reboot"
-rm -f "$REBOOT_FLAG"
+case_globals "non-linux-line"
 printf '# a comment mentioning nosmt\nmenuentry "nosmt build" {\n\tlinux\t/boot/vmlinuz ro quiet\n}\n' > "$GRUB_CFG"
 printf 'BOOT_IMAGE=/boot/vmlinuz ro quiet\n' > "$CMDLINE_SOURCE"
 if out=$(verify_kernel_params 2>&1); then
@@ -228,7 +243,8 @@ setup_case "isolcpus=nohz,domain,1-10 isolcpus=nohz,domain,1-5" \
 if out=$(verify_kernel_params 2>&1); then
     bad "a param set twice with different values must fail" "$out"
 elif grep -q "set more than once" <<< "$out" \
-    && grep -q "1-10" <<< "$out" && grep -q "1-5" <<< "$out"; then
+    && grep -q "1-10" <<< "$out" && grep -q "1-5" <<< "$out" \
+    && grep -q "only place they belong" <<< "$out"; then
     ok "conflicting duplicate is caught and both values shown"
 else
     bad "should name the conflict and both values" "$out"
@@ -237,10 +253,7 @@ fi
 # The identical param appearing on several menu entries (normal +
 # recovery) is how a correct grub.cfg always looks — not a conflict.
 KERNEL_PARAMS=("isolcpus=nohz,domain,1-5")
-GRUB_CFG="${TMP_ROOT}/multi-entry.cfg"
-CMDLINE_SOURCE="${TMP_ROOT}/multi-entry.cmdline"
-REBOOT_FLAG="${TMP_ROOT}/multi-entry.reboot"
-rm -f "$REBOOT_FLAG"
+case_globals "multi-entry"
 {
     printf '\tlinux\t/boot/vmlinuz ro isolcpus=nohz,domain,1-5\n'
     printf '\tlinux\t/boot/vmlinuz ro single isolcpus=nohz,domain,1-5\n'
@@ -250,6 +263,43 @@ if out=$(verify_kernel_params 2>&1); then
     ok "same value on several menu entries is not a conflict"
 else
     bad "repeating one value across entries is normal, not an error" "$out"
+fi
+
+# ---------------------------------------------------------------------
+# A reboot flag left behind by an earlier run must be cleared once the
+# params are live. server-deploy.sh only removes it on the path where it
+# reboots the host itself, so a hand-rebooted box with a disk-backed /tmp
+# keeps it, and the closing summary would report a pending reboot that
+# this very run just proved unnecessary.
+# ---------------------------------------------------------------------
+KERNEL_PARAMS=("nosmt")
+setup_case "nosmt" "nosmt" "stale-flag"
+touch "$REBOOT_FLAG"
+if out=$(verify_kernel_params 2>&1); then
+    if [[ -f "$REBOOT_FLAG" ]]; then
+        bad "a stale reboot flag must be cleared once every param is live" "$out"
+    else
+        ok "stale reboot flag cleared when the params are already active"
+    fi
+else
+    bad "a fully applied config must not fail" "$out"
+fi
+
+# ---------------------------------------------------------------------
+# A grub.cfg at another path is not the same failure as params that did
+# not land, and must not be reported as one — that message tells the
+# operator to distrust a host whose tuning may be perfectly fine.
+# ---------------------------------------------------------------------
+KERNEL_PARAMS=("nosmt")
+setup_case "nosmt" "nosmt" "no-grub-cfg"
+rm -f "$GRUB_CFG"
+if out=$(verify_kernel_params 2>&1); then
+    bad "a missing grub.cfg must fail" "verify_kernel_params returned 0"
+elif grep -q "does not exist" <<< "$out" \
+    && ! grep -q "did not reach" <<< "$out"; then
+    ok "a missing grub.cfg is named as such, not as unapplied params"
+else
+    bad "should report the missing config, not a failed application" "$out"
 fi
 
 echo ""

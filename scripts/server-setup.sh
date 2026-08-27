@@ -292,6 +292,19 @@ kernel_param_values_in_cfg() {
 verify_kernel_params() {
     local missing_cfg=() missing_live=() p key values
 
+    # A missing config gets its own message. Without this the per-param
+    # checks below all read false and the run fails with "the parameters
+    # did not reach $GRUB_CFG", sending the operator after a GRUB problem
+    # that does not exist when the real answer is that this host writes
+    # its generated config somewhere else.
+    if [[ ! -f "$GRUB_CFG" ]]; then
+        echo "error: $GRUB_CFG does not exist, so the parameters cannot be" >&2
+        echo "  verified. update-grub on this host writes its generated config" >&2
+        echo "  elsewhere (grub2/ on RHEL-family images, for one). Point GRUB_CFG" >&2
+        echo "  at the right path before trusting any tuning on this box." >&2
+        return 1
+    fi
+
     # Conflicting duplicates first: a param that is present twice would
     # otherwise pass the "did it land" check below while leaving the
     # effective setting ambiguous.
@@ -334,6 +347,11 @@ verify_kernel_params() {
         printf '    %s\n' "${missing_live[@]}"
         echo "  *** REBOOT REQUIRED for these to take effect ***"
     else
+        # Clear a flag left by an earlier run: server-deploy.sh only
+        # removes it on the path where it does the reboot itself, so a
+        # host rebooted by hand keeps it wherever /tmp is disk-backed,
+        # and the closing summary would then contradict this line.
+        rm -f "$REBOOT_FLAG"
         echo "  All ${#KERNEL_PARAMS[@]} parameters are active on the running kernel."
     fi
     return 0
@@ -487,7 +505,12 @@ done
 for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
     [ -w "$epp" ] && printf 'performance' > "$epp" 2>/dev/null
 done
-logger -t melin-cpu-governor "applied=${applied} skipped=${skipped}"
+# Best-effort: logger exits non-zero when it cannot reach the syslog
+# socket, and it is the last command here, so its status would become the
+# script's — failing the systemd unit at every boot and, because
+# server-setup.sh runs this directly under `set -e`, aborting a
+# provisioning run that had already applied the governor successfully.
+logger -t melin-cpu-governor "applied=${applied} skipped=${skipped}" || true
 EOF
 chmod +x /usr/local/sbin/melin-cpu-governor
 
