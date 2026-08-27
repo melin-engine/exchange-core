@@ -189,13 +189,40 @@ JOURNAL_DIR="$(dirname "$JOURNAL_PATH")"
 REPLICA_JOURNAL="${JOURNAL_DIR}/replica.journal"
 REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
-# Where melin-bench drops its result JSON on whichever host ran it. Fixed
-# path, so ownership matters: the DPDK bench runs under sudo and leaves the
-# file owned by root, and /tmp is sticky, so a later non-root run on the
-# same host can neither overwrite nor unlink it — it dies with
-# "create json file: PermissionDenied". Always clear it through
-# `_reset_bench_json` before a launch rather than trusting the writer.
-BENCH_JSON="/tmp/bench-results.json"
+# Where melin-bench drops its result JSON on whichever host ran it.
+#
+# The path is per-host rather than per-run, so ownership matters: the DPDK
+# bench runs under sudo and leaves the file owned by root mode 0644. A later
+# non-root run then cannot replace it — it cannot write it, because of the
+# file's own mode, and it cannot unlink it either, because /tmp is sticky and
+# only the owner may remove a file there. Two separate mechanisms, one
+# symptom: "create json file: PermissionDenied" at startup.
+#
+# Always clear it through `_reset_bench_json` before a launch rather than
+# trusting the writer. Overridable, since a caller who wants runs to stop
+# colliding at all can simply give each one its own path.
+BENCH_JSON="${BENCH_JSON:-/tmp/bench-results.json}"
+
+# Clear a stale result JSON on `host` before a bench launch.
+#
+# Runs under ${SUDO} because the file may be root-owned from a previous DPDK
+# run on that host. Cheap and idempotent — `rm -f` succeeds when the file is
+# already gone — so every launch path calls it rather than reasoning about
+# which transport ran last.
+#
+# Defined here beside BENCH_JSON rather than among the workload functions:
+# its first caller is `run_bench`, hundreds of lines above where a helper
+# like this would otherwise land.
+_reset_bench_json() {
+    local host="$1"
+    # Non-fatal, but not silent. If the file survives, the bench launched
+    # moments later dies with the PermissionDenied this exists to prevent,
+    # and this warning is the only thing that would connect the two.
+    if ! ssh $SSH_OPTS "$host" "${SUDO} rm -f ${BENCH_JSON}" 2>/dev/null; then
+        echo "  warning: could not clear ${BENCH_JSON} on ${host} — if a root-owned" >&2
+        echo "           leftover is there, the next non-root bench will fail to start." >&2
+    fi
+}
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
 # Open-loop target rate in orders/sec for the throughput workload.
@@ -1921,17 +1948,6 @@ transport_stop_dpdk_dual_repl() {
 # ---------------------------------------------------------------------------
 # Workload functions
 # ---------------------------------------------------------------------------
-
-# Clear a stale result JSON on `host` before a bench launch.
-#
-# Runs under ${SUDO} because the file may be root-owned from a previous
-# DPDK run on that host, and /tmp's sticky bit means only its owner can
-# unlink it. Cheap and idempotent, so every launch path calls it rather
-# than reasoning about which transport ran last.
-_reset_bench_json() {
-    local host="$1"
-    ssh $SSH_OPTS "$host" "${SUDO} rm -f ${BENCH_JSON} 2>/dev/null; true" 2>/dev/null || true
-}
 
 # Launch melin-bench on the bench host over DPDK.
 #
