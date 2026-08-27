@@ -285,10 +285,11 @@ cleanup() {
     done
     # Kill any orphaned bench client too — a hung run leaves the bench
     # binary executing on $BENCH and the next build trips "Text file
-    # busy" on the cp into the .dpdk suffixed path. The bench client
-    # runs as the SSH user, so no sudo needed.
-    ssh $SSH_OPTS "$BENCH" "pkill -INT -x melin-bench 2>/dev/null; \
-                            pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
+    # busy" on the cp into the .dpdk suffixed path. Signalled under
+    # ${SUDO}: the DPDK bench runs as root (EAL needs the hugetlbfs
+    # mount), so an unprivileged pkill silently fails to reap it.
+    ssh $SSH_OPTS "$BENCH" "${SUDO} pkill -INT -x melin-bench 2>/dev/null; \
+                            ${SUDO} pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Clean DPDK EAL lock files so the next run doesn't fail with
     # "Cannot create lock on '/var/run/dpdk/rte/config'".
     if [[ "${DPDK_RAN:-0}" == "1" ]]; then
