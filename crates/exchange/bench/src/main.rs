@@ -606,6 +606,14 @@ struct BenchArgs {
     /// host.
     #[arg(long)]
     dpdk_gateway_mac: Option<String>,
+    /// Server MAC (aa:bb:cc:dd:ee:ff) seeded into smoltcp for `--addr`,
+    /// so the first frame is addressed correctly without an ARP round
+    /// trip. Required in mlx5 bifurcated mode: there the DPDK port
+    /// shares the kernel netdev's real hardware MAC, not the SR-IOV
+    /// `02:00:<ip>` address the fallback derives. Read it from
+    /// `/sys/class/net/<iface>/address` on the server.
+    #[arg(long)]
+    dpdk_peer_mac: Option<String>,
     /// MTU for the DPDK interface. Use 9000 for jumbo frames. Must match server.
     #[arg(long, default_value_t = 1500)]
     dpdk_mtu: usize,
@@ -766,6 +774,7 @@ fn main() {
                             .as_deref()
                             .map(|s| s.parse().expect("invalid --dpdk-peer-ip")),
                         gateway_mac: args.dpdk_gateway_mac.as_deref().map(melin_dpdk::parse_mac),
+                        peer_mac: args.dpdk_peer_mac.as_deref().map(melin_dpdk::parse_mac),
                     },
                     phases,
                     args.window,

@@ -189,6 +189,40 @@ JOURNAL_DIR="$(dirname "$JOURNAL_PATH")"
 REPLICA_JOURNAL="${JOURNAL_DIR}/replica.journal"
 REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
+# Where melin-bench drops its result JSON on whichever host ran it.
+#
+# The path is per-host rather than per-run, so ownership matters: the DPDK
+# bench runs under sudo and leaves the file owned by root mode 0644. A later
+# non-root run then cannot replace it — it cannot write it, because of the
+# file's own mode, and it cannot unlink it either, because /tmp is sticky and
+# only the owner may remove a file there. Two separate mechanisms, one
+# symptom: "create json file: PermissionDenied" at startup.
+#
+# Always clear it through `_reset_bench_json` before a launch rather than
+# trusting the writer. Overridable, since a caller who wants runs to stop
+# colliding at all can simply give each one its own path.
+BENCH_JSON="${BENCH_JSON:-/tmp/bench-results.json}"
+
+# Clear a stale result JSON on `host` before a bench launch.
+#
+# Runs under ${SUDO} because the file may be root-owned from a previous DPDK
+# run on that host. Cheap and idempotent — `rm -f` succeeds when the file is
+# already gone — so every launch path calls it rather than reasoning about
+# which transport ran last.
+#
+# Defined here beside BENCH_JSON rather than among the workload functions:
+# its first caller is `run_bench`, hundreds of lines above where a helper
+# like this would otherwise land.
+_reset_bench_json() {
+    local host="$1"
+    # Non-fatal, but not silent. If the file survives, the bench launched
+    # moments later dies with the PermissionDenied this exists to prevent,
+    # and this warning is the only thing that would connect the two.
+    if ! ssh $SSH_OPTS "$host" "${SUDO} rm -f ${BENCH_JSON}" 2>/dev/null; then
+        echo "  warning: could not clear ${BENCH_JSON} on ${host} — if a root-owned" >&2
+        echo "           leftover is there, the next non-root bench will fail to start." >&2
+    fi
+}
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
 # Open-loop target rate in orders/sec for the throughput workload.
@@ -220,6 +254,12 @@ SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-${BENCH_DEFAULT_RATE_ARGS}}"
 # trip than figures previously published with `--async-replica-ack`
 # enabled, until that follow-up ships.
 REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS:-${BENCH_DEFAULT_RATE_ARGS}}"
+# Replica 2 defaults to whatever replica 1 gets, so the two are
+# configured identically unless deliberately skewed. Defined here rather
+# than defaulted at one launch site, because a value that reached only
+# the DPDK dual-repl launch and not the TCP one would silently produce
+# an A/B whose two halves had different replica configs.
+REPLICA2_EXTRA_ARGS="${REPLICA2_EXTRA_ARGS:-${REPLICA_EXTRA_ARGS}}"
 
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
@@ -279,10 +319,11 @@ cleanup() {
     done
     # Kill any orphaned bench client too — a hung run leaves the bench
     # binary executing on $BENCH and the next build trips "Text file
-    # busy" on the cp into the .dpdk suffixed path. The bench client
-    # runs as the SSH user, so no sudo needed.
-    ssh $SSH_OPTS "$BENCH" "pkill -INT -x melin-bench 2>/dev/null; \
-                            pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
+    # busy" on the cp into the .dpdk suffixed path. Signalled under
+    # ${SUDO}: the DPDK bench runs as root (EAL needs the hugetlbfs
+    # mount), so an unprivileged pkill silently fails to reap it.
+    ssh $SSH_OPTS "$BENCH" "${SUDO} pkill -INT -x melin-bench 2>/dev/null; \
+                            ${SUDO} pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Clean DPDK EAL lock files so the next run doesn't fail with
     # "Cannot create lock on '/var/run/dpdk/rte/config'".
     if [[ "${DPDK_RAN:-0}" == "1" ]]; then
@@ -1027,12 +1068,13 @@ run_bench() {
     # sample has to be taken either way, otherwise a failed run silently
     # reports its stall delta against a stale baseline on the next run.
     local rc=0
+    _reset_bench_json "$BENCH"
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${server_addr} \
             --health-addr ${health_addr} \
             --key bench.key \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --bench-cores 1 \
             --duration ${duration} \
             ${warmup_arg} ${cooldown_arg} ${threads_arg} \
@@ -1049,7 +1091,7 @@ collect_result() {
         name="${name}-no-persist"
     fi
     local out="${RESULTS_DIR}/${name}.json"
-    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "$out" 2>/dev/null || true
+    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:${BENCH_JSON}" "$out" 2>/dev/null || true
     if [[ -f "$out" ]]; then
         merge_vmstat_delta "$out"
     fi
@@ -1184,7 +1226,7 @@ transport_start_tcp_dual_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
-            ${REPLICA_EXTRA_ARGS:-} \
+            ${REPLICA2_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
@@ -1222,11 +1264,16 @@ load_dpdk_config() {
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
-        local vlan_id gateway gateway_mac peer_ip
+        local vlan_id gateway gateway_mac peer_ip dpdk_mac
         vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
         gateway=$(echo "$conf" | grep "^DPDK_GATEWAY=" | cut -d= -f2 || true)
         gateway_mac=$(echo "$conf" | grep "^DPDK_GATEWAY_MAC=" | cut -d= -f2 || true)
         peer_ip=$(echo "$conf" | grep "^DPDK_PEER_IP=" | cut -d= -f2 || true)
+        # The port's own hardware MAC (mlx5 bifurcated writes it). Peers
+        # that must address this host before any ARP exchange read it
+        # from here — an SR-IOV VF's MAC is derivable from its IP, a real
+        # one is not.
+        dpdk_mac=$(echo "$conf" | grep "^DPDK_MAC=" | cut -d= -f2 || true)
         # Strip surrounding double quotes from multi-word values (mlx5
         # writes `DPDK_EAL_ARGS="…"` so `source` / `eval` consumers
         # don't misparse it; we have to undo the quoting on the
@@ -1242,7 +1289,98 @@ load_dpdk_config() {
         eval "${prefix}_DPDK_GATEWAY=${gateway:-}"
         eval "${prefix}_DPDK_GATEWAY_MAC=${gateway_mac:-}"
         eval "${prefix}_DPDK_PEER_IP=${peer_ip:-}"
+        eval "${prefix}_DPDK_MAC=${dpdk_mac:-}"
     fi
+}
+
+# Emit `<flag> <value>`, or nothing when the value is empty.
+#
+# The trailing `return 0` is load-bearing: callers depend on the empty
+# case, and without it the failed `[[ -n ]]` test would become this
+# function's exit status and abort the run under `set -euo pipefail`
+# every time a host's conf omitted the key. Do not drop it.
+_opt_flag() {
+    local flag="$1" value="${2:-}"
+    [[ -n "$value" ]] && printf -- '%s %s' "$flag" "$value"
+    return 0
+}
+
+# `--dpdk-vlan <id>`, or empty when the host's conf carries no VLAN_ID.
+#
+# Every DPDK launch site must route through this. The VLAN flag was
+# previously built inline at the standalone site only, so the replicated
+# transports silently ran untagged: on a fabric that expects 802.1Q the
+# switch drops those frames without an error on either side, which looks
+# exactly like a client that connects and then hangs.
+_dpdk_vlan_arg() {
+    _opt_flag --dpdk-vlan "${1:-}"
+}
+
+# `--dpdk-peer-mac <mac>`, or empty when the peer's conf carries no
+# DPDK_MAC. Needed wherever the peer keeps a real hardware address
+# instead of the SR-IOV `02:00:<ip>` convention the client would
+# otherwise derive — i.e. every mlx5 bifurcated setup.
+#
+# Validated here rather than downstream: the value is handed to
+# `melin_dpdk::parse_mac`, which panics on a malformed one, so a stray
+# CR or a truncated conf line would surface as a bench crash mid-run
+# instead of a config error before anything starts.
+_dpdk_peer_mac_arg() {
+    local mac="${1:-}"
+    [[ -z "$mac" ]] && return 0
+    if [[ ! "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        echo "  ERROR: DPDK_MAC '${mac}' is not a MAC address (aa:bb:cc:dd:ee:ff)." >&2
+        echo "         Re-run dpdk-setup.sh on that host to rewrite /etc/melin-dpdk.conf." >&2
+        return 1
+    fi
+    _opt_flag --dpdk-peer-mac "$mac"
+}
+
+# Build BENCH_DPDK_ARGS for every non-TAP transport.
+#
+# One builder for all three sites. Three hand-maintained copies of this
+# string are precisely how the VLAN flag came to be passed by the
+# standalone launch and by neither replicated one; a new flag added here
+# reaches every transport by construction.
+_build_bench_dpdk_args() {
+    local bench_eal vlan_arg="" peer_mac_arg=""
+    bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
+    # L3 seeds its peer through --dpdk-gateway-mac and runs untagged, so
+    # neither flag applies there. Keeping the exclusion in one place
+    # stops the sites from disagreeing about it.
+    if [[ "$DPDK_MODE" != "l3" ]]; then
+        vlan_arg=$(_dpdk_vlan_arg "${BENCH_DPDK_VLAN:-}")
+        peer_mac_arg=$(_dpdk_peer_mac_arg "${SERVER_DPDK_MAC:-}")
+    fi
+    BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${vlan_arg} ${peer_mac_arg}"
+    if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+    fi
+    if [[ "$DPDK_MODE" == "l3" ]]; then
+        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-gateway ${BENCH_DPDK_GATEWAY} --dpdk-gateway-mac ${BENCH_DPDK_GATEWAY_MAC} --dpdk-peer-ip ${BENCH_DPDK_PEER_IP}"
+    fi
+}
+
+# Refuse mlx5 + replicated transports before anything is launched.
+#
+# The replica's DPDK connect derives the primary's MAC as 02:00:<ip>
+# (melin-server-runtime replication/dpdk.rs), the SR-IOV convention.
+# mlx5 bifurcated keeps the port's real hardware MAC, and melin-server
+# exposes no override, so the replica's SYN goes to an address nobody
+# owns and the run stalls in wait_for_log until it times out. Fail here
+# instead: the symptom is otherwise indistinguishable from a slow build.
+_assert_dpdk_mode_supports_replication() {
+    local transport="$1"
+    [[ "$DPDK_MODE" == "mlx5" ]] || return 0
+    echo "" >&2
+    echo "  ERROR: transport '${transport}' cannot run on an mlx5 bifurcated port." >&2
+    echo "         The replica derives the primary's MAC as 02:00:<ip> (the SR-IOV" >&2
+    echo "         convention). mlx5 keeps the NIC's real MAC and melin-server has" >&2
+    echo "         no --dpdk-peer-mac, so replicas can never reach the primary." >&2
+    echo "         Fixing this needs a change in the sequencer repo." >&2
+    echo "         Use TRANSPORTS=dpdk (standalone) or a kernel-TCP transport." >&2
+    echo "" >&2
+    return 1
 }
 
 DPDK_SRIOV_DONE=0
@@ -1518,10 +1656,8 @@ transport_start_dpdk() {
     local server_eal
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
 
-    local vlan_arg=""
-    if [[ -n "${SERVER_DPDK_VLAN:-}" ]]; then
-        vlan_arg="--dpdk-vlan ${SERVER_DPDK_VLAN}"
-    fi
+    local vlan_arg
+    vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
 
     # L3 bifurcated mode: smoltcp talks over the public NIC, so it needs
     # the gateway IP + MAC (for default route) and the peer IP (for the
@@ -1561,19 +1697,7 @@ transport_start_dpdk() {
         # In TAP mode, the bench client uses kernel TCP (no DPDK on client).
         BENCH_DPDK_ARGS=""
     else
-        local bench_eal
-        bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
-        local bench_vlan_arg=""
-        if [[ -n "${BENCH_DPDK_VLAN:-}" && "$DPDK_MODE" != "l3" ]]; then
-            bench_vlan_arg="--dpdk-vlan ${BENCH_DPDK_VLAN}"
-        fi
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg}"
-        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
-            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
-        fi
-        if [[ "$DPDK_MODE" == "l3" ]]; then
-            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-gateway ${BENCH_DPDK_GATEWAY} --dpdk-gateway-mac ${BENCH_DPDK_GATEWAY_MAC} --dpdk-peer-ip ${BENCH_DPDK_PEER_IP}"
-        fi
+        _build_bench_dpdk_args
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
@@ -1601,6 +1725,7 @@ transport_stop_dpdk() {
 
 transport_start_dpdk_repl() {
     dpdk_sriov_setup
+    _assert_dpdk_mode_supports_replication dpdk-repl
     local replica_journal="${REPLICA_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
     clean_journal "$REPLICA" "$replica_journal"
@@ -1619,9 +1744,11 @@ transport_start_dpdk_repl() {
         REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
     fi
 
-    local server_eal replica_eal
+    local server_eal replica_eal server_vlan_arg replica_vlan_arg
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
     replica_eal=$(_resolve_dpdk_eal_args "${REPLICA_DPDK_EAL_ARGS:-}")
+    server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
+    replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
 
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
@@ -1634,6 +1761,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${server_vlan_arg} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1650,6 +1778,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${replica_vlan_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1661,12 +1790,7 @@ transport_start_dpdk_repl() {
         add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
         BENCH_DPDK_ARGS=""
     else
-        local bench_eal
-        bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
-        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
-            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
-        fi
+        _build_bench_dpdk_args
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
@@ -1695,6 +1819,7 @@ transport_stop_dpdk_repl() {
 
 transport_start_dpdk_dual_repl() {
     dpdk_sriov_setup
+    _assert_dpdk_mode_supports_replication dpdk-dual-repl
     local replica_journal="${REPLICA_JOURNAL}"
     local replica2_journal="${REPLICA2_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
@@ -1728,9 +1853,13 @@ transport_start_dpdk_dual_repl() {
     fi
 
     local server_eal replica_eal replica2_eal
+    local server_vlan_arg replica_vlan_arg replica2_vlan_arg
     server_eal=$(_resolve_dpdk_eal_args "${SERVER_DPDK_EAL_ARGS:-}")
     replica_eal=$(_resolve_dpdk_eal_args "${REPLICA_DPDK_EAL_ARGS:-}")
     replica2_eal=$(_resolve_dpdk_eal_args "${REPLICA2_DPDK_EAL_ARGS:-}")
+    server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
+    replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
+    replica2_vlan_arg=$(_dpdk_vlan_arg "${REPLICA2_DPDK_VLAN:-}")
 
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
@@ -1743,6 +1872,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${server_vlan_arg} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1759,6 +1889,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${replica_vlan_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1773,7 +1904,8 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${REPLICA2_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA2_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA2_DPDK_PORT} \
-            ${REPLICA_EXTRA_ARGS:-} \
+            ${replica2_vlan_arg} \
+            ${REPLICA2_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
@@ -1784,12 +1916,7 @@ transport_start_dpdk_dual_repl() {
         add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
         BENCH_DPDK_ARGS=""
     else
-        local bench_eal
-        bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
-        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
-            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
-        fi
+        _build_bench_dpdk_args
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
@@ -1822,6 +1949,32 @@ transport_stop_dpdk_dual_repl() {
 # Workload functions
 # ---------------------------------------------------------------------------
 
+# Launch melin-bench on the bench host over DPDK.
+#
+# Runs under ${SUDO} deliberately: EAL maps the hugetlbfs segments from
+# the root-owned /mnt/huge_2m and reads /proc/self/pagemap, neither of
+# which the cap_sys_nice grant covers. Without root, EAL aborts at init
+# with "get_seg_fd(): open '/mnt/huge_2m/rtemap_0' failed: Permission
+# denied" before a single packet moves.
+#
+# Every DPDK workload routes through here rather than hand-rolling the
+# command: the throughput and single-order sites previously carried
+# separate copies and silently drifted apart on exactly this flag.
+_run_bench_dpdk() {
+    local duration="$1"
+    shift
+    _reset_bench_json "$BENCH"
+    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        ${SUDO} ./target/release/melin-bench \
+            --addr ${CURRENT_BIND} \
+            --health-addr ${CURRENT_HEALTH} \
+            --key bench.key \
+            --json ${BENCH_JSON} \
+            --duration ${duration} \
+            --accounts ${BENCH_ACCOUNTS} \
+            ${BENCH_DPDK_ARGS} $*"
+}
+
 workload_throughput() {
     local transport="$1"
     echo ""
@@ -1841,16 +1994,9 @@ workload_throughput() {
     if [[ "${TARGET_RATE}" != "0" ]]; then rate_arg="--target-rate ${TARGET_RATE}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
-        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ${SUDO} ./target/release/melin-bench \
-                --addr ${CURRENT_BIND} \
-                --health-addr ${CURRENT_HEALTH} \
-                --key bench.key \
-                --json /tmp/bench-results.json \
-                --duration ${THROUGHPUT_DURATION} \
-                --accounts ${BENCH_ACCOUNTS} \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} ${rate_arg} \
-                --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
+        _run_bench_dpdk "${THROUGHPUT_DURATION}" \
+            ${warmup_arg} ${cooldown_arg} ${threads_arg} ${rate_arg} \
+            --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     elif [[ -n "${rate_arg}" ]]; then
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}" --target-rate "${TARGET_RATE}"
     else
@@ -1874,16 +2020,9 @@ workload_single() {
     if [[ -n "${COOLDOWN_DURATION}" ]]; then cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
-        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
-                --addr ${CURRENT_BIND} \
-                --health-addr ${CURRENT_HEALTH} \
-                --key bench.key \
-                --json /tmp/bench-results.json \
-                --duration ${SINGLE_DURATION} \
-                --accounts ${BENCH_ACCOUNTS} \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} \
-                --clients 1 --window 1"
+        _run_bench_dpdk "${SINGLE_DURATION}" \
+            ${warmup_arg} ${cooldown_arg} \
+            --clients 1 --window 1
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients 1 --window 1
     fi
@@ -1898,13 +2037,14 @@ workload_engine_only() {
     echo "============================================================"
     echo ""
 
+    _reset_bench_json "$SERVER"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --mode engine \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --duration ${LOCAL_DURATION}"
 
-    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:${BENCH_JSON}" \
         "${RESULTS_DIR}/local-engine-only.json" 2>/dev/null || true
 }
 
@@ -1918,15 +2058,16 @@ workload_pipeline_only() {
 
     clean_journal "$SERVER" "$JOURNAL_PATH"
 
+    _reset_bench_json "$SERVER"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --mode pipeline \
             --window 256 \
             --journal ${JOURNAL_PATH} \
-            --json /tmp/bench-results.json \
+            --json ${BENCH_JSON} \
             --duration ${LOCAL_DURATION}"
 
-    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:${BENCH_JSON}" \
         "${RESULTS_DIR}/local-pipeline-only.json" 2>/dev/null || true
 }
 

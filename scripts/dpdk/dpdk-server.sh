@@ -117,6 +117,11 @@ case "$MODE" in
             exit 1
         fi
         DPDK_PORTS_ARG="--dpdk-ports ${DPDK_PORT}"
+        # Tag exactly as the sriov path does. Omitting this was a silent
+        # failure: dpdk-setup.sh --vlan writes VLAN_ID and points the
+        # operator here, the server then came up untagged, and the switch
+        # dropped every frame with no error on either side.
+        if [[ -n "${VLAN_ID:-}" ]]; then DPDK_VLAN_ARG="--dpdk-vlan $VLAN_ID"; fi
         if [[ "$MTU" != "1500" ]]; then DPDK_MTU_ARG="--dpdk-mtu $MTU"; fi
         ;;
     sriov)

@@ -102,6 +102,15 @@ pub struct DpdkBenchConfig {
     /// different source IP than `peer_ip`), so the operator pulls the
     /// gateway MAC from `ip neigh` and passes it in here.
     pub gateway_mac: Option<[u8; 6]>,
+    /// MAC of the server at `server_addr`, seeded into smoltcp so the
+    /// first frame can be addressed without waiting on ARP. Required
+    /// wherever the server's port does not follow the SR-IOV
+    /// `02:00:<ip>` convention that the fallback below assumes —
+    /// notably the mlx5 bifurcated path, where the DPDK port shares the
+    /// kernel netdev's real hardware MAC. Getting this wrong is silent:
+    /// frames are addressed to a MAC nothing owns, so every connect
+    /// simply times out.
+    pub peer_mac: Option<[u8; 6]>,
 }
 
 /// Run the DPDK roundtrip benchmark.
@@ -281,14 +290,20 @@ pub fn run_dpdk_roundtrip(
             std::net::IpAddr::V4(v4) => v4.octets(),
             _ => panic!("IPv6 not supported"),
         };
-        let server_mac = [
+        // An operator-supplied MAC always wins. The `02:00:<ip>` form is
+        // the SR-IOV convention — `dpdk-setup.sh` assigns VFs exactly
+        // that address — and is only correct on that path. Ports that
+        // keep a real hardware MAC (mlx5 bifurcated shares the kernel
+        // netdev's) must pass `--dpdk-peer-mac`, or the frames below go
+        // to an address nothing on the segment answers for.
+        let server_mac = config.peer_mac.unwrap_or([
             0x02,
             0x00,
             server_ip_bytes[0],
             server_ip_bytes[1],
             server_ip_bytes[2],
             server_ip_bytes[3],
-        ];
+        ]);
         // Inject a crafted ARP reply into smoltcp so it learns the server's MAC.
         let mut arp_reply = [0u8; 42];
         arp_reply[0..6].copy_from_slice(&mac); // dest: us
@@ -312,8 +327,18 @@ pub fn run_dpdk_roundtrip(
         iface.poll(now, &mut device, &mut tmp_sockets);
         device.flush_tx();
 
+        // Name the source: a derived MAC on a port that keeps its real
+        // hardware address is the failure mode this path is most likely
+        // to hit, and it is otherwise indistinguishable from success —
+        // the connect just hangs.
+        let mac_source = if config.peer_mac.is_some() {
+            "supplied"
+        } else {
+            "derived 02:00:<ip>"
+        };
         eprintln!(
-            "  ARP: sent gratuitous, seeded server MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            "  ARP: sent gratuitous, seeded server MAC \
+             {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({mac_source})",
             server_mac[0],
             server_mac[1],
             server_mac[2],

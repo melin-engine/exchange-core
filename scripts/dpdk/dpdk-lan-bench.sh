@@ -102,6 +102,23 @@ BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
 BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
 BENCH_DPDK_EAL_ARGS="${BENCH_DPDK_EAL_ARGS:-}"
 
+# Optional flags, empty when the server's conf carries no value. Both are
+# silent failures when they should be set and aren't: an untagged frame
+# on a tagged fabric is dropped by the switch, and a client that derives
+# the SR-IOV 02:00:<ip> MAC for a port keeping a real hardware address
+# sends to nobody. Either way the symptom is a client that connects to
+# nothing rather than an error. VLAN_ID and DPDK_MAC come from the
+# server's conf via the `eval` above; the bench-side conf is parsed into
+# BENCH_DPDK_* names and does not clobber them.
+DPDK_VLAN_ARG=""
+if [[ -n "${VLAN_ID:-}" ]]; then
+    DPDK_VLAN_ARG="--dpdk-vlan ${VLAN_ID}"
+fi
+DPDK_PEER_MAC_ARG=""
+if [[ -n "${DPDK_MAC:-}" ]]; then
+    DPDK_PEER_MAC_ARG="--dpdk-peer-mac ${DPDK_MAC}"
+fi
+
 # Default bench args if none provided.
 if [[ -z "$BENCH_EXTRA_ARGS" ]]; then
     BENCH_EXTRA_ARGS="100000000 --clients 16 --window 256"
@@ -221,6 +238,7 @@ ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-se
         --dpdk-ip ${DPDK_IP} \
         --dpdk-prefix-len ${DPDK_PREFIX} \
         --dpdk-ports ${DPDK_PORT} \
+        ${DPDK_VLAN_ARG} \
     >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
 # Wait for server. Can't use nc -z (smoltcp doesn't respond to kernel probes).
@@ -269,7 +287,7 @@ else
         BENCH_EAL_FULL="--huge-dir=${HUGE_DIR}"
     fi
 
-    BENCH_DPDK_ARGS="--dpdk-eal-args='${BENCH_EAL_FULL}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+    BENCH_DPDK_ARGS="--dpdk-eal-args='${BENCH_EAL_FULL}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${DPDK_VLAN_ARG} ${DPDK_PEER_MAC_ARG}"
     if [[ -n "$BENCH_DPDK_IP" ]]; then
         BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX_VAL}"
     fi
