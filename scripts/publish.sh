@@ -23,6 +23,10 @@ CRATES=(
     # Level 0: no internal dependencies
     melin-types
     melin-gateway-core
+    # Staged in this workspace, destined for the sequencer repository.
+    # Depends on no exchange crate — released from here only until the
+    # move, after which the sequencer repo publishes it.
+    melin-bench-harness
 
     # Level 1
     melin-protocol       # depends on: types

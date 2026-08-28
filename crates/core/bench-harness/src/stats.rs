@@ -3,9 +3,10 @@
 //! At end of a roundtrip benchmark we fetch the per-stage latency
 //! histogram dump and merge it into the bench's results. This is the
 //! "tick-to-trade decomposition" that complements the bench-side full
-//! round-trip percentiles in `print_results`.
+//! round-trip percentiles the driving benchmark prints.
 //!
-//! Wire format produced by the server (see `crates/exchange/server/src/health.rs`):
+//! Wire format produced by the sequencer's health endpoint (see
+//! `crates/core/transport-core/src/health.rs` in the Melin repository):
 //!
 //! ```text
 //! stage\t<name>\t<samples>\t<min_ns>\t<p50_ns>\t<p90_ns>\t<p99_ns>\t<p99_9_ns>\t<max_ns>

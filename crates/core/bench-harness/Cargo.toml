@@ -1,0 +1,40 @@
+[package]
+name = "melin-bench-harness"
+version.workspace = true
+edition = "2024"
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Transport-agnostic benchmark harness for servers built on the Melin sequencer"
+
+# This crate deliberately has NO dependency on any exchange crate. It lives
+# under `crates/core/` (mirroring the sequencer repo's layout) because it is
+# staged here only until it moves to the Melin repository as
+# `crates/core/bench-harness`. Keep it that way: anything that needs
+# `melin-types`, `melin-protocol`, or `melin-exchange-core` belongs in
+# `melin-bench`, behind the workload seam, not here.
+#
+# Dependency versions are spelled out rather than inherited from
+# `[workspace.dependencies]` wherever the sequencer workspace does not
+# already declare the same crate, so this manifest survives the move with
+# minimal edits (`version`, and `melin-app` becoming a path dependency).
+
+[lib]
+name = "melin_bench_harness"
+path = "src/lib.rs"
+
+[dependencies]
+# `melin_app::unix_epoch_nanos` — the wall-clock anchor the TSC clock
+# calibrates against. This is a sequencer crate, so it stays a dependency
+# after the move.
+melin-app = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+# HdrHistogram: the recording data structure for every latency sample.
+# Not in the sequencer workspace's shared dependency list, so pinned here.
+hdrhistogram = "7"
+# Duration parsing for CLI flags (`30s`, `2m`, `500ms`).
+humantime = "2"
+tracing = { workspace = true }

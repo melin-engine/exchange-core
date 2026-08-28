@@ -47,9 +47,6 @@
 #![cfg_attr(feature = "dpdk", allow(dead_code))]
 
 mod generator;
-mod health_poller;
-mod keys;
-mod stats_client;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
@@ -74,6 +71,22 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
+// Transport-agnostic harness. Nothing re-exported here knows what an
+// order is; the exchange-shaped half of the bench lives in this crate.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use melin_bench_harness::clock::{calibrate_tsc, calibrate_tsc_clock, rdtscp, tsc_to_ns};
+use melin_bench_harness::pacing::{PaceClock, PaceStats};
+use melin_bench_harness::phases::{
+    BenchPhases, DEFAULT_BENCH_THREADS, DEFAULT_CLIENTS, DEFAULT_COOLDOWN, DEFAULT_DURATION,
+    DEFAULT_WARMUP, DEFAULT_WINDOW, parse_duration,
+};
+// Only the kernel-transport loops thread deadlines through a struct; the
+// DPDK loop compares against them inline.
+#[cfg(not(feature = "dpdk"))]
+use melin_bench_harness::phases::PhaseDeadlines;
+use melin_bench_harness::series::{LatencySample, TimeSeries, maybe_sample};
+use melin_bench_harness::{health, keys, series, stats};
+
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -84,419 +97,9 @@ use melin_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_wire_protocol::transport::BlockingTransportListener;
 
-/// Number of completed orders between latency time-series samples.
-/// Each sample captures interval p99/p99.9 (reset after each sample),
-/// giving temporal variation rather than cumulative smoothing.
-const SAMPLE_INTERVAL: usize = 1_000;
-
-/// Default measured-phase duration.
-const DEFAULT_DURATION: Duration = Duration::from_secs(60);
-
-/// Default warmup duration — primes caches, branch predictors, allocator
-/// arenas, and the disruptor ring before measurement starts.
-const DEFAULT_WARMUP: Duration = Duration::from_secs(5);
-
-/// Default cooldown duration — drains the final fsync-tail batches whose
-/// per-event cost isn't amortised across a full window. The samples
-/// recorded during cooldown are discarded.
-const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5);
-
-/// Default number of orders in flight simultaneously per client. Controls the
-/// level of pipelining — enough to keep the server pipeline saturated (journal +
-/// matching stages overlap), small enough that per-order latency reflects
-/// actual processing time rather than unbounded queueing.
-const DEFAULT_WINDOW: usize = 64;
-
-/// Default number of concurrent client connections.
-const DEFAULT_CLIENTS: usize = 16;
-
-/// Default number of bench client threads. Each thread manages a subset of
-/// connections via io_uring. Pinned to cores 7-10 (2 physical + 2 HT siblings
-/// on 8C/16T). With 4 bench + 6 server (3 pipeline + 2 reader + 1 repl-sender)
-/// = 10 pinned threads total, leaving core 0 for OS/IRQ.
-const DEFAULT_BENCH_THREADS: usize = 4;
-
 /// Maximum frame payload size (matches protocol).
 #[cfg(not(feature = "dpdk"))]
 const MAX_FRAME_SIZE: usize = 1024;
-
-/// Clap value parser: accept any humantime-recognised duration (`30s`,
-/// `2m`, `500ms`, …). Surfaces parse errors as clap-friendly strings.
-fn parse_duration(s: &str) -> Result<humantime::Duration, String> {
-    s.parse::<humantime::Duration>()
-        .map_err(|e| format!("invalid duration `{s}`: {e}"))
-}
-
-/// `BenchPhases` carries the three wall-clock durations that drive every
-/// bench loop: warmup (priming), measured (recorded into the histogram),
-/// and cooldown (final drain whose samples are discarded).
-#[derive(Clone, Copy)]
-pub(crate) struct BenchPhases {
-    pub warmup: Duration,
-    pub measured: Duration,
-    pub cooldown: Duration,
-}
-
-impl BenchPhases {
-    /// Deadlines relative to a shared `start` instant.
-    pub(crate) fn deadlines(self, start: Instant) -> PhaseDeadlines {
-        let warmup_end = start + self.warmup;
-        let measured_end = warmup_end + self.measured;
-        let cooldown_end = measured_end + self.cooldown;
-        PhaseDeadlines {
-            warmup_end,
-            measured_end,
-            cooldown_end,
-        }
-    }
-}
-
-/// Wall-clock cutoffs for the three phases.
-#[derive(Clone, Copy)]
-pub(crate) struct PhaseDeadlines {
-    pub warmup_end: Instant,
-    pub measured_end: Instant,
-    pub cooldown_end: Instant,
-}
-
-// ---------------------------------------------------------------------------
-// TSC (Time Stamp Counter) utilities for low-overhead per-order timing
-// ---------------------------------------------------------------------------
-
-/// Read the TSC with a serializing instruction (`rdtscp`). Returns raw tick
-/// count. ~4ns overhead vs ~15-25ns for `Instant::now()` via vDSO.
-/// `rdtscp` waits for all prior instructions to complete before reading,
-/// preventing the CPU from reordering the timestamp relative to the work
-/// being measured.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(crate) fn rdtscp() -> u64 {
-    unsafe {
-        let mut _aux: u32 = 0;
-        core::arch::x86_64::__rdtscp(&mut _aux)
-    }
-}
-
-/// Read the ARM virtual counter (`cntvct_el0`). ~2-5ns overhead,
-/// equivalent to x86's `rdtscp`. An `isb` (instruction synchronization
-/// barrier) serializes the pipeline to prevent reordering the read
-/// relative to the work being measured.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) fn rdtscp() -> u64 {
-    let cnt: u64;
-    unsafe {
-        core::arch::asm!(
-            "isb",
-            "mrs {}, cntvct_el0",
-            out(reg) cnt,
-            options(nostack, nomem),
-        );
-    }
-    cnt
-}
-
-/// Calibrate TSC/counter ticks per nanosecond by measuring a short sleep
-/// against `Instant::now()`. Returns the conversion factor (ticks / ns).
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub(crate) fn calibrate_tsc() -> f64 {
-    calibrate_tsc_clock().ticks_per_ns
-}
-
-/// Anchored TSC clock: ticks-per-ns plus a `(tsc, unix_ns)` pair captured at
-/// calibration time. Lets the hot path turn any later `rdtscp()` reading
-/// into a UNIX-nanos timestamp without a `clock_gettime()` vDSO call —
-/// previously `~25 ns` per event and visible in flamegraphs as ~6 % of
-/// the bench's `pipeline-pub` thread.
-///
-/// Two sources of error to be aware of when reading derived timestamps:
-///
-/// - **Anchor-capture offset** (~30–50 ns, constant): the calibration
-///   loop reads `unix_ns` first and the TSC second, so derived values
-///   undershoot truth by the time it takes one `clock_gettime` call to
-///   complete (plus a few cycles of bookkeeping). Choosing
-///   undershoot is deliberate — a "did we pass deadline X?" check
-///   downstream falsing earlier is safer than falsing later.
-/// - **Linear drift** from the calibration's `ticks_per_ns` measurement
-///   error. On a 10 ms sleep against `Instant::now()`, that's typically
-///   bounded by sleep jitter (single-digit µs) plus the host's TSC
-///   stability vs the kernel's `CLOCK_MONOTONIC`. Empirically ~100 ppm
-///   on this fleet, so a 60 s bench drifts up to ~6 ms — well below
-///   anything `Exchange`'s GTD scheduler or SEC-04 rate limiter
-///   exercises at the flows we publish, but a bench that toggles
-///   either would need a fresher anchor.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
-pub(crate) struct TscClock {
-    pub(crate) ticks_per_ns: f64,
-    /// Inverse of `ticks_per_ns`, precomputed so the hot path uses
-    /// multiplication instead of division (a few cycles per event).
-    pub(crate) ns_per_tick: f64,
-    /// TSC reading at calibration time. Pairs with `anchor_unix_ns`.
-    pub(crate) anchor_tsc: u64,
-    /// UNIX nanos at calibration time. Pairs with `anchor_tsc`.
-    pub(crate) anchor_unix_ns: u64,
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-impl TscClock {
-    /// Convert a TSC reading taken later in this process to UNIX
-    /// nanoseconds. Saturates at the anchor if `ts < anchor_tsc`
-    /// (shouldn't happen on any monotonic counter, but defensive
-    /// against unexpected CPU migrations on cores with un-synchronised
-    /// TSCs). See the struct docs for the small constant offset and the
-    /// linear drift bound.
-    #[inline(always)]
-    pub(crate) fn unix_ns(&self, ts: u64) -> u64 {
-        let delta_ticks = ts.saturating_sub(self.anchor_tsc);
-        self.anchor_unix_ns + (delta_ticks as f64 * self.ns_per_tick) as u64
-    }
-}
-
-/// Calibrate TSC and capture an anchor pair (`tsc`, `unix_ns`) so the hot
-/// path can derive wall-clock timestamps from `rdtscp()` alone.
-///
-/// `anchor_unix_ns` is sampled *before* `anchor_tsc` so the natural
-/// inter-call delay (one vDSO `clock_gettime`, ~25–50 ns) pushes the
-/// recorded UNIX-nanos slightly into the past relative to the TSC
-/// anchor. The result: `TscClock::unix_ns(ts)` always returns a value
-/// no later than what `clock_gettime` would have returned at the same
-/// `ts`. See `TscClock` docs for the full error model.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub(crate) fn calibrate_tsc_clock() -> TscClock {
-    // Warm up the counter path.
-    for _ in 0..100 {
-        let _ = rdtscp();
-    }
-
-    let duration = Duration::from_millis(10);
-    // Order matters: capture `anchor_unix_ns` *before* `anchor_tsc` so
-    // any inter-call slippage rounds derived timestamps earlier rather
-    // than later (see fn docs).
-    let anchor_unix_ns = melin_app::unix_epoch_nanos();
-    let anchor_tsc = rdtscp();
-    let t0_wall = Instant::now();
-    std::thread::sleep(duration);
-    let t1_tsc = rdtscp();
-    let elapsed_ns = t0_wall.elapsed().as_nanos() as f64;
-    let elapsed_tsc = (t1_tsc - anchor_tsc) as f64;
-    let ticks_per_ns = elapsed_tsc / elapsed_ns;
-    TscClock {
-        ticks_per_ns,
-        ns_per_tick: 1.0 / ticks_per_ns,
-        anchor_tsc,
-        anchor_unix_ns,
-    }
-}
-
-/// Convert counter tick delta to nanoseconds using a pre-calibrated factor.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[inline(always)]
-pub(crate) fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
-    (ticks as f64 / ticks_per_ns) as u64
-}
-
-// ---------------------------------------------------------------------------
-// Open-loop pacing
-// ---------------------------------------------------------------------------
-
-/// Slack tolerance for late sends. Any send issued more than this far past
-/// its scheduled time counts toward `late_sends`. Set wider than the
-/// natural event-loop fill granularity (one `submit_and_wait` cycle, on
-/// the order of one RTT for kernel transports) so submit-cycle jitter
-/// does not inflate the count. A non-zero value here means the bench is
-/// structurally behind its schedule — back-pressure from the server or
-/// the inflight cap — not that individual sends are a few microseconds
-/// late.
-pub(crate) const PACE_LATE_SLACK_NS: u64 = 1_000_000;
-
-/// Per-connection open-loop scheduler. Each connection advances on its own
-/// schedule (rate is split across connections at construction time), which
-/// avoids cross-thread atomic contention on a shared cursor without
-/// changing the aggregate target rate.
-///
-/// All arithmetic is in TSC ticks: the uring/dpdk hot paths already keep
-/// per-frame timing in ticks, so reusing the same unit lets the scheduled
-/// timestamp flow directly into `inflight_ts` (no per-send conversion).
-#[derive(Clone, Copy)]
-pub(crate) struct PaceClock {
-    /// Ticks between consecutive scheduled sends on this connection.
-    period_ticks: u64,
-    /// TSC tick of the next scheduled send.
-    next_due_ticks: u64,
-}
-
-impl PaceClock {
-    /// Build a pacer for one connection given the *aggregate* target rate
-    /// (orders/sec across all connections), the connection count it is
-    /// shared with, the TSC calibration factor, the bench-start TSC, and
-    /// the connection's index within the run. `conn_index` is used to
-    /// stagger the first send by a fraction of one period — this avoids a
-    /// thundering herd at `start_tsc` while preserving the aggregate rate.
-    pub(crate) fn new(
-        target_rate: u64,
-        clients: u64,
-        ticks_per_ns: f64,
-        start_tsc: u64,
-        conn_index: u64,
-    ) -> Self {
-        debug_assert!(target_rate > 0, "PaceClock::new requires target_rate > 0");
-        debug_assert!(clients > 0, "PaceClock::new requires clients > 0");
-        let rate_per_conn = target_rate as f64 / clients as f64;
-        let period_ns = 1_000_000_000.0 / rate_per_conn;
-        // u64 ticks: a period of ~10 ns at 3 GHz is ~30 ticks; rounding to
-        // the nearest tick is well below clock skew across the run.
-        let period_ticks = (period_ns * ticks_per_ns).round().max(1.0) as u64;
-        // Stagger first send by conn_index * (period / clients). For
-        // single-thread runs this leaves a uniform offset; for multi-thread
-        // runs threads stay slightly out of phase, which is closer to real
-        // client behavior.
-        let stagger = period_ticks
-            .saturating_mul(conn_index)
-            .checked_div(clients)
-            .unwrap_or(0);
-        Self {
-            period_ticks,
-            next_due_ticks: start_tsc.saturating_add(stagger),
-        }
-    }
-
-    /// If the next scheduled send is due at `now_ticks`, return its
-    /// scheduled TSC and advance the cursor; otherwise return `None`. The
-    /// returned tick is the *scheduled* time, not `now_ticks` — pushing
-    /// the scheduled time into the latency record is the standard fix for
-    /// coordinated omission.
-    #[inline]
-    pub(crate) fn pop_due(&mut self, now_ticks: u64) -> Option<u64> {
-        if now_ticks >= self.next_due_ticks {
-            let scheduled = self.next_due_ticks;
-            self.next_due_ticks = self.next_due_ticks.saturating_add(self.period_ticks);
-            Some(scheduled)
-        } else {
-            None
-        }
-    }
-
-    /// Unconditionally return the next scheduled tick and advance the
-    /// cursor. Intended for synchronous loops (engine mode) where the
-    /// caller spin-waits until the returned tick before doing work; for
-    /// event-loop callers see `pop_due`.
-    #[inline]
-    pub(crate) fn advance(&mut self) -> u64 {
-        let scheduled = self.next_due_ticks;
-        self.next_due_ticks = self.next_due_ticks.saturating_add(self.period_ticks);
-        scheduled
-    }
-
-    /// Reverse the most recent `pop_due` or `advance` so that the popped
-    /// scheduled slot is re-issued next call. Used by transports that
-    /// pop optimistically but may need to roll back when the wire send
-    /// fails — without it, a transient send error would drop a scheduled
-    /// slot and skew the achieved rate downward. Only the DPDK path
-    /// currently rolls back (smoltcp can return Ok(0) on transient
-    /// back-pressure); the kernel-TCP uring path never reaches a state
-    /// where a popped frame isn't queued for send.
-    #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
-    #[inline]
-    pub(crate) fn unpop(&mut self) {
-        self.next_due_ticks = self.next_due_ticks.saturating_sub(self.period_ticks);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn period_ticks(&self) -> u64 {
-        self.period_ticks
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_due_ticks(&self) -> u64 {
-        self.next_due_ticks
-    }
-}
-
-/// Aggregate pacing telemetry shared across bench threads. Updated lock-free.
-#[derive(Default)]
-pub(crate) struct PaceStats {
-    /// Sends whose actual submission time exceeded `scheduled + slack`.
-    /// A non-zero value indicates back-pressure from the server or
-    /// inflight cap.
-    pub late_sends: AtomicU64,
-    /// Maximum observed `actual_send_tsc - scheduled_tsc` in ticks. Read
-    /// once at end-of-run and converted to µs for reporting.
-    pub max_send_delay_ticks: AtomicU64,
-    /// Total scheduled sends (issued or skipped). Useful for the progress
-    /// reporter when target-rate is set.
-    pub scheduled: AtomicU64,
-}
-
-impl PaceStats {
-    /// Record a paced send. `now_ticks` is the actual submission time;
-    /// `scheduled_ticks` is what `PaceClock::pop_due` returned. If the
-    /// delay exceeds `PACE_LATE_SLACK_NS`, `late_sends` is incremented.
-    #[inline]
-    pub(crate) fn record_send(&self, now_ticks: u64, scheduled_ticks: u64, ticks_per_ns: f64) {
-        let delay_ticks = now_ticks.saturating_sub(scheduled_ticks);
-        // Lazy max via CAS loop. Contention is essentially nil — only one
-        // writer per bench thread, and at multi-M ops/s the value moves
-        // monotonically toward the run max.
-        let mut prev = self.max_send_delay_ticks.load(Ordering::Relaxed);
-        while delay_ticks > prev {
-            match self.max_send_delay_ticks.compare_exchange_weak(
-                prev,
-                delay_ticks,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => prev = actual,
-            }
-        }
-        let slack_ticks = (PACE_LATE_SLACK_NS as f64 * ticks_per_ns) as u64;
-        if delay_ticks > slack_ticks {
-            self.late_sends.fetch_add(1, Ordering::Relaxed);
-        }
-        self.scheduled.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// One latency time-series sample: interval percentiles at a point in time.
-/// Captured every `SAMPLE_INTERVAL` completed orders using an interval
-/// histogram (snapshot + reset), so each sample reflects recent behavior
-/// rather than cumulative averages.
-pub(crate) struct LatencySample {
-    /// Seconds elapsed since measurement start.
-    elapsed_secs: f64,
-    /// Interval p99 latency in microseconds.
-    p99_us: f64,
-    /// Interval p99.9 latency in microseconds.
-    p999_us: f64,
-    /// Interval p99.99 latency in microseconds.
-    p9999_us: f64,
-}
-
-/// Time-series of latency samples for chart display and stability plots.
-pub(crate) type TimeSeries = Vec<LatencySample>;
-
-/// Record a latency sample if `SAMPLE_INTERVAL` orders have accumulated
-/// in the interval histogram. Resets the interval histogram after sampling.
-pub(crate) fn maybe_sample(
-    interval_hist: &mut Histogram<u64>,
-    interval_count: &mut usize,
-    series: &mut TimeSeries,
-    start: Instant,
-) {
-    if *interval_count >= SAMPLE_INTERVAL {
-        if !interval_hist.is_empty() {
-            series.push(LatencySample {
-                elapsed_secs: start.elapsed().as_secs_f64(),
-                p99_us: interval_hist.value_at_quantile(0.99) as f64 / 1000.0,
-                p999_us: interval_hist.value_at_quantile(0.999) as f64 / 1000.0,
-                p9999_us: interval_hist.value_at_quantile(0.9999) as f64 / 1000.0,
-            });
-        }
-        interval_hist.reset();
-        *interval_count = 0;
-    }
-}
 
 /// Benchmark CLI arguments.
 #[derive(clap::Parser)]
@@ -1232,10 +835,10 @@ fn run_engine_bench(
         &extra_lines,
         json_path,
         &series,
-        &health_poller::HealthReport::default(),
+        &health::HealthReport::default(),
         // Engine mode runs the matching engine in-process with no
         // server / health endpoint, so there's nothing to fetch.
-        &stats_client::Body::Empty,
+        &stats::Body::Empty,
         pacing_report.as_ref(),
         Some(&outcomes),
     );
@@ -1746,10 +1349,10 @@ fn run_pipeline_inner(
         &extra_lines,
         json_path,
         &Vec::new(),
-        &health_poller::HealthReport::default(),
+        &health::HealthReport::default(),
         // Pipeline mode runs the disruptor stages in-process with no
         // server / health endpoint, so there's nothing to fetch.
-        &stats_client::Body::Empty,
+        &stats::Body::Empty,
         pacing_report.as_ref(),
         Some(&outcomes),
     );
@@ -2385,7 +1988,7 @@ fn run_uring_roundtrip<R, W, F>(
     );
 
     // Start health poller before bench threads.
-    let health_poller = health_addr.map(health_poller::HealthPoller::start);
+    let health_poller = health_addr.map(health::HealthPoller::start);
 
     // Shared start instant — every bench thread derives its phase
     // deadlines from this so they classify completions consistently.
@@ -2527,8 +2130,8 @@ fn run_uring_roundtrip<R, W, F>(
     // missing dump never aborts the run; print_results renders an
     // appropriate "feature off" / "no data" line instead.
     let server_stages = match health_addr {
-        Some(addr) => stats_client::fetch(addr),
-        None => stats_client::Body::Empty,
+        Some(addr) => stats::fetch(addr),
+        None => stats::Body::Empty,
     };
 
     print_results(
@@ -3250,8 +2853,8 @@ pub(crate) fn print_results(
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
     series: &[LatencySample],
-    health: &health_poller::HealthReport,
-    server_stages: &stats_client::Body,
+    health: &health::HealthReport,
+    server_stages: &stats::Body,
     pacing: Option<&PacingReport>,
     outcomes: Option<&OutcomeReport>,
 ) {
@@ -3326,7 +2929,7 @@ pub(crate) fn print_results(
     // from the server's /stats-dump endpoint at end of run; only
     // populated for the roundtrip mode against a server built with
     // --features latency-trace.
-    stats_client::render_console(server_stages);
+    stats::render_console(server_stages);
 
     // Write JSON results if requested.
     if let Some(path) = json_path {
@@ -3362,21 +2965,9 @@ pub(crate) fn print_results(
             histogram.max() as f64 / 1000.0
         ));
 
-        // Serialize time-series data for stability plots.
-        let ts_json = if series.is_empty() {
-            String::from("[]")
-        } else {
-            let entries: Vec<String> = series
-                .iter()
-                .map(|s| {
-                    format!(
-                        "{{\"elapsed_secs\":{:.3},\"p99_us\":{:.2},\"p999_us\":{:.2},\"p9999_us\":{:.2}}}",
-                        s.elapsed_secs, s.p99_us, s.p999_us, s.p9999_us,
-                    )
-                })
-                .collect();
-            format!("[{}]", entries.join(","))
-        };
+        // Serialize time-series data for stability plots. Schema owned by
+        // the harness so `melin-plot` has one definition to track.
+        let ts_json = series::to_json(series);
 
         // Serialize health samples (fixed fields + any extra metrics).
         let health_json = if health.samples.is_empty() {
@@ -3429,7 +3020,7 @@ pub(crate) fn print_results(
             format!("[{}]", entries.join(","))
         };
 
-        let stages_json = stats_client::render_json(server_stages);
+        let stages_json = stats::render_json(server_stages);
 
         // Outcome fragment: emitted only when response tracking was on,
         // so the schema for in-process modes (engine, pipeline) that
@@ -3690,164 +3281,5 @@ mod outcome_report_tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|b| *b), "missing variant in REJECT_REASONS");
-    }
-}
-
-#[cfg(test)]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-mod tsc_clock_tests {
-    use super::*;
-
-    /// A freshly calibrated `TscClock`, queried immediately, must agree
-    /// with `melin_app::unix_epoch_nanos()` to within a millisecond.
-    /// That window catches both flipped-sign anchor regressions
-    /// (derived value diverges by anchor_unix_ns) and a units mix-up in
-    /// `ns_per_tick` (the elapsed delta is small immediately after
-    /// calibration, so any factor error would still surface as a few-µs
-    /// drift before the kernel clock advances by the same amount).
-    #[test]
-    fn freshly_calibrated_clock_matches_wall_clock_within_1ms() {
-        let clock = calibrate_tsc_clock();
-        let derived = clock.unix_ns(rdtscp());
-        let now_unix = melin_app::unix_epoch_nanos();
-        let diff = derived.abs_diff(now_unix);
-        assert!(
-            diff < 1_000_000,
-            "derived {derived} vs wall {now_unix}, |Δ| = {diff} ns"
-        );
-    }
-
-    /// `unix_ns` must not underflow when the supplied TSC reading is
-    /// older than the anchor (which can happen if a thread migrated to
-    /// a core with an out-of-sync TSC, or simply if a TSC reading
-    /// captured pre-calibration is fed in by mistake).
-    #[test]
-    fn unix_ns_saturates_on_pre_anchor_tsc() {
-        let clock = calibrate_tsc_clock();
-        let value = clock.unix_ns(clock.anchor_tsc.saturating_sub(1_000));
-        assert_eq!(value, clock.anchor_unix_ns);
-    }
-}
-
-#[cfg(test)]
-mod pace_clock_tests {
-    use super::*;
-
-    // 1 tick = 1 ns for predictable arithmetic in these tests.
-    const TICKS_PER_NS: f64 = 1.0;
-
-    #[test]
-    fn period_matches_aggregate_rate_split_across_clients() {
-        // 1 M orders/sec / 4 clients = 250 k/sec per client = 4 µs period.
-        let p = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 0, 0);
-        assert_eq!(p.period_ticks(), 4_000);
-    }
-
-    #[test]
-    fn advance_returns_scheduled_and_steps_by_period() {
-        let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 5_000, 0);
-        assert_eq!(p.advance(), 5_000);
-        assert_eq!(p.advance(), 6_000);
-        assert_eq!(p.advance(), 7_000);
-    }
-
-    #[test]
-    fn unpop_reverses_one_step() {
-        let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 5_000, 0);
-        assert_eq!(p.advance(), 5_000);
-        assert_eq!(p.advance(), 6_000);
-        p.unpop();
-        // After unpop, the next advance re-issues 6_000.
-        assert_eq!(p.advance(), 6_000);
-        assert_eq!(p.advance(), 7_000);
-    }
-
-    #[test]
-    fn pop_due_is_monotonic_and_paced() {
-        let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 0, 0);
-        // 1 µs period at 1 M/s; first 3 sends due at 0, 1000, 2000.
-        assert_eq!(p.pop_due(0), Some(0));
-        assert_eq!(p.pop_due(999), None);
-        assert_eq!(p.pop_due(1_000), Some(1_000));
-        assert_eq!(p.pop_due(2_500), Some(2_000));
-        // After popping at 2_500, next due is 3_000.
-        assert_eq!(p.next_due_ticks(), 3_000);
-    }
-
-    #[test]
-    fn stagger_offsets_conns_within_one_period() {
-        let p0 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 0);
-        let p1 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 1);
-        let p2 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 2);
-        let p3 = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, 3);
-        // period = 4 µs / 4 conns = 1 µs offsets.
-        assert_eq!(p0.next_due_ticks(), 10_000);
-        assert_eq!(p1.next_due_ticks(), 11_000);
-        assert_eq!(p2.next_due_ticks(), 12_000);
-        assert_eq!(p3.next_due_ticks(), 13_000);
-    }
-
-    /// Regression pin for the multi-thread stagger bug: when bench
-    /// threads each constructed pacers using their *thread-local* conn
-    /// index instead of the global one, every thread's conn-0 fired at
-    /// the same offset, collapsing the herd. Modelling that here: four
-    /// conns distributed round-robin across two threads use global
-    /// indices 0..3; using local indices 0..1 on each thread would
-    /// produce two pacers at the 10_000 anchor and two at the 12_000
-    /// stagger — never covering the full period.
-    #[test]
-    fn stagger_uses_global_index_across_threads() {
-        // 1 M aggregate, 4 clients → 4 µs period, 1 µs stagger.
-        // Round-robin distribution across 2 threads: thread 0 owns
-        // global conns {0, 2}, thread 1 owns {1, 3}.
-        let global_indices = [0u64, 2, 1, 3];
-        let dues: Vec<u64> = global_indices
-            .iter()
-            .map(|&i| PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, i).next_due_ticks())
-            .collect();
-        let mut sorted = dues.clone();
-        sorted.sort();
-        // First sends cover the whole period at 1 µs spacing.
-        assert_eq!(sorted, vec![10_000, 11_000, 12_000, 13_000]);
-
-        // Bug sibling: using the thread-local index (0, 1, 0, 1)
-        // collapses two pairs onto the same tick.
-        let local_indices = [0u64, 1, 0, 1];
-        let buggy: Vec<u64> = local_indices
-            .iter()
-            .map(|&i| PaceClock::new(1_000_000, 4, TICKS_PER_NS, 10_000, i).next_due_ticks())
-            .collect();
-        // Two pacers at 10_000 and two at 11_000 — herd flattened only
-        // within each thread, not across them.
-        let mut buggy_sorted = buggy.clone();
-        buggy_sorted.sort();
-        assert_eq!(buggy_sorted, vec![10_000, 10_000, 11_000, 11_000]);
-    }
-
-    #[test]
-    fn period_clamps_to_at_least_one_tick() {
-        // Absurdly high rate would round period_ns to 0; clamp prevents
-        // an infinite loop in `pop_due` (which would otherwise see every
-        // `now` as due forever).
-        let p = PaceClock::new(u64::MAX / 2, 1, TICKS_PER_NS, 0, 0);
-        assert!(p.period_ticks() >= 1);
-    }
-
-    #[test]
-    fn record_send_increments_late_when_past_slack() {
-        let stats = PaceStats::default();
-        // delay just over slack → late.
-        stats.record_send(PACE_LATE_SLACK_NS + 1, 0, TICKS_PER_NS);
-        // delay just under slack → not late.
-        stats.record_send(PACE_LATE_SLACK_NS - 1, 0, TICKS_PER_NS);
-        // delay = 0 → not late.
-        stats.record_send(0, 0, TICKS_PER_NS);
-        assert_eq!(stats.late_sends.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.scheduled.load(Ordering::Relaxed), 3);
-        // Max should track the largest delay observed.
-        assert_eq!(
-            stats.max_send_delay_ticks.load(Ordering::Relaxed),
-            PACE_LATE_SLACK_NS + 1
-        );
     }
 }

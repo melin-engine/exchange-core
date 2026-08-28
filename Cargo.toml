@@ -2,7 +2,7 @@
 # Explicit subtree rather than `crates/*/*`: leftover ignored files from
 # other branches (e.g. artifacts under crates/core on the sequencer branch)
 # can leave stray directories under crates/ that a bare glob would pick up.
-members = ["crates/exchange/*"]
+members = ["crates/exchange/*", "crates/core/bench-harness"]
 resolver = "3"
 
 [workspace.package]
@@ -26,6 +26,10 @@ authors = ["P.L.S.C."]
 # Only crates that something else depends on are listed. The leaf binaries
 # (melin-admin, melin-bench, the two gateways, the two TUIs) inherit the
 # workspace version but are nobody's dependency, so they need no pin.
+# Staged here, destined for the sequencer repository as
+# `crates/core/bench-harness` — it depends on no exchange crate. Listed with
+# the exchange group only because it is still released from this workspace.
+melin-bench-harness = { path = "crates/core/bench-harness", version = "0.14.0" }
 melin-client = { path = "crates/exchange/client", version = "0.14.0" }
 melin-exchange-core = { path = "crates/exchange/exchange-core", version = "0.14.0" }
 melin-gateway-core = { path = "crates/exchange/gateway-core", version = "0.14.0" }

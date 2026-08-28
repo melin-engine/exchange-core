@@ -417,7 +417,7 @@ pub fn run_dpdk_roundtrip(
     // per-key HWM; sharing one key collapses every connection into one
     // namespace and the leader's HWM rejects everyone else's requests.
     let client_keys: Vec<ed25519_dalek::SigningKey> = (0..num_clients)
-        .map(|i| crate::keys::derive_client_key(key, i as u32))
+        .map(|i| melin_bench_harness::keys::derive_client_key(key, i as u32))
         .collect();
 
     // Sequential connect + auth — smoltcp's TCP stack is single-threaded
@@ -519,7 +519,7 @@ pub fn run_dpdk_roundtrip(
         Arc::clone(&pace_stats),
     );
 
-    let health_poller = health_addr.map(crate::health_poller::HealthPoller::start);
+    let health_poller = health_addr.map(melin_bench_harness::health::HealthPoller::start);
 
     let ticks_per_ns = crate::calibrate_tsc();
     let start = Instant::now();
@@ -978,8 +978,8 @@ pub fn run_dpdk_roundtrip(
     // server shuts down. Best-effort; missing data is rendered as a
     // one-line note in print_results.
     let server_stages = match health_addr {
-        Some(addr) => crate::stats_client::fetch(addr),
-        None => crate::stats_client::Body::Empty,
+        Some(addr) => melin_bench_harness::stats::fetch(addr),
+        None => melin_bench_harness::stats::Body::Empty,
     };
 
     // Fold per-connection outcome counters. Single-threaded DPDK loop so

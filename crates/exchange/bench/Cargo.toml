@@ -81,6 +81,10 @@ name = "journal_writer_bench"
 path = "src/journal_writer_bench.rs"
 
 [dependencies]
+# Transport-agnostic half of the bench: clock, phases, pacing, time
+# series, key derivation, health/stats scrapers. Knows nothing about
+# orders — everything exchange-shaped stays in this crate.
+melin-bench-harness = { workspace = true }
 melin-exchange-core = { workspace = true }
 melin-trading = { workspace = true }
 melin-types = { workspace = true }
@@ -95,8 +99,6 @@ melin-server-runtime = { workspace = true }
 melin-server = { workspace = true }
 melin-app = { workspace = true }
 melin-transport-core = { workspace = true }
-base64 = { workspace = true }
-blake3 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = "0.4"
