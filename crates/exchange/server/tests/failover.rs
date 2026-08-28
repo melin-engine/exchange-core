@@ -230,22 +230,11 @@ fn wait_for_primary_repl_ready(health_addr: SocketAddr, timeout: Duration) {
     }
 }
 
-/// Read the `melin_replicas_connected` gauge from a primary's metrics
-/// endpoint. `None` if the endpoint is not up yet or the metric is absent.
-fn fetch_replicas_connected(addr: SocketAddr) -> Option<u32> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = Vec::new();
-    stream.read_to_end(&mut body).ok()?;
-    let text = std::str::from_utf8(&body).ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("melin_replicas_connected ") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
+/// Prometheus line prefix for the connected-replica gauge. A `const` so
+/// the several call sites below cannot drift apart on a typo — a wrong
+/// prefix reads as "metric absent", which every fetch reports as `None`
+/// and no assertion distinguishes from "no replicas".
+const REPLICAS_CONNECTED_METRIC: &str = "melin_replicas_connected ";
 
 /// Block until `expected` replicas have actually attached to the primary.
 ///
@@ -259,14 +248,23 @@ fn fetch_replicas_connected(addr: SocketAddr) -> Option<u32> {
 /// The distinction is invisible on an idle machine, where a replica
 /// attaches in milliseconds, and decisive under a full-suite run, where it
 /// may not. Anything that then promotes or kills a replica is racing its
-/// own fixture: `trading` is `replicas_connected > 0`, so taking down the
-/// only attached replica flips the primary to `halted` and any assertion
-/// about it trading fails.
-fn wait_for_replicas(primary_health: SocketAddr, expected: u32, timeout: Duration) {
+/// own fixture, in two ways. Directly: `trading` is
+/// `replicas_connected > 0`, so taking down the only *attached* replica
+/// flips the primary to `halted`. And indirectly, which is the nastier
+/// one: the primary reports `replication_lag` only for engaged slots, so
+/// a replica that never attached contributes 0 and `wait_replicated`
+/// returns immediately, vacuously. Promoting that replica hands the test
+/// a node whose journal never received the seed events, and the first
+/// order on it comes back `Rejected { reason: UnknownSymbol }` — which
+/// reads as a matching-engine bug and is not one.
+///
+/// Polls the same gauge [`wait_metric`] does, but keeps its own loop so
+/// the panic can name the consequence rather than the metric.
+fn wait_for_replicas(primary_health: SocketAddr, expected: u64, timeout: Duration) {
     let start = Instant::now();
     let mut last = None;
     loop {
-        let seen = fetch_replicas_connected(primary_health);
+        let seen = fetch_metric_u64(primary_health, REPLICAS_CONNECTED_METRIC);
         if let Some(n) = seen
             && n >= expected
         {
@@ -284,25 +282,34 @@ fn wait_for_replicas(primary_health: SocketAddr, expected: u32, timeout: Duratio
     }
 }
 
-/// Seed events a fixture-spawned server publishes on first startup: one
-/// per account and one per instrument, from `--accounts 10 --instruments 2`.
-/// Keep in step with those arguments.
-const FIXTURE_SEED_EVENTS: u64 = 12;
+/// Accounts and instruments every fixture-spawned primary is started
+/// with. Named constants rather than inline literals so
+/// [`FIXTURE_SEED_EVENTS`] is derived from the arguments actually passed
+/// and cannot silently desync from them.
+const FIXTURE_ACCOUNTS: u32 = 10;
+const FIXTURE_INSTRUMENTS: u32 = 2;
+
+/// Seed events a fixture-spawned primary publishes on first startup: one
+/// `AddInstrument` per instrument, one `ProvisionAccount` per account.
+const FIXTURE_SEED_EVENTS: u64 = (FIXTURE_INSTRUMENTS + FIXTURE_ACCOUNTS) as u64;
 
 /// Block until the primary has published and journaled its seed events.
 ///
-/// Attaching a replica is not the same as being ready to trade. The
-/// runtime deliberately holds seeding until the first replica connects,
-/// so `wait_for_replicas` returning is the moment seeding *starts*, not
-/// the moment it finishes. Submitting an order in that window gets a
-/// `Rejected { reason: UnknownSymbol }` — the instrument genuinely does
-/// not exist yet — which reads as a matching-engine bug and is not one.
+/// Not a guard against clients observing an unseeded engine — the runtime
+/// drains the seed before its accept loop starts, so no client can reach
+/// one. What this buys the fixtures is a determinate starting
+/// `journal_seq`: on a replicated primary the runtime holds seeding until
+/// the first replica connects, so `wait_for_replicas` returning is the
+/// moment seeding *starts*. Without this wait a fixture hands back a
+/// cluster whose journal is somewhere between 0 and
+/// [`FIXTURE_SEED_EVENTS`], and any test reasoning about sequence numbers
+/// or restarting the primary inherits that ambiguity.
 ///
-/// `journal_seq` is the observable: seeding flows through the journal
-/// like any other event, so the sequence reaching the seed count means
-/// every instrument and account has been applied. Waiting for `>=` rather
-/// than `==` keeps this correct if the runtime ever journals additional
-/// bootstrap entries.
+/// `journal_seq` is the observable: seeding flows through the journal like
+/// any other event, and a genesis journal starts at sequence 1, so the
+/// durable sequence reaching the seed count means every instrument and
+/// account has been applied. Waiting for `>=` rather than `==` keeps this
+/// correct if the runtime ever journals additional bootstrap entries.
 fn wait_for_seed(primary_health: SocketAddr, expected: u64, timeout: Duration) {
     let start = Instant::now();
     let mut last = 0;
@@ -316,7 +323,7 @@ fn wait_for_seed(primary_health: SocketAddr, expected: u64, timeout: Duration) {
         if start.elapsed() > timeout {
             panic!(
                 "{primary_health} journaled only {last} of {expected} seed events within \
-                 {timeout:?} — orders submitted now would be rejected as UnknownSymbol"
+                 {timeout:?} — the fixture's starting journal_seq is indeterminate"
             );
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -449,55 +456,53 @@ fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::
     ))
 }
 
-/// Poll `/health` for up to `budget` and render what it reported, one
-/// line per sample, stopping early once the node reports trading.
+/// Assert that `addr` is trading, tolerating a brief flap.
 ///
-/// Diagnostic only — for assertions about `trading` that fail rarely and
-/// only under a full-suite run. A bare `assert!(trading)` cannot tell
-/// "the gate is genuinely closed" from "we sampled inside a sub-second
-/// flap while a replica reconnected", and those have opposite fixes. The
-/// connection count and replication lag come along because a gate that
-/// closed because a replica vanished looks quite different from one that
-/// closed with every peer still attached.
-fn health_timeline(addr: SocketAddr, budget: Duration) -> String {
+/// `trading` is live topology state, not a settled property: it is
+/// `!fenced && replicas_connected > 0`, so it drops to `halted` the
+/// instant the last replica detaches and comes back when one reattaches.
+/// Sampling it once right after a topology change — a promotion, a kill —
+/// is a coin flip under a loaded full-suite run, where the primary can
+/// take a few hundred milliseconds to reap a departed slot. Poll instead:
+/// a gate that is genuinely closed stays closed for the whole budget.
+///
+/// On timeout the panic carries a `/health` timeline, one line per
+/// sample, because "the gate is closed" and "a replica vanished" have
+/// opposite fixes and the bare assertion could not tell them apart. The
+/// connection count and replication lag come along as context —
+/// `replicas_connected` is the number that decides the flag, while
+/// `client_conns` counts *client* connections.
+fn assert_trading(addr: SocketAddr, budget: Duration, what: &str) {
     let start = Instant::now();
     let mut lines = vec![format!("health timeline for {addr} (budget {budget:?}):")];
-    let mut recovered = None;
-    while start.elapsed() < budget {
+    loop {
         match query_health(addr) {
             Ok((conns, seq, lag, trading)) => {
-                // `replicas_connected` is the number that decides the flag
-                // (`trading = !fenced && replicas_connected > 0`); `conns`
-                // counts *client* connections and is only context.
-                let replicas =
-                    fetch_replicas_connected(addr).map_or("?".to_string(), |n| n.to_string());
+                if trading {
+                    return;
+                }
+                let replicas = fetch_metric_u64(addr, REPLICAS_CONNECTED_METRIC)
+                    .map_or("?".to_string(), |n| n.to_string());
                 lines.push(format!(
                     "  +{:>7.3}s replicas_connected={replicas} client_conns={conns} \
-                     journal_seq={seq} repl_lag={lag} trading={trading}",
+                     journal_seq={seq} repl_lag={lag} trading=false",
                     start.elapsed().as_secs_f64()
                 ));
-                if trading {
-                    recovered = Some(start.elapsed());
-                    break;
-                }
             }
             Err(e) => lines.push(format!(
                 "  +{:>7.3}s query failed: {e}",
                 start.elapsed().as_secs_f64()
             )),
         }
-        std::thread::sleep(Duration::from_millis(200));
+        if start.elapsed() > budget {
+            panic!(
+                "{what}: {addr} never reported trading within {budget:?} — the gate is \
+                 genuinely closed, not a flap\n{}",
+                lines.join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    match recovered {
-        Some(d) => lines.push(format!(
-            "  => recovered after {:.3}s — a transient flap, not a closed gate",
-            d.as_secs_f64()
-        )),
-        None => lines.push(format!(
-            "  => still not trading after {budget:?} — the gate is genuinely closed"
-        )),
-    }
-    lines.join("\n")
 }
 
 /// Wait for a freshly-spawned replacement replica to fully catch up via
@@ -675,9 +680,9 @@ fn spawn_primary_with_extra_env(
         "--authorized-keys".into(),
         keys_path.to_str().expect("valid path").into(),
         "--accounts".into(),
-        "10".into(),
+        FIXTURE_ACCOUNTS.to_string(),
         "--instruments".into(),
-        "2".into(),
+        FIXTURE_INSTRUMENTS.to_string(),
         "--connection-timeout-secs".into(),
         "0".into(),
         "--yield-idle".into(),
@@ -1271,7 +1276,13 @@ fn recovered_primary_durability_gate_holds() {
     );
     cluster.replica = restarted_replica;
 
-    wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
+    // The primary is a *new* process, so its `replicas_connected` gauge
+    // starts at 0 and cannot be satisfied by the dead replica's socket —
+    // `>= 1` here means the restarted replica genuinely attached. The
+    // `wait_replicated` below is not a substitute: the primary reports
+    // lag only for engaged slots, so it returns immediately and vacuously
+    // while nothing is attached.
+    wait_for_replicas(cluster.primary.health_addr, 1, Duration::from_secs(30));
     cluster.wait_replicated();
 
     // Phase 2: submit BURST new orders. `Client::connect` auto-syncs
@@ -1387,8 +1398,11 @@ fn replica_reconnects_after_primary_restart_without_journal_wipe() {
     // The replica was never restarted: its journal file still exists, and
     // its in-process pipeline still owns the writer. Before the fix this
     // reconnect would fail with `AlreadyExists` from the fresh-journal
-    // creation path and replication lag would never converge.
-    wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
+    // creation path and replication lag would never converge. Waiting on
+    // the *new* primary's gauge is what proves the reconnect happened —
+    // `wait_replicated` alone is vacuous while no slot is engaged, so it
+    // would report success against a replica that never came back.
+    wait_for_replicas(cluster.primary.health_addr, 1, Duration::from_secs(30));
     cluster.wait_replicated();
 
     // Push more traffic and confirm it replicates — this proves the
@@ -3191,8 +3205,11 @@ fn rotation_soak_under_load() {
         &primary2_extra,
         extra_env,
     );
+    // primary2 runs alone, so "the health endpoint answers" is the whole
+    // readiness condition — no replica gauge to wait on. A `wait_healthy`
+    // used to follow this line; it polled the identical predicate and so
+    // returned on its first iteration, every time.
     wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(30));
-    wait_healthy(primary2.health_addr, Duration::from_secs(30));
 
     // To validate that recovery picked up every archived segment, submit
     // one order on the recovered primary and then read the live segment
@@ -3490,14 +3507,8 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
     // of the default 256 slots that would need minutes of test load.
     let mut cluster = DualCluster::start_with_primary_args(&["--replication-ring-size", "16"]);
 
+    // `DualCluster::start` already waits for both replicas to attach.
     let primary_health = cluster.primary.health_addr;
-    wait_metric(
-        primary_health,
-        "melin_replicas_connected ",
-        Duration::from_secs(30),
-        "both replicas connected at startup",
-        |v| v == 2,
-    );
 
     let stop = AtomicBool::new(false);
     // One submission counter per submitter thread (no sharing — summed
@@ -3588,7 +3599,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
             // that its inactive ring can never produce.
             wait_metric(
                 primary_health,
-                "melin_replicas_connected ",
+                REPLICAS_CONNECTED_METRIC,
                 Duration::from_secs(60),
                 &format!("cycle {cycle}: cluster whole before freeze"),
                 |v| v == 2,
@@ -3616,7 +3627,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
                     submitted[0].load(Ordering::Relaxed) + submitted[1].load(Ordering::Relaxed);
                 let mut last_progress = Instant::now();
                 loop {
-                    if let Some(v) = fetch_metric_u64(primary_health, "melin_replicas_connected ")
+                    if let Some(v) = fetch_metric_u64(primary_health, REPLICAS_CONNECTED_METRIC)
                         && v < 2
                     {
                         break;
@@ -3652,7 +3663,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
             // submitters keep the journal growing.
             wait_metric(
                 primary_health,
-                "melin_replicas_connected ",
+                REPLICAS_CONNECTED_METRIC,
                 Duration::from_secs(60),
                 &format!("cycle {cycle}: evicted replica reconnected"),
                 |v| v == 2,
@@ -3681,7 +3692,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
     // when the load stopped.
     wait_metric(
         primary_health,
-        "melin_replicas_connected ",
+        REPLICAS_CONNECTED_METRIC,
         Duration::from_secs(60),
         "cluster whole after load stopped",
         |v| v == 2,
@@ -3873,15 +3884,16 @@ fn higher_epoch_handshake_fences_stale_primary() {
     drop(prom);
 
     // The primary still trades at epoch 0 — `keep` holds the gate, so this
-    // is not the 0-replica halt.
-    let (_, _, _, trading_before) =
-        query_health(primary.health_addr).expect("primary health before fence");
-    if !trading_before {
-        panic!(
-            "primary should still be trading before the higher-epoch node connects\n{}",
-            health_timeline(primary.health_addr, Duration::from_secs(10))
-        );
-    }
+    // is not the 0-replica halt. Polled, not sampled: `prom` leaving is a
+    // live topology change, and under a full-suite run the primary can
+    // read `halted` for a few hundred milliseconds while it reaps the
+    // departed slot. The point is that the gate is *open*, not that it
+    // never blinked.
+    assert_trading(
+        primary.health_addr,
+        Duration::from_secs(10),
+        "primary should still be trading before the higher-epoch node connects",
+    );
 
     // Boot a replica from the epoch-1 journal (same journal name → same
     // lineage), pointed at the stale primary.
