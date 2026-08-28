@@ -47,7 +47,6 @@
 #![cfg_attr(feature = "dpdk", allow(dead_code))]
 
 mod generator;
-#[cfg(not(feature = "dpdk"))]
 mod workload;
 
 #[cfg(feature = "dpdk")]
@@ -79,19 +78,31 @@ use melin_bench_harness::phases::{
     BenchPhases, DEFAULT_BENCH_THREADS, DEFAULT_CLIENTS, DEFAULT_COOLDOWN, DEFAULT_DURATION,
     DEFAULT_WARMUP, DEFAULT_WINDOW, parse_duration,
 };
+use melin_bench_harness::report::{PacingReport, RunReport, Unit, print_results};
+use melin_bench_harness::series::{TimeSeries, maybe_sample};
 // The kernel-transport path hands its connections to the harness's
 // io_uring loop; the DPDK path runs its own loop over smoltcp sockets.
-use melin_bench_harness::series::{LatencySample, TimeSeries, maybe_sample};
 #[cfg(not(feature = "dpdk"))]
 use melin_bench_harness::transport::{connect_tcp, connect_uds};
 #[cfg(not(feature = "dpdk"))]
 use melin_bench_harness::uring::{self, Connection, LoopConfig};
-use melin_bench_harness::{health, keys, series, stats};
+use melin_bench_harness::{health, keys, stats};
 #[cfg(not(feature = "dpdk"))]
 use workload::ExchangeWorkload;
+use workload::{OutcomeReport, enforce_rejection_threshold};
+
+/// What this benchmark counts, for the harness's console labels.
+pub(crate) const ORDER: Unit = Unit {
+    singular: "order",
+    plural: "orders",
+    heading: "Per-Order",
+};
 
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
+// Only `auth_handshake` names response variants directly now; the DPDK
+// path runs its own handshake.
+#[cfg(not(feature = "dpdk"))]
 use melin_protocol::message::ResponseKind;
 use melin_server::exchange_app::ServerApp;
 #[cfg(not(feature = "dpdk"))]
@@ -829,22 +840,23 @@ fn run_engine_bench(
         ));
     }
 
-    print_results(
-        "Realistic Order Flow",
-        measured_orders as usize,
+    print_results(RunReport {
+        label: "Realistic Order Flow",
+        unit: &ORDER,
+        measured_count: measured_orders as usize,
         phases,
-        &histogram,
+        histogram: &histogram,
         wall,
-        &extra_lines,
+        extra_lines: &extra_lines,
         json_path,
-        &series,
-        &health::HealthReport::default(),
+        series: &series,
+        health: &health::HealthReport::default(),
         // Engine mode runs the matching engine in-process with no
         // server / health endpoint, so there's nothing to fetch.
-        &stats::Body::Empty,
-        pacing_report.as_ref(),
-        Some(&outcomes),
-    );
+        server_stages: &stats::Body::Empty,
+        pacing: pacing_report.as_ref(),
+        outcomes: &outcomes,
+    });
 
     // Print the slowest orders for tail latency diagnosis.
     let mut sorted: Vec<_> = slowest.into_iter().map(|std::cmp::Reverse(e)| e).collect();
@@ -1343,22 +1355,23 @@ fn run_pipeline_inner(
         None
     };
 
-    print_results(
-        "Pipeline (no network)",
-        measured_orders as usize,
+    print_results(RunReport {
+        label: "Pipeline (no network)",
+        unit: &ORDER,
+        measured_count: measured_orders as usize,
         phases,
-        &histogram,
-        measured_wall,
-        &extra_lines,
+        histogram: &histogram,
+        wall: measured_wall,
+        extra_lines: &extra_lines,
         json_path,
-        &Vec::new(),
-        &health::HealthReport::default(),
+        series: &Vec::new(),
+        health: &health::HealthReport::default(),
         // Pipeline mode runs the disruptor stages in-process with no
         // server / health endpoint, so there's nothing to fetch.
-        &stats::Body::Empty,
-        pacing_report.as_ref(),
-        Some(&outcomes),
-    );
+        server_stages: &stats::Body::Empty,
+        pacing: pacing_report.as_ref(),
+        outcomes: &outcomes,
+    });
 
     enforce_rejection_threshold(&outcomes, max_reject_pct);
 
@@ -2071,20 +2084,21 @@ fn run_uring_roundtrip<R, W, F>(
         None => stats::Body::Empty,
     };
 
-    print_results(
-        "Roundtrip",
-        histogram.len() as usize,
+    print_results(RunReport {
+        label: "Roundtrip",
+        unit: &ORDER,
+        measured_count: histogram.len() as usize,
         phases,
-        &histogram,
-        measured_wall,
-        &extra_lines,
+        histogram: &histogram,
+        wall: measured_wall,
+        extra_lines: &extra_lines,
         json_path,
-        &all_series,
-        &health,
-        &server_stages,
-        pacing_report.as_ref(),
-        Some(&outcomes),
-    );
+        series: &all_series,
+        health: &health,
+        server_stages: &server_stages,
+        pacing: pacing_report.as_ref(),
+        outcomes: &outcomes,
+    });
 
     println!();
     println!("=== Pipeline Latency Trace ===");
@@ -2093,542 +2107,6 @@ fn run_uring_roundtrip<R, W, F>(
     std::thread::sleep(Duration::from_millis(200));
 
     enforce_rejection_threshold(&outcomes, max_reject_pct);
-}
-
-// ===========================================================================
-// Shared reporting
-// ===========================================================================
-
-/// Print a latency histogram in µs. Adaptive nines: only prints p99.9, p99.99,
-/// etc. when `sample_count` is large enough (10×  per extra nine).
-pub(crate) fn print_latency_histogram(hist: &Histogram<u64>, sample_count: usize) {
-    println!("    min:     {:>8.2} µs", hist.min() as f64 / 1_000.0);
-    println!(
-        "    p50:     {:>8.2} µs",
-        hist.value_at_quantile(0.50) as f64 / 1_000.0
-    );
-    println!(
-        "    p90:     {:>8.2} µs",
-        hist.value_at_quantile(0.90) as f64 / 1_000.0
-    );
-    let mut nines = 2;
-    let mut threshold = 1_000usize;
-    while threshold <= sample_count {
-        let quantile = 1.0 - 10.0f64.powi(-(nines as i32));
-        let label = if nines <= 2 {
-            "p99".to_string()
-        } else {
-            format!("p99.{}", "9".repeat(nines - 2))
-        };
-        let value = hist.value_at_quantile(quantile) as f64 / 1_000.0;
-        let padded = format!("{label}:");
-        println!("    {padded:<9}{value:>8.2} µs");
-        nines += 1;
-        threshold *= 10;
-    }
-    println!("    max:     {:>8.2} µs", hist.max() as f64 / 1_000.0);
-}
-
-/// Stable ordering of [`RejectReason`] variants used as the index space
-/// for [`OutcomeReport::reject_reasons`]. Adding a new reject variant is
-/// a compile error inside [`reject_reason_index`] until the entry is
-/// appended here too — keep the two in sync.
-pub(crate) const REJECT_REASONS: &[(RejectReason, &str)] = &[
-    (RejectReason::NoLiquidity, "NoLiquidity"),
-    (RejectReason::FOKCannotFill, "FOKCannotFill"),
-    (RejectReason::InsufficientBalance, "InsufficientBalance"),
-    (RejectReason::UnknownAccount, "UnknownAccount"),
-    (RejectReason::UnknownSymbol, "UnknownSymbol"),
-    (RejectReason::SelfTradePrevented, "SelfTradePrevented"),
-    (RejectReason::DuplicateOrderId, "DuplicateOrderId"),
-    (RejectReason::ExceedsMaxOrderQty, "ExceedsMaxOrderQty"),
-    (RejectReason::ExceedsMaxNotional, "ExceedsMaxNotional"),
-    (RejectReason::TradingHalted, "TradingHalted"),
-    (RejectReason::OutsidePriceBand, "OutsidePriceBand"),
-    (RejectReason::UnknownOrder, "UnknownOrder"),
-    (RejectReason::PriceWouldCross, "PriceWouldCross"),
-    (RejectReason::PostOnlyWouldCross, "PostOnlyWouldCross"),
-    (RejectReason::HasRestingOrders, "HasRestingOrders"),
-    (RejectReason::DuplicateRequest, "DuplicateRequest"),
-    (RejectReason::ReplicaDisconnected, "ReplicaDisconnected"),
-    (RejectReason::InvalidExpiry, "InvalidExpiry"),
-    (RejectReason::InstrumentDisabled, "InstrumentDisabled"),
-    (RejectReason::ExceedsMaxOpenOrders, "ExceedsMaxOpenOrders"),
-    (RejectReason::ExceedsOrderRate, "ExceedsOrderRate"),
-    (RejectReason::Superseded, "Superseded"),
-];
-
-fn reject_reason_index(reason: RejectReason) -> usize {
-    // `RejectReason` is not `#[repr(u8)]`, so the discriminant isn't a
-    // stable index. An exhaustive match makes adding a new variant a
-    // compile error until both this function and `REJECT_REASONS` above
-    // are updated.
-    let idx = match reason {
-        RejectReason::NoLiquidity => 0,
-        RejectReason::FOKCannotFill => 1,
-        RejectReason::InsufficientBalance => 2,
-        RejectReason::UnknownAccount => 3,
-        RejectReason::UnknownSymbol => 4,
-        RejectReason::SelfTradePrevented => 5,
-        RejectReason::DuplicateOrderId => 6,
-        RejectReason::ExceedsMaxOrderQty => 7,
-        RejectReason::ExceedsMaxNotional => 8,
-        RejectReason::TradingHalted => 9,
-        RejectReason::OutsidePriceBand => 10,
-        RejectReason::UnknownOrder => 11,
-        RejectReason::PriceWouldCross => 12,
-        RejectReason::PostOnlyWouldCross => 13,
-        RejectReason::HasRestingOrders => 14,
-        RejectReason::DuplicateRequest => 15,
-        RejectReason::ReplicaDisconnected => 16,
-        RejectReason::InvalidExpiry => 17,
-        RejectReason::InstrumentDisabled => 18,
-        RejectReason::ExceedsMaxOpenOrders => 19,
-        RejectReason::ExceedsOrderRate => 20,
-        RejectReason::Superseded => 21,
-    };
-    // Catch silent label/index swaps: an exhaustive match would still
-    // type-check if two arms had their integers swapped, but the
-    // `REJECT_REASONS` table would then mislabel counts at print time.
-    // The existing `reject_reasons_indices_are_unique_and_match_table_length`
-    // test calls this for every variant, so a swap explodes there.
-    debug_assert_eq!(
-        REJECT_REASONS[idx].0, reason,
-        "REJECT_REASONS table and reject_reason_index match arms diverged at idx {idx}",
-    );
-    idx
-}
-
-/// Counts of execution-report variants observed by the bench client over
-/// the lifetime of a run. Folded across connections and bench threads to
-/// surface the rejection ratio in the run summary — without this, a
-/// misconfigured run where every order is rejected looks identical to a
-/// clean run in the latency histogram.
-///
-/// Plain `u64` fields (not atomics) because each connection is owned by
-/// a single bench thread; merging happens after thread join.
-#[derive(Default, Clone)]
-pub(crate) struct OutcomeReport {
-    /// `BatchEnd` frames received — one per acknowledged request, so
-    /// this is the denominator for the rejection ratio.
-    pub batch_ends: u64,
-    pub placed: u64,
-    pub fills: u64,
-    pub cancelled: u64,
-    pub triggered: u64,
-    pub replaced: u64,
-    pub instrument_status: u64,
-    pub rejected: u64,
-    pub engine_errors: u64,
-    pub server_busy: u64,
-    /// Per-reason rejection counts. Index space defined by
-    /// [`REJECT_REASONS`] / [`reject_reason_index`].
-    pub reject_reasons: [u64; REJECT_REASONS.len()],
-}
-
-impl OutcomeReport {
-    /// Increment the counter that matches `response`. Untracked variants
-    /// (handshake / market-data / stats frames) are ignored.
-    #[inline]
-    pub fn record(&mut self, response: &ResponseKind) {
-        match response {
-            ResponseKind::BatchEnd => self.batch_ends += 1,
-            ResponseKind::Report(report) => self.record_execution_report(report),
-            ResponseKind::EngineError => self.engine_errors += 1,
-            ResponseKind::ServerBusy => self.server_busy += 1,
-            // Non-trading frames (Challenge, ServerReady, Heartbeat,
-            // AuthFailed, stats/market-data snapshots) — not part of the
-            // request/ack accounting.
-            _ => {}
-        }
-    }
-
-    /// Increment the counter for a single execution-report variant.
-    /// Used by in-process bench modes (engine, pipeline) which observe
-    /// the matching stage's reports directly without going through the
-    /// wire `ResponseKind::Report` wrapper.
-    #[inline]
-    pub fn record_execution_report(&mut self, report: &ExecutionReport) {
-        match report {
-            ExecutionReport::Placed { .. } => self.placed += 1,
-            ExecutionReport::Fill { .. } => self.fills += 1,
-            ExecutionReport::Cancelled { .. } => self.cancelled += 1,
-            ExecutionReport::Triggered { .. } => self.triggered += 1,
-            ExecutionReport::Replaced { .. } => self.replaced += 1,
-            ExecutionReport::InstrumentStatusChanged { .. } => self.instrument_status += 1,
-            ExecutionReport::Rejected { reason, .. } => {
-                self.rejected += 1;
-                self.reject_reasons[reject_reason_index(*reason)] += 1;
-            }
-        }
-    }
-
-    pub fn merge(&mut self, other: &OutcomeReport) {
-        self.batch_ends += other.batch_ends;
-        self.placed += other.placed;
-        self.fills += other.fills;
-        self.cancelled += other.cancelled;
-        self.triggered += other.triggered;
-        self.replaced += other.replaced;
-        self.instrument_status += other.instrument_status;
-        self.rejected += other.rejected;
-        self.engine_errors += other.engine_errors;
-        self.server_busy += other.server_busy;
-        for (a, b) in self
-            .reject_reasons
-            .iter_mut()
-            .zip(other.reject_reasons.iter())
-        {
-            *a += *b;
-        }
-    }
-
-    /// Fraction of acknowledged requests that were rejected. Returns
-    /// `0.0` when no batches were observed, so callers comparing against
-    /// a threshold treat a zero-response run as "no rejections seen"
-    /// rather than 100% — a stalled run is a separate failure mode and
-    /// is already surfaced by the throughput line.
-    pub fn rejection_ratio(&self) -> f64 {
-        if self.batch_ends == 0 {
-            0.0
-        } else {
-            self.rejected as f64 / self.batch_ends as f64
-        }
-    }
-}
-
-/// Fail the run with a non-zero exit if more than `max_pct` percent of
-/// acknowledged requests were rejected. The CLI default is 50% — the
-/// generator naturally produces a few percent of rejections, so the
-/// gate targets catastrophic misconfig ("most orders rejected") rather
-/// than noise. Lower `max_pct` for production-flow runs where rejections
-/// should be near-zero; set it to 100.0 to disable.
-pub(crate) fn enforce_rejection_threshold(outcomes: &OutcomeReport, max_pct: f64) {
-    let pct = outcomes.rejection_ratio() * 100.0;
-    if pct > max_pct {
-        eprintln!(
-            "error: rejection ratio {pct:.2}% exceeds --max-reject-pct {max_pct:.2}% \
-             ({} rejected of {} acknowledged requests). Likely a misconfiguration — \
-             check account funding, instrument symbols, and risk limits.",
-            outcomes.rejected, outcomes.batch_ends,
-        );
-        std::process::exit(2);
-    }
-}
-
-/// End-of-run pacing report. `None` when `--target-rate` is unset (the
-/// closed-loop case); rendered into the JSON output and the console
-/// summary lines otherwise.
-pub(crate) struct PacingReport {
-    pub target_rate: u64,
-    pub scheduled: u64,
-    pub late_sends: u64,
-    pub max_send_delay_us: f64,
-}
-
-/// Print the outcome summary: acknowledged request count, rejection
-/// ratio, and the top reject reasons. Surfaces misconfigured runs (e.g.
-/// every order rejected with `InsufficientBalance`) that the latency
-/// histogram would otherwise hide.
-pub(crate) fn print_outcome_summary(outcomes: &OutcomeReport) {
-    println!();
-    println!("  Outcomes ({} acknowledged requests)", outcomes.batch_ends);
-    if outcomes.batch_ends == 0 {
-        println!("    (no responses observed — bench may have stalled before any ack)");
-        return;
-    }
-    let total = outcomes.batch_ends as f64;
-    let pct = |n: u64| n as f64 / total * 100.0;
-    println!(
-        "    rejected:  {:>10} ({:.2}%)",
-        outcomes.rejected,
-        pct(outcomes.rejected)
-    );
-    println!("    placed:    {:>10}", outcomes.placed);
-    println!("    fills:     {:>10}", outcomes.fills);
-    println!("    cancelled: {:>10}", outcomes.cancelled);
-    if outcomes.triggered > 0 {
-        println!("    triggered: {:>10}", outcomes.triggered);
-    }
-    if outcomes.replaced > 0 {
-        println!("    replaced:  {:>10}", outcomes.replaced);
-    }
-    if outcomes.engine_errors > 0 {
-        println!(
-            "    engine errors: {} ({:.2}%)",
-            outcomes.engine_errors,
-            pct(outcomes.engine_errors)
-        );
-    }
-    if outcomes.server_busy > 0 {
-        println!(
-            "    server-busy:   {} ({:.2}%)",
-            outcomes.server_busy,
-            pct(outcomes.server_busy)
-        );
-    }
-    if outcomes.rejected > 0 {
-        let mut reasons: Vec<(&str, u64)> = REJECT_REASONS
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (_, name))| {
-                let count = outcomes.reject_reasons[i];
-                if count > 0 {
-                    Some((*name, count))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Descending by count so the dominant reason is on top.
-        reasons.sort_by_key(|r| std::cmp::Reverse(r.1));
-        println!("    reject reasons:");
-        for (name, count) in reasons.iter().take(5) {
-            println!("      {name}: {count} ({:.2}%)", pct(*count));
-        }
-    }
-}
-
-/// Print benchmark results: header, throughput, latency histogram.
-/// Optionally writes results to a JSON file for post-processing.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn print_results(
-    label: &str,
-    measured_orders: usize,
-    phases: BenchPhases,
-    histogram: &Histogram<u64>,
-    wall: Duration,
-    extra_lines: &[String],
-    json_path: Option<&std::path::Path>,
-    series: &[LatencySample],
-    health: &health::HealthReport,
-    server_stages: &stats::Body,
-    pacing: Option<&PacingReport>,
-    outcomes: Option<&OutcomeReport>,
-) {
-    let throughput = (measured_orders as f64) / wall.as_secs_f64();
-    let wall_ms = wall.as_micros() as f64 / 1000.0;
-
-    println!(
-        "=== {label} Benchmark ({measured_orders} measured, warmup={} measured={} cooldown={}) ===",
-        humantime::format_duration(phases.warmup),
-        humantime::format_duration(phases.measured),
-        humantime::format_duration(phases.cooldown),
-    );
-    for line in extra_lines {
-        println!("{line}");
-    }
-    println!();
-    println!("  Throughput");
-    println!("    wall time:  {wall_ms:.2} ms");
-    println!(
-        "    throughput: {throughput:.0} orders/sec ({:.2} µs/order)",
-        1_000_000.0 / throughput
-    );
-    println!();
-    println!("  Per-Order Latency");
-    print_latency_histogram(histogram, measured_orders);
-
-    // Print outcome summary if we tracked responses.
-    if let Some(outcomes) = outcomes {
-        print_outcome_summary(outcomes);
-    }
-
-    // Print health summary if we collected anything — drops alone (no
-    // successful sample) still warrant a line so the gap is visible.
-    if !health.samples.is_empty() || health.dropped > 0 {
-        let duration = health.samples.last().map_or(0.0, |s| s.elapsed_secs)
-            - health.samples.first().map_or(0.0, |s| s.elapsed_secs);
-        let peak_depth = health
-            .samples
-            .iter()
-            .map(|s| s.input_queue_depth)
-            .max()
-            .unwrap_or(0);
-        let capacity = health
-            .samples
-            .iter()
-            .map(|s| s.input_queue_capacity)
-            .max()
-            .unwrap_or(0);
-        let final_events = health.samples.last().map_or(0, |s| s.events_processed);
-        println!();
-        let total = health.samples.len() as u64 + health.dropped;
-        let drop_pct = if total > 0 {
-            health.dropped as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
-        println!(
-            "  Health ({} samples over {duration:.1}s, {dropped} dropped, {drop_pct:.1}%)",
-            health.samples.len(),
-            dropped = health.dropped,
-        );
-        if capacity > 0 {
-            let pct = peak_depth as f64 / capacity as f64 * 100.0;
-            println!("    peak queue depth: {peak_depth} / {capacity} ({pct:.1}%)");
-        } else {
-            println!("    peak queue depth: {peak_depth}");
-        }
-        println!("    events processed: {final_events}");
-    }
-
-    // Server-side per-stage decomposition (tick-to-trade). Fetched
-    // from the server's /stats-dump endpoint at end of run; only
-    // populated for the roundtrip mode against a server built with
-    // --features latency-trace.
-    stats::render_console(server_stages);
-
-    // Write JSON results if requested.
-    if let Some(path) = json_path {
-        use std::io::Write;
-
-        let throughput = (measured_orders as f64) / wall.as_secs_f64();
-        let mut percentiles = String::from("{");
-        percentiles.push_str(&format!(
-            "\"min_us\":{:.2},\"p50_us\":{:.2},\"p90_us\":{:.2}",
-            histogram.min() as f64 / 1000.0,
-            histogram.value_at_quantile(0.50) as f64 / 1000.0,
-            histogram.value_at_quantile(0.90) as f64 / 1000.0,
-        ));
-        let mut n = 2;
-        let mut t = 1_000usize;
-        while t <= measured_orders {
-            let q = 1.0 - 10.0f64.powi(-(n as i32));
-            let label = if n <= 2 {
-                "p99_us".to_string()
-            } else {
-                format!("p99{}_us", ".9".repeat(n - 2))
-            };
-            percentiles.push_str(&format!(
-                ",\"{}\":{:.2}",
-                label,
-                histogram.value_at_quantile(q) as f64 / 1000.0
-            ));
-            n += 1;
-            t *= 10;
-        }
-        percentiles.push_str(&format!(
-            ",\"max_us\":{:.2}}}",
-            histogram.max() as f64 / 1000.0
-        ));
-
-        // Serialize time-series data for stability plots. Schema owned by
-        // the harness so `melin-plot` has one definition to track.
-        let ts_json = series::to_json(series);
-
-        // Serialize health samples (fixed fields + any extra metrics).
-        let health_json = if health.samples.is_empty() {
-            String::from("[]")
-        } else {
-            let entries: Vec<String> = health.samples
-                .iter()
-                .map(|s| {
-                    let mut json = format!(
-                        "{{\"elapsed_secs\":{:.3},\"active_connections\":{},\"events_processed\":{},\"journal_sequence\":{},\"replication_lag\":{},\"input_queue_depth\":{},\"input_queue_capacity\":{},\"pipeline_healthy\":{},\"trading_active\":{}",
-                        s.elapsed_secs,
-                        s.active_connections,
-                        s.events_processed,
-                        s.journal_sequence,
-                        s.replication_lag,
-                        s.input_queue_depth,
-                        s.input_queue_capacity,
-                        s.pipeline_healthy,
-                        s.trading_active,
-                    );
-                    // Append extra metrics (per-replica replication stats, etc.).
-                    // Sorted for deterministic output. Prometheus label syntax
-                    // like `metric{slot="0"}` is sanitized to `metric_slot_0`
-                    // for valid JSON keys.
-                    let mut keys: Vec<&String> = s.extra.keys().collect();
-                    keys.sort();
-                    for key in keys {
-                        let val = s.extra[key];
-                        // Sanitize Prometheus label syntax for JSON keys:
-                        // melin_replica_lag{slot="0"} → melin_replica_lag_slot_0
-                        let safe_key: String = key
-                            .chars()
-                            .filter_map(|c| match c {
-                                '{' | '=' => Some('_'),
-                                '}' | '"' => None,
-                                other => Some(other),
-                            })
-                            .collect();
-                        // Emit integers without decimal point for cleaner JSON.
-                        if val == val.trunc() && val.abs() < u64::MAX as f64 {
-                            json.push_str(&format!(",\"{safe_key}\":{}", val as i64));
-                        } else {
-                            json.push_str(&format!(",\"{safe_key}\":{val:.3}"));
-                        }
-                    }
-                    json.push('}');
-                    json
-                })
-                .collect();
-            format!("[{}]", entries.join(","))
-        };
-
-        let stages_json = stats::render_json(server_stages);
-
-        // Outcome fragment: emitted only when response tracking was on,
-        // so the schema for in-process modes (engine, pipeline) that
-        // don't observe wire responses is unchanged.
-        let outcomes_json = match outcomes {
-            Some(o) => {
-                let mut reasons = String::from("{");
-                let mut first = true;
-                for (i, (_, name)) in REJECT_REASONS.iter().enumerate() {
-                    let count = o.reject_reasons[i];
-                    if count == 0 {
-                        continue;
-                    }
-                    if !first {
-                        reasons.push(',');
-                    }
-                    first = false;
-                    reasons.push_str(&format!("\"{name}\":{count}"));
-                }
-                reasons.push('}');
-                format!(
-                    ",\"outcomes\":{{\"batch_ends\":{},\"placed\":{},\"fills\":{},\"cancelled\":{},\"triggered\":{},\"replaced\":{},\"rejected\":{},\"engine_errors\":{},\"server_busy\":{},\"reject_reasons\":{reasons}}}",
-                    o.batch_ends,
-                    o.placed,
-                    o.fills,
-                    o.cancelled,
-                    o.triggered,
-                    o.replaced,
-                    o.rejected,
-                    o.engine_errors,
-                    o.server_busy,
-                )
-            }
-            None => String::new(),
-        };
-
-        // Pacing fragment: emitted only when target-rate was set, so the
-        // schema for closed-loop runs is unchanged.
-        let pacing_json = match pacing {
-            Some(p) => format!(
-                ",\"pacing\":{{\"target_rate\":{},\"scheduled\":{},\"achieved_rate\":{:.0},\"late_sends\":{},\"max_send_delay_us\":{:.2}}}",
-                p.target_rate, p.scheduled, throughput, p.late_sends, p.max_send_delay_us,
-            ),
-            None => String::new(),
-        };
-
-        let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_ms\":{:.2},\"measured_ms\":{:.2},\"cooldown_ms\":{:.2},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}{pacing_json}{outcomes_json}}}",
-            phases.warmup.as_secs_f64() * 1000.0,
-            phases.measured.as_secs_f64() * 1000.0,
-            phases.cooldown.as_secs_f64() * 1000.0,
-            wall.as_secs_f64() * 1000.0,
-            throughput,
-        );
-
-        let mut file = std::fs::File::create(path).expect("create json file");
-        file.write_all(json.as_bytes()).expect("write json");
-        file.write_all(b"\n").expect("write newline");
-        eprintln!("Results written to {}", path.display());
-    }
 }
 
 /// Create a temporary directory that persists for the process lifetime.
@@ -2689,145 +2167,5 @@ mod pipeline_core_tests {
         let cores = resolve_pipeline_cores(&[1, 0, 0, 0, 0]).unwrap();
         assert_eq!(cores.journal, 1);
         assert_eq!(cores.drain, 0);
-    }
-}
-
-#[cfg(test)]
-mod outcome_report_tests {
-    use super::*;
-
-    fn dummy_order() -> (OrderId, Symbol, AccountId) {
-        (OrderId(1), Symbol(0), AccountId(7))
-    }
-
-    fn one_qty() -> Quantity {
-        Quantity(NonZeroU64::new(1).unwrap())
-    }
-
-    fn one_price() -> Price {
-        Price(NonZeroU64::new(100).unwrap())
-    }
-
-    #[test]
-    fn records_each_variant_into_the_right_bucket() {
-        let (oid, sym, acc) = dummy_order();
-        let mut r = OutcomeReport::default();
-        r.record(&ResponseKind::BatchEnd);
-        r.record(&ResponseKind::Report(ExecutionReport::Placed {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            side: Side::Buy,
-            price: one_price(),
-            quantity: one_qty(),
-        }));
-        r.record(&ResponseKind::Report(ExecutionReport::Rejected {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            reason: RejectReason::InsufficientBalance,
-        }));
-        r.record(&ResponseKind::EngineError);
-        r.record(&ResponseKind::ServerBusy);
-        // Heartbeat is intentionally untracked.
-        r.record(&ResponseKind::Heartbeat);
-
-        assert_eq!(r.batch_ends, 1);
-        assert_eq!(r.placed, 1);
-        assert_eq!(r.rejected, 1);
-        assert_eq!(r.engine_errors, 1);
-        assert_eq!(r.server_busy, 1);
-        assert_eq!(
-            r.reject_reasons[reject_reason_index(RejectReason::InsufficientBalance)],
-            1
-        );
-    }
-
-    #[test]
-    fn merge_sums_all_fields_including_reason_buckets() {
-        let (oid, sym, acc) = dummy_order();
-        let mut a = OutcomeReport::default();
-        a.record(&ResponseKind::Report(ExecutionReport::Rejected {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            reason: RejectReason::NoLiquidity,
-        }));
-        a.record(&ResponseKind::BatchEnd);
-
-        let mut b = OutcomeReport::default();
-        b.record(&ResponseKind::Report(ExecutionReport::Rejected {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            reason: RejectReason::NoLiquidity,
-        }));
-        b.record(&ResponseKind::BatchEnd);
-        b.record(&ResponseKind::BatchEnd);
-
-        a.merge(&b);
-        assert_eq!(a.batch_ends, 3);
-        assert_eq!(a.rejected, 2);
-        assert_eq!(
-            a.reject_reasons[reject_reason_index(RejectReason::NoLiquidity)],
-            2
-        );
-    }
-
-    #[test]
-    fn rejection_ratio_is_zero_when_no_batches_observed() {
-        let r = OutcomeReport::default();
-        // A stalled run with zero responses returns 0.0 rather than NaN
-        // or 1.0 — distinct failure mode, surfaced by throughput, not by
-        // the threshold check.
-        assert_eq!(r.rejection_ratio(), 0.0);
-    }
-
-    #[test]
-    fn rejection_ratio_divides_rejected_by_batch_ends() {
-        let r = OutcomeReport {
-            batch_ends: 1000,
-            rejected: 25,
-            ..OutcomeReport::default()
-        };
-        assert!((r.rejection_ratio() - 0.025).abs() < 1e-9);
-    }
-
-    #[test]
-    fn record_execution_report_and_record_agree_on_report_variants() {
-        // Engine and pipeline modes call `record_execution_report`
-        // directly; the network bench reaches it via `record` ->
-        // `ResponseKind::Report(_)`. Both paths must produce identical
-        // counter state for the same input.
-        let (oid, sym, acc) = dummy_order();
-        let rep = ExecutionReport::Rejected {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            reason: RejectReason::ExceedsMaxOrderQty,
-        };
-
-        let mut via_direct = OutcomeReport::default();
-        via_direct.record_execution_report(&rep);
-
-        let mut via_wire = OutcomeReport::default();
-        via_wire.record(&ResponseKind::Report(rep));
-
-        assert_eq!(via_direct.rejected, via_wire.rejected);
-        assert_eq!(via_direct.reject_reasons, via_wire.reject_reasons);
-    }
-
-    #[test]
-    fn reject_reasons_indices_are_unique_and_match_table_length() {
-        // Sanity check: REJECT_REASONS and reject_reason_index must stay
-        // in lockstep. Indices must cover [0, len) without collisions.
-        let mut seen = vec![false; REJECT_REASONS.len()];
-        for (reason, _) in REJECT_REASONS {
-            let idx = reject_reason_index(*reason);
-            assert!(idx < REJECT_REASONS.len(), "index {idx} out of range");
-            assert!(!seen[idx], "duplicate index {idx} for {reason:?}");
-            seen[idx] = true;
-        }
-        assert!(seen.iter().all(|b| *b), "missing variant in REJECT_REASONS");
     }
 }

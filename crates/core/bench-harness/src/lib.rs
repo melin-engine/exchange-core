@@ -28,12 +28,14 @@
 //!   harness and whatever it drives.
 //! * [`transport`] — retrying TCP/UDS connect helpers.
 //! * [`uring`] — the io_uring event loop, generic over a `Workload`.
+//! * [`report`] — console summary and the JSON results schema.
 
 pub mod clock;
 pub mod health;
 pub mod keys;
 pub mod pacing;
 pub mod phases;
+pub mod report;
 pub mod series;
 pub mod stats;
 pub mod transport;

@@ -102,13 +102,26 @@ so a latency sample measures the wire roundtrip and not the benchmark's own
 bookkeeping. A single fused call would fold the tally cost into every
 sample.
 
-**Next** — reporting. `print_results` is generic except for its outcomes
-section, which renders `OutcomeReport`'s execution-report counters and the
-per-`RejectReason` breakdown. Giving `Outcomes` a rendering method (console
-and JSON) moves the rest, and takes `enforce_rejection_threshold` with it.
+**Done** — reporting:
 
-**After that** — `melin-plot`, which is already exchange-free but reads the
-JSON schema the harness now owns.
+* `report` — `print_results`, `print_latency_histogram`, `PacingReport`,
+  the health-sample serializer, and the JSON results schema
+* `Outcomes` gained `render_console` and `render_json`, so the one
+  application-specific part of the report renders itself
+
+Two details worth knowing. The console says "orders/sec" and "Per-Order
+Latency" here and "requests/sec" elsewhere, via a `Unit` the caller passes
+— spelled out per form rather than title-cased from one string. And the
+JSON key stays `measured_orders` even though the harness counts requests,
+because the plotting tools and every result file already on disk read that
+name.
+
+`enforce_rejection_threshold` stayed in `melin-bench`: it reads
+`--max-reject-pct` and encodes the judgment that a rejection flood means a
+misconfigured run, which is exchange policy rather than a harness concern.
+
+**Next** — `melin-plot`, which is already exchange-free but reads the JSON
+schema the harness now owns.
 
 **Staying here** — `auth_handshake`. The challenge/response frames are
 defined in the sequencer's `wire-protocol`, but only the *server* side has

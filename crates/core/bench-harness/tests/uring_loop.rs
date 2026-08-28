@@ -31,6 +31,20 @@ impl Outcomes for Counts {
         self.completions += other.completions;
         self.chatter += other.chatter;
     }
+
+    fn render_console(&self) {
+        println!();
+        println!("  Outcomes");
+        println!("    completions: {}", self.completions);
+        println!("    chatter:     {}", self.chatter);
+    }
+
+    fn render_json(&self) -> String {
+        format!(
+            "{{\"completions\":{},\"chatter\":{}}}",
+            self.completions, self.chatter
+        )
+    }
 }
 
 /// Sends a fixed 4-byte payload and treats [`COMPLETE`] as the completion

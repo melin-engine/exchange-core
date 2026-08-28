@@ -26,10 +26,12 @@ use melin_dpdk::port::Port;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 
+use melin_bench_harness::report::{PacingReport, RunReport, print_results};
+
 use crate::generator;
 use crate::{
-    BenchPhases, OutcomeReport, TimeSeries, enforce_rejection_threshold, maybe_sample,
-    print_results, spawn_progress_reporter,
+    BenchPhases, ORDER, OutcomeReport, TimeSeries, enforce_rejection_threshold, maybe_sample,
+    spawn_progress_reporter,
 };
 
 /// TCP socket buffer size. 64KB gives plenty of headroom for pipelined
@@ -928,7 +930,7 @@ pub fn run_dpdk_roundtrip(
         extra_lines.push(format!(
             "  Target rate: {target_rate} ops/s (scheduled {scheduled}, late {late}, max send delay {max_delay_us:.1} µs)"
         ));
-        Some(crate::PacingReport {
+        Some(PacingReport {
             target_rate,
             scheduled,
             late_sends: late,
@@ -989,20 +991,21 @@ pub fn run_dpdk_roundtrip(
         outcomes.merge(&conn.outcomes);
     }
 
-    print_results(
-        "Roundtrip",
-        histogram.len() as usize,
+    print_results(RunReport {
+        label: "Roundtrip",
+        unit: &ORDER,
+        measured_count: histogram.len() as usize,
         phases,
-        &histogram,
-        measured_wall,
-        &extra_lines,
+        histogram: &histogram,
+        wall: measured_wall,
+        extra_lines: &extra_lines,
         json_path,
-        &series,
-        &health_poller.map(|p| p.stop()).unwrap_or_default(),
-        &server_stages,
-        pacing_report.as_ref(),
-        Some(&outcomes),
-    );
+        series: &series,
+        health: &health_poller.map(|p| p.stop()).unwrap_or_default(),
+        server_stages: &server_stages,
+        pacing: pacing_report.as_ref(),
+        outcomes: &outcomes,
+    });
 
     enforce_rejection_threshold(&outcomes, max_reject_pct);
 }

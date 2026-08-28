@@ -71,4 +71,22 @@ pub trait Outcomes: Default + Send {
     /// harness merges per-connection tallies in thread-completion order,
     /// which is not deterministic.
     fn merge(&mut self, other: &Self);
+
+    /// Print the outcome section of the console summary, or nothing if
+    /// this workload has nothing to add beyond throughput and latency.
+    ///
+    /// Called after the latency histogram and before the health summary.
+    /// Implementations own their own blank lines and indentation; the rest
+    /// of the report indents section bodies by four spaces under a
+    /// two-space heading.
+    ///
+    /// This is where a run that produced numbers but not *useful* numbers
+    /// gets caught — a flood of rejections looks identical to clean
+    /// traffic in the latency histogram.
+    fn render_console(&self);
+
+    /// Render these tallies as the JSON `outcomes` object, braces
+    /// included. Return `{}` when there is nothing to report: the key is
+    /// always present so consumers can rely on its shape.
+    fn render_json(&self) -> String;
 }
