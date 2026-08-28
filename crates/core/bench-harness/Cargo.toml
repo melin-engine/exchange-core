@@ -38,3 +38,7 @@ hdrhistogram = "7"
 # Duration parsing for CLI flags (`30s`, `2m`, `500ms`).
 humantime = "2"
 tracing = { workspace = true }
+# io_uring drives the event loop: RECV/SEND per connection through one
+# ring per bench thread.
+io-uring = "0.7"
+libc = { workspace = true }

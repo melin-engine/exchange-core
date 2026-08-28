@@ -24,6 +24,10 @@
 //! * [`keys`] — deterministic per-connection ed25519 key derivation.
 //! * [`health`] — background poller for the server's Prometheus endpoint.
 //! * [`stats`] — client for the server's `/stats-dump` per-stage histograms.
+//! * [`workload`] — the [`workload::Workload`] trait: the seam between this
+//!   harness and whatever it drives.
+//! * [`transport`] — retrying TCP/UDS connect helpers.
+//! * [`uring`] — the io_uring event loop, generic over a `Workload`.
 
 pub mod clock;
 pub mod health;
@@ -32,3 +36,6 @@ pub mod pacing;
 pub mod phases;
 pub mod series;
 pub mod stats;
+pub mod transport;
+pub mod uring;
+pub mod workload;

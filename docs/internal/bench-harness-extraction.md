@@ -83,21 +83,38 @@ Melin crates.
   sequencer's `transport-core/src/health.rs`)
 * `stats` — `/stats-dump` client
 
-**Next** — the workload seam. `run_uring_loop` decodes every response
-frame with the exchange codec to decide whether it completed a request:
+**Done** — the workload seam and the event loop:
 
-```rust
-let response = codec::decode_response(frame).expect("decode response");
-if matches!(response, ResponseKind::BatchEnd) { /* record latency */ }
-conn.outcomes.record(&response);
-```
+* `workload` — the `Workload` trait (produce a request frame, decode a
+  response, say whether it completes a request, tally it) and `Outcomes`
+  (mergeable per-connection counters)
+* `uring` — `Connection<W>`, `run_loop`, the send-window filler, and the
+  `[u32 LE len][body]` framing
+* `transport` — the retrying TCP (with `SO_BUSY_POLL`) and UDS connects
 
-A `Workload` trait — produce a request frame, classify a response frame,
-accumulate and render outcomes — lets the event loop, the connect/auth
-helpers, and the reporting move too, with the exchange as one
-implementation and the sequencer's `counter` example as another. That is
-what makes the harness usable from the sequencer repository at all; until
-then it is a library with no benchmark of its own.
+`melin-bench` supplies `ExchangeWorkload`, ~60 lines wiring
+`OrderFlowGenerator` and `ResponseKind` to the trait.
+
+The trait splits decoding, completion-classification, and tallying into
+three calls rather than one `on_response`. That is deliberate: the loop
+captures its receive timestamp *between* the classification and the tally,
+so a latency sample measures the wire roundtrip and not the benchmark's own
+bookkeeping. A single fused call would fold the tally cost into every
+sample.
+
+**Next** — reporting. `print_results` is generic except for its outcomes
+section, which renders `OutcomeReport`'s execution-report counters and the
+per-`RejectReason` breakdown. Giving `Outcomes` a rendering method (console
+and JSON) moves the rest, and takes `enforce_rejection_threshold` with it.
 
 **After that** — `melin-plot`, which is already exchange-free but reads the
 JSON schema the harness now owns.
+
+**Staying here** — `auth_handshake`. The challenge/response frames are
+defined in the sequencer's `wire-protocol`, but only the *server* side has
+a codec there; the client-side encode/decode lives in the exchange's
+`melin-protocol`, which folds control and application frames into one
+`ResponseKind`. Moving auth means adding client-side control-frame codec
+functions to the sequencer's `wire-protocol` first. Connection setup is
+per-connection and off the hot path, so leaving it on the caller's side
+costs nothing meanwhile.

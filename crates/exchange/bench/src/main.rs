@@ -47,6 +47,8 @@
 #![cfg_attr(feature = "dpdk", allow(dead_code))]
 
 mod generator;
+#[cfg(not(feature = "dpdk"))]
+mod workload;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
@@ -57,13 +59,10 @@ mod dpdk;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(not(feature = "dpdk"))]
-use std::collections::VecDeque;
-
-#[cfg(not(feature = "dpdk"))]
 use std::io::Write;
 use std::num::NonZeroU64;
 #[cfg(not(feature = "dpdk"))]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -80,12 +79,16 @@ use melin_bench_harness::phases::{
     BenchPhases, DEFAULT_BENCH_THREADS, DEFAULT_CLIENTS, DEFAULT_COOLDOWN, DEFAULT_DURATION,
     DEFAULT_WARMUP, DEFAULT_WINDOW, parse_duration,
 };
-// Only the kernel-transport loops thread deadlines through a struct; the
-// DPDK loop compares against them inline.
-#[cfg(not(feature = "dpdk"))]
-use melin_bench_harness::phases::PhaseDeadlines;
+// The kernel-transport path hands its connections to the harness's
+// io_uring loop; the DPDK path runs its own loop over smoltcp sockets.
 use melin_bench_harness::series::{LatencySample, TimeSeries, maybe_sample};
+#[cfg(not(feature = "dpdk"))]
+use melin_bench_harness::transport::{connect_tcp, connect_uds};
+#[cfg(not(feature = "dpdk"))]
+use melin_bench_harness::uring::{self, Connection, LoopConfig};
 use melin_bench_harness::{health, keys, series, stats};
+#[cfg(not(feature = "dpdk"))]
+use workload::ExchangeWorkload;
 
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
@@ -1617,52 +1620,6 @@ fn start_server<L: BlockingTransportListener>(
         .expect("spawn server thread");
 }
 
-/// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
-///
-/// Also enables `SO_BUSY_POLL` on the connected socket. The bench's
-/// io_uring loop already busy-spins on CQEs, so the kernel's NIC
-/// busy-poll uses cycles that would otherwise be wasted spinning, and
-/// it removes the softirq → wakeup handoff from every server response
-/// — tightening the bench's measurement floor so we observe the
-/// server's true latency rather than the bench's own client-side
-/// scheduler jitter.
-#[cfg(not(feature = "dpdk"))]
-fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
-    use std::os::unix::io::AsRawFd;
-    let mut last_err = None;
-    for _ in 0..50 {
-        match std::net::TcpStream::connect(addr) {
-            Ok(s) => {
-                // Best-effort SO_BUSY_POLL; failure is logged via stderr
-                // but does not abort the bench (the kernel may reject
-                // it without CAP_NET_ADMIN, in which case we measure
-                // with the default scheduler-wakeup cost — still
-                // accurate, just slightly noisier).
-                let val: libc::c_int = 50;
-                let rc = unsafe {
-                    libc::setsockopt(
-                        s.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_BUSY_POLL,
-                        &val as *const libc::c_int as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    )
-                };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    eprintln!("warning: SO_BUSY_POLL setsockopt failed: {err}");
-                }
-                return s;
-            }
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-    panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
-}
-
 /// Perform challenge-response auth handshake on a new connection.
 /// Must be called before the stream is set to non-blocking mode.
 #[cfg(not(feature = "dpdk"))]
@@ -1706,22 +1663,6 @@ fn auth_handshake(
         matches!(response, ResponseKind::ServerReady),
         "expected ServerReady, got {response:?}"
     );
-}
-
-/// Connect to UDS server with retry (up to 50 attempts, 10ms apart).
-#[cfg(not(feature = "dpdk"))]
-fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
-    let mut last_err = None;
-    for _ in 0..50 {
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(s) => return s,
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-    panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
 // Orchestration
@@ -1952,28 +1893,17 @@ fn run_uring_roundtrip<R, W, F>(
     let num_threads = bench_threads.min(num_clients);
 
     // Attach per-client generator and distribute round-robin across bench threads.
-    let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
+    let mut thread_conns: Vec<Vec<Connection<ExchangeWorkload>>> =
+        (0..num_threads).map(|_| Vec::new()).collect();
     for (i, ((read_stream, write_stream), flow)) in
         connected.into_iter().zip(per_client).enumerate()
     {
-        let read_fd = read_stream.as_raw_fd();
-        let write_fd = write_stream.as_raw_fd();
-
-        thread_conns[i % num_threads].push(UringBenchConn {
-            read_fd,
-            write_fd,
-            _read_owner: Box::new(read_stream),
-            _write_owner: Box::new(write_stream),
-            recv_buf: Box::new([0u8; URING_RECV_BUF_SIZE]),
-            parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
-            recv_pending: false,
-            send_buf: Vec::with_capacity(4096),
-            send_pending: false,
-            flow,
-            inflight_ts: VecDeque::with_capacity(window),
-            pacer: None,
-            outcomes: OutcomeReport::default(),
-        });
+        thread_conns[i % num_threads].push(Connection::new(
+            read_stream,
+            write_stream,
+            ExchangeWorkload::new(flow),
+            window,
+        ));
     }
 
     let progress = Arc::new(AtomicU64::new(0));
@@ -2020,18 +1950,20 @@ fn run_uring_roundtrip<R, W, F>(
                     {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
-                    run_uring_loop(
+                    uring::run_loop(
                         conns,
-                        window,
-                        bench_start,
-                        deadlines,
-                        thread_progress,
-                        target_rate,
-                        num_clients,
-                        thread_idx,
-                        total_threads,
-                        phases,
-                        thread_pace_stats,
+                        LoopConfig {
+                            window,
+                            bench_start,
+                            deadlines,
+                            phases,
+                            progress: thread_progress,
+                            target_rate,
+                            total_clients: num_clients,
+                            thread_idx,
+                            total_threads,
+                            pace_stats: thread_pace_stats,
+                        },
                     )
                 })
                 .expect("spawn bench thread")
@@ -2048,7 +1980,12 @@ fn run_uring_roundtrip<R, W, F>(
     let mut outcomes = OutcomeReport::default();
 
     for handle in handles {
-        let (h, s, ms, o) = handle.join().expect("bench thread panicked");
+        let uring::LoopResult {
+            histogram: h,
+            series: s,
+            measured_start: ms,
+            outcomes: o,
+        } = handle.join().expect("bench thread panicked");
         histogram.add(&h).expect("merge histograms");
         if let Some(t) = ms {
             earliest_measured_start =
@@ -2156,395 +2093,6 @@ fn run_uring_roundtrip<R, W, F>(
     std::thread::sleep(Duration::from_millis(200));
 
     enforce_rejection_threshold(&outcomes, max_reject_pct);
-}
-
-/// Size of per-connection recv buffer for io_uring RECV.
-#[cfg(not(feature = "dpdk"))]
-const URING_RECV_BUF_SIZE: usize = 4096;
-
-/// Flag bit in io_uring user_data to distinguish SEND from RECV CQEs.
-/// Bit 63 set = SEND completion, clear = RECV completion.
-#[cfg(not(feature = "dpdk"))]
-const SEND_FLAG: u64 = 1 << 63;
-
-/// Per-connection state for the io_uring benchmark event loop.
-#[cfg(not(feature = "dpdk"))]
-struct UringBenchConn {
-    read_fd: RawFd,
-    write_fd: RawFd,
-    /// Owns the read half — keeps the fd alive.
-    _read_owner: Box<dyn Send>,
-    /// Owns the write half — keeps the fd alive.
-    _write_owner: Box<dyn Send>,
-
-    // Recv state
-    recv_buf: Box<[u8; URING_RECV_BUF_SIZE]>,
-    parse_buf: Vec<u8>,
-    recv_pending: bool,
-
-    // Send state
-    send_buf: Vec<u8>,
-    send_pending: bool,
-
-    // Pipelining state — orders are generated on-the-fly. There is no
-    // pre-allocated cap: the loop runs until the wall-clock cooldown
-    // deadline expires.
-    flow: generator::OrderFlowGenerator,
-    /// TSC tick at send time. `u64` instead of `Instant` to avoid
-    /// ~15-25ns vDSO overhead per timestamp on the hot path. With
-    /// open-loop pacing enabled this stores the *scheduled* TSC instead
-    /// of the actual submission TSC — the standard coordinated-omission
-    /// fix.
-    inflight_ts: VecDeque<u64>,
-    /// Open-loop scheduler (when `--target-rate > 0`). Materialised
-    /// inside the per-thread bench loop where TSC calibration runs;
-    /// constructed `None` initially.
-    pacer: Option<PaceClock>,
-    /// Counts every execution-report variant received on this
-    /// connection. Merged into the run-wide [`OutcomeReport`] after the
-    /// thread joins. Kept per-conn (not per-thread) so the recv hot path
-    /// touches only this conn's cache lines.
-    outcomes: OutcomeReport,
-}
-
-/// io_uring event loop for all benchmark connections. Single-threaded:
-/// uses RECV for reads and SEND for writes through one io_uring ring.
-/// Returns the cumulative histogram and (when `chart` feature is enabled)
-/// a time-series of interval latency percentiles for visualization.
-#[cfg(not(feature = "dpdk"))]
-#[allow(clippy::too_many_arguments)]
-fn run_uring_loop(
-    mut connections: Vec<UringBenchConn>,
-    window: usize,
-    bench_start: Instant,
-    deadlines: PhaseDeadlines,
-    progress: Arc<AtomicU64>,
-    target_rate: u64,
-    total_clients: usize,
-    thread_idx: usize,
-    total_threads: usize,
-    phases: BenchPhases,
-    pace_stats: Arc<PaceStats>,
-) -> (Histogram<u64>, TimeSeries, Option<Instant>, OutcomeReport) {
-    use io_uring::{IoUring, opcode, types};
-
-    let ticks_per_ns = calibrate_tsc();
-
-    // `warmup_end_tsc` lets pace_stats.record_send skip telemetry for
-    // sends scheduled during warmup. Without this gate, `scheduled` and
-    // `late_sends` cover all phases while `achieved_rate` covers
-    // measured-only — dividing one by the other in the JSON would
-    // overestimate the effective load by the warmup ratio.
-    let warmup_end_tsc = if target_rate > 0 {
-        let warmup_ticks = (phases.warmup.as_nanos() as f64 * ticks_per_ns) as u64;
-        rdtscp().saturating_add(warmup_ticks)
-    } else {
-        0
-    };
-
-    // Materialise pacers now that we have a calibration factor and a
-    // local TSC reading. Each connection gets its own scheduler keyed off
-    // the same `start_tsc`; the global conn index (which spans threads)
-    // staggers the first send across the whole run, not just within one
-    // thread.
-    if target_rate > 0 {
-        let start_tsc = rdtscp();
-        let clients = total_clients.max(1) as u64;
-        for (local_idx, conn) in connections.iter_mut().enumerate() {
-            // Round-robin distribution: this thread's local conn `k` is
-            // global conn `thread_idx + k * total_threads`.
-            let global_idx = (thread_idx + local_idx * total_threads) as u64;
-            conn.pacer = Some(PaceClock::new(
-                target_rate,
-                clients,
-                ticks_per_ns,
-                start_tsc,
-                global_idx,
-            ));
-        }
-    }
-    // 4096 entries: supports up to 1024 connections per thread (RECV +
-    // SEND per connection, plus headroom for partial-send resubmissions).
-    let mut ring = IoUring::new(4096).expect("create io_uring for bench");
-    let mut histogram =
-        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    // Timestamp of the first measured (post-warmup) latency recording.
-    // Used to compute throughput over the measured phase only.
-    let mut measured_start: Option<Instant> = None;
-
-    let mut interval_hist =
-        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
-    let mut interval_count: usize = 0;
-    // Pre-allocate generously: at 10M ord/s × SAMPLE_INTERVAL=1000 across
-    // typical bench durations (≤ 10 min) we push ≤ 600k entries; sizing
-    // for that up-front avoids the doubling-reallocate spikes that show
-    // up as ~100µs outliers in the deep tail at the 32k/64k/128k/256k
-    // capacity boundaries.
-    let mut series: TimeSeries = Vec::with_capacity(600_000);
-
-    // Pre-allocated CQE collection buffer. Must collect CQEs before
-    // processing because the CQ borrow must end before mutating connections.
-    // Avoids per-iteration heap allocation from `.collect()`.
-    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(1024);
-
-    // Submit initial RECVs for all connections.
-    for (i, conn) in connections.iter_mut().enumerate() {
-        let sqe = opcode::Recv::new(
-            types::Fd(conn.read_fd),
-            conn.recv_buf.as_mut_ptr(),
-            URING_RECV_BUF_SIZE as u32,
-        )
-        .build()
-        .user_data(i as u64);
-        unsafe {
-            ring.submission().push(&sqe).expect("SQ full");
-        }
-        conn.recv_pending = true;
-    }
-
-    // Fill initial send windows.
-    uring_fill_windows(
-        &mut ring,
-        &mut connections,
-        window,
-        &deadlines,
-        &pace_stats,
-        ticks_per_ns,
-        warmup_end_tsc,
-    );
-
-    loop {
-        // Wall-clock-driven termination. The histogram is sealed at
-        // `measured_end`, so any inflight responses left after we break
-        // would only land in cooldown and be discarded anyway.
-        if Instant::now() >= deadlines.cooldown_end {
-            break;
-        }
-        match ring.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => panic!("io_uring submit_and_wait: {e}"),
-        }
-
-        // Sample the wall clock *after* the blocking wait and reuse it
-        // for the phase classifier on every CQE in this batch. Saves a
-        // vDSO call per response — at multi-M ops/s the per-CQE
-        // `Instant::now()` (~15-25 ns) was visible in profiles. Outer
-        // iters batch many CQEs and phase boundaries are coarse (5 s
-        // warmup, 60 s measured), so reusing one timestamp across a
-        // batch misclassifies at most a handful of samples around the
-        // warmup/measured boundary — far below run-to-run noise.
-        let now = Instant::now();
-
-        cqes.clear();
-        cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
-
-        for &(token, result) in cqes.iter() {
-            if token & SEND_FLAG != 0 {
-                // ── SEND completion ──
-                let idx = (token & !SEND_FLAG) as usize;
-                let conn = &mut connections[idx];
-                conn.send_pending = false;
-
-                assert!(result >= 0, "send error: {result}");
-                let sent = result as usize;
-                if sent >= conn.send_buf.len() {
-                    conn.send_buf.clear();
-                } else {
-                    // Partial send — drain and resubmit.
-                    conn.send_buf.drain(..sent);
-                    let sqe = opcode::Send::new(
-                        types::Fd(conn.write_fd),
-                        conn.send_buf.as_ptr(),
-                        conn.send_buf.len() as u32,
-                    )
-                    .build()
-                    .user_data(idx as u64 | SEND_FLAG);
-                    unsafe {
-                        ring.submission().push(&sqe).expect("SQ full");
-                    }
-                    conn.send_pending = true;
-                }
-            } else {
-                // ── RECV completion ──
-                let idx = token as usize;
-                assert!(result > 0, "recv error or disconnect: {result}");
-
-                let n_bytes = result as usize;
-                let conn = &mut connections[idx];
-                conn.recv_pending = false;
-                conn.parse_buf.extend_from_slice(&conn.recv_buf[..n_bytes]);
-
-                // Parse complete frames.
-                let mut cursor = 0;
-                while cursor + 4 <= conn.parse_buf.len() {
-                    let len_bytes: [u8; 4] = conn.parse_buf[cursor..cursor + 4]
-                        .try_into()
-                        .expect("4 bytes");
-                    let frame_len = u32::from_le_bytes(len_bytes) as usize;
-                    if cursor + 4 + frame_len > conn.parse_buf.len() {
-                        break;
-                    }
-
-                    let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                    let response = codec::decode_response(frame).expect("decode response");
-                    cursor += 4 + frame_len;
-
-                    if matches!(response, ResponseKind::BatchEnd) {
-                        // `rdtscp()` is captured FIRST — before any
-                        // per-frame bookkeeping (outcome tally, parse
-                        // buffer compaction) — so the histogram reflects
-                        // only the wire roundtrip, not the bench's own
-                        // post-processing cost.
-                        let sent_tsc = conn.inflight_ts.pop_front().expect(
-                            "inflight timestamp desync: got BatchEnd without matching send",
-                        );
-                        let latency_ns = tsc_to_ns(rdtscp() - sent_tsc, ticks_per_ns);
-                        // Phase classification by *receive* time, using
-                        // the outer-iter `now`. Once `measured_end`
-                        // passes the histogram is sealed; any further
-                        // completions fall through silently.
-                        if now >= deadlines.warmup_end && now < deadlines.measured_end {
-                            if measured_start.is_none() {
-                                measured_start = Some(now);
-                            }
-                            histogram.record(latency_ns).expect("record");
-                            interval_hist.record(latency_ns).expect("record interval");
-                            interval_count += 1;
-                            maybe_sample(
-                                &mut interval_hist,
-                                &mut interval_count,
-                                &mut series,
-                                bench_start,
-                            );
-                            progress.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-
-                    // Tally outcomes across every phase (warmup,
-                    // measured, cooldown). Runs *after* the latency
-                    // capture above so the histogram measures the wire
-                    // roundtrip only — adding this counter increment
-                    // before `rdtscp()` would inflate every sample by
-                    // the cost of this match.
-                    conn.outcomes.record(&response);
-                }
-                if cursor > 0 {
-                    // Shift remaining bytes to front without allocating.
-                    // `copy_within` + `truncate` avoids the O(n) memmove
-                    // overhead of `Vec::drain` which must drop + shift.
-                    let remaining = conn.parse_buf.len() - cursor;
-                    conn.parse_buf.copy_within(cursor.., 0);
-                    conn.parse_buf.truncate(remaining);
-                }
-
-                // Re-arm RECV. The outer loop's wall-clock check is the
-                // only exit; pending CQEs after cooldown are drained
-                // implicitly when the io_uring drops at function exit.
-                let sqe = opcode::Recv::new(
-                    types::Fd(conn.read_fd),
-                    conn.recv_buf.as_mut_ptr(),
-                    URING_RECV_BUF_SIZE as u32,
-                )
-                .build()
-                .user_data(idx as u64);
-                unsafe {
-                    ring.submission().push(&sqe).expect("SQ full");
-                }
-                conn.recv_pending = true;
-            }
-        }
-
-        // Refill send windows for connections with capacity.
-        uring_fill_windows(
-            &mut ring,
-            &mut connections,
-            window,
-            &deadlines,
-            &pace_stats,
-            ticks_per_ns,
-            warmup_end_tsc,
-        );
-    }
-
-    let mut outcomes = OutcomeReport::default();
-    for conn in &connections {
-        outcomes.merge(&conn.outcomes);
-    }
-
-    (histogram, series, measured_start, outcomes)
-}
-
-/// Fill send windows for all connections that have capacity and no pending send.
-/// Builds a length-prefixed send buffer and submits SEND SQEs. Stops issuing
-/// new frames once the cooldown deadline has passed — the loop above will
-/// then terminate as soon as `submit_and_wait` returns (or immediately if
-/// the queue is empty).
-#[cfg(not(feature = "dpdk"))]
-#[allow(clippy::too_many_arguments)]
-fn uring_fill_windows(
-    ring: &mut io_uring::IoUring,
-    connections: &mut [UringBenchConn],
-    window: usize,
-    deadlines: &PhaseDeadlines,
-    pace_stats: &PaceStats,
-    ticks_per_ns: f64,
-    warmup_end_tsc: u64,
-) {
-    use io_uring::{opcode, types};
-
-    // Past cooldown: do nothing. We want the loop to wind down, not to
-    // queue more sends that will arrive after the run is reported.
-    if Instant::now() >= deadlines.cooldown_end {
-        return;
-    }
-
-    for (i, conn) in connections.iter_mut().enumerate() {
-        if conn.send_pending {
-            continue;
-        }
-
-        // Fill the send buffer with as many frames as the window allows.
-        // Each frame is encoded directly into `send_buf` as `[u32 LE len][payload]`.
-        // When pacing is active, `pop_due` gates each push by the
-        // schedule; the recorded timestamp is the *scheduled* TSC, which
-        // is what closes the coordinated-omission loophole.
-        while conn.inflight_ts.len() < window {
-            let send_tsc = if let Some(pacer) = conn.pacer.as_mut() {
-                let now_tsc = rdtscp();
-                match pacer.pop_due(now_tsc) {
-                    Some(scheduled) => {
-                        // Gate telemetry on warmup-end so `scheduled` /
-                        // `late_sends` reflect the same phase as the
-                        // throughput divisor (`achieved_rate`).
-                        if now_tsc >= warmup_end_tsc {
-                            pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
-                        }
-                        scheduled
-                    }
-                    None => break,
-                }
-            } else {
-                rdtscp()
-            };
-            conn.flow.next_wire_frame(&mut conn.send_buf);
-            conn.inflight_ts.push_back(send_tsc);
-        }
-
-        if !conn.send_buf.is_empty() {
-            let sqe = opcode::Send::new(
-                types::Fd(conn.write_fd),
-                conn.send_buf.as_ptr(),
-                conn.send_buf.len() as u32,
-            )
-            .build()
-            .user_data(i as u64 | SEND_FLAG);
-            unsafe {
-                ring.submission().push(&sqe).expect("SQ full");
-            }
-            conn.send_pending = true;
-        }
-    }
 }
 
 // ===========================================================================
