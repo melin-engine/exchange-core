@@ -999,10 +999,10 @@ impl TestCluster {
         // `in_memory>=2`, so the response gate would stall forever.
         // Downgrade to `disk` via the admin ACK-POLICY command — the
         // production failover playbook for a freshly-promoted node
-        // without peers. A separate test
-        // (`dual_replication_promote_then_durability_swap`) covers the
-        // same path on the dual-cluster shape so we know the runtime
-        // swap works under both topologies.
+        // without peers. `DualCluster::promote_replica1`/`promote_replica2`
+        // do the same on the dual-cluster shape (exercised by e.g.
+        // `dual_replication_promote_replica1_after_replica2_dies`), so the
+        // runtime swap is covered under both topologies.
         set_ack_policy(promote_addr, &self.operator_key, "disk");
 
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
@@ -1195,7 +1195,7 @@ fn kill_without_waiting_for_replication() {
     );
 }
 
-/// Exercise the `hybrid` durability gate on a primary that has been
+/// Exercise the `disk+ram` ack gate on a primary that has been
 /// restarted (i.e. recovered from its journal). The recovered primary's
 /// wire-sequence allocator starts at `last_seq + 1` — much larger than
 /// the fresh-primary case (which starts at 2 with the hash-chain feature)
@@ -1203,7 +1203,7 @@ fn kill_without_waiting_for_replication() {
 /// input-consumer space will silently open the response gate before the
 /// replica has actually replicated the event.
 ///
-/// The expected behavior of `hybrid` (`persisted>=1 && in_memory>=2`) is
+/// The expected behavior of `disk+ram` (`persisted>=1 && in_memory>=2`) is
 /// that every acked response is on at least one other node's in-memory
 /// state. We pre-populate the primary's journal with `PREFILL` events to
 /// push `starting_sequence` well above 2, then submit a small `BURST` of
@@ -1312,7 +1312,7 @@ fn recovered_primary_durability_gate_holds() {
     drop(client);
 
     // Promote the replica WITHOUT waiting for replication lag — the
-    // hybrid gate's contract is "every acked response is already on the
+    // `disk+ram` gate's contract is "every acked response is already on the
     // replica," so a wait would mask the bug.
     let mut client2 = cluster.kill_and_promote();
 
@@ -1338,7 +1338,7 @@ fn recovered_primary_durability_gate_holds() {
 
     assert!(
         missing.is_empty(),
-        "hybrid gate broken on recovered primary: {} of {} acked burst orders \
+        "disk+ram gate broken on recovered primary: {} of {} acked burst orders \
          were not on the promoted replica (missing ids: {:?}). \
          Acked: {:?}",
         missing.len(),
@@ -1818,7 +1818,7 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
-        // Downgrade the promoted standalone to `local` so its gate can
+        // Downgrade the promoted standalone to `disk` so its gate can
         // open without peers. See `TestCluster::kill_and_promote` for
         // the full rationale.
         set_ack_policy(addr, &self.operator_key, "disk");
@@ -3399,7 +3399,7 @@ fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
 }
 
 /// Behavioral tripwire for the durability gate: under the cluster
-/// default `hybrid` (`persisted>=1 && in_memory>=2`), a client ack must
+/// default `disk+ram` (`persisted>=1 && in_memory>=2`), a client ack must
 /// not be released until a replica has confirmed the order in memory.
 ///
 /// Freeze the replica process with SIGSTOP — the primary keeps
@@ -3460,7 +3460,7 @@ fn hybrid_gate_stalls_while_replica_frozen() {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         Ok(r) => panic!(
             "durability gate released a client ack while the only replica \
-             was frozen (hybrid requires in_memory>=2): {r:?}"
+             was frozen (disk+ram requires in_memory>=2): {r:?}"
         ),
         Err(e) => panic!("submitter channel closed unexpectedly: {e}"),
     }
@@ -3495,7 +3495,7 @@ fn hybrid_gate_stalls_while_replica_frozen() {
 ///
 /// Reproduce the full production shape: under sustained dual-replica
 /// load, SIGSTOP replica2 until ring backpressure evicts it (the
-/// healthy replica1 keeps satisfying the hybrid gate, so load never
+/// healthy replica1 keeps satisfying the `disk+ram` gate, so load never
 /// stops), SIGCONT so it reconnects and catches up *while the journal
 /// keeps growing*, and repeat. Every reconnect crosses the handoff
 /// window; the dense-lineage walk at the end catches any hole the
@@ -3865,7 +3865,7 @@ fn higher_epoch_handshake_fences_stale_primary() {
     // `trading` is precisely `replicas_connected > 0`.
     wait_for_replicas(primary.health_addr, 2, Duration::from_secs(30));
 
-    // Promote `prom` → epoch 1. Downgrade it to `local` so its gate opens
+    // Promote `prom` → epoch 1. Downgrade it to `disk` so its gate opens
     // without peers (it left the primary on promotion).
     let prom_admin_addr: SocketAddr = format!("127.0.0.1:{prom_admin}").parse().unwrap();
     promote(prom_admin_addr, &operator_key);

@@ -436,7 +436,7 @@ Symptoms you will see on ext4 at this floor:
 **Mitigations when a tighter tail matters:**
 
 - **Use xfs for the journal disk.** This is the single biggest win on ext4 systems. See `server-setup.sh` for the formatting and mount options.
-- **Run with dual replication and the default `hybrid` durability mode.** The response stage releases as soon as any node has the event on PLP-backed NVMe AND at least one replica has acked in memory — single-node fsync stalls are usually masked. (The ~10 s ext4 spike defeats this masking specifically because deterministic event flow correlates the spike across every node; xfs eliminates the correlation.)
+- **Run with dual replication and the default `disk+ram` ack policy.** The response stage releases as soon as any node has the event on PLP-backed NVMe AND at least one replica has acked in memory — single-node fsync stalls are usually masked. (The ~10 s ext4 spike defeats this masking specifically because deterministic event flow correlates the spike across every node; xfs eliminates the correlation.)
 - **Raise drive over-provisioning** if you stay on ext4. Smaller namespace + more unallocated capacity reduces drive-internal GC pressure that compounds with the fs-level spike.
 
 ## Reproducing Published Benchmarks

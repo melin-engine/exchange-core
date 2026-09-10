@@ -514,7 +514,6 @@ fn main() {
             matching: replica_core(1),
             response: replica_core(2),
             reader: replica_core(3),
-            repl_sender: 0,
             event_publisher: 0,
             // Unpinned: this bench sets a snapshot interval of ~35 days, so
             // the shadow stage never does any work worth a core.

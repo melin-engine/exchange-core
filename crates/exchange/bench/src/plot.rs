@@ -135,15 +135,18 @@ struct HealthPoint {
     response_gate_total_journal: u64,
     #[serde(default, rename = "melin_response_gate_total_blocker_replication")]
     response_gate_total_replication: u64,
-    #[serde(default, rename = "melin_durability_policy_degraded")]
-    durability_policy_degraded: u64,
+    // Recordings from before melin 0.15 spell these two
+    // `melin_durability_policy_*`; `parse_health_result` folds that
+    // spelling in.
+    #[serde(default, rename = "melin_ack_policy_degraded")]
+    ack_policy_degraded: u64,
     // f64, not u64 like its sibling gauges: the server emits this counter
     // with fractional-second precision, and the bench writer only rounds to
     // an integer when the value happens to be whole (`main.rs`). A u64 field
     // would deserialize fine on a whole sample and then hard-fail the moment
     // the policy spends a fractional second degraded.
-    #[serde(default, rename = "melin_durability_policy_degraded_seconds_total")]
-    durability_policy_degraded_seconds_total: f64,
+    #[serde(default, rename = "melin_ack_policy_degraded_seconds_total")]
+    ack_policy_degraded_seconds_total: f64,
     #[serde(default, rename = "melin_journal_rotations_total_path_fast")]
     journal_rotations_total_fast: u64,
     #[serde(default, rename = "melin_journal_rotations_total_path_sync_fallback")]
@@ -201,8 +204,8 @@ enum HealthMetric {
     StageIdleTotalResponse,
     ResponseGateTotalJournal,
     ResponseGateTotalReplication,
-    DurabilityPolicyDegraded,
-    DurabilityPolicyDegradedSecondsTotal,
+    AckPolicyDegraded,
+    AckPolicyDegradedSecondsTotal,
     JournalRotationsTotalFast,
     JournalRotationsTotalSyncFallback,
     JournalRotationsTotalFailed,
@@ -246,12 +249,10 @@ impl HealthMetric {
             Self::StageIdleTotalResponse => h.stage_idle_total_response as f64,
             Self::ResponseGateTotalJournal => h.response_gate_total_journal as f64,
             Self::ResponseGateTotalReplication => h.response_gate_total_replication as f64,
-            Self::DurabilityPolicyDegraded => h.durability_policy_degraded as f64,
+            Self::AckPolicyDegraded => h.ack_policy_degraded as f64,
             // Already f64 — no cast, so no precision loss on the fractional
             // seconds this counter can carry.
-            Self::DurabilityPolicyDegradedSecondsTotal => {
-                h.durability_policy_degraded_seconds_total
-            }
+            Self::AckPolicyDegradedSecondsTotal => h.ack_policy_degraded_seconds_total,
             Self::JournalRotationsTotalFast => h.journal_rotations_total_fast as f64,
             Self::JournalRotationsTotalSyncFallback => {
                 h.journal_rotations_total_sync_fallback as f64
@@ -277,49 +278,49 @@ impl HealthMetric {
 #[allow(dead_code, unused_variables)]
 fn _assert_all_metrics_plotted(p: &HealthPoint) {
     let HealthPoint {
-        elapsed_secs,                             // x-axis for every plot
-        active_connections,                       // plot_health_extra_metric
-        events_processed,                         // plot_health_events
-        journal_sequence,                         // plot_health_journal_seq
-        replication_lag,                          // plot_health_replication_lag
-        input_queue_depth,                        // plot_health_queue_depth
-        input_queue_capacity,                     // y-axis bound for plot_health_queue_depth
-        pipeline_healthy,                         // plot_health_extra_metric
-        trading_active,                           // plot_health_extra_metric
-        replicas_connected,                       // plot_health_extra_metric
-        replica_acked_sequence_slot_0,            // plot_health_extra_metric (per-slot)
-        replica_acked_sequence_slot_1,            // plot_health_extra_metric (per-slot)
-        replica_in_memory_sequence_slot_0,        // plot_health_extra_metric (per-slot)
-        replica_in_memory_sequence_slot_1,        // plot_health_extra_metric (per-slot)
-        replica_lag_slot_0,                       // plot_health_extra_metric (per-slot)
-        replica_lag_slot_1,                       // plot_health_extra_metric (per-slot)
-        replica_bytes_sent_total_slot_0,          // plot_health_extra_metric (per-slot)
-        replica_bytes_sent_total_slot_1,          // plot_health_extra_metric (per-slot)
-        replica_ack_latency_us_slot_0,            // plot_health_extra_metric (per-slot)
-        replica_ack_latency_us_slot_1,            // plot_health_extra_metric (per-slot)
-        replica_catching_up_slot_0,               // plot_health_extra_metric (per-slot)
-        replica_catching_up_slot_1,               // plot_health_extra_metric (per-slot)
-        replica_evictions_total,                  // plot_health_extra_metric
-        replication_ring_depth_slot_0,            // plot_health_extra_metric (per-slot)
-        replication_ring_depth_slot_1,            // plot_health_extra_metric (per-slot)
-        fastest_replica_cursor,                   // plot_health_extra_metric
-        stage_busy_total_journal,                 // plot_health_utilization (derivative)
-        stage_busy_total_matching,                // plot_health_utilization (derivative)
-        stage_busy_total_response,                // plot_health_utilization (derivative)
-        stage_idle_total_journal,                 // plot_health_utilization (derivative)
-        stage_idle_total_matching,                // plot_health_utilization (derivative)
-        stage_idle_total_response,                // plot_health_utilization (derivative)
-        response_gate_total_journal,              // plot_health_extra_metric
-        response_gate_total_replication,          // plot_health_extra_metric
-        durability_policy_degraded,               // plot_health_extra_metric
-        durability_policy_degraded_seconds_total, // plot_health_extra_metric
-        journal_rotations_total_fast,             // plot_health_extra_metric
-        journal_rotations_total_sync_fallback,    // plot_health_extra_metric
-        journal_rotations_total_failed,           // plot_health_extra_metric
-        replica_acks_received_total_slot_0,       // plot_health_extra_metric (per-slot)
-        replica_acks_received_total_slot_1,       // plot_health_extra_metric (per-slot)
-        replica_divergence_total,                 // plot_health_extra_metric
-        unknown,                                  // warned at load time, not plotted
+        elapsed_secs,                          // x-axis for every plot
+        active_connections,                    // plot_health_extra_metric
+        events_processed,                      // plot_health_events
+        journal_sequence,                      // plot_health_journal_seq
+        replication_lag,                       // plot_health_replication_lag
+        input_queue_depth,                     // plot_health_queue_depth
+        input_queue_capacity,                  // y-axis bound for plot_health_queue_depth
+        pipeline_healthy,                      // plot_health_extra_metric
+        trading_active,                        // plot_health_extra_metric
+        replicas_connected,                    // plot_health_extra_metric
+        replica_acked_sequence_slot_0,         // plot_health_extra_metric (per-slot)
+        replica_acked_sequence_slot_1,         // plot_health_extra_metric (per-slot)
+        replica_in_memory_sequence_slot_0,     // plot_health_extra_metric (per-slot)
+        replica_in_memory_sequence_slot_1,     // plot_health_extra_metric (per-slot)
+        replica_lag_slot_0,                    // plot_health_extra_metric (per-slot)
+        replica_lag_slot_1,                    // plot_health_extra_metric (per-slot)
+        replica_bytes_sent_total_slot_0,       // plot_health_extra_metric (per-slot)
+        replica_bytes_sent_total_slot_1,       // plot_health_extra_metric (per-slot)
+        replica_ack_latency_us_slot_0,         // plot_health_extra_metric (per-slot)
+        replica_ack_latency_us_slot_1,         // plot_health_extra_metric (per-slot)
+        replica_catching_up_slot_0,            // plot_health_extra_metric (per-slot)
+        replica_catching_up_slot_1,            // plot_health_extra_metric (per-slot)
+        replica_evictions_total,               // plot_health_extra_metric
+        replication_ring_depth_slot_0,         // plot_health_extra_metric (per-slot)
+        replication_ring_depth_slot_1,         // plot_health_extra_metric (per-slot)
+        fastest_replica_cursor,                // plot_health_extra_metric
+        stage_busy_total_journal,              // plot_health_utilization (derivative)
+        stage_busy_total_matching,             // plot_health_utilization (derivative)
+        stage_busy_total_response,             // plot_health_utilization (derivative)
+        stage_idle_total_journal,              // plot_health_utilization (derivative)
+        stage_idle_total_matching,             // plot_health_utilization (derivative)
+        stage_idle_total_response,             // plot_health_utilization (derivative)
+        response_gate_total_journal,           // plot_health_extra_metric
+        response_gate_total_replication,       // plot_health_extra_metric
+        ack_policy_degraded,                   // plot_health_extra_metric
+        ack_policy_degraded_seconds_total,     // plot_health_extra_metric
+        journal_rotations_total_fast,          // plot_health_extra_metric
+        journal_rotations_total_sync_fallback, // plot_health_extra_metric
+        journal_rotations_total_failed,        // plot_health_extra_metric
+        replica_acks_received_total_slot_0,    // plot_health_extra_metric (per-slot)
+        replica_acks_received_total_slot_1,    // plot_health_extra_metric (per-slot)
+        replica_divergence_total,              // plot_health_extra_metric
+        unknown,                               // warned at load time, not plotted
     } = p;
 }
 
@@ -339,6 +340,59 @@ fn warn_unknown_metrics(result: &HealthResult, filename: &str) {
             "warning: {filename} has unrecognized health metrics (no plot generated): {}",
             keys.join(", ")
         );
+    }
+}
+
+/// Health-metric spellings from before melin 0.15 renamed the ack-policy
+/// gauges.
+///
+/// A recording carries only these keys when it predates the rename, these
+/// *and* the current keys when the server was in the one-release alias
+/// window (0.15 emits each gauge under both names, and the health poller
+/// keeps every `melin_*` line), and only the current keys after that.
+/// `#[serde(alias)]` can't cover the middle case — serde rejects the second
+/// spelling as a duplicate field and the whole file fails to parse — so the
+/// old keys are left to land in `unknown` and are folded in afterwards.
+const LEGACY_ACK_POLICY_DEGRADED: &str = "melin_durability_policy_degraded";
+const LEGACY_ACK_POLICY_DEGRADED_SECONDS: &str = "melin_durability_policy_degraded_seconds_total";
+
+/// Parse a bench result's health section. Every load that plots health goes
+/// through here rather than straight to serde, so recordings from before
+/// and during the 0.15 metric rename plot the same as current ones.
+fn parse_health_result(data: &str) -> serde_json::Result<HealthResult> {
+    let mut result: HealthResult = serde_json::from_str(data)?;
+    for point in &mut result.health {
+        point.fold_legacy_metrics();
+    }
+    Ok(result)
+}
+
+impl HealthPoint {
+    /// Move legacy-spelled metrics out of `unknown` into their typed fields.
+    ///
+    /// When both spellings are present they were scraped from the same
+    /// server-side value, so taking the legacy one is correct either way. A
+    /// legacy value of the wrong shape is put back in `unknown`, where
+    /// `warn_unknown_metrics` reports it instead of it vanishing silently.
+    fn fold_legacy_metrics(&mut self) {
+        if let Some(v) = self.unknown.remove(LEGACY_ACK_POLICY_DEGRADED) {
+            match v.as_u64() {
+                Some(n) => self.ack_policy_degraded = n,
+                None => {
+                    self.unknown
+                        .insert(LEGACY_ACK_POLICY_DEGRADED.to_string(), v);
+                }
+            }
+        }
+        if let Some(v) = self.unknown.remove(LEGACY_ACK_POLICY_DEGRADED_SECONDS) {
+            match v.as_f64() {
+                Some(secs) => self.ack_policy_degraded_seconds_total = secs,
+                None => {
+                    self.unknown
+                        .insert(LEGACY_ACK_POLICY_DEGRADED_SECONDS.to_string(), v);
+                }
+            }
+        }
     }
 }
 
@@ -1214,7 +1268,7 @@ fn cmd_health(args: &[String]) {
         if data.is_empty() {
             continue;
         }
-        match serde_json::from_str::<HealthResult>(&data) {
+        match parse_health_result(&data) {
             Ok(r) if !r.health.is_empty() => {
                 let filename = path
                     .file_name()
@@ -1368,10 +1422,10 @@ fn emit_health_metric_plots(results: &[(HealthResult, String)], stem: &str) {
             y_label: "Status",
         },
         PlotSpec {
-            suffix: "durability-degraded",
-            metrics: &[DurabilityPolicyDegraded],
+            suffix: "ack-policy-degraded",
+            metrics: &[AckPolicyDegraded],
             labels: &["degraded"],
-            title: "Durability Policy Degraded (1 = clamped below target node count)",
+            title: "Ack Policy Degraded (1 = unsatisfiable by connected replicas)",
             y_label: "Status",
         },
         PlotSpec {
@@ -1382,10 +1436,10 @@ fn emit_health_metric_plots(results: &[(HealthResult, String)], stem: &str) {
             y_label: "Events",
         },
         PlotSpec {
-            suffix: "durability-degraded-seconds",
-            metrics: &[DurabilityPolicyDegradedSecondsTotal],
+            suffix: "ack-policy-degraded-seconds",
+            metrics: &[AckPolicyDegradedSecondsTotal],
             labels: &["degraded"],
-            title: "Time Durability Policy Unsatisfiable (cumulative)",
+            title: "Time Ack Policy Unsatisfiable (cumulative)",
             y_label: "Seconds",
         },
         PlotSpec {
@@ -2051,7 +2105,7 @@ fn cmd_all(args: &[String]) {
     let mut health_results = Vec::new();
     for path in &json_files {
         let data = fs::read_to_string(path).unwrap_or_default();
-        if let Ok(r) = serde_json::from_str::<HealthResult>(&data)
+        if let Ok(r) = parse_health_result(&data)
             && !r.health.is_empty()
         {
             let filename = path
@@ -2158,6 +2212,69 @@ mod tests {
         assert_eq!(h.unknown.len(), 1);
     }
 
+    /// A one-sample health result: the fields every sample carries, plus
+    /// `metrics`, a fragment of extra `"key": value` pairs.
+    fn health_json_with(metrics: &str) -> String {
+        format!(
+            r#"{{"label":"x","throughput_ops":0.0,"health":[{{
+                "elapsed_secs": 0.0,
+                "active_connections": 0,
+                "events_processed": 0,
+                "journal_sequence": 0,
+                "replication_lag": 0,
+                "input_queue_depth": 0,
+                "input_queue_capacity": 0,
+                "pipeline_healthy": true,
+                "trading_active": true,
+                {metrics}
+            }}]}}"#
+        )
+    }
+
+    /// melin 0.15 renamed the ack-policy gauges and emits both spellings for
+    /// one release, so recordings exist with the old keys only, both, or the
+    /// new keys only. All three must plot the same values — the both-keys
+    /// file is the one `#[serde(alias)]` would have refused to parse — and
+    /// none may leave a legacy key behind for `warn_unknown_metrics` to flag.
+    #[test]
+    fn ack_policy_metrics_load_from_every_rename_era() {
+        let legacy = r#""melin_durability_policy_degraded": 1,
+            "melin_durability_policy_degraded_seconds_total": 2.5"#;
+        let current = r#""melin_ack_policy_degraded": 1,
+            "melin_ack_policy_degraded_seconds_total": 2.5"#;
+        for (era, metrics) in [
+            ("before 0.15", legacy.to_string()),
+            ("0.15 alias window", format!("{legacy}, {current}")),
+            ("after the alias", current.to_string()),
+        ] {
+            let json = health_json_with(&metrics);
+            let r = parse_health_result(&json).unwrap_or_else(|e| panic!("{era}: {e}"));
+            let h = &r.health[0];
+            assert_eq!(HealthMetric::AckPolicyDegraded.read(h), 1.0, "{era}");
+            assert_eq!(
+                HealthMetric::AckPolicyDegradedSecondsTotal.read(h),
+                2.5,
+                "{era}"
+            );
+            assert!(
+                h.unknown.is_empty(),
+                "{era}: left in unknown: {:?}",
+                h.unknown
+            );
+        }
+    }
+
+    /// A legacy key whose value isn't the expected number stays in
+    /// `unknown`, so it is reported instead of silently dropped.
+    #[test]
+    fn malformed_legacy_ack_policy_metric_stays_unknown() {
+        let json = health_json_with(r#""melin_durability_policy_degraded": "yes""#);
+        let r = parse_health_result(&json).expect("parse");
+        let h = &r.health[0];
+        assert_eq!(HealthMetric::AckPolicyDegraded.read(h), 0.0);
+        assert!(h.unknown.contains_key(LEGACY_ACK_POLICY_DEGRADED));
+    }
+
     /// Exercise every `HealthMetric` variant. A recursive `.read()` arm
     /// would stack-overflow this test before producing a value, and a
     /// new variant added without a `match` arm would fail to compile —
@@ -2201,8 +2318,8 @@ mod tests {
             "melin_stage_idle_total_stage_response": 27,
             "melin_response_gate_total_blocker_journal": 28,
             "melin_response_gate_total_blocker_replication": 29,
-            "melin_durability_policy_degraded": 1,
-            "melin_durability_policy_degraded_seconds_total": 30.5,
+            "melin_ack_policy_degraded": 1,
+            "melin_ack_policy_degraded_seconds_total": 30.5,
             "melin_journal_rotations_total_path_fast": 31,
             "melin_journal_rotations_total_path_sync_fallback": 32,
             "melin_journal_rotations_total_path_failed": 33,
@@ -2250,11 +2367,11 @@ mod tests {
             (HealthMetric::StageIdleTotalResponse, 27.0),
             (HealthMetric::ResponseGateTotalJournal, 28.0),
             (HealthMetric::ResponseGateTotalReplication, 29.0),
-            (HealthMetric::DurabilityPolicyDegraded, 1.0),
+            (HealthMetric::AckPolicyDegraded, 1.0),
             // Deliberately fractional: this metric is seconds with sub-second
             // precision, so a u64 field would fail to deserialize here. The
             // `.5` is the regression guard for that.
-            (HealthMetric::DurabilityPolicyDegradedSecondsTotal, 30.5),
+            (HealthMetric::AckPolicyDegradedSecondsTotal, 30.5),
             (HealthMetric::JournalRotationsTotalFast, 31.0),
             (HealthMetric::JournalRotationsTotalSyncFallback, 32.0),
             (HealthMetric::JournalRotationsTotalFailed, 33.0),

@@ -528,7 +528,7 @@ EFFECTIVE_ACK_POLICY="$(_effective_ack_policy)"
 REQUIRED_REPLICAS="$(_policy_min_replicas "$EFFECTIVE_ACK_POLICY")"
 
 # Walk the unique transports in MATRIX and flag any that can't satisfy
-# the mode. LOCAL_MATRIX entries (engine-only, pipeline-only) bypass
+# the policy. LOCAL_MATRIX entries (engine-only, pipeline-only) bypass
 # the response gate entirely and are not affected.
 INVALID_ACK_POLICY=()
 declare -A _VALIDATED
