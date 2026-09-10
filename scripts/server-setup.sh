@@ -845,7 +845,7 @@ if [[ -n "$JOURNAL_DISK" ]]; then
     # `fdatasync` spikes at ~256 MiB write boundaries, correlated across
     # all replicas (deterministic event stream → identical byte layout →
     # ext4's jbd2 metadata batching fires at the same offset on every
-    # node). The hybrid durability gate masks single-node hiccups, but
+    # node). The `disk+ram` ack gate masks single-node hiccups, but
     # when all three nodes hit the spike simultaneously the bench sees a
     # ~10 s-cadence outlier in the tail. xfs doesn't exhibit this
     # behaviour on the same hardware: same throughput, p50/p99 unchanged,

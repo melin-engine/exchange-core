@@ -78,6 +78,11 @@ use hdrhistogram::Histogram;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 use melin_server::exchange_app::ServerApp;
+// The server's own frame ceiling, so the handshake frames this bench
+// builds are bounded by the number the server actually enforces rather
+// than a copy that could drift.
+#[cfg(not(feature = "dpdk"))]
+use melin_server_runtime::MAX_FRAME_SIZE;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::server::ServerConfig;
 use melin_types::types::*;
@@ -115,10 +120,6 @@ const DEFAULT_CLIENTS: usize = 16;
 /// on 8C/16T). With 4 bench + 6 server (3 pipeline + 2 reader + 1 repl-sender)
 /// = 10 pinned threads total, leaving core 0 for OS/IRQ.
 const DEFAULT_BENCH_THREADS: usize = 4;
-
-/// Maximum frame payload size (matches protocol).
-#[cfg(not(feature = "dpdk"))]
-const MAX_FRAME_SIZE: usize = 1024;
 
 /// Clap value parser: accept any humantime-recognised duration (`30s`,
 /// `2m`, `500ms`, …). Surfaces parse errors as clap-friendly strings.
@@ -1871,10 +1872,14 @@ fn run_roundtrip_bench(
         connection_timeout_secs: 0,
         authorized_keys: keys_path,
         // Single-node durability for the embedded bench server: ack on
-        // local persistence alone. The default `Hybrid` mode waits for
-        // `in_memory>=2` replica acks that never arrive when nothing else
-        // is connected, which would stall every response.
-        durability_mode: melin_server_runtime::durability_policy::DurabilityMode::Local,
+        // local persistence alone. The default `DiskAndRam` policy also
+        // requires `in_memory>=2`, i.e. a replica ack that never arrives
+        // when nothing else is connected, which would stall every response.
+        //
+        // `AckPolicy::Disk` is melin 0.15's name for what was
+        // `DurabilityMode::Local`; the guarantee (`persisted>=1`) is
+        // unchanged.
+        ack_policy: melin_server_runtime::ack_policy::AckPolicy::Disk,
         ..ServerConfig::default()
     };
     // Wire the trading AppFactory: replication / seed paths take it

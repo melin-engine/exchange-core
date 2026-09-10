@@ -151,8 +151,8 @@ mod tests {
     // Note: the encoder's `Err` arm exists for codec-level failures
     // (e.g. an `InvalidField` propagated up); the codec does NOT
     // check buffer length and will panic with index-out-of-bounds
-    // on an undersized scratch. The runtime always passes
-    // `MAX_RESPONSE_BUF` (8 KiB), which is sized to fit any single
-    // wire response, so this is a caller-guarantee contract — not
-    // something the encoder defends against.
+    // on an undersized scratch. The runtime always passes a scratch of
+    // `melin_server_runtime::MAX_RESPONSE_BUF` bytes, which it sizes to
+    // fit any single wire response, so this is a caller-guarantee
+    // contract — not something the encoder defends against.
 }

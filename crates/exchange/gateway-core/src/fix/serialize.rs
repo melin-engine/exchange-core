@@ -7,11 +7,20 @@ use super::tags;
 /// Builder for constructing FIX messages.
 ///
 /// Usage:
-/// ```ignore
+/// ```
+/// # use melin_gateway_core::fix::{serialize::FixMessageBuilder, tags};
 /// let msg = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
 ///     .str_tag(tags::CL_ORD_ID, "ORD001")
 ///     .str_tag(tags::SYMBOL, "BTC/USD")
 ///     .build("SENDER", "TARGET", 42);
+///
+/// // BeginString and BodyLength lead, the caller's fields follow the
+/// // generated header in the order given, and CheckSum (tag 10, three
+/// // digits) closes the message.
+/// assert!(msg.starts_with(b"8=FIX.4.4\x019="));
+/// let fields = b"\x0111=ORD001\x0155=BTC/USD\x01";
+/// assert!(msg.windows(fields.len()).any(|w| w == fields));
+/// assert!(msg[msg.len() - 8..].starts_with(b"\x0110="));
 /// ```
 pub struct FixMessageBuilder {
     /// Body fields (after BeginString and BodyLength, before CheckSum).
