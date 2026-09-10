@@ -1220,7 +1220,7 @@ fn kill_without_waiting_for_replication() {
 /// quantitatively distinct from the fresh-primary version.
 #[test]
 #[serial]
-fn recovered_primary_durability_gate_holds() {
+fn recovered_primary_ack_gate_holds() {
     const PREFILL: u64 = 50;
     const BURST: u64 = 10;
 
@@ -1357,7 +1357,7 @@ fn recovered_primary_durability_gate_holds() {
 /// every subsequent reconnect sees `journal_writer == None` and tries to
 /// create a fresh journal file — which fails `AlreadyExists` against the
 /// journal the replica is already streaming into. The
-/// `recovered_primary_durability_gate_holds` test sidesteps this by also
+/// `recovered_primary_ack_gate_holds` test sidesteps this by also
 /// wiping the replica's journal on restart; production deployments
 /// cannot.
 ///
@@ -3398,7 +3398,7 @@ fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
     let _ = saw_in_mem_ahead;
 }
 
-/// Behavioral tripwire for the durability gate: under the cluster
+/// Behavioral tripwire for the ack gate: under the cluster
 /// default `disk+ram` (`persisted>=1 && in_memory>=2`), a client ack must
 /// not be released until a replica has confirmed the order in memory.
 ///
@@ -3425,7 +3425,7 @@ fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
 /// normal release latency while staying well inside any teardown path.
 #[test]
 #[serial]
-fn hybrid_gate_stalls_while_replica_frozen() {
+fn disk_ram_gate_stalls_while_replica_frozen() {
     let cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
 

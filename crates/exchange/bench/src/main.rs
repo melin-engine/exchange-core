@@ -78,6 +78,11 @@ use hdrhistogram::Histogram;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 use melin_server::exchange_app::ServerApp;
+// The server's own frame ceiling, so the handshake frames this bench
+// builds are bounded by the number the server actually enforces rather
+// than a copy that could drift.
+#[cfg(not(feature = "dpdk"))]
+use melin_server_runtime::MAX_FRAME_SIZE;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::server::ServerConfig;
 use melin_types::types::*;
@@ -115,10 +120,6 @@ const DEFAULT_CLIENTS: usize = 16;
 /// on 8C/16T). With 4 bench + 6 server (3 pipeline + 2 reader + 1 repl-sender)
 /// = 10 pinned threads total, leaving core 0 for OS/IRQ.
 const DEFAULT_BENCH_THREADS: usize = 4;
-
-/// Maximum frame payload size (matches protocol).
-#[cfg(not(feature = "dpdk"))]
-const MAX_FRAME_SIZE: usize = 1024;
 
 /// Clap value parser: accept any humantime-recognised duration (`30s`,
 /// `2m`, `500ms`, …). Surfaces parse errors as clap-friendly strings.
