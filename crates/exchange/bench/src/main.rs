@@ -1430,7 +1430,11 @@ fn run_pipeline_inner(
         false, // no replication
         max_journal_batch,
         melin_journal::replication::REPLICATION_RING_CAPACITY,
-        true,  // busy_spin — match production default (yield_idle=false)
+        // Every stage busy-spins — the production default on isolated
+        // cores, and what this mode's own threads do too.
+        melin_transport_core::pipeline::StageWaits::uniform(
+            melin_pipeline::wait::WaitStrategy::BusySpin,
+        ),
         false, // event_publisher
         false, // shadow
         std::sync::Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -1506,7 +1510,12 @@ fn run_pipeline_inner(
     // SPSC channel requires capacity >= 2; clamp so `--window=1` (useful
     // for isolating pure pipeline latency without queueing) doesn't panic.
     let ts_capacity = window.next_power_of_two().max(2);
-    let (mut ts_tx, mut ts_rx) = melin_pipeline::spsc::channel::<u64>(ts_capacity);
+    // The publisher thread producing into it busy-spins like every
+    // other thread in this mode.
+    let (mut ts_tx, mut ts_rx) = melin_pipeline::spsc::channel::<u64>(
+        ts_capacity,
+        melin_pipeline::wait::WaitStrategy::BusySpin,
+    );
 
     // Publisher thread: continuously feeds events into the disruptor.
     // `sequence: 0` — the journal stage allocates sequences in disruptor

@@ -689,7 +689,6 @@ fn spawn_primary_with_extra_env(
         FIXTURE_INSTRUMENTS.to_string(),
         "--connection-timeout-secs".into(),
         "0".into(),
-        "--yield-idle".into(),
         // Reduce core count to avoid conflicts in CI.
         "--cores".into(),
         "0,0,0,0,0,0,0,0,0".into(),
@@ -825,7 +824,6 @@ fn spawn_replica_named_with_extra_env(
         keys_path.to_str().expect("valid path").into(),
         "--connection-timeout-secs".into(),
         "0".into(),
-        "--yield-idle".into(),
         "--cores".into(),
         "0,0,0,0,0,0,0,0,0".into(),
     ];
@@ -1487,7 +1485,6 @@ fn crashed_primary_recovers_from_journal() {
                 "2",
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
             ])
@@ -2176,7 +2173,6 @@ fn replacement_replica_catches_up_from_journal() {
                     .expect("valid path"),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
             ])
@@ -2301,7 +2297,6 @@ fn catchup_with_fills_during_gap() {
                     .unwrap(),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
             ])
@@ -2414,7 +2409,6 @@ fn catchup_then_immediate_failover() {
                     .unwrap(),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
             ])
@@ -2534,7 +2528,6 @@ fn fresh_replica_full_catchup() {
                     .unwrap(),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
             ])
@@ -2649,7 +2642,6 @@ fn snapshot_transfer_when_archives_purged() {
                 "2",
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
                 "--standalone",
@@ -2682,9 +2674,10 @@ fn snapshot_transfer_when_archives_purged() {
 
     // All 20 orders are now committed (each submit_order waited for a
     // response gated on journal fsync). Remove any snapshot taken before
-    // this point — in yield-idle mode the timer fires promptly, so a
-    // partial snapshot (e.g. only orders 1–N) may already exist. The
-    // next snapshot is guaranteed to include all 20 orders.
+    // this point — every thread is unpinned and yields, so the timer
+    // fires promptly and a partial snapshot (e.g. only orders 1–N) may
+    // already exist. The next snapshot is guaranteed to include all 20
+    // orders.
     let snap_path = primary_journal.with_extension("snapshot");
     let _ = std::fs::remove_file(&snap_path);
 
@@ -2746,7 +2739,6 @@ fn snapshot_transfer_when_archives_purged() {
                 "2",
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0,0",
                 "--snapshot-interval-ms",

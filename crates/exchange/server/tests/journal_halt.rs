@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
+use melin_pipeline::wait::WaitStrategy;
 use melin_server::exchange_app::ServerApp as App;
 use melin_trading::trading_event::TradingEvent;
 use melin_transport_core::pipeline::MatchingStage;
@@ -87,11 +88,11 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
 
     let (input_producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let consumer = consumers.pop().unwrap();
     let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
         .add_consumer()
-        .build();
+        .build(WaitStrategy::SpinThenYield);
     let output_consumer = output_consumers.pop().unwrap();
 
     // Durable cursor unused by the halt test — nothing publishes into it.
@@ -111,7 +112,7 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
         active_conns,
         Some(Arc::clone(&counter)),
         Arc::clone(&fence),
-        false,
+        WaitStrategy::SpinThenYield,
         1, // starting_wire_seq (halt test does not exercise the gate)
     );
 

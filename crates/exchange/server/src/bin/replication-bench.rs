@@ -38,12 +38,13 @@ use melin_app::unix_epoch_nanos;
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
+use melin_pipeline::wait::WaitStrategy;
 use melin_server::exchange_app::ServerApp;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::replication::{
     ReplicaControlPlane, ReplicationListener, ReplicationMetrics, Sender, run_receiver, run_sender,
 };
-use melin_server_runtime::server::PipelineCores;
+use melin_server_runtime::server::{PipelineCores, Placement};
 use melin_trading::trading_event::TradingEvent;
 type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
 type OutputSlot = melin_transport_core::pipeline::OutputSlot<
@@ -51,7 +52,7 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_types::types::QueryResponse,
 >;
 use melin_transport_core::JournaledApp;
-use melin_transport_core::pipeline::build_pipeline_with_replication;
+use melin_transport_core::pipeline::{StageWaits, build_pipeline_with_replication};
 use melin_transport_core::trace::mono_trace_ns;
 use melin_types::types::{AccountId, CurrencyId};
 
@@ -246,6 +247,16 @@ const HEARTBEAT_SECS: u64 = 5;
 fn main() {
     let args = Args::parse();
     let busy_spin = !args.no_busy_spin;
+    // One wait policy for every thread, pinned or not. This bench has
+    // always let unpinned threads spin (and warns when nothing is pinned
+    // at all); the server's layout check does not run here, so the
+    // placements below may pair an unpinned core with a spinner.
+    let wait = if busy_spin {
+        WaitStrategy::BusySpin
+    } else {
+        WaitStrategy::SpinThenYield
+    };
+    let place = |core: usize| Placement { core, wait };
     let ack_policy = args.ack_policy;
 
     let n_replicas = args.replicas;
@@ -360,7 +371,7 @@ fn main() {
         true, // enable_replication
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_SIZE,
-        busy_spin,
+        StageWaits::uniform(wait),
         false, // enable_event_publisher
         false, // enable_shadow
         Arc::clone(&primary_fence),
@@ -430,17 +441,16 @@ fn main() {
             pin("drain", drain_core);
             let mut consumer = output_consumer_0;
             let mut batch = vec![OutputSlot::default(); 256];
+            let mut waiter = wait.waiter();
             loop {
                 if s.load(Ordering::Relaxed) {
                     return;
                 }
                 let n = consumer.consume_batch(&mut batch, 256);
                 if n == 0 {
-                    if busy_spin {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
+                    waiter.idle();
+                } else {
+                    waiter.reset();
                 }
             }
         })
@@ -471,10 +481,12 @@ fn main() {
         evict_flags: replication_ring_progress.evict_flags.clone(),
         active_flags: replication_ring_progress.active_flags.clone(),
         metrics: Arc::clone(&metrics),
-        handler_cores: [primary_cores.handler_0, primary_cores.handler_1],
+        handlers: [
+            place(primary_cores.handler_0),
+            place(primary_cores.handler_1),
+        ],
         batch_size: BATCH_SIZE,
         heartbeat_secs: HEARTBEAT_SECS,
-        busy_spin,
         fence_state: Arc::clone(&primary_fence),
     };
 
@@ -510,18 +522,18 @@ fn main() {
         let base = replica_bases[i];
         let replica_core = |offset: usize| if base == 0 { 0 } else { base + offset };
         let cores = PipelineCores {
-            journal: replica_core(0),
-            matching: replica_core(1),
-            response: replica_core(2),
-            reader: replica_core(3),
-            event_publisher: 0,
+            journal: place(replica_core(0)),
+            matching: place(replica_core(1)),
+            response: place(replica_core(2)),
+            reader: place(replica_core(3)),
+            event_publisher: Placement::unpinned(),
             // Unpinned: this bench sets a snapshot interval of ~35 days, so
             // the shadow stage never does any work worth a core.
-            shadow: 0,
-            repl_handler_0: 0,
-            repl_handler_1: 0,
-            journal_prep: 0,
-            journal_disk: replica_core(4),
+            shadow: Placement::unpinned(),
+            repl_handler_0: Placement::unpinned(),
+            repl_handler_1: Placement::unpinned(),
+            journal_prep: Placement::unpinned(),
+            journal_disk: place(replica_core(4)),
         };
         let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
         let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
@@ -543,9 +555,11 @@ fn main() {
                     3_000_000, // snapshot_interval_ms (effectively never)
                     replica_snapshot,
                     cores,
+                    // Zero-fill staging, the production default; the
+                    // bench measures streaming, not segment rotation.
+                    melin_journal::StagingMode::default(),
                     std::time::Duration::ZERO,
                     8, // pipeline_depth
-                    busy_spin,
                     std::sync::Arc::new(melin_server::app_factory::Factory::new(
                         melin_server::app_factory::FactoryConfig {
                             accounts: 0,

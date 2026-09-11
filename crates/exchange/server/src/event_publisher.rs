@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 use melin_app::auth::AuthorizedKeys;
 use melin_market_data::mirror::BookMirror;
 use melin_pipeline::ring;
+use melin_pipeline::wait::WaitStrategy;
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_transport_core::pipeline::{
@@ -148,7 +149,7 @@ pub fn run(
     bind_addr: SocketAddr,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
-    busy_spin: bool,
+    wait: WaitStrategy,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -173,7 +174,9 @@ pub fn run(
 
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut frame_buf = [0u8; MAX_FRAME_BUF];
-    let mut idle_spins: u32 = 0;
+    // The thread's wait policy comes from its `--cores` entry: a
+    // publisher on a core of its own spins, one sharing a core yields.
+    let mut waiter = wait.waiter();
     let mut last_broadcast = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -206,15 +209,10 @@ pub fn run(
                 last_broadcast = std::time::Instant::now();
             }
 
-            if busy_spin || idle_spins < 1000 {
-                idle_spins = idle_spins.wrapping_add(1);
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            waiter.idle();
             continue;
         }
-        idle_spins = 0;
+        waiter.reset();
         last_broadcast = std::time::Instant::now();
 
         // Process each event: update mirrors, then broadcast to streaming subscribers.
@@ -852,7 +850,7 @@ mod tests {
 
         let (_, consumer) = ring::DisruptorBuilder::<OutputSlot>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumer.into_iter().next().unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -866,7 +864,13 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("test-publisher".into())
             .spawn(move || {
-                run(consumer, addr, keys, &shutdown2, false);
+                run(
+                    consumer,
+                    addr,
+                    keys,
+                    &shutdown2,
+                    WaitStrategy::SpinThenYield,
+                );
             })
             .unwrap();
 

@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk` (comma-separated). The tenth (`journal-prep`) and eleventh (`journal-disk`) entries are optional; a shorter list leaves those threads unpinned. Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
+| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: `journal,matching,response,reader,unused,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk` (comma-separated). Each entry takes an optional wait-policy suffix: a bare core (or `7s`) busy-spins and needs the core to itself, `7y` spins briefly then yields and may share it. The fifth entry is ignored (set it to `0`). The tenth (`journal-prep`) and eleventh (`journal-disk`) entries are optional; a shorter list leaves those threads unpinned. Core 0 should be reserved for OS/IRQ. 0 = unpinned (and therefore yielding) for any field. The server refuses to start when two threads share a core unless both entries carry `y`. See [Core Pinning](#core-pinning---cores). |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -49,8 +49,8 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--heartbeat-interval-secs` | `10` | Seconds between heartbeats to idle connections. `0` to disable. |
 | `--connection-timeout-secs` | `30` | Seconds before disconnecting silent clients. `0` to disable. |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
-| `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
-| `--health-bind` | `127.0.0.1:9878` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
+| `--journal-staging-mode` | `zero-fill` | How the background preparer stages the next journal segment. `zero-fill` pre-writes it, so appends never carry filesystem-metadata cost; `allocate` only reserves it, costing no device bandwidth while staging. Consider `allocate` on network-attached volumes (e.g. EBS), where the pre-write competes with the hot path for metered bandwidth. Which mode wins is a property of the volume; measure both. |
+| `--health-bind` | `127.0.0.1:9878` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Served by primaries and replicas alike, so a primary and a replica on one host need distinct binds. Omit to disable. |
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 | `--snapshot-interval-ms` | `3_000_000` (50 min) | Interval in milliseconds between snapshots written by the shadow exchange — the sole snapshot writer. Set to `0` to disable; recovery then falls back to full journal replay. The shadow replays events on a dedicated thread, so snapshot writes never pause the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
 | `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
@@ -435,7 +435,7 @@ The recommended core assignment for a production server:
 | 2 | Matching stage | 2nd |
 | 3 | Response stage | 3rd |
 | 4 | Reader thread (io_uring / DPDK poll) | 4th |
-| 5 | Replication sender | 5th |
+| 5 | (unused — the entry is ignored, set it to `0`) | 5th |
 | 6 | Event publisher | 6th |
 | 7 | Shadow exchange (scheduled snapshots) | 7th |
 | 8 | Replication handler 0 | 8th |
@@ -448,7 +448,11 @@ The recommended core assignment for a production server:
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-`--cores 1,2,3,4,5,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, repl-sender→5, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. Use `0` for any position to leave that thread unpinned (OS-scheduled).
+`--cores 1,2,3,4,0,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. The fifth entry is ignored. Use `0` for any position to leave that thread unpinned (OS-scheduled).
+
+Each entry also states how the thread waits when it has nothing to do. A bare core (`7`, or `7s`) busy-spins and needs the core to itself. `7y` spins briefly, then yields to the scheduler, and may share the core with other yielding threads. `0` leaves the thread unpinned, which always yields. `journal-prep` blocks in file I/O rather than polling and takes no suffix. The server refuses to start when two entries name the same core and either thread busy-spins; the check covers every entry, including threads no other flag enables, and the error names both threads and the core. On DPDK the `reader` entry pins the NIC poll thread, which never yields, so it cannot take `y` — give it a core of its own. The boot log prints the resolved layout in `--cores` syntax.
+
+On a shared machine where every thread should yield, suffix every pinned entry: `--cores 1y,2y,3y,4y,0,6y,7y,8y,9y,10,11y`. This replaces the former `--yield-idle` flag, which was removed; an all-`0` layout needs no change. A mixed layout keeps the acknowledgement path spinning on dedicated cores and packs the auxiliary threads onto one shared core: `--cores 1,2,3,4,0,8y,8y,6,7,8,5` puts journal, matching, response, reader and journal-disk on cores 1-5, the two replication handlers on 6 and 7, and the event publisher, shadow and segment preparer together on core 8. The replication handlers are on the acknowledgement path whenever the ack policy waits on a replica, so only a standalone node should treat them as auxiliary.
 
 A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage. An eleventh pins the journal disk thread — the half of the journal that writes each batch, syncs it, and publishes the durability position every acknowledgement waits on. It busy-spins like the other stages, so give it a dedicated core, and keep it on the same CCD as the journal stage: the two exchange a cache line on every batch. `--cores 1,2,3,4,5,6,7,8,9,10,11` is the default, so a server started without `--cores` takes cores 1-11 — budget for it when planning the layout.
 
@@ -609,7 +613,7 @@ curl http://127.0.0.1:9878/stats-dump
 | `replication_lag` | `journal_seq - replication_cursor` (0 in standalone mode) |
 | `trading` / `halted` | `trading` when accepting orders; `halted` when replica is disconnected (replication mode only) |
 
-**Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9878`). Omit the flag to disable.
+**Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9878`). Omit the flag to disable. Replicas serve the endpoint too, whether or not election is enabled (the election gauges are absent without it); a primary and a replica on the same host need distinct binds.
 
 **Kubernetes**: Use as a TCP liveness probe on the health port. For basic liveness, check TCP connect success. For readiness, parse the first and last tokens and require `OK` + `trading`.
 

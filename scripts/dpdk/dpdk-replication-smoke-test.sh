@@ -43,6 +43,9 @@ REPLICA_IP="192.168.201.2"
 PREFIX=24
 REPL_PORT=9877
 HEALTH_PORT=9878
+# The replica serves a health endpoint too, and its default bind is the
+# primary's port on the same host.
+REPLICA_HEALTH_PORT=9879
 
 # Veth pair: replica side <-> primary side.
 VETH_REPLICA="dpdk-repl-r"
@@ -293,6 +296,7 @@ RUST_LOG=info RUST_BACKTRACE=1 \
 "$PROJECT_DIR/target/release/melin-server" \
     --journal "$TMPDIR/replica.journal" \
     --snapshot-interval-ms 0 \
+    --health-bind "127.0.0.1:$REPLICA_HEALTH_PORT" \
     --replica-of "$PRIMARY_IP:$REPL_PORT" \
     --replication-key "$TMPDIR/repl_key.key" \
     --dpdk-eal-args="--vdev=net_af_packet0,iface=$VETH_REPLICA --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=replica" \

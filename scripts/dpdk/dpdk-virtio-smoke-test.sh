@@ -357,7 +357,6 @@ vm_ssh "sudo RUST_LOG=info,melin_server=debug,melin_dpdk=debug \
     --standalone \
     --accounts 100 \
     --instruments 10 \
-    --yield-idle \
     --cores 0,0,0,0,0,0,0,0,0 \
     --dpdk-eal-args='--huge-dir=/mnt/huge_2m --log-level=6' \
     --dpdk-ip $DPDK_IP \
