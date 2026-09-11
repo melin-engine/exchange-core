@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "melin-admin"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "crossterm",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "melin-bench"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "blake3",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "melin-client"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "melin-protocol",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "melin-exchange-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "astenn",
  "melin-trading",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "melin-gateway-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "proptest",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "melin-market-data"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "astenn",
  "ed25519-dalek",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "melin-md-gateway"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "melin-oe-gateway"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
@@ -1862,7 +1862,7 @@ checksum = "8143a9b06c76df8fe53af02ee8d537388a64d2ceef764c0ee3f5dbe4ca7751cf"
 
 [[package]]
 name = "melin-protocol"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bolero",
  "melin-types",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "melin-server"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "blake3",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "melin-trading"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "melin-app",
  "melin-types",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "melin-tui"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "melin-tui-fix-client"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "crossterm",
  "melin-gateway-core",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "melin-types"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "melin-wire-protocol"
