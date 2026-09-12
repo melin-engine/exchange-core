@@ -34,7 +34,7 @@ echo ""
 # Build the verify tool on both servers (cached — instant if already built).
 for HOST in "$SERVER1" "$SERVER2"; do
     ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        cargo build --release -p melin-server --bin journal-verify 2>&1 | tail -1"
+        cargo build --release -p melin-ec-server--bin journal-verify 2>&1 | tail -1"
 done
 
 # Run the verifier on a host, echoing its full report even when the

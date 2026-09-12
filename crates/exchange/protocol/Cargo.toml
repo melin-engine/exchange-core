@@ -1,5 +1,5 @@
 [package]
-name = "melin-protocol"
+name = "melin-ec-protocol"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -13,7 +13,7 @@ description = "Binary wire protocol with typed request/response enums for the Me
 # replaces hand-rolled le::put / le::get pairs. derive feature for
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-types = { workspace = true }
+melin-ec-types = { workspace = true }
 melin-wire-protocol = { workspace = true }
 
 [dev-dependencies]

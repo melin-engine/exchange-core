@@ -1,13 +1,13 @@
 //! Engine-internal types and re-exports of the shared trading wire types.
 //!
 //! Wire-level data (Symbol, Order, ExecutionReport, etc.) lives in
-//! `melin-trading` so the no-op transport binary can speak the same
+//! `melin-ec-trading` so the no-op transport binary can speak the same
 //! protocol without pulling in the matching engine. Engine-internal
 //! types that the matching pipeline needs but external consumers don't
 //! (reservation slab handles, the `astenn`-backed HashMap aliases) stay
 //! here.
 
-pub use melin_types::types::*;
+pub use melin_ec_types::types::*;
 
 /// HashMap with FxHash and extendible hashing (via `astenn`).
 ///

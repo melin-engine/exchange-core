@@ -8,9 +8,9 @@ use std::collections::HashSet;
 use std::io;
 use std::num::NonZeroU64;
 
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
-use melin_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::ResponseKind;
+use melin_ec_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 
 use crate::index::RestingOrder;
 use crate::mirror::{BookMirror, Level};
@@ -206,7 +206,7 @@ impl std::error::Error for SnapshotError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_protocol::codec::encode_response;
+    use melin_ec_protocol::codec::encode_response;
     use std::num::NonZeroU64;
 
     fn price(n: u64) -> Price {

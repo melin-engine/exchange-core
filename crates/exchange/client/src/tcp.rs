@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 
 use ed25519_dalek::{Signer, SigningKey};
 
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_wire_protocol::error::ProtocolError;
 
@@ -271,7 +271,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_protocol::types::{OrderId, Symbol};
+    use melin_ec_protocol::types::{OrderId, Symbol};
 
     /// Generate a test signing key from a fixed seed for deterministic tests.
     fn test_key() -> SigningKey {
@@ -365,7 +365,7 @@ mod tests {
         let responses = client
             .send_request(&Request::CancelOrder {
                 symbol: Symbol(1),
-                account: melin_protocol::types::AccountId(1),
+                account: melin_ec_protocol::types::AccountId(1),
                 order_id: OrderId(42),
             })
             .unwrap();
@@ -655,7 +655,7 @@ mod tests {
         let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
-            account: melin_protocol::types::AccountId(1),
+            account: melin_ec_protocol::types::AccountId(1),
             order_id: OrderId(42),
         });
 
@@ -684,7 +684,7 @@ mod tests {
         let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
-            account: melin_protocol::types::AccountId(1),
+            account: melin_ec_protocol::types::AccountId(1),
             order_id: OrderId(42),
         });
 

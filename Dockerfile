@@ -11,7 +11,7 @@
 #   docker run --rm -p 9000:9000 -p 9001:9001 melin
 #
 # Connect TUI (from host):
-#   cargo run -p melin-tui-fix-client -- \
+#   cargo run -p melin-ec-tui-fix-client -- \
 #     --oe-addr localhost:9000 --md-addr localhost:9001 \
 #     --sender TRADER --oe-target MELIN-OE --md-target MELIN-MD
 
@@ -42,10 +42,10 @@ RUN mkdir -p .cargo && printf '[build]\nrustflags = []\n' > .cargo/config.toml
 RUN --mount=type=ssh \
     mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null && \
     cargo build --release \
-    -p melin-server \
-    -p melin-oe-gateway \
-    -p melin-md-gateway \
-    -p melin-admin
+    -p melin-ec-server \
+    -p melin-ec-oe-gateway \
+    -p melin-ec-md-gateway \
+    -p melin-ec-admin
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim

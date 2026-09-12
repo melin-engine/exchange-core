@@ -1679,19 +1679,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-admin"
-version = "0.15.0"
-dependencies = [
- "base64",
- "crossterm",
- "ed25519-dalek",
- "melin-ec-client",
- "melin-protocol",
- "rand 0.10.2",
- "ratatui",
-]
-
-[[package]]
 name = "melin-app"
 version = "0.15.0"
 source = "git+https://github.com/melin-engine/melin.git?branch=main#ab73ffb5b6417573339c34177fea0d0c34c0cd62"
@@ -1699,46 +1686,6 @@ dependencies = [
  "base64",
  "libc",
  "tracing",
-]
-
-[[package]]
-name = "melin-bench"
-version = "0.15.0"
-dependencies = [
- "base64",
- "blake3",
- "clap",
- "crossterm",
- "ed25519-dalek",
- "fastcp",
- "flate2",
- "getrandom 0.4.3",
- "hdrhistogram",
- "humantime",
- "io-uring",
- "libc",
- "melin-app",
- "melin-dpdk",
- "melin-exchange-core",
- "melin-journal",
- "melin-pipeline",
- "melin-protocol",
- "melin-server",
- "melin-server-runtime",
- "melin-trading",
- "melin-transport-core",
- "melin-types",
- "melin-wire-protocol",
- "plotters",
- "rand 0.10.2",
- "ratatui",
- "rayon",
- "serde",
- "serde_json",
- "tempfile",
- "tikv-jemallocator",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1756,21 +1703,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-ec-client"
-version = "0.15.0"
-dependencies = [
- "ed25519-dalek",
- "melin-protocol",
- "melin-wire-protocol",
-]
-
-[[package]]
-name = "melin-exchange-core"
+name = "melin-ec"
 version = "0.15.0"
 dependencies = [
  "astenn",
- "melin-trading",
- "melin-types",
+ "melin-ec-trading",
+ "melin-ec-types",
  "proptest",
  "rustc-hash",
  "tempfile",
@@ -1778,12 +1716,202 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-gateway-core"
+name = "melin-ec-admin"
+version = "0.15.0"
+dependencies = [
+ "base64",
+ "crossterm",
+ "ed25519-dalek",
+ "melin-ec-client",
+ "melin-ec-protocol",
+ "rand 0.10.2",
+ "ratatui",
+]
+
+[[package]]
+name = "melin-ec-bench"
+version = "0.15.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "clap",
+ "crossterm",
+ "ed25519-dalek",
+ "fastcp",
+ "flate2",
+ "getrandom 0.4.3",
+ "hdrhistogram",
+ "humantime",
+ "io-uring",
+ "libc",
+ "melin-app",
+ "melin-dpdk",
+ "melin-ec",
+ "melin-ec-protocol",
+ "melin-ec-server",
+ "melin-ec-trading",
+ "melin-ec-types",
+ "melin-journal",
+ "melin-pipeline",
+ "melin-server-runtime",
+ "melin-transport-core",
+ "melin-wire-protocol",
+ "plotters",
+ "rand 0.10.2",
+ "ratatui",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tikv-jemallocator",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "melin-ec-client"
+version = "0.15.0"
+dependencies = [
+ "ed25519-dalek",
+ "melin-ec-protocol",
+ "melin-wire-protocol",
+]
+
+[[package]]
+name = "melin-ec-gateway-core"
 version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "proptest",
 ]
+
+[[package]]
+name = "melin-ec-market-data"
+version = "0.15.0"
+dependencies = [
+ "astenn",
+ "ed25519-dalek",
+ "melin-ec-protocol",
+ "melin-ec-types",
+ "melin-wire-protocol",
+ "proptest",
+ "rustc-hash",
+ "tracing",
+]
+
+[[package]]
+name = "melin-ec-md-gateway"
+version = "0.15.0"
+dependencies = [
+ "ed25519-dalek",
+ "io-uring",
+ "libc",
+ "melin-ec-gateway-core",
+ "melin-ec-market-data",
+ "melin-ec-protocol",
+ "melin-ec-types",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "melin-ec-oe-gateway"
+version = "0.15.0"
+dependencies = [
+ "ed25519-dalek",
+ "io-uring",
+ "libc",
+ "melin-ec",
+ "melin-ec-gateway-core",
+ "melin-ec-protocol",
+ "melin-ec-types",
+ "proptest",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "melin-ec-protocol"
+version = "0.15.0"
+dependencies = [
+ "bolero",
+ "melin-ec-types",
+ "melin-wire-protocol",
+ "zerocopy",
+]
+
+[[package]]
+name = "melin-ec-server"
+version = "0.15.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "bolero",
+ "clap",
+ "crc32c",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "io-uring",
+ "libc",
+ "melin-app",
+ "melin-dpdk",
+ "melin-ec",
+ "melin-ec-client",
+ "melin-ec-market-data",
+ "melin-ec-protocol",
+ "melin-ec-trading",
+ "melin-ec-types",
+ "melin-journal",
+ "melin-pipeline",
+ "melin-server-runtime",
+ "melin-transport-core",
+ "melin-wire-protocol",
+ "rand 0.10.2",
+ "rustc-hash",
+ "serial_test",
+ "tempfile",
+ "tikv-jemallocator",
+ "tracing",
+ "tracing-subscriber",
+ "zerocopy",
+]
+
+[[package]]
+name = "melin-ec-trading"
+version = "0.15.0"
+dependencies = [
+ "melin-app",
+ "melin-ec-types",
+]
+
+[[package]]
+name = "melin-ec-tui"
+version = "0.15.0"
+dependencies = [
+ "crossterm",
+ "ed25519-dalek",
+ "melin-ec-client",
+ "melin-ec-protocol",
+ "ratatui",
+ "tikv-jemallocator",
+]
+
+[[package]]
+name = "melin-ec-tui-fix-client"
+version = "0.15.0"
+dependencies = [
+ "crossterm",
+ "melin-ec-gateway-core",
+ "ratatui",
+]
+
+[[package]]
+name = "melin-ec-types"
+version = "0.15.0"
 
 [[package]]
 name = "melin-journal"
@@ -1803,68 +1931,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-market-data"
-version = "0.15.0"
-dependencies = [
- "astenn",
- "ed25519-dalek",
- "melin-protocol",
- "melin-types",
- "melin-wire-protocol",
- "proptest",
- "rustc-hash",
- "tracing",
-]
-
-[[package]]
-name = "melin-md-gateway"
-version = "0.15.0"
-dependencies = [
- "ed25519-dalek",
- "io-uring",
- "libc",
- "melin-gateway-core",
- "melin-market-data",
- "melin-protocol",
- "melin-types",
- "serde",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "melin-oe-gateway"
-version = "0.15.0"
-dependencies = [
- "ed25519-dalek",
- "io-uring",
- "libc",
- "melin-exchange-core",
- "melin-gateway-core",
- "melin-protocol",
- "melin-types",
- "proptest",
- "serde",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "melin-pipeline"
 version = "0.15.0"
 source = "git+https://github.com/melin-engine/melin.git?branch=main#ab73ffb5b6417573339c34177fea0d0c34c0cd62"
-
-[[package]]
-name = "melin-protocol"
-version = "0.15.0"
-dependencies = [
- "bolero",
- "melin-types",
- "melin-wire-protocol",
- "zerocopy",
-]
 
 [[package]]
 name = "melin-raft"
@@ -1881,42 +1950,6 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "melin-server"
-version = "0.15.0"
-dependencies = [
- "base64",
- "blake3",
- "bolero",
- "clap",
- "crc32c",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "io-uring",
- "libc",
- "melin-app",
- "melin-dpdk",
- "melin-ec-client",
- "melin-exchange-core",
- "melin-journal",
- "melin-market-data",
- "melin-pipeline",
- "melin-protocol",
- "melin-server-runtime",
- "melin-trading",
- "melin-transport-core",
- "melin-types",
- "melin-wire-protocol",
- "rand 0.10.2",
- "rustc-hash",
- "serial_test",
- "tempfile",
- "tikv-jemallocator",
- "tracing",
- "tracing-subscriber",
- "zerocopy",
 ]
 
 [[package]]
@@ -1946,14 +1979,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-trading"
-version = "0.15.0"
-dependencies = [
- "melin-app",
- "melin-types",
-]
-
-[[package]]
 name = "melin-transport-core"
 version = "0.15.0"
 source = "git+https://github.com/melin-engine/melin.git?branch=main#ab73ffb5b6417573339c34177fea0d0c34c0cd62"
@@ -1968,31 +1993,6 @@ dependencies = [
  "tracing",
  "zerocopy",
 ]
-
-[[package]]
-name = "melin-tui"
-version = "0.15.0"
-dependencies = [
- "crossterm",
- "ed25519-dalek",
- "melin-ec-client",
- "melin-protocol",
- "ratatui",
- "tikv-jemallocator",
-]
-
-[[package]]
-name = "melin-tui-fix-client"
-version = "0.15.0"
-dependencies = [
- "crossterm",
- "melin-gateway-core",
- "ratatui",
-]
-
-[[package]]
-name = "melin-types"
-version = "0.15.0"
 
 [[package]]
 name = "melin-wire-protocol"

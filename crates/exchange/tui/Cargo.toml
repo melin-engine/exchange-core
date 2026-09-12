@@ -1,5 +1,5 @@
 [package]
-name = "melin-tui"
+name = "melin-ec-tui"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -8,9 +8,15 @@ homepage.workspace = true
 authors.workspace = true
 description = "Interactive TUI trading client for the Melin exchange"
 
+# The binary keeps the name operators know; only the package carries the
+# `melin-ec-` prefix.
+[[bin]]
+name = "melin-tui"
+path = "src/main.rs"
+
 [dependencies]
 melin-ec-client = { workspace = true }
-melin-protocol = { workspace = true }
+melin-ec-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"

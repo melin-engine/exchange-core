@@ -147,19 +147,19 @@ fi
 
 echo "  Building DPDK server on ${SERVER}..."
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-    cargo build --release -p melin-server --features dpdk --no-default-features && \
-    cargo build --release -p melin-admin --bin melin-keygen" 2>&1 | tail -3
+    cargo build --release -p melin-ec-server--features dpdk --no-default-features && \
+    cargo build --release -p melin-ec-admin --bin melin-keygen" 2>&1 | tail -3
 echo "  server build: OK"
 
 echo "  Building bench on ${BENCH}..."
 if [[ "${USE_KERNEL_TCP_BENCH:-0}" == "1" ]]; then
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-        cargo build --release -p melin-bench -p melin-admin" 2>&1 | tail -3
+        cargo build --release -p melin-ec-bench -p melin-ec-admin" 2>&1 | tail -3
     echo "  bench build: OK (kernel TCP)"
 else
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-        cargo build --release -p melin-bench --features dpdk --no-default-features && \
-        cargo build --release -p melin-admin --bin melin-keygen" 2>&1 | tail -3
+        cargo build --release -p melin-ec-bench --features dpdk --no-default-features && \
+        cargo build --release -p melin-ec-admin --bin melin-keygen" 2>&1 | tail -3
     echo "  bench build: OK (DPDK)"
 fi
 echo ""

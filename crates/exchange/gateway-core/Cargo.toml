@@ -1,5 +1,5 @@
 [package]
-name = "melin-gateway-core"
+name = "melin-ec-gateway-core"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true

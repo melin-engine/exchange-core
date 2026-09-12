@@ -16,14 +16,14 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use melin_ec_server::exchange_app::ServerApp as App;
+use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_types::types::*;
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
-use melin_server::exchange_app::ServerApp as App;
-use melin_trading::trading_event::TradingEvent;
 use melin_transport_core::pipeline::MatchingStage;
 use melin_transport_core::trace::mono_trace_ns;
-use melin_types::types::*;
 
 // Trading-bound aliases scoped to this integration test. Mirror the
 // concrete ring-slot shapes the server's runtime monomorphises against.

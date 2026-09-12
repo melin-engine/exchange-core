@@ -120,7 +120,7 @@ echo "=== Building ==="
 
 echo "  Building server with DPDK transport..."
 cd "$PROJECT_DIR"
-cargo build --release -p melin-server --features dpdk --no-default-features --quiet 2>&1
+cargo build --release -p melin-ec-server--features dpdk --no-default-features --quiet 2>&1
 echo "  server build: OK"
 
 echo "  Building keygen + bench (default features)..."
@@ -139,7 +139,7 @@ echo ""
 
 # --- 4. Start DPDK server ---
 echo "=== Starting DPDK server ==="
-RUST_LOG=info,melin_server=debug,melin_dpdk=debug \
+RUST_LOG=info,melin_ec_server=debug,melin_dpdk=debug \
 "$PROJECT_DIR/target/release/melin-server" \
     --bind "0.0.0.0:$DPDK_PORT" \
     --journal "$TMPDIR/smoke.journal" \

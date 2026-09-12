@@ -164,7 +164,7 @@ After auth, the server sends a continuous stream of frames:
 ```
 
 - **ring_sequence**: Monotonically increasing output ring sequence. Subscribers can detect gaps (missed events) if their last-seen sequence jumps by more than 1.
-- **length + tag + payload**: Standard response codec (same as the per-client response frames). Decodable with the `melin-protocol` crate's `codec::decode_response()`.
+- **length + tag + payload**: Standard response codec (same as the per-client response frames). Decodable with the `melin-ec-protocol` crate's `codec::decode_response()`.
 
 Every event the matching stage produces appears on the event channel — fills, placements, cancellations, batch-end markers, stats snapshots, and engine errors. There is no filtering; subscribers receive the full firehose.
 
@@ -417,7 +417,7 @@ RUST_LOG=info ./target/release/melin-server ...
 RUST_LOG=debug ./target/release/melin-server ...
 
 # Debugging specific crate:
-RUST_LOG=melin_server=debug,melin_engine=info ./target/release/melin-server ...
+RUST_LOG=melin_ec_server=debug,melin_ec=info ./target/release/melin-server ...
 ```
 
 ---

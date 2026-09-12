@@ -170,7 +170,7 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p melin-admin --bin melin-keygen -- bench trader && \
+        cargo run --release -p melin-ec-admin --bin melin-keygen -- bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \

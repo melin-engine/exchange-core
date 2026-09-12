@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signer, SigningKey};
 use tracing::{debug, error, info, warn};
 
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
-use melin_types::types::{AccountId, OrderId, Side};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_types::types::{AccountId, OrderId, Side};
 
 use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
@@ -22,9 +22,9 @@ use crate::id_map::ClOrdIdMap;
 use crate::metrics::GatewayMetrics;
 use crate::price;
 use crate::translate::{self, TranslateContext};
-use melin_gateway_core::fix::parse::FixMessage;
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
+use melin_ec_gateway_core::fix::parse::FixMessage;
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
 
 /// Maximum outbound messages retained per session for ResendRequest
 /// replay. At ~250 bytes/msg this caps the store at ~2.5 MB per
@@ -1167,8 +1167,8 @@ impl Session {
     fn update_fill_ledger(
         &mut self,
         order_id: OrderId,
-        fill_price: melin_types::types::Price,
-        fill_quantity: melin_types::types::Quantity,
+        fill_price: melin_ec_types::types::Price,
+        fill_quantity: melin_ec_types::types::Quantity,
         lot_inverse: u64,
         side: Side,
     ) {
@@ -1713,7 +1713,7 @@ impl Drop for Session {
 // Helpers
 // ---------------------------------------------------------------------------
 
-use melin_types::types::ExecutionReport;
+use melin_ec_types::types::ExecutionReport;
 
 /// Borrowed view over an `OrderSymbolInfo` with sensible fallbacks when no
 /// info was recorded for the order. Returned by [`sym_info_or_default`] so
@@ -1826,9 +1826,9 @@ fn rebuild_with_poss_dup(stored_bytes: &[u8], sender: &str, target: &str) -> Vec
     builder.build(sender, target, seq)
 }
 
-/// Delegates to `melin_gateway_core::auth::load_signing_key`.
+/// Delegates to `melin_ec_gateway_core::auth::load_signing_key`.
 fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
-    melin_gateway_core::auth::load_signing_key(path)
+    melin_ec_gateway_core::auth::load_signing_key(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1838,9 +1838,9 @@ fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::serialize::FixMessageBuilder;
-    use melin_protocol::message::ResponseKind;
-    use melin_types::types::{
+    use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+    use melin_ec_protocol::message::ResponseKind;
+    use melin_ec_types::types::{
         ExecutionReport, InstrumentStatus, Price, Quantity, RejectReason, Side, Symbol,
     };
     use std::num::NonZeroU64;
@@ -1977,7 +1977,7 @@ lot_size_inverse = 1
     /// length-prefixed wire format.
     fn push_melin_response(session: &mut Session, response: &ResponseKind) {
         let mut buf = [0u8; 256];
-        let n = melin_protocol::codec::encode_response(response, &mut buf).unwrap();
+        let n = melin_ec_protocol::codec::encode_response(response, &mut buf).unwrap();
         session.melin_parse_buf.extend_from_slice(&buf[..n]);
     }
 
@@ -2535,9 +2535,9 @@ lot_size_inverse = 1
         // event loop uses.
         let mut buf = s.fix_send_buf.clone();
         let raw1 =
-            melin_gateway_core::fix::parse::try_extract_message(&mut buf).expect("first msg");
+            melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf).expect("first msg");
         let raw2 =
-            melin_gateway_core::fix::parse::try_extract_message(&mut buf).expect("second msg");
+            melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf).expect("second msg");
         assert!(buf.is_empty(), "exactly two messages expected");
 
         let first = FixMessage::parse(&raw1).unwrap();
@@ -3115,7 +3115,7 @@ lot_size_inverse = 1
     fn drain_send_buf(s: &mut Session) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = std::mem::take(&mut s.fix_send_buf);
-        while let Some(m) = melin_gateway_core::fix::parse::try_extract_message(&mut buf) {
+        while let Some(m) = melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf) {
             out.push(m);
         }
         // Anything that didn't frame goes back.

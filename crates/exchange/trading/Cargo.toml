@@ -1,5 +1,5 @@
 [package]
-name = "melin-trading"
+name = "melin-ec-trading"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -9,9 +9,9 @@ authors.workspace = true
 description = "Shared trading wire types used by both matching engine and transport"
 
 [lib]
-name = "melin_trading"
+name = "melin_ec_trading"
 path = "src/lib.rs"
 
 [dependencies]
 melin-app = { workspace = true }
-melin-types = { workspace = true }
+melin-ec-types = { workspace = true }

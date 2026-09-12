@@ -31,15 +31,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_app::auth::AuthorizedKeys;
-use melin_market_data::mirror::BookMirror;
+use melin_ec_market_data::mirror::BookMirror;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_types::types::{ExecutionReport, QueryResponse, Symbol};
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
 use melin_transport_core::pipeline::{
     OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
 };
-use melin_types::types::{ExecutionReport, QueryResponse, Symbol};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
@@ -397,7 +397,7 @@ fn send_snapshot(
     mirrors: &rustc_hash::FxHashMap<Symbol, BookMirror>,
     last_seq: u64,
 ) -> io::Result<()> {
-    use melin_types::types::Side;
+    use melin_ec_types::types::Side;
 
     let mut buf = [0u8; MAX_FRAME_BUF];
 
@@ -580,7 +580,7 @@ fn send_auth_failed(writer: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_types::types::*;
+    use melin_ec_types::types::*;
 
     /// Helper to create a Streaming subscriber for tests that bypass
     /// the auth + subscribe handshake.
@@ -1062,7 +1062,7 @@ mod tests {
                 order_id: OrderId(1),
                 symbol: sym,
                 account: AccountId(1),
-                reason: melin_types::types::RejectReason::NoLiquidity,
+                reason: melin_ec_types::types::RejectReason::NoLiquidity,
             }),
             sym
         );

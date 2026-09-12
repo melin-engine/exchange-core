@@ -1,5 +1,5 @@
 [package]
-name = "melin-market-data"
+name = "melin-ec-market-data"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -9,8 +9,8 @@ authors.workspace = true
 description = "Order book mirror and trade history reconstructed from execution reports"
 
 [dependencies]
-melin-types = { workspace = true }
-melin-protocol = { workspace = true }
+melin-ec-types = { workspace = true }
+melin-ec-protocol = { workspace = true }
 melin-wire-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }

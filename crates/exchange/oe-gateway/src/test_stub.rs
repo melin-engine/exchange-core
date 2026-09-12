@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
 
 /// Control handle owned by the test. Starts a stub listener, connects
 /// to the first gateway connection, and exposes channels for driving

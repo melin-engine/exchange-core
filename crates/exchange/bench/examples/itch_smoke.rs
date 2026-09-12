@@ -18,8 +18,8 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
-use melin_bench::calibration::book::{BookTracker, TrackerError};
-use melin_bench::calibration::itch::{self, ItchEvent, ItchParser};
+use melin_ec_bench::calibration::book::{BookTracker, TrackerError};
+use melin_ec_bench::calibration::itch::{self, ItchEvent, ItchParser};
 
 fn main() {
     let path = env::args().nth(1).expect("usage: itch_smoke <path>");

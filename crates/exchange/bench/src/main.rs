@@ -75,17 +75,17 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 
 #[cfg(not(feature = "dpdk"))]
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
-use melin_server::exchange_app::ServerApp;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::ResponseKind;
+use melin_ec_server::exchange_app::ServerApp;
 // The server's own frame ceiling, so the handshake frames this bench
 // builds are bounded by the number the server actually enforces rather
 // than a copy that could drift.
+use melin_ec_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::MAX_FRAME_SIZE;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::server::ServerConfig;
-use melin_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_wire_protocol::transport::BlockingTransportListener;
 
@@ -875,7 +875,7 @@ fn run_engine_bench(
         ..Default::default()
     };
 
-    let mut exchange = melin_exchange_core::exchange::Exchange::with_capacity();
+    let mut exchange = melin_ec::exchange::Exchange::with_capacity();
 
     // Register instruments.
     for i in 1..=num_instruments {
@@ -1293,8 +1293,11 @@ struct PipelineBenchCores {
 /// plausible-looking but meaningless number.
 fn resolve_pipeline_cores(spec: &str) -> Result<PipelineBenchCores, String> {
     // One core per `PIPELINE_THREADS` entry, in that order.
-    let c =
-        melin_server::named_cores::parse_named_cores("--pipeline-cores", spec, &PIPELINE_THREADS)?;
+    let c = melin_ec_server::named_cores::parse_named_cores(
+        "--pipeline-cores",
+        spec,
+        &PIPELINE_THREADS,
+    )?;
     let cores = PipelineBenchCores {
         journal_seq: c[0],
         matching: c[1],
@@ -1346,7 +1349,7 @@ fn run_pipeline_bench(
     use melin_journal::BufferedWriter;
 
     // Set up exchange with one instrument and funded account.
-    let mut app = ServerApp(melin_exchange_core::exchange::Exchange::with_capacity());
+    let mut app = ServerApp(melin_ec::exchange::Exchange::with_capacity());
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -1392,7 +1395,7 @@ struct PipelineInnerCfg<'a> {
     cores: PipelineBenchCores,
 }
 
-use melin_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::TradingEvent;
 
 /// Pipeline-mode body: builds the pipeline around `writer`, spawns the
 /// journal, matching and publisher threads, and drains from the calling
@@ -1611,7 +1614,7 @@ fn run_pipeline_inner(
                     sequence: 0,
                     timestamp_ns: tsc_clock.unix_ns(ts),
                     event: JournalEvent::App(
-                        melin_trading::trading_event::TradingEvent::SubmitOrder {
+                        melin_ec_trading::trading_event::TradingEvent::SubmitOrder {
                             symbol: Symbol(1),
                             order: Order {
                                 id: order_id,
@@ -1904,7 +1907,7 @@ fn run_roundtrip_bench(
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
     let factory =
-        melin_server::app_factory::Factory::new(melin_server::app_factory::FactoryConfig {
+        melin_ec_server::app_factory::Factory::new(melin_ec_server::app_factory::FactoryConfig {
             accounts: config.accounts,
             instruments: config.instruments,
             max_orders_per_account: config.max_orders_per_account,
@@ -2009,11 +2012,11 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
-    factory: melin_server::app_factory::Factory,
+    factory: melin_ec_server::app_factory::Factory,
     shutdown: Arc<AtomicBool>,
 ) {
-    use melin_server::request_decoder::RequestDecoder;
-    use melin_server::response_encoder::ResponseEncoder;
+    use melin_ec_server::request_decoder::RequestDecoder;
+    use melin_ec_server::response_encoder::ResponseEncoder;
     use melin_server_runtime::server::EventPublisherFn;
 
     let event_publisher: Option<EventPublisherFn<ServerApp>> = None;
@@ -2089,7 +2092,7 @@ fn auth_handshake(
     key: &ed25519_dalek::SigningKey,
 ) {
     use ed25519_dalek::Signer;
-    use melin_protocol::message::Request;
+    use melin_ec_protocol::message::Request;
 
     // Read Challenge frame.
     let mut len_buf = [0u8; 4];

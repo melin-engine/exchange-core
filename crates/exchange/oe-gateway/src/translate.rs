@@ -5,8 +5,8 @@
 
 use std::num::NonZeroU64;
 
-use melin_protocol::message::Request;
-use melin_types::types::{
+use melin_ec_protocol::message::Request;
+use melin_ec_types::types::{
     AccountId, ExecutionReport, OrderId, OrderType, Price, Quantity, RejectReason,
     SelfTradeProtection, Side, Symbol, TimeInForce,
 };
@@ -14,9 +14,9 @@ use melin_types::types::{
 use crate::config::SymbolConfig;
 use crate::id_map::ClOrdIdMap;
 use crate::price;
-use melin_gateway_core::fix::parse::FixMessage;
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
+use melin_ec_gateway_core::fix::parse::FixMessage;
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
 
 /// Look up a ClOrdID for an OrderId, logging a warning on miss.
 ///
@@ -226,7 +226,7 @@ pub fn new_order_single(
 
     Ok(Request::SubmitOrder {
         symbol,
-        order: melin_types::types::Order {
+        order: melin_ec_types::types::Order {
             id: order_id,
             account,
             side,
@@ -781,9 +781,9 @@ pub fn position_report_to_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::parse::FixMessage;
-    use melin_gateway_core::fix::serialize::FixMessageBuilder;
-    use melin_types::types::OrderId;
+    use melin_ec_gateway_core::fix::parse::FixMessage;
+    use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+    use melin_ec_types::types::OrderId;
     use std::collections::HashMap;
 
     /// Build a `FixCtx` for tests using the standard MELIN/FIRM pair.
@@ -1495,7 +1495,7 @@ mod tests {
 
         let report = ExecutionReport::InstrumentStatusChanged {
             symbol: Symbol(1),
-            status: melin_types::types::InstrumentStatus::Enabled,
+            status: melin_ec_types::types::InstrumentStatus::Enabled,
         };
 
         let fix_bytes = execution_report_to_fix(&report, &ctx(&id_map, 100, 1), None, 1, 1);

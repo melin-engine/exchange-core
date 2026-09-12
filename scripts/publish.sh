@@ -21,30 +21,30 @@ fi
 # from the Melin sequencer repository, not from here.
 CRATES=(
     # Level 0: no internal dependencies
-    melin-types
-    melin-gateway-core
+    melin-ec-types
+    melin-ec-gateway-core
 
     # Level 1
-    melin-protocol       # depends on: types
-    melin-trading        # depends on: types
+    melin-ec-protocol       # depends on: types
+    melin-ec-trading        # depends on: types
 
     # Level 2
-    melin-exchange-core  # depends on: trading, types
-    melin-market-data    # depends on: types, protocol
-    melin-ec-client      # depends on: protocol
+    melin-ec                # the matching engine; depends on: trading, types
+    melin-ec-market-data    # depends on: types, protocol
+    melin-ec-client         # depends on: protocol
 
     # Level 3
-    melin-tui-fix-client # depends on: gateway-core
+    melin-ec-tui-fix-client # depends on: gateway-core
 
     # Level 4
-    melin-server         # depends on: exchange-core, market-data, ...
-    melin-oe-gateway     # depends on: gateway-core, protocol, exchange-core, types
-    melin-md-gateway     # depends on: gateway-core, market-data, protocol, types
-    melin-admin          # depends on: client, protocol
-    melin-tui            # depends on: client, protocol
+    melin-ec-server         # depends on: melin-ec, market-data, ...
+    melin-ec-oe-gateway     # depends on: gateway-core, protocol, melin-ec, types
+    melin-ec-md-gateway     # depends on: gateway-core, market-data, protocol, types
+    melin-ec-admin          # depends on: client, protocol
+    melin-ec-tui            # depends on: client, protocol
 
     # Level 5
-    melin-bench          # depends on: server, ...
+    melin-ec-bench          # depends on: server, ...
 )
 
 # Guard: make sure every publishable workspace member is in the list above

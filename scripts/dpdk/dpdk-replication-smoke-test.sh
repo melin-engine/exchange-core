@@ -198,7 +198,7 @@ echo "=== Building ==="
 cd "$PROJECT_DIR"
 
 echo "  Building server with DPDK..."
-cargo build --release -p melin-server --features dpdk --no-default-features --quiet 2>&1
+cargo build --release -p melin-ec-server--features dpdk --no-default-features --quiet 2>&1
 echo "  server: OK"
 
 echo "  Building keygen..."

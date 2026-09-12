@@ -50,7 +50,7 @@ echo ""
 # --- 1. Build ---
 echo "=== Building ==="
 cd "$PROJECT_DIR"
-cargo build --release -p melin-server -p melin-bench -p melin-admin --quiet 2>&1
+cargo build --release -p melin-ec-server -p melin-ec-bench -p melin-ec-admin --quiet 2>&1
 echo "  Build: OK"
 echo ""
 
@@ -64,7 +64,7 @@ echo ""
 
 # --- 3. Start server ---
 echo "=== Starting server ==="
-RUST_LOG=info,melin_server=debug \
+RUST_LOG=info,melin_ec_server=debug \
 "$PROJECT_DIR/target/release/melin-server" \
     --bind "$ADDR" \
     --journal "$TMPDIR/smoke.journal" \

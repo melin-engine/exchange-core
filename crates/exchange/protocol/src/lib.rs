@@ -9,7 +9,7 @@ pub mod message;
 /// interpret responses, so they don't need a direct dependency on the
 /// engine crate.
 pub mod types {
-    pub use melin_types::types::{
+    pub use melin_ec_types::types::{
         AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
         InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits,
         SelfTradeProtection, Side, Symbol, TimeInForce,

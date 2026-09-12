@@ -15,8 +15,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

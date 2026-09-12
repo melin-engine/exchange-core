@@ -23,8 +23,8 @@ use melin_dpdk::device::DpdkDevice;
 use melin_dpdk::eal::Eal;
 use melin_dpdk::mempool::Mempool;
 use melin_dpdk::port::Port;
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::ResponseKind;
 
 use crate::generator;
 use crate::{
@@ -1029,7 +1029,7 @@ fn dpdk_auth_all(
         "dpdk_auth_all: one key required per connection",
     );
     use ed25519_dalek::Signer;
-    use melin_protocol::message::Request;
+    use melin_ec_protocol::message::Request;
 
     // Auth states per connection.
     #[derive(PartialEq)]

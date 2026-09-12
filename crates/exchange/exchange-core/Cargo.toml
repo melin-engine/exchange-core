@@ -1,5 +1,5 @@
 [package]
-name = "melin-exchange-core"
+name = "melin-ec"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -23,8 +23,8 @@ default = []
 [dependencies]
 rustc-hash = "2"
 tracing = { workspace = true }
-melin-trading = { workspace = true }
-melin-types = { workspace = true }
+melin-ec-trading = { workspace = true }
+melin-ec-types = { workspace = true }
 astenn = "0.1"
 
 [dev-dependencies]

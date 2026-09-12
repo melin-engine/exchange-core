@@ -308,9 +308,9 @@ echo ""
 
 # --- 8. Build server inside VM ---
 echo "=== Building server in VM ==="
-echo "  cargo build --release -p melin-server --features dpdk --no-default-features"
+echo "  cargo build --release -p melin-ec-server--features dpdk --no-default-features"
 echo "  (this may take a few minutes on first run)"
-vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -5
+vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-ec-server--features dpdk --no-default-features" 2>&1 | tail -5
 echo "  Server build: OK"
 
 echo "  Building keygen..."
@@ -349,7 +349,7 @@ vm_ssh "cd /tmp && ~/melin/target/release/melin-keygen bench trader"
 vm_ssh "echo \"trader \$(cat /tmp/bench.pub | tr -d '\n') bench\" > /tmp/authorized_keys"
 echo "  Auth keys generated"
 
-vm_ssh "sudo RUST_LOG=info,melin_server=debug,melin_dpdk=debug \
+vm_ssh "sudo RUST_LOG=info,melin_ec_server=debug,melin_dpdk=debug \
     ~/melin/target/release/melin-server \
     --bind 0.0.0.0:$DPDK_PORT \
     --journal /tmp/smoke.journal \

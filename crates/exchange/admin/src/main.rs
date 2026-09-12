@@ -20,8 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use melin_ec_client::{Client, StatsSnapshot};
-use melin_protocol::message::{Request, ResponseKind};
-use melin_protocol::types::{
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
     InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits,
     SelfTradeProtection, Side, Symbol, TimeInForce,

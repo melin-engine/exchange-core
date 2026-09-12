@@ -35,26 +35,26 @@ use ed25519_dalek::SigningKey;
 
 use melin_app::auth::AuthorizedKeys;
 use melin_app::unix_epoch_nanos;
+use melin_ec_server::exchange_app::ServerApp;
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_pipeline::wait::WaitStrategy;
-use melin_server::exchange_app::ServerApp;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::replication::{
     ReplicaControlPlane, ReplicationListener, ReplicationMetrics, Sender, run_receiver, run_sender,
 };
 use melin_server_runtime::server::{PipelineCores, Placement};
-use melin_trading::trading_event::TradingEvent;
 type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
 type OutputSlot = melin_transport_core::pipeline::OutputSlot<
-    melin_types::types::ExecutionReport,
-    melin_types::types::QueryResponse,
+    melin_ec_types::types::ExecutionReport,
+    melin_ec_types::types::QueryResponse,
 >;
+use melin_ec_types::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::{StageWaits, build_pipeline_with_replication};
 use melin_transport_core::trace::mono_trace_ns;
-use melin_types::types::{AccountId, CurrencyId};
 
 #[derive(Parser)]
 struct Args {
@@ -169,7 +169,7 @@ fn resolve_cores(
         Some(spec) => {
             // One core per `PRIMARY_THREADS` entry, in that order.
             let c =
-                melin_server::named_cores::parse_named_cores("--cores", spec, &PRIMARY_THREADS)?;
+                melin_ec_server::named_cores::parse_named_cores("--cores", spec, &PRIMARY_THREADS)?;
             PrimaryCores {
                 generator: c[0],
                 journal_seq: c[1],
@@ -363,7 +363,7 @@ fn main() {
     // exercised separately in pipeline tests until the boot-site
     // dispatch refactor lands.
     let engine = JournaledApp::<ServerApp, melin_journal::BufferedWriter<_>>::create(
-        ServerApp(melin_exchange_core::exchange::Exchange::with_capacity()),
+        ServerApp(melin_ec::exchange::Exchange::with_capacity()),
         &primary_journal,
     )
     .expect("create primary journal");
@@ -572,8 +572,8 @@ fn main() {
                     melin_journal::StagingMode::default(),
                     std::time::Duration::ZERO,
                     8, // pipeline_depth
-                    std::sync::Arc::new(melin_server::app_factory::Factory::new(
-                        melin_server::app_factory::FactoryConfig {
+                    std::sync::Arc::new(melin_ec_server::app_factory::Factory::new(
+                        melin_ec_server::app_factory::FactoryConfig {
                             accounts: 0,
                             instruments: 0,
                             max_orders_per_account: 10_000,

@@ -17,9 +17,9 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fix_client::FixClient;
-use melin_gateway_core::fix::parse::{Field, FixMessage};
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
+use melin_ec_gateway_core::fix::parse::{Field, FixMessage};
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};

@@ -1,15 +1,15 @@
 //! Trading-side [`RequestDecoder`] implementation.
 //!
-//! Owns the bytes -> `melin_protocol::Request` -> `TradingEvent`
+//! Owns the bytes -> `melin_ec_protocol::Request` -> `TradingEvent`
 //! pipeline. Hides the wire enum behind the [`RequestDecoder`] trait
 //! so the server runtime never needs to pattern-match on
 //! application-shaped variants.
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_protocol::codec;
-use melin_protocol::message::Request;
-use melin_trading::trading_event::TradingEvent;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::Request;
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_wire_protocol::error::ProtocolError;
 
 /// Decoder for the trading wire protocol.
@@ -165,7 +165,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use melin_app::AppEvent;
-    use melin_types::types::*;
+    use melin_ec_types::types::*;
 
     /// Wire-encode a Request into the byte form the decoder expects
     /// (seq + tag + payload, with the framing length-prefix already

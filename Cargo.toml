@@ -23,22 +23,27 @@ authors = ["P.L.S.C."]
 # used for local builds, the version requirement for published ones. Both
 # must be carried here so `cargo publish` accepts the member manifests.
 #
+# Every exchange-core crate is `melin-ec-…` ("ec" for exchange core), and
+# the matching engine itself is `melin-ec`. Bare `melin-…` names belong to
+# the sequencer's crates, so the two families can never collide on
+# crates.io. Binaries keep their `melin-…` names: operators see no change.
+#
 # Only crates that something else depends on are listed. The leaf binaries
-# (melin-admin, melin-bench, the two gateways, the two TUIs) inherit the
-# workspace version but are nobody's dependency, so they need no pin.
+# (melin-ec-admin, melin-ec-bench, the two gateways, the two TUIs) inherit
+# the workspace version but are nobody's dependency, so they need no pin.
+melin-ec = { path = "crates/exchange/exchange-core", version = "0.15.0" }
 melin-ec-client = { path = "crates/exchange/client", version = "0.15.0" }
-melin-exchange-core = { path = "crates/exchange/exchange-core", version = "0.15.0" }
-melin-gateway-core = { path = "crates/exchange/gateway-core", version = "0.15.0" }
-melin-market-data = { path = "crates/exchange/market-data", version = "0.15.0" }
-melin-protocol = { path = "crates/exchange/protocol", version = "0.15.0" }
+melin-ec-gateway-core = { path = "crates/exchange/gateway-core", version = "0.15.0" }
+melin-ec-market-data = { path = "crates/exchange/market-data", version = "0.15.0" }
+melin-ec-protocol = { path = "crates/exchange/protocol", version = "0.15.0" }
 # `default-features = false` lives here rather than on the consumer: a member
-# cannot override an inherited `default-features`, and melin-bench — the only
-# crate that depends on the server — re-declares the server's feature set and
-# enables the pieces it wants explicitly. A future consumer that does want the
-# stock build must ask for `features = ["hash-chain", "release-tracing"]`.
-melin-server = { path = "crates/exchange/server", version = "0.15.0", default-features = false }
-melin-trading = { path = "crates/exchange/trading", version = "0.15.0" }
-melin-types = { path = "crates/exchange/types", version = "0.15.0" }
+# cannot override an inherited `default-features`, and melin-ec-bench — the
+# only crate that depends on the server — re-declares the server's feature
+# set and enables the pieces it wants explicitly. A future consumer that does
+# want the stock build must ask for `features = ["hash-chain", "release-tracing"]`.
+melin-ec-server = { path = "crates/exchange/server", version = "0.15.0", default-features = false }
+melin-ec-trading = { path = "crates/exchange/trading", version = "0.15.0" }
+melin-ec-types = { path = "crates/exchange/types", version = "0.15.0" }
 
 # Melin sequencer crates, consumed from crates.io and released from the
 # separate sequencer repository. Kept as a group distinct from the exchange

@@ -66,13 +66,13 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Shared book mirror state between the core thread and the event loop.
-    let md_state = Arc::new(RwLock::new(melin_market_data::core::MdState::new()));
+    let md_state = Arc::new(RwLock::new(melin_ec_market_data::core::MdState::new()));
 
     // Collect symbol IDs for the Subscribe request.
-    let symbol_ids: Vec<melin_types::types::Symbol> = config
+    let symbol_ids: Vec<melin_ec_types::types::Symbol> = config
         .symbols
         .values()
-        .map(|s| melin_types::types::Symbol(s.id))
+        .map(|s| melin_ec_types::types::Symbol(s.id))
         .collect();
 
     // Spawn the MarketDataCore thread — connects to the event publisher,
@@ -84,8 +84,8 @@ fn main() {
     let core_handle = std::thread::Builder::new()
         .name("md-core".into())
         .spawn(move || {
-            melin_market_data::core::run(
-                melin_market_data::core::CoreConfig {
+            melin_ec_market_data::core::run(
+                melin_ec_market_data::core::CoreConfig {
                     event_publisher_addr: core_addr,
                     symbols: symbol_ids,
                     key_path: core_key_path,

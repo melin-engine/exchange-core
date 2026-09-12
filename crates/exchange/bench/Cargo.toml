@@ -1,5 +1,5 @@
 [package]
-name = "melin-bench"
+name = "melin-ec-bench"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -10,31 +10,31 @@ description = "Benchmark suite for the Melin exchange"
 default-run = "melin-bench"
 
 [features]
-## Default mirrors `melin-server`'s default set so plain `cargo run -p
-## melin-bench` behaves like a stock server build. Disable individual
+## Default mirrors `melin-ec-server`'s default set so plain `cargo run -p
+## melin-ec-bench` behaves like a stock server build. Disable individual
 ## features with `--no-default-features --features=...` to benchmark
 ## without hash-chain or release-tracing.
 default = ["hash-chain", "release-tracing"]
-## The `melin-server/...` entries below are redundant today: `melin-server`
-## is taken with `default-features = false` and its own `hash-chain` /
-## `release-tracing` features only forward to the same leaf crates already
-## listed here. They are forwarded anyway so that the day someone gates
-## server code on one of these directly, bench builds pick it up instead of
-## silently measuring a server built without it.
+## The `melin-ec-server/...` entries below are redundant today:
+## `melin-ec-server` is taken with `default-features = false` and its own
+## `hash-chain` / `release-tracing` features only forward to the same leaf
+## crates already listed here. They are forwarded anyway so that the day
+## someone gates server code on one of these directly, bench builds pick it
+## up instead of silently measuring a server built without it.
 hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
     "melin-server-runtime/hash-chain",
-    "melin-server/hash-chain",
+    "melin-ec-server/hash-chain",
 ]
 release-tracing = [
     "tracing/max_level_info",
     "melin-server-runtime/release-tracing",
-    "melin-server/release-tracing",
+    "melin-ec-server/release-tracing",
 ]
 skip-order-exec = [
-    "melin-exchange-core/skip-order-exec",
-    "melin-server/skip-order-exec",
+    "melin-ec/skip-order-exec",
+    "melin-ec-server/skip-order-exec",
     "hash-chain",
     "release-tracing",
 ]
@@ -42,7 +42,7 @@ no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persis
 latency-trace = [
     "melin-transport-core/latency-trace",
     "melin-server-runtime/latency-trace",
-    "melin-server/latency-trace",
+    "melin-ec-server/latency-trace",
 ]
 tick-to-trade = ["latency-trace", "melin-server-runtime/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
@@ -64,9 +64,11 @@ pipeline-stats = [
 plot = ["dep:plotters"]
 
 [lib]
-name = "melin_bench"
+name = "melin_ec_bench"
 path = "src/lib.rs"
 
+# The binaries keep the names operators know; only the package and the
+# library carry the `melin-ec-` prefix.
 [[bin]]
 name = "melin-bench"
 path = "src/main.rs"
@@ -81,18 +83,18 @@ name = "journal_writer_bench"
 path = "src/journal_writer_bench.rs"
 
 [dependencies]
-melin-exchange-core = { workspace = true }
-melin-trading = { workspace = true }
-melin-types = { workspace = true }
+melin-ec = { workspace = true }
+melin-ec-trading = { workspace = true }
+melin-ec-types = { workspace = true }
 melin-journal = { workspace = true }
 melin-pipeline = { workspace = true }
-melin-protocol = { workspace = true }
+melin-ec-protocol = { workspace = true }
 melin-wire-protocol = { workspace = true }
 melin-server-runtime = { workspace = true }
 # Inherits `default-features = false` from the workspace — this crate
 # re-declares the server's feature set (see [features] above) and enables the
 # pieces it wants explicitly, so the bench build matches the flags it measures.
-melin-server = { workspace = true }
+melin-ec-server = { workspace = true }
 melin-app = { workspace = true }
 melin-transport-core = { workspace = true }
 base64 = { workspace = true }

@@ -264,7 +264,7 @@ REPLICA2_EXTRA_ARGS="${REPLICA2_EXTRA_ARGS:-${REPLICA_EXTRA_ARGS}}"
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
 # `debug` (or a scoped directive like
-# `melin_server::replication=debug,info`) when diagnosing replication
+# `melin_server_runtime::replication=debug,info`) when diagnosing replication
 # stalls. Debug logs include per-second TCP_INFO snapshots per replica
 # socket, slow-SEND completions, and replica-side queue depths.
 BENCH_RUST_LOG="${RUST_LOG:-info}"
@@ -609,8 +609,8 @@ if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
     if [[ -n "${MAIN_EXTRA_FEATURES:-}" ]]; then
         SKIP_ORDER_EXEC_FEATURES="${SKIP_ORDER_EXEC_FEATURES},${MAIN_EXTRA_FEATURES}"
     fi
-    MAIN_BUILD="cargo build --release -p melin-bench && \
-        cargo build --release -p melin-server --no-default-features --features ${SKIP_ORDER_EXEC_FEATURES}"
+    MAIN_BUILD="cargo build --release -p melin-ec-bench && \
+        cargo build --release -p melin-ec-server--no-default-features --features ${SKIP_ORDER_EXEC_FEATURES}"
 else
     MAIN_FEATURES=""
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
@@ -660,7 +660,7 @@ if [[ -n "${SERVER_FEATURES:-}" ]]; then
     echo "  Rebuilding melin-server on primary with --features ${SERVER_FEATURES}..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-        cargo build --release -p melin-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
+        cargo build --release -p melin-ec-server--features ${SERVER_FEATURES}" 2>&1 | tail -3
 fi
 
 # DPDK build on server (and replica if dpdk-repl).
@@ -697,7 +697,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
         (
             ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
                 export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                cargo build --release -p melin-ec-server--features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                 | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
         ) &
         dpdk_pids+=($!)
@@ -710,7 +710,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
         (
             ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
                 export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-bench --features ${DPDK_BENCH_FEATURES}" 2>&1 \
+                cargo build --release -p melin-ec-bench --features ${DPDK_BENCH_FEATURES}" 2>&1 \
                 | tail -3 | sed "s/^/  [${BENCH} dpdk-bench] /"
         ) &
         dpdk_pids+=($!)
@@ -728,7 +728,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
             (
                 ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
                     export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                    cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                    cargo build --release -p melin-ec-server--features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                     | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
             ) &
             dpdk_pids+=($!)
@@ -737,7 +737,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
             (
                 ssh $SSH_OPTS "$REPLICA2" "cd ${REPO_DIR} && source ~/.cargo/env && \
                     export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                    cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                    cargo build --release -p melin-ec-server--features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                     | tail -3 | sed "s/^/  [${REPLICA2} dpdk-server] /"
             ) &
             dpdk_pids+=($!)
@@ -776,7 +776,7 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p melin-admin --bin melin-keygen -- bench trader && \
+        cargo run --release -p melin-ec-admin --bin melin-keygen -- bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
@@ -808,7 +808,7 @@ if [[ "$HAS_REPL" == "1" ]]; then
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
         if [[ ! -f repl.key ]]; then \
             source ~/.cargo/env && \
-            cargo run --release -p melin-admin --bin melin-keygen -- repl replication && \
+            cargo run --release -p melin-ec-admin --bin melin-keygen -- repl replication && \
             echo 'Generated repl.key'; \
         else \
             echo 'repl.key already exists'; \
@@ -2281,7 +2281,7 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
         mkdir -p "${RUN_PLOT_DIR}"
 
         echo "  Building plot tool..."
-        (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
+        (cd "$LOCAL_REPO" && cargo build --release -p melin-ec-bench --features plot --bin melin-plot 2>&1 | tail -1)
         PLOT_TOOL="${LOCAL_REPO}/target/release/melin-plot"
 
         # Latency CDF — throughput-style results (both durable and

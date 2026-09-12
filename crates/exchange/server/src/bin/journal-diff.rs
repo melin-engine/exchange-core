@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_journal::reader::{JournalEntry, JournalReader};
-use melin_trading::trading_event::TradingEvent;
 
 /// Sequential reader over a lineage: archives oldest-first, then live.
 struct LineageWalker {

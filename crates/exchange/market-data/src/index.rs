@@ -1,7 +1,7 @@
 //! Order index: tracks resting orders so fills and cancels can resolve
 //! back to the correct price level without scanning the book.
 
-use melin_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
+use melin_ec_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 
 /// FxHash + extendible hashing: avoids rehash spikes by growing one bucket
 /// at a time instead of rehashing the entire table at once.

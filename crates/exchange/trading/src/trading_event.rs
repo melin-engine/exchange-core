@@ -20,8 +20,8 @@ use std::num::NonZeroU64;
 
 use melin_app::{AppEvent, CodecError};
 
-use melin_types::le;
-use melin_types::types::{
+use melin_ec_types::le;
+use melin_ec_types::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, Order, OrderId,
     OrderType, Price, Quantity, RiskLimits, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
@@ -702,7 +702,7 @@ const _: fn() = || {
 };
 
 // The cache-line size bound on `JournalEvent<TradingEvent>` lives in
-// `melin-exchange-core` alongside the other InputSlot assertions — this crate
+// `melin-ec` alongside the other InputSlot assertions — this crate
 // stays dependency-free of the journal framing.
 
 #[cfg(test)]

@@ -28,10 +28,10 @@ pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:53000,muzzy_decay_ms:57000\0";
 
 use clap::Parser;
-use melin_server::app_factory::{Factory, FactoryConfig};
-use melin_server::event_publisher;
-use melin_server::request_decoder::RequestDecoder;
-use melin_server::response_encoder::ResponseEncoder;
+use melin_ec_server::app_factory::{Factory, FactoryConfig};
+use melin_ec_server::event_publisher;
+use melin_ec_server::request_decoder::RequestDecoder;
+use melin_ec_server::response_encoder::ResponseEncoder;
 use melin_server_runtime::server::{self, ServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,5 +1,5 @@
 [package]
-name = "melin-admin"
+name = "melin-ec-admin"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -22,7 +22,7 @@ path = "src/promote.rs"
 
 [dependencies]
 melin-ec-client = { workspace = true }
-melin-protocol = { workspace = true }
+melin-ec-protocol = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }

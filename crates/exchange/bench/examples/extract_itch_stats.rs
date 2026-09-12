@@ -21,11 +21,11 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
-use melin_bench::calibration::fixture::{
+use melin_ec_bench::calibration::fixture::{
     FixtureMetadata, ReferenceFixture, SymbolFixture, ticker_key,
 };
-use melin_bench::calibration::itch::{self, ItchParser};
-use melin_bench::calibration::stats::StatsAggregator;
+use melin_ec_bench::calibration::itch::{self, ItchParser};
+use melin_ec_bench::calibration::stats::StatsAggregator;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();

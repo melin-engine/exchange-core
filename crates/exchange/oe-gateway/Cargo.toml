@@ -1,5 +1,5 @@
 [package]
-name = "melin-oe-gateway"
+name = "melin-ec-oe-gateway"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -13,10 +13,10 @@ name = "melin-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]
-melin-gateway-core = { workspace = true }
-melin-protocol = { workspace = true }
-melin-exchange-core = { workspace = true }
-melin-types = { workspace = true }
+melin-ec-gateway-core = { workspace = true }
+melin-ec-protocol = { workspace = true }
+melin-ec = { workspace = true }
+melin-ec-types = { workspace = true }
 ed25519-dalek = { workspace = true }
 toml = "1"
 serde = { version = "1", features = ["derive"] }

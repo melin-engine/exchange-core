@@ -1,5 +1,5 @@
 [package]
-name = "melin-tui-fix-client"
+name = "melin-ec-tui-fix-client"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -13,6 +13,6 @@ name = "melin-tui-fix-client"
 path = "src/main.rs"
 
 [dependencies]
-melin-gateway-core = { workspace = true }
+melin-ec-gateway-core = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"

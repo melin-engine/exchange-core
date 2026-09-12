@@ -21,10 +21,10 @@
 
 use std::env;
 
-use melin_bench::calibration::fixture::{ReferenceFixture, SymbolFixture};
-use melin_bench::calibration::generator_adapter::GeneratorAdapter;
-use melin_bench::calibration::stats::StatsAggregator;
-use melin_bench::generator::GeneratorConfig;
+use melin_ec_bench::calibration::fixture::{ReferenceFixture, SymbolFixture};
+use melin_ec_bench::calibration::generator_adapter::GeneratorAdapter;
+use melin_ec_bench::calibration::stats::StatsAggregator;
+use melin_ec_bench::generator::GeneratorConfig;
 
 /// 200k events is enough to stabilize quantiles to ~1% for the body
 /// of the distribution and ~5% for the deep tail; finishes in well
@@ -153,8 +153,8 @@ fn calibration_report() {
 }
 
 fn print_quantile_table(
-    reference: &[melin_bench::calibration::fixture::QuantilePoint],
-    generator: &[melin_bench::calibration::fixture::QuantilePoint],
+    reference: &[melin_ec_bench::calibration::fixture::QuantilePoint],
+    generator: &[melin_ec_bench::calibration::fixture::QuantilePoint],
 ) {
     println!("  q       reference     generator     ratio (g/ref)");
     for (r, g) in reference.iter().zip(generator.iter()) {

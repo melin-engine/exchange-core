@@ -95,7 +95,7 @@ The output JSON carries only aggregated derivatives — quantiles, summary scala
 #### Running the calibration
 
 ```
-cargo test -p melin-bench --test calibration -- --nocapture
+cargo test -p melin-ec-bench --test calibration -- --nocapture
 ```
 
 A small reference fixture is committed at `crates/exchange/bench/tests/fixtures/reference-stats.json` so the test runs out of the box. To compare against a different reference, set `MELIN_CALIBRATION_FIXTURE` to a JSON path and `MELIN_CALIBRATION_SYMBOL` to a ticker present in that file.
@@ -246,8 +246,8 @@ A future enhancement would expose a `/stats-reset` endpoint so the bench can cle
 # Both server and bench built with `tick-to-trade` for the full
 # decomposition. The flag implies `latency-trace`, so this also
 # enables the lighter 4-stage histograms.
-cargo build --release -p melin-server --features tick-to-trade
-cargo build --release -p melin-bench  --features tick-to-trade
+cargo build --release -p melin-ec-server --features tick-to-trade
+cargo build --release -p melin-ec-bench  --features tick-to-trade
 
 # Roundtrip benchmark — decomposition appears under the latency table.
 # A 60 s measured phase comfortably saturates server-side histograms;

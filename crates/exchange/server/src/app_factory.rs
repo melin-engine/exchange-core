@@ -7,8 +7,8 @@
 //! event variants by name.
 
 use melin_app::app_factory::AppFactory;
-use melin_trading::trading_event::TradingEvent;
-use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
 use crate::exchange_app::ServerApp;
 
@@ -48,7 +48,7 @@ impl AppFactory for Factory {
     type App = ServerApp;
 
     fn empty(&self) -> ServerApp {
-        ServerApp(melin_exchange_core::exchange::Exchange::with_capacity())
+        ServerApp(melin_ec::exchange::Exchange::with_capacity())
     }
 
     fn prefault(&self, app: &mut ServerApp) {

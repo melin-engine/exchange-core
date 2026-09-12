@@ -434,7 +434,7 @@ impl Gateway {
                 None => return,
             };
 
-            let raw = match melin_gateway_core::fix::parse::try_extract_message(
+            let raw = match melin_ec_gateway_core::fix::parse::try_extract_message(
                 &mut session.fix_parse_buf,
             ) {
                 Some(raw) => raw,
@@ -1016,9 +1016,9 @@ fn socket_addr_to_sockaddr(addr: std::net::SocketAddr) -> libc::sockaddr_in {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::parse::FixMessage;
-    use melin_gateway_core::fix::serialize::FixMessageBuilder;
-    use melin_gateway_core::fix::tags;
+    use melin_ec_gateway_core::fix::parse::FixMessage;
+    use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+    use melin_ec_gateway_core::fix::tags;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -1177,7 +1177,7 @@ lot_size_inverse = 1
             let mut tmp = [0u8; 256];
             loop {
                 if let Some(msg) =
-                    melin_gateway_core::fix::parse::try_extract_message(&mut self.accum)
+                    melin_ec_gateway_core::fix::parse::try_extract_message(&mut self.accum)
                 {
                     return msg;
                 }
@@ -1205,7 +1205,7 @@ lot_size_inverse = 1
         let mut buf = Vec::with_capacity(256);
         let mut tmp = [0u8; 256];
         loop {
-            if let Some(msg) = melin_gateway_core::fix::parse::try_extract_message(&mut buf) {
+            if let Some(msg) = melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf) {
                 return msg;
             }
             match stream.read(&mut tmp) {
@@ -1412,8 +1412,8 @@ lot_size_inverse = 1
     #[test]
     fn new_order_single_round_trip_to_execution_report() {
         use crate::test_stub::MelinStub;
-        use melin_protocol::message::{Request, ResponseKind};
-        use melin_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
+        use melin_ec_protocol::message::{Request, ResponseKind};
+        use melin_ec_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
         use std::num::NonZeroU64;
 
         let stub = MelinStub::start();
@@ -1483,8 +1483,8 @@ lot_size_inverse = 1
     #[test]
     fn resend_request_replays_through_real_io_uring() {
         use crate::test_stub::MelinStub;
-        use melin_protocol::message::{Request, ResponseKind};
-        use melin_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
+        use melin_ec_protocol::message::{Request, ResponseKind};
+        use melin_ec_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
         use std::num::NonZeroU64;
 
         let stub = MelinStub::start();
@@ -1570,8 +1570,8 @@ lot_size_inverse = 1
     #[test]
     fn cancel_rejected_by_engine_yields_order_cancel_reject() {
         use crate::test_stub::MelinStub;
-        use melin_protocol::message::{Request, ResponseKind};
-        use melin_types::types::{AccountId, ExecutionReport, RejectReason, Symbol};
+        use melin_ec_protocol::message::{Request, ResponseKind};
+        use melin_ec_types::types::{AccountId, ExecutionReport, RejectReason, Symbol};
 
         let stub = MelinStub::start();
         let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
@@ -1760,8 +1760,8 @@ lot_size_inverse = 1
             let (mut stream, _) = listener.accept().unwrap();
             // Send Challenge.
             let mut buf = [0u8; 128];
-            let n = melin_protocol::codec::encode_response(
-                &melin_protocol::message::ResponseKind::Challenge { nonce: [0u8; 32] },
+            let n = melin_ec_protocol::codec::encode_response(
+                &melin_ec_protocol::message::ResponseKind::Challenge { nonce: [0u8; 32] },
                 &mut buf,
             )
             .unwrap();
@@ -1775,8 +1775,8 @@ lot_size_inverse = 1
             stream.read_exact(&mut payload).unwrap();
 
             // Send AuthFailed instead of ServerReady.
-            let n = melin_protocol::codec::encode_response(
-                &melin_protocol::message::ResponseKind::AuthFailed,
+            let n = melin_ec_protocol::codec::encode_response(
+                &melin_ec_protocol::message::ResponseKind::AuthFailed,
                 &mut buf,
             )
             .unwrap();
