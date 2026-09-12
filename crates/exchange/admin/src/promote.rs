@@ -5,10 +5,10 @@
 //! PROMOTE command.
 //!
 //! Usage:
-//!   melin-promote <addr> <key-file>
+//!   melin-ec-promote <addr> <key-file>
 //!
 //! Example:
-//!   melin-promote 127.0.0.1:9878 ops.key
+//!   melin-ec-promote 127.0.0.1:9878 ops.key
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -21,12 +21,12 @@ use melin_ec_protocol::message::{Request, ResponseKind};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: melin-promote <addr> <key-file>");
+        eprintln!("usage: melin-ec-promote <addr> <key-file>");
         eprintln!("  addr:     promote endpoint of the replica (e.g. 127.0.0.1:9878)");
         eprintln!("  key-file: path to the Ed25519 operator private key (32-byte seed)");
         eprintln!();
         eprintln!("example:");
-        eprintln!("  melin-promote 127.0.0.1:9878 ops.key");
+        eprintln!("  melin-ec-promote 127.0.0.1:9878 ops.key");
         std::process::exit(1);
     }
 

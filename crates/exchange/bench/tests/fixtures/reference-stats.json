@@ -3,7 +3,7 @@
     "source": "ITCH 5.0",
     "date": "",
     "attribution": "",
-    "generated_by": "melin-bench/examples/extract_itch_stats.rs",
+    "generated_by": "melin-ec-bench/examples/extract_itch_stats.rs",
     "schema_version": 1
   },
   "symbols": {

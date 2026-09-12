@@ -9,7 +9,7 @@
 //! 7. Verify the promoted replica's journal sequence >= last acked sequence
 //!    and that the exchange state is consistent (balances, order placement)
 //!
-//! Uses actual child processes (`melin-server` binary) and TCP so the test
+//! Uses actual child processes (`melin-ec-server` binary) and TCP so the test
 //! exercises the real replication and promotion code paths.
 //!
 //! Trading-only — the scenarios under test (order submit / balance /
@@ -41,11 +41,11 @@ use melin_ec_protocol::types::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Path to the `melin-server` binary, resolved at compile time. `env!` works
+/// Path to the `melin-ec-server` binary, resolved at compile time. `env!` works
 /// under any runner; `std::env::var` only works under `cargo test`, where it
 /// would otherwise silently pick up a stale release binary.
 fn server_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_melin-server"))
+    PathBuf::from(env!("CARGO_BIN_EXE_melin-ec-server"))
 }
 
 /// Connect a TCP client with a 60s socket read timeout so the test
@@ -892,7 +892,7 @@ impl TestCluster {
         let bin = server_bin();
         assert!(
             bin.exists(),
-            "melin-server binary not found at {bin:?}. Run `cargo build --release` first."
+            "melin-ec-server binary not found at {bin:?}. Run `cargo build --release` first."
         );
 
         let tmp = tempfile::tempdir().expect("create temp dir");
@@ -1692,7 +1692,7 @@ impl DualCluster {
 
     fn start_with_args(primary_extra_args: &[&str], replica_extra_args: &[&str]) -> Self {
         let bin = server_bin();
-        assert!(bin.exists(), "melin-server binary not found");
+        assert!(bin.exists(), "melin-ec-server binary not found");
 
         let tmp = tempfile::tempdir().expect("create temp dir");
         let key = SigningKey::from_bytes(&[0xFA; 32]);
@@ -2994,7 +2994,7 @@ fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
 #[serial]
 fn rotation_soak_under_load() {
     let bin = server_bin();
-    assert!(bin.exists(), "melin-server binary not found at {bin:?}");
+    assert!(bin.exists(), "melin-ec-server binary not found at {bin:?}");
     let tmp = tempfile::Builder::new()
         .prefix("melin-soak-")
         .tempdir()
@@ -3809,7 +3809,7 @@ impl ChildExt for std::process::Child {
 #[serial]
 fn higher_epoch_handshake_fences_stale_primary() {
     let bin = server_bin();
-    assert!(bin.exists(), "melin-server binary not found");
+    assert!(bin.exists(), "melin-ec-server binary not found");
     let tmp = tempfile::tempdir().expect("create temp dir");
 
     let key = SigningKey::from_bytes(&[0xFA; 32]);

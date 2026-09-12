@@ -14,7 +14,7 @@ use crate::types::{
 #[test]
 fn rate_limit_default_disabled_in_engine_constructor() {
     // The engine library default is `0/0` (disabled). The CLI in
-    // `melin-server` applies its own non-zero default; this test
+    // `melin-ec-server` applies its own non-zero default; this test
     // guards against silent flips that would break in-process users.
     let exchange = Exchange::new();
     assert_eq!(exchange.max_orders_per_second(), (0, 0));

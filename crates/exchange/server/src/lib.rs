@@ -27,7 +27,7 @@ pub mod event_publisher;
 pub mod named_cores;
 
 // Crate-root re-exports for the three trading adapters most often
-// referenced from outside this crate — the `melin-server` binary, the
+// referenced from outside this crate — the `melin-ec-server` binary, the
 // `melin-server-runtime` doc comments, and bench code all reach them by
 // short path. Keeps doc-links like `melin_ec_server::Factory`
 // resolving without requiring callers to know the internal module layout.

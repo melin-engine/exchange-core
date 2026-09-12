@@ -210,7 +210,7 @@ GRUB_MKCONFIG="$(command -v grub-mkconfig || true)"
 # this one is regenerated wholesale on every run and would silently discard
 # their edits.
 GRUB_DROPIN_DIR="/etc/default/grub.d"
-GRUB_DROPIN="${GRUB_DROPIN_DIR}/99-melin-bench.cfg"
+GRUB_DROPIN="${GRUB_DROPIN_DIR}/99-melin-ec-bench.cfg"
 # What update-grub generates, and therefore what the next boot reads.
 GRUB_CFG="/boot/grub/grub.cfg"
 # Dropped on a reboot, which is exactly the lifetime we want: its presence
@@ -647,7 +647,7 @@ echo ""
 # 3d. Sysctl tuning (persistent via /etc/sysctl.d/)
 # ---------------------------------------------------------------------------
 echo "=== Configuring sysctl ==="
-SYSCTL_FILE="/etc/sysctl.d/99-melin-bench.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-melin-ec-bench.conf"
 cat > "$SYSCTL_FILE" << 'EOF'
 # Melin exchange engine — latency tuning.
 # Never swap — a single page-in is ~1ms.
@@ -724,7 +724,7 @@ EOF
 # Raise the system-wide max file descriptor limit. The default (1024) is
 # too low for client-sweep benchmarks: 512 clients × 2 fds (stream +
 # clone) + server-side accept fds + journal/io_uring fds ≈ 1500+.
-LIMITS_FILE="/etc/security/limits.d/99-melin-bench.conf"
+LIMITS_FILE="/etc/security/limits.d/99-melin-ec-bench.conf"
 cat > "$LIMITS_FILE" << 'EOF'
 # Melin benchmark — raise fd limits for high client counts.
 *    soft nofile 65536

@@ -36,7 +36,7 @@ pub struct SessionConfig {
     /// Melin account ID for orders from this session.
     pub account_id: u32,
     /// Path to the Ed25519 private key (32-byte raw seed) for
-    /// authenticating to melin-server on behalf of this session.
+    /// authenticating to melin-ec-server on behalf of this session.
     pub key_path: PathBuf,
     /// Maximum inbound FIX messages per second (order + cancel + replace).
     /// 0 or absent = unlimited.

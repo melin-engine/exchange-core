@@ -202,14 +202,14 @@ cargo build --release -p melin-ec-server--features dpdk --no-default-features --
 echo "  server: OK"
 
 echo "  Building keygen..."
-cargo build --release --bin melin-keygen --quiet 2>&1
+cargo build --release --bin melin-ec-keygen --quiet 2>&1
 echo "  keygen: OK"
 echo ""
 
 # --- 3. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" repl_key trader
+"$PROJECT_DIR/target/release/melin-ec-keygen" repl_key trader
 # The DPDK primary now authenticates connecting replicas: the key must carry
 # Replication permission (the primary rejects Trader/Operator/etc.).
 echo "replication $(cat repl_key.pub | tr -d '\n') repl" > authorized_keys
@@ -250,7 +250,7 @@ echo ""
 # --- 5. Start primary ---
 echo "=== Starting DPDK primary ==="
 RUST_LOG=info RUST_BACKTRACE=1 \
-"$PROJECT_DIR/target/release/melin-server" \
+"$PROJECT_DIR/target/release/melin-ec-server" \
     --bind "0.0.0.0:9876" \
     --health-bind "0.0.0.0:$HEALTH_PORT" \
     --journal "$TMPDIR/primary.journal" \
@@ -293,7 +293,7 @@ echo ""
 # --- 6. Start replica ---
 echo "=== Starting DPDK replica ==="
 RUST_LOG=info RUST_BACKTRACE=1 \
-"$PROJECT_DIR/target/release/melin-server" \
+"$PROJECT_DIR/target/release/melin-ec-server" \
     --journal "$TMPDIR/replica.journal" \
     --snapshot-interval-ms 0 \
     --health-bind "127.0.0.1:$REPLICA_HEALTH_PORT" \

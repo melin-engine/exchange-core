@@ -55,14 +55,12 @@ hash-chain = [
 name = "melin_ec_server"
 path = "src/lib.rs"
 
-# The binaries keep the names operators know; only the package and the
-# library carry the `melin-ec-` prefix.
 [[bin]]
-name = "melin-server"
+name = "melin-ec-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "melin-replication-bench"
+name = "melin-ec-replication-bench"
 path = "src/bin/replication-bench.rs"
 required-features = ["skip-order-exec"]
 

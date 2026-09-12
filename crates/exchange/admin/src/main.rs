@@ -5,7 +5,7 @@
 //! displayed in a scrolling log behind the menu overlays.
 //!
 //! Usage:
-//!     melin-admin <addr> <key-file>
+//!     melin-ec-admin <addr> <key-file>
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -1699,7 +1699,7 @@ fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: melin-admin <addr> <key-file>");
+        eprintln!("usage: melin-ec-admin <addr> <key-file>");
         std::process::exit(1);
     }
 

@@ -8,9 +8,9 @@
 # Architecture:
 #   Host                          Guest (Debian VM)
 #   ────                          ─────
-#   melin-bench ──TCP──> vmtap0 ──virtio-net-pci──> DPDK net_virtio PMD
+#   melin-ec-bench ──TCP──> vmtap0 ──virtio-net-pci──> DPDK net_virtio PMD
 #                        192.168.200.2              192.168.200.1
-#                                                   melin-server (DPDK)
+#                                                   melin-ec-server (DPDK)
 #
 # The guest has two NICs:
 #   - Management: QEMU user-mode (DHCP, SSH via port forward on 2222)
@@ -314,7 +314,7 @@ vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-ec-s
 echo "  Server build: OK"
 
 echo "  Building keygen..."
-vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release --bin melin-keygen" 2>&1 | tail -3
+vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release --bin melin-ec-keygen" 2>&1 | tail -3
 echo "  Keygen build: OK"
 echo ""
 
@@ -345,12 +345,12 @@ echo ""
 
 # --- 10. Generate auth keys + start server ---
 echo "=== Starting DPDK server in VM ==="
-vm_ssh "cd /tmp && ~/melin/target/release/melin-keygen bench trader"
+vm_ssh "cd /tmp && ~/melin/target/release/melin-ec-keygen bench trader"
 vm_ssh "echo \"trader \$(cat /tmp/bench.pub | tr -d '\n') bench\" > /tmp/authorized_keys"
 echo "  Auth keys generated"
 
 vm_ssh "sudo RUST_LOG=info,melin_ec_server=debug,melin_dpdk=debug \
-    ~/melin/target/release/melin-server \
+    ~/melin/target/release/melin-ec-server \
     --bind 0.0.0.0:$DPDK_PORT \
     --journal /tmp/smoke.journal \
     --authorized-keys /tmp/authorized_keys \
@@ -376,7 +376,7 @@ while ! vm_ssh "grep -q 'DPDK transport listening' /tmp/server.log 2>/dev/null";
         exit 1
     fi
     # Check if server process is still running.
-    if ! vm_ssh "pgrep -f melin-server >/dev/null 2>&1"; then
+    if ! vm_ssh "pgrep -f melin-ec-server >/dev/null 2>&1"; then
         echo "  ERROR: Server process died"
         echo "  --- Server log ---"
         vm_ssh "cat /tmp/server.log" 2>/dev/null || true
@@ -392,7 +392,7 @@ echo ""
 # --- 11. Build + run bench on host ---
 echo "=== Building host bench ==="
 cd "$PROJECT_DIR"
-cargo build --release --bin melin-bench --bin melin-keygen --quiet 2>&1
+cargo build --release --bin melin-ec-bench --bin melin-ec-keygen --quiet 2>&1
 echo "  bench + keygen: OK"
 
 # Generate matching auth keys on host.
@@ -404,7 +404,7 @@ echo ""
 echo "=== Running smoke benchmark ==="
 echo "  short timed run, 1 client, window 1 (single-order latency)"
 
-"$PROJECT_DIR/target/release/melin-bench" \
+"$PROJECT_DIR/target/release/melin-ec-bench" \
     --addr "$DPDK_IP:$DPDK_PORT" \
     --key "$TMPDIR/bench.key" \
     --clients 1 \

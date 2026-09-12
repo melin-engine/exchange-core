@@ -57,7 +57,7 @@ echo ""
 # --- 2. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" bench trader
+"$PROJECT_DIR/target/release/melin-ec-keygen" bench trader
 echo "trader $(cat bench.pub | tr -d '\n') bench" > authorized_keys
 echo "  Generated bench.key + authorized_keys"
 echo ""
@@ -65,7 +65,7 @@ echo ""
 # --- 3. Start server ---
 echo "=== Starting server ==="
 RUST_LOG=info,melin_ec_server=debug \
-"$PROJECT_DIR/target/release/melin-server" \
+"$PROJECT_DIR/target/release/melin-ec-server" \
     --bind "$ADDR" \
     --journal "$TMPDIR/smoke.journal" \
     --authorized-keys "$TMPDIR/authorized_keys" \
@@ -104,7 +104,7 @@ echo ""
 echo "=== Running smoke benchmark ==="
 echo "  short timed run, 1 client, window 1 (single-order latency)"
 
-"$PROJECT_DIR/target/release/melin-bench" \
+"$PROJECT_DIR/target/release/melin-ec-bench" \
     --addr "$ADDR" \
     --key "$TMPDIR/bench.key" \
     --clients 1 \

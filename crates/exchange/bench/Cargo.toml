@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Benchmark suite for the Melin exchange"
-default-run = "melin-bench"
+default-run = "melin-ec-bench"
 
 [features]
 ## Default mirrors `melin-ec-server`'s default set so plain `cargo run -p
@@ -67,14 +67,12 @@ plot = ["dep:plotters"]
 name = "melin_ec_bench"
 path = "src/lib.rs"
 
-# The binaries keep the names operators know; only the package and the
-# library carry the `melin-ec-` prefix.
 [[bin]]
-name = "melin-bench"
+name = "melin-ec-bench"
 path = "src/main.rs"
 
 [[bin]]
-name = "melin-plot"
+name = "melin-ec-plot"
 path = "src/plot.rs"
 required-features = ["plot"]
 

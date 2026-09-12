@@ -78,7 +78,7 @@
 #                       Comma-separated cargo features appended to the
 #                       kernel-TCP main build. Composes
 #                       with NO_PERSIST.
-#   SKIP_ORDER_EXEC=1   Build `melin-server` with the matching hot path
+#   SKIP_ORDER_EXEC=1   Build `melin-ec-server` with the matching hot path
 #                       bypassed (--no-default-features
 #                       --features skip-order-exec) so the run isolates
 #                       durable-transport cost from matching cost. The
@@ -116,7 +116,7 @@
 #                       this to enable diagnostic instrumentation on the
 #                       DPDK transport without editing the script. Server
 #                       prints histograms to stderr at shutdown
-#                       (/tmp/melin-server.log on the remote).
+#                       (/tmp/melin-ec-server.log on the remote).
 #   DPDK_BENCH_EXTRA_FEATURES=<list>
 #                       Comma-separated cargo features to append to the
 #                       DPDK bench build (e.g. `latency-trace`). Mirrors
@@ -154,7 +154,7 @@ REPLICA_VLAN="${6:-}"
 REPLICA2_PUB="${7:-}"
 REPLICA2_VLAN="${8:-}"
 
-SSH_CONTROL_DIR="$(mktemp -d -t melin-bench-ssh.XXXXXX)"
+SSH_CONTROL_DIR="$(mktemp -d -t melin-ec-bench-ssh.XXXXXX)"
 SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 # ControlMaster multiplexes every subsequent ssh over the first
 # connection per host — amortizes the handshake from dozens of calls
@@ -189,7 +189,7 @@ JOURNAL_DIR="$(dirname "$JOURNAL_PATH")"
 REPLICA_JOURNAL="${JOURNAL_DIR}/replica.journal"
 REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
-# Where melin-bench drops its result JSON on whichever host ran it.
+# Where melin-ec-bench drops its result JSON on whichever host ran it.
 #
 # The path is per-host rather than per-run, so ownership matters: the DPDK
 # bench runs under sudo and leaves the file owned by root mode 0644. A later
@@ -314,7 +314,7 @@ DPDK_RAN=0
 # ---------------------------------------------------------------------------
 cleanup() {
     for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
-        ssh $SSH_OPTS "$host" "${SUDO} pkill -INT -x melin-server 2>/dev/null; \
+        ssh $SSH_OPTS "$host" "${SUDO} pkill -INT -x melin-ec-server 2>/dev/null; \
                                ${SUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true" 2>/dev/null || true
     done
     # Kill any orphaned bench client too — a hung run leaves the bench
@@ -322,7 +322,7 @@ cleanup() {
     # busy" on the cp into the .dpdk suffixed path. Signalled under
     # ${SUDO}: the DPDK bench runs as root (EAL needs the hugetlbfs
     # mount), so an unprivileged pkill silently fails to reap it.
-    ssh $SSH_OPTS "$BENCH" "${SUDO} pkill -INT -x melin-bench 2>/dev/null; \
+    ssh $SSH_OPTS "$BENCH" "${SUDO} pkill -INT -x melin-ec-bench 2>/dev/null; \
                             ${SUDO} pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Clean DPDK EAL lock files so the next run doesn't fail with
     # "Cannot create lock on '/var/run/dpdk/rte/config'".
@@ -652,12 +652,12 @@ if [[ "$build_failed" == "1" ]]; then
     exit 1
 fi
 
-# Optional instrumented melin-server build on the primary only. Used to
+# Optional instrumented melin-ec-server build on the primary only. Used to
 # enable diagnostic features (pipeline-stats, latency-trace) for one-off
 # investigations without polluting the default build on every host.
 # Example: SERVER_FEATURES=pipeline-stats ./scripts/lan-bench-suite.sh ...
 if [[ -n "${SERVER_FEATURES:-}" ]]; then
-    echo "  Rebuilding melin-server on primary with --features ${SERVER_FEATURES}..."
+    echo "  Rebuilding melin-ec-server on primary with --features ${SERVER_FEATURES}..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         cargo build --release -p melin-ec-server--features ${SERVER_FEATURES}" 2>&1 | tail -3
@@ -665,7 +665,7 @@ fi
 
 # DPDK build on server (and replica if dpdk-repl).
 # In TAP mode, test-containers-start.sh already built the .dpdk binary.
-# In SR-IOV mode we rebuild melin-server here with the dpdk feature plus
+# In SR-IOV mode we rebuild melin-ec-server here with the dpdk feature plus
 # the mode selector (skip-order-exec under SKIP_ORDER_EXEC=1, trading
 # is the default and no longer needs a feature flag).
 if [[ "$NEED_DPDK" == "1" ]]; then
@@ -686,9 +686,9 @@ if [[ "$NEED_DPDK" == "1" ]]; then
     fi
 
     # Check if TAP mode .dpdk binary already exists (container setup).
-    HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-server.dpdk && echo yes || echo no")
+    HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-ec-server.dpdk && echo yes || echo no")
     if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
-        echo "  DPDK binary already built (melin-server.dpdk)."
+        echo "  DPDK binary already built (melin-ec-server.dpdk)."
     else
         # Each DPDK build is independent — run them concurrently and
         # fail the suite if any one returns non-zero.
@@ -758,14 +758,14 @@ echo ""
 # ---------------------------------------------------------------------------
 # Grant CAP_SYS_NICE to the freshly-built bench binary so it can set
 # SCHED_FIFO on its pipeline threads without running as root. Without
-# this, melin-bench logs "SCHED_FIFO failed (run as root or grant
+# this, melin-ec-bench logs "SCHED_FIFO failed (run as root or grant
 # CAP_SYS_NICE)" at startup and falls back to CFS scheduling — which
 # leaves a tail-latency hole (the bench threads can be preempted by
 # unrelated userspace on the same cores). The server doesn't need this
 # step because it's already launched via ${SUDO} and inherits caps.
 # Idempotent: runs after every build, costs ~50 ms.
-ssh $SSH_OPTS "$BENCH" "${SUDO} setcap cap_sys_nice+ep ${REPO_DIR}/target/release/melin-bench" || \
-    echo "  WARN: setcap on melin-bench failed — bench threads will run on SCHED_OTHER"
+ssh $SSH_OPTS "$BENCH" "${SUDO} setcap cap_sys_nice+ep ${REPO_DIR}/target/release/melin-ec-bench" || \
+    echo "  WARN: setcap on melin-ec-bench failed — bench threads will run on SCHED_OTHER"
 
 # ---------------------------------------------------------------------------
 # Generate auth keys (shared setup — needed by all benchmarks)
@@ -776,7 +776,7 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p melin-ec-admin --bin melin-keygen -- bench trader && \
+        cargo run --release -p melin-ec-admin --bin melin-ec-keygen -- bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
@@ -792,7 +792,7 @@ ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
 # insert) and runtime (no lookup hit on unused entries).
 AUTH_KEYS_COUNT=1024
 AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
-    ./target/release/melin-bench \
+    ./target/release/melin-ec-bench \
         --key bench.key \
         --clients ${AUTH_KEYS_COUNT} \
         --print-authorized-keys")
@@ -808,7 +808,7 @@ if [[ "$HAS_REPL" == "1" ]]; then
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
         if [[ ! -f repl.key ]]; then \
             source ~/.cargo/env && \
-            cargo run --release -p melin-ec-admin --bin melin-keygen -- repl replication && \
+            cargo run --release -p melin-ec-admin --bin melin-ec-keygen -- repl replication && \
             echo 'Generated repl.key'; \
         else \
             echo 'repl.key already exists'; \
@@ -913,7 +913,7 @@ stop_servers() {
         # we list it explicitly. The server runs as root (launched via
         # $SUDO), so the kill also needs root — non-root pkill silently
         # fails to signal a foreign process.
-        ssh $SSH_OPTS "$host" "${SUDO} pkill -INT -x melin-server 2>/dev/null; \
+        ssh $SSH_OPTS "$host" "${SUDO} pkill -INT -x melin-ec-server 2>/dev/null; \
                                ${SUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     # Wait for processes to exit. DPDK EAL cleanup can take several
@@ -925,7 +925,7 @@ stop_servers() {
         for host in "$@"; do
             # Treat SSH failures as "still alive" — a dropped control
             # socket shouldn't make us skip the wait and race VFIO.
-            if ! ssh $SSH_OPTS "$host" "! pgrep -x melin-server >/dev/null 2>&1 && \
+            if ! ssh $SSH_OPTS "$host" "! pgrep -x melin-ec-server >/dev/null 2>&1 && \
                                         ! pgrep -f '[m]elin-server.dpdk' >/dev/null 2>&1" 2>/dev/null; then
                 any_alive=1
                 break
@@ -937,7 +937,7 @@ stop_servers() {
     done
     if [ "$waited" -ge 10 ]; then
         for host in "$@"; do
-            ssh $SSH_OPTS "$host" "${SUDO} pkill -KILL -x melin-server 2>/dev/null; \
+            ssh $SSH_OPTS "$host" "${SUDO} pkill -KILL -x melin-ec-server 2>/dev/null; \
                                    ${SUDO} pkill -KILL -f '[m]elin-server.dpdk' 2>/dev/null; true"
         done
         sleep 1
@@ -1075,7 +1075,7 @@ run_bench() {
     local rc=0
     _reset_bench_json "$BENCH"
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ./target/release/melin-ec-bench \
             --addr ${server_addr} \
             --health-addr ${health_addr} \
             --key bench.key \
@@ -1119,17 +1119,17 @@ transport_start_tcp() {
     pin_irqs "$SERVER" "server"
     pin_irqs "$BENCH" "bench"
 
-    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-ec-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-ec-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Server"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Server"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
 
@@ -1149,30 +1149,30 @@ transport_start_tcp_repl() {
     pin_irqs "$BENCH" "bench"
     pin_irqs "$REPLICA" "replica"
 
-    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-ec-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-ec-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
             ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "replication sender listening" 30 "Replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-ec-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-ec-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
 
@@ -1201,40 +1201,40 @@ transport_start_tcp_dual_repl() {
     pin_irqs "$REPLICA" "replica1"
     pin_irqs "$REPLICA2" "replica2"
 
-    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-ec-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-ec-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
             ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "replication sender listening" 30 "Replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-ec-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-ec-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    ssh $SSH_OPTS "$REPLICA2" "${SUDO} pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "${SUDO} pkill -x melin-ec-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA2" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-ec-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA2_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
 
@@ -1370,7 +1370,7 @@ _build_bench_dpdk_args() {
 #
 # The replica's DPDK connect derives the primary's MAC as 02:00:<ip>
 # (melin-server-runtime replication/dpdk.rs), the SR-IOV convention.
-# mlx5 bifurcated keeps the port's real hardware MAC, and melin-server
+# mlx5 bifurcated keeps the port's real hardware MAC, and melin-ec-server
 # exposes no override, so the replica's SYN goes to an address nobody
 # owns and the run stalls in wait_for_log until it times out. Fail here
 # instead: the symptom is otherwise indistinguishable from a slow build.
@@ -1380,7 +1380,7 @@ _assert_dpdk_mode_supports_replication() {
     echo "" >&2
     echo "  ERROR: transport '${transport}' cannot run on an mlx5 bifurcated port." >&2
     echo "         The replica derives the primary's MAC as 02:00:<ip> (the SR-IOV" >&2
-    echo "         convention). mlx5 keeps the NIC's real MAC and melin-server has" >&2
+    echo "         convention). mlx5 keeps the NIC's real MAC and melin-ec-server has" >&2
     echo "         no --dpdk-peer-mac, so replicas can never reach the primary." >&2
     echo "         Fixing this needs a change in the sequencer repo." >&2
     echo "         Use TRANSPORTS=dpdk (standalone) or a kernel-TCP transport." >&2
@@ -1405,7 +1405,7 @@ dpdk_sriov_setup() {
         # TAP mode (Docker containers): skip SR-IOV, use TAP PMD.
         # The .dpdk binary is separate from the default binary so TCP
         # transports aren't broken by the DPDK feature flag.
-        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server.dpdk"
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-ec-server.dpdk"
         echo ""
         echo "=== DPDK TAP mode (no SR-IOV) ==="
         echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=tap"
@@ -1415,7 +1415,7 @@ dpdk_sriov_setup() {
         # so the operator must have already run `dpdk-setup.sh` on every
         # host with DPDK_IP supplied. Re-running it here without env vars
         # would just error. Trust the existing conf and load bench-side.
-        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-ec-server"
         load_dpdk_config "$BENCH" "BENCH"
         echo ""
         echo "=== DPDK mlx5 mode (operator-provisioned) ==="
@@ -1430,7 +1430,7 @@ dpdk_sriov_setup() {
         # rte_flow steering. Setup is fully operator-driven on each host
         # (`DPDK_MODE=l3 DPDK_PEER_IP=<peer> dpdk-setup.sh`), so here we
         # just load both confs and trust them.
-        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-ec-server"
         load_dpdk_config "$BENCH" "BENCH"
         echo ""
         echo "=== DPDK L3 bifurcated mode (operator-provisioned) ==="
@@ -1464,7 +1464,7 @@ dpdk_sriov_setup() {
         SERVER_DPDK_PREFIX="${SERVER_DPDK_PREFIX:-24}"
         DPDK_MODE="${SERVER_DPDK_MODE:-sriov}"
         load_dpdk_config "$BENCH" "BENCH"
-        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-ec-server"
         # Auto-detect VF count for LACP bonds: use both ports so traffic
         # arriving on either bond member's VF is received.
         local vf_count
@@ -1677,7 +1677,7 @@ transport_start_dpdk() {
         vlan_arg=""
     fi
 
-    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-ec-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1691,9 +1691,9 @@ transport_start_dpdk() {
             ${vlan_arg} \
             ${server_l3_args} \
             ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK server"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening" 120 "DPDK server"
 
     # TAP mode: set up kernel routing so the bench client can reach smoltcp.
     if [[ "$DPDK_MODE" == "tap" ]]; then
@@ -1723,7 +1723,7 @@ transport_start_dpdk() {
 transport_stop_dpdk() {
     perf_capture_stop
     stop_servers "$SERVER"
-    # TAP mode uses melin-server.dpdk — kill that too.
+    # TAP mode uses melin-ec-server.dpdk — kill that too.
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     clean_eal_lockfiles "$SERVER" "$BENCH"
 }
@@ -1755,7 +1755,7 @@ transport_start_dpdk_repl() {
     server_vlan_arg=$(_dpdk_vlan_arg "${SERVER_DPDK_VLAN:-}")
     replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
 
-    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-ec-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1768,11 +1768,11 @@ transport_start_dpdk_repl() {
             --dpdk-ports ${SERVER_DPDK_PORT} \
             ${server_vlan_arg} \
             ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-ec-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1785,9 +1785,9 @@ transport_start_dpdk_repl() {
             --dpdk-ports ${REPLICA_DPDK_PORT} \
             ${replica_vlan_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening" 120 "DPDK primary"
 
     # TAP mode: routing for bench client.
     if [[ "$DPDK_MODE" == "tap" ]]; then
@@ -1866,7 +1866,7 @@ transport_start_dpdk_dual_repl() {
     replica_vlan_arg=$(_dpdk_vlan_arg "${REPLICA_DPDK_VLAN:-}")
     replica2_vlan_arg=$(_dpdk_vlan_arg "${REPLICA2_DPDK_VLAN:-}")
 
-    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-ec-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1879,11 +1879,11 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ports ${SERVER_DPDK_PORT} \
             ${server_vlan_arg} \
             ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${SUDO} pkill -x melin-ec-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1896,9 +1896,9 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ports ${REPLICA_DPDK_PORT} \
             ${replica_vlan_arg} \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    ssh $SSH_OPTS "$REPLICA2" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "${SUDO} pkill -x melin-ec-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA2" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1911,9 +1911,9 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ports ${REPLICA2_DPDK_PORT} \
             ${replica2_vlan_arg} \
             ${REPLICA2_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
+    wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening" 120 "DPDK primary"
 
     # TAP mode: routing for bench client.
     if [[ "$DPDK_MODE" == "tap" ]]; then
@@ -1954,7 +1954,7 @@ transport_stop_dpdk_dual_repl() {
 # Workload functions
 # ---------------------------------------------------------------------------
 
-# Launch melin-bench on the bench host over DPDK.
+# Launch melin-ec-bench on the bench host over DPDK.
 #
 # Runs under ${SUDO} deliberately: EAL maps the hugetlbfs segments from
 # the root-owned /mnt/huge_2m and reads /proc/self/pagemap, neither of
@@ -1970,7 +1970,7 @@ _run_bench_dpdk() {
     shift
     _reset_bench_json "$BENCH"
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ${SUDO} ./target/release/melin-bench \
+        ${SUDO} ./target/release/melin-ec-bench \
             --addr ${CURRENT_BIND} \
             --health-addr ${CURRENT_HEALTH} \
             --key bench.key \
@@ -2044,7 +2044,7 @@ workload_engine_only() {
 
     _reset_bench_json "$SERVER"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ./target/release/melin-ec-bench \
             --mode engine \
             --json ${BENCH_JSON} \
             --duration ${LOCAL_DURATION}"
@@ -2065,7 +2065,7 @@ workload_pipeline_only() {
 
     _reset_bench_json "$SERVER"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ./target/release/melin-ec-bench \
             --mode pipeline \
             --window 256 \
             --journal ${JOURNAL_PATH} \
@@ -2281,8 +2281,8 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
         mkdir -p "${RUN_PLOT_DIR}"
 
         echo "  Building plot tool..."
-        (cd "$LOCAL_REPO" && cargo build --release -p melin-ec-bench --features plot --bin melin-plot 2>&1 | tail -1)
-        PLOT_TOOL="${LOCAL_REPO}/target/release/melin-plot"
+        (cd "$LOCAL_REPO" && cargo build --release -p melin-ec-bench --features plot --bin melin-ec-plot 2>&1 | tail -1)
+        PLOT_TOOL="${LOCAL_REPO}/target/release/melin-ec-plot"
 
         # Latency CDF — throughput-style results (both durable and
         # `-no-persist` variants so the two can be overlaid).

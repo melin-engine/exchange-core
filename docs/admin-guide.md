@@ -1,15 +1,15 @@
 # Admin CLI Guide
 
-The `melin-admin` tool is a terminal UI (TUI) for operating a running trading engine instance. It provides a wizard-style menu system for all administrative and trading operations, plus a live dashboard showing server health metrics.
+The `melin-ec-admin` tool is a terminal UI (TUI) for operating a running trading engine instance. It provides a wizard-style menu system for all administrative and trading operations, plus a live dashboard showing server health metrics.
 
-A companion tool, `melin-keygen`, generates the Ed25519 keypairs required for authentication.
+A companion tool, `melin-ec-keygen`, generates the Ed25519 keypairs required for authentication.
 
 ## Key Generation
 
-Before connecting, you need an Ed25519 keypair. The `melin-keygen` binary creates one:
+Before connecting, you need an Ed25519 keypair. The `melin-ec-keygen` binary creates one:
 
 ```sh
-melin-keygen <name> <permission>
+melin-ec-keygen <name> <permission>
 ```
 
 **Permissions** are one of:
@@ -23,7 +23,7 @@ melin-keygen <name> <permission>
 **Example:**
 
 ```sh
-melin-keygen ops operator
+melin-ec-keygen ops operator
 ```
 
 This produces two files and prints instructions to stdout:
@@ -49,7 +49,7 @@ Copy that last line into the server's `authorized_keys` file before starting the
 ## Connecting
 
 ```sh
-melin-admin <addr> <key-file>
+melin-ec-admin <addr> <key-file>
 ```
 
 - `<addr>` -- server socket address, e.g. `127.0.0.1:9000` or `10.0.0.1:9000`
@@ -58,7 +58,7 @@ melin-admin <addr> <key-file>
 **Example:**
 
 ```sh
-melin-admin 127.0.0.1:9000 ops.key
+melin-ec-admin 127.0.0.1:9000 ops.key
 ```
 
 On launch, the admin tool:
@@ -335,10 +335,10 @@ The log retains up to 10,000 entries before pruning older messages.
 ## Typical Workflow: Setting Up a New Market
 
 ```
-1. Generate keys:         melin-keygen ops operator
+1. Generate keys:         melin-ec-keygen ops operator
 2. Add key to server:     (append authorized_keys line to server config)
-3. Start the server:      melin-server --addr 0.0.0.0:9000 ...
-4. Connect admin:         melin-admin 127.0.0.1:9000 ops.key
+3. Start the server:      melin-ec-server --addr 0.0.0.0:9000 ...
+4. Connect admin:         melin-ec-admin 127.0.0.1:9000 ops.key
 5. Add Instrument:        symbol=1, base=1, quote=2
 6. Set Fee Schedule:      symbol=1, maker=2bps, taker=5bps
 7. Set Risk Limits:       symbol=1, max_qty=10000, max_notional=0

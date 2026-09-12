@@ -5,7 +5,7 @@
 //! no shared state — all session state is owned by the event loop thread.
 //!
 //! Uses multishot RECV with provided buffer groups (same pattern as
-//! `melin-server`'s reader.rs) for efficient I/O multiplexing.
+//! `melin-ec-server`'s reader.rs) for efficient I/O multiplexing.
 
 use std::collections::HashMap;
 use std::net::TcpListener;

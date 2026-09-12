@@ -108,7 +108,7 @@ Two tests:
 ## CLI Parameters
 
 ```
-cargo run --release --bin melin-bench [-- [OPTIONS]]
+cargo run --release --bin melin-ec-bench [-- [OPTIONS]]
 ```
 
 Run length is wall-clock-driven. The three phases (warmup, measured,
@@ -253,7 +253,7 @@ cargo build --release -p melin-ec-bench  --features tick-to-trade
 # A 60 s measured phase comfortably saturates server-side histograms;
 # server-side stages also accumulate seed-drain noise (see
 # "Measurement window" below).
-./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 --duration=60s
+./target/release/melin-ec-bench --mode=roundtrip --clients=8 --window=64 --duration=60s
 
 # Or fetch the dump directly without running the bench.
 curl http://127.0.0.1:9878/stats-dump
@@ -288,7 +288,7 @@ Pass `--target-rate <ops/s>` to switch to **open-loop** scheduling: sends are sc
 ### CLI
 
 ```
-melin-bench --addr <server> --target-rate 500000 --duration 60s
+melin-ec-bench --addr <server> --target-rate 500000 --duration 60s
 ```
 
 Aggregate rate is split evenly across `--clients` (or across the single publisher in `pipeline` mode, or the single in-process engine call in `engine` mode). Per-client first sends are staggered by `period / clients` so the bench does not produce a thundering herd at startup.
@@ -447,18 +447,18 @@ See the [sequencer README](https://github.com/melin-engine/melin#benchmarks) for
 
 Engine server:
 ```sh
-./melin-server --bind 0.0.0.0:9876 --journal /mnt/journal/melin.journal
+./melin-ec-server --bind 0.0.0.0:9876 --journal /mnt/journal/melin.journal
 ```
 
 Bench client (separate machine):
 ```sh
-./melin-bench 100000000 --addr <engine-ip>:9876 --window=256
+./melin-ec-bench 100000000 --addr <engine-ip>:9876 --window=256
 ```
 
 ### Single-order latency
 
 ```sh
-./melin-bench 500000 --addr <engine-ip>:9876 --window=1 --clients=1
+./melin-ec-bench 500000 --addr <engine-ip>:9876 --window=1 --clients=1
 ```
 
 No pipelining, no batching. Measures the true single-order round-trip time with full durability.
@@ -466,7 +466,7 @@ No pipelining, no batching. Measures the true single-order round-trip time with 
 ### Engine-only
 
 ```sh
-./melin-bench 100000000 --mode=engine
+./melin-ec-bench 100000000 --mode=engine
 ```
 
 Runs on the engine server itself. No network, no journal, no pipeline.
@@ -482,10 +482,10 @@ The release profile is configured for maximum performance:
 
 Build with:
 ```sh
-cargo build --release --bin melin-bench
+cargo build --release --bin melin-ec-bench
 ```
 
-The binary is at `target/release/melin-bench`.
+The binary is at `target/release/melin-ec-bench`.
 
 ## Limitations and Caveats
 

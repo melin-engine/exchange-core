@@ -27,7 +27,7 @@ Production operations guide for the trading engine. Written for the person runni
 
 ```sh
 cargo build --release
-./target/release/melin-server [OPTIONS]
+./target/release/melin-ec-server [OPTIONS]
 ```
 
 The server uses jemalloc by default (thread-local caches eliminate allocator lock contention).
@@ -89,7 +89,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 ### Minimal Production Launch (Standalone)
 
 ```sh
-./target/release/melin-server \
+./target/release/melin-ec-server \
     --bind 0.0.0.0:9876 \
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
@@ -103,7 +103,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 
 ```sh
 # Primary
-./target/release/melin-server \
+./target/release/melin-ec-server \
     --bind 0.0.0.0:9876 \
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
@@ -113,7 +113,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
-./target/release/melin-server \
+./target/release/melin-ec-server \
     --journal /mnt/nvme/melin.journal \
     --cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11 \
     --replica-of <primary-ip>:9877 \
@@ -125,7 +125,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 The event channel provides a real-time firehose of all execution events (fills, placements, cancellations, stats) to TCP subscribers. Enable it with `--event-bind`:
 
 ```sh
-./target/release/melin-server \
+./target/release/melin-ec-server \
     --bind 0.0.0.0:9876 \
     --health-bind 0.0.0.0:9878 \
     --event-bind 0.0.0.0:9879 \
@@ -305,7 +305,7 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
 **Recommended: place the snapshot file on the OS disk, not the journal NVMe.** The snapshot write is a bulk I/O operation (tens of MiB) that could cause I/O jitter on the journal NVMe if co-located. Use `--snapshot-path` to specify an explicit path on a separate disk:
 
 ```sh
-./target/release/melin-server \
+./target/release/melin-ec-server \
     --journal /mnt/nvme/melin.journal \
     --snapshot-path /var/lib/melin/melin.snapshot \
     --snapshot-interval-ms 60000 \
@@ -411,13 +411,13 @@ Examples:
 
 ```sh
 # Production: info level (default)
-RUST_LOG=info ./target/release/melin-server ...
+RUST_LOG=info ./target/release/melin-ec-server ...
 
 # Debugging client issues:
-RUST_LOG=debug ./target/release/melin-server ...
+RUST_LOG=debug ./target/release/melin-ec-server ...
 
 # Debugging specific crate:
-RUST_LOG=melin_ec_server=debug,melin_ec=info ./target/release/melin-server ...
+RUST_LOG=melin_ec_server=debug,melin_ec=info ./target/release/melin-ec-server ...
 ```
 
 ---
@@ -469,7 +469,7 @@ printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} isolcpus=nohz,domain,1-9 nohz_
 
 Append to `GRUB_CMDLINE_LINUX`, not `GRUB_CMDLINE_LINUX_DEFAULT`. Only the former is guaranteed to be defined — several hosting images ship without a `GRUB_CMDLINE_LINUX_DEFAULT` line at all, so an edit targeting it silently does nothing — and `GRUB_CMDLINE_LINUX` applies to the recovery entry too.
 
-Note the filename. `scripts/server-setup.sh` owns `99-melin-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
+Note the filename. `scripts/server-setup.sh` owns `99-melin-ec-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
 
 Then apply:
 
@@ -504,7 +504,7 @@ To revert, remove the drop-in — the vendor's `/etc/default/grub` was never mod
 sudo rm /etc/default/grub.d/99-melin-manual.cfg && sudo update-grub && sudo reboot
 ```
 
-On a host provisioned by `scripts/server-setup.sh`, remove `99-melin-bench.cfg` the same way to undo the parameters it applied.
+On a host provisioned by `scripts/server-setup.sh`, remove `99-melin-ec-bench.cfg` the same way to undo the parameters it applied.
 
 ### Runtime Tuning (bench-isolate.sh)
 
@@ -545,7 +545,7 @@ Set the governor at runtime even when `cpufreq.default_governor=performance` is 
 
 The default core layout above assumes 11+ logical CPUs — i.e., a box where cores 1-10 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 7-9 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
 
-For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal-seq=1, matching=2, response=3, reader=4, event-publisher=5, shadow=6, bench client=7. The replication handlers, the segment preparer and the journal disk thread are left unpinned (replication is not used in embedded bench mode).
+For embedded benchmark mode (`melin-ec-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal-seq=1, matching=2, response=3, reader=4, event-publisher=5, shadow=6, bench client=7. The replication handlers, the segment preparer and the journal disk thread are left unpinned (replication is not used in embedded bench mode).
 
 For production deployments on smaller hosts, pass the equivalent `--cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=5,shadow=6,repl-handler-0=0,repl-handler-1=0,journal-prep=0,journal-disk=0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. The `0` entries are deliberate: with no spare core to give them, the replication handlers, the segment preparer and the disk thread run unpinned, and the server warns at boot that `journal-disk` has no core. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
 
@@ -688,7 +688,7 @@ Trading resumes automatically when the replica reconnects — no operator interv
 
 ### Admin Dashboard (QueryStats)
 
-The admin TUI (`melin-admin`) connects to a running server and can send a `QueryStats` request. This returns a live snapshot of server state:
+The admin TUI (`melin-ec-admin`) connects to a running server and can send a `QueryStats` request. This returns a live snapshot of server state:
 
 - **Active connections**: current authenticated client count
 - **Events processed**: total events handled by the matching engine
@@ -697,7 +697,7 @@ The admin TUI (`melin-admin`) connects to a running server and can send a `Query
 QueryStats is not journaled (no state change) and does not affect the hot path. It reads counters via relaxed atomics.
 
 ```sh
-melin-admin <server-addr> <admin-key-file>
+melin-ec-admin <server-addr> <admin-key-file>
 ```
 
 ### Compile Features
@@ -736,7 +736,7 @@ This records timestamps at each pipeline stage transition and builds histograms 
 Histograms are reported on shutdown. The bench crate passes these features through:
 
 ```sh
-cargo run --release --bin melin-bench --features latency-trace,pipeline-stats
+cargo run --release --bin melin-ec-bench --features latency-trace,pipeline-stats
 ```
 
 **Warning**: Latency trace adds overhead (~tens of nanoseconds per event for `rdtsc` calls). Do not enable in production unless actively diagnosing a latency issue.
@@ -750,7 +750,7 @@ cargo run --release --bin melin-bench --features latency-trace,pipeline-stats
 Use the admin tool to send `CancelAll` for a specific account. This cancels all resting orders across all instruments for that account. The command is journaled before execution.
 
 ```
-melin-admin <server-addr> <admin-key-file>
+melin-ec-admin <server-addr> <admin-key-file>
 # Select "Cancel All" from the menu
 # Enter account ID
 ```
@@ -760,7 +760,7 @@ melin-admin <server-addr> <admin-key-file>
 Use the admin tool to set a circuit breaker with `halted=true` on a specific instrument. All new orders for that instrument will be rejected with `TradingHalted`. Existing resting orders remain on the book but will not match.
 
 ```
-melin-admin <server-addr> <admin-key-file>
+melin-ec-admin <server-addr> <admin-key-file>
 # Select "Set Circuit Breaker" from the menu
 # Enter symbol, set halted = true
 ```

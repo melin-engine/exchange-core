@@ -22,7 +22,7 @@
 //!
 //! Read a result as "what one batch costs when the disk is keeping up",
 //! not as a prediction of journal cost under load. For the latter, run
-//! `melin-bench --mode pipeline`, which exercises the real hand-off.
+//! `melin-ec-bench --mode pipeline`, which exercises the real hand-off.
 //!
 //! Usage:
 //!     cargo run --release -p melin-ec-bench --bin journal_writer_bench -- [OPTIONS]

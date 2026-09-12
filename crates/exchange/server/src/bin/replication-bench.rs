@@ -354,7 +354,7 @@ fn main() {
 
     // --- Tempdir for journal files ---
     let tmp_root: PathBuf =
-        std::env::temp_dir().join(format!("melin-replication-bench-{}", std::process::id()));
+        std::env::temp_dir().join(format!("melin-ec-replication-bench-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_root).expect("mkdir tempdir");
     let primary_journal: PathBuf = tmp_root.join("primary.journal");
 

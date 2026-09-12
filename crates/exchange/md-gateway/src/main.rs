@@ -5,7 +5,7 @@
 //! and MarketDataRequestReject (Y) to connected clients.
 //!
 //! Usage:
-//!   melin-md-gateway --config md-gateway.toml [--core N]
+//!   melin-ec-md-gateway --config md-gateway.toml [--core N]
 
 mod config;
 pub mod event_loop;
@@ -34,7 +34,7 @@ fn main() {
                 config_path = Some(args.get(i).cloned().unwrap_or_default());
             }
             _ => {
-                eprintln!("usage: melin-md-gateway --config <path>");
+                eprintln!("usage: melin-ec-md-gateway --config <path>");
                 std::process::exit(1);
             }
         }
@@ -42,7 +42,7 @@ fn main() {
     }
 
     let config_path = config_path.unwrap_or_else(|| {
-        eprintln!("usage: melin-md-gateway --config <path>");
+        eprintln!("usage: melin-ec-md-gateway --config <path>");
         std::process::exit(1);
     });
 
@@ -60,7 +60,7 @@ fn main() {
         listen = %config.listen,
         event_publisher = %config.event_publisher,
         symbols = config.symbols.len(),
-        "melin-md-gateway starting"
+        "melin-ec-md-gateway starting"
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -118,5 +118,5 @@ fn main() {
     shutdown.store(true, Ordering::Relaxed);
     let _ = core_handle.join();
 
-    tracing::info!("melin-md-gateway stopped");
+    tracing::info!("melin-ec-md-gateway stopped");
 }

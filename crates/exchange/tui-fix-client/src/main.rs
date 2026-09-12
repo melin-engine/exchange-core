@@ -1,7 +1,7 @@
 //! TUI trading client that speaks FIX 4.4 to both the oe-gateway and md-gateway.
 //!
 //! Usage:
-//!   melin-tui-fix-client --oe-addr 127.0.0.1:9000 --md-addr 127.0.0.1:9001 \
+//!   melin-ec-tui-fix-client --oe-addr 127.0.0.1:9000 --md-addr 127.0.0.1:9001 \
 //!     --sender CLIENT --oe-target MELIN-OE --md-target MELIN-MD
 
 mod bot;
@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {
                 eprintln!(
-                    "usage: melin-tui-fix-client [--oe-addr ADDR] [--md-addr ADDR] [--sender ID] [--oe-target ID] [--md-target ID] [--bot] [--bot-sender ID]"
+                    "usage: melin-ec-tui-fix-client [--oe-addr ADDR] [--md-addr ADDR] [--sender ID] [--oe-target ID] [--md-target ID] [--bot] [--bot-sender ID]"
                 );
                 std::process::exit(1);
             }

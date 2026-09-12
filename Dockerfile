@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for the melin all-in-one image.
 #
-# Contains: melin-server, melin-oe-gateway, melin-md-gateway, melin-keygen.
-# Does NOT include melin-tui-fix-client — run that on the host.
+# Contains: melin-ec-server, melin-ec-oe-gateway, melin-ec-md-gateway, melin-ec-keygen.
+# Does NOT include melin-ec-tui-fix-client — run that on the host.
 #
 # Build (requires SSH agent for private git deps):
 #   docker build --ssh default -t melin .
@@ -55,10 +55,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binaries from builder.
-COPY --from=builder /build/target/release/melin-server /usr/local/bin/
-COPY --from=builder /build/target/release/melin-oe-gateway /usr/local/bin/
-COPY --from=builder /build/target/release/melin-md-gateway /usr/local/bin/
-COPY --from=builder /build/target/release/melin-keygen /usr/local/bin/
+COPY --from=builder /build/target/release/melin-ec-server /usr/local/bin/
+COPY --from=builder /build/target/release/melin-ec-oe-gateway /usr/local/bin/
+COPY --from=builder /build/target/release/melin-ec-md-gateway /usr/local/bin/
+COPY --from=builder /build/target/release/melin-ec-keygen /usr/local/bin/
 
 # Copy entrypoint.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

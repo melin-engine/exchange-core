@@ -249,7 +249,7 @@ echo ""
 CARGO_BIN="$(sudo -u "${SUDO_USER}" bash -lc 'which cargo')"
 sudo -u "${SUDO_USER}" \
     CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
-    "$CARGO_BIN" run --release --bin melin-bench "$@"
+    "$CARGO_BIN" run --release --bin melin-ec-bench "$@"
 
 # --- Stop perf and show summary ---
 if [[ -n "$PERF_PID" ]]; then

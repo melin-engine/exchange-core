@@ -8,10 +8,8 @@ homepage.workspace = true
 authors.workspace = true
 description = "Interactive TUI trading client for the Melin exchange"
 
-# The binary keeps the name operators know; only the package carries the
-# `melin-ec-` prefix.
 [[bin]]
-name = "melin-tui"
+name = "melin-ec-tui"
 path = "src/main.rs"
 
 [dependencies]

@@ -9,7 +9,7 @@ authors.workspace = true
 description = "TUI trading client over FIX 4.4 for the Melin exchange"
 
 [[bin]]
-name = "melin-tui-fix-client"
+name = "melin-ec-tui-fix-client"
 path = "src/main.rs"
 
 [dependencies]

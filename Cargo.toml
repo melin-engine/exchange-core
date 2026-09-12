@@ -26,7 +26,8 @@ authors = ["P.L.S.C."]
 # Every exchange-core crate is `melin-ec-…` ("ec" for exchange core), and
 # the matching engine itself is `melin-ec`. Bare `melin-…` names belong to
 # the sequencer's crates, so the two families can never collide on
-# crates.io. Binaries keep their `melin-…` names: operators see no change.
+# crates.io. The binaries carry the prefix too (`melin-ec-server`,
+# `melin-ec-admin`, …), so one name means one thing everywhere.
 #
 # Only crates that something else depends on are listed. The leaf binaries
 # (melin-ec-admin, melin-ec-bench, the two gateways, the two TUIs) inherit

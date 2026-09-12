@@ -215,7 +215,7 @@ impl FixtureMetadata {
             source: source.to_string(),
             date: date.to_string(),
             attribution: attribution.to_string(),
-            generated_by: "melin-bench/examples/extract_itch_stats.rs".to_string(),
+            generated_by: "melin-ec-bench/examples/extract_itch_stats.rs".to_string(),
             schema_version: 1,
         }
     }

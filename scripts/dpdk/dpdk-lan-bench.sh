@@ -148,7 +148,7 @@ fi
 echo "  Building DPDK server on ${SERVER}..."
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
     cargo build --release -p melin-ec-server--features dpdk --no-default-features && \
-    cargo build --release -p melin-ec-admin --bin melin-keygen" 2>&1 | tail -3
+    cargo build --release -p melin-ec-admin --bin melin-ec-keygen" 2>&1 | tail -3
 echo "  server build: OK"
 
 echo "  Building bench on ${BENCH}..."
@@ -159,7 +159,7 @@ if [[ "${USE_KERNEL_TCP_BENCH:-0}" == "1" ]]; then
 else
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
         cargo build --release -p melin-ec-bench --features dpdk --no-default-features && \
-        cargo build --release -p melin-ec-admin --bin melin-keygen" 2>&1 | tail -3
+        cargo build --release -p melin-ec-admin --bin melin-ec-keygen" 2>&1 | tail -3
     echo "  bench build: OK (DPDK)"
 fi
 echo ""
@@ -171,7 +171,7 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        ./target/release/melin-keygen bench trader && \
+        ./target/release/melin-ec-keygen bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
@@ -218,7 +218,7 @@ echo ""
 # 5. Start DPDK server
 # ---------------------------------------------------------------------------
 echo "=== Starting DPDK server ==="
-ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+ssh $SSH_OPTS "$SERVER" "pkill -x melin-ec-server 2>/dev/null; true"
 sleep 1
 
 # Build the EAL args string.
@@ -229,7 +229,7 @@ else
     EAL_FULL="--huge-dir=${HUGE_DIR}"
 fi
 
-ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-ec-server \
         --bind 0.0.0.0:${PORT} \
         --journal ${JOURNAL_PATH} \
         --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -239,7 +239,7 @@ ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-se
         --dpdk-prefix-len ${DPDK_PREFIX} \
         --dpdk-ports ${DPDK_PORT} \
         ${DPDK_VLAN_ARG} \
-    >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+    >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
 # Wait for server. Can't use nc -z (smoltcp doesn't respond to kernel probes).
 # Instead, try a short bench run as a health check.
@@ -248,14 +248,14 @@ sleep 3
 
 # Check if the server process is alive.
 for i in $(seq 1 30); do
-    if ssh $SSH_OPTS "$SERVER" "pgrep -x melin-server" >/dev/null 2>&1; then
-        echo "  Server process is running (PID: $(ssh $SSH_OPTS "$SERVER" "pgrep -x melin-server"))"
+    if ssh $SSH_OPTS "$SERVER" "pgrep -x melin-ec-server" >/dev/null 2>&1; then
+        echo "  Server process is running (PID: $(ssh $SSH_OPTS "$SERVER" "pgrep -x melin-ec-server"))"
         break
     fi
     if [[ $i -eq 30 ]]; then
         echo "  ERROR: Server process not found."
         echo "  --- Server log ---"
-        ssh $SSH_OPTS "$SERVER" "tail -30 /tmp/melin-server.log" 2>/dev/null || true
+        ssh $SSH_OPTS "$SERVER" "tail -30 /tmp/melin-ec-server.log" 2>/dev/null || true
         exit 1
     fi
     sleep 1
@@ -273,7 +273,7 @@ echo ""
 
 if [[ "${USE_KERNEL_TCP_BENCH:-0}" == "1" ]]; then
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ./target/release/melin-ec-bench \
             --addr ${DPDK_IP}:${PORT} \
             --key bench.key \
             --json /tmp/dpdk-bench-results.json \
@@ -293,7 +293,7 @@ else
     fi
 
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ./target/release/melin-ec-bench \
             --addr ${DPDK_IP}:${PORT} \
             --key bench.key \
             --json /tmp/dpdk-bench-results.json \
@@ -318,12 +318,12 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Stopping server ==="
-ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+ssh $SSH_OPTS "$SERVER" "pkill -x melin-ec-server 2>/dev/null; true"
 echo "  Done."
 
 if [[ $BENCH_EXIT -ne 0 ]]; then
     echo ""
     echo "  --- Server log (last 30 lines) ---"
-    ssh $SSH_OPTS "$SERVER" "tail -30 /tmp/melin-server.log" 2>/dev/null || true
+    ssh $SSH_OPTS "$SERVER" "tail -30 /tmp/melin-ec-server.log" 2>/dev/null || true
     exit 1
 fi

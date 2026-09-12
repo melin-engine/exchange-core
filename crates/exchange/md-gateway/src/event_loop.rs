@@ -6,7 +6,7 @@
 //! thread handles event publisher subscriptions separately.
 //!
 //! Uses multishot RECV with provided buffer groups for efficient I/O
-//! multiplexing (same pattern as `melin-server`'s reader.rs and the
+//! multiplexing (same pattern as `melin-ec-server`'s reader.rs and the
 //! order-entry gateway).
 
 use std::net::TcpListener;

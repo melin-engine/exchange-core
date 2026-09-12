@@ -9,7 +9,7 @@ authors.workspace = true
 description = "FIX 4.4 order entry gateway for the Melin exchange"
 
 [[bin]]
-name = "melin-oe-gateway"
+name = "melin-ec-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]

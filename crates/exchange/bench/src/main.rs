@@ -32,7 +32,7 @@
 //! to without further coordination.
 //!
 //! Usage:
-//!     cargo run --release --bin melin-bench -- \
+//!     cargo run --release --bin melin-ec-bench -- \
 //!         [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] \
 //!         [--health-addr=<ip:port>] [--clients=N] [--window=N] \
 //!         [--bench-threads=N] [--warmup-duration=5s] [--duration=60s] \
@@ -501,7 +501,7 @@ pub(crate) fn maybe_sample(
 
 /// Benchmark CLI arguments.
 #[derive(clap::Parser)]
-#[command(name = "melin-bench", about = "Matching engine benchmark suite")]
+#[command(name = "melin-ec-bench", about = "Matching engine benchmark suite")]
 struct BenchArgs {
     /// Benchmark mode: roundtrip (full server), pipeline (no network), engine (matching only).
     #[arg(long, default_value = "roundtrip")]
@@ -3518,7 +3518,7 @@ pub(crate) fn print_results(
 
 /// Create a temporary directory that persists for the process lifetime.
 fn tempdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("melin-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("melin-ec-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -3549,7 +3549,7 @@ mod pipeline_core_tests {
     fn the_default_flag_value_parses() {
         // Guards the `default_value` string on `--pipeline-cores` against
         // drifting out of sync with `PIPELINE_THREADS`.
-        let parsed = BenchArgs::parse_from(["melin-bench"]).pipeline_cores;
+        let parsed = BenchArgs::parse_from(["melin-ec-bench"]).pipeline_cores;
         assert!(resolve_pipeline_cores(&parsed).is_ok(), "{parsed:?}");
     }
 

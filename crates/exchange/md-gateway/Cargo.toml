@@ -9,7 +9,7 @@ authors.workspace = true
 description = "FIX 4.4 market data gateway for the Melin exchange"
 
 [[bin]]
-name = "melin-md-gateway"
+name = "melin-ec-md-gateway"
 path = "src/main.rs"
 
 [dependencies]

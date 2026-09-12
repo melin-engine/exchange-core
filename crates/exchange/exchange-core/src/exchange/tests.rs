@@ -3831,7 +3831,7 @@ fn snapshot_preserves_fee_account() {
     // pair — same code path the production on-disk snapshot uses,
     // minus the transport framing/CRC (which lives behind the
     // `Application` trait in `melin-transport-core` and is exercised
-    // by the integration tests in `melin-server/tests/`).
+    // by the integration tests in `melin-ec-server/tests/`).
     let bytes = crate::snapshot::encode_exchange_payload(&exchange);
     let restored = crate::snapshot::decode_exchange_payload(&bytes).unwrap();
 
