@@ -176,10 +176,21 @@ ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
         echo 'bench.key already exists'; \
     fi"
 
-# Copy the authorized_keys line to the server.
-AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'trader {} bench'")
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo '${AUTH_LINE}' > authorized_keys"
-echo "  Auth keys configured."
+# The bench authenticates each client with a key derived from bench.key,
+# so the server must authorize the derived public keys — one per client
+# the bench run below will open. The count comes from the bench args,
+# falling back to the bench's own default.
+CLIENTS=16
+bench_args=(${BENCH_EXTRA_ARGS})
+for ((i = 0; i < ${#bench_args[@]}; i++)); do
+    case "${bench_args[$i]}" in
+        --clients) CLIENTS="${bench_args[$((i + 1))]}" ;;
+        --clients=*) CLIENTS="${bench_args[$i]#--clients=}" ;;
+    esac
+done
+ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && ./target/release/melin-ec-bench --key bench.key --clients ${CLIENTS} --print-authorized-keys" \
+    | ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && cat > authorized_keys"
+echo "  Auth keys configured (${CLIENTS} derived client keys)."
 echo ""
 
 # ---------------------------------------------------------------------------

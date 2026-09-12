@@ -58,7 +58,10 @@ echo ""
 echo "=== Auth keys ==="
 cd "$TMPDIR"
 "$PROJECT_DIR/target/release/melin-ec-keygen" bench trader
-echo "trader $(cat bench.pub | tr -d '\n') bench" > authorized_keys
+# The bench authenticates each client with a key derived from bench.key,
+# not with bench.key itself, so the server must authorize the derived
+# public keys — the bench prints them for the client count it will use.
+"$PROJECT_DIR/target/release/melin-ec-bench" --key bench.key --clients 1 --print-authorized-keys > authorized_keys
 echo "  Generated bench.key + authorized_keys"
 echo ""
 
@@ -107,6 +110,8 @@ echo "  short timed run, 1 client, window 1 (single-order latency)"
 "$PROJECT_DIR/target/release/melin-ec-bench" \
     --addr "$ADDR" \
     --key "$TMPDIR/bench.key" \
+    --accounts 100 \
+    --instruments 10 \
     --clients 1 \
     --window 1 \
     --warmup-duration 1s \

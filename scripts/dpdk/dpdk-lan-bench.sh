@@ -147,7 +147,7 @@ fi
 
 echo "  Building DPDK server on ${SERVER}..."
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-    cargo build --release -p melin-ec-server--features dpdk --no-default-features && \
+    cargo build --release -p melin-ec-server --features dpdk --no-default-features && \
     cargo build --release -p melin-ec-admin --bin melin-ec-keygen" 2>&1 | tail -3
 echo "  server build: OK"
 

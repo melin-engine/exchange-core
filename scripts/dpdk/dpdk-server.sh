@@ -173,7 +173,7 @@ if [[ "${NO_PERSIST:-0}" == "1" ]]; then
     echo "  *** NO_PERSIST=1: journal fsync disabled (benchmarking only) ***"
 fi
 
-exec cargo run --release -p melin-ec-server--features "$FEATURES" --no-default-features -- \
+exec cargo run --release -p melin-ec-server --features "$FEATURES" --no-default-features -- \
     --bind 0.0.0.0:9876 \
     --journal "$JOURNAL" \
     --authorized-keys "$AUTH_KEYS" \

@@ -610,7 +610,7 @@ if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
         SKIP_ORDER_EXEC_FEATURES="${SKIP_ORDER_EXEC_FEATURES},${MAIN_EXTRA_FEATURES}"
     fi
     MAIN_BUILD="cargo build --release -p melin-ec-bench && \
-        cargo build --release -p melin-ec-server--no-default-features --features ${SKIP_ORDER_EXEC_FEATURES}"
+        cargo build --release -p melin-ec-server --no-default-features --features ${SKIP_ORDER_EXEC_FEATURES}"
 else
     MAIN_FEATURES=""
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
@@ -660,7 +660,7 @@ if [[ -n "${SERVER_FEATURES:-}" ]]; then
     echo "  Rebuilding melin-ec-server on primary with --features ${SERVER_FEATURES}..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-        cargo build --release -p melin-ec-server--features ${SERVER_FEATURES}" 2>&1 | tail -3
+        cargo build --release -p melin-ec-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
 fi
 
 # DPDK build on server (and replica if dpdk-repl).
@@ -697,7 +697,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
         (
             ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
                 export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-ec-server--features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                cargo build --release -p melin-ec-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                 | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
         ) &
         dpdk_pids+=($!)
@@ -728,7 +728,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
             (
                 ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
                     export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                    cargo build --release -p melin-ec-server--features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                    cargo build --release -p melin-ec-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                     | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
             ) &
             dpdk_pids+=($!)
@@ -737,7 +737,7 @@ if [[ "$NEED_DPDK" == "1" ]]; then
             (
                 ssh $SSH_OPTS "$REPLICA2" "cd ${REPO_DIR} && source ~/.cargo/env && \
                     export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                    cargo build --release -p melin-ec-server--features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                    cargo build --release -p melin-ec-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
                     | tail -3 | sed "s/^/  [${REPLICA2} dpdk-server] /"
             ) &
             dpdk_pids+=($!)

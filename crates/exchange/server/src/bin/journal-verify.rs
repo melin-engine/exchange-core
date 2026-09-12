@@ -2,7 +2,7 @@
 //! segment, verify per-entry CRCs, dense sequences, and cross-segment
 //! chain links, and print a per-segment summary with an overall verdict.
 //!
-//! Usage: cargo run --release -p melin-ec-server--bin journal-verify -- <live-journal-path>
+//! Usage: cargo run --release -p melin-ec-server --bin journal-verify -- <live-journal-path>
 //!
 //! Pointing at a single archived segment also works — it is then
 //! verified in isolation (no sibling discovery matches its name).
