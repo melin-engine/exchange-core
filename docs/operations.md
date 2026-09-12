@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,4,5,6,7,8,9,10,11` | Pipeline core IDs: `journal,matching,response,reader,unused,event-publisher,shadow,repl-handler-0,repl-handler-1,journal-prep,journal-disk` (comma-separated). Each entry takes an optional wait-policy suffix: a bare core (or `7s`) busy-spins and needs the core to itself, `7y` spins briefly then yields and may share it. The fifth entry is ignored (set it to `0`). The tenth (`journal-prep`) and eleventh (`journal-disk`) entries are optional; a shorter list leaves those threads unpinned. Core 0 should be reserved for OS/IRQ. 0 = unpinned (and therefore yielding) for any field. The server refuses to start when two threads share a core unless both entries carry `y`. See [Core Pinning](#core-pinning---cores). |
+| `--cores` | `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11` | One `thread=core` entry per pipeline thread, in any order; every thread must be named. Each entry takes an optional wait-policy suffix: a bare core (or `7s`) busy-spins and needs the core to itself, `7y` spins briefly then yields and may share it; `journal-prep` blocks in file I/O and takes no suffix. `0` leaves a thread unpinned (and therefore yielding), and `none` unpins every thread. Core 0 should be reserved for OS/IRQ. The server refuses to start on a positional list, a missing, unknown or repeated name, or two threads on one core unless both entries carry `y`, and warns at boot when `journal-seq`, `matching`, `response`, `reader` or `journal-disk` has no core. See [Core Pinning](#core-pinning---cores). |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -82,7 +82,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
 4. Build the disruptor pipeline (input ring + output ring).
 5. Spawn I/O thread: in TCP mode, one io_uring reader thread that multiplexes every connection via multishot RECV; in DPDK mode, one poll thread per NIC queue.
-6. Spawn 4-7 pipeline OS threads: journal, journal-disk, matching, response, optionally repl-sender, optionally event-publisher, optionally shadow exchange -- each pinned to its `--cores` value.
+6. Spawn the pipeline OS threads: journal-seq, journal-disk, journal-prep, matching, response, optionally event-publisher, optionally the shadow exchange, and the replication handlers when replication is on -- each pinned to its `--cores` entry.
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
 
@@ -94,7 +94,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9,10,11 \
+    --cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11 \
     --max-journal-mib 512 \
     --standalone
 ```
@@ -108,14 +108,14 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9,10,11 \
+    --cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11 \
     --max-journal-mib 512 \
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
-    --cores 1,2,3,4,5,6,7,8,9,10,11 \
+    --cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
 ```
@@ -131,7 +131,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,5,6,7,8,9,10,11 \
+    --cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11 \
     --standalone
 ```
 
@@ -309,7 +309,7 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
     --journal /mnt/nvme/melin.journal \
     --snapshot-path /var/lib/melin/melin.snapshot \
     --snapshot-interval-ms 60000 \
-    --cores 1,2,3,4,5,6,7,8,9,10,11 \
+    --cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11 \
     ...
 ```
 
@@ -428,35 +428,35 @@ RUST_LOG=melin_server=debug,melin_engine=info ./target/release/melin-server ...
 
 The recommended core assignment for a production server:
 
-| Core(s) | Assignment | `--cores` position |
+| Core(s) | Assignment | `--cores` name |
 |---------|-----------|------|
 | 0 | OS, IRQs, RCU callbacks | (reserved, never assign pipeline work) |
-| 1 | Journal stage | 1st |
-| 2 | Matching stage | 2nd |
-| 3 | Response stage | 3rd |
-| 4 | Reader thread (io_uring / DPDK poll) | 4th |
-| 5 | (unused — the entry is ignored, set it to `0`) | 5th |
-| 6 | Event publisher | 6th |
-| 7 | Shadow exchange (scheduled snapshots) | 7th |
-| 8 | Replication handler 0 | 8th |
-| 9 | Replication handler 1 | 9th |
-| 10 | Journal segment preparer | 10th (optional) |
-| 11 | Journal disk thread (writes, syncs, publishes durability) | 11th (optional) |
+| 1 | Journal sequencing thread | `journal-seq` |
+| 2 | Matching stage | `matching` |
+| 3 | Response stage | `response` |
+| 4 | Reader thread (io_uring / DPDK poll) | `reader` |
+| 5 | Unused by the default layout | -- |
+| 6 | Event publisher | `event-publisher` |
+| 7 | Shadow exchange (scheduled snapshots) | `shadow` |
+| 8 | Replication handler 0 | `repl-handler-0` |
+| 9 | Replication handler 1 | `repl-handler-1` |
+| 10 | Journal segment preparer | `journal-prep` |
+| 11 | Journal disk thread (writes, syncs, publishes durability) | `journal-disk` |
 | 12+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`)
 
-Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
+Each pipeline thread pins itself to the core `--cores` gives it before entering its loop. If pinning fails, a warning is logged but the server continues.
 
-`--cores 1,2,3,4,0,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. The fifth entry is ignored. Use `0` for any position to leave that thread unpinned (OS-scheduled).
+`--cores` takes one `thread=core` entry per pipeline thread, in any order, and every thread must be named: `journal-seq`, `matching`, `response`, `reader`, `event-publisher`, `shadow`, `repl-handler-0`, `repl-handler-1`, `journal-prep` and `journal-disk`. A thread no other flag enables — the event publisher without `--event-bind`, the replication handlers on a standalone node — still takes an entry, so a layout reads the same whatever the node is doing. `0` leaves a thread unpinned, and `none` unpins every thread. The server refuses to start on a positional list, or on a missing, unknown or repeated name, and says which. To migrate a positional value, name the positions and drop the fifth: `1,2,3,4,0,6,7,8,9,10,11` becomes `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11`, which is also the default. A nine- or ten-entry list adds `journal-prep=0` and `journal-disk=0` for the threads it left out, and an all-`0` list is `none`.
 
 Each entry also states how the thread waits when it has nothing to do. A bare core (`7`, or `7s`) busy-spins and needs the core to itself. `7y` spins briefly, then yields to the scheduler, and may share the core with other yielding threads. `0` leaves the thread unpinned, which always yields. `journal-prep` blocks in file I/O rather than polling and takes no suffix. The server refuses to start when two entries name the same core and either thread busy-spins; the check covers every entry, including threads no other flag enables, and the error names both threads and the core. On DPDK the `reader` entry pins the NIC poll thread, which never yields, so it cannot take `y` — give it a core of its own. The boot log prints the resolved layout in `--cores` syntax.
 
-On a shared machine where every thread should yield, suffix every pinned entry: `--cores 1y,2y,3y,4y,0,6y,7y,8y,9y,10,11y`. This replaces the former `--yield-idle` flag, which was removed; an all-`0` layout needs no change. A mixed layout keeps the acknowledgement path spinning on dedicated cores and packs the auxiliary threads onto one shared core: `--cores 1,2,3,4,0,8y,8y,6,7,8,5` puts journal, matching, response, reader and journal-disk on cores 1-5, the two replication handlers on 6 and 7, and the event publisher, shadow and segment preparer together on core 8. The replication handlers are on the acknowledgement path whenever the ack policy waits on a replica, so only a standalone node should treat them as auxiliary.
+An unpinned thread runs on the CPUs the server process was started with: the set that `taskset`, systemd's `CPUAffinity=` or a container cpuset narrows, and one that never includes an isolated core. Without isolated cores the scheduler moves it as load changes; with them, it shares the non-isolated cores with the OS and interrupt handling. `journal-seq`, `matching`, `response`, `reader` and `journal-disk` are on the path of every request, so the server warns at boot when any of them has no core, and calls `none` out as what it is: a development layout, under which latency figures say nothing about the server.
 
-A tenth entry pins the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage. An eleventh pins the journal disk thread — the half of the journal that writes each batch, syncs it, and publishes the durability position every acknowledgement waits on. It busy-spins like the other stages, so give it a dedicated core, and keep it on the same CCD as the journal stage: the two exchange a cache line on every batch. `--cores 1,2,3,4,5,6,7,8,9,10,11` is the default, so a server started without `--cores` takes cores 1-11 — budget for it when planning the layout.
+On a shared machine where every thread should yield, suffix every pinned entry: `--cores journal-seq=1y,matching=2y,response=3y,reader=4y,event-publisher=6y,shadow=7y,repl-handler-0=8y,repl-handler-1=9y,journal-prep=10,journal-disk=11y`. This replaces the former `--yield-idle` flag, which was removed; a `none` layout needs no change. A mixed layout keeps the acknowledgement path spinning on dedicated cores and packs the auxiliary threads onto one shared core: `--cores journal-seq=1,matching=2,response=3,reader=4,journal-disk=5,repl-handler-0=6,repl-handler-1=7,event-publisher=8y,shadow=8y,journal-prep=8` puts journal-seq, matching, response, reader and journal-disk on cores 1-5, the two replication handlers on 6 and 7, and the event publisher, shadow and segment preparer together on core 8. The replication handlers are on the acknowledgement path whenever the ack policy waits on a replica, so only a standalone node should treat them as auxiliary.
 
-Both trailing entries are optional, and a short list leaves the threads it omits unpinned: a nine-value `--cores` leaves both the preparer and the disk thread unpinned, a ten-value one leaves the disk thread unpinned. Configurations carried over from a previous release therefore keep their exact behaviour, with the omitted threads running wherever the scheduler puts them (typically core 0, alongside the OS and IRQs). Leaving the disk thread there is the more costly of the two: it busy-spins and syncs on every batch, so sharing a core with the OS puts that contention directly under the durability position clients wait on.
+`journal-prep` is the journal segment preparer, which stages the next journal segment in the background so rotation doesn't stall the journal stage. `journal-disk` is the journal disk thread — the half of the journal that writes each batch, syncs it, and publishes the durability position every acknowledgement waits on. It busy-spins like the other stages, so give it a dedicated core, and keep it on the same CCD as `journal-seq`: the two exchange a cache line on every batch. Running either unpinned is a stated choice (`journal-disk=0`), and the disk thread is the costlier one to leave without a core: it syncs on every batch, so sharing a core with the OS puts that contention directly under the durability position clients wait on. The default layout takes cores 1-4 and 6-11 — budget for it when planning the layout.
 
 ### Kernel Boot Parameters (GRUB)
 
@@ -545,9 +545,9 @@ Set the governor at runtime even when `cpufreq.default_governor=performance` is 
 
 The default core layout above assumes 11+ logical CPUs — i.e., a box where cores 1-10 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 7-9 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
 
-For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal=1, matching=2, response=3, reader=4, event-publisher=5, shadow=6, bench client=7. Replication-sender and handler cores are left unpinned (replication is not used in embedded bench mode).
+For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal-seq=1, matching=2, response=3, reader=4, event-publisher=5, shadow=6, bench client=7. The replication handlers, the segment preparer and the journal disk thread are left unpinned (replication is not used in embedded bench mode).
 
-For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,7,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. The nine-value form is deliberate here: it also leaves the journal segment preparer unpinned, which is what you want when there is no spare core to give it. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
+For production deployments on smaller hosts, pass the equivalent `--cores journal-seq=1,matching=2,response=3,reader=4,event-publisher=5,shadow=6,repl-handler-0=0,repl-handler-1=0,journal-prep=0,journal-disk=0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. The `0` entries are deliberate: with no spare core to give them, the replication handlers, the segment preparer and the disk thread run unpinned, and the server warns at boot that `journal-disk` has no core. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
 
 ### Private Network (802.1Q VLAN)
 

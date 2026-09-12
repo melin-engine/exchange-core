@@ -129,7 +129,7 @@ RUST_LOG="${RUST_LOG:-info}" melin-server \
     --authorized-keys "$DATA_DIR/authorized_keys" \
     --journal "$DATA_DIR/melin.journal" \
     --event-bind 127.0.0.1:9877 \
-    --cores 0,0,0,0,0,0,0,0,0 \
+    --cores none \
     --accounts 1000 \
     --instruments 2 \
     &

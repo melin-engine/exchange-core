@@ -1446,13 +1446,13 @@ fn run_pipeline_inner(
     // Spawn journal and matching stage threads.
     let shutdown_j = Arc::clone(&shutdown);
     let mut journal_stage = out.journal_stage;
-    // The journal stage spawns a disk thread that busy-spins on batches
-    // and publishes the durability cursors. Unpinned it is OS-scheduled
-    // like any other thread, which on an isolcpus host means it lands
-    // on a housekeeping core and its jitter shows up as journal tail.
-    // The stage spawns it itself, from the journal thread, so the core
-    // has to be handed over before `run`.
+    // The journal's disk thread busy-spins on batches and publishes the
+    // durability cursors. Unpinned it is OS-scheduled like any other
+    // thread, which on an isolcpus host means it lands on a housekeeping
+    // core and its jitter shows up as journal tail. `start` launches it
+    // from this thread and reads the core then, so hand it over first.
     journal_stage.set_disk_core(cores.journal_disk);
+    let sequencer = journal_stage.start().expect("start journal stage");
     let journal_core = cores.journal;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
@@ -1462,7 +1462,7 @@ fn run_pipeline_inner(
             {
                 eprintln!("warning: could not pin journal to core {journal_core}: {e}");
             }
-            journal_stage.run(&shutdown_j)
+            sequencer.run(&shutdown_j)
         })
         .expect("spawn journal thread");
 

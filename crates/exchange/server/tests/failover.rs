@@ -691,7 +691,7 @@ fn spawn_primary_with_extra_env(
         "0".into(),
         // Reduce core count to avoid conflicts in CI.
         "--cores".into(),
-        "0,0,0,0,0,0,0,0,0".into(),
+        "none".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -825,7 +825,7 @@ fn spawn_replica_named_with_extra_env(
         "--connection-timeout-secs".into(),
         "0".into(),
         "--cores".into(),
-        "0,0,0,0,0,0,0,0,0".into(),
+        "none".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -1486,7 +1486,7 @@ fn crashed_primary_recovers_from_journal() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2174,7 +2174,7 @@ fn replacement_replica_catches_up_from_journal() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2298,7 +2298,7 @@ fn catchup_with_fills_during_gap() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2410,7 +2410,7 @@ fn catchup_then_immediate_failover() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2529,7 +2529,7 @@ fn fresh_replica_full_catchup() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2643,7 +2643,7 @@ fn snapshot_transfer_when_archives_purged() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
                 "--standalone",
                 "--ack-policy",
                 "disk",
@@ -2740,7 +2740,7 @@ fn snapshot_transfer_when_archives_purged() {
                 "--connection-timeout-secs",
                 "0",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
                 "--snapshot-interval-ms",
                 "100",
             ])

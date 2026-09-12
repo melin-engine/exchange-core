@@ -379,8 +379,8 @@ fn main() {
 
     let mut input_producer = pipeline.input_producer;
     let mut journal_stage = pipeline.journal_stage;
-    // The stage spawns its disk thread itself, from the journal thread,
-    // so the core has to be handed over before `run`.
+    // `start` launches the disk thread from the thread that calls it and
+    // reads the core then, so hand it over first.
     journal_stage.set_disk_core(primary_cores.journal_disk);
     let matching_stage = pipeline.matching_stage;
     let mut output_consumers = pipeline.output_consumers;
@@ -414,11 +414,14 @@ fn main() {
     // --- Spawn primary pipeline stages ---
     let s = Arc::clone(&shutdown);
     let journal_core = primary_cores.journal;
+    // Started here, on the spawning thread, so the journal's disk and
+    // preparer threads do not inherit the journal thread's pin.
+    let sequencer = journal_stage.start().expect("start journal stage");
     let journal_handle = std::thread::Builder::new()
         .name("bench-journal".into())
         .spawn(move || {
             pin("journal", journal_core);
-            let _ = journal_stage.run(&s);
+            let _ = sequencer.run(&s);
         })
         .expect("spawn journal");
 
@@ -522,7 +525,7 @@ fn main() {
         let base = replica_bases[i];
         let replica_core = |offset: usize| if base == 0 { 0 } else { base + offset };
         let cores = PipelineCores {
-            journal: place(replica_core(0)),
+            journal_seq: place(replica_core(0)),
             matching: place(replica_core(1)),
             response: place(replica_core(2)),
             reader: place(replica_core(3)),
