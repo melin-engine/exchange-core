@@ -15,6 +15,8 @@
 //! - [`response_encoder::ResponseEncoder`] —
 //!   `ExecutionReport` / `QueryResponse` → wire encoder.
 //! - [`event_publisher`] — market-data firehose.
+//! - [`named_cores`] — the benches' `thread=core` flag parser, in the
+//!   server's `--cores` shape.
 
 pub mod app_factory;
 pub mod exchange_app;
@@ -22,6 +24,7 @@ pub mod request_decoder;
 pub mod response_encoder;
 
 pub mod event_publisher;
+pub mod named_cores;
 
 // Crate-root re-exports for the three trading adapters most often
 // referenced from outside this crate — the `melin-server` binary, the

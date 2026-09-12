@@ -12,12 +12,12 @@
 #      off pipeline/reader/bench cores)
 #   4. irqbalance → stopped (prevents daemon from redistributing IRQs)
 #
-# Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response),
-# 4=reader thread (or DPDK poll thread), 5=repl-sender, 6=event-publisher,
-# 7=shadow, 8-9=repl-handlers, 10=journal-prep, 11=journal-disk,
-# 12+=bench threads. All pinned via sched_setaffinity. The server side is
-# the server's `--cores` default; keep bench threads above its last core,
-# or the two SCHED_FIFO spinners share a core and starve each other.
+# Core layout: 0=OS/IRQ, 1=journal-seq, 2=matching, 3=response,
+# 4=reader thread (or DPDK poll thread), 6=event-publisher, 7=shadow,
+# 8-9=repl-handlers, 10=journal-prep, 11=journal-disk, 12+=bench threads;
+# core 5 is idle. All pinned via sched_setaffinity. The server side is the
+# server's `--cores` default; keep bench threads above its last core, or
+# the two SCHED_FIFO spinners share a core and starve each other.
 # All settings are saved and restored on exit (including Ctrl-C / errors).
 # Kernel dmesg is captured before/after to correlate spikes with kernel events.
 

@@ -553,15 +553,20 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
-    /// Pipeline-mode core assignment, five comma-separated IDs in the
-    /// order `journal,matching,publisher,journal-disk,drain`. 0 leaves
-    /// an entry unpinned. Every one of these threads busy-spins, so two
-    /// on one core starve each other — the values are checked for
-    /// duplicates before anything is spawned. Keep `journal` and
-    /// `journal-disk` on the same CCD: they exchange a cache line on
-    /// every batch. Ignored outside `--mode pipeline`.
-    #[arg(long, value_delimiter = ',', default_value = "1,2,3,4,5")]
-    pipeline_cores: Vec<usize>,
+    /// Pipeline-mode core assignment as `thread=core` entries in any
+    /// order, one per thread — `journal-seq`, `matching`, `publisher`,
+    /// `journal-disk` and `drain` — the shape of the server's `--cores`.
+    /// `0` leaves a thread unpinned and `none` leaves them all unpinned.
+    /// Every one of these threads busy-spins, so two on one core starve
+    /// each other — the layout is checked for duplicates before anything
+    /// is spawned. Keep `journal-seq` and `journal-disk` on the same
+    /// CCD: they exchange a cache line on every batch. Ignored outside
+    /// `--mode pipeline`.
+    #[arg(
+        long,
+        default_value = "journal-seq=1,matching=2,publisher=3,journal-disk=4,drain=5"
+    )]
+    pipeline_cores: String,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -1260,15 +1265,21 @@ fn run_engine_bench(
 // Pipeline benchmark (disruptor + journal + matching, no network)
 // ===========================================================================
 
-/// Entries `--pipeline-cores` expects: journal, matching, publisher,
-/// journal-disk, drain.
-const PIPELINE_CORE_SLOTS: usize = 5;
+/// The pipeline-mode threads as `--pipeline-cores` names them, in the
+/// order [`PipelineBenchCores`] lists its fields.
+const PIPELINE_THREADS: [&str; 5] = [
+    "journal-seq",
+    "matching",
+    "publisher",
+    "journal-disk",
+    "drain",
+];
 
 /// Pipeline-mode core assignment, resolved from `--pipeline-cores`. A
 /// field of 0 leaves that thread unpinned (OS-scheduled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PipelineBenchCores {
-    journal: usize,
+    journal_seq: usize,
     matching: usize,
     publisher: usize,
     journal_disk: usize,
@@ -1280,25 +1291,21 @@ struct PipelineBenchCores {
 /// itself: `pin_to_core` promotes to SCHED_FIFO on an isolated core, so
 /// one thread spins and the other starves, and the run reports a
 /// plausible-looking but meaningless number.
-fn resolve_pipeline_cores(v: &[usize]) -> Result<PipelineBenchCores, String> {
-    if v.len() != PIPELINE_CORE_SLOTS {
-        return Err(format!(
-            "--pipeline-cores expects {PIPELINE_CORE_SLOTS} comma-separated IDs \
-             (journal,matching,publisher,journal-disk,drain), got {}",
-            v.len()
-        ));
-    }
+fn resolve_pipeline_cores(spec: &str) -> Result<PipelineBenchCores, String> {
+    // One core per `PIPELINE_THREADS` entry, in that order.
+    let c =
+        melin_server::named_cores::parse_named_cores("--pipeline-cores", spec, &PIPELINE_THREADS)?;
     let cores = PipelineBenchCores {
-        journal: v[0],
-        matching: v[1],
-        publisher: v[2],
-        journal_disk: v[3],
-        drain: v[4],
+        journal_seq: c[0],
+        matching: c[1],
+        publisher: c[2],
+        journal_disk: c[3],
+        drain: c[4],
     };
     // (core, owner) so a duplicate can name both sides of the clash
     // rather than just the number.
     let claimed = [
-        (cores.journal, "journal"),
+        (cores.journal_seq, "journal-seq"),
         (cores.matching, "matching"),
         (cores.publisher, "publisher"),
         (cores.journal_disk, "journal-disk"),
@@ -1413,9 +1420,9 @@ fn run_pipeline_inner(
     } = cfg;
 
     eprintln!(
-        "  Pipeline cores: journal={} matching={} publisher={} journal-disk={} drain={} \
+        "  Pipeline cores: journal-seq={} matching={} publisher={} journal-disk={} drain={} \
          (0 = unpinned)",
-        cores.journal, cores.matching, cores.publisher, cores.journal_disk, cores.drain,
+        cores.journal_seq, cores.matching, cores.publisher, cores.journal_disk, cores.drain,
     );
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
@@ -1453,7 +1460,7 @@ fn run_pipeline_inner(
     // from this thread and reads the core then, so hand it over first.
     journal_stage.set_disk_core(cores.journal_disk);
     let sequencer = journal_stage.start().expect("start journal stage");
-    let journal_core = cores.journal;
+    let journal_core = cores.journal_seq;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
@@ -3519,12 +3526,14 @@ mod pipeline_core_tests {
     use clap::Parser;
 
     #[test]
-    fn five_entries_map_in_documented_order() {
-        let cores = resolve_pipeline_cores(&[1, 2, 3, 4, 5]).unwrap();
+    fn entries_are_named_in_any_order() {
+        let cores =
+            resolve_pipeline_cores("drain=5,journal-disk=4,publisher=3,matching=2,journal-seq=1")
+                .unwrap();
         assert_eq!(
             cores,
             PipelineBenchCores {
-                journal: 1,
+                journal_seq: 1,
                 matching: 2,
                 publisher: 3,
                 journal_disk: 4,
@@ -3536,22 +3545,28 @@ mod pipeline_core_tests {
     #[test]
     fn the_default_flag_value_parses() {
         // Guards the `default_value` string on `--pipeline-cores` against
-        // drifting out of sync with `PIPELINE_CORE_SLOTS`.
+        // drifting out of sync with `PIPELINE_THREADS`.
         let parsed = BenchArgs::parse_from(["melin-bench"]).pipeline_cores;
         assert!(resolve_pipeline_cores(&parsed).is_ok(), "{parsed:?}");
     }
 
     #[test]
-    fn wrong_arity_is_rejected() {
-        let err = resolve_pipeline_cores(&[1, 2, 3, 4]).unwrap_err();
-        assert!(err.contains("expects 5"), "{err}");
+    fn every_thread_needs_an_entry_and_positional_lists_are_refused() {
+        let err = resolve_pipeline_cores("journal-seq=1,matching=2,publisher=3,journal-disk=4")
+            .unwrap_err();
+        assert!(err.contains("no core for drain"), "{err}");
+        let err = resolve_pipeline_cores("1,2,3,4,5").unwrap_err();
+        assert!(err.contains("--pipeline-cores"), "{err}");
+        assert!(err.contains("positional"), "{err}");
     }
 
     #[test]
     fn a_duplicate_core_names_both_claimants() {
         // The collision the old hardcoded layout invited: the drain
         // thread landing on the journal's disk core.
-        let err = resolve_pipeline_cores(&[1, 2, 3, 4, 4]).unwrap_err();
+        let err =
+            resolve_pipeline_cores("journal-seq=1,matching=2,publisher=3,journal-disk=4,drain=4")
+                .unwrap_err();
         assert!(err.contains("core 4"), "{err}");
         assert!(err.contains("journal-disk"), "{err}");
         assert!(err.contains("drain"), "{err}");
@@ -3561,9 +3576,12 @@ mod pipeline_core_tests {
     fn zero_is_an_unpinned_sentinel_not_a_core() {
         // Several threads may be left unpinned at once; 0 must not read
         // as a duplicate claim on core 0.
-        let cores = resolve_pipeline_cores(&[1, 0, 0, 0, 0]).unwrap();
-        assert_eq!(cores.journal, 1);
+        let cores =
+            resolve_pipeline_cores("journal-seq=1,matching=0,publisher=0,journal-disk=0,drain=0")
+                .unwrap();
+        assert_eq!(cores.journal_seq, 1);
         assert_eq!(cores.drain, 0);
+        assert_eq!(resolve_pipeline_cores("none").unwrap().journal_seq, 0);
     }
 }
 
