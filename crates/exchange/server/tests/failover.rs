@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use melin_client::Client;
+use melin_ec_client::Client;
 use melin_protocol::message::Request;
 use melin_protocol::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce,

@@ -26,7 +26,7 @@ authors = ["P.L.S.C."]
 # Only crates that something else depends on are listed. The leaf binaries
 # (melin-admin, melin-bench, the two gateways, the two TUIs) inherit the
 # workspace version but are nobody's dependency, so they need no pin.
-melin-client = { path = "crates/exchange/client", version = "0.15.0" }
+melin-ec-client = { path = "crates/exchange/client", version = "0.15.0" }
 melin-exchange-core = { path = "crates/exchange/exchange-core", version = "0.15.0" }
 melin-gateway-core = { path = "crates/exchange/gateway-core", version = "0.15.0" }
 melin-market-data = { path = "crates/exchange/market-data", version = "0.15.0" }

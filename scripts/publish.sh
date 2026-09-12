@@ -31,7 +31,7 @@ CRATES=(
     # Level 2
     melin-exchange-core  # depends on: trading, types
     melin-market-data    # depends on: types, protocol
-    melin-client         # depends on: protocol
+    melin-ec-client      # depends on: protocol
 
     # Level 3
     melin-tui-fix-client # depends on: gateway-core

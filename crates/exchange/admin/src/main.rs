@@ -19,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use melin_client::{Client, StatsSnapshot};
+use melin_ec_client::{Client, StatsSnapshot};
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,

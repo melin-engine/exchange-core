@@ -21,7 +21,7 @@ name = "melin-promote"
 path = "src/promote.rs"
 
 [dependencies]
-melin-client = { workspace = true }
+melin-ec-client = { workspace = true }
 melin-protocol = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }

@@ -1,5 +1,5 @@
 [package]
-name = "melin-client"
+name = "melin-ec-client"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true

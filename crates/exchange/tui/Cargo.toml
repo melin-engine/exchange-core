@@ -9,7 +9,7 @@ authors.workspace = true
 description = "Interactive TUI trading client for the Melin exchange"
 
 [dependencies]
-melin-client = { workspace = true }
+melin-ec-client = { workspace = true }
 melin-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 ratatui = "0.30"

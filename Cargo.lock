@@ -1685,7 +1685,7 @@ dependencies = [
  "base64",
  "crossterm",
  "ed25519-dalek",
- "melin-client",
+ "melin-ec-client",
  "melin-protocol",
  "rand 0.10.2",
  "ratatui",
@@ -1742,15 +1742,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-client"
-version = "0.15.0"
-dependencies = [
- "ed25519-dalek",
- "melin-protocol",
- "melin-wire-protocol",
-]
-
-[[package]]
 name = "melin-dpdk"
 version = "0.15.0"
 source = "git+https://github.com/melin-engine/melin.git?branch=main#ab73ffb5b6417573339c34177fea0d0c34c0cd62"
@@ -1762,6 +1753,15 @@ dependencies = [
  "pkg-config",
  "rustc-hash",
  "tracing",
+]
+
+[[package]]
+name = "melin-ec-client"
+version = "0.15.0"
+dependencies = [
+ "ed25519-dalek",
+ "melin-protocol",
+ "melin-wire-protocol",
 ]
 
 [[package]]
@@ -1897,8 +1897,8 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
- "melin-client",
  "melin-dpdk",
+ "melin-ec-client",
  "melin-exchange-core",
  "melin-journal",
  "melin-market-data",
@@ -1975,7 +1975,7 @@ version = "0.15.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
- "melin-client",
+ "melin-ec-client",
  "melin-protocol",
  "ratatui",
  "tikv-jemallocator",

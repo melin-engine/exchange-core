@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use melin_client::Client;
+use melin_ec_client::Client;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::types::{
     AccountId, ExecutionReport, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
