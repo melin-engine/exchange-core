@@ -92,18 +92,9 @@ pub enum Request {
 
     // --- Control messages (all permission levels) ---
     /// Keepalive heartbeat. Resets the server's idle timeout for this
-    /// connection. Tag-only, no payload.
+    /// connection. Tag-only, no payload. The auth handshake is not
+    /// here: it is the sequencer's, run before any request.
     Heartbeat,
-    /// Challenge-response authentication. Sent after receiving a
-    /// `Challenge` from the server. Contains the Ed25519 signature
-    /// over the server-issued nonce plus the client's Ed25519 public
-    /// key for identity lookup.
-    ChallengeResponse {
-        /// Ed25519 signature over the 32-byte challenge nonce.
-        signature: [u8; 64],
-        /// Client's long-term Ed25519 public key (32 bytes).
-        public_key: [u8; 32],
-    },
 
     /// Subscribe to the event firehose for specific symbols.
     /// Sent after auth+ServerReady. `count == 0` means all symbols.
@@ -154,7 +145,12 @@ impl Request {
     }
 }
 
-/// Server → client response payload.
+/// Server → client application response payload.
+///
+/// The transport's own frames — heartbeats, `BatchEnd`, `ServerBusy`,
+/// `EngineError`, and the auth handshake — are not here: the sequencer
+/// encodes them and its client tells them apart (`melin_client::classify`)
+/// before a frame reaches this codec.
 ///
 /// PositionSnapshot (389 bytes) dominates the enum size, but ResponseKind must
 /// be `Copy` for zero-allocation codec paths. Boxing would add heap indirection.
@@ -165,35 +161,6 @@ impl Request {
 pub enum ResponseKind {
     /// An execution report from the matching engine.
     Report(ExecutionReport),
-    /// The engine encountered an internal error processing the request.
-    EngineError,
-    /// Signals the end of a response batch for a single request.
-    /// A single request (e.g., SubmitOrder) can produce multiple Reports
-    /// (fills, placements, triggers). BatchEnd tells the client that all
-    /// reports for this request have been sent.
-    BatchEnd,
-    /// Sent by the server immediately after accepting a connection.
-    /// Signals that the pipeline is ready and the client may begin
-    /// sending requests. Used for readiness synchronization in LAN
-    /// benchmarks where the client can't observe server startup.
-    ServerReady,
-    /// Keepalive heartbeat sent during idle periods. Tag-only, no payload.
-    Heartbeat,
-    /// Challenge sent by the server after accepting a connection.
-    /// Carries a fresh nonce for the client to sign with its Ed25519
-    /// private key.
-    Challenge {
-        /// Random nonce (32 bytes) that the client must sign.
-        nonce: [u8; 32],
-    },
-    /// Authentication failed — invalid signature, unknown key, or
-    /// other auth error. Server drops the connection after sending this.
-    AuthFailed,
-
-    /// The server's input pipeline is full. The client should retry
-    /// after a brief backoff. Sent directly by the reader thread
-    /// without entering the pipeline. Tag-only, no payload.
-    ServerBusy,
 
     // --- Stats response ---
     /// Server stats snapshot. Sent in response to `QueryStats`.

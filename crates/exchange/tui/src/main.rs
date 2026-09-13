@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use melin_ec_client::Client;
+use melin_ec_client::{Client, ClientError};
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_ec_protocol::types::{
     AccountId, ExecutionReport, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
@@ -568,14 +568,7 @@ fn client_thread(
                 for resp in &responses {
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
-                        ResponseKind::EngineError => "ENGINE ERROR".into(),
-                        ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
-                        ResponseKind::BatchEnd
-                        | ResponseKind::ServerReady
-                        | ResponseKind::Heartbeat
-                        | ResponseKind::Challenge { .. }
-                        | ResponseKind::AuthFailed
-                        | ResponseKind::StatsHeader { .. }
+                        ResponseKind::StatsHeader { .. }
                         | ResponseKind::BookSnapshotBegin { .. }
                         | ResponseKind::BookSnapshotLevel { .. }
                         | ResponseKind::BookSnapshotEnd { .. }
@@ -589,6 +582,12 @@ fn client_thread(
                     let _ = response_tx.send("(no reports)".into());
                 }
                 let _ = response_tx.send(format!("  ⏱ {latency:.3?}"));
+            }
+            // The engine's verdict on one request, not a connection
+            // failure: the next command goes through as usual.
+            Err(ClientError::EngineError) => {
+                let _ = response_tx.send("ENGINE ERROR".into());
+                let _ = response_tx.send(format!("  ⏱ {:.3?}", start.elapsed()));
             }
             Err(e) => {
                 let _ = response_tx.send(format!("Request failed: {e}"));

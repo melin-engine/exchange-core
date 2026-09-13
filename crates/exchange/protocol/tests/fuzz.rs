@@ -105,7 +105,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
         return None;
     }
 
-    match data[0] % 7 {
+    match data[0] % 6 {
         0 => {
             // SubmitOrder.
             if data.len() < 29 {
@@ -169,20 +169,6 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
         }),
         3 => Some(Request::Heartbeat),
         4 => {
-            // ChallengeResponse.
-            if data.len() < 97 {
-                return None;
-            }
-            let mut signature = [0u8; 64];
-            signature.copy_from_slice(&data[1..65]);
-            let mut public_key = [0u8; 32];
-            public_key.copy_from_slice(&data[65..97]);
-            Some(Request::ChallengeResponse {
-                signature,
-                public_key,
-            })
-        }
-        5 => {
             // Subscribe.
             if data.len() < 2 {
                 return None;
@@ -211,7 +197,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
         return None;
     }
 
-    match data[0] % 14 {
+    match data[0] % 10 {
         0 => {
             // Placed.
             let order_id = OrderId(u64_at(data, 1)?);
@@ -301,11 +287,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
                 reason,
             }))
         }
-        5 => Some(ResponseKind::EngineError),
-        6 => Some(ResponseKind::BatchEnd),
-        7 => Some(ResponseKind::ServerReady),
-        8 => Some(ResponseKind::Heartbeat),
-        9 => {
+        5 => {
             // BookSnapshotBegin.
             let symbol = Symbol(u32_at(data, 1)?);
             let last_applied_seq = u64_at(data, 5)?;
@@ -314,7 +296,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
                 last_applied_seq,
             })
         }
-        10 => {
+        6 => {
             // BookSnapshotLevel.
             if data.len() < 26 {
                 return None;
@@ -336,7 +318,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
                 order_count,
             })
         }
-        11 => {
+        7 => {
             // BookSnapshotEnd.
             let symbol = Symbol(u32_at(data, 1)?);
             let level_count = u32_at(data, 5)?;
@@ -345,7 +327,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
                 level_count,
             })
         }
-        12 => {
+        8 => {
             // SnapshotComplete.
             let last_applied_seq = u64_at(data, 1)?;
             Some(ResponseKind::SnapshotComplete { last_applied_seq })

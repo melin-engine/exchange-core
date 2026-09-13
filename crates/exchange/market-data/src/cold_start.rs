@@ -234,6 +234,8 @@ impl std::error::Error for SnapshotError {}
 mod tests {
     use super::*;
     use melin_ec_protocol::codec::encode_response;
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
     use std::num::NonZeroU64;
 
     fn price(n: u64) -> Price {
@@ -247,6 +249,17 @@ mod tests {
         let mut frame = Vec::with_capacity(8 + response_len);
         frame.extend_from_slice(&seq.to_le_bytes());
         frame.extend_from_slice(&buf[..response_len]);
+        frame
+    }
+
+    /// A sequence-prefixed frame carrying one of the transport's own
+    /// frames, as the publisher sends heartbeats and batch ends.
+    fn transport_frame(seq: u64, resp: &TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = control_codec::encode_transport_response(resp, &mut buf).unwrap();
+        let mut frame = Vec::with_capacity(8 + n);
+        frame.extend_from_slice(&seq.to_le_bytes());
+        frame.extend_from_slice(&buf[..n]);
         frame
     }
 
@@ -367,8 +380,9 @@ mod tests {
 
     #[test]
     fn parse_snapshot_ignores_non_snapshot_frames() {
-        // Insert a Heartbeat between Begin and End — it should be silently
-        // ignored by the `_ => {}` catch-all arm.
+        // Insert a Heartbeat and a BatchEnd between Begin and End — the
+        // transport's frames, skipped by the reader before the codec
+        // sees them.
         let mut data = Vec::new();
         data.extend(encode_frame(
             0,
@@ -377,7 +391,8 @@ mod tests {
                 last_applied_seq: 42,
             },
         ));
-        data.extend(encode_frame(0, &ResponseKind::Heartbeat));
+        data.extend(transport_frame(0, &TransportResponse::Heartbeat));
+        data.extend(transport_frame(0, &TransportResponse::BatchEnd));
         data.extend(encode_frame(
             0,
             &ResponseKind::BookSnapshotEnd {

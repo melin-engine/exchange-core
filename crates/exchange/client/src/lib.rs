@@ -26,6 +26,10 @@ pub enum ClientError {
     AuthFailed,
     /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,
+    /// The engine failed on the request; do not retry it. The reply
+    /// batch has been read to its end, so the connection is still
+    /// usable for the next request.
+    EngineError,
 }
 
 impl std::fmt::Display for ClientError {
@@ -36,6 +40,7 @@ impl std::fmt::Display for ClientError {
             Self::Disconnected => write!(f, "disconnected from server"),
             Self::AuthFailed => write!(f, "authentication failed"),
             Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
+            Self::EngineError => write!(f, "engine error on the request, do not retry"),
         }
     }
 }

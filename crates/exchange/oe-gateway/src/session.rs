@@ -2030,11 +2030,23 @@ lot_size_inverse = 1
     }
 
     /// Encode a response with the codec and strip the 4-byte length
-    /// prefix to match what the dispatcher hands to the auth handlers
-    /// (it consumes the prefix when framing).
+    /// prefix to match what the dispatcher hands to the handlers (it
+    /// consumes the prefix when framing).
     fn encode_response_payload(resp: &ResponseKind) -> Vec<u8> {
         let mut buf = [0u8; 64];
         let n = codec::encode_response(resp, &mut buf).unwrap();
+        buf[4..n].to_vec()
+    }
+
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
+
+    /// One of the transport's own frames — the handshake's, a
+    /// heartbeat, a batch end — the same way: the payload without the
+    /// length prefix.
+    fn transport_payload(resp: &TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = control_codec::encode_transport_response(resp, &mut buf).unwrap();
         buf[4..n].to_vec()
     }
 
@@ -2050,11 +2062,11 @@ lot_size_inverse = 1
         // A handshake that has answered the challenge and awaits the
         // node's verdict.
         let mut handshake = Handshake::new(&SigningKey::from_bytes(&[0u8; 32]));
-        let challenge = encode_response_payload(&ResponseKind::Challenge { nonce: [0u8; 32] });
+        let challenge = transport_payload(&TransportResponse::Challenge { nonce: [0u8; 32] });
         assert!(matches!(handshake.feed(&challenge), Ok(Step::Send(_))));
         s.handshake = Some(handshake);
 
-        let payload = encode_response_payload(&ResponseKind::ServerReady);
+        let payload = transport_payload(&TransportResponse::ServerReady);
         let action = s.handle_handshake_frame(&payload, &config);
 
         assert_eq!(action, SessionAction::SendMelin);
@@ -2117,8 +2129,8 @@ lot_size_inverse = 1
         s.heartbeat_interval = Duration::from_secs(30);
         s.fix_outbound_seq = 1;
 
-        for transport in [ResponseKind::Heartbeat, ResponseKind::BatchEnd] {
-            push_melin_frame(&mut s, &encode_response_payload(&transport));
+        for transport in [TransportResponse::Heartbeat, TransportResponse::BatchEnd] {
+            push_melin_frame(&mut s, &transport_payload(&transport));
             let action = s.try_process_melin_frame(&config, &sym, Instant::now());
             assert_eq!(action, SessionAction::None, "{transport:?}");
             assert!(matches!(s.state, SessionState::SyncingRequestSeq));
@@ -2146,13 +2158,13 @@ lot_size_inverse = 1
         let mut s = active_session(&config, Instant::now());
 
         for transport in [
-            ResponseKind::Heartbeat,
-            ResponseKind::BatchEnd,
-            ResponseKind::ServerBusy,
-            ResponseKind::EngineError,
-            ResponseKind::ServerReady,
+            TransportResponse::Heartbeat,
+            TransportResponse::BatchEnd,
+            TransportResponse::ServerBusy,
+            TransportResponse::EngineError,
+            TransportResponse::ServerReady,
         ] {
-            push_melin_frame(&mut s, &encode_response_payload(&transport));
+            push_melin_frame(&mut s, &transport_payload(&transport));
             let action = s.try_process_melin_frame(&config, &sym, Instant::now());
             assert_eq!(action, SessionAction::None, "{transport:?}");
             assert!(matches!(s.state, SessionState::Active));

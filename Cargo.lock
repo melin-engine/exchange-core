@@ -1841,6 +1841,7 @@ dependencies = [
  "melin-ec-gateway-core",
  "melin-ec-protocol",
  "melin-ec-types",
+ "melin-wire-protocol",
  "proptest",
  "serde",
  "toml",

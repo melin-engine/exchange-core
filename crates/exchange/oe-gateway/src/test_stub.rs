@@ -36,6 +36,8 @@ use std::time::Duration;
 
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 /// Control handle owned by the test. Starts a stub listener, connects
 /// to the first gateway connection, and exposes channels for driving
@@ -176,14 +178,12 @@ fn run_stub(
     // signature the gateway returns — tests only care that the state
     // machine progresses.
     let nonce = [0u8; 32];
-    write_response(&mut stream, &ResponseKind::Challenge { nonce })?;
+    write_transport(&mut stream, &TransportResponse::Challenge { nonce })?;
 
-    let (_seq, req) = read_request_blocking(&mut stream, &shutdown)?;
-    match req {
-        Request::ChallengeResponse { .. } => {}
-        other => return Err(format!("expected ChallengeResponse, got {other:?}")),
-    }
-    write_response(&mut stream, &ResponseKind::ServerReady)?;
+    let payload = read_frame_blocking(&mut stream, &shutdown)?;
+    control_codec::decode_challenge_response(&payload)
+        .map_err(|e| format!("expected ChallengeResponse, got {e:?}"))?;
+    write_transport(&mut stream, &TransportResponse::ServerReady)?;
 
     // Production-side, the gateway issues `QueryRequestSeq` immediately
     // after `ServerReady` to learn the engine's per-key request_seq HWM
@@ -200,7 +200,7 @@ fn run_stub(
         other => return Err(format!("expected QueryRequestSeq, got {other:?}")),
     }
     write_response(&mut stream, &ResponseKind::RequestSeqHwm { hwm: 0 })?;
-    write_response(&mut stream, &ResponseKind::BatchEnd)?;
+    write_transport(&mut stream, &TransportResponse::BatchEnd)?;
 
     // --- Request/response loop ---
     let mut accum: Vec<u8> = Vec::with_capacity(256);
@@ -251,21 +251,32 @@ fn run_stub(
     Ok(())
 }
 
-/// Blocking single-request read used during the auth handshake. Loops
+/// Blocking single-request read used during the handshake. Loops
 /// until a full `[u32 len][payload]` frame has arrived, honoring the
 /// shutdown flag between short read intervals.
 fn read_request_blocking(
     stream: &mut TcpStream,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<(u64, Request), String> {
+    let payload = read_frame_blocking(stream, shutdown)?;
+    codec::decode_request(&payload).map_err(|e| format!("decode_request: {e:?}"))
+}
+
+/// Blocking single-frame read used during the auth handshake, whose
+/// frames are the sequencer's rather than the exchange codec's. The
+/// frame's payload, without the length prefix.
+fn read_frame_blocking(
+    stream: &mut TcpStream,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<Vec<u8>, String> {
     let mut accum = Vec::with_capacity(128);
     let mut tmp = [0u8; 128];
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return Err("shutdown during handshake".to_string());
         }
-        if let Some(pair) = try_extract_request(&mut accum)? {
-            return Ok(pair);
+        if let Some(payload) = try_extract_frame(&mut accum) {
+            return Ok(payload);
         }
         match stream.read(&mut tmp) {
             Ok(0) => return Err("EOF during handshake".to_string()),
@@ -281,21 +292,41 @@ fn read_request_blocking(
     }
 }
 
+/// If `buf` contains at least one complete `[u32 len][payload]` frame,
+/// drain it and hand back the payload. `None` if the frame is not yet
+/// complete.
+fn try_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if buf.len() < 4 + len {
+        return None;
+    }
+    Some(buf.drain(..4 + len).skip(4).collect())
+}
+
 /// If `buf` contains at least one complete `[u32 len][seq+tag+payload]`
 /// frame, drain it and decode. Returns Ok(None) if the frame is not
 /// yet complete.
 fn try_extract_request(buf: &mut Vec<u8>) -> Result<Option<(u64, Request)>, String> {
-    if buf.len() < 4 {
+    let Some(payload) = try_extract_frame(buf) else {
         return Ok(None);
-    }
-    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + len {
-        return Ok(None);
-    }
-    let payload: Vec<u8> = buf.drain(..4 + len).skip(4).collect();
+    };
     let (seq, req) =
         codec::decode_request(&payload).map_err(|e| format!("decode_request: {e:?}"))?;
     Ok(Some((seq, req)))
+}
+
+/// Encode and write one of the transport's own frames on the wire, as
+/// the node's runtime does for the handshake and batch ends.
+fn write_transport(stream: &mut TcpStream, resp: &TransportResponse) -> Result<(), String> {
+    let mut buf = [0u8; 64];
+    let n = control_codec::encode_transport_response(resp, &mut buf)
+        .map_err(|e| format!("encode_transport_response: {e:?}"))?;
+    stream
+        .write_all(&buf[..n])
+        .map_err(|e| format!("write: {e}"))
 }
 
 /// Encode and write one response on the wire.

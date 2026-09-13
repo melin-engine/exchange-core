@@ -1760,8 +1760,8 @@ lot_size_inverse = 1
             let (mut stream, _) = listener.accept().unwrap();
             // Send Challenge.
             let mut buf = [0u8; 128];
-            let n = melin_ec_protocol::codec::encode_response(
-                &melin_ec_protocol::message::ResponseKind::Challenge { nonce: [0u8; 32] },
+            let n = melin_wire_protocol::control_codec::encode_transport_response(
+                &melin_wire_protocol::control::TransportResponse::Challenge { nonce: [0u8; 32] },
                 &mut buf,
             )
             .unwrap();
@@ -1775,8 +1775,8 @@ lot_size_inverse = 1
             stream.read_exact(&mut payload).unwrap();
 
             // Send AuthFailed instead of ServerReady.
-            let n = melin_ec_protocol::codec::encode_response(
-                &melin_ec_protocol::message::ResponseKind::AuthFailed,
+            let n = melin_wire_protocol::control_codec::encode_transport_response(
+                &melin_wire_protocol::control::TransportResponse::AuthFailed,
                 &mut buf,
             )
             .unwrap();

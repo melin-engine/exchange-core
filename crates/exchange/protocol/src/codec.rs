@@ -75,11 +75,8 @@ struct RequestSeqHeader {
 const REQUEST_SEQ_HEADER_LEN: usize = core::mem::size_of::<RequestSeqHeader>();
 const _: () = assert!(REQUEST_SEQ_HEADER_LEN == 8);
 
-// Transport-level tags — imported from wire-protocol (single source of truth).
-use melin_wire_protocol::control_codec::{
-    TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR,
-    TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
-};
+// Transport-level tags (0x00–0x0F) are the sequencer's: encoded by its
+// runtime and told apart by its client, they never reach this codec.
 
 // --- Domain request tags (0x10–0x2F) ---
 const TAG_SUBMIT_ORDER: u8 = 0x10;
@@ -192,17 +189,6 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
         Request::Heartbeat => {
             buf[pos] = TAG_REQUEST_HEARTBEAT;
             pos += 1;
-        }
-        Request::ChallengeResponse {
-            signature,
-            public_key,
-        } => {
-            buf[pos] = TAG_CHALLENGE_RESPONSE;
-            pos += 1;
-            buf[pos..pos + 64].copy_from_slice(signature);
-            pos += 64;
-            buf[pos..pos + 32].copy_from_slice(public_key);
-            pos += 32;
         }
         Request::AddInstrument { spec } => {
             buf[pos] = TAG_ADD_INSTRUMENT;
@@ -420,22 +406,6 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
             ))
         }
         TAG_REQUEST_HEARTBEAT => Ok((seq, Request::Heartbeat)),
-        TAG_CHALLENGE_RESPONSE => {
-            if payload.len() < 96 {
-                return Err(ProtocolError::Truncated);
-            }
-            let mut signature = [0u8; 64];
-            signature.copy_from_slice(&payload[..64]);
-            let mut public_key = [0u8; 32];
-            public_key.copy_from_slice(&payload[64..96]);
-            Ok((
-                seq,
-                Request::ChallengeResponse {
-                    signature,
-                    public_key,
-                },
-            ))
-        }
         TAG_ADD_INSTRUMENT => {
             if payload.len() < 12 {
                 return Err(ProtocolError::Truncated);
@@ -690,36 +660,6 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
         ResponseKind::Report(report) => {
             pos += encode_execution_report(report, &mut buf[pos..]);
         }
-        ResponseKind::EngineError => {
-            buf[pos] = TAG_ENGINE_ERROR;
-            pos += 1;
-        }
-        ResponseKind::BatchEnd => {
-            buf[pos] = TAG_BATCH_END;
-            pos += 1;
-        }
-        ResponseKind::ServerReady => {
-            buf[pos] = TAG_SERVER_READY;
-            pos += 1;
-        }
-        ResponseKind::Heartbeat => {
-            buf[pos] = TAG_RESPONSE_HEARTBEAT;
-            pos += 1;
-        }
-        ResponseKind::Challenge { nonce } => {
-            buf[pos] = TAG_CHALLENGE;
-            pos += 1;
-            buf[pos..pos + 32].copy_from_slice(nonce);
-            pos += 32;
-        }
-        ResponseKind::AuthFailed => {
-            buf[pos] = TAG_AUTH_FAILED;
-            pos += 1;
-        }
-        ResponseKind::ServerBusy => {
-            buf[pos] = TAG_SERVER_BUSY;
-            pos += 1;
-        }
         ResponseKind::StatsHeader {
             active_connections,
             events_processed,
@@ -828,20 +768,6 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
     let payload = &buf[1..];
 
     match tag {
-        TAG_ENGINE_ERROR => Ok(ResponseKind::EngineError),
-        TAG_BATCH_END => Ok(ResponseKind::BatchEnd),
-        TAG_SERVER_READY => Ok(ResponseKind::ServerReady),
-        TAG_RESPONSE_HEARTBEAT => Ok(ResponseKind::Heartbeat),
-        TAG_CHALLENGE => {
-            if payload.len() < 32 {
-                return Err(ProtocolError::Truncated);
-            }
-            let mut nonce = [0u8; 32];
-            nonce.copy_from_slice(&payload[..32]);
-            Ok(ResponseKind::Challenge { nonce })
-        }
-        TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
-        TAG_SERVER_BUSY => Ok(ResponseKind::ServerBusy),
         TAG_PLACED
         | TAG_FILL
         | TAG_CANCELLED
@@ -1566,10 +1492,6 @@ mod tests {
                 account: AccountId(42),
             },
             Request::Heartbeat,
-            Request::ChallengeResponse {
-                signature: [0xAA; 64],
-                public_key: [0xBB; 32],
-            },
             Request::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(3),
@@ -1862,13 +1784,6 @@ mod tests {
                 old_remaining: Quantity(nz(50)),
                 new_remaining: Quantity(nz(30)),
             }),
-            ResponseKind::EngineError,
-            ResponseKind::BatchEnd,
-            ResponseKind::ServerReady,
-            ResponseKind::Heartbeat,
-            ResponseKind::Challenge { nonce: [0xCC; 32] },
-            ResponseKind::AuthFailed,
-            ResponseKind::ServerBusy,
             ResponseKind::StatsHeader {
                 active_connections: 5,
                 events_processed: 1_234_567,
@@ -1960,15 +1875,15 @@ mod tests {
         let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // ChallengeResponse needs sig(64) + pubkey(32) = 96 bytes
-        // after the tag. 95 bytes after the tag must be rejected.
-        let mut short = [0u8; 9 + 95];
-        short[8] = TAG_CHALLENGE_RESPONSE;
+        // CancelAll needs account(4) after the tag. 3 bytes after the
+        // tag must be rejected.
+        let mut short = [0u8; 9 + 3];
+        short[8] = TAG_CANCEL_ALL;
         let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
-        // Exactly 96 bytes after the tag is the boundary — must succeed.
-        let mut ok_buf = [0u8; 9 + 96];
-        ok_buf[8] = TAG_CHALLENGE_RESPONSE;
+        // Exactly 4 bytes after the tag is the boundary — must succeed.
+        let mut ok_buf = [0u8; 9 + 4];
+        ok_buf[8] = TAG_CANCEL_ALL;
         assert!(decode_request(&ok_buf).is_ok());
     }
 
@@ -1986,16 +1901,29 @@ mod tests {
         let result = decode_response(&[]);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // Challenge needs nonce(32) bytes after the tag. 31 bytes
+        // StatsHeader needs 3 × u64 = 24 bytes after the tag. 23 bytes
         // must be rejected.
-        let mut short = [0u8; 1 + 31];
-        short[0] = TAG_CHALLENGE;
+        let mut short = [0u8; 1 + 23];
+        short[0] = TAG_STATS_HEADER;
         let result = decode_response(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
-        // Exactly 32 bytes after the tag is the boundary — must succeed.
-        let mut ok_buf = [0u8; 1 + 32];
-        ok_buf[0] = TAG_CHALLENGE;
+        // Exactly 24 bytes after the tag is the boundary — must succeed.
+        let mut ok_buf = [0u8; 1 + 24];
+        ok_buf[0] = TAG_STATS_HEADER;
         assert!(decode_response(&ok_buf).is_ok());
+    }
+
+    #[test]
+    fn transport_tags_are_not_this_codecs() {
+        // The reserved range below 0x10 is the sequencer's: a heartbeat
+        // or a batch end handed to this codec is an unknown tag, since
+        // `melin_client::classify` is meant to have taken it first.
+        for tag in [0x01u8, 0x02, 0x0F] {
+            assert!(matches!(
+                decode_response(&[tag]),
+                Err(ProtocolError::UnknownTag(t)) if t == tag
+            ));
+        }
     }
 
     #[test]
