@@ -98,6 +98,7 @@ melin-dpdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 bolero = "0.13"
+melin-client = { workspace = true }
 melin-ec-client = { workspace = true }
 melin-journal = { workspace = true, features = ["test-utils"] }
 melin-ec-protocol = { workspace = true }

@@ -2084,51 +2084,6 @@ fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
-/// Perform challenge-response auth handshake on a new connection.
-/// Must be called before the stream is set to non-blocking mode.
-#[cfg(not(feature = "dpdk"))]
-fn auth_handshake(
-    stream: &mut (impl std::io::Read + std::io::Write),
-    key: &ed25519_dalek::SigningKey,
-) {
-    use ed25519_dalek::Signer;
-    use melin_ec_protocol::message::Request;
-
-    // Read Challenge frame.
-    let mut len_buf = [0u8; 4];
-    std::io::Read::read_exact(stream, &mut len_buf).expect("read Challenge length");
-    let len = u32::from_le_bytes(len_buf) as usize;
-    assert!(len <= MAX_FRAME_SIZE, "Challenge frame too large: {len}");
-    let mut payload = [0u8; 128];
-    std::io::Read::read_exact(stream, &mut payload[..len]).expect("read Challenge payload");
-    let response = codec::decode_response(&payload[..len]).expect("decode Challenge");
-    let nonce = match response {
-        ResponseKind::Challenge { nonce } => nonce,
-        other => panic!("expected Challenge, got {other:?}"),
-    };
-
-    let signature = key.sign(&nonce);
-    let request = Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: key.verifying_key().to_bytes(),
-    };
-    let mut buf = [0u8; 256];
-    let written = codec::encode_request(&request, 0, &mut buf).expect("encode ChallengeResponse");
-    std::io::Write::write_all(stream, &buf[..written]).expect("send ChallengeResponse");
-    std::io::Write::flush(stream).expect("flush ChallengeResponse");
-
-    // Read ServerReady.
-    std::io::Read::read_exact(stream, &mut len_buf).expect("read ServerReady length");
-    let len = u32::from_le_bytes(len_buf) as usize;
-    assert!(len <= MAX_FRAME_SIZE, "ServerReady frame too large: {len}");
-    std::io::Read::read_exact(stream, &mut payload[..len]).expect("read ServerReady payload");
-    let response = codec::decode_response(&payload[..len]).expect("decode ServerReady");
-    assert!(
-        matches!(response, ResponseKind::ServerReady),
-        "expected ServerReady, got {response:?}"
-    );
-}
-
 /// Connect to UDS server with retry (up to 50 attempts, 10ms apart).
 #[cfg(not(feature = "dpdk"))]
 fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
@@ -2361,7 +2316,11 @@ fn run_uring_roundtrip<R, W, F>(
         .into_par_iter()
         .map(|i| {
             let (mut read_stream, write_stream) = connect();
-            auth_handshake(&mut read_stream, &client_keys[i]);
+            // The sequencer's handshake over the bare, still-blocking
+            // socket: it reads nothing past ServerReady, so the io_uring
+            // loop that takes the descriptor over sees every later frame.
+            melin_client::authenticate(&mut read_stream, &client_keys[i])
+                .unwrap_or_else(|e| panic!("client {i}: auth handshake failed: {e}"));
             (read_stream, write_stream)
         })
         .collect();

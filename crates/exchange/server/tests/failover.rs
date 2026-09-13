@@ -21,7 +21,6 @@
 
 #![cfg(not(feature = "skip-order-exec"))]
 
-use ed25519_dalek::Signer;
 use serial_test::serial;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -537,57 +536,17 @@ fn wait_for_replacement_catchup(primary_health: SocketAddr) {
 /// (e.g. `PROMOTE`, `ROTATE`). Returns the server's first response line
 /// trimmed of whitespace.
 fn admin_command(addr: SocketAddr, operator_key: &SigningKey, command: &str) -> String {
-    use melin_ec_protocol::codec;
-    use melin_ec_protocol::message::{Request, ResponseKind};
-
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .expect("connect to admin endpoint");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
 
-    // Step 1: Receive Challenge.
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).expect("read challenge len");
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    let mut frame_buf = vec![0u8; frame_len];
-    stream
-        .read_exact(&mut frame_buf)
-        .expect("read challenge payload");
-    let nonce = match codec::decode_response(&frame_buf).expect("decode challenge") {
-        ResponseKind::Challenge { nonce } => nonce,
-        other => panic!("expected Challenge, got {other:?}"),
-    };
+    // The admin endpoint authenticates like a node, then speaks text
+    // lines on the same socket.
+    melin_client::authenticate(&mut stream, operator_key).expect("admin auth handshake");
 
-    // Step 2: Sign nonce + ephemerals (TCP path uses zero ephs).
-    let signature = operator_key.sign(&nonce);
-    let request = Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: operator_key.verifying_key().to_bytes(),
-    };
-    let mut encode_buf = [0u8; 256];
-    let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");
-    stream
-        .write_all(&encode_buf[..written])
-        .expect("send ChallengeResponse");
-    stream.flush().expect("flush");
-
-    // Step 3: Read auth result.
-    stream
-        .read_exact(&mut len_buf)
-        .expect("read auth result len");
-    let result_len = u32::from_le_bytes(len_buf) as usize;
-    let mut result_buf = vec![0u8; result_len];
-    stream
-        .read_exact(&mut result_buf)
-        .expect("read auth result payload");
-    match codec::decode_response(&result_buf).expect("decode auth result") {
-        ResponseKind::ServerReady => {}
-        ResponseKind::AuthFailed => panic!("admin auth failed"),
-        other => panic!("unexpected auth response: {other:?}"),
-    }
-
-    // Step 4: Send command + read response line.
+    // Send command + read response line.
     stream
         .write_all(format!("{command}\n").as_bytes())
         .expect("send admin command");

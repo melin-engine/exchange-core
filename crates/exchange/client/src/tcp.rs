@@ -4,7 +4,7 @@
 
 use std::net::SocketAddr;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
@@ -21,11 +21,10 @@ use crate::{ClientError, StatsSnapshot};
 pub struct Client {
     reader: BlockingFrameReader<std::net::TcpStream>,
     writer: BlockingFrameWriter<std::net::TcpStream>,
-    /// Pre-allocated encode buffer. 128 bytes is the upper bound,
-    /// set by ChallengeResponse (4 prefix + 8 seq + 1 tag + 64 sig +
-    /// 32 pubkey + slack). The auth handshake uses its own 256-byte
-    /// stack buffer in `connect()` so this buffer only sees post-auth
-    /// requests in practice — but keep it sized for the worst case.
+    /// Pre-allocated encode buffer. 128 bytes bounds every request this
+    /// client encodes; the handshake frame, the largest on the wire
+    /// (4 prefix + 8 seq + 1 tag + 64 sig + 32 pubkey), is built by the
+    /// sequencer's client in `connect()` and never passes through here.
     encode_buf: [u8; 128],
     /// Per-connection monotonically increasing request sequence number.
     /// Used with the server-side per-key idempotency dedup. Starts at 0
@@ -95,7 +94,7 @@ impl Client {
         key: &SigningKey,
         timeout: Option<std::time::Duration>,
     ) -> Result<Self, ClientError> {
-        let stream = match timeout {
+        let mut stream = match timeout {
             Some(t) => std::net::TcpStream::connect_timeout(&addr, t)?,
             None => std::net::TcpStream::connect(addr)?,
         };
@@ -103,47 +102,14 @@ impl Client {
         if let Some(t) = timeout {
             stream.set_read_timeout(Some(t))?;
         }
-        let mut reader = BlockingFrameReader::new(stream.try_clone()?);
-        let mut writer = BlockingFrameWriter::new(stream);
 
-        // Step 1: Receive Challenge from server.
-        let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
-        let response = codec::decode_response(frame)?;
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
-            _ => {
-                return Err(ClientError::Protocol(ProtocolError::InvalidField(
-                    "expected Challenge",
-                )));
-            }
-        };
+        // Steps 1-4: the sequencer's handshake, run on the bare socket
+        // before the buffered reader exists, so nothing past ServerReady
+        // is read ahead and lost.
+        melin_client::authenticate(&mut stream, key).map_err(handshake_error)?;
 
-        // Step 2: Sign the nonce and send ChallengeResponse.
-        let signature = key.sign(&nonce);
-        let public_key = key.verifying_key().to_bytes();
-        let request = Request::ChallengeResponse {
-            signature: signature.to_bytes(),
-            public_key,
-        };
-        let mut encode_buf = [0u8; 256];
-        let written = codec::encode_request(&request, 0, &mut encode_buf)?;
-        writer.write_frame(&encode_buf[4..written])?;
-        writer.flush()?;
-
-        // Step 3: Wait for ServerReady or AuthFailed.
-        let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
-        let response = codec::decode_response(frame)?;
-        match response {
-            ResponseKind::ServerReady => {}
-            ResponseKind::AuthFailed => {
-                return Err(ClientError::AuthFailed);
-            }
-            _ => {
-                return Err(ClientError::Protocol(ProtocolError::InvalidField(
-                    "expected ServerReady or AuthFailed",
-                )));
-            }
-        }
+        let reader = BlockingFrameReader::new(stream.try_clone()?);
+        let writer = BlockingFrameWriter::new(stream);
 
         let mut client = Self {
             reader,
@@ -265,6 +231,23 @@ impl Client {
         Err(ClientError::Protocol(ProtocolError::InvalidField(
             "no StatsHeader in response",
         )))
+    }
+}
+
+/// The handshake's outcomes in this crate's terms. `authenticate` only
+/// returns the first four; the rest belong to the sequencer's
+/// `Connection` and are folded into an I/O error rather than left
+/// unmapped. A protocol violation keeps its variant and loses its
+/// detail: `ProtocolError` carries no message.
+fn handshake_error(e: melin_client::Error) -> ClientError {
+    match e {
+        melin_client::Error::AuthFailed { .. } => ClientError::AuthFailed,
+        melin_client::Error::Io(e) => ClientError::Io(e),
+        melin_client::Error::Disconnected => ClientError::Disconnected,
+        melin_client::Error::Protocol(_) => {
+            ClientError::Protocol(ProtocolError::InvalidField("auth handshake frame"))
+        }
+        other => ClientError::Io(std::io::Error::other(other.to_string())),
     }
 }
 

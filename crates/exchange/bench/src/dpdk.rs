@@ -1028,21 +1028,12 @@ fn dpdk_auth_all(
         keys.len(),
         "dpdk_auth_all: one key required per connection",
     );
-    use ed25519_dalek::Signer;
-    use melin_ec_protocol::message::Request;
+    use melin_client::{Handshake, Step};
 
-    // Auth states per connection.
-    #[derive(PartialEq)]
-    enum AuthPhase {
-        WaitChallenge,
-        WaitServerReady,
-        Done,
-    }
-
-    let mut phases: Vec<AuthPhase> = connections
-        .iter()
-        .map(|_| AuthPhase::WaitChallenge)
-        .collect();
+    // One handshake state machine per connection: fed each frame smoltcp
+    // delivers, it hands back the response to send. Vec: one per
+    // connection, indexed alongside `connections`.
+    let mut handshakes: Vec<Handshake> = keys.iter().map(Handshake::new).collect();
     let mut recv_buf = [0u8; 512];
 
     loop {
@@ -1063,7 +1054,7 @@ fn dpdk_auth_all(
         let mut all_done = true;
 
         for (i, conn) in connections.iter_mut().enumerate() {
-            if phases[i] == AuthPhase::Done {
+            if handshakes[i].is_done() {
                 continue;
             }
             all_done = false;
@@ -1096,42 +1087,14 @@ fn dpdk_auth_all(
             // Use a cursor approach: process the frame, then compact once.
             let consumed = 4 + frame_len;
 
-            match &phases[i] {
-                AuthPhase::WaitChallenge => {
-                    let response = codec::decode_response(&conn.parse_buf[4..consumed])
-                        .expect("decode Challenge");
-                    let nonce = match response {
-                        ResponseKind::Challenge { nonce } => nonce,
-                        other => panic!("client {i}: expected Challenge, got {other:?}"),
-                    };
-
-                    let conn_key = &keys[i];
-                    let signature = conn_key.sign(&nonce);
-                    let request = Request::ChallengeResponse {
-                        signature: signature.to_bytes(),
-                        public_key: conn_key.verifying_key().to_bytes(),
-                    };
-                    let mut buf = [0u8; 256];
-                    let written = codec::encode_request(&request, 0, &mut buf)
-                        .expect("encode ChallengeResponse");
-
+            match handshakes[i].feed(&conn.parse_buf[4..consumed]) {
+                // The challenge response, length prefix included.
+                Ok(Step::Send(frame)) => {
                     let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
-                    socket
-                        .send_slice(&buf[..written])
-                        .expect("send ChallengeResponse");
-
-                    phases[i] = AuthPhase::WaitServerReady;
+                    socket.send_slice(frame).expect("send ChallengeResponse");
                 }
-                AuthPhase::WaitServerReady => {
-                    let response = codec::decode_response(&conn.parse_buf[4..consumed])
-                        .expect("decode ServerReady");
-                    assert!(
-                        matches!(response, ResponseKind::ServerReady),
-                        "client {i}: expected ServerReady, got {response:?}"
-                    );
-                    phases[i] = AuthPhase::Done;
-                }
-                AuthPhase::Done => unreachable!(),
+                Ok(Step::Ready) => {}
+                Err(e) => panic!("client {i}: auth handshake failed: {e}"),
             }
 
             // Compact parse buffer after processing the frame.

@@ -10,5 +10,6 @@ description = "Blocking client library for the Melin exchange binary protocol"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
+melin-client = { workspace = true }
 melin-ec-protocol = { workspace = true }
 melin-wire-protocol = { workspace = true }

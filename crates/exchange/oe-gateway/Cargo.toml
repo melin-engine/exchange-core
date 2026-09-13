@@ -13,6 +13,7 @@ name = "melin-ec-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]
+melin-client = { workspace = true }
 melin-ec-gateway-core = { workspace = true }
 melin-ec-protocol = { workspace = true }
 melin-ec = { workspace = true }

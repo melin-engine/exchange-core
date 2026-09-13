@@ -9,9 +9,10 @@ use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use tracing::{debug, error, info, warn};
 
+use melin_client::{Handshake, Step};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_ec_types::types::{AccountId, OrderId, Side};
@@ -163,7 +164,6 @@ pub struct Session {
     /// entry matches the next PositionSnapshot. VecDeque for O(1) push/pop.
     pending_positions: VecDeque<String>,
     account_id: AccountId,
-    signing_key: Option<SigningKey>,
     /// Index into config.sessions for this FIX session.
     session_config_idx: Option<usize>,
     /// Monotonic ExecID counter for FIX execution reports (tag 17).
@@ -183,8 +183,10 @@ pub struct Session {
     rate_window_start: Instant,
 
     // ── Auth state ──
-    /// Nonce from the Melin Challenge, kept until auth completes.
-    auth_nonce: Option<[u8; 32]>,
+    /// The Melin handshake in progress, from FIX Logon until the node
+    /// says it is ready. It holds the session's only copy of the signing
+    /// key and drops it the moment the challenge is signed.
+    handshake: Option<Handshake>,
 
     // ── Connect state ──
     /// Stored sockaddr for the io_uring CONNECT SQE lifetime.
@@ -228,7 +230,6 @@ impl Session {
             pending_cancels: HashMap::new(),
             pending_positions: VecDeque::new(),
             account_id: AccountId(0),
-            signing_key: None,
             session_config_idx: None,
             exec_id: 1,
             order_ledger: HashMap::new(),
@@ -237,7 +238,7 @@ impl Session {
             rate_msg_count: 0,
             rate_window_start: now,
 
-            auth_nonce: None,
+            handshake: None,
             connect_addr: None,
             metrics,
         }
@@ -369,7 +370,9 @@ impl Session {
         self.sender_comp_id = sender_comp_id.to_owned();
         self.account_id = AccountId(session_config.account_id);
         self.heartbeat_interval = Duration::from_secs(heartbeat_secs);
-        self.signing_key = Some(signing_key);
+        // The handshake takes its own copy of the key; the one loaded
+        // here is gone when this function returns.
+        self.handshake = Some(Handshake::new(&signing_key));
         self.session_config_idx = Some(cfg_idx);
         self.max_msgs_per_sec = session_config.max_msgs_per_sec;
         self.fix_inbound_seq = 2; // Logon was seq 1.
@@ -411,8 +414,9 @@ impl Session {
         self.melin_parse_buf.drain(..4 + frame_len);
 
         match self.state {
-            SessionState::AwaitingChallenge => self.handle_challenge(&payload, config),
-            SessionState::AwaitingAuthResult => self.handle_auth_result(&payload, config),
+            SessionState::AwaitingChallenge | SessionState::AwaitingAuthResult => {
+                self.handle_handshake_frame(&payload, config)
+            }
             SessionState::SyncingRequestSeq => self.handle_request_seq_sync(&payload, config),
             SessionState::Active => self.handle_active_melin(&payload, config, symbol_map),
             _ => {
@@ -422,68 +426,24 @@ impl Session {
         }
     }
 
-    fn handle_challenge(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
-        let response = match codec::decode_response(payload) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(error = %e, "failed to decode Melin Challenge");
-                self.queue_fix_logout(config, "internal error");
-                return SessionAction::Close;
+    /// Feed one frame to the Melin handshake, in either of its states:
+    /// the challenge, answered with the signed nonce, then the node's
+    /// verdict. The handshake itself knows which it is waiting for.
+    fn handle_handshake_frame(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
+        let Some(handshake) = self.handshake.as_mut() else {
+            error!("Melin frame with no handshake in progress");
+            self.queue_fix_logout(config, "internal error");
+            return SessionAction::Close;
+        };
+
+        match handshake.feed(payload) {
+            Ok(Step::Send(frame)) => {
+                // The challenge response, length prefix included.
+                self.melin_send_buf.extend_from_slice(frame);
+                self.state = SessionState::AwaitingAuthResult;
+                SessionAction::SendMelin
             }
-        };
-
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
-            other => {
-                error!(response = ?other, "expected Challenge from Melin server");
-                self.queue_fix_logout(config, "internal error");
-                return SessionAction::Close;
-            }
-        };
-
-        // Sign the nonce with the session's Ed25519 key.
-        let signing_key = match &self.signing_key {
-            Some(k) => k,
-            None => {
-                error!("no signing key loaded");
-                return SessionAction::Close;
-            }
-        };
-
-        let signature = signing_key.sign(&nonce);
-        let request = Request::ChallengeResponse {
-            signature: signature.to_bytes(),
-            public_key: signing_key.verifying_key().to_bytes(),
-        };
-
-        // Encode ChallengeResponse into Melin send buffer.
-        let written = match codec::encode_request(&request, 0, &mut self.melin_encode_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                error!(error = %e, "failed to encode ChallengeResponse");
-                return SessionAction::Close;
-            }
-        };
-        self.melin_send_buf
-            .extend_from_slice(&self.melin_encode_buf[..written]);
-
-        self.auth_nonce = Some(nonce);
-        self.state = SessionState::AwaitingAuthResult;
-        SessionAction::SendMelin
-    }
-
-    fn handle_auth_result(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
-        let response = match codec::decode_response(payload) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(error = %e, "failed to decode Melin auth result");
-                self.queue_fix_logout(config, "internal error");
-                return SessionAction::Close;
-            }
-        };
-
-        match response {
-            ResponseKind::ServerReady => {
+            Ok(Step::Ready) => {
                 info!(
                     sender = %self.sender_comp_id,
                     "Melin authentication succeeded"
@@ -511,22 +471,20 @@ impl Session {
                 self.melin_send_buf
                     .extend_from_slice(&self.melin_encode_buf[..written]);
 
-                // Clean up auth state now — the signing key isn't needed
-                // again and clearing it early shrinks the window during
-                // which it sits in memory after use.
-                self.auth_nonce = None;
-                self.signing_key = None;
+                // The handshake is over; dropping it drops what was
+                // left of the auth state.
+                self.handshake = None;
 
                 self.state = SessionState::SyncingRequestSeq;
                 SessionAction::SendMelin
             }
-            ResponseKind::AuthFailed => {
+            Err(melin_client::Error::AuthFailed { .. }) => {
                 warn!(sender = %self.sender_comp_id, "Melin authentication failed");
                 self.queue_fix_logout(config, "authentication failed");
                 SessionAction::Close
             }
-            other => {
-                error!(response = ?other, "unexpected Melin auth response");
+            Err(e) => {
+                error!(error = %e, "Melin handshake failed");
                 self.queue_fix_logout(config, "internal error");
                 SessionAction::Close
             }
@@ -2007,7 +1965,7 @@ lot_size_inverse = 1
         assert_eq!(s.sender_comp_id, "FIRM_A");
         assert_eq!(s.account_id, AccountId(7));
         assert_eq!(s.heartbeat_interval, Duration::from_secs(30));
-        assert!(s.signing_key.is_some());
+        assert!(s.handshake.is_some());
         assert_eq!(s.fix_inbound_seq, 2);
     }
 
@@ -2073,17 +2031,20 @@ lot_size_inverse = 1
         s.state = SessionState::AwaitingAuthResult;
         s.sender_comp_id = "FIRM_A".to_owned();
         s.heartbeat_interval = Duration::from_secs(30);
-        s.signing_key = Some(SigningKey::from_bytes(&[0u8; 32]));
-        s.auth_nonce = Some([0u8; 32]);
+        // A handshake that has answered the challenge and awaits the
+        // node's verdict.
+        let mut handshake = Handshake::new(&SigningKey::from_bytes(&[0u8; 32]));
+        let challenge = encode_response_payload(&ResponseKind::Challenge { nonce: [0u8; 32] });
+        assert!(matches!(handshake.feed(&challenge), Ok(Step::Send(_))));
+        s.handshake = Some(handshake);
 
         let payload = encode_response_payload(&ResponseKind::ServerReady);
-        let action = s.handle_auth_result(&payload, &config);
+        let action = s.handle_handshake_frame(&payload, &config);
 
         assert_eq!(action, SessionAction::SendMelin);
         assert!(matches!(s.state, SessionState::SyncingRequestSeq));
-        // Auth state was wiped — signing key out of memory ASAP.
-        assert!(s.signing_key.is_none());
-        assert!(s.auth_nonce.is_none());
+        // Auth state was wiped — the handshake and its key copy are gone.
+        assert!(s.handshake.is_none());
         // FIX Logon ack is NOT sent yet — the client must wait until
         // we've seeded melin_seq from the engine's HWM.
         assert!(s.fix_send_buf.is_empty());
