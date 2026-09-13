@@ -74,7 +74,7 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-#[cfg(not(feature = "dpdk"))]
+use melin_client::Reply;
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::ResponseKind;
 use melin_ec_server::exchange_app::ServerApp;
@@ -2767,10 +2767,10 @@ fn run_uring_loop(
                     }
 
                     let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                    let response = codec::decode_response(frame).expect("decode response");
+                    let reply = melin_client::classify(frame).expect("classify reply");
                     cursor += 4 + frame_len;
 
-                    if matches!(response, ResponseKind::BatchEnd) {
+                    if matches!(reply, Reply::BatchEnd) {
                         // `rdtscp()` is captured FIRST — before any
                         // per-frame bookkeeping (outcome tally, parse
                         // buffer compaction) — so the histogram reflects
@@ -2807,7 +2807,7 @@ fn run_uring_loop(
                     // roundtrip only — adding this counter increment
                     // before `rdtscp()` would inflate every sample by
                     // the cost of this match.
-                    conn.outcomes.record(&response);
+                    conn.outcomes.record(&reply).expect("decode response");
                 }
                 if cursor > 0 {
                     // Shift remaining bytes to front without allocating.
@@ -3059,20 +3059,29 @@ pub(crate) struct OutcomeReport {
 }
 
 impl OutcomeReport {
-    /// Increment the counter that matches `response`. Untracked variants
-    /// (handshake / market-data / stats frames) are ignored.
+    /// Increment the counter that matches one reply frame off the wire,
+    /// as the sequencer's client tells them apart. An application
+    /// response is decoded here, and only an execution report counts:
+    /// stats and market-data frames are not part of the request/ack
+    /// accounting, and neither is a heartbeat. The error is the
+    /// exchange codec's, for a response it cannot decode.
     #[inline]
-    pub fn record(&mut self, response: &ResponseKind) {
-        match response {
-            ResponseKind::BatchEnd => self.batch_ends += 1,
-            ResponseKind::Report(report) => self.record_execution_report(report),
-            ResponseKind::EngineError => self.engine_errors += 1,
-            ResponseKind::ServerBusy => self.server_busy += 1,
-            // Non-trading frames (Challenge, ServerReady, Heartbeat,
-            // AuthFailed, stats/market-data snapshots) — not part of the
-            // request/ack accounting.
-            _ => {}
+    pub fn record(
+        &mut self,
+        reply: &Reply<'_>,
+    ) -> Result<(), melin_wire_protocol::error::ProtocolError> {
+        match *reply {
+            Reply::BatchEnd => self.batch_ends += 1,
+            Reply::EngineError => self.engine_errors += 1,
+            Reply::ServerBusy => self.server_busy += 1,
+            Reply::Heartbeat => {}
+            Reply::Response(bytes) => {
+                if let ResponseKind::Report(report) = codec::decode_response(bytes)? {
+                    self.record_execution_report(&report);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Increment the counter for a single execution-report variant.
@@ -3563,12 +3572,20 @@ mod outcome_report_tests {
         Price(NonZeroU64::new(100).unwrap())
     }
 
+    /// A response as it comes off the wire: the codec's bytes without
+    /// the length prefix, which is what `classify` is fed.
+    fn wire(kind: &ResponseKind) -> Vec<u8> {
+        let mut buf = [0u8; 512];
+        let written = codec::encode_response(kind, &mut buf).unwrap();
+        buf[4..written].to_vec()
+    }
+
     #[test]
     fn records_each_variant_into_the_right_bucket() {
         let (oid, sym, acc) = dummy_order();
         let mut r = OutcomeReport::default();
-        r.record(&ResponseKind::BatchEnd);
-        r.record(&ResponseKind::Report(ExecutionReport::Placed {
+        r.record(&Reply::BatchEnd).unwrap();
+        let placed = wire(&ResponseKind::Report(ExecutionReport::Placed {
             order_id: oid,
             symbol: sym,
             account: acc,
@@ -3576,16 +3593,23 @@ mod outcome_report_tests {
             price: one_price(),
             quantity: one_qty(),
         }));
-        r.record(&ResponseKind::Report(ExecutionReport::Rejected {
+        r.record(&Reply::Response(&placed)).unwrap();
+        let rejected = wire(&ResponseKind::Report(ExecutionReport::Rejected {
             order_id: oid,
             symbol: sym,
             account: acc,
             reason: RejectReason::InsufficientBalance,
         }));
-        r.record(&ResponseKind::EngineError);
-        r.record(&ResponseKind::ServerBusy);
-        // Heartbeat is intentionally untracked.
-        r.record(&ResponseKind::Heartbeat);
+        r.record(&Reply::Response(&rejected)).unwrap();
+        r.record(&Reply::EngineError).unwrap();
+        r.record(&Reply::ServerBusy).unwrap();
+        // Heartbeat is intentionally untracked, and so is a response
+        // that is not an execution report.
+        r.record(&Reply::Heartbeat).unwrap();
+        let hwm = wire(&ResponseKind::RequestSeqHwm { hwm: 3 });
+        r.record(&Reply::Response(&hwm)).unwrap();
+        // A response the codec cannot decode is the caller's to judge.
+        assert!(r.record(&Reply::Response(&[0xFF])).is_err());
 
         assert_eq!(r.batch_ends, 1);
         assert_eq!(r.placed, 1);
@@ -3601,24 +3625,20 @@ mod outcome_report_tests {
     #[test]
     fn merge_sums_all_fields_including_reason_buckets() {
         let (oid, sym, acc) = dummy_order();
-        let mut a = OutcomeReport::default();
-        a.record(&ResponseKind::Report(ExecutionReport::Rejected {
+        let rejected = wire(&ResponseKind::Report(ExecutionReport::Rejected {
             order_id: oid,
             symbol: sym,
             account: acc,
             reason: RejectReason::NoLiquidity,
         }));
-        a.record(&ResponseKind::BatchEnd);
+        let mut a = OutcomeReport::default();
+        a.record(&Reply::Response(&rejected)).unwrap();
+        a.record(&Reply::BatchEnd).unwrap();
 
         let mut b = OutcomeReport::default();
-        b.record(&ResponseKind::Report(ExecutionReport::Rejected {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            reason: RejectReason::NoLiquidity,
-        }));
-        b.record(&ResponseKind::BatchEnd);
-        b.record(&ResponseKind::BatchEnd);
+        b.record(&Reply::Response(&rejected)).unwrap();
+        b.record(&Reply::BatchEnd).unwrap();
+        b.record(&Reply::BatchEnd).unwrap();
 
         a.merge(&b);
         assert_eq!(a.batch_ends, 3);
@@ -3651,9 +3671,9 @@ mod outcome_report_tests {
     #[test]
     fn record_execution_report_and_record_agree_on_report_variants() {
         // Engine and pipeline modes call `record_execution_report`
-        // directly; the network bench reaches it via `record` ->
-        // `ResponseKind::Report(_)`. Both paths must produce identical
-        // counter state for the same input.
+        // directly; the network bench reaches it via `record` on the
+        // wire bytes of a `ResponseKind::Report(_)`. Both paths must
+        // produce identical counter state for the same input.
         let (oid, sym, acc) = dummy_order();
         let rep = ExecutionReport::Rejected {
             order_id: oid,
@@ -3666,7 +3686,8 @@ mod outcome_report_tests {
         via_direct.record_execution_report(&rep);
 
         let mut via_wire = OutcomeReport::default();
-        via_wire.record(&ResponseKind::Report(rep));
+        let bytes = wire(&ResponseKind::Report(rep));
+        via_wire.record(&Reply::Response(&bytes)).unwrap();
 
         assert_eq!(via_direct.rejected, via_wire.rejected);
         assert_eq!(via_direct.reject_reasons, via_wire.reject_reasons);

@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
+use melin_client::Reply;
 
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
@@ -106,7 +107,7 @@ impl Client {
         // Steps 1-4: the sequencer's handshake, run on the bare socket
         // before the buffered reader exists, so nothing past ServerReady
         // is read ahead and lost.
-        melin_client::authenticate(&mut stream, key).map_err(handshake_error)?;
+        melin_client::authenticate(&mut stream, key).map_err(transport_error)?;
 
         let reader = BlockingFrameReader::new(stream.try_clone()?);
         let writer = BlockingFrameWriter::new(stream);
@@ -158,20 +159,23 @@ impl Client {
         self.writer.write_frame(&self.encode_buf[4..written])?;
         self.writer.flush()?;
 
-        // Collect responses until BatchEnd. Heartbeats received during
-        // idle periods are silently consumed (not part of a request batch).
+        // Collect responses until BatchEnd. The sequencer's client tells
+        // the node's frames apart; only application responses reach the
+        // exchange codec. Heartbeats received during idle periods are
+        // silently consumed (not part of a request batch). An engine
+        // error is a per-request outcome the batch still ends normally
+        // after, so it is reported in the batch rather than as an error
+        // that would leave its `BatchEnd` unread on the connection.
         let mut responses = Vec::new();
         loop {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
-            let response = codec::decode_response(frame)?;
-            match response {
-                ResponseKind::BatchEnd => break,
-                ResponseKind::Heartbeat | ResponseKind::ServerReady => continue,
-                ResponseKind::ServerBusy => {
-                    return Err(ClientError::ServerBusy);
-                }
-                other => responses.push(other),
+            match melin_client::classify(frame).map_err(transport_error)? {
+                Reply::Response(bytes) => responses.push(codec::decode_response(bytes)?),
+                Reply::Heartbeat => continue,
+                Reply::BatchEnd => break,
+                Reply::ServerBusy => return Err(ClientError::ServerBusy),
+                Reply::EngineError => responses.push(ResponseKind::EngineError),
             }
         }
 
@@ -234,18 +238,19 @@ impl Client {
     }
 }
 
-/// The handshake's outcomes in this crate's terms. `authenticate` only
-/// returns the first four; the rest belong to the sequencer's
-/// `Connection` and are folded into an I/O error rather than left
-/// unmapped. A protocol violation keeps its variant and loses its
-/// detail: `ProtocolError` carries no message.
-fn handshake_error(e: melin_client::Error) -> ClientError {
+/// The sequencer client's outcomes in this crate's terms. `authenticate`
+/// and `classify` only return the first four; the rest belong to the
+/// sequencer's `Connection` and are folded into an I/O error rather
+/// than left unmapped. A protocol violation — a frame out of place in
+/// the handshake, a reserved tag in a reply — keeps its variant and
+/// loses its detail: `ProtocolError` carries no message.
+fn transport_error(e: melin_client::Error) -> ClientError {
     match e {
         melin_client::Error::AuthFailed { .. } => ClientError::AuthFailed,
         melin_client::Error::Io(e) => ClientError::Io(e),
         melin_client::Error::Disconnected => ClientError::Disconnected,
         melin_client::Error::Protocol(_) => {
-            ClientError::Protocol(ProtocolError::InvalidField("auth handshake frame"))
+            ClientError::Protocol(ProtocolError::InvalidField("frame from the node"))
         }
         other => ClientError::Io(std::io::Error::other(other.to_string())),
     }

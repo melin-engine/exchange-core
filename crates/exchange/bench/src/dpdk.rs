@@ -19,12 +19,11 @@ use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
+use melin_client::Reply;
 use melin_dpdk::device::DpdkDevice;
 use melin_dpdk::eal::Eal;
 use melin_dpdk::mempool::Mempool;
 use melin_dpdk::port::Port;
-use melin_ec_protocol::codec;
-use melin_ec_protocol::message::ResponseKind;
 
 use crate::generator;
 use crate::{
@@ -810,12 +809,12 @@ pub fn run_dpdk_roundtrip(
                 }
 
                 let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                // Decode errors are dropped intentionally: malformed
-                // frames from the server are not the bench's
+                // Malformed frames are dropped intentionally, here and
+                // in the outcome tally below: they are not the bench's
                 // responsibility to diagnose, and panicking would mask
                 // genuine throughput regressions during a long run.
-                if let Ok(response) = codec::decode_response(payload) {
-                    if matches!(response, ResponseKind::BatchEnd) {
+                if let Ok(reply) = melin_client::classify(payload) {
+                    if matches!(reply, Reply::BatchEnd) {
                         diag_batch_ends += 1;
                         // Capture `rdtscp()` BEFORE any per-frame
                         // bookkeeping (outcome tally below) so the
@@ -853,8 +852,9 @@ pub fn run_dpdk_roundtrip(
                     }
                     // Outcome tally runs *after* the latency capture
                     // above so this counter increment is not billed to
-                    // the wire roundtrip.
-                    conn.outcomes.record(&response);
+                    // the wire roundtrip. An undecodable response is
+                    // dropped for the reason given above.
+                    let _ = conn.outcomes.record(&reply);
                 }
 
                 cursor += 4 + frame_len;

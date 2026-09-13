@@ -5,7 +5,7 @@
 //! through a shared `Arc<RwLock<MdState>>`.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,7 +148,7 @@ fn run_session(
             return Ok(());
         }
 
-        let (seq, response) = read_frame(&mut stream)?;
+        let (seq, response) = crate::cold_start::read_response(&mut stream)?;
 
         if let ResponseKind::Report(ref report) = response {
             let sym = report_symbol(report);
@@ -175,24 +175,6 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
         | ExecutionReport::Replaced { symbol, .. }
         | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
     }
-}
-
-/// Read a sequence-prefixed frame (8-byte seq + 4-byte len + payload).
-fn read_frame(stream: &mut TcpStream) -> Result<(u64, ResponseKind), Box<dyn std::error::Error>> {
-    let mut seq_buf = [0u8; 8];
-    stream.read_exact(&mut seq_buf)?;
-    let seq = u64::from_le_bytes(seq_buf);
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    if frame_len > 4096 {
-        return Err(format!("frame too large: {frame_len}").into());
-    }
-    let mut frame_buf = vec![0u8; frame_len];
-    stream.read_exact(&mut frame_buf)?;
-    let response = codec::decode_response(&frame_buf)?;
-    Ok((seq, response))
 }
 
 /// Send a length-prefixed request.

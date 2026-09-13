@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use tracing::{debug, error, info, warn};
 
-use melin_client::{Handshake, Step};
+use melin_client::{Handshake, Reply, Step};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_ec_types::types::{AccountId, OrderId, Side};
@@ -417,11 +417,43 @@ impl Session {
             SessionState::AwaitingChallenge | SessionState::AwaitingAuthResult => {
                 self.handle_handshake_frame(&payload, config)
             }
-            SessionState::SyncingRequestSeq => self.handle_request_seq_sync(&payload, config),
-            SessionState::Active => self.handle_active_melin(&payload, config, symbol_map),
+            SessionState::SyncingRequestSeq => match self.melin_response(&payload) {
+                Some(response) => self.handle_request_seq_sync(response, config),
+                None => SessionAction::None,
+            },
+            SessionState::Active => match self.melin_response(&payload) {
+                Some(response) => self.handle_active_melin(response, config, symbol_map),
+                None => SessionAction::None,
+            },
             _ => {
                 debug!(state = ?self.state, "Melin frame in unexpected state");
                 SessionAction::None
+            }
+        }
+    }
+
+    /// Tell a Melin frame past the handshake apart, the way the
+    /// sequencer's client does: an application response is handed
+    /// back for the exchange codec, everything else is dealt with here.
+    /// A heartbeat and a `BatchEnd` carry nothing the session tracks; a
+    /// busy node and an engine error are logged; a malformed frame is
+    /// dropped, since a bad frame from the engine must not take the
+    /// session down.
+    fn melin_response<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
+        match melin_client::classify(payload) {
+            Ok(Reply::Response(bytes)) => Some(bytes),
+            Ok(Reply::Heartbeat | Reply::BatchEnd) => None,
+            Ok(Reply::ServerBusy) => {
+                warn!(sender = %self.sender_comp_id, "Melin server busy");
+                None
+            }
+            Ok(Reply::EngineError) => {
+                error!(sender = %self.sender_comp_id, "Melin engine error");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "malformed Melin frame");
+                None
             }
         }
     }
@@ -496,8 +528,10 @@ impl Session {
     /// next outbound request increments past whatever the engine has
     /// already accepted under any prior session lifetime, then sends
     /// the FIX Logon ack and unblocks the session into `Active`. The
-    /// `BatchEnd` that arrives after `RequestSeqHwm` is processed by
-    /// `handle_active_melin` (which no-ops it) once we've transitioned.
+    /// `BatchEnd` that follows `RequestSeqHwm`, like a keepalive
+    /// heartbeat before it, never reaches here: the dispatcher drops
+    /// the transport's frames and the session stays parked until the
+    /// real response.
     fn handle_request_seq_sync(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
         let response = match codec::decode_response(payload) {
             Ok(r) => r,
@@ -531,13 +565,6 @@ impl Session {
 
                 self.state = SessionState::Active;
                 SessionAction::SendFix
-            }
-            ResponseKind::BatchEnd | ResponseKind::Heartbeat => {
-                // BatchEnd shouldn't arrive before RequestSeqHwm — engine
-                // emits the query response first — but be defensive: a
-                // stray BatchEnd (or keepalive Heartbeat) doesn't break
-                // anything, just stay parked until the real response.
-                SessionAction::None
             }
             other => {
                 error!(
@@ -1007,17 +1034,6 @@ impl Session {
                         }
                     }
                 }
-            }
-            ResponseKind::BatchEnd | ResponseKind::Heartbeat | ResponseKind::ServerReady => {
-                SessionAction::None
-            }
-            ResponseKind::ServerBusy => {
-                warn!(sender = %self.sender_comp_id, "Melin server busy");
-                SessionAction::None
-            }
-            ResponseKind::EngineError => {
-                error!(sender = %self.sender_comp_id, "Melin engine error");
-                SessionAction::None
             }
             ResponseKind::PositionSnapshot {
                 account: _,
@@ -2078,6 +2094,76 @@ lot_size_inverse = 1
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
         assert_eq!(parsed.msg_type(), tags::MSG_LOGON);
         assert_eq!(parsed.get_str(tags::HEART_BT_INT), Some("30"));
+    }
+
+    /// Queue one length-prefixed Melin frame for the dispatcher.
+    fn push_melin_frame(s: &mut Session, payload: &[u8]) {
+        s.melin_parse_buf
+            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        s.melin_parse_buf.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn transport_frames_keep_the_session_parked_until_the_hwm_arrives() {
+        // The node heartbeats a quiet connection, and the query's batch
+        // ends after its one response. Neither is the response: the
+        // session stays in SyncingRequestSeq, without a word to the FIX
+        // client, until the HWM arrives.
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::SyncingRequestSeq;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.heartbeat_interval = Duration::from_secs(30);
+        s.fix_outbound_seq = 1;
+
+        for transport in [ResponseKind::Heartbeat, ResponseKind::BatchEnd] {
+            push_melin_frame(&mut s, &encode_response_payload(&transport));
+            let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+            assert_eq!(action, SessionAction::None, "{transport:?}");
+            assert!(matches!(s.state, SessionState::SyncingRequestSeq));
+            assert!(s.fix_send_buf.is_empty());
+        }
+
+        push_melin_frame(
+            &mut s,
+            &encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 5 }),
+        );
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::SendFix);
+        assert!(matches!(s.state, SessionState::Active));
+        assert_eq!(s.melin_seq, 5);
+    }
+
+    #[test]
+    fn transport_frames_are_dropped_while_active() {
+        // Heartbeats, batch ends, a busy node, an engine error, and a
+        // frame with a reserved tag (the handshake's ServerReady, over
+        // long ago) are the transport's business: none produces FIX
+        // traffic or moves the session.
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        for transport in [
+            ResponseKind::Heartbeat,
+            ResponseKind::BatchEnd,
+            ResponseKind::ServerBusy,
+            ResponseKind::EngineError,
+            ResponseKind::ServerReady,
+        ] {
+            push_melin_frame(&mut s, &encode_response_payload(&transport));
+            let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+            assert_eq!(action, SessionAction::None, "{transport:?}");
+            assert!(matches!(s.state, SessionState::Active));
+            assert!(s.fix_send_buf.is_empty());
+        }
+        // An empty frame is a protocol violation, dropped the same way.
+        push_melin_frame(&mut s, &[]);
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::None);
+        assert!(matches!(s.state, SessionState::Active));
+        assert!(s.melin_parse_buf.is_empty());
     }
 
     #[test]
