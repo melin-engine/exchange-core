@@ -1689,6 +1689,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-client"
+version = "0.15.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#ab73ffb5b6417573339c34177fea0d0c34c0cd62"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "melin-wire-protocol",
+]
+
+[[package]]
 name = "melin-dpdk"
 version = "0.15.0"
 source = "git+https://github.com/melin-engine/melin.git?branch=main#ab73ffb5b6417573339c34177fea0d0c34c0cd62"
@@ -1722,6 +1732,7 @@ dependencies = [
  "base64",
  "crossterm",
  "ed25519-dalek",
+ "melin-client",
  "melin-ec-client",
  "melin-ec-protocol",
  "rand 0.10.2",
@@ -1790,7 +1801,7 @@ name = "melin-ec-market-data"
 version = "0.15.0"
 dependencies = [
  "astenn",
- "ed25519-dalek",
+ "melin-client",
  "melin-ec-protocol",
  "melin-ec-types",
  "melin-wire-protocol",

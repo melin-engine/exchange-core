@@ -10,13 +10,11 @@
 //! Example:
 //!   melin-ec-promote 127.0.0.1:9878 ops.key
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::time::Duration;
 
-use ed25519_dalek::{Signer, SigningKey};
-use melin_ec_protocol::codec;
-use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_client::{Connection, Error, key};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -38,114 +36,43 @@ fn main() {
         }
     };
 
-    // Load the operator signing key (32-byte raw Ed25519 seed).
-    let seed = match std::fs::read(&args[2]) {
-        Ok(s) => s,
+    // The operator signing key: a raw 32-byte Ed25519 seed, or the PKCS#8
+    // PEM `openssl genpkey` writes.
+    let signing_key = match key::load_signing_key(Path::new(&args[2])) {
+        Ok(k) => k,
         Err(e) => {
-            eprintln!("error: failed to read key file '{}': {e}", args[2]);
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
-    if seed.len() != 32 {
-        eprintln!(
-            "error: key file must be exactly 32 bytes (got {})",
-            seed.len()
-        );
-        std::process::exit(1);
-    }
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&seed);
-    let signing_key = SigningKey::from_bytes(&key_bytes);
 
+    // The promotion endpoint authenticates exactly like a node — the
+    // Ed25519 challenge-response the sequencer's client implements — and
+    // then speaks text lines, so the socket is taken back once the
+    // handshake is done.
     eprintln!("Connecting to {addr}...");
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to connect to {addr}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set read timeout");
-
-    // --- Ed25519 challenge-response authentication ---
-
-    // Step 1: Receive Challenge (32-byte nonce).
-    let mut len_buf = [0u8; 4];
-    if let Err(e) = stream.read_exact(&mut len_buf) {
-        eprintln!("error: failed to read challenge: {e}");
+    let mut connection =
+        match Connection::connect_timeout(addr, &signing_key, Duration::from_secs(5)) {
+            Ok(c) => c,
+            Err(Error::AuthFailed { .. }) => {
+                eprintln!(
+                    "error: authentication failed — key not authorized or not an operator key"
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    eprintln!("Authenticated.");
+    // A promotion can take a moment on a busy replica: longer than the
+    // connect and handshake bound.
+    if let Err(e) = connection.set_read_timeout(Duration::from_secs(10)) {
+        eprintln!("error: failed to set read timeout: {e}");
         std::process::exit(1);
     }
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    let mut frame_buf = vec![0u8; frame_len];
-    if let Err(e) = stream.read_exact(&mut frame_buf) {
-        eprintln!("error: failed to read challenge payload: {e}");
-        std::process::exit(1);
-    }
-    let nonce = match codec::decode_response(&frame_buf) {
-        Ok(ResponseKind::Challenge { nonce }) => nonce,
-        Ok(other) => {
-            eprintln!("error: expected Challenge, got {other:?}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: failed to decode challenge: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Step 2: Sign the nonce.
-    let signature = signing_key.sign(&nonce);
-    let request = Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: signing_key.verifying_key().to_bytes(),
-    };
-    let mut encode_buf = [0u8; 256];
-    let written = match codec::encode_request(&request, 0, &mut encode_buf) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("error: failed to encode ChallengeResponse: {e}");
-            std::process::exit(1);
-        }
-    };
-    // Send the full frame (length prefix + payload) — the server reads
-    // the 4-byte length first, then the payload.
-    if let Err(e) = stream.write_all(&encode_buf[..written]) {
-        eprintln!("error: failed to send ChallengeResponse: {e}");
-        std::process::exit(1);
-    }
-    stream.flush().expect("flush");
-
-    // Step 3: Read auth result (ServerReady or AuthFailed).
-    if let Err(e) = stream.read_exact(&mut len_buf) {
-        eprintln!("error: failed to read auth result: {e}");
-        std::process::exit(1);
-    }
-    let result_len = u32::from_le_bytes(len_buf) as usize;
-    let mut result_buf = vec![0u8; result_len];
-    if let Err(e) = stream.read_exact(&mut result_buf) {
-        eprintln!("error: failed to read auth result payload: {e}");
-        std::process::exit(1);
-    }
-    match codec::decode_response(&result_buf) {
-        Ok(ResponseKind::ServerReady) => {
-            eprintln!("Authenticated.");
-        }
-        Ok(ResponseKind::AuthFailed) => {
-            eprintln!("error: authentication failed — key not authorized or not an operator key");
-            std::process::exit(1);
-        }
-        Ok(other) => {
-            eprintln!("error: unexpected response: {other:?}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: failed to decode auth result: {e}");
-            std::process::exit(1);
-        }
-    }
+    let mut stream = connection.into_stream();
 
     // --- Send PROMOTE command ---
     if let Err(e) = stream.write_all(b"PROMOTE\n") {

@@ -9,10 +9,10 @@ authors.workspace = true
 description = "Order book mirror and trade history reconstructed from execution reports"
 
 [dependencies]
+melin-client = { workspace = true }
 melin-ec-types = { workspace = true }
 melin-ec-protocol = { workspace = true }
 melin-wire-protocol = { workspace = true }
-ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
 astenn = "0.1"
 rustc-hash = "2"
