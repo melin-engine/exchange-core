@@ -136,7 +136,7 @@ samples count without further coordination.
 | `--accounts` | 10,000 | Number of trading accounts in the generator. |
 | `--instruments` | 100 | Number of instruments. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
-| `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
+| `--key <PATH>` | (none) | Path to the Ed25519 private key: a 32-byte raw seed, or a PKCS#8 PEM as written by `openssl genpkey -algorithm ed25519`. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
 | `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). For roundtrip runs against the embedded server, N must be higher than every core in the server's `--cores` list, which is the authoritative layout — use 12. Use 1 for remote benchmarks on a dedicated machine with `isolcpus`, where no server shares the host. |
 | `--pipeline-cores <LAYOUT>` | `journal-seq=1,matching=2,publisher=3,journal-disk=4,drain=5` | Pipeline-mode core assignment as `thread=core` entries in any order, one per thread, the shape of the server's `--cores`. Applies to `--mode pipeline` only, which runs its own in-process pipeline rather than talking to a server. All five threads busy-spin, so a duplicate core is rejected before anything is spawned. `0` leaves a thread unpinned and `none` leaves them all unpinned. Keep `journal-seq` and `journal-disk` on the same CCD — they exchange a cache line on every batch. |
 

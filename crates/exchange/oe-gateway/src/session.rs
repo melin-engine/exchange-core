@@ -9,7 +9,6 @@ use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
 use tracing::{debug, error, info, warn};
 
 use melin_client::{Handshake, Reply, Step};
@@ -356,8 +355,9 @@ impl Session {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
 
-        // Load the signing key for Melin authentication.
-        let signing_key = match load_signing_key(&session_config.key_path) {
+        // Load the signing key for Melin authentication: a raw 32-byte
+        // seed or a PKCS#8 PEM, as the sequencer's client reads them.
+        let signing_key = match melin_client::key::load_signing_key(&session_config.key_path) {
             Ok(k) => k,
             Err(e) => {
                 error!(error = %e, "failed to load signing key");
@@ -1800,11 +1800,6 @@ fn rebuild_with_poss_dup(stored_bytes: &[u8], sender: &str, target: &str) -> Vec
     builder.build(sender, target, seq)
 }
 
-/// Delegates to `melin_ec_gateway_core::auth::load_signing_key`.
-fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
-    melin_ec_gateway_core::auth::load_signing_key(path)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2038,6 +2033,7 @@ lot_size_inverse = 1
         buf[4..n].to_vec()
     }
 
+    use ed25519_dalek::SigningKey;
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec;
 

@@ -1990,19 +1990,11 @@ fn run_roundtrip_bench(
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Load a 32-byte raw Ed25519 private key from a file.
+/// The bench's Ed25519 key, from a raw 32-byte seed or a PKCS#8 PEM as
+/// the sequencer's client reads them. A bench without its key cannot
+/// run, so the error is fatal here rather than at every call site.
 fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("cannot read key file {}: {e}", path.display()));
-    if bytes.len() != 32 {
-        panic!(
-            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
-            bytes.len()
-        );
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    ed25519_dalek::SigningKey::from_bytes(&seed)
+    melin_client::key::load_signing_key(path).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Start the server on a background thread. The listener is already bound,

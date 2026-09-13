@@ -13,6 +13,7 @@ name = "melin-ec-tui"
 path = "src/main.rs"
 
 [dependencies]
+melin-client = { workspace = true }
 melin-ec-client = { workspace = true }
 melin-ec-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }

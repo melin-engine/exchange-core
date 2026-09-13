@@ -815,19 +815,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read key file {path}: {e}"));
-    if bytes.len() != 32 {
-        panic!(
-            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
-            bytes.len()
-        );
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    ed25519_dalek::SigningKey::from_bytes(&seed)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::args()
         .nth(1)
@@ -837,7 +824,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| panic!("usage: trading-tui <addr> <key-file>"));
-    let key = load_signing_key(&key_path);
+    // A raw 32-byte seed or a PKCS#8 PEM, as the sequencer's client
+    // reads them.
+    let key = melin_client::key::load_signing_key(std::path::Path::new(&key_path))?;
 
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (response_tx, response_rx) = mpsc::channel::<String>();

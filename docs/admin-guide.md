@@ -53,7 +53,7 @@ melin-ec-admin <addr> <key-file>
 ```
 
 - `<addr>` -- server socket address, e.g. `127.0.0.1:9000` or `10.0.0.1:9000`
-- `<key-file>` -- path to the `.key` file (32-byte raw seed)
+- `<key-file>` -- path to the private key: the `.key` file (32-byte raw seed), or a PKCS#8 PEM as written by `openssl genpkey -algorithm ed25519`
 
 **Example:**
 

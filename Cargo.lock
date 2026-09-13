@@ -1794,7 +1794,6 @@ dependencies = [
 name = "melin-ec-gateway-core"
 version = "0.15.0"
 dependencies = [
- "ed25519-dalek",
  "proptest",
 ]
 
@@ -1910,6 +1909,7 @@ version = "0.15.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
+ "melin-client",
  "melin-ec-client",
  "melin-ec-protocol",
  "ratatui",
