@@ -49,24 +49,20 @@ melin-ec-types = { path = "crates/exchange/types", version = "0.15.0" }
 # Melin sequencer crates, consumed from crates.io and released from the
 # separate sequencer repository. Kept as a group distinct from the exchange
 # crates above: the sequencer moves on its own schedule and the two version
-# numbers only happen to coincide today. All eight must be bumped together —
-# a straggler mixes journal/wire formats across the pipeline rather than
-# just looking untidy.
-#
-# Temporarily pinned to the sequencer's `main` branch to validate the
-# upcoming 0.16 release ahead of time; switch back to a crates.io version
-# once 0.16 is published.
-melin-app = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
+# numbers need not coincide. All eight must be bumped together — a straggler
+# mixes journal/wire formats across the pipeline rather than just looking
+# untidy.
+melin-app = "0.16.0"
 # The node's own wire-protocol client: framing, the Ed25519 handshake and
 # the reply batch. Every tool here that talks to a node authenticates
 # through it rather than re-rolling the handshake.
-melin-client = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
-melin-dpdk = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
-melin-journal = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
-melin-pipeline = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
-melin-server-runtime = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
-melin-transport-core = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
-melin-wire-protocol = { git = "https://github.com/melin-engine/melin.git", branch = "main" }
+melin-client = "0.16.0"
+melin-dpdk = "0.16.0"
+melin-journal = "0.16.0"
+melin-pipeline = "0.16.0"
+melin-server-runtime = "0.16.0"
+melin-transport-core = "0.16.0"
+melin-wire-protocol = "0.16.0"
 
 base64 = "0.22"
 blake3 = "1"
