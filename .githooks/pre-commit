@@ -7,7 +7,9 @@
 #   1. Cargo.lock is staged when modified (prevents dep drift)
 #   2. cargo fmt (formatting)
 #   3. cargo clippy on all targets with warnings as errors
-#   4. cargo nextest run, falling back to cargo test if nextest is missing
+#   4. non-default configurations: the DPDK builds and the binaries gated
+#      behind required-features
+#   5. cargo nextest run, falling back to cargo test if nextest is missing
 
 set -e
 
@@ -38,7 +40,39 @@ if ! cargo clippy --all-targets -- -D warnings 2>"$STDERR_LOG"; then
     exit 1
 fi
 
-# 4. Tests. Prefer cargo-nextest (~3× faster on the failover suite via
+# 4. Non-default configurations. Steps 3 and 5 build the default feature
+# set only, so code it does not select can stop compiling without anything
+# noticing. Two kinds of it matter here:
+#
+#   * the DPDK transport, which production kernel-bypass deployments run
+#     and which `--no-default-features` builds on its own feature set;
+#   * binaries declared with `required-features`, which cargo silently
+#     skips — the 0.15 upgrade shipped a broken `melin-ec-replication-bench`
+#     and `melin-ec-plot` because of it.
+#
+# `check` rather than `clippy`: catching compile rot is the point, and it
+# costs seconds on a warm target. Each configuration keeps its own
+# artifacts, so the rebuild is paid once, not per commit. The DPDK builds
+# need the DPDK libraries installed.
+#
+# Each entry is one `cargo check` argument list; word splitting is intended.
+FEATURE_CHECKS=(
+    "-p melin-ec-server --no-default-features --features dpdk"
+    "-p melin-ec-server --no-default-features --features dpdk,skip-order-exec"
+    "-p melin-ec-bench --no-default-features --features dpdk"
+    "-p melin-ec-server --features skip-order-exec --bin melin-ec-replication-bench"
+    "-p melin-ec-bench --features plot --bin melin-ec-plot"
+)
+for args in "${FEATURE_CHECKS[@]}"; do
+    # shellcheck disable=SC2086
+    if ! cargo check $args 2>"$STDERR_LOG"; then
+        cat "$STDERR_LOG" >&2
+        echo "error: 'cargo check $args' failed."
+        exit 1
+    fi
+done
+
+# 5. Tests. Prefer cargo-nextest (~3× faster on the failover suite via
 # per-test process isolation) and fall back to cargo test if it isn't
 # installed. Install with `cargo install cargo-nextest --locked`.
 if command -v cargo-nextest >/dev/null 2>&1; then
