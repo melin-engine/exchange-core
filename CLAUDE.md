@@ -31,7 +31,14 @@
 - **Never push without explicit confirmation** — always ask for review before pushing. Do not push unless the user confirms.
 - **Commit intermediary steps** — for large multi-step tasks, commit each logical step separately rather than batching everything into one giant commit. This keeps history clean and bisectable. Always ask for review after each commit before moving to the next.
 - **Always check `Cargo.lock`** — when dependencies change, `Cargo.lock` must be staged and committed alongside `Cargo.toml` changes. The pre-commit hook enforces this.
-- **Never skip hooks** — do not use `--no-verify` to bypass the pre-commit hook. If the hook fails (clippy warnings, formatting), fix the issue first. The hook exists to catch problems before they enter history.
+- **Never skip hooks** — do not use `--no-verify` to bypass the pre-commit hook. If the hook fails (clippy warnings, formatting), fix the issue first. The hook exists to catch problems before they enter history. It runs fmt, clippy, the DPDK builds, the `required-features` binaries (`melin-ec-replication-bench`, `melin-ec-plot`) and the test suite; install it with `git config core.hooksPath .githooks`.
+- **Changelog** — record every operator- or dependent-visible change under `## [Unreleased]` in `CHANGELOG.md` ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)) in the same branch that makes it. Call out anything that breaks a deployment or a Rust dependent under **Changed** or **Removed**, and mark changes inherited from the sequencer *(sequencer)*.
+
+### Releases
+- **`scripts/release.sh <X.Y.Z>`** cuts a release: bumps the workspace version and the `melin-ec*` pins, promotes the changelog's Unreleased section, stamps the BSL Change Date into `LICENSE`, commits `chore(release): X.Y.Z` on `release/X.Y.Z` (the pre-commit hook is the release gate), and tags `vX.Y.Z`. Without `--execute` it is a full rehearsal that restores the repository afterwards; with it, it pushes and runs `scripts/publish.sh --execute`.
+- **Before a release**, run `cargo update` as its own `chore(deps)` commit on `main`; the release script deliberately refreshes only workspace members.
+- **After a release**, merge `release/X.Y.Z` into `main` with `--no-ff`.
+- **`scripts/publish.sh`** publishes through `cargo publish --workspace`, skipping versions already on crates.io, so an interrupted publish resumes by re-running it. Without `--execute` it is a packaging dry run.
 
 ## Key Design Constraints
 
