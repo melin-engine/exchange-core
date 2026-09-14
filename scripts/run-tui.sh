@@ -97,4 +97,4 @@ if [ "$BOT" -eq 1 ]; then
     TUI_ARGS+=(--bot)
 fi
 
-cargo run -p melin-tui-fix-client -- "${TUI_ARGS[@]}"
+cargo run -p melin-ec-tui-fix-client -- "${TUI_ARGS[@]}"

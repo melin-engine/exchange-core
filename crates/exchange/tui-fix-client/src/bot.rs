@@ -4,8 +4,8 @@
 //! parameter sampling, and FIX message construction can be unit tested
 //! without opening a real gateway connection.
 
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
 
 // --- Price model ---
 
@@ -129,7 +129,7 @@ pub(crate) fn build_bot_nos(clord: &str, order: &BotOrder) -> FixMessageBuilder 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::parse::FixMessage;
+    use melin_ec_gateway_core::fix::parse::FixMessage;
 
     // --- bot_mid_price ---
 

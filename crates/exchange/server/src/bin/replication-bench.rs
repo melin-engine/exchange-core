@@ -35,25 +35,26 @@ use ed25519_dalek::SigningKey;
 
 use melin_app::auth::AuthorizedKeys;
 use melin_app::unix_epoch_nanos;
+use melin_ec_server::exchange_app::ServerApp;
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
-use melin_server::exchange_app::ServerApp;
+use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::replication::{
     ReplicaControlPlane, ReplicationListener, ReplicationMetrics, Sender, run_receiver, run_sender,
 };
-use melin_server_runtime::server::PipelineCores;
-use melin_trading::trading_event::TradingEvent;
+use melin_server_runtime::server::{PipelineCores, Placement};
 type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
 type OutputSlot = melin_transport_core::pipeline::OutputSlot<
-    melin_types::types::ExecutionReport,
-    melin_types::types::QueryResponse,
+    melin_ec_types::types::ExecutionReport,
+    melin_ec_types::types::QueryResponse,
 >;
+use melin_ec_types::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
-use melin_transport_core::pipeline::build_pipeline_with_replication;
+use melin_transport_core::pipeline::{StageWaits, build_pipeline_with_replication};
 use melin_transport_core::trace::mono_trace_ns;
-use melin_types::types::{AccountId, CurrencyId};
 
 #[derive(Parser)]
 struct Args {
@@ -84,19 +85,19 @@ struct Args {
     #[arg(long, value_enum, default_value_t = AckPolicy::DiskAndRam)]
     ack_policy: AckPolicy,
 
-    /// Primary-side core assignment, comma-separated IDs in the order
-    /// `generator,journal,matching,drain,repl-sender,handler-0,handler-1`
-    /// plus an optional eighth `journal-disk` entry for the journal's disk
-    /// thread (omitted = unpinned, same rule as the server's `--cores`).
-    /// 0 leaves an entry unpinned, and omitting the flag leaves every
-    /// primary thread unpinned — which is only sane on a host without
-    /// isolated cores. Under `isolcpus` the scheduler will not migrate a
-    /// thread onto or between isolated cores, so unpinned threads all
-    /// inherit whichever core the process started on and the whole bench
-    /// measures one core's worth of contention. Suggested on a 16-core
-    /// host: `--cores 1,2,3,4,5,6,7,8`.
-    #[arg(long, value_delimiter = ',')]
-    cores: Option<Vec<usize>>,
+    /// Primary-side core assignment as `thread=core` entries in any
+    /// order, one per thread — `generator`, `journal-seq`, `matching`,
+    /// `drain`, `repl-sender`, `handler-0`, `handler-1` and
+    /// `journal-disk` — the shape of the server's `--cores`. `0` leaves a
+    /// thread unpinned and `none` leaves them all unpinned, as does
+    /// omitting the flag — which is only sane on a host without isolated
+    /// cores. Under `isolcpus` the scheduler will not migrate a thread
+    /// onto or between isolated cores, so unpinned threads all inherit
+    /// whichever core the process started on and the whole bench measures
+    /// one core's worth of contention. Suggested on a 16-core host:
+    /// `--cores generator=1,journal-seq=2,matching=3,drain=4,repl-sender=5,handler-0=6,handler-1=7,journal-disk=8`.
+    #[arg(long)]
+    cores: Option<String>,
 
     /// First core of each replica's own pipeline, one entry per replica.
     /// Replica `i` takes `base..=base+4` for its journal, matching, drain,
@@ -111,10 +112,18 @@ struct Args {
 /// Threads a replica pins out of its `--replica-cores` base.
 const CORES_PER_REPLICA: usize = 5;
 
-/// Required `--cores` entries: generator, journal, matching, drain,
-/// repl-sender, handler-0, handler-1. The optional eighth entry is the
-/// journal-disk core.
-const PRIMARY_CORE_SLOTS: usize = 7;
+/// The primary's threads as `--cores` names them, in the order
+/// [`PrimaryCores`] lists its fields.
+const PRIMARY_THREADS: [&str; 8] = [
+    "generator",
+    "journal-seq",
+    "matching",
+    "drain",
+    "repl-sender",
+    "handler-0",
+    "handler-1",
+    "journal-disk",
+];
 
 /// Primary-side core assignment, resolved from `--cores`. All-zero (every
 /// thread unpinned) is the default, preserving the behavior of runs from
@@ -122,7 +131,7 @@ const PRIMARY_CORE_SLOTS: usize = 7;
 #[derive(Debug, Clone, Copy, Default)]
 struct PrimaryCores {
     generator: usize,
-    journal: usize,
+    journal_seq: usize,
     matching: usize,
     drain: usize,
     repl_sender: usize,
@@ -151,34 +160,26 @@ fn pin(label: &str, core: usize) {
 /// threads are SCHED_FIFO once pinned, so one spins and the other starves,
 /// and the run reports a plausible-looking but meaningless number.
 fn resolve_cores(
-    cores: Option<&Vec<usize>>,
+    cores: Option<&str>,
     replica_cores: Option<&Vec<usize>>,
     n_replicas: usize,
 ) -> Result<(PrimaryCores, Vec<usize>), String> {
     let primary = match cores {
         None => PrimaryCores::default(),
-        Some(v) if v.len() == PRIMARY_CORE_SLOTS || v.len() == PRIMARY_CORE_SLOTS + 1 => {
+        Some(spec) => {
+            // One core per `PRIMARY_THREADS` entry, in that order.
+            let c =
+                melin_ec_server::named_cores::parse_named_cores("--cores", spec, &PRIMARY_THREADS)?;
             PrimaryCores {
-                generator: v[0],
-                journal: v[1],
-                matching: v[2],
-                drain: v[3],
-                repl_sender: v[4],
-                handler_0: v[5],
-                handler_1: v[6],
-                // Optional trailing entry; omitted leaves the disk thread
-                // unpinned so seven-entry invocations keep their layout.
-                journal_disk: v.get(PRIMARY_CORE_SLOTS).copied().unwrap_or(0),
+                generator: c[0],
+                journal_seq: c[1],
+                matching: c[2],
+                drain: c[3],
+                repl_sender: c[4],
+                handler_0: c[5],
+                handler_1: c[6],
+                journal_disk: c[7],
             }
-        }
-        Some(v) => {
-            return Err(format!(
-                "--cores expects {PRIMARY_CORE_SLOTS} or {} comma-separated IDs \
-                 (generator,journal,matching,drain,repl-sender,handler-0,handler-1, \
-                 then optionally journal-disk), got {}",
-                PRIMARY_CORE_SLOTS + 1,
-                v.len()
-            ));
         }
     };
 
@@ -197,7 +198,7 @@ fn resolve_cores(
     // sides of the clash rather than just the number.
     let mut claimed: Vec<(usize, String)> = vec![
         (primary.generator, "generator".to_string()),
-        (primary.journal, "journal".to_string()),
+        (primary.journal_seq, "journal-seq".to_string()),
         (primary.matching, "matching".to_string()),
         (primary.drain, "drain".to_string()),
         (primary.repl_sender, "repl-sender".to_string()),
@@ -209,9 +210,15 @@ fn resolve_cores(
         if *base == 0 {
             continue;
         }
-        for (offset, role) in ["journal", "matching", "drain", "receiver", "journal-disk"]
-            .iter()
-            .enumerate()
+        for (offset, role) in [
+            "journal-seq",
+            "matching",
+            "drain",
+            "receiver",
+            "journal-disk",
+        ]
+        .iter()
+        .enumerate()
         {
             claimed.push((base + offset, format!("replica-{i} {role}")));
         }
@@ -246,6 +253,16 @@ const HEARTBEAT_SECS: u64 = 5;
 fn main() {
     let args = Args::parse();
     let busy_spin = !args.no_busy_spin;
+    // One wait policy for every thread, pinned or not. This bench has
+    // always let unpinned threads spin (and warns when nothing is pinned
+    // at all); the server's layout check does not run here, so the
+    // placements below may pair an unpinned core with a spinner.
+    let wait = if busy_spin {
+        WaitStrategy::BusySpin
+    } else {
+        WaitStrategy::SpinThenYield
+    };
+    let place = |core: usize| Placement { core, wait };
     let ack_policy = args.ack_policy;
 
     let n_replicas = args.replicas;
@@ -257,14 +274,17 @@ fn main() {
         std::process::exit(2);
     }
 
-    let (primary_cores, replica_bases) =
-        match resolve_cores(args.cores.as_ref(), args.replica_cores.as_ref(), n_replicas) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                eprintln!("FATAL: {e}");
-                std::process::exit(2);
-            }
-        };
+    let (primary_cores, replica_bases) = match resolve_cores(
+        args.cores.as_deref(),
+        args.replica_cores.as_ref(),
+        n_replicas,
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            std::process::exit(2);
+        }
+    };
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -282,10 +302,10 @@ fn main() {
         );
     } else {
         eprintln!(
-            "  primary: generator={} journal={} matching={} drain={} repl-sender={} \
+            "  primary: generator={} journal-seq={} matching={} drain={} repl-sender={} \
              handlers={},{} journal-disk={}",
             primary_cores.generator,
-            primary_cores.journal,
+            primary_cores.journal_seq,
             primary_cores.matching,
             primary_cores.drain,
             primary_cores.repl_sender,
@@ -334,7 +354,7 @@ fn main() {
 
     // --- Tempdir for journal files ---
     let tmp_root: PathBuf =
-        std::env::temp_dir().join(format!("melin-replication-bench-{}", std::process::id()));
+        std::env::temp_dir().join(format!("melin-ec-replication-bench-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_root).expect("mkdir tempdir");
     let primary_journal: PathBuf = tmp_root.join("primary.journal");
 
@@ -343,7 +363,7 @@ fn main() {
     // exercised separately in pipeline tests until the boot-site
     // dispatch refactor lands.
     let engine = JournaledApp::<ServerApp, melin_journal::BufferedWriter<_>>::create(
-        ServerApp(melin_exchange_core::exchange::Exchange::with_capacity()),
+        ServerApp(melin_ec::exchange::Exchange::with_capacity()),
         &primary_journal,
     )
     .expect("create primary journal");
@@ -360,7 +380,7 @@ fn main() {
         true, // enable_replication
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_SIZE,
-        busy_spin,
+        StageWaits::uniform(wait),
         false, // enable_event_publisher
         false, // enable_shadow
         Arc::clone(&primary_fence),
@@ -368,8 +388,8 @@ fn main() {
 
     let mut input_producer = pipeline.input_producer;
     let mut journal_stage = pipeline.journal_stage;
-    // The stage spawns its disk thread itself, from the journal thread,
-    // so the core has to be handed over before `run`.
+    // `start` launches the disk thread from the thread that calls it and
+    // reads the core then, so hand it over first.
     journal_stage.set_disk_core(primary_cores.journal_disk);
     let matching_stage = pipeline.matching_stage;
     let mut output_consumers = pipeline.output_consumers;
@@ -402,12 +422,15 @@ fn main() {
 
     // --- Spawn primary pipeline stages ---
     let s = Arc::clone(&shutdown);
-    let journal_core = primary_cores.journal;
+    let journal_core = primary_cores.journal_seq;
+    // Started here, on the spawning thread, so the journal's disk and
+    // preparer threads do not inherit the journal thread's pin.
+    let sequencer = journal_stage.start().expect("start journal stage");
     let journal_handle = std::thread::Builder::new()
         .name("bench-journal".into())
         .spawn(move || {
             pin("journal", journal_core);
-            let _ = journal_stage.run(&s);
+            let _ = sequencer.run(&s);
         })
         .expect("spawn journal");
 
@@ -430,17 +453,16 @@ fn main() {
             pin("drain", drain_core);
             let mut consumer = output_consumer_0;
             let mut batch = vec![OutputSlot::default(); 256];
+            let mut waiter = wait.waiter();
             loop {
                 if s.load(Ordering::Relaxed) {
                     return;
                 }
                 let n = consumer.consume_batch(&mut batch, 256);
                 if n == 0 {
-                    if busy_spin {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
+                    waiter.idle();
+                } else {
+                    waiter.reset();
                 }
             }
         })
@@ -471,10 +493,12 @@ fn main() {
         evict_flags: replication_ring_progress.evict_flags.clone(),
         active_flags: replication_ring_progress.active_flags.clone(),
         metrics: Arc::clone(&metrics),
-        handler_cores: [primary_cores.handler_0, primary_cores.handler_1],
+        handlers: [
+            place(primary_cores.handler_0),
+            place(primary_cores.handler_1),
+        ],
         batch_size: BATCH_SIZE,
         heartbeat_secs: HEARTBEAT_SECS,
-        busy_spin,
         fence_state: Arc::clone(&primary_fence),
     };
 
@@ -510,18 +534,18 @@ fn main() {
         let base = replica_bases[i];
         let replica_core = |offset: usize| if base == 0 { 0 } else { base + offset };
         let cores = PipelineCores {
-            journal: replica_core(0),
-            matching: replica_core(1),
-            response: replica_core(2),
-            reader: replica_core(3),
-            event_publisher: 0,
+            journal_seq: place(replica_core(0)),
+            matching: place(replica_core(1)),
+            response: place(replica_core(2)),
+            reader: place(replica_core(3)),
+            event_publisher: Placement::unpinned(),
             // Unpinned: this bench sets a snapshot interval of ~35 days, so
             // the shadow stage never does any work worth a core.
-            shadow: 0,
-            repl_handler_0: 0,
-            repl_handler_1: 0,
-            journal_prep: 0,
-            journal_disk: replica_core(4),
+            shadow: Placement::unpinned(),
+            repl_handler_0: Placement::unpinned(),
+            repl_handler_1: Placement::unpinned(),
+            journal_prep: Placement::unpinned(),
+            journal_disk: place(replica_core(4)),
         };
         let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
         let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
@@ -543,11 +567,13 @@ fn main() {
                     3_000_000, // snapshot_interval_ms (effectively never)
                     replica_snapshot,
                     cores,
+                    // Zero-fill staging, the production default; the
+                    // bench measures streaming, not segment rotation.
+                    melin_journal::StagingMode::default(),
                     std::time::Duration::ZERO,
                     8, // pipeline_depth
-                    busy_spin,
-                    std::sync::Arc::new(melin_server::app_factory::Factory::new(
-                        melin_server::app_factory::FactoryConfig {
+                    std::sync::Arc::new(melin_ec_server::app_factory::Factory::new(
+                        melin_ec_server::app_factory::FactoryConfig {
                             accounts: 0,
                             instruments: 0,
                             max_orders_per_account: 10_000,
@@ -724,38 +750,67 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// `--cores` in the named form, one core per `PRIMARY_THREADS` entry
+    /// in that order.
+    fn spec(cores: [usize; 8]) -> String {
+        PRIMARY_THREADS
+            .iter()
+            .zip(cores)
+            .map(|(name, core)| format!("{name}={core}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     #[test]
     fn omitted_flags_leave_everything_unpinned() {
         let (primary, bases) = resolve_cores(None, None, 2).unwrap();
         assert_eq!(primary.generator, 0);
         assert_eq!(primary.handler_1, 0);
         assert_eq!(bases, vec![0, 0]);
+
+        let (primary, _) = resolve_cores(Some("none"), None, 2).unwrap();
+        assert_eq!(primary.journal_disk, 0, "`none` is the same layout");
     }
 
     #[test]
-    fn primary_cores_map_in_documented_order() {
-        let cores = vec![1, 2, 3, 4, 5, 6, 7];
-        let (primary, _) = resolve_cores(Some(&cores), None, 2).unwrap();
+    fn primary_cores_are_named_in_any_order() {
+        let cores = "journal-disk=8,handler-1=7,handler-0=6,repl-sender=5,drain=4,matching=3,\
+                     journal-seq=2,generator=1";
+        let (primary, _) = resolve_cores(Some(cores), None, 2).unwrap();
         assert_eq!(primary.generator, 1);
-        assert_eq!(primary.journal, 2);
+        assert_eq!(primary.journal_seq, 2);
         assert_eq!(primary.matching, 3);
         assert_eq!(primary.drain, 4);
         assert_eq!(primary.repl_sender, 5);
         assert_eq!(primary.handler_0, 6);
         assert_eq!(primary.handler_1, 7);
-        assert_eq!(primary.journal_disk, 0, "omitted journal-disk = unpinned");
-    }
-
-    #[test]
-    fn optional_eighth_entry_pins_the_journal_disk_thread() {
-        let cores = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let (primary, _) = resolve_cores(Some(&cores), None, 2).unwrap();
         assert_eq!(primary.journal_disk, 8);
     }
 
     #[test]
+    fn every_primary_thread_needs_an_entry() {
+        // The disk thread used to be an optional trailing entry; leaving
+        // it unpinned is now spelled out, as on the server.
+        let seven = "generator=1,journal-seq=2,matching=3,drain=4,repl-sender=5,handler-0=6,\
+                     handler-1=7";
+        let err = resolve_cores(Some(seven), None, 2).unwrap_err();
+        assert!(err.contains("no core for journal-disk"), "{err}");
+        let (primary, _) =
+            resolve_cores(Some(&format!("{seven},journal-disk=0")), None, 2).unwrap();
+        assert_eq!(primary.journal_disk, 0);
+    }
+
+    #[test]
+    fn a_positional_primary_list_is_refused() {
+        let err = resolve_cores(Some("1,2,3,4,5,6,7,8"), None, 2).unwrap_err();
+        assert!(err.contains("--cores"), "{err}");
+        assert!(err.contains("positional"), "{err}");
+        assert!(err.contains("generator=1,journal-seq=2"), "{err}");
+    }
+
+    #[test]
     fn journal_disk_colliding_with_a_primary_core_is_rejected() {
-        let cores = vec![1, 2, 3, 4, 5, 6, 7, 2];
+        let cores = spec([1, 2, 3, 4, 5, 6, 7, 2]);
         let err = resolve_cores(Some(&cores), None, 2).unwrap_err();
         assert!(err.contains("core 2"), "{err}");
         assert!(err.contains("journal-disk"), "{err}");
@@ -772,13 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn wrong_primary_core_count_is_rejected() {
-        let cores = vec![1, 2, 3];
-        let err = resolve_cores(Some(&cores), None, 2).unwrap_err();
-        assert!(err.contains("--cores expects 7"), "{err}");
-    }
-
-    #[test]
     fn replica_core_count_must_match_replica_count() {
         let bases = vec![8];
         let err = resolve_cores(None, Some(&bases), 2).unwrap_err();
@@ -787,17 +835,20 @@ mod tests {
 
     #[test]
     fn duplicate_primary_cores_are_rejected() {
-        let cores = vec![1, 2, 2, 4, 5, 6, 7];
+        let cores = spec([1, 2, 2, 4, 5, 6, 7, 8]);
         let err = resolve_cores(Some(&cores), None, 2).unwrap_err();
         assert!(err.contains("core 2"), "{err}");
-        assert!(err.contains("journal") && err.contains("matching"), "{err}");
+        assert!(
+            err.contains("journal-seq") && err.contains("matching"),
+            "{err}"
+        );
     }
 
     /// The overlap that actually bites: a replica's five-core span running
     /// into a primary thread's core.
     #[test]
     fn replica_span_overlapping_the_primary_is_rejected() {
-        let cores = vec![1, 2, 3, 4, 5, 6, 7];
+        let cores = spec([1, 2, 3, 4, 5, 6, 7, 0]);
         let bases = vec![5, 12];
         let err = resolve_cores(Some(&cores), Some(&bases), 2).unwrap_err();
         assert!(err.contains("core 5"), "{err}");
@@ -816,7 +867,7 @@ mod tests {
     fn adjacent_replica_spans_are_accepted() {
         // The documented 16-core layout: primary on 1-8, replicas on
         // 9..=13 and 14..=18.
-        let cores = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let cores = spec([1, 2, 3, 4, 5, 6, 7, 8]);
         let bases = vec![9, 14];
         let (_, resolved) = resolve_cores(Some(&cores), Some(&bases), 2).unwrap();
         assert_eq!(resolved, vec![9, 14]);
@@ -826,7 +877,7 @@ mod tests {
     /// as claiming cores 0-3, which would collide with the primary.
     #[test]
     fn zero_replica_base_claims_nothing() {
-        let cores = vec![1, 2, 3, 4, 5, 6, 7];
+        let cores = spec([1, 2, 3, 4, 5, 6, 7, 0]);
         let bases = vec![0, 12];
         let (_, resolved) = resolve_cores(Some(&cores), Some(&bases), 2).unwrap();
         assert_eq!(resolved, vec![0, 12]);

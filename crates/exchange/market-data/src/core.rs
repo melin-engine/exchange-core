@@ -5,17 +5,17 @@
 //! through a shared `Arc<RwLock<MdState>>`.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ed25519_dalek::{Signer, SigningKey};
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
-use melin_types::types::{ExecutionReport, Symbol};
+use melin_client::Connection;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_types::types::{ExecutionReport, Symbol};
 
 use crate::mirror::BookMirror;
 
@@ -55,8 +55,9 @@ pub struct CoreConfig {
     pub event_publisher_addr: SocketAddr,
     /// Symbols to subscribe to (empty = all).
     pub symbols: Vec<Symbol>,
-    /// Path to the Ed25519 private key (32-byte raw seed) for
-    /// authenticating to the event publisher.
+    /// Path to the Ed25519 private key for authenticating to the event
+    /// publisher: a 32-byte raw seed, or the PKCS#8 PEM `openssl genpkey`
+    /// writes.
     pub key_path: PathBuf,
 }
 
@@ -92,55 +93,22 @@ fn run_session(
     state: &Arc<RwLock<MdState>>,
     shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream =
-        TcpStream::connect_timeout(&config.event_publisher_addr, Duration::from_secs(5))?;
+    // Step 1: Connect and authenticate. The event publisher runs the same
+    // Ed25519 challenge-response as a node, which the sequencer's client
+    // implements; the socket is taken back afterwards because the
+    // snapshot and firehose frames that follow carry a sequence prefix
+    // the node's reply framing does not.
+    let signing_key = melin_client::key::load_signing_key(&config.key_path)?;
+    let connection = Connection::connect_timeout(
+        config.event_publisher_addr,
+        &signing_key,
+        Duration::from_secs(5),
+    )?;
+    tracing::info!(addr = %config.event_publisher_addr, "connected to event publisher, auth succeeded");
+    let mut stream = connection.into_stream();
+    // The firehose is quiet between trades; give it longer than the
+    // connect bound before treating silence as a dead publisher.
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_nodelay(true)?;
-
-    tracing::info!(addr = %config.event_publisher_addr, "connected to event publisher");
-
-    // Step 1: Auth handshake (client side).
-    // Load the Ed25519 signing key.
-    let signing_key = load_signing_key(&config.key_path)?;
-    let public_key = signing_key.verifying_key();
-
-    // Read Challenge from publisher.
-    let challenge = read_response(&mut stream)?;
-    let nonce = match challenge {
-        ResponseKind::Challenge { nonce } => nonce,
-        other => {
-            return Err(format!(
-                "expected Challenge, got {:?}",
-                std::mem::discriminant(&other)
-            )
-            .into());
-        }
-    };
-
-    let signature = signing_key.sign(&nonce);
-    let auth_request = Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: public_key.to_bytes(),
-    };
-    send_request(&mut stream, &auth_request, 0)?;
-
-    // Read ServerReady or AuthFailed.
-    let auth_result = read_response(&mut stream)?;
-    match auth_result {
-        ResponseKind::ServerReady => {
-            tracing::info!("event publisher auth succeeded");
-        }
-        ResponseKind::AuthFailed => {
-            return Err("event publisher auth failed".into());
-        }
-        other => {
-            return Err(format!(
-                "expected ServerReady, got {:?}",
-                std::mem::discriminant(&other)
-            )
-            .into());
-        }
-    }
 
     // Step 2: Send Subscribe request.
     let mut symbols_arr = [Symbol(0); 8];
@@ -180,7 +148,7 @@ fn run_session(
             return Ok(());
         }
 
-        let (seq, response) = read_frame(&mut stream)?;
+        let (seq, response) = crate::cold_start::read_response(&mut stream)?;
 
         if let ResponseKind::Report(ref report) = response {
             let sym = report_symbol(report);
@@ -207,54 +175,6 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
         | ExecutionReport::Replaced { symbol, .. }
         | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
     }
-}
-
-/// Load a 32-byte Ed25519 signing key seed from a file.
-fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
-    let seed = std::fs::read(path)?;
-    if seed.len() != 32 {
-        return Err(format!(
-            "key file must be 32 bytes, got {} ({})",
-            seed.len(),
-            path.display()
-        )
-        .into());
-    }
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&seed);
-    Ok(SigningKey::from_bytes(&bytes))
-}
-
-/// Read a single length-prefixed response from the stream.
-fn read_response(stream: &mut TcpStream) -> Result<ResponseKind, Box<dyn std::error::Error>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    if frame_len > 4096 {
-        return Err(format!("frame too large: {frame_len}").into());
-    }
-    let mut frame_buf = vec![0u8; frame_len];
-    stream.read_exact(&mut frame_buf)?;
-    let response = codec::decode_response(&frame_buf)?;
-    Ok(response)
-}
-
-/// Read a sequence-prefixed frame (8-byte seq + 4-byte len + payload).
-fn read_frame(stream: &mut TcpStream) -> Result<(u64, ResponseKind), Box<dyn std::error::Error>> {
-    let mut seq_buf = [0u8; 8];
-    stream.read_exact(&mut seq_buf)?;
-    let seq = u64::from_le_bytes(seq_buf);
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    if frame_len > 4096 {
-        return Err(format!("frame too large: {frame_len}").into());
-    }
-    let mut frame_buf = vec![0u8; frame_len];
-    stream.read_exact(&mut frame_buf)?;
-    let response = codec::decode_response(&frame_buf)?;
-    Ok((seq, response))
 }
 
 /// Send a length-prefixed request.

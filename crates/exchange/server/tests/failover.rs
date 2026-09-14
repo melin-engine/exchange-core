@@ -9,7 +9,7 @@
 //! 7. Verify the promoted replica's journal sequence >= last acked sequence
 //!    and that the exchange state is consistent (balances, order placement)
 //!
-//! Uses actual child processes (`melin-server` binary) and TCP so the test
+//! Uses actual child processes (`melin-ec-server` binary) and TCP so the test
 //! exercises the real replication and promotion code paths.
 //!
 //! Trading-only — the scenarios under test (order submit / balance /
@@ -21,7 +21,6 @@
 
 #![cfg(not(feature = "skip-order-exec"))]
 
-use ed25519_dalek::Signer;
 use serial_test::serial;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -31,9 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use melin_client::Client;
-use melin_protocol::message::Request;
-use melin_protocol::types::{
+use melin_ec_client::Client;
+use melin_ec_protocol::message::Request;
+use melin_ec_protocol::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce,
 };
 
@@ -41,11 +40,11 @@ use melin_protocol::types::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Path to the `melin-server` binary, resolved at compile time. `env!` works
+/// Path to the `melin-ec-server` binary, resolved at compile time. `env!` works
 /// under any runner; `std::env::var` only works under `cargo test`, where it
 /// would otherwise silently pick up a stale release binary.
 fn server_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_melin-server"))
+    PathBuf::from(env!("CARGO_BIN_EXE_melin-ec-server"))
 }
 
 /// Connect a TCP client with a 60s socket read timeout so the test
@@ -537,57 +536,17 @@ fn wait_for_replacement_catchup(primary_health: SocketAddr) {
 /// (e.g. `PROMOTE`, `ROTATE`). Returns the server's first response line
 /// trimmed of whitespace.
 fn admin_command(addr: SocketAddr, operator_key: &SigningKey, command: &str) -> String {
-    use melin_protocol::codec;
-    use melin_protocol::message::{Request, ResponseKind};
-
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .expect("connect to admin endpoint");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
 
-    // Step 1: Receive Challenge.
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).expect("read challenge len");
-    let frame_len = u32::from_le_bytes(len_buf) as usize;
-    let mut frame_buf = vec![0u8; frame_len];
-    stream
-        .read_exact(&mut frame_buf)
-        .expect("read challenge payload");
-    let nonce = match codec::decode_response(&frame_buf).expect("decode challenge") {
-        ResponseKind::Challenge { nonce } => nonce,
-        other => panic!("expected Challenge, got {other:?}"),
-    };
+    // The admin endpoint authenticates like a node, then speaks text
+    // lines on the same socket.
+    melin_client::authenticate(&mut stream, operator_key).expect("admin auth handshake");
 
-    // Step 2: Sign nonce + ephemerals (TCP path uses zero ephs).
-    let signature = operator_key.sign(&nonce);
-    let request = Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: operator_key.verifying_key().to_bytes(),
-    };
-    let mut encode_buf = [0u8; 256];
-    let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");
-    stream
-        .write_all(&encode_buf[..written])
-        .expect("send ChallengeResponse");
-    stream.flush().expect("flush");
-
-    // Step 3: Read auth result.
-    stream
-        .read_exact(&mut len_buf)
-        .expect("read auth result len");
-    let result_len = u32::from_le_bytes(len_buf) as usize;
-    let mut result_buf = vec![0u8; result_len];
-    stream
-        .read_exact(&mut result_buf)
-        .expect("read auth result payload");
-    match codec::decode_response(&result_buf).expect("decode auth result") {
-        ResponseKind::ServerReady => {}
-        ResponseKind::AuthFailed => panic!("admin auth failed"),
-        other => panic!("unexpected auth response: {other:?}"),
-    }
-
-    // Step 4: Send command + read response line.
+    // Send command + read response line.
     stream
         .write_all(format!("{command}\n").as_bytes())
         .expect("send admin command");
@@ -689,10 +648,9 @@ fn spawn_primary_with_extra_env(
         FIXTURE_INSTRUMENTS.to_string(),
         "--connection-timeout-secs".into(),
         "0".into(),
-        "--yield-idle".into(),
         // Reduce core count to avoid conflicts in CI.
         "--cores".into(),
-        "0,0,0,0,0,0,0,0,0".into(),
+        "none".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -825,9 +783,8 @@ fn spawn_replica_named_with_extra_env(
         keys_path.to_str().expect("valid path").into(),
         "--connection-timeout-secs".into(),
         "0".into(),
-        "--yield-idle".into(),
         "--cores".into(),
-        "0,0,0,0,0,0,0,0,0".into(),
+        "none".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -894,7 +851,7 @@ impl TestCluster {
         let bin = server_bin();
         assert!(
             bin.exists(),
-            "melin-server binary not found at {bin:?}. Run `cargo build --release` first."
+            "melin-ec-server binary not found at {bin:?}. Run `cargo build --release` first."
         );
 
         let tmp = tempfile::tempdir().expect("create temp dir");
@@ -1019,7 +976,7 @@ fn submit_order(
     side: Side,
     price_val: u64,
     qty_val: u64,
-) -> Vec<melin_protocol::message::ResponseKind> {
+) -> Vec<melin_ec_protocol::message::ResponseKind> {
     client
         .send_request(&Request::SubmitOrder {
             symbol: Symbol(symbol),
@@ -1033,7 +990,7 @@ fn submit_order(
                 },
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(qty_val),
-                stp: melin_protocol::types::SelfTradeProtection::Allow,
+                stp: melin_ec_protocol::types::SelfTradeProtection::Allow,
                 expiry_ns: 0,
             },
         })
@@ -1041,11 +998,11 @@ fn submit_order(
 }
 
 fn has_report(
-    responses: &[melin_protocol::message::ResponseKind],
-    pred: fn(&melin_protocol::types::ExecutionReport) -> bool,
+    responses: &[melin_ec_protocol::message::ResponseKind],
+    pred: fn(&melin_ec_protocol::types::ExecutionReport) -> bool,
 ) -> bool {
     responses.iter().any(|r| {
-        if let melin_protocol::message::ResponseKind::Report(report) = r {
+        if let melin_ec_protocol::message::ResponseKind::Report(report) = r {
             pred(report)
         } else {
             false
@@ -1077,7 +1034,7 @@ fn kill_primary_promote_replica_no_data_loss() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed, got: {r:?}"
     );
@@ -1087,7 +1044,7 @@ fn kill_primary_promote_replica_no_data_loss() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Fill { .. }
+            melin_ec_protocol::types::ExecutionReport::Fill { .. }
         )),
         "expected Fill, got: {r:?}"
     );
@@ -1126,7 +1083,7 @@ fn kill_during_active_fills() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed after fill-heavy workload, got: {r:?}"
     );
@@ -1136,7 +1093,7 @@ fn kill_during_active_fills() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Fill { .. }
+            melin_ec_protocol::types::ExecutionReport::Fill { .. }
         )),
         "expected Fill after fill-heavy workload, got: {r:?}"
     );
@@ -1174,7 +1131,7 @@ fn kill_without_waiting_for_replication() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed with id={}, got: {r:?}",
         last_acked_id + 1
@@ -1186,8 +1143,8 @@ fn kill_without_waiting_for_replication() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -1303,7 +1260,10 @@ fn recovered_primary_ack_gate_holds() {
         // response could also be a Rejected (e.g. balance, dedup),
         // which doesn't reflect a gated-durable state.
         if has_report(&r, |rep| {
-            matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+            matches!(
+                rep,
+                melin_ec_protocol::types::ExecutionReport::Placed { .. }
+            )
         }) {
             acked.push(id);
         }
@@ -1326,8 +1286,8 @@ fn recovered_primary_ack_gate_holds() {
         if !has_report(&r, |rep| {
             matches!(
                 rep,
-                melin_protocol::types::ExecutionReport::Rejected {
-                    reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                melin_ec_protocol::types::ExecutionReport::Rejected {
+                    reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                     ..
                 }
             )
@@ -1424,7 +1384,7 @@ fn replica_reconnects_after_primary_restart_without_journal_wipe() {
         assert!(
             has_report(&r, |rep| matches!(
                 rep,
-                melin_protocol::types::ExecutionReport::Placed { .. }
+                melin_ec_protocol::types::ExecutionReport::Placed { .. }
             )),
             "phase-2 order {i}: expected Placed, got {r:?}"
         );
@@ -1487,9 +1447,8 @@ fn crashed_primary_recovers_from_journal() {
                 "2",
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1516,9 +1475,12 @@ fn crashed_primary_recovers_from_journal() {
     // either Placed or Fill.
     let r = submit_order(&mut client3, 21, 1, 1, Side::Buy, 300, 1);
     let accepted = has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+        matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )
     }) || has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+        matches!(rep, melin_ec_protocol::types::ExecutionReport::Fill { .. })
     });
     assert!(
         accepted,
@@ -1530,8 +1492,8 @@ fn crashed_primary_recovers_from_journal() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -1578,7 +1540,7 @@ fn journals_contiguous_across_replication() {
     let replica_journal = cluster._tmp.path().join("replica.journal");
 
     let walk = |label: &str, path: &Path| -> u64 {
-        let mut reader = JournalReader::<melin_trading::trading_event::TradingEvent>::open(path)
+        let mut reader = JournalReader::<melin_ec_trading::trading_event::TradingEvent>::open(path)
             .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
         let mut count = 0u64;
         loop {
@@ -1689,7 +1651,7 @@ impl DualCluster {
 
     fn start_with_args(primary_extra_args: &[&str], replica_extra_args: &[&str]) -> Self {
         let bin = server_bin();
-        assert!(bin.exists(), "melin-server binary not found");
+        assert!(bin.exists(), "melin-ec-server binary not found");
 
         let tmp = tempfile::tempdir().expect("create temp dir");
         let key = SigningKey::from_bytes(&[0xFA; 32]);
@@ -1882,8 +1844,8 @@ fn sec04_rate_limit_replicates_to_replica() {
         assert!(
             !has_report(&r, |rep| matches!(
                 rep,
-                melin_protocol::types::ExecutionReport::Rejected {
-                    reason: melin_protocol::types::RejectReason::ExceedsOrderRate,
+                melin_ec_protocol::types::ExecutionReport::Rejected {
+                    reason: melin_ec_protocol::types::RejectReason::ExceedsOrderRate,
                     ..
                 }
             )),
@@ -1899,8 +1861,8 @@ fn sec04_rate_limit_replicates_to_replica() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::ExceedsOrderRate,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::ExceedsOrderRate,
                 ..
             }
         )),
@@ -1958,7 +1920,7 @@ fn dual_replication_survives_one_replica_failure() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed, got: {r:?}"
     );
@@ -1995,8 +1957,8 @@ fn dual_replication_halts_when_both_disconnect() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::ReplicaDisconnected,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::ReplicaDisconnected,
                 ..
             }
         )),
@@ -2037,7 +1999,7 @@ fn dual_replication_promote_replica1_after_replica2_dies() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed on promoted replica 1, got: {r:?}"
     );
@@ -2082,9 +2044,12 @@ fn dual_replication_with_fills_then_failover() {
     // Place + fill on promoted replica — proves matching state is correct.
     let r = submit_order(&mut client2, 31, 2, 1, Side::Sell, 500, 1);
     let accepted = has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+        matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )
     }) || has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+        matches!(rep, melin_ec_protocol::types::ExecutionReport::Fill { .. })
     });
     assert!(accepted, "expected Placed or Fill, got: {r:?}");
 
@@ -2092,7 +2057,7 @@ fn dual_replication_with_fills_then_failover() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Fill { .. }
+            melin_ec_protocol::types::ExecutionReport::Fill { .. }
         )),
         "expected Fill on promoted replica, got: {r:?}"
     );
@@ -2176,9 +2141,8 @@ fn replacement_replica_catches_up_from_journal() {
                     .expect("valid path"),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2222,7 +2186,7 @@ fn replacement_replica_catches_up_from_journal() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed on promoted replacement, got: {r:?}"
     );
@@ -2231,8 +2195,8 @@ fn replacement_replica_catches_up_from_journal() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -2301,9 +2265,8 @@ fn catchup_with_fills_during_gap() {
                     .unwrap(),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2342,9 +2305,12 @@ fn catchup_with_fills_during_gap() {
     // Place a sell + matching buy to verify balances are correct.
     let r = submit_order(&mut client2, 21, 2, 1, Side::Sell, 500, 1);
     let accepted = has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+        matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )
     }) || has_report(&r, |rep| {
-        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+        matches!(rep, melin_ec_protocol::types::ExecutionReport::Fill { .. })
     });
     assert!(accepted, "expected Placed or Fill, got: {r:?}");
 
@@ -2352,7 +2318,7 @@ fn catchup_with_fills_during_gap() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Fill { .. }
+            melin_ec_protocol::types::ExecutionReport::Fill { .. }
         )),
         "expected Fill after catch-up with fills, got: {r:?}"
     );
@@ -2414,9 +2380,8 @@ fn catchup_then_immediate_failover() {
                     .unwrap(),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2462,7 +2427,7 @@ fn catchup_then_immediate_failover() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed, got: {r:?}"
     );
@@ -2472,8 +2437,8 @@ fn catchup_then_immediate_failover() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -2534,9 +2499,8 @@ fn fresh_replica_full_catchup() {
                     .unwrap(),
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2581,7 +2545,7 @@ fn fresh_replica_full_catchup() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected Placed on promoted fresh replacement, got: {r:?}"
     );
@@ -2590,8 +2554,8 @@ fn fresh_replica_full_catchup() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -2649,9 +2613,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "2",
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
                 "--standalone",
                 "--ack-policy",
                 "disk",
@@ -2682,9 +2645,10 @@ fn snapshot_transfer_when_archives_purged() {
 
     // All 20 orders are now committed (each submit_order waited for a
     // response gated on journal fsync). Remove any snapshot taken before
-    // this point — in yield-idle mode the timer fires promptly, so a
-    // partial snapshot (e.g. only orders 1–N) may already exist. The
-    // next snapshot is guaranteed to include all 20 orders.
+    // this point — every thread is unpinned and yields, so the timer
+    // fires promptly and a partial snapshot (e.g. only orders 1–N) may
+    // already exist. The next snapshot is guaranteed to include all 20
+    // orders.
     let snap_path = primary_journal.with_extension("snapshot");
     let _ = std::fs::remove_file(&snap_path);
 
@@ -2746,9 +2710,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "2",
                 "--connection-timeout-secs",
                 "0",
-                "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0,0",
+                "none",
                 "--snapshot-interval-ms",
                 "100",
             ])
@@ -2798,10 +2761,10 @@ fn snapshot_transfer_when_archives_purged() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )) || has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Fill { .. }
+            melin_ec_protocol::types::ExecutionReport::Fill { .. }
         )),
         "expected Placed or Fill after snapshot transfer, got: {r:?}"
     );
@@ -2816,8 +2779,8 @@ fn snapshot_transfer_when_archives_purged() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -2871,8 +2834,8 @@ fn snapshot_transfer_when_archives_purged() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -2885,8 +2848,8 @@ fn snapshot_transfer_when_archives_purged() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Rejected {
-                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
                 ..
             }
         )),
@@ -2898,8 +2861,8 @@ fn snapshot_transfer_when_archives_purged() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
-                | melin_protocol::types::ExecutionReport::Fill { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+                | melin_ec_protocol::types::ExecutionReport::Fill { .. }
         )),
         "expected Placed or Fill on promoted replica, got: {r:?}"
     );
@@ -2943,7 +2906,7 @@ fn submit_resting_burst(client: &mut Client, first_id: u64, n: u64) {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: qty(1),
-                    stp: melin_protocol::types::SelfTradeProtection::Allow,
+                    stp: melin_ec_protocol::types::SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
             })
@@ -2963,7 +2926,7 @@ fn count_archives(journal_path: &Path) -> usize {
 /// its first entry, successor anchors equal to predecessor tails) and
 /// return `(first_sequence, last_sequence)` over the whole lineage.
 fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
-    use melin_trading::trading_event::TradingEvent;
+    use melin_ec_trading::trading_event::TradingEvent;
 
     let report = melin_journal::segment::verify_lineage::<TradingEvent>(journal_path)
         .unwrap_or_else(|e| panic!("lineage of {} broken: {e}", journal_path.display()));
@@ -2990,7 +2953,7 @@ fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
 #[serial]
 fn rotation_soak_under_load() {
     let bin = server_bin();
-    assert!(bin.exists(), "melin-server binary not found at {bin:?}");
+    assert!(bin.exists(), "melin-ec-server binary not found at {bin:?}");
     let tmp = tempfile::Builder::new()
         .prefix("melin-soak-")
         .tempdir()
@@ -3170,13 +3133,13 @@ fn rotation_soak_under_load() {
     // would execute; the recovered writer must resume exactly one past
     // the replica's durable tail.
     {
+        use melin_ec_server::ServerApp;
+        use melin_ec_trading::trading_event::TradingEvent;
         use melin_journal::BufferedWriter;
-        use melin_server::ServerApp;
-        use melin_trading::trading_event::TradingEvent;
         use melin_transport_core::JournaledApp;
 
         let recovered = JournaledApp::<ServerApp, BufferedWriter<TradingEvent>>::recover(
-            ServerApp(melin_exchange_core::exchange::Exchange::with_capacity()),
+            ServerApp(melin_ec::exchange::Exchange::with_capacity()),
             &replica_journal,
         )
         .expect("replica journal must recover through the production path");
@@ -3246,7 +3209,7 @@ fn rotation_soak_under_load() {
     // Read the live segment back and check its tail sequence.
     use melin_journal::JournalReader;
     let mut reader =
-        JournalReader::<melin_trading::trading_event::TradingEvent>::open(&primary_journal)
+        JournalReader::<melin_ec_trading::trading_event::TradingEvent>::open(&primary_journal)
             .expect("reopen primary live segment");
     while reader.next_entry().expect("scan live").is_some() {}
     let post_disk_seq = reader.last_sequence().unwrap_or(0);
@@ -3476,7 +3439,7 @@ fn disk_ram_gate_stalls_while_replica_frozen() {
     assert!(
         has_report(&r, |rep| matches!(
             rep,
-            melin_protocol::types::ExecutionReport::Placed { .. }
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
         )),
         "expected a normal Placed ack after thaw, got: {r:?}"
     );
@@ -3558,7 +3521,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
                             },
                             time_in_force: TimeInForce::GTC,
                             quantity: qty(1),
-                            stp: melin_protocol::types::SelfTradeProtection::Allow,
+                            stp: melin_ec_protocol::types::SelfTradeProtection::Allow,
                             expiry_ns: 0,
                         },
                     });
@@ -3805,7 +3768,7 @@ impl ChildExt for std::process::Child {
 #[serial]
 fn higher_epoch_handshake_fences_stale_primary() {
     let bin = server_bin();
-    assert!(bin.exists(), "melin-server binary not found");
+    assert!(bin.exists(), "melin-ec-server binary not found");
     let tmp = tempfile::tempdir().expect("create temp dir");
 
     let key = SigningKey::from_bytes(&[0xFA; 32]);

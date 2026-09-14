@@ -32,7 +32,7 @@
 //! to without further coordination.
 //!
 //! Usage:
-//!     cargo run --release --bin melin-bench -- \
+//!     cargo run --release --bin melin-ec-bench -- \
 //!         [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] \
 //!         [--health-addr=<ip:port>] [--clients=N] [--window=N] \
 //!         [--bench-threads=N] [--warmup-duration=5s] [--duration=60s] \
@@ -74,18 +74,18 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-#[cfg(not(feature = "dpdk"))]
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
-use melin_server::exchange_app::ServerApp;
+use melin_client::Reply;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::ResponseKind;
+use melin_ec_server::exchange_app::ServerApp;
 // The server's own frame ceiling, so the handshake frames this bench
 // builds are bounded by the number the server actually enforces rather
 // than a copy that could drift.
+use melin_ec_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::MAX_FRAME_SIZE;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::server::ServerConfig;
-use melin_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_wire_protocol::transport::BlockingTransportListener;
 
@@ -501,7 +501,7 @@ pub(crate) fn maybe_sample(
 
 /// Benchmark CLI arguments.
 #[derive(clap::Parser)]
-#[command(name = "melin-bench", about = "Matching engine benchmark suite")]
+#[command(name = "melin-ec-bench", about = "Matching engine benchmark suite")]
 struct BenchArgs {
     /// Benchmark mode: roundtrip (full server), pipeline (no network), engine (matching only).
     #[arg(long, default_value = "roundtrip")]
@@ -553,15 +553,20 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
-    /// Pipeline-mode core assignment, five comma-separated IDs in the
-    /// order `journal,matching,publisher,journal-disk,drain`. 0 leaves
-    /// an entry unpinned. Every one of these threads busy-spins, so two
-    /// on one core starve each other — the values are checked for
-    /// duplicates before anything is spawned. Keep `journal` and
-    /// `journal-disk` on the same CCD: they exchange a cache line on
-    /// every batch. Ignored outside `--mode pipeline`.
-    #[arg(long, value_delimiter = ',', default_value = "1,2,3,4,5")]
-    pipeline_cores: Vec<usize>,
+    /// Pipeline-mode core assignment as `thread=core` entries in any
+    /// order, one per thread — `journal-seq`, `matching`, `publisher`,
+    /// `journal-disk` and `drain` — the shape of the server's `--cores`.
+    /// `0` leaves a thread unpinned and `none` leaves them all unpinned.
+    /// Every one of these threads busy-spins, so two on one core starve
+    /// each other — the layout is checked for duplicates before anything
+    /// is spawned. Keep `journal-seq` and `journal-disk` on the same
+    /// CCD: they exchange a cache line on every batch. Ignored outside
+    /// `--mode pipeline`.
+    #[arg(
+        long,
+        default_value = "journal-seq=1,matching=2,publisher=3,journal-disk=4,drain=5"
+    )]
+    pipeline_cores: String,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -870,7 +875,7 @@ fn run_engine_bench(
         ..Default::default()
     };
 
-    let mut exchange = melin_exchange_core::exchange::Exchange::with_capacity();
+    let mut exchange = melin_ec::exchange::Exchange::with_capacity();
 
     // Register instruments.
     for i in 1..=num_instruments {
@@ -1260,15 +1265,21 @@ fn run_engine_bench(
 // Pipeline benchmark (disruptor + journal + matching, no network)
 // ===========================================================================
 
-/// Entries `--pipeline-cores` expects: journal, matching, publisher,
-/// journal-disk, drain.
-const PIPELINE_CORE_SLOTS: usize = 5;
+/// The pipeline-mode threads as `--pipeline-cores` names them, in the
+/// order [`PipelineBenchCores`] lists its fields.
+const PIPELINE_THREADS: [&str; 5] = [
+    "journal-seq",
+    "matching",
+    "publisher",
+    "journal-disk",
+    "drain",
+];
 
 /// Pipeline-mode core assignment, resolved from `--pipeline-cores`. A
 /// field of 0 leaves that thread unpinned (OS-scheduled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PipelineBenchCores {
-    journal: usize,
+    journal_seq: usize,
     matching: usize,
     publisher: usize,
     journal_disk: usize,
@@ -1280,25 +1291,24 @@ struct PipelineBenchCores {
 /// itself: `pin_to_core` promotes to SCHED_FIFO on an isolated core, so
 /// one thread spins and the other starves, and the run reports a
 /// plausible-looking but meaningless number.
-fn resolve_pipeline_cores(v: &[usize]) -> Result<PipelineBenchCores, String> {
-    if v.len() != PIPELINE_CORE_SLOTS {
-        return Err(format!(
-            "--pipeline-cores expects {PIPELINE_CORE_SLOTS} comma-separated IDs \
-             (journal,matching,publisher,journal-disk,drain), got {}",
-            v.len()
-        ));
-    }
+fn resolve_pipeline_cores(spec: &str) -> Result<PipelineBenchCores, String> {
+    // One core per `PIPELINE_THREADS` entry, in that order.
+    let c = melin_ec_server::named_cores::parse_named_cores(
+        "--pipeline-cores",
+        spec,
+        &PIPELINE_THREADS,
+    )?;
     let cores = PipelineBenchCores {
-        journal: v[0],
-        matching: v[1],
-        publisher: v[2],
-        journal_disk: v[3],
-        drain: v[4],
+        journal_seq: c[0],
+        matching: c[1],
+        publisher: c[2],
+        journal_disk: c[3],
+        drain: c[4],
     };
     // (core, owner) so a duplicate can name both sides of the clash
     // rather than just the number.
     let claimed = [
-        (cores.journal, "journal"),
+        (cores.journal_seq, "journal-seq"),
         (cores.matching, "matching"),
         (cores.publisher, "publisher"),
         (cores.journal_disk, "journal-disk"),
@@ -1339,7 +1349,7 @@ fn run_pipeline_bench(
     use melin_journal::BufferedWriter;
 
     // Set up exchange with one instrument and funded account.
-    let mut app = ServerApp(melin_exchange_core::exchange::Exchange::with_capacity());
+    let mut app = ServerApp(melin_ec::exchange::Exchange::with_capacity());
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -1385,7 +1395,7 @@ struct PipelineInnerCfg<'a> {
     cores: PipelineBenchCores,
 }
 
-use melin_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::TradingEvent;
 
 /// Pipeline-mode body: builds the pipeline around `writer`, spawns the
 /// journal, matching and publisher threads, and drains from the calling
@@ -1413,9 +1423,9 @@ fn run_pipeline_inner(
     } = cfg;
 
     eprintln!(
-        "  Pipeline cores: journal={} matching={} publisher={} journal-disk={} drain={} \
+        "  Pipeline cores: journal-seq={} matching={} publisher={} journal-disk={} drain={} \
          (0 = unpinned)",
-        cores.journal, cores.matching, cores.publisher, cores.journal_disk, cores.drain,
+        cores.journal_seq, cores.matching, cores.publisher, cores.journal_disk, cores.drain,
     );
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
@@ -1430,7 +1440,11 @@ fn run_pipeline_inner(
         false, // no replication
         max_journal_batch,
         melin_journal::replication::REPLICATION_RING_CAPACITY,
-        true,  // busy_spin — match production default (yield_idle=false)
+        // Every stage busy-spins — the production default on isolated
+        // cores, and what this mode's own threads do too.
+        melin_transport_core::pipeline::StageWaits::uniform(
+            melin_pipeline::wait::WaitStrategy::BusySpin,
+        ),
         false, // event_publisher
         false, // shadow
         std::sync::Arc::new(melin_transport_core::fence::FenceState::new(0)),
@@ -1442,14 +1456,14 @@ fn run_pipeline_inner(
     // Spawn journal and matching stage threads.
     let shutdown_j = Arc::clone(&shutdown);
     let mut journal_stage = out.journal_stage;
-    // The journal stage spawns a disk thread that busy-spins on batches
-    // and publishes the durability cursors. Unpinned it is OS-scheduled
-    // like any other thread, which on an isolcpus host means it lands
-    // on a housekeeping core and its jitter shows up as journal tail.
-    // The stage spawns it itself, from the journal thread, so the core
-    // has to be handed over before `run`.
+    // The journal's disk thread busy-spins on batches and publishes the
+    // durability cursors. Unpinned it is OS-scheduled like any other
+    // thread, which on an isolcpus host means it lands on a housekeeping
+    // core and its jitter shows up as journal tail. `start` launches it
+    // from this thread and reads the core then, so hand it over first.
     journal_stage.set_disk_core(cores.journal_disk);
-    let journal_core = cores.journal;
+    let sequencer = journal_stage.start().expect("start journal stage");
+    let journal_core = cores.journal_seq;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
@@ -1458,7 +1472,7 @@ fn run_pipeline_inner(
             {
                 eprintln!("warning: could not pin journal to core {journal_core}: {e}");
             }
-            journal_stage.run(&shutdown_j)
+            sequencer.run(&shutdown_j)
         })
         .expect("spawn journal thread");
 
@@ -1506,7 +1520,12 @@ fn run_pipeline_inner(
     // SPSC channel requires capacity >= 2; clamp so `--window=1` (useful
     // for isolating pure pipeline latency without queueing) doesn't panic.
     let ts_capacity = window.next_power_of_two().max(2);
-    let (mut ts_tx, mut ts_rx) = melin_pipeline::spsc::channel::<u64>(ts_capacity);
+    // The publisher thread producing into it busy-spins like every
+    // other thread in this mode.
+    let (mut ts_tx, mut ts_rx) = melin_pipeline::spsc::channel::<u64>(
+        ts_capacity,
+        melin_pipeline::wait::WaitStrategy::BusySpin,
+    );
 
     // Publisher thread: continuously feeds events into the disruptor.
     // `sequence: 0` — the journal stage allocates sequences in disruptor
@@ -1595,7 +1614,7 @@ fn run_pipeline_inner(
                     sequence: 0,
                     timestamp_ns: tsc_clock.unix_ns(ts),
                     event: JournalEvent::App(
-                        melin_trading::trading_event::TradingEvent::SubmitOrder {
+                        melin_ec_trading::trading_event::TradingEvent::SubmitOrder {
                             symbol: Symbol(1),
                             order: Order {
                                 id: order_id,
@@ -1888,7 +1907,7 @@ fn run_roundtrip_bench(
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
     let factory =
-        melin_server::app_factory::Factory::new(melin_server::app_factory::FactoryConfig {
+        melin_ec_server::app_factory::Factory::new(melin_ec_server::app_factory::FactoryConfig {
             accounts: config.accounts,
             instruments: config.instruments,
             max_orders_per_account: config.max_orders_per_account,
@@ -1971,19 +1990,11 @@ fn run_roundtrip_bench(
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Load a 32-byte raw Ed25519 private key from a file.
+/// The bench's Ed25519 key, from a raw 32-byte seed or a PKCS#8 PEM as
+/// the sequencer's client reads them. A bench without its key cannot
+/// run, so the error is fatal here rather than at every call site.
 fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("cannot read key file {}: {e}", path.display()));
-    if bytes.len() != 32 {
-        panic!(
-            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
-            bytes.len()
-        );
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    ed25519_dalek::SigningKey::from_bytes(&seed)
+    melin_client::key::load_signing_key(path).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Start the server on a background thread. The listener is already bound,
@@ -1993,11 +2004,11 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
-    factory: melin_server::app_factory::Factory,
+    factory: melin_ec_server::app_factory::Factory,
     shutdown: Arc<AtomicBool>,
 ) {
-    use melin_server::request_decoder::RequestDecoder;
-    use melin_server::response_encoder::ResponseEncoder;
+    use melin_ec_server::request_decoder::RequestDecoder;
+    use melin_ec_server::response_encoder::ResponseEncoder;
     use melin_server_runtime::server::EventPublisherFn;
 
     let event_publisher: Option<EventPublisherFn<ServerApp>> = None;
@@ -2063,51 +2074,6 @@ fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
         }
     }
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
-}
-
-/// Perform challenge-response auth handshake on a new connection.
-/// Must be called before the stream is set to non-blocking mode.
-#[cfg(not(feature = "dpdk"))]
-fn auth_handshake(
-    stream: &mut (impl std::io::Read + std::io::Write),
-    key: &ed25519_dalek::SigningKey,
-) {
-    use ed25519_dalek::Signer;
-    use melin_protocol::message::Request;
-
-    // Read Challenge frame.
-    let mut len_buf = [0u8; 4];
-    std::io::Read::read_exact(stream, &mut len_buf).expect("read Challenge length");
-    let len = u32::from_le_bytes(len_buf) as usize;
-    assert!(len <= MAX_FRAME_SIZE, "Challenge frame too large: {len}");
-    let mut payload = [0u8; 128];
-    std::io::Read::read_exact(stream, &mut payload[..len]).expect("read Challenge payload");
-    let response = codec::decode_response(&payload[..len]).expect("decode Challenge");
-    let nonce = match response {
-        ResponseKind::Challenge { nonce } => nonce,
-        other => panic!("expected Challenge, got {other:?}"),
-    };
-
-    let signature = key.sign(&nonce);
-    let request = Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: key.verifying_key().to_bytes(),
-    };
-    let mut buf = [0u8; 256];
-    let written = codec::encode_request(&request, 0, &mut buf).expect("encode ChallengeResponse");
-    std::io::Write::write_all(stream, &buf[..written]).expect("send ChallengeResponse");
-    std::io::Write::flush(stream).expect("flush ChallengeResponse");
-
-    // Read ServerReady.
-    std::io::Read::read_exact(stream, &mut len_buf).expect("read ServerReady length");
-    let len = u32::from_le_bytes(len_buf) as usize;
-    assert!(len <= MAX_FRAME_SIZE, "ServerReady frame too large: {len}");
-    std::io::Read::read_exact(stream, &mut payload[..len]).expect("read ServerReady payload");
-    let response = codec::decode_response(&payload[..len]).expect("decode ServerReady");
-    assert!(
-        matches!(response, ResponseKind::ServerReady),
-        "expected ServerReady, got {response:?}"
-    );
 }
 
 /// Connect to UDS server with retry (up to 50 attempts, 10ms apart).
@@ -2342,7 +2308,11 @@ fn run_uring_roundtrip<R, W, F>(
         .into_par_iter()
         .map(|i| {
             let (mut read_stream, write_stream) = connect();
-            auth_handshake(&mut read_stream, &client_keys[i]);
+            // The sequencer's handshake over the bare, still-blocking
+            // socket: it reads nothing past ServerReady, so the io_uring
+            // loop that takes the descriptor over sees every later frame.
+            melin_client::authenticate(&mut read_stream, &client_keys[i])
+                .unwrap_or_else(|e| panic!("client {i}: auth handshake failed: {e}"));
             (read_stream, write_stream)
         })
         .collect();
@@ -2789,10 +2759,10 @@ fn run_uring_loop(
                     }
 
                     let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                    let response = codec::decode_response(frame).expect("decode response");
+                    let reply = melin_client::classify(frame).expect("classify reply");
                     cursor += 4 + frame_len;
 
-                    if matches!(response, ResponseKind::BatchEnd) {
+                    if matches!(reply, Reply::BatchEnd) {
                         // `rdtscp()` is captured FIRST — before any
                         // per-frame bookkeeping (outcome tally, parse
                         // buffer compaction) — so the histogram reflects
@@ -2829,7 +2799,7 @@ fn run_uring_loop(
                     // roundtrip only — adding this counter increment
                     // before `rdtscp()` would inflate every sample by
                     // the cost of this match.
-                    conn.outcomes.record(&response);
+                    conn.outcomes.record(&reply).expect("decode response");
                 }
                 if cursor > 0 {
                     // Shift remaining bytes to front without allocating.
@@ -3081,20 +3051,29 @@ pub(crate) struct OutcomeReport {
 }
 
 impl OutcomeReport {
-    /// Increment the counter that matches `response`. Untracked variants
-    /// (handshake / market-data / stats frames) are ignored.
+    /// Increment the counter that matches one reply frame off the wire,
+    /// as the sequencer's client tells them apart. An application
+    /// response is decoded here, and only an execution report counts:
+    /// stats and market-data frames are not part of the request/ack
+    /// accounting, and neither is a heartbeat. The error is the
+    /// exchange codec's, for a response it cannot decode.
     #[inline]
-    pub fn record(&mut self, response: &ResponseKind) {
-        match response {
-            ResponseKind::BatchEnd => self.batch_ends += 1,
-            ResponseKind::Report(report) => self.record_execution_report(report),
-            ResponseKind::EngineError => self.engine_errors += 1,
-            ResponseKind::ServerBusy => self.server_busy += 1,
-            // Non-trading frames (Challenge, ServerReady, Heartbeat,
-            // AuthFailed, stats/market-data snapshots) — not part of the
-            // request/ack accounting.
-            _ => {}
+    pub fn record(
+        &mut self,
+        reply: &Reply<'_>,
+    ) -> Result<(), melin_wire_protocol::error::ProtocolError> {
+        match *reply {
+            Reply::BatchEnd => self.batch_ends += 1,
+            Reply::EngineError => self.engine_errors += 1,
+            Reply::ServerBusy => self.server_busy += 1,
+            Reply::Heartbeat => {}
+            Reply::Response(bytes) => {
+                if let ResponseKind::Report(report) = codec::decode_response(bytes)? {
+                    self.record_execution_report(&report);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Increment the counter for a single execution-report variant.
@@ -3499,7 +3478,7 @@ pub(crate) fn print_results(
 
 /// Create a temporary directory that persists for the process lifetime.
 fn tempdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("melin-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("melin-ec-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -3510,12 +3489,14 @@ mod pipeline_core_tests {
     use clap::Parser;
 
     #[test]
-    fn five_entries_map_in_documented_order() {
-        let cores = resolve_pipeline_cores(&[1, 2, 3, 4, 5]).unwrap();
+    fn entries_are_named_in_any_order() {
+        let cores =
+            resolve_pipeline_cores("drain=5,journal-disk=4,publisher=3,matching=2,journal-seq=1")
+                .unwrap();
         assert_eq!(
             cores,
             PipelineBenchCores {
-                journal: 1,
+                journal_seq: 1,
                 matching: 2,
                 publisher: 3,
                 journal_disk: 4,
@@ -3527,22 +3508,28 @@ mod pipeline_core_tests {
     #[test]
     fn the_default_flag_value_parses() {
         // Guards the `default_value` string on `--pipeline-cores` against
-        // drifting out of sync with `PIPELINE_CORE_SLOTS`.
-        let parsed = BenchArgs::parse_from(["melin-bench"]).pipeline_cores;
+        // drifting out of sync with `PIPELINE_THREADS`.
+        let parsed = BenchArgs::parse_from(["melin-ec-bench"]).pipeline_cores;
         assert!(resolve_pipeline_cores(&parsed).is_ok(), "{parsed:?}");
     }
 
     #[test]
-    fn wrong_arity_is_rejected() {
-        let err = resolve_pipeline_cores(&[1, 2, 3, 4]).unwrap_err();
-        assert!(err.contains("expects 5"), "{err}");
+    fn every_thread_needs_an_entry_and_positional_lists_are_refused() {
+        let err = resolve_pipeline_cores("journal-seq=1,matching=2,publisher=3,journal-disk=4")
+            .unwrap_err();
+        assert!(err.contains("no core for drain"), "{err}");
+        let err = resolve_pipeline_cores("1,2,3,4,5").unwrap_err();
+        assert!(err.contains("--pipeline-cores"), "{err}");
+        assert!(err.contains("positional"), "{err}");
     }
 
     #[test]
     fn a_duplicate_core_names_both_claimants() {
         // The collision the old hardcoded layout invited: the drain
         // thread landing on the journal's disk core.
-        let err = resolve_pipeline_cores(&[1, 2, 3, 4, 4]).unwrap_err();
+        let err =
+            resolve_pipeline_cores("journal-seq=1,matching=2,publisher=3,journal-disk=4,drain=4")
+                .unwrap_err();
         assert!(err.contains("core 4"), "{err}");
         assert!(err.contains("journal-disk"), "{err}");
         assert!(err.contains("drain"), "{err}");
@@ -3552,9 +3539,12 @@ mod pipeline_core_tests {
     fn zero_is_an_unpinned_sentinel_not_a_core() {
         // Several threads may be left unpinned at once; 0 must not read
         // as a duplicate claim on core 0.
-        let cores = resolve_pipeline_cores(&[1, 0, 0, 0, 0]).unwrap();
-        assert_eq!(cores.journal, 1);
+        let cores =
+            resolve_pipeline_cores("journal-seq=1,matching=0,publisher=0,journal-disk=0,drain=0")
+                .unwrap();
+        assert_eq!(cores.journal_seq, 1);
         assert_eq!(cores.drain, 0);
+        assert_eq!(resolve_pipeline_cores("none").unwrap().journal_seq, 0);
     }
 }
 
@@ -3574,12 +3564,20 @@ mod outcome_report_tests {
         Price(NonZeroU64::new(100).unwrap())
     }
 
+    /// A response as it comes off the wire: the codec's bytes without
+    /// the length prefix, which is what `classify` is fed.
+    fn wire(kind: &ResponseKind) -> Vec<u8> {
+        let mut buf = [0u8; 512];
+        let written = codec::encode_response(kind, &mut buf).unwrap();
+        buf[4..written].to_vec()
+    }
+
     #[test]
     fn records_each_variant_into_the_right_bucket() {
         let (oid, sym, acc) = dummy_order();
         let mut r = OutcomeReport::default();
-        r.record(&ResponseKind::BatchEnd);
-        r.record(&ResponseKind::Report(ExecutionReport::Placed {
+        r.record(&Reply::BatchEnd).unwrap();
+        let placed = wire(&ResponseKind::Report(ExecutionReport::Placed {
             order_id: oid,
             symbol: sym,
             account: acc,
@@ -3587,16 +3585,23 @@ mod outcome_report_tests {
             price: one_price(),
             quantity: one_qty(),
         }));
-        r.record(&ResponseKind::Report(ExecutionReport::Rejected {
+        r.record(&Reply::Response(&placed)).unwrap();
+        let rejected = wire(&ResponseKind::Report(ExecutionReport::Rejected {
             order_id: oid,
             symbol: sym,
             account: acc,
             reason: RejectReason::InsufficientBalance,
         }));
-        r.record(&ResponseKind::EngineError);
-        r.record(&ResponseKind::ServerBusy);
-        // Heartbeat is intentionally untracked.
-        r.record(&ResponseKind::Heartbeat);
+        r.record(&Reply::Response(&rejected)).unwrap();
+        r.record(&Reply::EngineError).unwrap();
+        r.record(&Reply::ServerBusy).unwrap();
+        // Heartbeat is intentionally untracked, and so is a response
+        // that is not an execution report.
+        r.record(&Reply::Heartbeat).unwrap();
+        let hwm = wire(&ResponseKind::RequestSeqHwm { hwm: 3 });
+        r.record(&Reply::Response(&hwm)).unwrap();
+        // A response the codec cannot decode is the caller's to judge.
+        assert!(r.record(&Reply::Response(&[0xFF])).is_err());
 
         assert_eq!(r.batch_ends, 1);
         assert_eq!(r.placed, 1);
@@ -3612,24 +3617,20 @@ mod outcome_report_tests {
     #[test]
     fn merge_sums_all_fields_including_reason_buckets() {
         let (oid, sym, acc) = dummy_order();
-        let mut a = OutcomeReport::default();
-        a.record(&ResponseKind::Report(ExecutionReport::Rejected {
+        let rejected = wire(&ResponseKind::Report(ExecutionReport::Rejected {
             order_id: oid,
             symbol: sym,
             account: acc,
             reason: RejectReason::NoLiquidity,
         }));
-        a.record(&ResponseKind::BatchEnd);
+        let mut a = OutcomeReport::default();
+        a.record(&Reply::Response(&rejected)).unwrap();
+        a.record(&Reply::BatchEnd).unwrap();
 
         let mut b = OutcomeReport::default();
-        b.record(&ResponseKind::Report(ExecutionReport::Rejected {
-            order_id: oid,
-            symbol: sym,
-            account: acc,
-            reason: RejectReason::NoLiquidity,
-        }));
-        b.record(&ResponseKind::BatchEnd);
-        b.record(&ResponseKind::BatchEnd);
+        b.record(&Reply::Response(&rejected)).unwrap();
+        b.record(&Reply::BatchEnd).unwrap();
+        b.record(&Reply::BatchEnd).unwrap();
 
         a.merge(&b);
         assert_eq!(a.batch_ends, 3);
@@ -3662,9 +3663,9 @@ mod outcome_report_tests {
     #[test]
     fn record_execution_report_and_record_agree_on_report_variants() {
         // Engine and pipeline modes call `record_execution_report`
-        // directly; the network bench reaches it via `record` ->
-        // `ResponseKind::Report(_)`. Both paths must produce identical
-        // counter state for the same input.
+        // directly; the network bench reaches it via `record` on the
+        // wire bytes of a `ResponseKind::Report(_)`. Both paths must
+        // produce identical counter state for the same input.
         let (oid, sym, acc) = dummy_order();
         let rep = ExecutionReport::Rejected {
             order_id: oid,
@@ -3677,7 +3678,8 @@ mod outcome_report_tests {
         via_direct.record_execution_report(&rep);
 
         let mut via_wire = OutcomeReport::default();
-        via_wire.record(&ResponseKind::Report(rep));
+        let bytes = wire(&ResponseKind::Report(rep));
+        via_wire.record(&Reply::Response(&bytes)).unwrap();
 
         assert_eq!(via_direct.rejected, via_wire.rejected);
         assert_eq!(via_direct.reject_reasons, via_wire.reject_reasons);

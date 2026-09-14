@@ -8,7 +8,7 @@ use super::tags;
 ///
 /// Usage:
 /// ```
-/// # use melin_gateway_core::fix::{serialize::FixMessageBuilder, tags};
+/// # use melin_ec_gateway_core::fix::{serialize::FixMessageBuilder, tags};
 /// let msg = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
 ///     .str_tag(tags::CL_ORD_ID, "ORD001")
 ///     .str_tag(tags::SYMBOL, "BTC/USD")

@@ -1679,23 +1679,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-admin"
-version = "0.15.0"
-dependencies = [
- "base64",
- "crossterm",
- "ed25519-dalek",
- "melin-client",
- "melin-protocol",
- "rand 0.10.2",
- "ratatui",
-]
-
-[[package]]
 name = "melin-app"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c85f136ea406ed36804e34ab9f17e0fba7732d40766b632c354599d5fe8df631"
+checksum = "9a502cf49d25cd31b1a17ba0aa0496490a6dc47047e94055bbc31a891cc704af"
 dependencies = [
  "base64",
  "libc",
@@ -1703,7 +1690,60 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-bench"
+name = "melin-client"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7144951b4e0cbaa1c2b29ce360f7bb086f099ea884a5a8ce4a3177390b77142a"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "melin-wire-protocol",
+]
+
+[[package]]
+name = "melin-dpdk"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1a877f420f5995856eb464c5d073275f40e302222d207239640c849a0bc1be7"
+dependencies = [
+ "bindgen",
+ "cc",
+ "fastcp",
+ "libc",
+ "pkg-config",
+ "rustc-hash",
+ "tracing",
+]
+
+[[package]]
+name = "melin-ec"
+version = "0.15.0"
+dependencies = [
+ "astenn",
+ "melin-ec-trading",
+ "melin-ec-types",
+ "proptest",
+ "rustc-hash",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "melin-ec-admin"
+version = "0.15.0"
+dependencies = [
+ "base64",
+ "crossterm",
+ "ed25519-dalek",
+ "melin-client",
+ "melin-ec-client",
+ "melin-ec-protocol",
+ "rand 0.10.2",
+ "ratatui",
+]
+
+[[package]]
+name = "melin-ec-bench"
 version = "0.15.0"
 dependencies = [
  "base64",
@@ -1719,16 +1759,17 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
+ "melin-client",
  "melin-dpdk",
- "melin-exchange-core",
+ "melin-ec",
+ "melin-ec-protocol",
+ "melin-ec-server",
+ "melin-ec-trading",
+ "melin-ec-types",
  "melin-journal",
  "melin-pipeline",
- "melin-protocol",
- "melin-server",
  "melin-server-runtime",
- "melin-trading",
  "melin-transport-core",
- "melin-types",
  "melin-wire-protocol",
  "plotters",
  "rand 0.10.2",
@@ -1743,76 +1784,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-client"
+name = "melin-ec-client"
 version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
- "melin-protocol",
+ "melin-client",
+ "melin-ec-protocol",
  "melin-wire-protocol",
 ]
 
 [[package]]
-name = "melin-dpdk"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89b42be7d7cb92222836870067d04c22c5c68184849cbecc01b06a2efb1c68c1"
-dependencies = [
- "bindgen",
- "cc",
- "fastcp",
- "libc",
- "pkg-config",
- "rustc-hash",
- "tracing",
-]
-
-[[package]]
-name = "melin-exchange-core"
+name = "melin-ec-gateway-core"
 version = "0.15.0"
 dependencies = [
- "astenn",
- "melin-trading",
- "melin-types",
- "proptest",
- "rustc-hash",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "melin-gateway-core"
-version = "0.15.0"
-dependencies = [
- "ed25519-dalek",
  "proptest",
 ]
 
 [[package]]
-name = "melin-journal"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee7a2e22c7884c6a7abea2a0a055a312a28548a7a7020ca360a5b904a80f2d5c"
-dependencies = [
- "blake3",
- "crc32c",
- "getrandom 0.4.3",
- "libc",
- "melin-app",
- "melin-pipeline",
- "memmap2",
- "rustix",
- "tracing",
- "zerocopy",
-]
-
-[[package]]
-name = "melin-market-data"
+name = "melin-ec-market-data"
 version = "0.15.0"
 dependencies = [
  "astenn",
- "ed25519-dalek",
- "melin-protocol",
- "melin-types",
+ "melin-client",
+ "melin-ec-protocol",
+ "melin-ec-types",
  "melin-wire-protocol",
  "proptest",
  "rustc-hash",
@@ -1820,16 +1815,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-md-gateway"
+name = "melin-ec-md-gateway"
 version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
  "libc",
- "melin-gateway-core",
- "melin-market-data",
- "melin-protocol",
- "melin-types",
+ "melin-ec-gateway-core",
+ "melin-ec-market-data",
+ "melin-ec-protocol",
+ "melin-ec-types",
  "serde",
  "toml",
  "tracing",
@@ -1837,16 +1832,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-oe-gateway"
+name = "melin-ec-oe-gateway"
 version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
  "libc",
- "melin-exchange-core",
- "melin-gateway-core",
- "melin-protocol",
- "melin-types",
+ "melin-client",
+ "melin-ec",
+ "melin-ec-gateway-core",
+ "melin-ec-protocol",
+ "melin-ec-types",
+ "melin-wire-protocol",
  "proptest",
  "serde",
  "toml",
@@ -1855,41 +1852,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-pipeline"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8143a9b06c76df8fe53af02ee8d537388a64d2ceef764c0ee3f5dbe4ca7751cf"
-
-[[package]]
-name = "melin-protocol"
+name = "melin-ec-protocol"
 version = "0.15.0"
 dependencies = [
  "bolero",
- "melin-types",
+ "melin-ec-types",
  "melin-wire-protocol",
  "zerocopy",
 ]
 
 [[package]]
-name = "melin-raft"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b57b40f2f6705d170d230d1202113b88c155a9137454ee666303b12b0530a94"
-dependencies = [
- "crc32c",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "melin-app",
- "melin-transport-core",
- "openraft",
- "postcard",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "melin-server"
+name = "melin-ec-server"
 version = "0.15.0"
 dependencies = [
  "base64",
@@ -1904,15 +1877,16 @@ dependencies = [
  "melin-app",
  "melin-client",
  "melin-dpdk",
- "melin-exchange-core",
+ "melin-ec",
+ "melin-ec-client",
+ "melin-ec-market-data",
+ "melin-ec-protocol",
+ "melin-ec-trading",
+ "melin-ec-types",
  "melin-journal",
- "melin-market-data",
  "melin-pipeline",
- "melin-protocol",
  "melin-server-runtime",
- "melin-trading",
  "melin-transport-core",
- "melin-types",
  "melin-wire-protocol",
  "rand 0.10.2",
  "rustc-hash",
@@ -1925,10 +1899,86 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-server-runtime"
+name = "melin-ec-trading"
 version = "0.15.0"
+dependencies = [
+ "melin-app",
+ "melin-ec-types",
+]
+
+[[package]]
+name = "melin-ec-tui"
+version = "0.15.0"
+dependencies = [
+ "crossterm",
+ "ed25519-dalek",
+ "melin-client",
+ "melin-ec-client",
+ "melin-ec-protocol",
+ "ratatui",
+ "tikv-jemallocator",
+]
+
+[[package]]
+name = "melin-ec-tui-fix-client"
+version = "0.15.0"
+dependencies = [
+ "crossterm",
+ "melin-ec-gateway-core",
+ "ratatui",
+]
+
+[[package]]
+name = "melin-ec-types"
+version = "0.15.0"
+
+[[package]]
+name = "melin-journal"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2c51315e65f41c1e6141f1878f4f07f0463303690e2081209ecb6abd6f94a06"
+checksum = "c111ae1748499f051ef4e325b05501f990040cc5bc5fb9c531684efbf7deb8a2"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "getrandom 0.4.3",
+ "libc",
+ "melin-app",
+ "melin-pipeline",
+ "memmap2",
+ "rustix",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
+name = "melin-pipeline"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31832a207d399556eb2cc82b65dff7e9133e073a94310babce0400df0912b56c"
+
+[[package]]
+name = "melin-raft"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80a1182c6cae1125f8d745737e3ba34624679633144a91e7346ae1ddb01b236f"
+dependencies = [
+ "crc32c",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "melin-app",
+ "melin-transport-core",
+ "openraft",
+ "postcard",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "melin-server-runtime"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ff6f42ab43ac44389d9ca8c1bbd6e9c629e28fbad989a78430b9de08f73f5b7"
 dependencies = [
  "base64",
  "blake3",
@@ -1952,18 +2002,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-trading"
-version = "0.15.0"
-dependencies = [
- "melin-app",
- "melin-types",
-]
-
-[[package]]
 name = "melin-transport-core"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b7932c25d902d4dd696bda548bb9af0e0d7916b7326ab70fadd3beaa1f0ef21"
+checksum = "8c83e311d982fb645784d5284b65d795c3c6dfc6bfcfafbd664f2cea2a80febe"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -1977,35 +2019,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-tui"
-version = "0.15.0"
-dependencies = [
- "crossterm",
- "ed25519-dalek",
- "melin-client",
- "melin-protocol",
- "ratatui",
- "tikv-jemallocator",
-]
-
-[[package]]
-name = "melin-tui-fix-client"
-version = "0.15.0"
-dependencies = [
- "crossterm",
- "melin-gateway-core",
- "ratatui",
-]
-
-[[package]]
-name = "melin-types"
-version = "0.15.0"
-
-[[package]]
 name = "melin-wire-protocol"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "607a2fd2059e0a5660c1e569c489a80326cf82c8964d7e632cd790d3d0d36aa3"
+checksum = "d96994e7b7c42af1701c42a093a4e81c443829e264c50080990a7a36e5cfaea3"
 
 [[package]]
 name = "memchr"

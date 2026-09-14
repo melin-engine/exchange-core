@@ -23,36 +23,46 @@ authors = ["P.L.S.C."]
 # used for local builds, the version requirement for published ones. Both
 # must be carried here so `cargo publish` accepts the member manifests.
 #
+# Every exchange-core crate is `melin-ec-…` ("ec" for exchange core), and
+# the matching engine itself is `melin-ec`. Bare `melin-…` names belong to
+# the sequencer's crates, so the two families can never collide on
+# crates.io. The binaries carry the prefix too (`melin-ec-server`,
+# `melin-ec-admin`, …), so one name means one thing everywhere.
+#
 # Only crates that something else depends on are listed. The leaf binaries
-# (melin-admin, melin-bench, the two gateways, the two TUIs) inherit the
-# workspace version but are nobody's dependency, so they need no pin.
-melin-client = { path = "crates/exchange/client", version = "0.15.0" }
-melin-exchange-core = { path = "crates/exchange/exchange-core", version = "0.15.0" }
-melin-gateway-core = { path = "crates/exchange/gateway-core", version = "0.15.0" }
-melin-market-data = { path = "crates/exchange/market-data", version = "0.15.0" }
-melin-protocol = { path = "crates/exchange/protocol", version = "0.15.0" }
+# (melin-ec-admin, melin-ec-bench, the two gateways, the two TUIs) inherit
+# the workspace version but are nobody's dependency, so they need no pin.
+melin-ec = { path = "crates/exchange/exchange-core", version = "0.15.0" }
+melin-ec-client = { path = "crates/exchange/client", version = "0.15.0" }
+melin-ec-gateway-core = { path = "crates/exchange/gateway-core", version = "0.15.0" }
+melin-ec-market-data = { path = "crates/exchange/market-data", version = "0.15.0" }
+melin-ec-protocol = { path = "crates/exchange/protocol", version = "0.15.0" }
 # `default-features = false` lives here rather than on the consumer: a member
-# cannot override an inherited `default-features`, and melin-bench — the only
-# crate that depends on the server — re-declares the server's feature set and
-# enables the pieces it wants explicitly. A future consumer that does want the
-# stock build must ask for `features = ["hash-chain", "release-tracing"]`.
-melin-server = { path = "crates/exchange/server", version = "0.15.0", default-features = false }
-melin-trading = { path = "crates/exchange/trading", version = "0.15.0" }
-melin-types = { path = "crates/exchange/types", version = "0.15.0" }
+# cannot override an inherited `default-features`, and melin-ec-bench — the
+# only crate that depends on the server — re-declares the server's feature
+# set and enables the pieces it wants explicitly. A future consumer that does
+# want the stock build must ask for `features = ["hash-chain", "release-tracing"]`.
+melin-ec-server = { path = "crates/exchange/server", version = "0.15.0", default-features = false }
+melin-ec-trading = { path = "crates/exchange/trading", version = "0.15.0" }
+melin-ec-types = { path = "crates/exchange/types", version = "0.15.0" }
 
 # Melin sequencer crates, consumed from crates.io and released from the
 # separate sequencer repository. Kept as a group distinct from the exchange
 # crates above: the sequencer moves on its own schedule and the two version
-# numbers only happen to coincide today. All seven must be bumped together —
-# a straggler mixes journal/wire formats across the pipeline rather than
-# just looking untidy.
-melin-app = "0.15.0"
-melin-dpdk = "0.15.0"
-melin-journal = "0.15.0"
-melin-pipeline = "0.15.0"
-melin-server-runtime = "0.15.0"
-melin-transport-core = "0.15.0"
-melin-wire-protocol = "0.15.0"
+# numbers need not coincide. All eight must be bumped together — a straggler
+# mixes journal/wire formats across the pipeline rather than just looking
+# untidy.
+melin-app = "0.16.0"
+# The node's own wire-protocol client: framing, the Ed25519 handshake and
+# the reply batch. Every tool here that talks to a node authenticates
+# through it rather than re-rolling the handshake.
+melin-client = "0.16.0"
+melin-dpdk = "0.16.0"
+melin-journal = "0.16.0"
+melin-pipeline = "0.16.0"
+melin-server-runtime = "0.16.0"
+melin-transport-core = "0.16.0"
+melin-wire-protocol = "0.16.0"
 
 base64 = "0.22"
 blake3 = "1"

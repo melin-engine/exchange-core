@@ -8,9 +8,10 @@ use std::collections::HashSet;
 use std::io;
 use std::num::NonZeroU64;
 
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
-use melin_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
+use melin_client::Reply;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::ResponseKind;
+use melin_ec_types::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 
 use crate::index::RestingOrder;
 use crate::mirror::{BookMirror, Level};
@@ -40,7 +41,7 @@ pub fn parse_snapshot(reader: &mut dyn io::Read) -> Result<SnapshotResult, Snaps
     let mut level_count: u32 = 0;
 
     loop {
-        let (_seq, response) = read_frame(reader)?;
+        let (_seq, response) = read_response(reader)?;
 
         match response {
             ResponseKind::BookSnapshotBegin {
@@ -105,8 +106,8 @@ pub fn parse_snapshot(reader: &mut dyn io::Read) -> Result<SnapshotResult, Snaps
                 });
             }
 
-            // Ignore any other frame types during snapshot parse
-            // (e.g., BatchEnd, Heartbeat could arrive).
+            // Any other application response is not the snapshot's;
+            // the transport's frames never get this far.
             _ => {}
         }
     }
@@ -146,14 +147,31 @@ fn seed_level(
     }
 }
 
-/// Read a single sequence-prefixed response frame from the stream.
-fn read_frame(reader: &mut dyn io::Read) -> Result<(u64, ResponseKind), SnapshotError> {
-    // 8-byte sequence prefix.
+/// Read the next application response off the publisher's stream, with
+/// the ring sequence it was published at. The transport's frames in
+/// between — a heartbeat on a quiet feed, the `BatchEnd` closing each
+/// request's batch, a busy or failing engine's word on a request that
+/// is not ours — are told apart by the sequencer's client and skipped:
+/// the mirrors are built from execution reports alone.
+pub(crate) fn read_response(
+    reader: &mut dyn io::Read,
+) -> Result<(u64, ResponseKind), SnapshotError> {
+    loop {
+        let (seq, frame) = read_frame(reader)?;
+        match melin_client::classify(&frame)? {
+            Reply::Response(bytes) => return Ok((seq, codec::decode_response(bytes)?)),
+            Reply::Heartbeat | Reply::BatchEnd | Reply::ServerBusy | Reply::EngineError => {}
+        }
+    }
+}
+
+/// Read a single sequence-prefixed frame from the stream: the 8-byte
+/// ring sequence, then the standard 4-byte length-prefixed payload.
+fn read_frame(reader: &mut dyn io::Read) -> Result<(u64, Vec<u8>), SnapshotError> {
     let mut seq_buf = [0u8; 8];
     reader.read_exact(&mut seq_buf)?;
     let seq = u64::from_le_bytes(seq_buf);
 
-    // 4-byte length prefix.
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let frame_len = u32::from_le_bytes(len_buf) as usize;
@@ -164,18 +182,26 @@ fn read_frame(reader: &mut dyn io::Read) -> Result<(u64, ResponseKind), Snapshot
 
     let mut frame_buf = vec![0u8; frame_len];
     reader.read_exact(&mut frame_buf)?;
-
-    let response = codec::decode_response(&frame_buf)?;
-    Ok((seq, response))
+    Ok((seq, frame_buf))
 }
 
 /// Errors during snapshot parsing.
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(io::Error),
+    /// The exchange codec could not decode an application response.
     Protocol(melin_wire_protocol::error::ProtocolError),
+    /// The sequencer's client refused a frame: an empty one, or a tag
+    /// from the protocol's reserved range where a reply belongs.
+    Transport(melin_client::Error),
     FrameTooLarge(usize),
     DuplicateSymbol(Symbol),
+}
+
+impl From<melin_client::Error> for SnapshotError {
+    fn from(e: melin_client::Error) -> Self {
+        Self::Transport(e)
+    }
 }
 
 impl From<io::Error> for SnapshotError {
@@ -195,6 +221,7 @@ impl std::fmt::Display for SnapshotError {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
+            Self::Transport(e) => write!(f, "malformed frame from the publisher: {e}"),
             Self::FrameTooLarge(n) => write!(f, "frame too large: {n} bytes"),
             Self::DuplicateSymbol(s) => write!(f, "duplicate symbol in snapshot: {:?}", s),
         }
@@ -206,7 +233,9 @@ impl std::error::Error for SnapshotError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_protocol::codec::encode_response;
+    use melin_ec_protocol::codec::encode_response;
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
     use std::num::NonZeroU64;
 
     fn price(n: u64) -> Price {
@@ -220,6 +249,17 @@ mod tests {
         let mut frame = Vec::with_capacity(8 + response_len);
         frame.extend_from_slice(&seq.to_le_bytes());
         frame.extend_from_slice(&buf[..response_len]);
+        frame
+    }
+
+    /// A sequence-prefixed frame carrying one of the transport's own
+    /// frames, as the publisher sends heartbeats and batch ends.
+    fn transport_frame(seq: u64, resp: &TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = control_codec::encode_transport_response(resp, &mut buf).unwrap();
+        let mut frame = Vec::with_capacity(8 + n);
+        frame.extend_from_slice(&seq.to_le_bytes());
+        frame.extend_from_slice(&buf[..n]);
         frame
     }
 
@@ -340,8 +380,9 @@ mod tests {
 
     #[test]
     fn parse_snapshot_ignores_non_snapshot_frames() {
-        // Insert a Heartbeat between Begin and End — it should be silently
-        // ignored by the `_ => {}` catch-all arm.
+        // Insert a Heartbeat and a BatchEnd between Begin and End — the
+        // transport's frames, skipped by the reader before the codec
+        // sees them.
         let mut data = Vec::new();
         data.extend(encode_frame(
             0,
@@ -350,7 +391,8 @@ mod tests {
                 last_applied_seq: 42,
             },
         ));
-        data.extend(encode_frame(0, &ResponseKind::Heartbeat));
+        data.extend(transport_frame(0, &TransportResponse::Heartbeat));
+        data.extend(transport_frame(0, &TransportResponse::BatchEnd));
         data.extend(encode_frame(
             0,
             &ResponseKind::BookSnapshotEnd {

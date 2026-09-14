@@ -11,7 +11,7 @@ All modes use the realistic order flow generator: a mix of limit orders and canc
 Calls `Exchange::execute()` and `Exchange::cancel()` directly in a tight loop. No disruptor, no journal, no I/O. Measures pure matching engine throughput and per-order latency with realistic order flow.
 
 ```sh
-cargo run --release -p melin-bench -- --mode=engine 1000000
+cargo run --release -p melin-ec-bench -- --mode=engine 1000000
 ```
 
 ### `--mode=pipeline`
@@ -19,8 +19,8 @@ cargo run --release -p melin-bench -- --mode=engine 1000000
 Builds the full disruptor pipeline (journal + matching stages on separate OS threads) but bypasses network transport. The bench thread publishes `InputSlot`s directly to the input `Producer` and drains `OutputSlot`s from the output SPSC queue. Isolates pipeline latency from TCP/UDS overhead.
 
 ```sh
-cargo run --release -p melin-bench -- --mode=pipeline 1000000
-cargo run --release -p melin-bench --features no-persist -- --mode=pipeline 1000000   # skip journal I/O
+cargo run --release -p melin-ec-bench -- --mode=pipeline 1000000
+cargo run --release -p melin-ec-bench --features no-persist -- --mode=pipeline 1000000   # skip journal I/O
 ```
 
 ### `--mode=roundtrip` (default)
@@ -28,9 +28,9 @@ cargo run --release -p melin-bench --features no-persist -- --mode=pipeline 1000
 Full end-to-end benchmark. Boots the server in-process, connects via TCP (default) or Unix domain socket, and measures client-perceived round-trip latency through the entire pipeline: transport, queuing, journaling, matching, and response dispatch.
 
 ```sh
-cargo run --release -p melin-bench -- 1000000                          # TCP, default settings
-cargo run --release -p melin-bench -- --uds 1000000                    # Unix domain socket
-cargo run --release -p melin-bench -- --clients=32 --window=8 1000000  # 32 concurrent clients
+cargo run --release -p melin-ec-bench -- 1000000                          # TCP, default settings
+cargo run --release -p melin-ec-bench -- --uds 1000000                    # Unix domain socket
+cargo run --release -p melin-ec-bench -- --clients=32 --window=8 1000000  # 32 concurrent clients
 ```
 
 ## Options

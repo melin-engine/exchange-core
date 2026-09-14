@@ -1,5 +1,5 @@
 [package]
-name = "melin-client"
+name = "melin-ec-client"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -10,5 +10,6 @@ description = "Blocking client library for the Melin exchange binary protocol"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
-melin-protocol = { workspace = true }
+melin-client = { workspace = true }
+melin-ec-protocol = { workspace = true }
 melin-wire-protocol = { workspace = true }

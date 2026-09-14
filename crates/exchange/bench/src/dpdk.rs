@@ -19,12 +19,11 @@ use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
+use melin_client::Reply;
 use melin_dpdk::device::DpdkDevice;
 use melin_dpdk::eal::Eal;
 use melin_dpdk::mempool::Mempool;
 use melin_dpdk::port::Port;
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
 
 use crate::generator;
 use crate::{
@@ -810,12 +809,12 @@ pub fn run_dpdk_roundtrip(
                 }
 
                 let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                // Decode errors are dropped intentionally: malformed
-                // frames from the server are not the bench's
+                // Malformed frames are dropped intentionally, here and
+                // in the outcome tally below: they are not the bench's
                 // responsibility to diagnose, and panicking would mask
                 // genuine throughput regressions during a long run.
-                if let Ok(response) = codec::decode_response(payload) {
-                    if matches!(response, ResponseKind::BatchEnd) {
+                if let Ok(reply) = melin_client::classify(payload) {
+                    if matches!(reply, Reply::BatchEnd) {
                         diag_batch_ends += 1;
                         // Capture `rdtscp()` BEFORE any per-frame
                         // bookkeeping (outcome tally below) so the
@@ -853,8 +852,9 @@ pub fn run_dpdk_roundtrip(
                     }
                     // Outcome tally runs *after* the latency capture
                     // above so this counter increment is not billed to
-                    // the wire roundtrip.
-                    conn.outcomes.record(&response);
+                    // the wire roundtrip. An undecodable response is
+                    // dropped for the reason given above.
+                    let _ = conn.outcomes.record(&reply);
                 }
 
                 cursor += 4 + frame_len;
@@ -1028,21 +1028,12 @@ fn dpdk_auth_all(
         keys.len(),
         "dpdk_auth_all: one key required per connection",
     );
-    use ed25519_dalek::Signer;
-    use melin_protocol::message::Request;
+    use melin_client::{Handshake, Step};
 
-    // Auth states per connection.
-    #[derive(PartialEq)]
-    enum AuthPhase {
-        WaitChallenge,
-        WaitServerReady,
-        Done,
-    }
-
-    let mut phases: Vec<AuthPhase> = connections
-        .iter()
-        .map(|_| AuthPhase::WaitChallenge)
-        .collect();
+    // One handshake state machine per connection: fed each frame smoltcp
+    // delivers, it hands back the response to send. Vec: one per
+    // connection, indexed alongside `connections`.
+    let mut handshakes: Vec<Handshake> = keys.iter().map(Handshake::new).collect();
     let mut recv_buf = [0u8; 512];
 
     loop {
@@ -1063,7 +1054,7 @@ fn dpdk_auth_all(
         let mut all_done = true;
 
         for (i, conn) in connections.iter_mut().enumerate() {
-            if phases[i] == AuthPhase::Done {
+            if handshakes[i].is_done() {
                 continue;
             }
             all_done = false;
@@ -1096,42 +1087,14 @@ fn dpdk_auth_all(
             // Use a cursor approach: process the frame, then compact once.
             let consumed = 4 + frame_len;
 
-            match &phases[i] {
-                AuthPhase::WaitChallenge => {
-                    let response = codec::decode_response(&conn.parse_buf[4..consumed])
-                        .expect("decode Challenge");
-                    let nonce = match response {
-                        ResponseKind::Challenge { nonce } => nonce,
-                        other => panic!("client {i}: expected Challenge, got {other:?}"),
-                    };
-
-                    let conn_key = &keys[i];
-                    let signature = conn_key.sign(&nonce);
-                    let request = Request::ChallengeResponse {
-                        signature: signature.to_bytes(),
-                        public_key: conn_key.verifying_key().to_bytes(),
-                    };
-                    let mut buf = [0u8; 256];
-                    let written = codec::encode_request(&request, 0, &mut buf)
-                        .expect("encode ChallengeResponse");
-
+            match handshakes[i].feed(&conn.parse_buf[4..consumed]) {
+                // The challenge response, length prefix included.
+                Ok(Step::Send(frame)) => {
                     let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
-                    socket
-                        .send_slice(&buf[..written])
-                        .expect("send ChallengeResponse");
-
-                    phases[i] = AuthPhase::WaitServerReady;
+                    socket.send_slice(frame).expect("send ChallengeResponse");
                 }
-                AuthPhase::WaitServerReady => {
-                    let response = codec::decode_response(&conn.parse_buf[4..consumed])
-                        .expect("decode ServerReady");
-                    assert!(
-                        matches!(response, ResponseKind::ServerReady),
-                        "client {i}: expected ServerReady, got {response:?}"
-                    );
-                    phases[i] = AuthPhase::Done;
-                }
-                AuthPhase::Done => unreachable!(),
+                Ok(Step::Ready) => {}
+                Err(e) => panic!("client {i}: auth handshake failed: {e}"),
             }
 
             // Compact parse buffer after processing the frame.

@@ -6,12 +6,12 @@
 //!   authorized_keys     — ready-to-use authorized_keys file entry
 //!
 //! Usage:
-//!     melin-keygen <name> <permission>
+//!     melin-ec-keygen <name> <permission>
 //!
 //! Example:
-//!     melin-keygen ops operator
-//!     melin-keygen market-maker trader
-//!     melin-keygen monitor readonly
+//!     melin-ec-keygen ops operator
+//!     melin-ec-keygen market-maker trader
+//!     melin-ec-keygen monitor readonly
 
 use std::path::Path;
 
@@ -22,13 +22,13 @@ use ed25519_dalek::SigningKey;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: melin-keygen <name> <permission>");
+        eprintln!("usage: melin-ec-keygen <name> <permission>");
         eprintln!("  permission: operator | trader | custodian | readonly | replication");
         eprintln!();
         eprintln!("example:");
-        eprintln!("  melin-keygen ops operator");
-        eprintln!("  melin-keygen market-maker trader");
-        eprintln!("  melin-keygen treasury custodian");
+        eprintln!("  melin-ec-keygen ops operator");
+        eprintln!("  melin-ec-keygen market-maker trader");
+        eprintln!("  melin-ec-keygen treasury custodian");
         std::process::exit(1);
     }
 

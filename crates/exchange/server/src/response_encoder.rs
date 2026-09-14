@@ -7,9 +7,9 @@
 //! runtime directly and never reach this encoder.
 
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
-use melin_types::types::{ExecutionReport, QueryResponse};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::ResponseKind;
+use melin_ec_types::types::{ExecutionReport, QueryResponse};
 
 /// Encoder for the trading wire protocol.
 ///
@@ -61,7 +61,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use melin_types::types::*;
+    use melin_ec_types::types::*;
 
     const SCRATCH: usize = 512;
 

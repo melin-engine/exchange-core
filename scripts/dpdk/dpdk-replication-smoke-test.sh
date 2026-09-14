@@ -43,6 +43,9 @@ REPLICA_IP="192.168.201.2"
 PREFIX=24
 REPL_PORT=9877
 HEALTH_PORT=9878
+# The replica serves a health endpoint too, and its default bind is the
+# primary's port on the same host.
+REPLICA_HEALTH_PORT=9879
 
 # Veth pair: replica side <-> primary side.
 VETH_REPLICA="dpdk-repl-r"
@@ -195,18 +198,18 @@ echo "=== Building ==="
 cd "$PROJECT_DIR"
 
 echo "  Building server with DPDK..."
-cargo build --release -p melin-server --features dpdk --no-default-features --quiet 2>&1
+cargo build --release -p melin-ec-server --features dpdk --no-default-features --quiet 2>&1
 echo "  server: OK"
 
 echo "  Building keygen..."
-cargo build --release --bin melin-keygen --quiet 2>&1
+cargo build --release --bin melin-ec-keygen --quiet 2>&1
 echo "  keygen: OK"
 echo ""
 
 # --- 3. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" repl_key trader
+"$PROJECT_DIR/target/release/melin-ec-keygen" repl_key trader
 # The DPDK primary now authenticates connecting replicas: the key must carry
 # Replication permission (the primary rejects Trader/Operator/etc.).
 echo "replication $(cat repl_key.pub | tr -d '\n') repl" > authorized_keys
@@ -247,7 +250,7 @@ echo ""
 # --- 5. Start primary ---
 echo "=== Starting DPDK primary ==="
 RUST_LOG=info RUST_BACKTRACE=1 \
-"$PROJECT_DIR/target/release/melin-server" \
+"$PROJECT_DIR/target/release/melin-ec-server" \
     --bind "0.0.0.0:9876" \
     --health-bind "0.0.0.0:$HEALTH_PORT" \
     --journal "$TMPDIR/primary.journal" \
@@ -290,9 +293,10 @@ echo ""
 # --- 6. Start replica ---
 echo "=== Starting DPDK replica ==="
 RUST_LOG=info RUST_BACKTRACE=1 \
-"$PROJECT_DIR/target/release/melin-server" \
+"$PROJECT_DIR/target/release/melin-ec-server" \
     --journal "$TMPDIR/replica.journal" \
     --snapshot-interval-ms 0 \
+    --health-bind "127.0.0.1:$REPLICA_HEALTH_PORT" \
     --replica-of "$PRIMARY_IP:$REPL_PORT" \
     --replication-key "$TMPDIR/repl_key.key" \
     --dpdk-eal-args="--vdev=net_af_packet0,iface=$VETH_REPLICA --no-pci --log-level=6 --huge-dir=$HUGE_2M_MOUNT --file-prefix=replica" \

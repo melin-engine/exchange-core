@@ -81,8 +81,8 @@ if [[ ${#POSITIONAL[@]} -lt 3 ]]; then
     echo "  server-vlan-ip    VLAN/private IP of the engine server (used for trading traffic)"
     echo "  user              SSH username (default: root)"
     echo ""
-    echo "  After '--', extra args are passed to melin-server."
-    echo "  After a second '--', extra args are passed to melin-bench."
+    echo "  After '--', extra args are passed to melin-ec-server."
+    echo "  After a second '--', extra args are passed to melin-ec-bench."
     echo ""
     echo "examples:"
     echo "  $0 84.32.176.142 84.32.176.143 10.0.0.1"
@@ -95,7 +95,7 @@ BENCH_PUB="${POSITIONAL[1]}"
 SERVER_VLAN="${POSITIONAL[2]}"
 SSH_USER="${POSITIONAL[3]:-root}"
 
-SSH_CONTROL_DIR="$(mktemp -d -t melin-bench-ssh.XXXXXX)"
+SSH_CONTROL_DIR="$(mktemp -d -t melin-ec-bench-ssh.XXXXXX)"
 SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 # ControlMaster multiplexes every subsequent ssh over the first
 # connection per host — amortizes the handshake from ~50 calls down
@@ -170,16 +170,27 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p melin-admin --bin melin-keygen -- bench trader && \
+        cargo run --release -p melin-ec-admin --bin melin-ec-keygen -- bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
     fi"
 
-# Copy the authorized_keys line to the server.
-AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'trader {} bench'")
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo '${AUTH_LINE}' > authorized_keys"
-echo "  Auth keys configured."
+# The bench authenticates each client with a key derived from bench.key,
+# so the server must authorize the derived public keys — one per client
+# the bench run below will open. The count comes from the bench args,
+# falling back to the bench's own default.
+CLIENTS=16
+bench_args=(${BENCH_EXTRA_ARGS})
+for ((i = 0; i < ${#bench_args[@]}; i++)); do
+    case "${bench_args[$i]}" in
+        --clients) CLIENTS="${bench_args[$((i + 1))]}" ;;
+        --clients=*) CLIENTS="${bench_args[$i]#--clients=}" ;;
+    esac
+done
+ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && ./target/release/melin-ec-bench --key bench.key --clients ${CLIENTS} --print-authorized-keys" \
+    | ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && cat > authorized_keys"
+echo "  Auth keys configured (${CLIENTS} derived client keys)."
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -222,16 +233,16 @@ echo ""
 # 5. Start the engine on the server
 # ---------------------------------------------------------------------------
 echo "=== Starting engine on server ==="
-# Kill any existing melin-server process.
-ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+# Kill any existing melin-ec-server process.
+ssh $SSH_OPTS "$SERVER" "pkill -x melin-ec-server 2>/dev/null; true"
 sleep 1
-ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-ec-server \
         --bind ${BIND_ADDR} \
         --health-bind ${HEALTH_ADDR} \
         --journal ${JOURNAL_PATH} \
         --authorized-keys ${REPO_DIR}/authorized_keys \
         ${SERVER_EXTRA_ARGS} \
-    >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+    >/tmp/melin-ec-server.log 2>&1 </dev/null &" </dev/null
 
 # Wait for the server to be ready.
 echo "  Waiting for server to start..."
@@ -241,8 +252,8 @@ for i in $(seq 1 120); do
         break
     fi
     if [[ $i -eq 120 ]]; then
-        echo "  ERROR: Server did not start within 120s. Check /tmp/melin-server.log on server."
-        ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
+        echo "  ERROR: Server did not start within 120s. Check /tmp/melin-ec-server.log on server."
+        ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-ec-server.log" 2>/dev/null || true
         exit 1
     fi
     sleep 1
@@ -256,7 +267,7 @@ echo "=== Running benchmark ==="
 echo ""
 
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-    ./target/release/melin-bench \
+    ./target/release/melin-ec-bench \
         --addr ${BIND_ADDR} \
         --health-addr ${HEALTH_ADDR} \
         --key bench.key \
@@ -278,7 +289,7 @@ echo ""
 # 8. Stop the server
 # ---------------------------------------------------------------------------
 echo "=== Stopping server ==="
-ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
+ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-ec-server 2>/dev/null; true"
 sleep 2
 echo "  Server stopped."
 

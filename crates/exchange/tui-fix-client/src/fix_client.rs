@@ -8,9 +8,9 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use melin_gateway_core::fix::parse::{self, FixMessage};
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
+use melin_ec_gateway_core::fix::parse::{self, FixMessage};
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
 
 /// A blocking FIX 4.4 session client.
 pub struct FixClient {

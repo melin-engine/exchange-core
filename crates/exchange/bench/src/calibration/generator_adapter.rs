@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 
-use melin_types::types::{OrderType, Side as EngineSide, TimeInForce};
+use melin_ec_types::types::{OrderType, Side as EngineSide, TimeInForce};
 
 use super::Side as CalibSide;
 use super::itch::ItchEvent;

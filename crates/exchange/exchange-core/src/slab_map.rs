@@ -24,7 +24,7 @@
 use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 
-use melin_types::types::{AccountId, OrderId};
+use melin_ec_types::types::{AccountId, OrderId};
 
 /// Either an occupied entry or a freelist link to the next vacant slot.
 ///

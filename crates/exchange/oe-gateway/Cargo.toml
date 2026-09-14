@@ -1,5 +1,5 @@
 [package]
-name = "melin-oe-gateway"
+name = "melin-ec-oe-gateway"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -9,14 +9,15 @@ authors.workspace = true
 description = "FIX 4.4 order entry gateway for the Melin exchange"
 
 [[bin]]
-name = "melin-oe-gateway"
+name = "melin-ec-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]
-melin-gateway-core = { workspace = true }
-melin-protocol = { workspace = true }
-melin-exchange-core = { workspace = true }
-melin-types = { workspace = true }
+melin-client = { workspace = true }
+melin-ec-gateway-core = { workspace = true }
+melin-ec-protocol = { workspace = true }
+melin-ec = { workspace = true }
+melin-ec-types = { workspace = true }
 ed25519-dalek = { workspace = true }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
@@ -26,4 +27,5 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+melin-wire-protocol = { workspace = true }
 proptest = "1"

@@ -5,7 +5,7 @@
 //! and MarketDataRequestReject (Y) to connected clients.
 //!
 //! Usage:
-//!   melin-md-gateway --config md-gateway.toml [--core N]
+//!   melin-ec-md-gateway --config md-gateway.toml [--core N]
 
 mod config;
 pub mod event_loop;
@@ -34,7 +34,7 @@ fn main() {
                 config_path = Some(args.get(i).cloned().unwrap_or_default());
             }
             _ => {
-                eprintln!("usage: melin-md-gateway --config <path>");
+                eprintln!("usage: melin-ec-md-gateway --config <path>");
                 std::process::exit(1);
             }
         }
@@ -42,7 +42,7 @@ fn main() {
     }
 
     let config_path = config_path.unwrap_or_else(|| {
-        eprintln!("usage: melin-md-gateway --config <path>");
+        eprintln!("usage: melin-ec-md-gateway --config <path>");
         std::process::exit(1);
     });
 
@@ -60,19 +60,19 @@ fn main() {
         listen = %config.listen,
         event_publisher = %config.event_publisher,
         symbols = config.symbols.len(),
-        "melin-md-gateway starting"
+        "melin-ec-md-gateway starting"
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Shared book mirror state between the core thread and the event loop.
-    let md_state = Arc::new(RwLock::new(melin_market_data::core::MdState::new()));
+    let md_state = Arc::new(RwLock::new(melin_ec_market_data::core::MdState::new()));
 
     // Collect symbol IDs for the Subscribe request.
-    let symbol_ids: Vec<melin_types::types::Symbol> = config
+    let symbol_ids: Vec<melin_ec_types::types::Symbol> = config
         .symbols
         .values()
-        .map(|s| melin_types::types::Symbol(s.id))
+        .map(|s| melin_ec_types::types::Symbol(s.id))
         .collect();
 
     // Spawn the MarketDataCore thread — connects to the event publisher,
@@ -84,8 +84,8 @@ fn main() {
     let core_handle = std::thread::Builder::new()
         .name("md-core".into())
         .spawn(move || {
-            melin_market_data::core::run(
-                melin_market_data::core::CoreConfig {
+            melin_ec_market_data::core::run(
+                melin_ec_market_data::core::CoreConfig {
                     event_publisher_addr: core_addr,
                     symbols: symbol_ids,
                     key_path: core_key_path,
@@ -118,5 +118,5 @@ fn main() {
     shutdown.store(true, Ordering::Relaxed);
     let _ = core_handle.join();
 
-    tracing::info!("melin-md-gateway stopped");
+    tracing::info!("melin-ec-md-gateway stopped");
 }

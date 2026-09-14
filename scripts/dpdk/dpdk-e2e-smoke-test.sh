@@ -121,23 +121,26 @@ echo "=== Building ==="
 cd "$PROJECT_DIR"
 
 echo "  Building server with DPDK..."
-cargo build --release -p melin-server --features dpdk --no-default-features --quiet 2>&1
+cargo build --release -p melin-ec-server --features dpdk --no-default-features --quiet 2>&1
 echo "  server: OK"
 
 echo "  Building bench with DPDK..."
-cargo build --release -p melin-bench --features dpdk --no-default-features --quiet 2>&1
+cargo build --release -p melin-ec-bench --features dpdk --no-default-features --quiet 2>&1
 echo "  bench: OK"
 
 echo "  Building keygen..."
-cargo build --release --bin melin-keygen --quiet 2>&1
+cargo build --release --bin melin-ec-keygen --quiet 2>&1
 echo "  keygen: OK"
 echo ""
 
 # --- 3. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" bench trader
-echo "trader $(cat bench.pub | tr -d '\n') bench" > authorized_keys
+"$PROJECT_DIR/target/release/melin-ec-keygen" bench trader
+# The bench authenticates each client with a key derived from bench.key,
+# so authorize the derived public keys for the client count the bench
+# run below uses.
+"$PROJECT_DIR/target/release/melin-ec-bench" --key bench.key --clients 2 --print-authorized-keys > authorized_keys
 echo "  Generated bench.key + authorized_keys"
 echo ""
 
@@ -155,7 +158,7 @@ echo ""
 # --- 5. Start server ---
 echo "=== Starting DPDK server ==="
 RUST_LOG=info \
-"$PROJECT_DIR/target/release/melin-server" \
+"$PROJECT_DIR/target/release/melin-ec-server" \
     --bind "0.0.0.0:$PORT" \
     --journal "$TMPDIR/smoke.journal" \
     --authorized-keys "$TMPDIR/authorized_keys" \
@@ -196,9 +199,11 @@ echo "=== Running DPDK bench ==="
 echo "  short timed run, 2 clients, window 32"
 echo ""
 
-"$PROJECT_DIR/target/release/melin-bench" \
+"$PROJECT_DIR/target/release/melin-ec-bench" \
     --addr "$SERVER_IP:$PORT" \
     --key "$TMPDIR/bench.key" \
+    --accounts 100 \
+    --instruments 10 \
     --clients 2 \
     --window 32 \
     --warmup-duration 2s \

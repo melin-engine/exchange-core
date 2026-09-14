@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Entrypoint for the melin all-in-one Docker image.
-# Starts melin-server, melin-oe-gateway, and melin-md-gateway.
+# Starts melin-ec-server, melin-ec-oe-gateway, and melin-ec-md-gateway.
 #
 # Ports exposed:
 #   9000 — oe-gateway (FIX 4.4 order entry)
 #   9001 — md-gateway (FIX 4.4 market data)
 #
 # Connect the TUI:
-#   melin-tui-fix-client --oe-addr <host>:9000 --md-addr <host>:9001 \
+#   melin-ec-tui-fix-client --oe-addr <host>:9000 --md-addr <host>:9001 \
 #     --sender TRADER --oe-target MELIN-OE --md-target MELIN-MD
 
 set -euo pipefail
@@ -24,13 +24,13 @@ cd "$DATA_DIR"
 
 if [ ! -f "$DATA_DIR/trader.key" ]; then
     echo "Generating trader Ed25519 key..."
-    melin-keygen trader operator
+    melin-ec-keygen trader operator
     echo "  trader.key created"
 fi
 
 if [ ! -f "$DATA_DIR/bot.key" ]; then
     echo "Generating bot Ed25519 key..."
-    melin-keygen bot operator
+    melin-ec-keygen bot operator
     echo "  bot.key created"
 fi
 
@@ -116,21 +116,20 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "Starting melin-server..."
+echo "Starting melin-ec-server..."
 # RUST_LOG=info on the engine: server.rs initializes tracing with
 # EnvFilter::from_default_env(), which defaults to error-only when the
 # variable is unset. info-level surfaces recovery progress, seeding
 # completion, and any error!/warn! the engine wants to emit before
 # exiting — without it, a silent crash leaves the operator with no
 # diagnostic. Gateway processes inherit and benefit similarly.
-RUST_LOG="${RUST_LOG:-info}" melin-server \
+RUST_LOG="${RUST_LOG:-info}" melin-ec-server \
     --bind 127.0.0.1:9876 \
     --standalone \
     --authorized-keys "$DATA_DIR/authorized_keys" \
     --journal "$DATA_DIR/melin.journal" \
     --event-bind 127.0.0.1:9877 \
-    --yield-idle \
-    --cores 0,0,0,0,0,0,0,0 \
+    --cores none \
     --accounts 1000 \
     --instruments 2 \
     &
@@ -144,7 +143,7 @@ SERVER_PID=$!
 SERVER_READY=0
 for i in $(seq 1 50); do
     if nc -z 127.0.0.1 9876 2>/dev/null && nc -z 127.0.0.1 9877 2>/dev/null; then
-        echo "  melin-server ready"
+        echo "  melin-ec-server ready"
         SERVER_READY=1
         break
     fi
@@ -155,15 +154,15 @@ if [ "$SERVER_READY" -ne 1 ]; then
     # to infer "engine never bound" from a missing 'ready' line. Make the
     # failure mode loud so a slow journal recovery (or a startup panic
     # that doesn't even reach the bind) is obvious in the container log.
-    echo "  WARN: melin-server did not bind 9876+9877 within 5s — gateways will start anyway and may race or fail to connect" >&2
+    echo "  WARN: melin-ec-server did not bind 9876+9877 within 5s — gateways will start anyway and may race or fail to connect" >&2
 fi
 
 echo "Starting oe-gateway..."
-melin-oe-gateway --config "$DATA_DIR/oe-gateway.toml" &
+melin-ec-oe-gateway --config "$DATA_DIR/oe-gateway.toml" &
 OE_PID=$!
 
 echo "Starting md-gateway..."
-melin-md-gateway --config "$DATA_DIR/md-gateway.toml" &
+melin-ec-md-gateway --config "$DATA_DIR/md-gateway.toml" &
 MD_PID=$!
 
 sleep 0.5
@@ -176,7 +175,7 @@ echo "  OE gateway: 0.0.0.0:9000 (MELIN-OE)"
 echo "  MD gateway: 0.0.0.0:9001 (MELIN-MD)"
 echo ""
 echo "  Connect TUI:"
-echo "    melin-tui-fix-client \\"
+echo "    melin-ec-tui-fix-client \\"
 echo "      --oe-addr localhost:9000 \\"
 echo "      --md-addr localhost:9001 \\"
 echo "      --sender TRADER \\"

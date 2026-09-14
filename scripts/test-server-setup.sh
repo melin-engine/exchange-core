@@ -202,7 +202,7 @@ echo "=== server-setup.sh drop-in generation ==="
 # remote box is the way back in. Nothing else in this file would notice.
 # ---------------------------------------------------------------------
 BENCH_PARAMS="isolcpus=nohz,domain,1-5 nosmt iommu=pt"
-DROPIN="${TMP_ROOT}/dropin.d/99-melin-bench.cfg"
+DROPIN="${TMP_ROOT}/dropin.d/99-melin-ec-bench.cfg"
 write_grub_dropin "$DROPIN"
 
 if [[ -f "$DROPIN" ]]; then

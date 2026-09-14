@@ -31,14 +31,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_app::auth::AuthorizedKeys;
-use melin_market_data::mirror::BookMirror;
+use melin_ec_market_data::mirror::BookMirror;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_types::types::{ExecutionReport, QueryResponse, Symbol};
 use melin_pipeline::ring;
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
+use melin_pipeline::wait::WaitStrategy;
 use melin_transport_core::pipeline::{
     OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
 };
-use melin_types::types::{ExecutionReport, QueryResponse, Symbol};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
@@ -84,58 +85,84 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
     }
 }
 
-/// Convert an `OutputPayload` to the wire `ResponseKind`. Translates
-/// query responses (`QueryResponse::Stats` / `::Position` /
-/// `::RequestSeqHwm`) to the public wire variants.
+/// One wire frame an output slot expands to. The exchange's own
+/// responses go through its codec; the frames the transport owns —
+/// `EngineError`, `BatchEnd` — through the sequencer's, as the node's
+/// response thread does, so a subscriber reads the publisher's stream
+/// with the same client it reads a node with.
+// `ResponseKind` is wide (its position snapshot), the transport
+// variant a few bytes: two of these live on the stack per slot and are
+// encoded at once, so boxing the wide side would add an allocation on
+// the publish path for a size that never matters.
+#[expect(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Copy)]
+enum Frame {
+    Response(ResponseKind),
+    Transport(TransportResponse),
+}
+
+impl Frame {
+    /// Encode as `[length][tag][payload]` into `buf`; the bytes written.
+    fn encode(&self, buf: &mut [u8]) -> Result<usize, melin_wire_protocol::error::ProtocolError> {
+        match self {
+            Frame::Response(kind) => codec::encode_response(kind, buf),
+            Frame::Transport(response) => control_codec::encode_transport_response(response, buf),
+        }
+    }
+}
+
+/// The wire frame for an `OutputPayload`. Translates query responses
+/// (`QueryResponse::Stats` / `::Position` / `::RequestSeqHwm`) to the
+/// public wire variants.
 ///
 /// Returns `None` for `OutputPayload::BatchEnd` — that slot carries
 /// no payload of its own; the wire `BatchEnd` is emitted from the
-/// `is_last_in_request` flag (see `slot_to_kinds`).
-fn payload_to_response(payload: OutputPayload) -> Option<ResponseKind> {
+/// `is_last_in_request` flag (see `slot_to_frames`).
+fn payload_to_frame(payload: OutputPayload) -> Option<Frame> {
     Some(match payload {
         OutputPayload::QueryResponse(QueryResponse::Stats {
             active_connections,
             events_processed,
             journal_sequence,
-        }) => ResponseKind::StatsHeader {
+        }) => Frame::Response(ResponseKind::StatsHeader {
             active_connections,
             events_processed,
             journal_sequence,
-        },
+        }),
         OutputPayload::QueryResponse(QueryResponse::Position {
             account,
             balances,
             count,
-        }) => ResponseKind::PositionSnapshot {
+        }) => Frame::Response(ResponseKind::PositionSnapshot {
             account,
             balances,
             count,
-        },
+        }),
         OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
-            ResponseKind::RequestSeqHwm { hwm }
+            Frame::Response(ResponseKind::RequestSeqHwm { hwm })
         }
-        OutputPayload::Report(report) => ResponseKind::Report(report),
+        OutputPayload::Report(report) => Frame::Response(ResponseKind::Report(report)),
         OutputPayload::BatchEnd => return None,
-        OutputPayload::EngineError => ResponseKind::EngineError,
+        OutputPayload::EngineError => Frame::Transport(TransportResponse::EngineError),
     })
 }
 
-/// Expand a slot into the wire `ResponseKind`s subscribers should see:
-/// the payload (if any) plus a trailing `BatchEnd` when
+/// Expand a slot into the wire frames subscribers should see: the
+/// payload (if any) plus a trailing `BatchEnd` when
 /// `is_last_in_request` is set. Returns the populated count
 /// (`0..=2`); the array is filled from index 0.
-fn slot_to_kinds(slot: &OutputSlot) -> ([ResponseKind; 2], usize) {
-    let mut kinds = [ResponseKind::BatchEnd; 2];
+fn slot_to_frames(slot: &OutputSlot) -> ([Frame; 2], usize) {
+    let mut frames = [Frame::Transport(TransportResponse::BatchEnd); 2];
     let mut len = 0;
-    if let Some(k) = payload_to_response(slot.payload) {
-        kinds[len] = k;
+    if let Some(frame) = payload_to_frame(slot.payload) {
+        frames[len] = frame;
         len += 1;
     }
     if slot.is_last_in_request {
-        kinds[len] = ResponseKind::BatchEnd;
+        frames[len] = Frame::Transport(TransportResponse::BatchEnd);
         len += 1;
     }
-    (kinds, len)
+    (frames, len)
 }
 
 /// Run the event publisher loop. Blocks the calling thread until shutdown.
@@ -148,7 +175,7 @@ pub fn run(
     bind_addr: SocketAddr,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
-    busy_spin: bool,
+    wait: WaitStrategy,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -173,7 +200,9 @@ pub fn run(
 
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut frame_buf = [0u8; MAX_FRAME_BUF];
-    let mut idle_spins: u32 = 0;
+    // The thread's wait policy comes from its `--cores` entry: a
+    // publisher on a core of its own spins, one sharing a core yields.
+    let mut waiter = wait.waiter();
     let mut last_broadcast = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -206,15 +235,10 @@ pub fn run(
                 last_broadcast = std::time::Instant::now();
             }
 
-            if busy_spin || idle_spins < 1000 {
-                idle_spins = idle_spins.wrapping_add(1);
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            waiter.idle();
             continue;
         }
-        idle_spins = 0;
+        waiter.reset();
         last_broadcast = std::time::Instant::now();
 
         // Process each event: update mirrors, then broadcast to streaming subscribers.
@@ -232,10 +256,10 @@ pub fn run(
 
             // Encode and broadcast — one slot may expand to up to two
             // wire frames (payload + trailing BatchEnd).
-            let (kinds, kinds_len) = slot_to_kinds(slot);
-            for kind in &kinds[..kinds_len] {
+            let (frames, frames_len) = slot_to_frames(slot);
+            for wire in &frames[..frames_len] {
                 frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
-                let response_len = match codec::encode_response(kind, &mut frame_buf[8..]) {
+                let response_len = match wire.encode(&mut frame_buf[8..]) {
                     Ok(n) => n,
                     Err(e) => {
                         debug!(error = %e, "event publisher: encode failed, skipping");
@@ -399,7 +423,7 @@ fn send_snapshot(
     mirrors: &rustc_hash::FxHashMap<Symbol, BookMirror>,
     last_seq: u64,
 ) -> io::Result<()> {
-    use melin_types::types::Side;
+    use melin_ec_types::types::Side;
 
     let mut buf = [0u8; MAX_FRAME_BUF];
 
@@ -582,7 +606,7 @@ fn send_auth_failed(writer: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_types::types::*;
+    use melin_ec_types::types::*;
 
     /// Helper to create a Streaming subscriber for tests that bypass
     /// the auth + subscribe handshake.
@@ -597,7 +621,7 @@ mod tests {
     #[test]
     fn frame_encoding_with_sequence_prefix() {
         // Test the frame wire format: u64 ring sequence + standard response.
-        let kind = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
+        let frame = payload_to_frame(OutputPayload::Report(ExecutionReport::Placed {
             order_id: OrderId(100),
             symbol: Symbol(1),
             account: AccountId(1),
@@ -605,12 +629,12 @@ mod tests {
             price: Price(std::num::NonZeroU64::new(100).unwrap()),
             quantity: Quantity(std::num::NonZeroU64::new(50).unwrap()),
         }))
-        .expect("Report payload always has a wire kind");
+        .expect("a report is always a frame");
 
         let ring_seq: u64 = 42;
         let mut buf = [0u8; MAX_FRAME_BUF];
         buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
-        let response_len = codec::encode_response(&kind, &mut buf[8..]).unwrap();
+        let response_len = frame.encode(&mut buf[8..]).unwrap();
         let total_len = 8 + response_len;
 
         // Verify sequence prefix.
@@ -633,8 +657,8 @@ mod tests {
     }
 
     #[test]
-    fn payload_to_response_all_variants() {
-        let r = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
+    fn payload_to_frame_all_variants() {
+        let r = payload_to_frame(OutputPayload::Report(ExecutionReport::Placed {
             order_id: OrderId(1),
             symbol: Symbol(1),
             account: AccountId(1),
@@ -642,21 +666,53 @@ mod tests {
             price: Price(std::num::NonZeroU64::new(50).unwrap()),
             quantity: Quantity(std::num::NonZeroU64::new(10).unwrap()),
         }));
-        assert!(matches!(r, Some(ResponseKind::Report(_))));
+        assert!(matches!(r, Some(Frame::Response(ResponseKind::Report(_)))));
 
         // BatchEnd-payload slots have no payload of their own; the
         // wire BatchEnd is emitted via `is_last_in_request`.
-        assert!(payload_to_response(OutputPayload::BatchEnd).is_none());
+        assert!(payload_to_frame(OutputPayload::BatchEnd).is_none());
 
-        let r = payload_to_response(OutputPayload::EngineError);
-        assert!(matches!(r, Some(ResponseKind::EngineError)));
+        // An engine error is the transport's frame, as on a node.
+        let r = payload_to_frame(OutputPayload::EngineError);
+        assert!(matches!(
+            r,
+            Some(Frame::Transport(TransportResponse::EngineError))
+        ));
 
-        let r = payload_to_response(OutputPayload::QueryResponse(QueryResponse::Stats {
+        let r = payload_to_frame(OutputPayload::QueryResponse(QueryResponse::Stats {
             active_connections: 5,
             events_processed: 1000,
             journal_sequence: 500,
         }));
-        assert!(matches!(r, Some(ResponseKind::StatsHeader { .. })));
+        assert!(matches!(
+            r,
+            Some(Frame::Response(ResponseKind::StatsHeader { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_last_slot_ends_its_batch_on_the_wire() {
+        // The batch end the runtime sends after the last slot of a
+        // request is the sequencer's frame, so a subscriber's client
+        // classifies it as one.
+        let slot = OutputSlot {
+            payload: OutputPayload::EngineError,
+            is_last_in_request: true,
+            ..OutputSlot::default()
+        };
+        let (frames, len) = slot_to_frames(&slot);
+        assert_eq!(len, 2);
+        let mut buf = [0u8; MAX_FRAME_BUF];
+        let n = frames[0].encode(&mut buf).unwrap();
+        assert_eq!(
+            melin_client::classify(&buf[4..n]).unwrap(),
+            melin_client::Reply::EngineError
+        );
+        let n = frames[1].encode(&mut buf).unwrap();
+        assert_eq!(
+            melin_client::classify(&buf[4..n]).unwrap(),
+            melin_client::Reply::BatchEnd
+        );
     }
 
     #[test]
@@ -712,11 +768,14 @@ mod tests {
 
         // Use a wire BatchEnd frame directly — these tests just need a
         // small dummy payload to push to subscribers.
-        let kind = ResponseKind::BatchEnd;
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         let ring_seq: u64 = 7;
         frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
-        let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
+        let response_len = control_codec::encode_transport_response(
+            &TransportResponse::BatchEnd,
+            &mut frame_buf[8..],
+        )
+        .unwrap();
         let total_len = 8 + response_len;
         let frame = &frame_buf[..total_len];
 
@@ -759,10 +818,13 @@ mod tests {
 
         for seq in 0u64..10 {
             // Wire BatchEnd frame directly — synthetic test payload.
-            let kind = ResponseKind::BatchEnd;
             let mut frame_buf = [0u8; MAX_FRAME_BUF];
             frame_buf[..8].copy_from_slice(&seq.to_le_bytes());
-            let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
+            let response_len = control_codec::encode_transport_response(
+                &TransportResponse::BatchEnd,
+                &mut frame_buf[8..],
+            )
+            .unwrap();
             sub.stream
                 .write_all(&frame_buf[..8 + response_len])
                 .unwrap();
@@ -826,10 +888,13 @@ mod tests {
 
         // Use a wire BatchEnd frame directly — these tests just need a
         // small dummy payload to push to subscribers.
-        let kind = ResponseKind::BatchEnd;
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         frame_buf[..8].copy_from_slice(&0u64.to_le_bytes());
-        let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
+        let response_len = control_codec::encode_transport_response(
+            &TransportResponse::BatchEnd,
+            &mut frame_buf[8..],
+        )
+        .unwrap();
         let frame = &frame_buf[..8 + response_len];
 
         for _ in 0..10 {
@@ -852,7 +917,7 @@ mod tests {
 
         let (_, consumer) = ring::DisruptorBuilder::<OutputSlot>::new(64)
             .add_consumer()
-            .build();
+            .build(WaitStrategy::SpinThenYield);
         let consumer = consumer.into_iter().next().unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -866,7 +931,13 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("test-publisher".into())
             .spawn(move || {
-                run(consumer, addr, keys, &shutdown2, false);
+                run(
+                    consumer,
+                    addr,
+                    keys,
+                    &shutdown2,
+                    WaitStrategy::SpinThenYield,
+                );
             })
             .unwrap();
 
@@ -1058,7 +1129,7 @@ mod tests {
                 order_id: OrderId(1),
                 symbol: sym,
                 account: AccountId(1),
-                reason: melin_types::types::RejectReason::NoLiquidity,
+                reason: melin_ec_types::types::RejectReason::NoLiquidity,
             }),
             sym
         );

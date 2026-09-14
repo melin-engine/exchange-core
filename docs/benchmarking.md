@@ -95,7 +95,7 @@ The output JSON carries only aggregated derivatives — quantiles, summary scala
 #### Running the calibration
 
 ```
-cargo test -p melin-bench --test calibration -- --nocapture
+cargo test -p melin-ec-bench --test calibration -- --nocapture
 ```
 
 A small reference fixture is committed at `crates/exchange/bench/tests/fixtures/reference-stats.json` so the test runs out of the box. To compare against a different reference, set `MELIN_CALIBRATION_FIXTURE` to a JSON path and `MELIN_CALIBRATION_SYMBOL` to a ticker present in that file.
@@ -108,7 +108,7 @@ Two tests:
 ## CLI Parameters
 
 ```
-cargo run --release --bin melin-bench [-- [OPTIONS]]
+cargo run --release --bin melin-ec-bench [-- [OPTIONS]]
 ```
 
 Run length is wall-clock-driven. The three phases (warmup, measured,
@@ -136,9 +136,9 @@ samples count without further coordination.
 | `--accounts` | 10,000 | Number of trading accounts in the generator. |
 | `--instruments` | 100 | Number of instruments. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
-| `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
+| `--key <PATH>` | (none) | Path to the Ed25519 private key: a 32-byte raw seed, or a PKCS#8 PEM as written by `openssl genpkey -algorithm ed25519`. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
 | `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). For roundtrip runs against the embedded server, N must be higher than every core in the server's `--cores` list, which is the authoritative layout — use 12. Use 1 for remote benchmarks on a dedicated machine with `isolcpus`, where no server shares the host. |
-| `--pipeline-cores <LIST>` | `1,2,3,4,5` | Pipeline-mode core assignment: `journal,matching,publisher,journal-disk,drain`. Applies to `--mode pipeline` only, which runs its own in-process pipeline rather than talking to a server. All five threads busy-spin, so a duplicate entry is rejected before anything is spawned. Use `0` to leave an entry unpinned. Keep `journal` and `journal-disk` on the same CCD — they exchange a cache line on every batch. |
+| `--pipeline-cores <LAYOUT>` | `journal-seq=1,matching=2,publisher=3,journal-disk=4,drain=5` | Pipeline-mode core assignment as `thread=core` entries in any order, one per thread, the shape of the server's `--cores`. Applies to `--mode pipeline` only, which runs its own in-process pipeline rather than talking to a server. All five threads busy-spin, so a duplicate core is rejected before anything is spawned. `0` leaves a thread unpinned and `none` leaves them all unpinned. Keep `journal-seq` and `journal-disk` on the same CCD — they exchange a cache line on every batch. |
 
 ### Feature flags
 
@@ -246,14 +246,14 @@ A future enhancement would expose a `/stats-reset` endpoint so the bench can cle
 # Both server and bench built with `tick-to-trade` for the full
 # decomposition. The flag implies `latency-trace`, so this also
 # enables the lighter 4-stage histograms.
-cargo build --release -p melin-server --features tick-to-trade
-cargo build --release -p melin-bench  --features tick-to-trade
+cargo build --release -p melin-ec-server --features tick-to-trade
+cargo build --release -p melin-ec-bench  --features tick-to-trade
 
 # Roundtrip benchmark — decomposition appears under the latency table.
 # A 60 s measured phase comfortably saturates server-side histograms;
 # server-side stages also accumulate seed-drain noise (see
 # "Measurement window" below).
-./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 --duration=60s
+./target/release/melin-ec-bench --mode=roundtrip --clients=8 --window=64 --duration=60s
 
 # Or fetch the dump directly without running the bench.
 curl http://127.0.0.1:9878/stats-dump
@@ -288,7 +288,7 @@ Pass `--target-rate <ops/s>` to switch to **open-loop** scheduling: sends are sc
 ### CLI
 
 ```
-melin-bench --addr <server> --target-rate 500000 --duration 60s
+melin-ec-bench --addr <server> --target-rate 500000 --duration 60s
 ```
 
 Aggregate rate is split evenly across `--clients` (or across the single publisher in `pipeline` mode, or the single in-process engine call in `engine` mode). Per-client first sends are staggered by `period / clients` so the bench does not produce a thundering herd at startup.
@@ -447,18 +447,18 @@ See the [sequencer README](https://github.com/melin-engine/melin#benchmarks) for
 
 Engine server:
 ```sh
-./melin-server --bind 0.0.0.0:9876 --journal /mnt/journal/melin.journal
+./melin-ec-server --bind 0.0.0.0:9876 --journal /mnt/journal/melin.journal
 ```
 
 Bench client (separate machine):
 ```sh
-./melin-bench 100000000 --addr <engine-ip>:9876 --window=256
+./melin-ec-bench 100000000 --addr <engine-ip>:9876 --window=256
 ```
 
 ### Single-order latency
 
 ```sh
-./melin-bench 500000 --addr <engine-ip>:9876 --window=1 --clients=1
+./melin-ec-bench 500000 --addr <engine-ip>:9876 --window=1 --clients=1
 ```
 
 No pipelining, no batching. Measures the true single-order round-trip time with full durability.
@@ -466,7 +466,7 @@ No pipelining, no batching. Measures the true single-order round-trip time with 
 ### Engine-only
 
 ```sh
-./melin-bench 100000000 --mode=engine
+./melin-ec-bench 100000000 --mode=engine
 ```
 
 Runs on the engine server itself. No network, no journal, no pipeline.
@@ -482,10 +482,10 @@ The release profile is configured for maximum performance:
 
 Build with:
 ```sh
-cargo build --release --bin melin-bench
+cargo build --release --bin melin-ec-bench
 ```
 
-The binary is at `target/release/melin-bench`.
+The binary is at `target/release/melin-ec-bench`.
 
 ## Limitations and Caveats
 

@@ -1,5 +1,5 @@
 [package]
-name = "melin-types"
+name = "melin-ec-types"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -9,7 +9,7 @@ authors.workspace = true
 description = "Shared trading domain primitives and little-endian wire encoding"
 
 [lib]
-name = "melin_types"
+name = "melin_ec_types"
 path = "src/lib.rs"
 
 [dependencies]

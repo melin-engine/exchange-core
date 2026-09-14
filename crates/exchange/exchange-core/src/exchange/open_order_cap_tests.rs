@@ -16,7 +16,7 @@ use crate::types::{
 fn max_open_orders_default_is_ten_thousand() {
     // Constant is the documented operator-friendly default. Asserted to
     // catch silent drift if someone bumps it without updating the
-    // CLI flag default in `melin-server`.
+    // CLI flag default in `melin-ec-server`.
     assert_eq!(DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT, 10_000);
     let exchange = Exchange::new();
     assert_eq!(

@@ -1,15 +1,15 @@
 //! Trading-side [`RequestDecoder`] implementation.
 //!
-//! Owns the bytes -> `melin_protocol::Request` -> `TradingEvent`
+//! Owns the bytes -> `melin_ec_protocol::Request` -> `TradingEvent`
 //! pipeline. Hides the wire enum behind the [`RequestDecoder`] trait
 //! so the server runtime never needs to pattern-match on
 //! application-shaped variants.
 
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
-use melin_protocol::codec;
-use melin_protocol::message::Request;
-use melin_trading::trading_event::TradingEvent;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::Request;
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_wire_protocol::error::ProtocolError;
 
 /// Decoder for the trading wire protocol.
@@ -58,14 +58,11 @@ fn protocol_error_reason(e: &ProtocolError) -> &'static str {
     }
 }
 
-/// Transport-level frames the runtime never publishes to the
-/// pipeline: heartbeats, post-auth handshakes, subscription control.
+/// Connection-level requests the runtime never publishes to the
+/// pipeline: heartbeats and subscription control.
 #[inline]
 fn should_filter(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. }
-    )
+    matches!(request, Request::Heartbeat | Request::Subscribe { .. })
 }
 
 /// Permission model — separation of duties:
@@ -153,7 +150,7 @@ fn to_trading_event(request: &Request) -> TradingEvent {
         Request::DisableInstrument { symbol } => TradingEvent::DisableInstrument { symbol },
         Request::EnableInstrument { symbol } => TradingEvent::EnableInstrument { symbol },
         Request::RemoveInstrument { symbol } => TradingEvent::RemoveInstrument { symbol },
-        Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. } => {
+        Request::Heartbeat | Request::Subscribe { .. } => {
             unreachable!("filtered before to_trading_event")
         }
     }
@@ -165,7 +162,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use melin_app::AppEvent;
-    use melin_types::types::*;
+    use melin_ec_types::types::*;
 
     /// Wire-encode a Request into the byte form the decoder expects
     /// (seq + tag + payload, with the framing length-prefix already
@@ -204,21 +201,6 @@ mod tests {
             &Request::Subscribe {
                 symbols: [Symbol(0); 8],
                 count: 0,
-            },
-            0,
-        );
-        assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Trader),
-            Decoded::Filter
-        ));
-    }
-
-    #[test]
-    fn challenge_response_is_filtered() {
-        let bytes = encode(
-            &Request::ChallengeResponse {
-                signature: [0u8; 64],
-                public_key: [0u8; 32],
             },
             0,
         );
@@ -518,14 +500,5 @@ mod tests {
     #[should_panic(expected = "filtered before to_trading_event")]
     fn heartbeat_panics_if_not_filtered() {
         to_trading_event(&Request::Heartbeat);
-    }
-
-    #[test]
-    #[should_panic(expected = "filtered before to_trading_event")]
-    fn challenge_response_panics_if_not_filtered() {
-        to_trading_event(&Request::ChallengeResponse {
-            signature: [0u8; 64],
-            public_key: [0u8; 32],
-        });
     }
 }

@@ -395,14 +395,14 @@ fi
 if [[ -f /tmp/lan-bench-results.json ]]; then
     cp /tmp/lan-bench-results.json "${RESULTS_DIR}/bench-results.json"
     echo "=== Generating latency stability plot ==="
-    if cargo build --release -p melin-bench --features plot 2>/dev/null; then
-        ./target/release/melin-plot stability \
+    if cargo build --release -p melin-ec-bench --features plot 2>/dev/null; then
+        ./target/release/melin-ec-plot stability \
             -o "${RESULTS_DIR}/latency-stability.svg" \
             "${RESULTS_DIR}/bench-results.json" 2>/dev/null \
             && echo "  Plot → ${RESULTS_DIR}/latency-stability.svg" \
             || echo "  (plot generation failed)"
     else
-        echo "  (skipped — melin-plot build failed)"
+        echo "  (skipped — melin-ec-plot build failed)"
     fi
     echo ""
 fi

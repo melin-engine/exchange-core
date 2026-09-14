@@ -14,9 +14,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use melin_client::Client;
-use melin_protocol::message::{Request, ResponseKind};
-use melin_protocol::types::{
+use melin_ec_client::{Client, ClientError};
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::types::{
     AccountId, ExecutionReport, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
     RejectReason, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
@@ -568,14 +568,7 @@ fn client_thread(
                 for resp in &responses {
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
-                        ResponseKind::EngineError => "ENGINE ERROR".into(),
-                        ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
-                        ResponseKind::BatchEnd
-                        | ResponseKind::ServerReady
-                        | ResponseKind::Heartbeat
-                        | ResponseKind::Challenge { .. }
-                        | ResponseKind::AuthFailed
-                        | ResponseKind::StatsHeader { .. }
+                        ResponseKind::StatsHeader { .. }
                         | ResponseKind::BookSnapshotBegin { .. }
                         | ResponseKind::BookSnapshotLevel { .. }
                         | ResponseKind::BookSnapshotEnd { .. }
@@ -589,6 +582,12 @@ fn client_thread(
                     let _ = response_tx.send("(no reports)".into());
                 }
                 let _ = response_tx.send(format!("  ⏱ {latency:.3?}"));
+            }
+            // The engine's verdict on one request, not a connection
+            // failure: the next command goes through as usual.
+            Err(ClientError::EngineError) => {
+                let _ = response_tx.send("ENGINE ERROR".into());
+                let _ = response_tx.send(format!("  ⏱ {:.3?}", start.elapsed()));
             }
             Err(e) => {
                 let _ = response_tx.send(format!("Request failed: {e}"));
@@ -816,19 +815,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read key file {path}: {e}"));
-    if bytes.len() != 32 {
-        panic!(
-            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
-            bytes.len()
-        );
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    ed25519_dalek::SigningKey::from_bytes(&seed)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::args()
         .nth(1)
@@ -838,7 +824,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| panic!("usage: trading-tui <addr> <key-file>"));
-    let key = load_signing_key(&key_path);
+    // A raw 32-byte seed or a PKCS#8 PEM, as the sequencer's client
+    // reads them.
+    let key = melin_client::key::load_signing_key(std::path::Path::new(&key_path))?;
 
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (response_tx, response_rx) = mpsc::channel::<String>();

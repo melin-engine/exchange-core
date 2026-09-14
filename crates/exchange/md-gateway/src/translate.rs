@@ -3,10 +3,10 @@
 //! Translates internal `MdOutput` types into FIX MarketDataSnapshotFullRefresh (W)
 //! and MarketDataRequestReject (Y) messages.
 
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
-use melin_market_data::mirror::Level;
-use melin_types::types::Price;
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
+use melin_ec_market_data::mirror::Level;
+use melin_ec_types::types::Price;
 
 /// Build a `MarketDataSnapshotFullRefresh` (35=W) message for a single symbol.
 ///
@@ -165,7 +165,7 @@ pub fn ticks_to_decimal(ticks: u64, tick_inverse: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::parse::FixMessage;
+    use melin_ec_gateway_core::fix::parse::FixMessage;
     use std::num::NonZeroU64;
 
     fn price(n: u64) -> Price {

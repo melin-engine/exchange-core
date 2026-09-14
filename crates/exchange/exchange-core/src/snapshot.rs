@@ -10,7 +10,7 @@
 //!
 //! On-disk framing (magic, versions, sequence, chain hash, CRC, atomic
 //! rename) lives in `melin_transport_core::snapshot` — generic over the
-//! `melin_app::Application` trait, which `melin_server::exchange_app::ServerApp`
+//! `melin_app::Application` trait, which `melin_ec_server::exchange_app::ServerApp`
 //! implements as a thin newtype around `Exchange`. This module owns the
 //! engine-specific payload bytes only.
 
@@ -1690,7 +1690,7 @@ mod tests {
     // below. The production on-disk path lives in
     // `melin_transport_core::snapshot` (generic over `Application`,
     // including CRC32C framing) and is exercised by the integration
-    // tests in `melin-server/tests/`. Engine tests only need to verify
+    // tests in `melin-ec-server/tests/`. Engine tests only need to verify
     // the payload codec (`encode_exchange_payload` /
     // `decode_exchange_payload`) — the seq + chain_hash are persisted
     // alongside so existing tests that assert on them keep working.
@@ -1758,7 +1758,7 @@ mod tests {
     // Note: the previous engine-side `checksum_mismatch_surfaces_as_snapshot_error`
     // test was deleted in the engine ↔ core decoupling. That guarantee
     // belongs to `melin_transport_core::snapshot`, which has its own
-    // framing-corruption tests, and `melin-server/tests/` exercises the
+    // framing-corruption tests, and `melin-ec-server/tests/` exercises the
     // full production framing end-to-end via `Application`.
 
     #[test]

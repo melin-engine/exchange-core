@@ -10,12 +10,12 @@
 #   host         SSH target (e.g. root@84.32.70.221 or a name from ~/.ssh/config).
 #   seconds      Sampling duration. Default 20.
 #   pgrep-expr   Process basename matched with `pgrep -x` (exact match on
-#                comm, not the full command line). Default: `melin-server`.
+#                comm, not the full command line). Default: `melin-ec-server`.
 #
 # Examples:
 #   ./scripts/profile-remote.sh root@10.0.0.5           # replica receiver, 20 s
 #   ./scripts/profile-remote.sh root@10.0.0.1 30       # primary, 30 s
-#   ./scripts/profile-remote.sh root@10.0.0.5 20 melin-bench
+#   ./scripts/profile-remote.sh root@10.0.0.5 20 melin-ec-bench
 #
 # Output:
 #   Prints the top-60 hot stacks (perf report --stdio) inline, and leaves
@@ -39,14 +39,14 @@ usage: profile-remote.sh <host> [seconds] [pgrep-expr]
 
   host         SSH target (e.g. root@10.0.0.5)
   seconds      Sampling duration (default: 20)
-  pgrep-expr   pgrep -x basename (default: melin-server)
+  pgrep-expr   pgrep -x basename (default: melin-ec-server)
 USAGE
     exit 1
 fi
 
 HOST="$1"
 SECONDS_="${2:-20}"
-PGREP_EXPR="${3:-melin-server}"
+PGREP_EXPR="${3:-melin-ec-server}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 

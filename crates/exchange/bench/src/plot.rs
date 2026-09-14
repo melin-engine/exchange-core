@@ -1,14 +1,14 @@
 //! Generate SVG and PNG plots from benchmark JSON results.
 //!
-//! Reads JSON files produced by `melin-bench --json` and generates:
+//! Reads JSON files produced by `melin-ec-bench --json` and generates:
 //! 1. **Latency CDF** — percentile plot comparing benchmark configs
 //! 2. **Saturation curve** — throughput vs latency at multiple load levels
 //! 3. **Pipeline breakdown** — stage utilization bar chart
 //!
 //! Usage:
-//!   melin-plot latency-cdf -o latency.svg results/*.json
-//!   melin-plot saturation -o saturation.svg sweep/*.json
-//!   melin-plot pipeline -o pipeline.svg --stats pipeline-stats.log
+//!   melin-ec-plot latency-cdf -o latency.svg results/*.json
+//!   melin-ec-plot saturation -o saturation.svg sweep/*.json
+//!   melin-ec-plot pipeline -o pipeline.svg --stats pipeline-stats.log
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -41,7 +41,7 @@ macro_rules! render_both {
     }};
 }
 
-// --- JSON schema matching melin-bench output ---
+// --- JSON schema matching melin-ec-bench output ---
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -442,7 +442,7 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("Usage: melin-plot <command> [options] <files...>");
+    eprintln!("Usage: melin-ec-plot <command> [options] <files...>");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  latency-cdf  Percentile plot comparing benchmark configs");
@@ -458,10 +458,10 @@ fn print_usage() {
     eprintln!("  --stats <f>  Pipeline stats log file (for pipeline command)");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  melin-plot latency-cdf results/1-fsync.json results/2-no-persist.json");
-    eprintln!("  melin-plot saturation sweep/*.json");
-    eprintln!("  melin-plot pipeline --stats /tmp/melin-server.log");
-    eprintln!("  melin-plot all results/");
+    eprintln!("  melin-ec-plot latency-cdf results/1-fsync.json results/2-no-persist.json");
+    eprintln!("  melin-ec-plot saturation sweep/*.json");
+    eprintln!("  melin-ec-plot pipeline --stats /tmp/melin-ec-server.log");
+    eprintln!("  melin-ec-plot all results/");
 }
 
 // --- Argument parsing (minimal, no clap dependency for this tool) ---
@@ -2145,7 +2145,7 @@ fn cmd_all(args: &[String]) {
     }
 
     // 4. Pipeline breakdown (look for server log).
-    let log_candidates = ["server.log", "melin-server.log"];
+    let log_candidates = ["server.log", "melin-ec-server.log"];
     for log_name in &log_candidates {
         let log_path = dir.join(log_name);
         if log_path.exists() {

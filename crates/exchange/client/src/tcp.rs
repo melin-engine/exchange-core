@@ -4,10 +4,11 @@
 
 use std::net::SocketAddr;
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
+use melin_client::Reply;
 
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_wire_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_wire_protocol::error::ProtocolError;
 
@@ -21,11 +22,10 @@ use crate::{ClientError, StatsSnapshot};
 pub struct Client {
     reader: BlockingFrameReader<std::net::TcpStream>,
     writer: BlockingFrameWriter<std::net::TcpStream>,
-    /// Pre-allocated encode buffer. 128 bytes is the upper bound,
-    /// set by ChallengeResponse (4 prefix + 8 seq + 1 tag + 64 sig +
-    /// 32 pubkey + slack). The auth handshake uses its own 256-byte
-    /// stack buffer in `connect()` so this buffer only sees post-auth
-    /// requests in practice — but keep it sized for the worst case.
+    /// Pre-allocated encode buffer. 128 bytes bounds every request this
+    /// client encodes; the handshake frame, the largest on the wire
+    /// (4 prefix + 8 seq + 1 tag + 64 sig + 32 pubkey), is built by the
+    /// sequencer's client in `connect()` and never passes through here.
     encode_buf: [u8; 128],
     /// Per-connection monotonically increasing request sequence number.
     /// Used with the server-side per-key idempotency dedup. Starts at 0
@@ -95,7 +95,7 @@ impl Client {
         key: &SigningKey,
         timeout: Option<std::time::Duration>,
     ) -> Result<Self, ClientError> {
-        let stream = match timeout {
+        let mut stream = match timeout {
             Some(t) => std::net::TcpStream::connect_timeout(&addr, t)?,
             None => std::net::TcpStream::connect(addr)?,
         };
@@ -103,47 +103,14 @@ impl Client {
         if let Some(t) = timeout {
             stream.set_read_timeout(Some(t))?;
         }
-        let mut reader = BlockingFrameReader::new(stream.try_clone()?);
-        let mut writer = BlockingFrameWriter::new(stream);
 
-        // Step 1: Receive Challenge from server.
-        let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
-        let response = codec::decode_response(frame)?;
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
-            _ => {
-                return Err(ClientError::Protocol(ProtocolError::InvalidField(
-                    "expected Challenge",
-                )));
-            }
-        };
+        // Steps 1-4: the sequencer's handshake, run on the bare socket
+        // before the buffered reader exists, so nothing past ServerReady
+        // is read ahead and lost.
+        melin_client::authenticate(&mut stream, key).map_err(transport_error)?;
 
-        // Step 2: Sign the nonce and send ChallengeResponse.
-        let signature = key.sign(&nonce);
-        let public_key = key.verifying_key().to_bytes();
-        let request = Request::ChallengeResponse {
-            signature: signature.to_bytes(),
-            public_key,
-        };
-        let mut encode_buf = [0u8; 256];
-        let written = codec::encode_request(&request, 0, &mut encode_buf)?;
-        writer.write_frame(&encode_buf[4..written])?;
-        writer.flush()?;
-
-        // Step 3: Wait for ServerReady or AuthFailed.
-        let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
-        let response = codec::decode_response(frame)?;
-        match response {
-            ResponseKind::ServerReady => {}
-            ResponseKind::AuthFailed => {
-                return Err(ClientError::AuthFailed);
-            }
-            _ => {
-                return Err(ClientError::Protocol(ProtocolError::InvalidField(
-                    "expected ServerReady or AuthFailed",
-                )));
-            }
-        }
+        let reader = BlockingFrameReader::new(stream.try_clone()?);
+        let writer = BlockingFrameWriter::new(stream);
 
         let mut client = Self {
             reader,
@@ -192,23 +159,30 @@ impl Client {
         self.writer.write_frame(&self.encode_buf[4..written])?;
         self.writer.flush()?;
 
-        // Collect responses until BatchEnd. Heartbeats received during
-        // idle periods are silently consumed (not part of a request batch).
+        // Collect responses until BatchEnd. The sequencer's client tells
+        // the node's frames apart; only application responses reach the
+        // exchange codec. Heartbeats received during idle periods are
+        // silently consumed (not part of a request batch). An engine
+        // error is the node's word on this one request, and its batch
+        // still ends normally: read on to the `BatchEnd` so the
+        // connection's framing stays intact, then report the error.
         let mut responses = Vec::new();
+        let mut engine_error = false;
         loop {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
-            let response = codec::decode_response(frame)?;
-            match response {
-                ResponseKind::BatchEnd => break,
-                ResponseKind::Heartbeat | ResponseKind::ServerReady => continue,
-                ResponseKind::ServerBusy => {
-                    return Err(ClientError::ServerBusy);
-                }
-                other => responses.push(other),
+            match melin_client::classify(frame).map_err(transport_error)? {
+                Reply::Response(bytes) => responses.push(codec::decode_response(bytes)?),
+                Reply::Heartbeat => continue,
+                Reply::BatchEnd => break,
+                Reply::ServerBusy => return Err(ClientError::ServerBusy),
+                Reply::EngineError => engine_error = true,
             }
         }
 
+        if engine_error {
+            return Err(ClientError::EngineError);
+        }
         Ok(responses)
     }
 
@@ -268,14 +242,45 @@ impl Client {
     }
 }
 
+/// The sequencer client's outcomes in this crate's terms. `authenticate`
+/// and `classify` only return the first four; the rest belong to the
+/// sequencer's `Connection` and are folded into an I/O error rather
+/// than left unmapped. A protocol violation — a frame out of place in
+/// the handshake, a reserved tag in a reply — keeps its variant and
+/// loses its detail: `ProtocolError` carries no message.
+fn transport_error(e: melin_client::Error) -> ClientError {
+    match e {
+        melin_client::Error::AuthFailed { .. } => ClientError::AuthFailed,
+        melin_client::Error::Io(e) => ClientError::Io(e),
+        melin_client::Error::Disconnected => ClientError::Disconnected,
+        melin_client::Error::Protocol(_) => {
+            ClientError::Protocol(ProtocolError::InvalidField("frame from the node"))
+        }
+        other => ClientError::Io(std::io::Error::other(other.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_protocol::types::{OrderId, Symbol};
+    use melin_ec_protocol::types::{OrderId, Symbol};
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
 
     /// Generate a test signing key from a fixed seed for deterministic tests.
     fn test_key() -> SigningKey {
         SigningKey::from_bytes(&[0xAA; 32])
+    }
+
+    /// Send one of the transport's own frames the way a node does.
+    fn write_transport(
+        writer: &mut BlockingFrameWriter<std::net::TcpStream>,
+        response: &TransportResponse,
+    ) {
+        let mut buf = [0u8; 64];
+        let written = control_codec::encode_transport_response(response, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
     }
 
     /// Run the server side of the challenge-response handshake, accepting
@@ -292,31 +297,17 @@ mod tests {
 
         // Send Challenge.
         let nonce = [0xBB; 32];
-        let mut buf = [0u8; 128];
-        let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
-        writer.write_frame(&buf[4..written]).unwrap();
-        writer.flush().unwrap();
+        write_transport(writer, &TransportResponse::Challenge { nonce });
 
-        // Read ChallengeResponse.
+        // Read ChallengeResponse and verify the signature over the nonce.
         let frame = reader.read_frame().unwrap().unwrap();
-        let (_seq, request) = codec::decode_request(frame).unwrap();
-        let (sig_bytes, pk_bytes) = match request {
-            Request::ChallengeResponse {
-                signature,
-                public_key,
-            } => (signature, public_key),
-            _ => panic!("expected ChallengeResponse"),
-        };
-
-        // Verify signature over the nonce.
-        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let (_seq, response) = control_codec::decode_challenge_response(frame).unwrap();
+        let vk = VerifyingKey::from_bytes(&response.public_key).unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&response.signature);
         vk.verify(&nonce, &sig).unwrap();
 
         // Send ServerReady.
-        let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
-        writer.write_frame(&buf[4..written]).unwrap();
-        writer.flush().unwrap();
+        write_transport(writer, &TransportResponse::ServerReady);
 
         // Service the auto-sync QueryRequestSeq: read the query, reply
         // with RequestSeqHwm + BatchEnd.
@@ -326,13 +317,12 @@ mod tests {
             matches!(req, Request::QueryRequestSeq),
             "expected auto-sync QueryRequestSeq, got {req:?}"
         );
+        let mut buf = [0u8; 128];
         let written =
             codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: sync_hwm }, &mut buf)
                 .unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
-        let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
-        writer.write_frame(&buf[4..written]).unwrap();
-        writer.flush().unwrap();
+        write_transport(writer, &TransportResponse::BatchEnd);
     }
 
     /// Mock server that authenticates, reads one request, responds with BatchEnd.
@@ -347,10 +337,7 @@ mod tests {
         let _frame = reader.read_frame().unwrap().unwrap();
 
         // Respond with BatchEnd.
-        let mut buf = [0u8; 128];
-        let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
-        writer.write_frame(&buf[4..written]).unwrap();
-        writer.flush().unwrap();
+        write_transport(&mut writer, &TransportResponse::BatchEnd);
     }
 
     #[test]
@@ -365,7 +352,7 @@ mod tests {
         let responses = client
             .send_request(&Request::CancelOrder {
                 symbol: Symbol(1),
-                account: melin_protocol::types::AccountId(1),
+                account: melin_ec_protocol::types::AccountId(1),
                 order_id: OrderId(42),
             })
             .unwrap();
@@ -439,9 +426,7 @@ mod tests {
                 codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: later_hwm }, &mut buf)
                     .unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
-            let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::BatchEnd);
         });
 
         let key = test_key();
@@ -524,19 +509,13 @@ mod tests {
 
             // Send Challenge.
             let nonce = [0xBB; 32];
-            let mut buf = [0u8; 128];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::Challenge { nonce });
 
             // Read ChallengeResponse (discard it).
             let _frame = reader.read_frame().unwrap().unwrap();
 
             // Send AuthFailed.
-            let written = codec::encode_response(&ResponseKind::AuthFailed, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::AuthFailed);
         });
 
         let key = test_key();
@@ -557,11 +536,7 @@ mod tests {
             let mut writer = BlockingFrameWriter::new(stream);
 
             let nonce = [0xBB; 32];
-            let mut buf = [0u8; 128];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::Challenge { nonce });
 
             // Consume the ChallengeResponse, then drop.
             let _ = reader.read_frame();
@@ -582,10 +557,7 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = BlockingFrameWriter::new(stream);
 
-            let mut buf = [0u8; 8];
-            let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::ServerReady);
         });
 
         let key = test_key();
@@ -607,19 +579,13 @@ mod tests {
 
             // Send Challenge.
             let nonce = [0xBB; 32];
-            let mut buf = [0u8; 128];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::Challenge { nonce });
 
             // Read ChallengeResponse.
             let _frame = reader.read_frame().unwrap().unwrap();
 
             // Send Heartbeat instead of ServerReady/AuthFailed.
-            let written = codec::encode_response(&ResponseKind::Heartbeat, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::Heartbeat);
         });
 
         let key = test_key();
@@ -645,17 +611,14 @@ mod tests {
             let _frame = reader.read_frame().unwrap().unwrap();
 
             // Respond with ServerBusy instead of a normal response batch.
-            let mut buf = [0u8; 128];
-            let written = codec::encode_response(&ResponseKind::ServerBusy, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            writer.flush().unwrap();
+            write_transport(&mut writer, &TransportResponse::ServerBusy);
         });
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
-            account: melin_protocol::types::AccountId(1),
+            account: melin_ec_protocol::types::AccountId(1),
             order_id: OrderId(42),
         });
 
@@ -663,6 +626,48 @@ mod tests {
             matches!(result, Err(ClientError::ServerBusy)),
             "expected ServerBusy error, got {result:?}"
         );
+    }
+
+    /// An engine error is the node's word on one request: its batch
+    /// still ends, and the connection is good for the next request.
+    #[test]
+    fn engine_error_is_reported_once_its_batch_has_ended() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+
+            // The first request fails in the engine; the batch ends.
+            let _frame = reader.read_frame().unwrap().unwrap();
+            write_transport(&mut writer, &TransportResponse::EngineError);
+            write_transport(&mut writer, &TransportResponse::BatchEnd);
+
+            // The second, on the same connection, gets an empty batch.
+            let _frame = reader.read_frame().unwrap().unwrap();
+            write_transport(&mut writer, &TransportResponse::BatchEnd);
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        let request = Request::CancelOrder {
+            symbol: Symbol(1),
+            account: melin_ec_protocol::types::AccountId(1),
+            order_id: OrderId(42),
+        };
+
+        let result = client.send_request(&request);
+        assert!(
+            matches!(result, Err(ClientError::EngineError)),
+            "expected EngineError, got {result:?}"
+        );
+        // The BatchEnd was consumed with the error: the next request
+        // reads its own batch, not a stale terminator.
+        assert!(client.send_request(&request).unwrap().is_empty());
     }
 
     #[test]
@@ -684,7 +689,7 @@ mod tests {
         let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
-            account: melin_protocol::types::AccountId(1),
+            account: melin_ec_protocol::types::AccountId(1),
             order_id: OrderId(42),
         });
 

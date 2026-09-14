@@ -15,13 +15,13 @@ mod tests {
     use melin_transport_core::journaled_app::{JournaledApp, JournaledAppError};
     use melin_transport_core::snapshot;
 
-    use melin_exchange_core::exchange::Exchange;
+    use melin_ec::exchange::Exchange;
     // Import the concrete newtype (not the `pub type App = ServerApp`
     // alias) so it's usable as a tuple-struct constructor in `App(...)`.
+    use melin_ec_server::exchange_app::ServerApp as App;
+    use melin_ec_trading::trading_event::TradingEvent;
+    use melin_ec_types::types::*;
     use melin_journal::BufferedWriter;
-    use melin_server::exchange_app::ServerApp as App;
-    use melin_trading::trading_event::TradingEvent;
-    use melin_types::types::*;
 
     /// Synchronous journal-then-apply harness mirroring the deleted
     /// `JournaledExchange` API. Wraps `JournaledApp<App,
@@ -542,7 +542,7 @@ mod tests {
         // Write journal entries with key_hash + request_seq.
         {
             let mut writer =
-                BufferedWriter::<melin_trading::trading_event::TradingEvent>::create(&path)
+                BufferedWriter::<melin_ec_trading::trading_event::TradingEvent>::create(&path)
                     .unwrap();
             let ts = melin_app::unix_epoch_nanos();
             // Deposit with seq=1
@@ -599,8 +599,10 @@ mod tests {
         // Create journaled exchange, write events with key_hash.
         {
             let mut writer =
-                BufferedWriter::<melin_trading::trading_event::TradingEvent>::create(&journal_path)
-                    .unwrap();
+                BufferedWriter::<melin_ec_trading::trading_event::TradingEvent>::create(
+                    &journal_path,
+                )
+                .unwrap();
             let ts = melin_app::unix_epoch_nanos();
             writer
                 .batch_append_with_ts(
@@ -650,9 +652,10 @@ mod tests {
     /// Helper: find the byte offset where valid journal data ends
     /// (after the last fully-written entry, before pre-allocated space).
     fn valid_data_end(path: &Path) -> u64 {
-        let mut reader =
-            melin_journal::JournalReader::<melin_trading::trading_event::TradingEvent>::open(path)
-                .unwrap();
+        let mut reader = melin_journal::JournalReader::<
+            melin_ec_trading::trading_event::TradingEvent,
+        >::open(path)
+        .unwrap();
         while reader.next_entry().unwrap().is_some() {}
         reader.valid_file_end()
     }
@@ -989,7 +992,7 @@ mod tests {
     /// produce the same fee account balance after recovery.
     #[test]
     fn journal_replay_preserves_fee_schedule() {
-        use melin_exchange_core::account::FEE_ACCOUNT;
+        use melin_ec::account::FEE_ACCOUNT;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fees.journal");

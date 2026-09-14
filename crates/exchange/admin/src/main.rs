@@ -5,7 +5,7 @@
 //! displayed in a scrolling log behind the menu overlays.
 //!
 //! Usage:
-//!     melin-admin <addr> <key-file>
+//!     melin-ec-admin <addr> <key-file>
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -19,9 +19,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use melin_client::{Client, StatsSnapshot};
-use melin_protocol::message::{Request, ResponseKind};
-use melin_protocol::types::{
+use melin_ec_client::{Client, ClientError, StatsSnapshot};
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_protocol::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
     InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits,
     SelfTradeProtection, Side, Symbol, TimeInForce,
@@ -1421,14 +1421,7 @@ fn client_thread(
                 for resp in &responses {
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
-                        ResponseKind::EngineError => "ENGINE ERROR".into(),
-                        ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
-                        ResponseKind::BatchEnd
-                        | ResponseKind::ServerReady
-                        | ResponseKind::Heartbeat
-                        | ResponseKind::Challenge { .. }
-                        | ResponseKind::AuthFailed
-                        | ResponseKind::BookSnapshotBegin { .. }
+                        ResponseKind::BookSnapshotBegin { .. }
                         | ResponseKind::BookSnapshotLevel { .. }
                         | ResponseKind::BookSnapshotEnd { .. }
                         | ResponseKind::SnapshotComplete { .. }
@@ -1450,6 +1443,12 @@ fn client_thread(
                     };
                     let _ = response_tx.send(format!("{msg}  [{latency:.3?}]"));
                 }
+            }
+            // The engine's verdict on one request, not a connection
+            // failure: the next command goes through as usual.
+            Err(ClientError::EngineError) => {
+                let latency = start.elapsed();
+                let _ = response_tx.send(format!("ENGINE ERROR  [{latency:.3?}]"));
             }
             Err(e) => {
                 let _ = response_tx.send(format!("Request failed: {e}"));
@@ -1679,32 +1678,19 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
-// ── Key loading ─────────────────────────────────────────────────────
-
-fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read key file {path}: {e}"));
-    if bytes.len() != 32 {
-        panic!(
-            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
-            bytes.len()
-        );
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    ed25519_dalek::SigningKey::from_bytes(&seed)
-}
-
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: melin-admin <addr> <key-file>");
+        eprintln!("usage: melin-ec-admin <addr> <key-file>");
         std::process::exit(1);
     }
 
     let addr: SocketAddr = args[1].parse()?;
-    let key = load_signing_key(&args[2]);
+    // A raw 32-byte seed or a PKCS#8 PEM, as the sequencer's client
+    // reads them.
+    let key = melin_client::key::load_signing_key(std::path::Path::new(&args[2]))?;
 
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (response_tx, response_rx) = mpsc::channel::<String>();

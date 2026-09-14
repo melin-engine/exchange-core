@@ -22,10 +22,10 @@
 //!
 //! Read a result as "what one batch costs when the disk is keeping up",
 //! not as a prediction of journal cost under load. For the latter, run
-//! `melin-bench --mode pipeline`, which exercises the real hand-off.
+//! `melin-ec-bench --mode pipeline`, which exercises the real hand-off.
 //!
 //! Usage:
-//!     cargo run --release -p melin-bench --bin journal_writer_bench -- [OPTIONS]
+//!     cargo run --release -p melin-ec-bench --bin journal_writer_bench -- [OPTIONS]
 //!
 //! Options:
 //!     --events <N>               Events to write (default: 1_000_000)
@@ -36,10 +36,10 @@ use std::num::NonZero;
 use std::path::Path;
 use std::time::Instant;
 
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_journal::BufferedWriter;
 use melin_journal::JournalEvent;
 use melin_journal::JournalWrite;
-use melin_trading::trading_event::TradingEvent;
 
 #[derive(Parser)]
 struct Args {
@@ -72,25 +72,25 @@ fn main() {
 /// generated stream is not trivially compressible.
 fn make_event(i: usize) -> JournalEvent<TradingEvent> {
     let nz = |v: u64| NonZero::new(v).expect("non-zero");
-    let order_id = melin_types::types::OrderId((i as u64) + 1);
+    let order_id = melin_ec_types::types::OrderId((i as u64) + 1);
     let side = if i.is_multiple_of(2) {
-        melin_types::types::Side::Buy
+        melin_ec_types::types::Side::Buy
     } else {
-        melin_types::types::Side::Sell
+        melin_ec_types::types::Side::Sell
     };
     JournalEvent::App(TradingEvent::SubmitOrder {
-        symbol: melin_types::types::Symbol(1),
-        order: melin_types::types::Order {
+        symbol: melin_ec_types::types::Symbol(1),
+        order: melin_ec_types::types::Order {
             id: order_id,
-            account: melin_types::types::AccountId(1),
+            account: melin_ec_types::types::AccountId(1),
             side,
-            order_type: melin_types::types::OrderType::Limit {
-                price: melin_types::types::Price(nz(100)),
+            order_type: melin_ec_types::types::OrderType::Limit {
+                price: melin_ec_types::types::Price(nz(100)),
                 post_only: false,
             },
-            time_in_force: melin_types::types::TimeInForce::GTC,
-            quantity: melin_types::types::Quantity(nz(1)),
-            stp: melin_types::types::SelfTradeProtection::Allow,
+            time_in_force: melin_ec_types::types::TimeInForce::GTC,
+            quantity: melin_ec_types::types::Quantity(nz(1)),
+            stp: melin_ec_types::types::SelfTradeProtection::Allow,
             expiry_ns: 0,
         },
     })

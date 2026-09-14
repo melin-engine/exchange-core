@@ -1,5 +1,5 @@
 [package]
-name = "melin-server"
+name = "melin-ec-server"
 version.workspace = true
 edition = "2024"
 license-file.workspace = true
@@ -16,7 +16,7 @@ default = ["hash-chain", "release-tracing"]
 ## Disable with --no-default-features to get RUST_LOG=debug back.
 release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-tracing"]
 skip-order-exec = [
-    "melin-exchange-core/skip-order-exec",
+    "melin-ec/skip-order-exec",
     "hash-chain",
     "release-tracing",
 ]
@@ -52,15 +52,15 @@ hash-chain = [
 ]
 
 [lib]
-name = "melin_server"
+name = "melin_ec_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "melin-server"
+name = "melin-ec-server"
 path = "src/main.rs"
 
 [[bin]]
-name = "melin-replication-bench"
+name = "melin-ec-replication-bench"
 path = "src/bin/replication-bench.rs"
 required-features = ["skip-order-exec"]
 
@@ -71,15 +71,15 @@ path = "src/bin/journal-verify.rs"
 [dependencies]
 melin-app = { workspace = true }
 melin-pipeline = { workspace = true }
-melin-exchange-core = { workspace = true }
+melin-ec = { workspace = true }
 melin-journal = { workspace = true }
-melin-protocol = { workspace = true }
+melin-ec-protocol = { workspace = true }
 melin-server-runtime = { workspace = true }
-melin-trading = { workspace = true }
+melin-ec-trading = { workspace = true }
 melin-transport-core = { workspace = true }
-melin-types = { workspace = true }
+melin-ec-types = { workspace = true }
 melin-wire-protocol = { workspace = true }
-melin-market-data = { workspace = true }
+melin-ec-market-data = { workspace = true }
 blake3 = "1"
 clap = { workspace = true }
 base64 = { workspace = true }
@@ -99,8 +99,9 @@ melin-dpdk = { workspace = true, optional = true }
 [dev-dependencies]
 bolero = "0.13"
 melin-client = { workspace = true }
+melin-ec-client = { workspace = true }
 melin-journal = { workspace = true, features = ["test-utils"] }
-melin-protocol = { workspace = true }
+melin-ec-protocol = { workspace = true }
 melin-transport-core = { workspace = true, features = ["test-utils"] }
 ed25519-dalek = { workspace = true }
 serial_test = "3"

@@ -4,9 +4,9 @@
 //! accesses, and infinite loops. Complements the proptest round-trip
 //! tests which only exercise valid inputs.
 
+use melin_ec_server::exchange_app::ServerApp;
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_journal::codec;
-use melin_server::exchange_app::ServerApp;
-use melin_trading::trading_event::TradingEvent;
 
 /// Journal entry decoder must never panic on arbitrary input.
 /// It must return Ok or a well-formed Err for any byte sequence.
@@ -73,8 +73,8 @@ fn fuzz_snapshot_decode() {
 // Helpers: construct valid types from raw bytes
 // ---------------------------------------------------------------------------
 
+use melin_ec_types::types::*;
 use melin_journal::JournalEvent;
-use melin_types::types::*;
 use std::num::NonZeroU64;
 
 /// Read a NonZeroU64 from bytes, returning None if zero or insufficient data.

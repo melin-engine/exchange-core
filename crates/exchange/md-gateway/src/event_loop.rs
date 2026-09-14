@@ -6,7 +6,7 @@
 //! thread handles event publisher subscriptions separately.
 //!
 //! Uses multishot RECV with provided buffer groups for efficient I/O
-//! multiplexing (same pattern as `melin-server`'s reader.rs and the
+//! multiplexing (same pattern as `melin-ec-server`'s reader.rs and the
 //! order-entry gateway).
 
 use std::net::TcpListener;
@@ -18,10 +18,10 @@ use std::time::Duration;
 use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error, info, warn};
 
-use melin_gateway_core::fix::parse::FixMessage;
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
-use melin_market_data::core::MdState;
+use melin_ec_gateway_core::fix::parse::FixMessage;
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
+use melin_ec_market_data::core::MdState;
 
 use crate::config::GatewayConfig;
 
@@ -461,7 +461,7 @@ impl MdSession {
         for sym_str in &requested_symbols {
             // Look up symbol ID from config.
             let sym_cfg = config.symbols.get(*sym_str);
-            let sym_id = sym_cfg.map(|c| melin_types::types::Symbol(c.id));
+            let sym_id = sym_cfg.map(|c| melin_ec_types::types::Symbol(c.id));
             let tick_inverse = sym_cfg.map_or(1, |c| c.tick_inverse);
 
             let (bids, asks) = if let Some(id) = sym_id
@@ -822,7 +822,7 @@ impl MdGateway {
                 None => return,
             };
 
-            let raw = match melin_gateway_core::fix::parse::try_extract_message(
+            let raw = match melin_ec_gateway_core::fix::parse::try_extract_message(
                 &mut session.fix_parse_buf,
             ) {
                 Some(raw) => raw,
@@ -1051,8 +1051,8 @@ fn get_peer_addr(fd: RawFd) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::parse::FixMessage;
-    use melin_gateway_core::fix::serialize::FixMessageBuilder;
+    use melin_ec_gateway_core::fix::parse::FixMessage;
+    use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -1147,7 +1147,8 @@ mod tests {
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
                 Err(e) => panic!("read error: {e}"),
             }
-            if let Some(msg) = melin_gateway_core::fix::parse::try_extract_message(&mut buf.clone())
+            if let Some(msg) =
+                melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf.clone())
             {
                 return msg;
             }
@@ -1262,8 +1263,8 @@ mod tests {
 
     #[test]
     fn market_data_request_returns_snapshot() {
-        use melin_market_data::mirror::BookMirror;
-        use melin_types::types::{
+        use melin_ec_market_data::mirror::BookMirror;
+        use melin_ec_types::types::{
             AccountId, ExecutionReport, OrderId, Price, Quantity, Side, Symbol,
         };
         use std::num::NonZeroU64;

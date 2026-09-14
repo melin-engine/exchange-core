@@ -9,12 +9,12 @@ use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signer, SigningKey};
 use tracing::{debug, error, info, warn};
 
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
-use melin_types::types::{AccountId, OrderId, Side};
+use melin_client::{Handshake, Reply, Step};
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::{Request, ResponseKind};
+use melin_ec_types::types::{AccountId, OrderId, Side};
 
 use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
@@ -22,9 +22,9 @@ use crate::id_map::ClOrdIdMap;
 use crate::metrics::GatewayMetrics;
 use crate::price;
 use crate::translate::{self, TranslateContext};
-use melin_gateway_core::fix::parse::FixMessage;
-use melin_gateway_core::fix::serialize::FixMessageBuilder;
-use melin_gateway_core::fix::tags;
+use melin_ec_gateway_core::fix::parse::FixMessage;
+use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_ec_gateway_core::fix::tags;
 
 /// Maximum outbound messages retained per session for ResendRequest
 /// replay. At ~250 bytes/msg this caps the store at ~2.5 MB per
@@ -163,7 +163,6 @@ pub struct Session {
     /// entry matches the next PositionSnapshot. VecDeque for O(1) push/pop.
     pending_positions: VecDeque<String>,
     account_id: AccountId,
-    signing_key: Option<SigningKey>,
     /// Index into config.sessions for this FIX session.
     session_config_idx: Option<usize>,
     /// Monotonic ExecID counter for FIX execution reports (tag 17).
@@ -183,8 +182,10 @@ pub struct Session {
     rate_window_start: Instant,
 
     // ── Auth state ──
-    /// Nonce from the Melin Challenge, kept until auth completes.
-    auth_nonce: Option<[u8; 32]>,
+    /// The Melin handshake in progress, from FIX Logon until the node
+    /// says it is ready. It holds the session's only copy of the signing
+    /// key and drops it the moment the challenge is signed.
+    handshake: Option<Handshake>,
 
     // ── Connect state ──
     /// Stored sockaddr for the io_uring CONNECT SQE lifetime.
@@ -228,7 +229,6 @@ impl Session {
             pending_cancels: HashMap::new(),
             pending_positions: VecDeque::new(),
             account_id: AccountId(0),
-            signing_key: None,
             session_config_idx: None,
             exec_id: 1,
             order_ledger: HashMap::new(),
@@ -237,7 +237,7 @@ impl Session {
             rate_msg_count: 0,
             rate_window_start: now,
 
-            auth_nonce: None,
+            handshake: None,
             connect_addr: None,
             metrics,
         }
@@ -355,8 +355,9 @@ impl Session {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
 
-        // Load the signing key for Melin authentication.
-        let signing_key = match load_signing_key(&session_config.key_path) {
+        // Load the signing key for Melin authentication: a raw 32-byte
+        // seed or a PKCS#8 PEM, as the sequencer's client reads them.
+        let signing_key = match melin_client::key::load_signing_key(&session_config.key_path) {
             Ok(k) => k,
             Err(e) => {
                 error!(error = %e, "failed to load signing key");
@@ -369,7 +370,9 @@ impl Session {
         self.sender_comp_id = sender_comp_id.to_owned();
         self.account_id = AccountId(session_config.account_id);
         self.heartbeat_interval = Duration::from_secs(heartbeat_secs);
-        self.signing_key = Some(signing_key);
+        // The handshake takes its own copy of the key; the one loaded
+        // here is gone when this function returns.
+        self.handshake = Some(Handshake::new(&signing_key));
         self.session_config_idx = Some(cfg_idx);
         self.max_msgs_per_sec = session_config.max_msgs_per_sec;
         self.fix_inbound_seq = 2; // Logon was seq 1.
@@ -411,10 +414,17 @@ impl Session {
         self.melin_parse_buf.drain(..4 + frame_len);
 
         match self.state {
-            SessionState::AwaitingChallenge => self.handle_challenge(&payload, config),
-            SessionState::AwaitingAuthResult => self.handle_auth_result(&payload, config),
-            SessionState::SyncingRequestSeq => self.handle_request_seq_sync(&payload, config),
-            SessionState::Active => self.handle_active_melin(&payload, config, symbol_map),
+            SessionState::AwaitingChallenge | SessionState::AwaitingAuthResult => {
+                self.handle_handshake_frame(&payload, config)
+            }
+            SessionState::SyncingRequestSeq => match self.melin_response(&payload) {
+                Some(response) => self.handle_request_seq_sync(response, config),
+                None => SessionAction::None,
+            },
+            SessionState::Active => match self.melin_response(&payload) {
+                Some(response) => self.handle_active_melin(response, config, symbol_map),
+                None => SessionAction::None,
+            },
             _ => {
                 debug!(state = ?self.state, "Melin frame in unexpected state");
                 SessionAction::None
@@ -422,68 +432,50 @@ impl Session {
         }
     }
 
-    fn handle_challenge(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
-        let response = match codec::decode_response(payload) {
-            Ok(r) => r,
+    /// Tell a Melin frame past the handshake apart, the way the
+    /// sequencer's client does: an application response is handed
+    /// back for the exchange codec, everything else is dealt with here.
+    /// A heartbeat and a `BatchEnd` carry nothing the session tracks; a
+    /// busy node and an engine error are logged; a malformed frame is
+    /// dropped, since a bad frame from the engine must not take the
+    /// session down.
+    fn melin_response<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
+        match melin_client::classify(payload) {
+            Ok(Reply::Response(bytes)) => Some(bytes),
+            Ok(Reply::Heartbeat | Reply::BatchEnd) => None,
+            Ok(Reply::ServerBusy) => {
+                warn!(sender = %self.sender_comp_id, "Melin server busy");
+                None
+            }
+            Ok(Reply::EngineError) => {
+                error!(sender = %self.sender_comp_id, "Melin engine error");
+                None
+            }
             Err(e) => {
-                error!(error = %e, "failed to decode Melin Challenge");
-                self.queue_fix_logout(config, "internal error");
-                return SessionAction::Close;
+                warn!(error = %e, "malformed Melin frame");
+                None
             }
-        };
-
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
-            other => {
-                error!(response = ?other, "expected Challenge from Melin server");
-                self.queue_fix_logout(config, "internal error");
-                return SessionAction::Close;
-            }
-        };
-
-        // Sign the nonce with the session's Ed25519 key.
-        let signing_key = match &self.signing_key {
-            Some(k) => k,
-            None => {
-                error!("no signing key loaded");
-                return SessionAction::Close;
-            }
-        };
-
-        let signature = signing_key.sign(&nonce);
-        let request = Request::ChallengeResponse {
-            signature: signature.to_bytes(),
-            public_key: signing_key.verifying_key().to_bytes(),
-        };
-
-        // Encode ChallengeResponse into Melin send buffer.
-        let written = match codec::encode_request(&request, 0, &mut self.melin_encode_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                error!(error = %e, "failed to encode ChallengeResponse");
-                return SessionAction::Close;
-            }
-        };
-        self.melin_send_buf
-            .extend_from_slice(&self.melin_encode_buf[..written]);
-
-        self.auth_nonce = Some(nonce);
-        self.state = SessionState::AwaitingAuthResult;
-        SessionAction::SendMelin
+        }
     }
 
-    fn handle_auth_result(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
-        let response = match codec::decode_response(payload) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(error = %e, "failed to decode Melin auth result");
-                self.queue_fix_logout(config, "internal error");
-                return SessionAction::Close;
-            }
+    /// Feed one frame to the Melin handshake, in either of its states:
+    /// the challenge, answered with the signed nonce, then the node's
+    /// verdict. The handshake itself knows which it is waiting for.
+    fn handle_handshake_frame(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
+        let Some(handshake) = self.handshake.as_mut() else {
+            error!("Melin frame with no handshake in progress");
+            self.queue_fix_logout(config, "internal error");
+            return SessionAction::Close;
         };
 
-        match response {
-            ResponseKind::ServerReady => {
+        match handshake.feed(payload) {
+            Ok(Step::Send(frame)) => {
+                // The challenge response, length prefix included.
+                self.melin_send_buf.extend_from_slice(frame);
+                self.state = SessionState::AwaitingAuthResult;
+                SessionAction::SendMelin
+            }
+            Ok(Step::Ready) => {
                 info!(
                     sender = %self.sender_comp_id,
                     "Melin authentication succeeded"
@@ -511,22 +503,20 @@ impl Session {
                 self.melin_send_buf
                     .extend_from_slice(&self.melin_encode_buf[..written]);
 
-                // Clean up auth state now — the signing key isn't needed
-                // again and clearing it early shrinks the window during
-                // which it sits in memory after use.
-                self.auth_nonce = None;
-                self.signing_key = None;
+                // The handshake is over; dropping it drops what was
+                // left of the auth state.
+                self.handshake = None;
 
                 self.state = SessionState::SyncingRequestSeq;
                 SessionAction::SendMelin
             }
-            ResponseKind::AuthFailed => {
+            Err(melin_client::Error::AuthFailed { .. }) => {
                 warn!(sender = %self.sender_comp_id, "Melin authentication failed");
                 self.queue_fix_logout(config, "authentication failed");
                 SessionAction::Close
             }
-            other => {
-                error!(response = ?other, "unexpected Melin auth response");
+            Err(e) => {
+                error!(error = %e, "Melin handshake failed");
                 self.queue_fix_logout(config, "internal error");
                 SessionAction::Close
             }
@@ -538,8 +528,10 @@ impl Session {
     /// next outbound request increments past whatever the engine has
     /// already accepted under any prior session lifetime, then sends
     /// the FIX Logon ack and unblocks the session into `Active`. The
-    /// `BatchEnd` that arrives after `RequestSeqHwm` is processed by
-    /// `handle_active_melin` (which no-ops it) once we've transitioned.
+    /// `BatchEnd` that follows `RequestSeqHwm`, like a keepalive
+    /// heartbeat before it, never reaches here: the dispatcher drops
+    /// the transport's frames and the session stays parked until the
+    /// real response.
     fn handle_request_seq_sync(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
         let response = match codec::decode_response(payload) {
             Ok(r) => r,
@@ -573,13 +565,6 @@ impl Session {
 
                 self.state = SessionState::Active;
                 SessionAction::SendFix
-            }
-            ResponseKind::BatchEnd | ResponseKind::Heartbeat => {
-                // BatchEnd shouldn't arrive before RequestSeqHwm — engine
-                // emits the query response first — but be defensive: a
-                // stray BatchEnd (or keepalive Heartbeat) doesn't break
-                // anything, just stay parked until the real response.
-                SessionAction::None
             }
             other => {
                 error!(
@@ -1050,17 +1035,6 @@ impl Session {
                     }
                 }
             }
-            ResponseKind::BatchEnd | ResponseKind::Heartbeat | ResponseKind::ServerReady => {
-                SessionAction::None
-            }
-            ResponseKind::ServerBusy => {
-                warn!(sender = %self.sender_comp_id, "Melin server busy");
-                SessionAction::None
-            }
-            ResponseKind::EngineError => {
-                error!(sender = %self.sender_comp_id, "Melin engine error");
-                SessionAction::None
-            }
             ResponseKind::PositionSnapshot {
                 account: _,
                 balances,
@@ -1167,8 +1141,8 @@ impl Session {
     fn update_fill_ledger(
         &mut self,
         order_id: OrderId,
-        fill_price: melin_types::types::Price,
-        fill_quantity: melin_types::types::Quantity,
+        fill_price: melin_ec_types::types::Price,
+        fill_quantity: melin_ec_types::types::Quantity,
         lot_inverse: u64,
         side: Side,
     ) {
@@ -1713,7 +1687,7 @@ impl Drop for Session {
 // Helpers
 // ---------------------------------------------------------------------------
 
-use melin_types::types::ExecutionReport;
+use melin_ec_types::types::ExecutionReport;
 
 /// Borrowed view over an `OrderSymbolInfo` with sensible fallbacks when no
 /// info was recorded for the order. Returned by [`sym_info_or_default`] so
@@ -1826,11 +1800,6 @@ fn rebuild_with_poss_dup(stored_bytes: &[u8], sender: &str, target: &str) -> Vec
     builder.build(sender, target, seq)
 }
 
-/// Delegates to `melin_gateway_core::auth::load_signing_key`.
-fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
-    melin_gateway_core::auth::load_signing_key(path)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1838,9 +1807,9 @@ fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_gateway_core::fix::serialize::FixMessageBuilder;
-    use melin_protocol::message::ResponseKind;
-    use melin_types::types::{
+    use melin_ec_gateway_core::fix::serialize::FixMessageBuilder;
+    use melin_ec_protocol::message::ResponseKind;
+    use melin_ec_types::types::{
         ExecutionReport, InstrumentStatus, Price, Quantity, RejectReason, Side, Symbol,
     };
     use std::num::NonZeroU64;
@@ -1977,7 +1946,7 @@ lot_size_inverse = 1
     /// length-prefixed wire format.
     fn push_melin_response(session: &mut Session, response: &ResponseKind) {
         let mut buf = [0u8; 256];
-        let n = melin_protocol::codec::encode_response(response, &mut buf).unwrap();
+        let n = melin_ec_protocol::codec::encode_response(response, &mut buf).unwrap();
         session.melin_parse_buf.extend_from_slice(&buf[..n]);
     }
 
@@ -2007,7 +1976,7 @@ lot_size_inverse = 1
         assert_eq!(s.sender_comp_id, "FIRM_A");
         assert_eq!(s.account_id, AccountId(7));
         assert_eq!(s.heartbeat_interval, Duration::from_secs(30));
-        assert!(s.signing_key.is_some());
+        assert!(s.handshake.is_some());
         assert_eq!(s.fix_inbound_seq, 2);
     }
 
@@ -2056,11 +2025,24 @@ lot_size_inverse = 1
     }
 
     /// Encode a response with the codec and strip the 4-byte length
-    /// prefix to match what the dispatcher hands to the auth handlers
-    /// (it consumes the prefix when framing).
+    /// prefix to match what the dispatcher hands to the handlers (it
+    /// consumes the prefix when framing).
     fn encode_response_payload(resp: &ResponseKind) -> Vec<u8> {
         let mut buf = [0u8; 64];
         let n = codec::encode_response(resp, &mut buf).unwrap();
+        buf[4..n].to_vec()
+    }
+
+    use ed25519_dalek::SigningKey;
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
+
+    /// One of the transport's own frames — the handshake's, a
+    /// heartbeat, a batch end — the same way: the payload without the
+    /// length prefix.
+    fn transport_payload(resp: &TransportResponse) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let n = control_codec::encode_transport_response(resp, &mut buf).unwrap();
         buf[4..n].to_vec()
     }
 
@@ -2073,17 +2055,20 @@ lot_size_inverse = 1
         s.state = SessionState::AwaitingAuthResult;
         s.sender_comp_id = "FIRM_A".to_owned();
         s.heartbeat_interval = Duration::from_secs(30);
-        s.signing_key = Some(SigningKey::from_bytes(&[0u8; 32]));
-        s.auth_nonce = Some([0u8; 32]);
+        // A handshake that has answered the challenge and awaits the
+        // node's verdict.
+        let mut handshake = Handshake::new(&SigningKey::from_bytes(&[0u8; 32]));
+        let challenge = transport_payload(&TransportResponse::Challenge { nonce: [0u8; 32] });
+        assert!(matches!(handshake.feed(&challenge), Ok(Step::Send(_))));
+        s.handshake = Some(handshake);
 
-        let payload = encode_response_payload(&ResponseKind::ServerReady);
-        let action = s.handle_auth_result(&payload, &config);
+        let payload = transport_payload(&TransportResponse::ServerReady);
+        let action = s.handle_handshake_frame(&payload, &config);
 
         assert_eq!(action, SessionAction::SendMelin);
         assert!(matches!(s.state, SessionState::SyncingRequestSeq));
-        // Auth state was wiped — signing key out of memory ASAP.
-        assert!(s.signing_key.is_none());
-        assert!(s.auth_nonce.is_none());
+        // Auth state was wiped — the handshake and its key copy are gone.
+        assert!(s.handshake.is_none());
         // FIX Logon ack is NOT sent yet — the client must wait until
         // we've seeded melin_seq from the engine's HWM.
         assert!(s.fix_send_buf.is_empty());
@@ -2117,6 +2102,76 @@ lot_size_inverse = 1
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
         assert_eq!(parsed.msg_type(), tags::MSG_LOGON);
         assert_eq!(parsed.get_str(tags::HEART_BT_INT), Some("30"));
+    }
+
+    /// Queue one length-prefixed Melin frame for the dispatcher.
+    fn push_melin_frame(s: &mut Session, payload: &[u8]) {
+        s.melin_parse_buf
+            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        s.melin_parse_buf.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn transport_frames_keep_the_session_parked_until_the_hwm_arrives() {
+        // The node heartbeats a quiet connection, and the query's batch
+        // ends after its one response. Neither is the response: the
+        // session stays in SyncingRequestSeq, without a word to the FIX
+        // client, until the HWM arrives.
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::SyncingRequestSeq;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.heartbeat_interval = Duration::from_secs(30);
+        s.fix_outbound_seq = 1;
+
+        for transport in [TransportResponse::Heartbeat, TransportResponse::BatchEnd] {
+            push_melin_frame(&mut s, &transport_payload(&transport));
+            let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+            assert_eq!(action, SessionAction::None, "{transport:?}");
+            assert!(matches!(s.state, SessionState::SyncingRequestSeq));
+            assert!(s.fix_send_buf.is_empty());
+        }
+
+        push_melin_frame(
+            &mut s,
+            &encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 5 }),
+        );
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::SendFix);
+        assert!(matches!(s.state, SessionState::Active));
+        assert_eq!(s.melin_seq, 5);
+    }
+
+    #[test]
+    fn transport_frames_are_dropped_while_active() {
+        // Heartbeats, batch ends, a busy node, an engine error, and a
+        // frame with a reserved tag (the handshake's ServerReady, over
+        // long ago) are the transport's business: none produces FIX
+        // traffic or moves the session.
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        for transport in [
+            TransportResponse::Heartbeat,
+            TransportResponse::BatchEnd,
+            TransportResponse::ServerBusy,
+            TransportResponse::EngineError,
+            TransportResponse::ServerReady,
+        ] {
+            push_melin_frame(&mut s, &transport_payload(&transport));
+            let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+            assert_eq!(action, SessionAction::None, "{transport:?}");
+            assert!(matches!(s.state, SessionState::Active));
+            assert!(s.fix_send_buf.is_empty());
+        }
+        // An empty frame is a protocol violation, dropped the same way.
+        push_melin_frame(&mut s, &[]);
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::None);
+        assert!(matches!(s.state, SessionState::Active));
+        assert!(s.melin_parse_buf.is_empty());
     }
 
     #[test]
@@ -2535,9 +2590,9 @@ lot_size_inverse = 1
         // event loop uses.
         let mut buf = s.fix_send_buf.clone();
         let raw1 =
-            melin_gateway_core::fix::parse::try_extract_message(&mut buf).expect("first msg");
+            melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf).expect("first msg");
         let raw2 =
-            melin_gateway_core::fix::parse::try_extract_message(&mut buf).expect("second msg");
+            melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf).expect("second msg");
         assert!(buf.is_empty(), "exactly two messages expected");
 
         let first = FixMessage::parse(&raw1).unwrap();
@@ -3115,7 +3170,7 @@ lot_size_inverse = 1
     fn drain_send_buf(s: &mut Session) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = std::mem::take(&mut s.fix_send_buf);
-        while let Some(m) = melin_gateway_core::fix::parse::try_extract_message(&mut buf) {
+        while let Some(m) = melin_ec_gateway_core::fix::parse::try_extract_message(&mut buf) {
             out.push(m);
         }
         // Anything that didn't frame goes back.

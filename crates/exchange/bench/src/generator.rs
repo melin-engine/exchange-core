@@ -45,8 +45,8 @@ fn fast_powf(base: f64, exp: f64) -> f64 {
     }
 }
 
-use melin_protocol::codec;
-use melin_protocol::message::Request;
+use melin_ec_protocol::codec;
+use melin_ec_protocol::message::Request;
 
 /// Upper bound on the size (in bytes) of any single length-prefixed request
 /// frame this generator can produce. Matches the largest fixed encoding the
@@ -54,7 +54,7 @@ use melin_protocol::message::Request;
 /// `CancelOrder`, `CancelReplace`) including the 4-byte LE length prefix.
 /// Callers should size scratch buffers to this so the encoder never reallocates.
 pub const MAX_REQUEST_FRAME_BYTES: usize = 136;
-use melin_types::types::{
+use melin_ec_types::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
     TimeInForce,
 };
@@ -908,8 +908,8 @@ mod tests {
 
     #[test]
     fn aggressive_orders_produce_fills() {
-        use melin_exchange_core::exchange::Exchange;
-        use melin_types::types::{CurrencyId, ExecutionReport, InstrumentSpec};
+        use melin_ec::exchange::Exchange;
+        use melin_ec_types::types::{CurrencyId, ExecutionReport, InstrumentSpec};
 
         let config = GeneratorConfig {
             num_accounts: 2,

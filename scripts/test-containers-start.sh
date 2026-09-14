@@ -136,11 +136,11 @@ docker exec "$SERVER" bash -c "
     apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3 && \
     source /root/.cargo/env && \
     cd $REPO_DIR && \
-    cargo build --release -p melin-server --features dpdk 2>&1 | tail -3 && \
-    cp target/release/melin-server target/release/melin-server.dpdk && \
+    cargo build --release -p melin-ec-server --features dpdk 2>&1 | tail -3 && \
+    cp target/release/melin-ec-server target/release/melin-ec-server.dpdk && \
     echo 'Rebuilding default (non-DPDK) server binary...' && \
-    cargo build --release -p melin-server 2>&1 | tail -3 && \
-    ls -la target/release/melin-server target/release/melin-server.dpdk
+    cargo build --release -p melin-ec-server 2>&1 | tail -3 && \
+    ls -la target/release/melin-ec-server target/release/melin-ec-server.dpdk
 "
 
 # Pick a DPDK IP that's on the Docker bridge subnet but not used by any
@@ -186,8 +186,8 @@ if [[ "$WITH_REPLICA" == "true" ]]; then
     docker exec "$SERVER" bash -c "
         cd /tmp && \
         rm -f trader.key trader.pub repl.key repl.pub authorized_keys 2>/dev/null; \
-        $REPO_DIR/target/release/melin-keygen trader trader > /dev/null 2>&1 && \
-        $REPO_DIR/target/release/melin-keygen repl replication > /dev/null 2>&1 && \
+        $REPO_DIR/target/release/melin-ec-keygen trader trader > /dev/null 2>&1 && \
+        $REPO_DIR/target/release/melin-ec-keygen repl replication > /dev/null 2>&1 && \
         echo \"trader \$(cat trader.pub | tr -d '\\n') trader\" > authorized_keys && \
         echo \"replication \$(cat repl.pub | tr -d '\\n') repl\" >> authorized_keys
     "
@@ -225,20 +225,20 @@ if [[ "$WITH_REPLICA" == "true" ]]; then
     echo "Manual smoke test (copy-paste):"
     echo ""
     echo "  # Start primary"
-    echo "  docker exec -d $SERVER bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-server \\"
+    echo "  docker exec -d $SERVER bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-ec-server \\"
     echo "      --journal /tmp/bench.journal --replication-bind 0.0.0.0:9877 --health-bind 0.0.0.0:9878 \\"
     echo "      --bind 0.0.0.0:9876 --authorized-keys /tmp/authorized_keys --accounts 100 --instruments 5 \\"
     echo "      >/tmp/server.log 2>&1'"
     echo ""
     echo "  # Start replica"
-    echo "  docker exec -d $REPLICA bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-server \\"
+    echo "  docker exec -d $REPLICA bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-ec-server \\"
     echo "      --replica-of $SERVER_IP:9877 --replication-key /tmp/repl.key --journal /tmp/replica.journal \\"
     echo "      >/tmp/replica.log 2>&1'"
 
     if [[ "$WITH_DUAL_REPLICA" == "true" ]]; then
         echo ""
         echo "  # Start replica2"
-        echo "  docker exec -d $REPLICA2 bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-server \\"
+        echo "  docker exec -d $REPLICA2 bash -c 'RUST_LOG=info $REPO_DIR/target/release/melin-ec-server \\"
         echo "      --replica-of $SERVER_IP:9877 --replication-key /tmp/repl.key --journal /tmp/replica2.journal \\"
         echo "      >/tmp/replica2.log 2>&1'"
 

@@ -8,9 +8,9 @@
 # Architecture:
 #   Host                          Guest (Debian VM)
 #   ────                          ─────
-#   melin-bench ──TCP──> vmtap0 ──virtio-net-pci──> DPDK net_virtio PMD
+#   melin-ec-bench ──TCP──> vmtap0 ──virtio-net-pci──> DPDK net_virtio PMD
 #                        192.168.200.2              192.168.200.1
-#                                                   melin-server (DPDK)
+#                                                   melin-ec-server (DPDK)
 #
 # The guest has two NICs:
 #   - Management: QEMU user-mode (DHCP, SSH via port forward on 2222)
@@ -308,14 +308,11 @@ echo ""
 
 # --- 8. Build server inside VM ---
 echo "=== Building server in VM ==="
-echo "  cargo build --release -p melin-server --features dpdk --no-default-features"
+echo "  cargo build --release -p melin-ec-server --features dpdk --no-default-features"
 echo "  (this may take a few minutes on first run)"
-vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -5
+vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-ec-server --features dpdk --no-default-features" 2>&1 | tail -5
 echo "  Server build: OK"
 
-echo "  Building keygen..."
-vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release --bin melin-keygen" 2>&1 | tail -3
-echo "  Keygen build: OK"
 echo ""
 
 # --- 9. Set up DPDK inside VM ---
@@ -345,20 +342,24 @@ echo ""
 
 # --- 10. Generate auth keys + start server ---
 echo "=== Starting DPDK server in VM ==="
-vm_ssh "cd /tmp && ~/melin/target/release/melin-keygen bench trader"
-vm_ssh "echo \"trader \$(cat /tmp/bench.pub | tr -d '\n') bench\" > /tmp/authorized_keys"
-echo "  Auth keys generated"
+# The bench authenticates each client with a key derived from bench.key,
+# so the derived public keys are what the server must authorize. Both
+# come from the host's bench binary; the VM only needs the result.
+(cd "$PROJECT_DIR" && cargo build --release --bin melin-ec-bench --bin melin-ec-keygen --quiet 2>&1)
+(cd "$TMPDIR" && "$PROJECT_DIR/target/release/melin-ec-keygen" bench trader > /dev/null)
+"$PROJECT_DIR/target/release/melin-ec-bench" --key "$TMPDIR/bench.key" --clients 1 --print-authorized-keys > "$TMPDIR/authorized_keys"
+vm_ssh "cat > /tmp/authorized_keys" < "$TMPDIR/authorized_keys"
+echo "  Auth keys generated on the host and copied to the VM"
 
-vm_ssh "sudo RUST_LOG=info,melin_server=debug,melin_dpdk=debug \
-    ~/melin/target/release/melin-server \
+vm_ssh "sudo RUST_LOG=info,melin_ec_server=debug,melin_dpdk=debug \
+    ~/melin/target/release/melin-ec-server \
     --bind 0.0.0.0:$DPDK_PORT \
     --journal /tmp/smoke.journal \
     --authorized-keys /tmp/authorized_keys \
     --standalone \
     --accounts 100 \
     --instruments 10 \
-    --yield-idle \
-    --cores 0,0,0,0,0,0,0,0,0 \
+    --cores none \
     --dpdk-eal-args='--huge-dir=/mnt/huge_2m --log-level=6' \
     --dpdk-ip $DPDK_IP \
     --dpdk-prefix-len $PREFIX \
@@ -377,7 +378,7 @@ while ! vm_ssh "grep -q 'DPDK transport listening' /tmp/server.log 2>/dev/null";
         exit 1
     fi
     # Check if server process is still running.
-    if ! vm_ssh "pgrep -f melin-server >/dev/null 2>&1"; then
+    if ! vm_ssh "pgrep -f melin-ec-server >/dev/null 2>&1"; then
         echo "  ERROR: Server process died"
         echo "  --- Server log ---"
         vm_ssh "cat /tmp/server.log" 2>/dev/null || true
@@ -390,24 +391,16 @@ echo "  DPDK server running (net_virtio PMD)"
 vm_ssh "grep -E '(DPDK|port|PMD|virtio)' /tmp/server.log" 2>/dev/null | head -10 || true
 echo ""
 
-# --- 11. Build + run bench on host ---
-echo "=== Building host bench ==="
+# --- 11. Run bench on host ---
 cd "$PROJECT_DIR"
-cargo build --release --bin melin-bench --bin melin-keygen --quiet 2>&1
-echo "  bench + keygen: OK"
-
-# Generate matching auth keys on host.
-# We need the same keypair — copy from VM.
-vm_ssh "cat /tmp/bench.key" > "$TMPDIR/bench.key"
-chmod 600 "$TMPDIR/bench.key"
-echo ""
-
 echo "=== Running smoke benchmark ==="
 echo "  short timed run, 1 client, window 1 (single-order latency)"
 
-"$PROJECT_DIR/target/release/melin-bench" \
+"$PROJECT_DIR/target/release/melin-ec-bench" \
     --addr "$DPDK_IP:$DPDK_PORT" \
     --key "$TMPDIR/bench.key" \
+    --accounts 100 \
+    --instruments 10 \
     --clients 1 \
     --window 1 \
     --warmup-duration 1s \

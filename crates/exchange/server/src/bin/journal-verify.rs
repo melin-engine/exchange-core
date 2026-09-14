@@ -2,7 +2,7 @@
 //! segment, verify per-entry CRCs, dense sequences, and cross-segment
 //! chain links, and print a per-segment summary with an overall verdict.
 //!
-//! Usage: cargo run --release -p melin-server --bin journal-verify -- <live-journal-path>
+//! Usage: cargo run --release -p melin-ec-server --bin journal-verify -- <live-journal-path>
 //!
 //! Pointing at a single archived segment also works — it is then
 //! verified in isolation (no sibling discovery matches its name).
@@ -11,8 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use melin_ec_trading::trading_event::TradingEvent;
 use melin_journal::JournalReader;
-use melin_trading::trading_event::TradingEvent;
 
 fn hex(h: [u8; 32]) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
