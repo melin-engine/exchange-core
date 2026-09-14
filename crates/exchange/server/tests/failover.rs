@@ -595,6 +595,73 @@ impl Drop for ServerProcess {
     }
 }
 
+/// SIGSTOP a spawned server and return only once the whole process has
+/// stopped.
+///
+/// `kill(SIGSTOP)` is not synchronous: it returns once the signal is
+/// queued. The kernel wakes one thread to take it, and only when that
+/// thread gets CPU does it stop the rest — until then every other
+/// thread keeps running. A replica "frozen" that way can still read an
+/// entry off the replication stream and ack it, which a test asserting
+/// on what happens *while* the replica is frozen reads as a durability
+/// bug.
+///
+/// `waitpid(WUNTRACED)` closes that window: the kernel reports the
+/// child stopped only once every thread in its group has stopped, so
+/// when this returns none of the server's code can run. The test is the
+/// server's parent, which is what lets it wait on the stop at all.
+fn freeze_process(child: &Child) {
+    // `pid_t` is what both syscalls take; a child pid always fits.
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: plain syscalls on a child this test spawned and still owns.
+    let rc = unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert_eq!(
+        rc,
+        0,
+        "SIGSTOP to server {pid} failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: as above; `status` outlives the call.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if waited == pid {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        // A signal delivered to the test process interrupts the wait
+        // without saying anything about the child; wait again.
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        panic!("waitpid on server {pid} failed: {err}");
+    }
+    // Without WCONTINUED the only other reportable state is termination,
+    // which means the server died between spawn and freeze. The wait has
+    // then reaped it, so its `Child` handle is stale — fail loudly rather
+    // than let the test observe a "frozen" peer that no longer exists.
+    assert!(
+        libc::WIFSTOPPED(status),
+        "server {pid} exited instead of stopping (wait status {status:#x})"
+    );
+}
+
+/// SIGCONT a server stopped by [`freeze_process`]. Resuming needs no
+/// wait: nothing asserts on the instant the threads run again.
+fn thaw_process(child: &Child) {
+    // `pid_t` is what `kill` takes; a child pid always fits.
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: plain syscall on a child this test spawned and still owns.
+    let rc = unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert_eq!(
+        rc,
+        0,
+        "SIGCONT to server {pid} failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Spawn a primary server process.
 /// Spawn a primary server process with caller-supplied extra CLI flags
 /// (e.g. `--admin-bind`, `--max-journal-mib`).
@@ -3368,9 +3435,11 @@ fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
 /// Freeze the replica process with SIGSTOP — the primary keeps
 /// journaling and shipping (the entry lands in the replica's socket
 /// buffer) so `persisted>=1` is satisfied, but no ack ever returns, so
-/// `in_memory>=2` cannot be. The response must NOT arrive while the
-/// replica is frozen. SIGCONT the replica and the same in-flight order
-/// must complete with a normal `Placed` ack.
+/// `in_memory>=2` cannot be. The order is submitted only after the
+/// kernel confirms every replica thread has stopped (see
+/// [`freeze_process`]), so the replica cannot have seen it. The response
+/// must NOT arrive while the replica is frozen. SIGCONT the replica and
+/// the same in-flight order must complete with a normal `Placed` ack.
 ///
 /// This is deliberately mechanism-agnostic: the pre-v14 sequence-space
 /// drift voided the gate within seconds of uptime (replica cursors ran
@@ -3402,9 +3471,7 @@ fn disk_ram_gate_stalls_while_replica_frozen() {
     // Freeze the replica. SIGSTOP halts ack production without closing
     // the TCP stream, so the primary sees a connected-but-silent peer —
     // the exact shape the gate exists to hold against.
-    unsafe {
-        libc::kill(cluster.replica.child.id() as i32, libc::SIGSTOP);
-    }
+    freeze_process(&cluster.replica.child);
 
     // Submit from a helper thread; the response (if any) is forwarded
     // over a channel so the main thread can assert on its *timing*.
@@ -3421,18 +3488,30 @@ fn disk_ram_gate_stalls_while_replica_frozen() {
     // vacuous-gate bug.
     match rx.recv_timeout(Duration::from_millis(1500)) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        Ok(r) => panic!(
-            "durability gate released a client ack while the only replica \
-             was frozen (disk+ram requires in_memory>=2): {r:?}"
-        ),
+        Ok(r) => {
+            // The replica is still frozen, so its cursors are exactly
+            // what it confirmed before stopping — the evidence that tells
+            // a gate that released without confirmation (in-memory cursor
+            // short of the primary's position) from a replica cursor
+            // that ran ahead of what the replica ever received. Read
+            // before panicking; a failed read is reported as such rather
+            // than masking the assertion.
+            let primary_health =
+                query_health(cluster.primary.health_addr).map_err(|e| e.to_string());
+            let replica_cursors = fetch_replica_cursors(cluster.primary.health_addr);
+            panic!(
+                "durability gate released a client ack while the only replica \
+                 was frozen (disk+ram requires in_memory>=2): {r:?}\n\
+                 primary health (conns, journal_seq, repl_lag, trading): {primary_health:?}\n\
+                 replica cursors per slot (in_memory, acked): {replica_cursors:?}"
+            );
+        }
         Err(e) => panic!("submitter channel closed unexpectedly: {e}"),
     }
 
     // Thaw the replica: it drains the buffered stream, acks, and the
     // in-flight response must now be released promptly.
-    unsafe {
-        libc::kill(cluster.replica.child.id() as i32, libc::SIGCONT);
-    }
+    thaw_process(&cluster.replica.child);
     let r = rx
         .recv_timeout(Duration::from_secs(30))
         .expect("no response after replica thawed — gate stuck");
@@ -3575,9 +3654,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
             // SIGSTOP halts the replica without closing its sockets:
             // the primary sees a connected-but-silent peer, exactly the
             // slow-replica shape that drives ring-backpressure eviction.
-            unsafe {
-                libc::kill(cluster.replica2.child.id() as i32, libc::SIGSTOP);
-            }
+            freeze_process(&cluster.replica2.child);
 
             // Eviction fires only once the frozen replica's kernel TCP
             // buffers (autotuned, potentially several MB) plus the
@@ -3620,9 +3697,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
                 }
             }
 
-            unsafe {
-                libc::kill(cluster.replica2.child.id() as i32, libc::SIGCONT);
-            }
+            thaw_process(&cluster.replica2.child);
 
             // The thawed replica drains the dead connection's buffered
             // tail, notices EOF, reconnects (1s backoff), catches up
