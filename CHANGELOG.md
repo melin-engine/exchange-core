@@ -18,6 +18,8 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-14
+
 ### Changed
 
 - **Every binary is renamed with the `melin-ec-` prefix**: `melin-ec-server`,
@@ -86,4 +88,5 @@ full detail behind entries marked *(sequencer)*.
 - An unpinned server thread runs on the process's own CPU set *(sequencer)*
   instead of inheriting an isolated core from the thread that started it.
 
-[Unreleased]: https://github.com/melin-engine/exchange-core/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/melin-engine/exchange-core/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.16.0
