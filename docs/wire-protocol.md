@@ -410,7 +410,7 @@ Reports that an order was rejected by the matching engine.
 | 18   | InstrumentDisabled    |
 | 19   | ExceedsMaxOpenOrders  |
 | 20   | ExceedsOrderRate      |
-| 21   | Superseded            |
+| 21   | *(reserved)*          |
 
 ### Tag 16: EngineError
 

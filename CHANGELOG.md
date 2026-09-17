@@ -18,6 +18,39 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+### Changed
+
+- **A halted node refuses a write before journaling it** *(sequencer)*. A
+  primary that has lost its last replica rejects state-mutating requests with
+  `ReplicaDisconnected`, as before, but the request is now turned away as it is
+  read, so it never reaches the journal. Previously the rejection was decided
+  after the journal had recorded the write, and a later replay — on restart, on
+  a promoted replica, or on a replica catching up — applied what the client was
+  told had failed. A refused request also consumes nothing, so a client may
+  resend it under the same request sequence once trading resumes.
+- **A superseded node closes client connections instead of rejecting**
+  *(sequencer)*. A node fenced by a newer primary is stopping; clients
+  reconnect and land on the new primary, as they would after a crash.
+- **Documented that a halted node answers no query** *(sequencer)*. This is
+  long-standing behavior, not a change in this release: `QueryStats`, position
+  and request-sequence queries get no reply until the halt clears, under every
+  ack policy, and connecting a client to a halted node blocks for the same
+  reason. Monitor a halted node through the health endpoint. See "Halt on
+  Replica Disconnect" in `docs/operations.md`.
+
+### Added
+
+- **`melin_writes_refused_total` on `/metrics`** *(sequencer)*, counting client
+  writes turned away while the node was halted. A refused write is never
+  journaled, so this counter is its only trace on the node.
+
+### Removed
+
+- **The `Superseded` reject reason**, and wire code 21 with it. Nothing produces
+  it any more (see above), so the code is now rejected as invalid on decode and
+  stays reserved — clients that map it should drop that arm. Rust dependents
+  matching on `RejectReason` drop the variant.
+
 ## [0.16.0] - 2026-09-14
 
 ### Changed

@@ -659,6 +659,7 @@ melin_trading_active 1
 | `melin_input_queue_depth` | gauge | Items pending in the input disruptor (`producer - matching`) |
 | `melin_input_queue_capacity` | gauge | Total input ring buffer capacity (constant 1,048,576) |
 | `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
+| `melin_writes_refused_total` | counter | Client writes rejected with `ReplicaDisconnected` while halted. A refused write is never journaled, so this counter is its only trace on the node |
 | `melin_stage_busy_total{stage="..."}` | counter | Cumulative busy iterations per stage (journal/response: batches, matching: events) |
 | `melin_stage_idle_total{stage="..."}` | counter | Cumulative idle iterations per stage |
 | `melin_journal_rotations_total{path="..."}` | counter | Journal segment rotation attempts by outcome: `fast` adopted a pre-staged segment; `sync_fallback` allocated synchronously on the journal thread; `failed` left the current segment in place |
@@ -680,9 +681,15 @@ scrape_configs:
 
 ### Halt on Replica Disconnect
 
-When replication is enabled (`--replication-bind`), the engine automatically halts trading if the replica disconnects. All state-mutating requests (orders, deposits, admin operations) are rejected with `ReplicaDisconnected` until the replica reconnects. QueryStats and heartbeats continue working.
+When replication is enabled (`--replication-bind`), the engine automatically halts trading if the replica disconnects. All state-mutating requests (orders, deposits, admin operations) are rejected with `ReplicaDisconnected` until the replica reconnects. Heartbeats continue working.
+
+**Queries are not answered while halted.** `QueryStats`, position queries and request-sequence queries get no reply until the halt clears, under every ack policy — the client sees only its own read timeout. Monitor a halted node through the health endpoint instead: `melin_trading_active` reports the halt itself, and `melin_journal_sequence`, `melin_replication_lag`, `melin_active_connections` and `melin_writes_refused_total` cover what the node is doing. Account positions and the request-sequence high-water mark are unavailable until trading resumes. A client that connects to a halted node also blocks, because connecting queries the request-sequence mark; point clients at the health endpoint, or at the operator admin endpoint, to tell a halted node from an unreachable one.
 
 This preserves the durability guarantee: the engine never acks a response that isn't durable on both primary and replica. Without this, a primary crash after replica disconnect could lose acked events.
+
+A refused request is turned away before it is journaled: it has no effect on the book or on balances, now or after a restart, a failover or a replica catch-up. It also consumes nothing, so a client may resend it with the same request sequence once trading resumes. Refusals are counted in `melin_writes_refused_total`.
+
+A primary superseded by a newer one (after a failover) behaves differently: it is shutting down, so it closes client connections instead of rejecting requests. Clients reconnect and land on the new primary, as they would after a crash.
 
 Trading resumes automatically when the replica reconnects — no operator intervention needed. In standalone mode (no `--replication-bind`), this check is disabled.
 

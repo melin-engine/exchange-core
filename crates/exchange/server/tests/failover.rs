@@ -740,6 +740,66 @@ fn spawn_primary_with_extra_env(
     }
 }
 
+/// Spawn a standalone node on `tmp_dir`'s primary journal — no replication
+/// port, so nothing halts it when it runs without a replica, which is what
+/// a node recovering from a journal on its own needs. `--ack-policy disk`
+/// comes with `--standalone` and is the only policy it accepts.
+///
+/// Seeding counts stay at the fixture's: they apply to a fresh journal
+/// only, and a recovering node takes its state from the journal instead.
+fn spawn_standalone_with_extra_env(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    client_port: u16,
+    health_port: u16,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> ServerProcess {
+    let journal = tmp_dir.join("primary.journal");
+    assert!(journal.exists(), "primary journal must exist");
+    let mut args: Vec<String> = vec![
+        "--bind".into(),
+        format!("127.0.0.1:{client_port}"),
+        "--health-bind".into(),
+        format!("127.0.0.1:{health_port}"),
+        "--standalone".into(),
+        "--ack-policy".into(),
+        "disk".into(),
+        "--journal".into(),
+        journal.to_str().expect("valid path").into(),
+        "--authorized-keys".into(),
+        keys_path.to_str().expect("valid path").into(),
+        "--accounts".into(),
+        FIXTURE_ACCOUNTS.to_string(),
+        "--instruments".into(),
+        FIXTURE_INSTRUMENTS.to_string(),
+        "--connection-timeout-secs".into(),
+        "0".into(),
+        "--cores".into(),
+        "none".into(),
+    ];
+    for a in extra_args {
+        args.push((*a).into());
+    }
+    let mut command = Command::new(bin);
+    command
+        .args(&args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4");
+    for (k, v) in extra_env {
+        command.env(k, v);
+    }
+    let child = command.spawn().expect("spawn standalone server");
+
+    ServerProcess {
+        child,
+        client_addr: format!("127.0.0.1:{client_port}").parse().unwrap(),
+        health_addr: format!("127.0.0.1:{health_port}").parse().unwrap(),
+    }
+}
+
 /// Spawn a replica server process.
 fn spawn_replica(
     bin: &Path,
@@ -1032,6 +1092,23 @@ impl TestCluster {
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
         connect_with_timeout(self.replica.client_addr, &self.key2)
+    }
+
+    /// Start a new standalone node on the (already stopped) primary's
+    /// journal, on fresh ports, and wait until it serves clients. Its state
+    /// is exactly what replaying that journal produces.
+    fn restart_primary_standalone(&self) -> ServerProcess {
+        let recovered = spawn_standalone_with_extra_env(
+            &self.bin,
+            self._tmp.path(),
+            &self.keys_path,
+            free_port(),
+            free_port(),
+            &[],
+            &[],
+        );
+        wait_ready(recovered.health_addr, Duration::from_secs(30));
+        recovered
     }
 }
 
@@ -1486,55 +1563,9 @@ fn crashed_primary_recovers_from_journal() {
     }
     let _ = cluster.primary.child.wait();
 
-    // Restart the old primary from its journal in standalone mode.
     // The journal may have a trailing partial write from the SIGKILL —
     // recovery must truncate it and continue.
-    let primary_journal = cluster._tmp.path().join("primary.journal");
-    assert!(primary_journal.exists(), "primary journal must exist");
-
-    let recovered_client_port = free_port();
-    let recovered_health_port = free_port();
-    let recovered = {
-        let child = Command::new(&cluster.bin)
-            .args([
-                "--bind",
-                &format!("127.0.0.1:{recovered_client_port}"),
-                "--health-bind",
-                &format!("127.0.0.1:{recovered_health_port}"),
-                "--standalone",
-                "--ack-policy",
-                "disk",
-                "--journal",
-                primary_journal.to_str().expect("valid path"),
-                "--authorized-keys",
-                cluster.keys_path.to_str().expect("valid path"),
-                "--accounts",
-                "10",
-                "--instruments",
-                "2",
-                "--connection-timeout-secs",
-                "0",
-                "--cores",
-                "none",
-            ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .spawn()
-            .expect("spawn recovered primary");
-        ServerProcess {
-            child,
-            client_addr: format!("127.0.0.1:{recovered_client_port}")
-                .parse()
-                .unwrap(),
-            health_addr: format!("127.0.0.1:{recovered_health_port}")
-                .parse()
-                .unwrap(),
-        }
-    };
-
-    wait_ready(recovered.health_addr, Duration::from_secs(30));
-
+    let recovered = cluster.restart_primary_standalone();
     let mut client3 = connect_with_timeout(recovered.client_addr, &cluster.key2);
 
     // New order must succeed — proves recovery restored instruments + balances.
@@ -1565,6 +1596,105 @@ fn crashed_primary_recovers_from_journal() {
             }
         )),
         "expected DuplicateOrderId on recovered primary, got: {r:?}"
+    );
+}
+
+/// A primary that loses its only replica refuses writes, and a refused
+/// write must leave no trace: not applied, and not journaled either, or
+/// replay would apply what the client was told failed. The refusal is
+/// counted on `/metrics`, which is where a halted node is observed from —
+/// it answers no query while halted (a known sequencer gap, see the note in
+/// `docs/operations.md`), so nothing here asks it one.
+///
+/// Replay is the witness. The refused order is a resting GTC order, so had
+/// it been journaled, the recovered node would hold it and reject a resend
+/// as `DuplicateOrderId` (or as `DuplicateRequest`, had it advanced the
+/// request-sequence HWM). The order accepted before the halt shows the
+/// opposite: replay did run, and does reject its id.
+#[test]
+#[serial]
+fn halted_primary_refuses_writes_without_journaling_them() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    let r = submit_order(&mut client, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "expected Placed before the halt, got: {r:?}"
+    );
+    cluster.wait_replicated();
+    // Taken while the node still answers queries: it is the sequence the
+    // refused write below takes, and the one the resend must reuse.
+    let hwm_before_refusal = client
+        .synchronize_request_seq()
+        .expect("query the request-sequence HWM");
+
+    unsafe {
+        libc::kill(cluster.replica.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.replica.child.wait();
+    wait_halted(cluster.primary.health_addr, Duration::from_secs(5));
+
+    let r = submit_order(&mut client, 2, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                order_id: melin_ec_protocol::types::OrderId(2),
+                reason: melin_ec_protocol::types::RejectReason::ReplicaDisconnected,
+                ..
+            }
+        )),
+        "expected ReplicaDisconnected while halted, got: {r:?}"
+    );
+    // The gate counts a refusal on the reading thread, which may still be
+    // ahead of the client's reply; wait rather than sample once.
+    wait_metric(
+        cluster.primary.health_addr,
+        "melin_writes_refused_total ",
+        Duration::from_secs(5),
+        "the refused write to be counted",
+        |v| v == 1,
+    );
+
+    drop(client);
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.primary.child.wait();
+    let recovered = cluster.restart_primary_standalone();
+    // Same key: connecting adopts the recovered HWM, so the resend below
+    // goes out under the sequence the refused write used.
+    let mut client = connect_with_timeout(recovered.client_addr, &cluster.key);
+    assert_eq!(
+        client
+            .synchronize_request_seq()
+            .expect("query the recovered request-sequence HWM"),
+        hwm_before_refusal,
+        "a refused write must not advance the request-sequence HWM"
+    );
+
+    let r = submit_order(&mut client, 2, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "the refused order, resent under the same request sequence, must be taken, got: {r:?}"
+    );
+    let r = submit_order(&mut client, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "the order accepted before the halt must survive replay, got: {r:?}"
     );
 }
 
@@ -3218,32 +3348,21 @@ fn rotation_soak_under_load() {
     }
 
     // ----- Restart and verify recovered state matches -----
-    // primary2 is brought up alone — no replica is spawned alongside it
-    // because this phase only validates journal recovery, not
-    // replication. Run with `--ack-policy disk` so the recovered
-    // primary is fully operational without a replica (same pattern the
-    // other "recovered primary, no replica" tests use); default policy
-    // would leave it halted and unable to service client requests.
-    let primary2_extra: Vec<&str> = primary_extra
-        .iter()
-        .copied()
-        .chain(["--ack-policy", "disk"])
-        .collect();
-    let mut primary2 = spawn_primary_with_extra_env(
+    // primary2 is brought up standalone — no replica is spawned alongside
+    // it because this phase only validates journal recovery, not
+    // replication, and a node that binds a replication port with no replica
+    // attached halts and refuses every write before it is journaled, which
+    // is exactly what the tail check below measures.
+    let mut primary2 = spawn_standalone_with_extra_env(
         &bin,
         tmp.path(),
         &keys_path,
         free_port(),
         free_port(),
-        free_port(),
-        &primary2_extra,
+        primary_extra,
         extra_env,
     );
-    // primary2 runs alone, so "the health endpoint answers" is the whole
-    // readiness condition — no replica gauge to wait on. A `wait_healthy`
-    // used to follow this line; it polled the identical predicate and so
-    // returned on its first iteration, every time.
-    wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(30));
+    wait_ready(primary2.health_addr, Duration::from_secs(30));
 
     // To validate that recovery picked up every archived segment, submit
     // one order on the recovered primary and then read the live segment

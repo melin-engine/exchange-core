@@ -884,6 +884,51 @@ mod tests {
         assert_covered(&TradingEvent::EndOfDay);
     }
 
+    /// `is_query` is what a halted node refuses by: a write it misreads as a
+    /// query slips past the halt and is journaled without the durability
+    /// the halt defends, and a query misread as a write is refused for
+    /// nothing. The expectation is spelled out per variant, in a match with
+    /// no wildcard, so a new variant cannot build until someone decides.
+    #[test]
+    fn is_query_classifies_every_variant() {
+        fn expected(ev: &TradingEvent) -> bool {
+            match ev {
+                TradingEvent::QueryStats
+                | TradingEvent::QueryPosition { .. }
+                | TradingEvent::QueryRequestSeq => true,
+                TradingEvent::AddInstrument { .. }
+                | TradingEvent::Deposit { .. }
+                | TradingEvent::SubmitOrder { .. }
+                | TradingEvent::CancelOrder { .. }
+                | TradingEvent::SetRiskLimits { .. }
+                | TradingEvent::CancelAll { .. }
+                | TradingEvent::SetCircuitBreaker { .. }
+                | TradingEvent::CancelReplace { .. }
+                | TradingEvent::SetFeeSchedule { .. }
+                | TradingEvent::ProvisionAccount { .. }
+                | TradingEvent::Withdraw { .. }
+                | TradingEvent::EndOfDay
+                | TradingEvent::DisableInstrument { .. }
+                | TradingEvent::EnableInstrument { .. }
+                | TradingEvent::RemoveInstrument { .. } => false,
+            }
+        }
+
+        let order = Order {
+            id: OrderId(1),
+            account: AccountId(2),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::IOC,
+            quantity: qty(10),
+            stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
+        };
+        for ev in all_variants_at_their_widest(order) {
+            assert_eq!(ev.is_query(), expected(&ev), "is_query for {ev:?}");
+        }
+    }
+
     #[test]
     fn round_trip_add_instrument() {
         round_trip(TradingEvent::AddInstrument {

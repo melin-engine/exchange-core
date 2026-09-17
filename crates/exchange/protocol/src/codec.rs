@@ -145,7 +145,9 @@ const REJECT_INVALID_EXPIRY: u8 = 17;
 const REJECT_INSTRUMENT_DISABLED: u8 = 18;
 const REJECT_EXCEEDS_MAX_OPEN_ORDERS: u8 = 19;
 const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
-const REJECT_SUPERSEDED: u8 = 21;
+// 21 was `Superseded`, retired when a fenced node started closing client
+// connections instead of rejecting. Reserved: never reassign it, or a client
+// built against an older release would misread the new reason.
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
@@ -1380,7 +1382,6 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::InstrumentDisabled => REJECT_INSTRUMENT_DISABLED,
         RejectReason::ExceedsMaxOpenOrders => REJECT_EXCEEDS_MAX_OPEN_ORDERS,
         RejectReason::ExceedsOrderRate => REJECT_EXCEEDS_ORDER_RATE,
-        RejectReason::Superseded => REJECT_SUPERSEDED,
     }
 }
 
@@ -1407,7 +1408,6 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_INSTRUMENT_DISABLED => Ok(RejectReason::InstrumentDisabled),
         REJECT_EXCEEDS_MAX_OPEN_ORDERS => Ok(RejectReason::ExceedsMaxOpenOrders),
         REJECT_EXCEEDS_ORDER_RATE => Ok(RejectReason::ExceedsOrderRate),
-        REJECT_SUPERSEDED => Ok(RejectReason::Superseded),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1756,12 +1756,6 @@ mod tests {
                 account: AccountId(10),
                 reason: RejectReason::InstrumentDisabled,
             }),
-            ResponseKind::Report(ExecutionReport::Rejected {
-                order_id: OrderId(24),
-                symbol: Symbol(1),
-                account: AccountId(10),
-                reason: RejectReason::Superseded,
-            }),
             ResponseKind::Report(ExecutionReport::InstrumentStatusChanged {
                 symbol: Symbol(1),
                 status: InstrumentStatus::Disabled,
@@ -2096,6 +2090,17 @@ mod tests {
         let result = decode_response(&payload);
         assert!(
             matches!(result, Err(ProtocolError::InvalidField(_))),
+            "expected InvalidField, got {result:?}"
+        );
+    }
+
+    /// 21 was `Superseded`. It must stay unassigned: nothing encodes it,
+    /// and decoding it is a protocol error rather than some other reason.
+    #[test]
+    fn retired_superseded_reject_code_is_invalid() {
+        let result = decode_reject_reason(21);
+        assert!(
+            matches!(result, Err(ProtocolError::InvalidField("reject reason"))),
             "expected InvalidField, got {result:?}"
         );
     }
