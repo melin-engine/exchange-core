@@ -70,6 +70,10 @@ pub struct ServerApp(pub Exchange);
 ///
 /// Holds no state, and nothing local to the node: every node's history
 /// starts from the same empty engine, as `Application` requires.
+///
+/// A heavy constructor: it allocates and touches over a hundred
+/// megabytes. It is for the runtime, not for test fixtures — a test
+/// wraps `Exchange::new()` instead.
 impl Default for ServerApp {
     fn default() -> Self {
         let mut exchange = Exchange::with_capacity();
@@ -274,15 +278,16 @@ impl Application for ServerApp {
         Exchange::check_request_seq(&mut self.0, key_hash, seq)
     }
 
-    /// Reserve the one collection whose size only the node knows: the
-    /// balance map, from `--accounts` and `--instruments`. Everything
-    /// else is reserved by `Default` and `restore`, which is where the
-    /// engine is built and so the only place a populated collection can
-    /// be sized. A populated balance map is left as it is, so this is a
-    /// no-op on a recovered engine and when called again.
+    /// Reserve what only the node knows the size of: the balance map and,
+    /// past its built-in capacity, the per-account maps, from
+    /// `--accounts` and `--instruments`. Everything else is reserved and
+    /// pre-faulted by `Default` and `restore`. The runtime calls this on
+    /// a genesis instance before it replays a journal into it, and again
+    /// before the instance serves, so a restored engine — whose balance
+    /// map is sized to its snapshot — gets its room here.
     fn prefault(&mut self, sizing: &Self::Sizing) {
         self.0
-            .reserve_balances(sizing.accounts as usize, sizing.instruments as usize);
+            .reserve_for_accounts(sizing.accounts as usize, sizing.instruments as usize);
     }
 
     /// `Exchange` exposes an in-memory `clone_via_snapshot` that skips

@@ -245,7 +245,8 @@ impl Exchange {
     /// The balance map is the one collection left at its default size: its
     /// steady-state size depends on the deployment (accounts × currencies),
     /// so the node reserves it from its own counts through
-    /// [`Self::reserve_balances`].
+    /// [`Self::reserve_for_accounts`], which also raises the per-account
+    /// maps past their constant for a deployment beyond it.
     pub fn with_capacity() -> Self {
         Self {
             instruments: Vec::with_capacity(INSTRUMENT_SLOTS),
@@ -274,20 +275,26 @@ impl Exchange {
         }
     }
 
-    /// Reserve the balance map for `num_accounts` accounts trading
-    /// `num_instruments` instruments (base + quote per instrument per
-    /// account), if it holds nothing yet. A bulk seed then never hits a
-    /// rehash as the map grows, and accounts provisioned later on the
-    /// matching thread land in reserved space instead of doubling it.
+    /// Reserve for `num_accounts` accounts trading `num_instruments`
+    /// instruments: the balance map for a base and a quote balance per
+    /// instrument per account, and the per-account maps for the accounts
+    /// themselves where the count exceeds [`ACCOUNT_MAP_CAPACITY`]. A
+    /// bulk seed then never hits a rehash as the maps grow, and accounts
+    /// provisioned later on the matching thread land in reserved space
+    /// instead of doubling it.
     ///
-    /// A populated map is left as it is: it was sized when it was built,
-    /// and the map has no in-place `reserve`. Calling this again is a
-    /// no-op.
-    pub fn reserve_balances(&mut self, num_accounts: usize, num_instruments: usize) {
+    /// Capacity only: every entry survives, a map that already has the
+    /// room is untouched, and a second call with the same counts is a
+    /// no-op. A map that is too small is rebuilt at the larger size (see
+    /// `reserve_map`) — a restored engine's balance map is sized to its
+    /// snapshot, so this is what gives it room to grow.
+    pub fn reserve_for_accounts(&mut self, num_accounts: usize, num_instruments: usize) {
         let balance_capacity = num_accounts
             .saturating_mul(num_instruments)
             .saturating_mul(2);
-        self.accounts.size_balances_if_empty(balance_capacity);
+        self.accounts.reserve_balances(balance_capacity);
+        crate::types::reserve_map(&mut self.order_counts, num_accounts);
+        crate::types::reserve_map(&mut self.order_buckets, num_accounts);
     }
 
     /// Reconstruct from restored parts (used by snapshot restore): a

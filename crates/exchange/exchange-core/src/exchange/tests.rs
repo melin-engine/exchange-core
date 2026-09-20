@@ -4429,6 +4429,67 @@ fn with_capacity_reserves_production_capacity() {
     assert_production_capacity(&exchange, "after replay");
 }
 
+/// The node's counts arrive through `reserve_for_accounts`, on a genesis
+/// instance before replay and on a restored one after: a map that is too
+/// small is rebuilt with every entry kept, one that has the room is left
+/// alone, and a second call changes nothing.
+#[test]
+fn reserve_for_accounts_grows_populated_maps_keeping_every_entry() {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 1_000);
+    exchange.set_max_orders_per_second(1_000, 5);
+    let mut reports = Vec::new();
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+    let balance_before = exchange.accounts().balance(ACCT_A, USD);
+    let count_before = exchange.order_counts.get(&ACCT_A).copied();
+    let bucket_of = |exchange: &Exchange| {
+        exchange
+            .order_buckets
+            .get(&ACCT_A)
+            .map(|b| (b.tokens, b.last_refill_ns))
+    };
+    let bucket_before = bucket_of(&exchange);
+    assert!(count_before.is_some() && bucket_before.is_some());
+
+    let accounts = 2 * ACCOUNT_MAP_CAPACITY;
+    exchange.reserve_for_accounts(accounts, 8);
+
+    assert!(exchange.accounts().balance_capacity() >= accounts * 8 * 2);
+    assert!(exchange.order_counts.capacity() >= accounts);
+    assert!(exchange.order_buckets.capacity() >= accounts);
+    assert_eq!(exchange.accounts().balance(ACCT_A, USD), balance_before);
+    assert_eq!(exchange.order_counts.get(&ACCT_A).copied(), count_before);
+    assert_eq!(bucket_of(&exchange), bucket_before);
+
+    let after_once = (
+        exchange.accounts().balance_capacity(),
+        exchange.order_counts.capacity(),
+        exchange.order_buckets.capacity(),
+    );
+    exchange.reserve_for_accounts(accounts, 8);
+    assert_eq!(
+        (
+            exchange.accounts().balance_capacity(),
+            exchange.order_counts.capacity(),
+            exchange.order_buckets.capacity(),
+        ),
+        after_once,
+        "a second call with the same counts must change nothing"
+    );
+
+    exchange.reserve_for_accounts(1, 1);
+    assert_eq!(
+        exchange.accounts().balance_capacity(),
+        after_once.0,
+        "a map that already has the room is left alone"
+    );
+}
+
 /// A restored engine serves straight away, and `prefault` leaves its
 /// populated collections alone: the restore itself is the one chance to
 /// reserve, so it must build at production capacity — from a snapshot of

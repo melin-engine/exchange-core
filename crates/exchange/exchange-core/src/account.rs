@@ -281,7 +281,7 @@ impl AccountManager {
     ///
     /// The balance map starts at its default size: its steady-state size
     /// is a property of the deployment, reserved by
-    /// [`Self::size_balances_if_empty`] from the node's own counts.
+    /// [`Self::reserve_balances`] from the node's own counts.
     pub fn with_capacity() -> Self {
         Self {
             balances: HashMap4::default(),
@@ -312,7 +312,7 @@ impl AccountManager {
                 self.free_slots.push(i as u32);
             }
         }
-        // Balances HashMap: pre-sizing via `size_balances_if_empty`
+        // Balances HashMap: pre-sizing via `reserve_balances`
         // eliminates the directory-doubling rehash spikes during bulk
         // seed (T1's >1 s outliers near the end of a 100K-account seed).
         // Page faults still happen lazily on first-touch — that cost is
@@ -328,19 +328,20 @@ impl AccountManager {
         self.reservation_slab.capacity()
     }
 
-    /// Size the balance map for `balance_capacity` entries, if it holds
-    /// none yet. Pre-sizing eliminates the directory-doubling rehash
-    /// spikes of a bulk seed (see [`Self::prefault`]).
-    ///
-    /// A populated map is left as it is: it was sized when it was built
-    /// (see [`Self::from_parts`]), and `HashMap4` has no in-place
-    /// `reserve`. Replacing an empty map is safe — it holds no state to
-    /// lose.
-    pub fn size_balances_if_empty(&mut self, balance_capacity: usize) {
-        if self.balances.is_empty() {
-            self.balances =
-                HashMap4::with_capacity_and_hasher(balance_capacity, Default::default());
-        }
+    /// Entries the balance map can hold before it grows.
+    #[cfg(test)]
+    pub(crate) fn balance_capacity(&self) -> usize {
+        self.balances.capacity()
+    }
+
+    /// Give the balance map room for `balance_capacity` entries, keeping
+    /// any it holds. Pre-sizing eliminates the directory-doubling rehash
+    /// spikes of a bulk seed (see [`Self::prefault`]), and of the accounts
+    /// a node provisions after a restart: a restored map is sized to its
+    /// snapshot (see [`Self::from_parts`]), so this is what gives it room
+    /// to grow. See `reserve_map` for the rebuild it takes.
+    pub fn reserve_balances(&mut self, balance_capacity: usize) {
+        crate::types::reserve_map(&mut self.balances, balance_capacity);
     }
 
     /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
@@ -362,8 +363,7 @@ impl AccountManager {
         mgr.prefault();
 
         // The balance map is sized to the snapshot: its production size
-        // is the node's to reserve, and only on an empty map (see
-        // `size_balances_if_empty`).
+        // is the node's to reserve afterwards (see `reserve_balances`).
         mgr.balances =
             HashMap4::with_capacity_and_hasher(balance_entries.len(), Default::default());
         for (key, balance) in balance_entries {

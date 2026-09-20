@@ -81,14 +81,21 @@ has no journal from sequence 1, is re-bootstrapped from a node that has.
   pre-faults it the same way — including the shadow copy that writes
   snapshots. Expect roughly 150 MB more resident memory per node for that
   copy, and about a tenth of a second more startup per restore.
+  `--accounts` and `--instruments` size the balance map on every node and
+  every start, a journal replay included *(sequencer)*, and `--accounts`
+  now also sizes the per-account maps for a deployment past a million
+  accounts. A node restored from a snapshot rebuilds its balance map to
+  those counts at startup, which takes a few seconds and twice the map's
+  memory while it runs.
 - **Rust dependents:** `AppFactory` is gone *(sequencer)*. The server is
   started with `StartupConfig` (which builds the startup events and the
   sizing). `ServerApp` implements `Default` as an empty, production-sized,
   pre-faulted engine, and its `restore` produces the same shape; its
-  `prefault` reserves only the balance map, from `--accounts` and
-  `--instruments`. `Exchange::prefault_seed` is gone: `with_capacity` and a
-  snapshot restore reserve production capacity themselves, and
-  `Exchange::reserve_balances` sizes the balance map. `ServerApp::new` is
+  `prefault` reserves only what `--accounts` and `--instruments` size.
+  `Exchange::prefault_seed` is gone: `with_capacity` and a snapshot restore
+  reserve production capacity themselves, and
+  `Exchange::reserve_for_accounts` sizes the balance map and the
+  per-account maps from the counts. `ServerApp::new` is
   gone: wrap an `Exchange` for a small one. `TradingEvent` gains
   `SetAccountLimits`. `StartupConfig::startup_events` seeds only under
   `synthetic-seed`; a dependent that needs the seed regardless calls
