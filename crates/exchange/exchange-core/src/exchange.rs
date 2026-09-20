@@ -290,62 +290,62 @@ impl Exchange {
         self.accounts.size_balances_if_empty(balance_capacity);
     }
 
-    /// Reconstruct from pre-built parts (used by snapshot restore). The
-    /// derived collections are built at production capacity, like
-    /// [`Self::with_capacity`]: a restored engine goes straight on to
-    /// serve, and must not pay a resize for the entries it takes on beyond
-    /// what the snapshot held.
+    /// Reconstruct from restored parts (used by snapshot restore): a
+    /// production-sized engine (see [`Self::with_capacity`]) that takes
+    /// the parts, is pre-faulted, and derives the rest through ordinary
+    /// inserts. The sizing lives in the constructor alone; the parts
+    /// arrive sized and pre-faulted by their own restores, and `prefault`
+    /// leaves them alone. A snapshot with more live orders than
+    /// [`LIVE_ORDER_CAPACITY`] reserves the excess before the prefault;
+    /// the per-account map cannot be reserved in place and grows during
+    /// the fill in that case, which only a snapshot of over a million
+    /// resting orders reaches.
+    ///
+    /// The limiter starts disabled with an empty bucket map, as on a
+    /// fresh engine. `restore_state` then repopulates the buckets from the
+    /// snapshot's v18+ section and applies the v19+ account limits (which,
+    /// going from disabled `(0, 0)` to active, preserves the restored
+    /// buckets — see `set_max_orders_per_second`).
     pub(crate) fn from_parts(
-        mut instruments: Vec<Option<Box<InstrumentState>>>,
+        instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
         key_hwm: HashMap<u64, u64>,
         scheduled_tasks: ScheduledTaskHeap,
     ) -> Self {
+        let mut exchange = Self::with_capacity();
+        exchange.instruments = instruments;
+        exchange
+            .instruments
+            .reserve(INSTRUMENT_SLOTS.saturating_sub(exchange.instruments.len()));
+        exchange.accounts = accounts;
+        exchange.key_hwm = key_hwm;
+        exchange.scheduled_tasks = scheduled_tasks;
         // Derive order_counts and live_order_ids from order_index across
         // all instruments. Both are fully reconstructible from the books,
         // so the snapshot doesn't carry them — the only source of truth
-        // is the order index.
-        let mut order_counts: HashMap4<AccountId, u32> =
-            HashMap4::with_capacity_and_hasher(ACCOUNT_MAP_CAPACITY, Default::default());
-        let mut live_order_ids: FxHashSet<(AccountId, OrderId)> =
-            FxHashSet::with_capacity_and_hasher(LIVE_ORDER_CAPACITY, Default::default());
-        for inst in &instruments {
-            if let Some(inst) = inst.as_deref() {
-                for ((account, order_id), _) in inst.book.active_order_slots() {
-                    *order_counts.entry(account).or_default() += 1;
-                    live_order_ids.insert((account, order_id));
-                }
-                for ((account, order_id), _) in inst.book.active_stop_slots() {
-                    *order_counts.entry(account).or_default() += 1;
-                    live_order_ids.insert((account, order_id));
-                }
-            }
+        // is the order index. Collected first so the live set can be
+        // reserved before the prefault.
+        let live: Vec<(AccountId, OrderId)> = exchange
+            .instruments
+            .iter()
+            .flatten()
+            .flat_map(|inst| {
+                let orders = inst.book.active_order_slots().map(|(key, _)| key);
+                let stops = inst
+                    .book
+                    .active_stop_slots()
+                    .into_iter()
+                    .map(|(key, _)| key);
+                orders.chain(stops)
+            })
+            .collect();
+        exchange.live_order_ids.reserve(live.len());
+        exchange.prefault();
+        for (account, order_id) in live {
+            *exchange.order_counts.entry(account).or_default() += 1;
+            exchange.live_order_ids.insert((account, order_id));
         }
-        instruments.reserve(INSTRUMENT_SLOTS.saturating_sub(instruments.len()));
-        Self {
-            instruments,
-            accounts,
-            live_order_ids,
-            order_counts,
-            key_hwm,
-            scheduled_tasks,
-            max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
-            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
-            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
-            // Snapshot restore: limiter starts disabled by default and
-            // the bucket map starts empty. `restore_state` then
-            // repopulates the buckets from the snapshot's v18+ section
-            // and applies the v19+ account limits (which, going from
-            // disabled `(0, 0)` to active, preserves the restored
-            // buckets — see `set_max_orders_per_second`).
-            order_buckets: HashMap4::with_capacity_and_hasher(
-                ACCOUNT_MAP_CAPACITY,
-                Default::default(),
-            ),
-            current_event_ts_ns: 0,
-            scratch_consumed: Vec::with_capacity(64),
-            scratch_freed: Vec::with_capacity(64),
-        }
+        exchange
     }
 
     /// Configure the per-account open-order cap (`0` = unlimited). See the

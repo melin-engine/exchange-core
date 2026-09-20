@@ -317,16 +317,15 @@ impl Application for ServerApp {
         w.write_all(&bytes)
     }
 
-    /// The decoder rebuilds every collection at production capacity, so a
-    /// restored engine is as ready to serve as a `Default` one; touching
-    /// its pages here completes the parallel.
+    /// The decoder rebuilds the engine production-sized and pre-faulted,
+    /// the same shape `Default` produces, so a restored engine is as ready
+    /// to serve as a fresh one.
     fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
-        let mut exchange = engine_snapshot::decode_exchange_payload(&bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        exchange.prefault();
-        Ok(ServerApp(exchange))
+        engine_snapshot::decode_exchange_payload(&bytes)
+            .map(ServerApp)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 

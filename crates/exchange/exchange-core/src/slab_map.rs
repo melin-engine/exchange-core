@@ -78,6 +78,15 @@ impl<V> SlabMap<V> {
         }
     }
 
+    /// Room for `additional` more entries in both the lookup and the
+    /// slab, for a snapshot deeper than the production capacity. Called
+    /// on an empty map before `OrderBook::prefault`, so the extra pages
+    /// are touched with the rest.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.lookup.reserve(additional);
+        self.slots.reserve(additional);
+    }
+
     /// Insert an entry. Returns the previous value at `key` if it was
     /// present (mirroring `std::collections::HashMap::insert`). On
     /// overwrite the existing slot is reused (no slot churn / freelist

@@ -77,11 +77,10 @@ has no journal from sequence 1, is re-bootstrapped from a node that has.
   used to size its collections after replaying its journal, which left a
   restarted node running on whatever the replay had grown and paying the
   growth on the matching thread. The engine is now built at production
-  capacity before the first event, and a snapshot restore rebuilds it the
-  same way — including the shadow copy that writes snapshots. Expect
-  roughly 64 MB more resident memory per node for that copy; the rest of
-  the reserved capacity is locked on first touch and costs nothing until
-  used.
+  capacity before the first event, and a snapshot restore rebuilds and
+  pre-faults it the same way — including the shadow copy that writes
+  snapshots. Expect roughly 150 MB more resident memory per node for that
+  copy, and about a tenth of a second more startup per restore.
 - **Rust dependents:** `AppFactory` is gone *(sequencer)*. The server is
   started with `StartupConfig` (which builds the startup events and the
   sizing). `ServerApp` implements `Default` as an empty, production-sized,

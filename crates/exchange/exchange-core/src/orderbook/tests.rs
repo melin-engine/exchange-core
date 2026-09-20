@@ -1096,8 +1096,9 @@ fn prefault_is_idempotent_and_safe() {
 }
 
 /// A restored book serves straight away, and `prefault` leaves a populated
-/// index alone, so the restore must reserve the production capacity on its
-/// own — a snapshot with one order must not come back as a one-slot book.
+/// collection alone, so the restore must reserve the production capacity
+/// on its own — a snapshot with one order must not come back as a
+/// one-slot book.
 #[test]
 fn restore_reserves_production_capacity() {
     let mut book = OrderBook::new(TEST_SYMBOL);
@@ -1113,6 +1114,35 @@ fn restore_reserves_production_capacity() {
 
     assert!(restored.order_index.capacity() >= ORDER_INDEX_CAPACITY);
     assert!(restored.stop_index.capacity() >= STOP_NODE_CAPACITY);
+    assert!(restored.bids.node_capacity() >= SIDE_NODE_CAPACITY);
+    assert!(restored.asks.node_capacity() >= SIDE_NODE_CAPACITY);
+    assert!(restored.stop_buys.node_capacity() >= STOP_NODE_CAPACITY);
+    assert!(restored.stop_sells.node_capacity() >= STOP_NODE_CAPACITY);
+}
+
+/// A snapshot deeper than the production capacity comes back holding it
+/// all, with room reserved before the prefault rather than grown during
+/// the fill.
+#[test]
+fn restore_keeps_a_book_deeper_than_production_capacity() {
+    let depth = ORDER_INDEX_CAPACITY + 1;
+    let mut book = OrderBook::new(TEST_SYMBOL);
+    let mut reports = Vec::new();
+    for id in 1..=depth as u64 {
+        book.execute(
+            limit_order(id, Side::Sell, 100, 1, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+    }
+
+    let restored = OrderBook::restore(TEST_SYMBOL, book.snapshot());
+
+    assert_eq!(restored.order_index.len(), depth);
+    assert!(restored.order_index.capacity() >= depth);
+    assert!(restored.asks.node_capacity() >= depth);
+    assert_eq!(restored.asks.levels_snapshot(), book.asks.levels_snapshot());
 }
 
 // -- Multi-level matching --

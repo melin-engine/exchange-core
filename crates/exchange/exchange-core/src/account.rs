@@ -352,43 +352,42 @@ impl AccountManager {
         reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
         fee_deficits: Vec<(CurrencyId, u64)>,
     ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
-        // Build balance HashMap4 directly from sparse entries (4-entry buckets for hot path).
-        let mut balances =
+        // A production-sized, pre-faulted manager (see `with_capacity`),
+        // filled through the same slot allocation a live reservation
+        // takes: the sizing lives in the constructor alone. A snapshot
+        // with more reservations than the slab's capacity reserves its
+        // excess before the prefault, so those pages are touched too.
+        let mut mgr = Self::with_capacity();
+        mgr.reservation_slab.reserve(reservations.len());
+        mgr.prefault();
+
+        // The balance map is sized to the snapshot: its production size
+        // is the node's to reserve, and only on an empty map (see
+        // `size_balances_if_empty`).
+        mgr.balances =
             HashMap4::with_capacity_and_hasher(balance_entries.len(), Default::default());
         for (key, balance) in balance_entries {
             if !balance.is_zero() {
-                balances.insert(key, balance);
+                mgr.balances.insert(key, balance);
             }
         }
 
-        // Build slab sequentially — slots 0..n for n reservations. At
-        // production capacity like `with_capacity`: the restored manager
-        // goes straight on to serve, and `prefault` leaves a populated
-        // slab alone, so this is its one chance to reserve. The free list
-        // gets the same room — it fills as reservations are released.
-        let slab_capacity = reservations.len().max(RESERVATION_SLAB_CAPACITY);
-        let mut slab = Vec::with_capacity(slab_capacity);
+        // The prefaulted free list hands out slot 0 first, so the
+        // reservations take slots 0..n in snapshot order.
         let mut slot_assignments = Vec::with_capacity(reservations.len());
         for (order_id, account, currency, remaining) in reservations {
-            let slot = ReservationSlot(slab.len() as u32);
-            slab.push(Reservation::new(account, currency, remaining));
+            let slot = mgr.alloc_slot(Reservation::new(account, currency, remaining));
             slot_assignments.push(((account, order_id), slot));
         }
 
-        let mut fee_account_deficits =
+        mgr.fee_account_deficits =
             HashMap4::with_capacity_and_hasher(fee_deficits.len(), Default::default());
         for (ccy, amt) in fee_deficits {
             if amt != 0 {
-                fee_account_deficits.insert(ccy, amt);
+                mgr.fee_account_deficits.insert(ccy, amt);
             }
         }
 
-        let mgr = Self {
-            balances,
-            reservation_slab: slab,
-            free_slots: Vec::with_capacity(slab_capacity),
-            fee_account_deficits,
-        };
         (mgr, slot_assignments)
     }
 
