@@ -68,8 +68,17 @@ impl StartupConfig {
             max_orders_burst = self.max_orders_burst,
             "per-account order limits to journal on becoming primary (SEC-03 cap, SEC-04 rate)"
         );
+        self.startup_events_seeding(cfg!(feature = "synthetic-seed"))
+    }
+
+    /// `startup_events` with the build's choice made explicit, so both
+    /// outcomes can be tested from one build: the crate's own tests always
+    /// run with `synthetic-seed` on (the test targets depend on the
+    /// feature), so a `cfg`-gated test of the stock build would never
+    /// compile, let alone run.
+    fn startup_events_seeding(&self, seed: bool) -> StartupEvents<TradingEvent> {
         StartupEvents {
-            genesis: self.genesis(),
+            genesis: if seed { self.genesis() } else { Vec::new() },
             on_primary: vec![self.account_limits()],
         }
     }
@@ -93,8 +102,9 @@ impl StartupConfig {
     }
 
     /// Genesis under `synthetic-seed`: funded accounts and placeholder
-    /// instruments, for development, benches and smoke tests.
-    #[cfg(feature = "synthetic-seed")]
+    /// instruments, for development, benches and smoke tests. A stock
+    /// build journals no genesis at all: instruments and accounts are
+    /// created through the admin client, against a running node.
     fn genesis(&self) -> Vec<TradingEvent> {
         if self.accounts > 0 {
             // Not a production build: these accounts are funded from
@@ -106,13 +116,6 @@ impl StartupConfig {
             );
         }
         self.synthetic_genesis()
-    }
-
-    /// Genesis in a stock build: nothing. Instruments and accounts are
-    /// created through the admin client, against a running node.
-    #[cfg(not(feature = "synthetic-seed"))]
-    fn genesis(&self) -> Vec<TradingEvent> {
-        Vec::new()
     }
 
     /// Instruments first, then accounts: `ProvisionAccount` funds an
@@ -183,19 +186,31 @@ mod tests {
     /// What the binary journals depends on how it was built, and on
     /// nothing else: the counts stay sizing either way.
     #[test]
-    #[cfg(feature = "synthetic-seed")]
     fn genesis_carries_the_seed_under_the_feature() {
-        assert_eq!(cfg(5, 3).startup_events().genesis.len(), 8);
+        assert_eq!(cfg(5, 3).startup_events_seeding(true).genesis.len(), 8);
     }
 
     #[test]
-    #[cfg(not(feature = "synthetic-seed"))]
     fn genesis_is_empty_in_a_stock_build() {
-        let events = cfg(5, 3).startup_events();
+        let events = cfg(5, 3).startup_events_seeding(false);
         assert!(events.genesis.is_empty());
         assert_eq!(cfg(5, 3).sizing().accounts, 5);
         // The limits are configuration, not a fixture: they stay.
         assert_eq!(events.on_primary.len(), 1);
+    }
+
+    /// The crate's tests always build with the feature on, so this is the
+    /// one assertion about the real `startup_events` they can make.
+    #[test]
+    fn startup_events_follow_the_build_feature() {
+        assert_eq!(
+            cfg(5, 3).startup_events().genesis.len(),
+            if cfg!(feature = "synthetic-seed") {
+                8
+            } else {
+                0
+            }
+        );
     }
 
     /// The limits travel as exactly one event, carrying the node's values,

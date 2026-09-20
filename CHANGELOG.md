@@ -18,6 +18,16 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+This release adopts the sequencer's next release. The [Unreleased section of
+its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+lists further fixes in the node runtime that apply here as they are; the
+entries below cover what changes for this product. One of
+them needs an operator action: a snapshot written by an earlier release may
+hold the effect of a request that was refused as a duplicate. The snapshot
+format bump below already makes every node rebuild from its journal, which
+repairs this — a replica that was bootstrapped by snapshot transfer, and so
+has no journal from sequence 1, is re-bootstrapped from a node that has.
+
 ### Changed
 
 - **A halted node refuses a write before journaling it** *(sequencer)*. A
@@ -64,11 +74,16 @@ full detail behind entries marked *(sequencer)*.
   its primary's from startup.
 - **Rust dependents:** `AppFactory` is gone *(sequencer)*. The server is
   started with `StartupConfig` (which builds the startup events and the
-  sizing), `ServerApp` implements `Default` and a sized `prefault`, and
-  `Exchange::prefault_seed` is replaced by `Exchange::prefault_for`.
-  `TradingEvent` gains `SetAccountLimits`. `StartupConfig::startup_events`
-  seeds only under `synthetic-seed`; a dependent that needs the seed
-  regardless calls `synthetic_startup_events`.
+  sizing). `ServerApp` implements `Default` as an empty, production-sized,
+  pre-faulted engine, and its `restore` produces the same shape; its
+  `prefault` reserves only the balance map, from `--accounts` and
+  `--instruments`. `Exchange::prefault_seed` is gone: `with_capacity` and a
+  snapshot restore reserve production capacity themselves, and
+  `Exchange::reserve_balances` sizes the balance map. `ServerApp::new` is
+  gone: wrap an `Exchange` for a small one. `TradingEvent` gains
+  `SetAccountLimits`. `StartupConfig::startup_events` seeds only under
+  `synthetic-seed`; a dependent that needs the seed regardless calls
+  `synthetic_startup_events`.
 
 ### Fixed
 
