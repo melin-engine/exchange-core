@@ -22,6 +22,25 @@ use crate::types::{
     ReservationSlot, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 
+/// Production capacity of a book's order index: one entry per resting
+/// order for O(1) cancel lookups. 4096 slots covers typical book depth
+/// (100-2000 orders) without a hot-path resize. `SlabMap` keeps the
+/// structure bounded by peak live entries under churn, so this is a
+/// tighter "expected steady-state size" than the previous astenn capacity
+/// (which had to be over-allocated to hide the lifetime-insert growth
+/// pathology).
+pub(crate) const ORDER_INDEX_CAPACITY: usize = 4_096;
+
+/// Production capacity of each side's node slab: half the order index,
+/// since orders split roughly bid/ask. Avoids growing the slab during
+/// the warmup phase of a hot book.
+pub(crate) const SIDE_NODE_CAPACITY: usize = ORDER_INDEX_CAPACITY / 2;
+
+/// Production capacity of the stop index and of each stop side's slab.
+/// Stops are ~3% of order flow, so 1K covers a hot book without wasted
+/// space.
+pub(crate) const STOP_NODE_CAPACITY: usize = 1_024;
+
 /// Central limit order book for a single instrument.
 #[derive(Debug)]
 pub struct OrderBook {
@@ -109,7 +128,9 @@ impl OrderBook {
         }
     }
 
-    /// Create an OrderBook pre-sized for production workloads.
+    /// Create an OrderBook pre-sized for production workloads: what
+    /// `Exchange::add_instrument` builds, and what a snapshot restore
+    /// rebuilds a book to (see [`Self::restore`]).
     ///
     /// Capacity is intentionally modest (4K order slots, 1K stop slots) so
     /// the hash tables fit in L2 cache (~160 KB). Oversized tables cause
@@ -118,26 +139,14 @@ impl OrderBook {
     /// Hashbrown resizes by doubling, so a 4K→8K resize moves ~128 KB —
     /// a one-time ~5 µs stall that appears in p99.99 at most.
     pub fn with_capacity(symbol: Symbol) -> Self {
-        // Pre-size each side's slab to ~2K nodes — half the order_index
-        // capacity, since orders split roughly bid/ask. Avoids growing the
-        // slab during the warmup phase of a hot book.
         Self {
             symbol,
-            bids: BookSide::with_capacity(Side::Buy, 2_048),
-            asks: BookSide::with_capacity(Side::Sell, 2_048),
-            // One entry per resting order for O(1) cancel lookups. 4096
-            // slots covers typical book depth (100-2000 orders) without
-            // hot-path resize. `SlabMap` keeps the structure bounded by
-            // peak live entries under churn, so this is a tighter
-            // "expected steady-state size" than the previous astenn
-            // capacity (which had to be over-allocated to hide the
-            // lifetime-insert growth pathology).
-            order_index: SlabMap::with_capacity(4_096),
-            // Stops are ~3% of order flow so a 1K slab covers a hot
-            // book without wasted space.
-            stop_buys: StopSide::with_capacity(1_024),
-            stop_sells: StopSide::with_capacity(1_024),
-            stop_index: SlabMap::with_capacity(1_024),
+            bids: BookSide::with_capacity(Side::Buy, SIDE_NODE_CAPACITY),
+            asks: BookSide::with_capacity(Side::Sell, SIDE_NODE_CAPACITY),
+            order_index: SlabMap::with_capacity(ORDER_INDEX_CAPACITY),
+            stop_buys: StopSide::with_capacity(STOP_NODE_CAPACITY),
+            stop_sells: StopSide::with_capacity(STOP_NODE_CAPACITY),
+            stop_index: SlabMap::with_capacity(STOP_NODE_CAPACITY),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),

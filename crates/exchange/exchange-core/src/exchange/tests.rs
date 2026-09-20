@@ -4380,3 +4380,72 @@ fn fee_schedule_change_does_not_touch_resting_reservations() {
     assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
     assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
 }
+
+// -----------------------------------------------------------------------
+// Production capacity: every engine a node serves from is born sized
+// -----------------------------------------------------------------------
+
+/// The collections whose growth would otherwise land on the matching
+/// thread, at the capacity a server node needs.
+fn assert_production_capacity(exchange: &Exchange, what: &str) {
+    assert!(
+        exchange.live_order_ids.capacity() >= LIVE_ORDER_CAPACITY,
+        "{what}: live_order_ids"
+    );
+    assert!(
+        exchange.order_counts.capacity() >= ACCOUNT_MAP_CAPACITY,
+        "{what}: order_counts"
+    );
+    assert!(
+        exchange.order_buckets.capacity() >= ACCOUNT_MAP_CAPACITY,
+        "{what}: order_buckets"
+    );
+    assert!(
+        exchange.instruments.capacity() >= INSTRUMENT_SLOTS,
+        "{what}: instruments"
+    );
+    assert!(
+        exchange.accounts().reservation_capacity() >= crate::account::RESERVATION_SLAB_CAPACITY,
+        "{what}: reservation slab"
+    );
+}
+
+/// `with_capacity` is what a node starts from, and a journal is replayed
+/// into it before anything else can reserve — so it must already be at
+/// production capacity, and stay there through the replay.
+#[test]
+fn with_capacity_reserves_production_capacity() {
+    let mut exchange = Exchange::with_capacity();
+    assert_production_capacity(&exchange, "fresh");
+
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 1_000);
+    let mut reports = Vec::new();
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+    assert_production_capacity(&exchange, "after replay");
+}
+
+/// A restored engine serves straight away, and `prefault` leaves its
+/// populated collections alone: the restore itself is the one chance to
+/// reserve, so it must build at production capacity — from a snapshot of
+/// an unsized engine too, which is what an embedded user's snapshot is.
+#[test]
+fn restore_reserves_production_capacity() {
+    let mut exchange = Exchange::new();
+    exchange.add_instrument(btc_usd_spec());
+    exchange.deposit(ACCT_A, USD, 1_000);
+    let mut reports = Vec::new();
+    exchange.execute(
+        Symbol(1),
+        limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+        &mut reports,
+    );
+
+    let restored = exchange.clone_via_snapshot();
+
+    assert_production_capacity(&restored, "restored");
+}

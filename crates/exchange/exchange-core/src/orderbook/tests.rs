@@ -1095,6 +1095,26 @@ fn prefault_is_idempotent_and_safe() {
     assert!(book.is_empty());
 }
 
+/// A restored book serves straight away, and `prefault` leaves a populated
+/// index alone, so the restore must reserve the production capacity on its
+/// own — a snapshot with one order must not come back as a one-slot book.
+#[test]
+fn restore_reserves_production_capacity() {
+    let mut book = OrderBook::new(TEST_SYMBOL);
+    let mut reports = Vec::new();
+    book.execute(
+        limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+        None,
+        ReservationSlot::DUMMY,
+        &mut reports,
+    );
+
+    let restored = OrderBook::restore(TEST_SYMBOL, book.snapshot());
+
+    assert!(restored.order_index.capacity() >= ORDER_INDEX_CAPACITY);
+    assert!(restored.stop_index.capacity() >= STOP_NODE_CAPACITY);
+}
+
 // -- Multi-level matching --
 
 #[test]

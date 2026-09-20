@@ -499,13 +499,16 @@ impl BookSide {
     /// price order). Returns `(side, mapping)` where `mapping` records the
     /// slab index assigned to each `(account, order_id)` so the caller can
     /// populate `OrderBook::order_index` with valid node indices.
+    ///
+    /// The slab comes out at production capacity (or the snapshot's
+    /// order count, if larger): a restored book serves straight away,
+    /// and `prefault` leaves a populated slab alone.
     pub(crate) fn from_levels_snapshot(
         side: Side,
         mut levels: Vec<(Price, Vec<RestingOrder>)>,
     ) -> (Self, SnapshotNodeMapping) {
-        // Pre-size the slab to the total order count to avoid re-allocations.
         let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
-        let mut out = Self::with_capacity(side, total.max(64));
+        let mut out = Self::with_capacity(side, total.max(super::SIDE_NODE_CAPACITY));
         let mut mapping = Vec::with_capacity(total);
         // Insert levels in this side's physical order (worst first) so
         // every level append lands at the Vec tail — O(1) instead of a
@@ -792,6 +795,18 @@ mod tests {
                 assert_eq!((node.order.account, node.order.id), (account, order_id));
             }
         }
+    }
+
+    /// A restored side serves straight away and `prefault` leaves a
+    /// populated slab alone, so the restore itself must reserve the
+    /// production capacity — not the handful of nodes the snapshot held.
+    #[test]
+    fn from_levels_snapshot_reserves_production_capacity() {
+        let (restored, _) = BookSide::from_levels_snapshot(
+            Side::Buy,
+            three_level_side(Side::Buy).levels_snapshot(),
+        );
+        assert!(restored.nodes.capacity() >= super::super::SIDE_NODE_CAPACITY);
     }
 
     #[test]

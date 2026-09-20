@@ -1336,7 +1336,7 @@ fn build_indexed_instruments(
         let idx = spec.symbol.0 as usize;
         let book = books_map
             .remove(&spec.symbol)
-            .unwrap_or_else(|| OrderBook::new(spec.symbol));
+            .unwrap_or_else(|| OrderBook::with_capacity(spec.symbol));
         instruments[idx] = Some(Box::new(InstrumentState {
             spec: *spec,
             book,
@@ -1663,24 +1663,30 @@ impl OrderBook {
         node_for.extend(bid_node_idx);
         node_for.extend(ask_node_idx);
 
-        let order_index: crate::slab_map::SlabMap<(Side, Price, ReservationSlot, u32)> = snap
-            .order_index
-            .into_iter()
-            .map(|(id, account, side, price)| {
-                let node_idx = node_for
-                    .get(&(account, id))
-                    .copied()
-                    // Snapshot self-consistency: every order_index entry
-                    // must correspond to a resting order in the same
-                    // snapshot. If it doesn't, the snapshot is corrupt and
-                    // we'd rather fail loudly than silently skip cancels.
-                    .expect("snapshot order_index references missing book entry");
-                (
-                    (account, id),
-                    (side, price, ReservationSlot::DUMMY, node_idx),
-                )
-            })
-            .collect();
+        // Both indexes come out at production capacity (or the snapshot's
+        // entry count, if larger), like the sides above: a restored book
+        // serves straight away, and `prefault` leaves a populated index
+        // alone, so this is its one chance to reserve.
+        let mut order_index: crate::slab_map::SlabMap<(Side, Price, ReservationSlot, u32)> =
+            crate::slab_map::SlabMap::with_capacity(
+                snap.order_index
+                    .len()
+                    .max(crate::orderbook::ORDER_INDEX_CAPACITY),
+            );
+        for (id, account, side, price) in snap.order_index {
+            let node_idx = node_for
+                .get(&(account, id))
+                .copied()
+                // Snapshot self-consistency: every order_index entry
+                // must correspond to a resting order in the same
+                // snapshot. If it doesn't, the snapshot is corrupt and
+                // we'd rather fail loudly than silently skip cancels.
+                .expect("snapshot order_index references missing book entry");
+            order_index.insert(
+                (account, id),
+                (side, price, ReservationSlot::DUMMY, node_idx),
+            );
+        }
 
         // Build stop sides; collect the slab-index mapping the same way
         // as for resting orders so we can populate `stop_index` with
@@ -1693,17 +1699,19 @@ impl OrderBook {
         stop_node_for.extend(buy_stop_idx);
         stop_node_for.extend(sell_stop_idx);
 
-        let stop_index: crate::slab_map::SlabMap<(Side, Price, u32)> = snap
-            .stop_index
-            .into_iter()
-            .map(|(id, account, side, price)| {
-                let node_idx = stop_node_for
-                    .get(&(account, id))
-                    .copied()
-                    .expect("snapshot stop_index references missing stop entry");
-                ((account, id), (side, price, node_idx))
-            })
-            .collect();
+        let mut stop_index: crate::slab_map::SlabMap<(Side, Price, u32)> =
+            crate::slab_map::SlabMap::with_capacity(
+                snap.stop_index
+                    .len()
+                    .max(crate::orderbook::STOP_NODE_CAPACITY),
+            );
+        for (id, account, side, price) in snap.stop_index {
+            let node_idx = stop_node_for
+                .get(&(account, id))
+                .copied()
+                .expect("snapshot stop_index references missing stop entry");
+            stop_index.insert((account, id), (side, price, node_idx));
+        }
 
         Self::from_parts(
             symbol,
@@ -2067,7 +2075,7 @@ mod tests {
     }
 
     /// A seeded exchange with a resting order, a funded account and active
-    /// account limits: state in every collection `prefault_for` sizes.
+    /// account limits: state in every collection `prefault` touches.
     fn populated_exchange() -> Exchange {
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
@@ -2084,15 +2092,22 @@ mod tests {
         exchange
     }
 
-    /// `prefault` runs on a primary after journal recovery and on a replica
-    /// at promotion — both with orders resting. A resting order must stay
-    /// cancellable afterwards.
+    /// `prefault` runs on a restored engine, with orders resting, and on
+    /// one about to replay a journal. A resting order must stay
+    /// cancellable afterwards, and the state — everything replay and
+    /// failover depend on — may not move.
     #[test]
     fn prefault_keeps_resting_orders_cancellable() {
         let mut exchange = populated_exchange();
+        let before = encode_exchange_payload(&exchange);
 
         exchange.prefault();
 
+        assert_eq!(
+            encode_exchange_payload(&exchange),
+            before,
+            "prefault changed the state of a populated exchange"
+        );
         let mut reports = Vec::new();
         exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
         assert!(
@@ -2101,54 +2116,17 @@ mod tests {
         );
     }
 
-    /// `prefault_for` runs on engines that already hold state — recovered,
-    /// restored or replicated — so it must be capacity only: the snapshot,
-    /// which is everything replay and failover depend on, may not move.
+    /// Every node prefaults the engine it builds, and a replica does again
+    /// after a resync: the second call must be a no-op.
     #[test]
-    fn prefault_for_leaves_populated_state_unchanged() {
+    fn prefault_is_idempotent() {
         let mut exchange = populated_exchange();
-        let before = encode_exchange_payload(&exchange);
-
-        exchange.prefault_for(1_000, 8);
-
-        assert_eq!(
-            encode_exchange_payload(&exchange),
-            before,
-            "prefault_for changed the state of a populated exchange"
-        );
-    }
-
-    /// Every node calls `prefault_for` once per instance it builds, and a
-    /// replica does again after a resync: the second call must be a no-op.
-    #[test]
-    fn prefault_for_is_idempotent() {
-        let mut exchange = populated_exchange();
-        exchange.prefault_for(1_000, 8);
+        exchange.prefault();
         let once = encode_exchange_payload(&exchange);
 
-        exchange.prefault_for(1_000, 8);
+        exchange.prefault();
 
         assert_eq!(encode_exchange_payload(&exchange), once);
-    }
-
-    /// On a fresh engine the instrument pool serves the seed: an
-    /// instrument added after sizing behaves exactly like one added to an
-    /// unsized engine.
-    #[test]
-    fn prefault_for_then_seed_matches_unsized_seed() {
-        let mut sized = Exchange::new();
-        sized.prefault_for(10, 4);
-        sized.add_instrument(btc_usd_spec());
-        sized.deposit(ACCT_A, USD, 100_000);
-
-        let mut plain = Exchange::new();
-        plain.add_instrument(btc_usd_spec());
-        plain.deposit(ACCT_A, USD, 100_000);
-
-        assert_eq!(
-            encode_exchange_payload(&sized),
-            encode_exchange_payload(&plain)
-        );
     }
 
     #[test]

@@ -104,7 +104,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 
 1. Load authorized keys from `--authorized-keys`.
 2. Initialize or recover the exchange (see [Recovery on Startup](#recovery-on-startup)).
-3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
+3. Reserve the exchange's memory and pre-fault it (avoids growth and page faults on the hot path). Every node reserves the same production capacity before its first event; the balance map alone is sized from `--accounts` and `--instruments`.
 4. Build the disruptor pipeline (input ring + output ring).
 5. Spawn I/O thread: in TCP mode, one io_uring reader thread that multiplexes every connection via multishot RECV; in DPDK mode, one poll thread per NIC queue.
 6. Spawn the pipeline OS threads: journal-seq, journal-disk, journal-prep, matching, response, optionally event-publisher, optionally the shadow exchange, and the replication handlers when replication is on -- each pinned to its `--cores` entry.

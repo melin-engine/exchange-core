@@ -348,12 +348,13 @@ impl StopSide {
 
     /// Reconstruct from snapshot levels and return the
     /// `(account, order_id) -> node_idx` mapping so the caller can
-    /// populate `stop_index` with valid handles.
+    /// populate `stop_index` with valid handles. Production capacity, as
+    /// `BookSide::from_levels_snapshot`.
     pub(crate) fn from_levels_snapshot(
         levels: Vec<(Price, Vec<PendingStop>)>,
     ) -> (Self, SnapshotNodeMapping) {
         let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
-        let mut side = Self::with_capacity(total.max(64));
+        let mut side = Self::with_capacity(total.max(super::STOP_NODE_CAPACITY));
         let mut mapping = Vec::with_capacity(total);
         for (price, stops) in levels {
             for stop in stops {

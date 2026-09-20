@@ -54,24 +54,27 @@ const _: () = assert!(size_of::<ExecutionReport>() == 64);
 /// neither `Application` (in `melin-app`) nor `Exchange` (in
 /// `melin-ec`) is local to `melin-ec-server`, but `ServerApp` is.
 ///
-/// The inner field is `pub` because the server frequently constructs an
-/// `Exchange` directly (`Exchange::with_capacity`) and wraps it; making
-/// the wrap explicit at every construction site is
-/// cheaper than introducing a parallel set of constructors here.
+/// The inner field is `pub` because benches and tests construct an
+/// `Exchange` directly and wrap it; making the wrap explicit at every
+/// construction site is cheaper than introducing a parallel set of
+/// constructors here.
 pub struct ServerApp(pub Exchange);
 
-impl ServerApp {
-    /// Construct a `ServerApp` wrapping a freshly-initialised `Exchange`.
-    /// Convenience for tests and bootstrap paths that want the default
-    /// `Exchange::new()` sizing without spelling the wrap.
-    pub fn new() -> Self {
-        ServerApp(Exchange::new())
-    }
-}
-
+/// The state every node starts from: an empty engine with production
+/// capacity reserved and its pages touched. The runtime builds one of
+/// these on every node and then seeds a genesis into it, replays a
+/// journal into it, or applies a primary's stream to it — so reserving
+/// here, before the first event, is what keeps growth and page faults off
+/// the matching thread whichever way the node comes up. A snapshot
+/// restore builds the same shape by another route (see `restore`).
+///
+/// Holds no state, and nothing local to the node: every node's history
+/// starts from the same empty engine, as `Application` requires.
 impl Default for ServerApp {
     fn default() -> Self {
-        Self::new()
+        let mut exchange = Exchange::with_capacity();
+        exchange.prefault();
+        ServerApp(exchange)
     }
 }
 
@@ -271,15 +274,15 @@ impl Application for ServerApp {
         Exchange::check_request_seq(&mut self.0, key_hash, seq)
     }
 
-    /// Size the engine for the node's workload, then walk the
-    /// pre-allocated slabs and indices so the first hot-path access
-    /// doesn't soft-fault. The runtime calls this on engines that already
-    /// hold state (recovered, restored, replicated), which
-    /// `Exchange::prefault_for` handles by never replacing a populated
-    /// collection.
+    /// Reserve the one collection whose size only the node knows: the
+    /// balance map, from `--accounts` and `--instruments`. Everything
+    /// else is reserved by `Default` and `restore`, which is where the
+    /// engine is built and so the only place a populated collection can
+    /// be sized. A populated balance map is left as it is, so this is a
+    /// no-op on a recovered engine and when called again.
     fn prefault(&mut self, sizing: &Self::Sizing) {
         self.0
-            .prefault_for(sizing.accounts as usize, sizing.instruments as usize);
+            .reserve_balances(sizing.accounts as usize, sizing.instruments as usize);
     }
 
     /// `Exchange` exposes an in-memory `clone_via_snapshot` that skips
@@ -314,12 +317,16 @@ impl Application for ServerApp {
         w.write_all(&bytes)
     }
 
+    /// The decoder rebuilds every collection at production capacity, so a
+    /// restored engine is as ready to serve as a `Default` one; touching
+    /// its pages here completes the parallel.
     fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
-        engine_snapshot::decode_exchange_payload(&bytes)
-            .map(ServerApp)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let mut exchange = engine_snapshot::decode_exchange_payload(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        exchange.prefault();
+        Ok(ServerApp(exchange))
     }
 }
 
@@ -684,7 +691,7 @@ mod tests {
 
         // 4. Successful withdraw on a clean account emits nothing.
         let mut reports = Vec::new();
-        let mut clean = ServerApp::new();
+        let mut clean = ServerApp(Exchange::new());
         clean.0.deposit(AccountId(7), CurrencyId(2), 500);
         <ServerApp as Application>::apply(
             &mut clean,

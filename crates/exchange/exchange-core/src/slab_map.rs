@@ -195,22 +195,6 @@ impl<V> SlabMap<V> {
     }
 }
 
-impl<V> FromIterator<((AccountId, OrderId), V)> for SlabMap<V> {
-    /// Build a `SlabMap` from an iterator of `(key, value)` pairs. The
-    /// `size_hint` lower bound is used to pre-size the underlying lookup
-    /// and slab so a known-length producer (e.g. snapshot restore) avoids
-    /// rehash / Vec-growth allocations during the build.
-    fn from_iter<I: IntoIterator<Item = ((AccountId, OrderId), V)>>(iter: I) -> Self {
-        let iter = iter.into_iter();
-        let (lower, _) = iter.size_hint();
-        let mut map = Self::with_capacity(lower);
-        for (key, value) in iter {
-            map.insert(key, value);
-        }
-        map
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
