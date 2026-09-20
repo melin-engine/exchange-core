@@ -21,6 +21,13 @@ skip-order-exec = [
     "release-tracing",
 ]
 no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persist"]
+## Seed a fresh journal with `--instruments` placeholder instruments and
+## `--accounts` accounts funded out of nothing. A development fixture, so
+## it is off by default and a production build cannot mint balances by
+## accident: benches, smoke tests and demos opt in explicitly. A node
+## built without it starts empty; instruments and accounts are created
+## through the admin client.
+synthetic-seed = []
 ## Lightweight per-stage histograms for the original 4 stages
 ## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
 ## locks per event on the hot path; appropriate for narrow debugging
@@ -97,6 +104,12 @@ zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The integration tests spawn `melin-ec-server` through CARGO_BIN_EXE and
+# expect the funded accounts genesis seeds. Depending on ourselves turns
+# `synthetic-seed` on for the whole package whenever a test target is
+# built — and only then: `cargo build` ignores dev-dependencies, so the
+# shipped binary is still built without it.
+melin-ec-server = { path = ".", features = ["synthetic-seed"] }
 bolero = "0.13"
 melin-client = { workspace = true }
 melin-ec-client = { workspace = true }

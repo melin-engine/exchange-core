@@ -119,7 +119,9 @@ JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 BIND_ADDR="${SERVER_VLAN}:9876"
 HEALTH_ADDR="${SERVER_VLAN}:9878"
-CARGO_BUILD_FLAGS="${CARGO_BUILD_FLAGS:---release}"
+# `synthetic-seed` so the server provisions the accounts the bench trades
+# from; a stock build starts with none.
+CARGO_BUILD_FLAGS="${CARGO_BUILD_FLAGS:---release --features melin-ec-server/synthetic-seed}"
 
 echo "=== LAN Benchmark ==="
 echo "  Server:      ${SERVER} (VLAN: ${SERVER_VLAN})"

@@ -1878,6 +1878,7 @@ dependencies = [
  "melin-ec-client",
  "melin-ec-market-data",
  "melin-ec-protocol",
+ "melin-ec-server",
  "melin-ec-trading",
  "melin-ec-types",
  "melin-journal",

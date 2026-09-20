@@ -1900,7 +1900,9 @@ fn run_roundtrip_bench(
         ..ServerConfig::default()
     };
     // The bench server runs standalone but seeds and sizes itself through
-    // the same startup configuration as the binary.
+    // the same startup configuration as the binary — with the synthetic
+    // seed forced on, since a bench with no funded account has nothing to
+    // trade.
     let startup = melin_ec_server::StartupConfig {
         accounts: num_accounts,
         instruments: num_instruments,
@@ -2012,7 +2014,10 @@ fn start_server<L: BlockingTransportListener>(
             if let Err(e) = melin_server_runtime::server::run_with_listener::<ServerApp>(
                 listener,
                 config,
-                startup.startup_events(),
+                // Always the synthetic seed: the bench owns this journal
+                // and trades from the accounts it funds, whether or not
+                // the server crate was built with `synthetic-seed`.
+                startup.synthetic_startup_events(),
                 startup.sizing(),
                 RequestDecoder,
                 ResponseEncoder,

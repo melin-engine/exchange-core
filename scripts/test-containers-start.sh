@@ -116,7 +116,7 @@ for name in "${CONTAINERS[@]}"; do
         git clone https://github.com/melin-engine/exchange-core.git $REPO_DIR && \
         cd $REPO_DIR && \
         $CHECKOUT_CMD
-        cargo build --release
+        cargo build --release --features melin-ec-server/synthetic-seed
     " 2>&1 | tail -3
 
     IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name")
@@ -136,10 +136,10 @@ docker exec "$SERVER" bash -c "
     apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3 && \
     source /root/.cargo/env && \
     cd $REPO_DIR && \
-    cargo build --release -p melin-ec-server --features dpdk 2>&1 | tail -3 && \
+    cargo build --release -p melin-ec-server --features dpdk,synthetic-seed 2>&1 | tail -3 && \
     cp target/release/melin-ec-server target/release/melin-ec-server.dpdk && \
     echo 'Rebuilding default (non-DPDK) server binary...' && \
-    cargo build --release -p melin-ec-server 2>&1 | tail -3 && \
+    cargo build --release -p melin-ec-server --features synthetic-seed 2>&1 | tail -3 && \
     ls -la target/release/melin-ec-server target/release/melin-ec-server.dpdk
 "
 

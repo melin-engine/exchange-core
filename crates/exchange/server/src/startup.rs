@@ -4,7 +4,10 @@
 //!
 //! - **Genesis** — the bulk `AddInstrument` / `ProvisionAccount` seed.
 //!   Journaled once, by the node that creates the journal as primary;
-//!   every other node receives it in the history.
+//!   every other node receives it in the history. It is a development
+//!   fixture: the accounts it provisions are funded out of nothing, so a
+//!   stock build seeds nothing and only a build with the `synthetic-seed`
+//!   feature emits it.
 //! - **Account limits** — the SEC-03 open-order cap and SEC-04 rate
 //!   limiter. Journaled as a `SetAccountLimits` event every time a node
 //!   becomes primary, from that node's own flags, so the limits in force
@@ -23,9 +26,9 @@ use melin_server_runtime::StartupEvents;
 /// The trading node's startup configuration, built from the command line.
 #[derive(Debug, Clone, Copy)]
 pub struct StartupConfig {
-    /// Accounts to provision in genesis, and to size for.
+    /// Accounts to size for, and to provision in the synthetic seed.
     pub accounts: u32,
-    /// Instruments to register in genesis, and to size for.
+    /// Instruments to size for, and to register in the synthetic seed.
     pub instruments: u32,
     /// SEC-03: maximum simultaneously open orders per account. `0` means
     /// unlimited.
@@ -52,6 +55,10 @@ pub struct ExchangeSizing {
 impl StartupConfig {
     /// The events the runtime journals on this node's behalf: the genesis
     /// seed, then the account limits.
+    ///
+    /// Genesis is empty unless the crate is built with `synthetic-seed`.
+    /// A node that seeds nothing starts with no instrument and no account;
+    /// both are created at runtime through the admin client.
     pub fn startup_events(&self) -> StartupEvents<TradingEvent> {
         // The only trace of the values a node brings to the cluster: they
         // take effect once journaled, when the node becomes primary.
@@ -75,9 +82,42 @@ impl StartupConfig {
         }
     }
 
+    /// The same, always carrying the synthetic seed whatever the crate
+    /// was built with. For a node driven by a bench or a test, which owns
+    /// its journal and needs funded accounts to trade with.
+    pub fn synthetic_startup_events(&self) -> StartupEvents<TradingEvent> {
+        StartupEvents {
+            genesis: self.synthetic_genesis(),
+            on_primary: vec![self.account_limits()],
+        }
+    }
+
+    /// Genesis under `synthetic-seed`: funded accounts and placeholder
+    /// instruments, for development, benches and smoke tests.
+    #[cfg(feature = "synthetic-seed")]
+    fn genesis(&self) -> Vec<TradingEvent> {
+        if self.accounts > 0 {
+            // Not a production build: these accounts are funded from
+            // nowhere, and the journal keeps that forever.
+            tracing::warn!(
+                accounts = self.accounts,
+                instruments = self.instruments,
+                "built with the synthetic-seed feature: genesis provisions funded test accounts"
+            );
+        }
+        self.synthetic_genesis()
+    }
+
+    /// Genesis in a stock build: nothing. Instruments and accounts are
+    /// created through the admin client, against a running node.
+    #[cfg(not(feature = "synthetic-seed"))]
+    fn genesis(&self) -> Vec<TradingEvent> {
+        Vec::new()
+    }
+
     /// Instruments first, then accounts: `ProvisionAccount` funds an
     /// account in every currency of every instrument registered so far.
-    fn genesis(&self) -> Vec<TradingEvent> {
+    pub fn synthetic_genesis(&self) -> Vec<TradingEvent> {
         let mut events = Vec::with_capacity(self.instruments as usize + self.accounts as usize);
         for i in 0..self.instruments {
             events.push(TradingEvent::AddInstrument {
@@ -121,14 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn genesis_count_matches_config() {
+    fn synthetic_genesis_count_matches_config() {
         // 3 instruments + 5 accounts.
-        assert_eq!(cfg(5, 3).startup_events().genesis.len(), 8);
+        assert_eq!(cfg(5, 3).synthetic_startup_events().genesis.len(), 8);
     }
 
     #[test]
-    fn genesis_order_is_instruments_then_accounts() {
-        let events = cfg(2, 2).startup_events().genesis;
+    fn synthetic_genesis_order_is_instruments_then_accounts() {
+        let events = cfg(2, 2).synthetic_genesis();
         assert!(matches!(events[0], TradingEvent::AddInstrument { .. }));
         assert!(matches!(events[1], TradingEvent::AddInstrument { .. }));
         assert!(matches!(events[2], TradingEvent::ProvisionAccount { .. }));
@@ -136,8 +176,26 @@ mod tests {
     }
 
     #[test]
-    fn genesis_empty_when_no_accounts_or_instruments() {
-        assert!(cfg(0, 0).startup_events().genesis.is_empty());
+    fn synthetic_genesis_empty_when_no_accounts_or_instruments() {
+        assert!(cfg(0, 0).synthetic_genesis().is_empty());
+    }
+
+    /// What the binary journals depends on how it was built, and on
+    /// nothing else: the counts stay sizing either way.
+    #[test]
+    #[cfg(feature = "synthetic-seed")]
+    fn genesis_carries_the_seed_under_the_feature() {
+        assert_eq!(cfg(5, 3).startup_events().genesis.len(), 8);
+    }
+
+    #[test]
+    #[cfg(not(feature = "synthetic-seed"))]
+    fn genesis_is_empty_in_a_stock_build() {
+        let events = cfg(5, 3).startup_events();
+        assert!(events.genesis.is_empty());
+        assert_eq!(cfg(5, 3).sizing().accounts, 5);
+        // The limits are configuration, not a fixture: they stay.
+        assert_eq!(events.on_primary.len(), 1);
     }
 
     /// The limits travel as exactly one event, carrying the node's values,
@@ -145,7 +203,7 @@ mod tests {
     /// must be journaled again by every node that becomes primary.
     #[test]
     fn on_primary_carries_the_account_limits() {
-        let events = cfg(2, 2).startup_events();
+        let events = cfg(2, 2).synthetic_startup_events();
         assert_eq!(
             events.on_primary,
             vec![TradingEvent::SetAccountLimits {

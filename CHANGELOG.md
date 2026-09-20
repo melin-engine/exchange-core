@@ -45,6 +45,16 @@ full detail behind entries marked *(sequencer)*.
   recorded ones: a replica follows the primary's limits, and its own flags
   take effect only once it is promoted. Changing a limit takes a primary
   restart or a failover. See "Per-account limits" in `docs/operations.md`.
+- **A node starts with no instrument and no account.** The genesis seed —
+  `--instruments` placeholder instruments and `--accounts` accounts funded
+  out of nothing — was a development fixture that every build emitted, so
+  a production node minted balances on its first start and kept them in
+  the journal forever. It is now behind the `synthetic-seed` build
+  feature, off by default. Register instruments and provision accounts
+  through the admin client instead. `--accounts` and `--instruments` keep
+  sizing the node either way. Benches, smoke tests and the demo scripts
+  build with the feature; a node that does logs a warning when it seeds.
+  See "Starting empty" in `docs/operations.md`.
 - **Snapshot format v19** carries the per-account limits. A node refuses to
   start from a snapshot written by an earlier release.
 - **Replicas pre-allocate their memory before streaming** *(sequencer)*.
@@ -56,7 +66,9 @@ full detail behind entries marked *(sequencer)*.
   started with `StartupConfig` (which builds the startup events and the
   sizing), `ServerApp` implements `Default` and a sized `prefault`, and
   `Exchange::prefault_seed` is replaced by `Exchange::prefault_for`.
-  `TradingEvent` gains `SetAccountLimits`.
+  `TradingEvent` gains `SetAccountLimits`. `StartupConfig::startup_events`
+  seeds only under `synthetic-seed`; a dependent that needs the seed
+  regardless calls `synthetic_startup_events`.
 
 ### Fixed
 

@@ -246,7 +246,9 @@ A future enhancement would expose a `/stats-reset` endpoint so the bench can cle
 # Both server and bench built with `tick-to-trade` for the full
 # decomposition. The flag implies `latency-trace`, so this also
 # enables the lighter 4-stage histograms.
-cargo build --release -p melin-ec-server --features tick-to-trade
+# `synthetic-seed` gives the bench the funded accounts it trades from;
+# without it the server starts with no account and no instrument.
+cargo build --release -p melin-ec-server --features tick-to-trade,synthetic-seed
 cargo build --release -p melin-ec-bench  --features tick-to-trade
 
 # Roundtrip benchmark — decomposition appears under the latency table.
@@ -486,6 +488,18 @@ cargo build --release --bin melin-ec-bench
 ```
 
 The binary is at `target/release/melin-ec-bench`.
+
+A bench against a separate engine server also needs that server to hold
+accounts to trade from. Build it with the `synthetic-seed` feature, which
+provisions `--accounts` funded accounts and `--instruments` instruments
+on a fresh journal:
+
+```sh
+cargo build --release -p melin-ec-server --features synthetic-seed
+```
+
+The feature is off by default, so a server built without it starts empty
+and every order is rejected for an unknown account.
 
 ## Limitations and Caveats
 

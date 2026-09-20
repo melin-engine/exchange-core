@@ -308,9 +308,9 @@ echo ""
 
 # --- 8. Build server inside VM ---
 echo "=== Building server in VM ==="
-echo "  cargo build --release -p melin-ec-server --features dpdk --no-default-features"
+echo "  cargo build --release -p melin-ec-server --features dpdk,synthetic-seed --no-default-features"
 echo "  (this may take a few minutes on first run)"
-vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-ec-server --features dpdk --no-default-features" 2>&1 | tail -5
+vm_ssh "cd ~/melin && source ~/.cargo/env && cargo build --release -p melin-ec-server --features dpdk,synthetic-seed --no-default-features" 2>&1 | tail -5
 echo "  Server build: OK"
 
 echo ""

@@ -44,8 +44,8 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
-| `--accounts` | `100000` | Number of accounts to seed on first startup (fresh journal only). Also the account count the node reserves memory for on every start, primary or replica. |
-| `--instruments` | `100` | Number of instruments to seed on first startup (fresh journal only). Also the instrument count the node reserves memory for on every start. |
+| `--accounts` | `100000` | Number of accounts the node reserves memory for on every start, primary or replica. A build with the `synthetic-seed` feature also provisions that many funded test accounts on a fresh journal; see [Starting empty](#starting-empty). |
+| `--instruments` | `100` | Number of instruments the node reserves memory for on every start. A build with the `synthetic-seed` feature also registers that many placeholder instruments on a fresh journal. |
 | `--max-orders-per-account` | `10000` | Maximum simultaneously open orders per account (resting limits plus pending stops); beyond it, submissions reject with `ExceedsMaxOpenOrders`. `0` = unlimited. See [Per-account limits](#per-account-limits) for when a node's value takes effect. |
 | `--max-orders-per-second` | `1000` | Per-account sustained order rate; beyond it, submissions reject with `ExceedsOrderRate`. `0` disables the limiter. See [Per-account limits](#per-account-limits). |
 | `--max-orders-burst` | `5000` | Per-account burst allowance for the order-rate limiter. `0` disables the limiter. See [Per-account limits](#per-account-limits). |
@@ -57,6 +57,18 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 | `--snapshot-interval-ms` | `3_000_000` (50 min) | Interval in milliseconds between snapshots written by the shadow exchange — the sole snapshot writer. Set to `0` to disable; recovery then falls back to full journal replay. The shadow replays events on a dedicated thread, so snapshot writes never pause the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
 | `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
+
+#### Starting empty
+
+A release build starts with no instrument and no account. On a fresh journal there is nothing to trade until an operator creates both, which is done at runtime through the admin client (`melin-ec-admin`): register each instrument, then provision the accounts.
+
+Development builds can seed instead. The `synthetic-seed` build feature registers `--instruments` placeholder instruments and provisions `--accounts` accounts, each funded in every currency out of nothing, as the first events of a fresh journal — the fixture the benches and smoke tests trade from:
+
+```sh
+cargo build --release -p melin-ec-server --features synthetic-seed
+```
+
+The feature is off by default so that a production binary cannot create balances. A node built with it logs a warning at startup when it seeds, and the seed is permanent: it is journaled, replicated, and carried in every snapshot, so a journal created by a seeded build keeps those funded accounts for its lifetime. Never point one at a production journal.
 
 #### Per-account limits
 
@@ -221,7 +233,7 @@ The `init_engine` function checks the following conditions in order:
 
 3. **Journal exists (no snapshot)**: Full replay from genesis. Every event in the journal is replayed to reconstruct exchange state.
 
-4. **Neither exists**: Fresh start. Creates a new journal and seeds test data based on `--accounts` and `--instruments`.
+4. **Neither exists**: Fresh start. Creates a new journal, empty — unless the node was built with `synthetic-seed`, which seeds test data per `--accounts` and `--instruments`. See [Starting empty](#starting-empty).
 
 ### Post-Recovery Rotation Check
 
@@ -394,6 +406,7 @@ Examples:
 - `connection rejected: max_connections reached` -- at the connection limit, new clients turned away
 - `replica disconnected` -- replication link lost, degraded to local-only durability
 - `replica connection error` -- replication connection failed
+- `built with the synthetic-seed feature` -- this node is seeding funded test accounts into a fresh journal; not a production build
 
 **Action**: Investigate promptly. These indicate resource pressure or infrastructure issues that could escalate.
 
@@ -408,7 +421,6 @@ Examples:
 - `listening` -- ready to accept connections
 - `pinned to core` -- thread affinity applied
 - `shutdown signal received` / `shutdown complete` -- orderly shutdown
-- `seeded test data` -- first startup
 
 ### `debug` -- Client-caused events
 
@@ -842,7 +854,7 @@ If only a snapshot file exists (journal deleted or on a different disk that fail
 
 ### 5. Complete Data Loss
 
-If both the journal and snapshot are gone, the server starts fresh with empty state and seeds test data per `--accounts`/`--instruments`.
+If both the journal and snapshot are gone, the server starts fresh with empty state: no instrument, no account, no balance. A build with `synthetic-seed` re-seeds test data per `--accounts`/`--instruments` instead — which is a fixture, not a recovery. Real state only comes back from a journal or a snapshot.
 
 ---
 

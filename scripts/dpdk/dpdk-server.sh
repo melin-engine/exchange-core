@@ -166,10 +166,12 @@ export RUST_LOG="${RUST_LOG:-debug}"
 
 cd "$PROJECT_DIR"
 
-# Build features: always dpdk, optionally no-persist for benchmarking.
-FEATURES="dpdk"
+# Build features: always dpdk plus synthetic-seed (this node is driven by
+# the bench, which trades from the genesis accounts), optionally
+# no-persist for benchmarking.
+FEATURES="dpdk,synthetic-seed"
 if [[ "${NO_PERSIST:-0}" == "1" ]]; then
-    FEATURES="dpdk,no-persist"
+    FEATURES="${FEATURES},no-persist"
     echo "  *** NO_PERSIST=1: journal fsync disabled (benchmarking only) ***"
 fi
 

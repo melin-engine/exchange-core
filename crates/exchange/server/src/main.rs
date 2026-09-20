@@ -41,13 +41,15 @@ use melin_server_runtime::server::{self, ServerConfig};
 struct Cli {
     #[command(flatten)]
     server: ServerConfig,
-    /// Number of accounts to seed on first startup (fresh journal only),
-    /// and to reserve memory for on every start. Seeded with
-    /// `ProvisionAccount`, O(accounts) (~0.5 s for 1M).
+    /// Number of accounts to reserve memory for on every start, primary
+    /// or replica. A build with the `synthetic-seed` feature also
+    /// provisions that many funded accounts on a fresh journal, which
+    /// costs O(accounts) (~0.5 s for 1M).
     #[arg(long, default_value_t = 100_000)]
     accounts: u32,
-    /// Number of instruments to seed on first startup (fresh journal
-    /// only), and to reserve memory for on every start.
+    /// Number of instruments to reserve memory for on every start. A
+    /// build with the `synthetic-seed` feature also registers that many
+    /// placeholder instruments on a fresh journal.
     #[arg(long, default_value_t = 100)]
     instruments: u32,
 }

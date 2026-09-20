@@ -120,7 +120,7 @@ echo "=== Building ==="
 
 echo "  Building server with DPDK transport..."
 cd "$PROJECT_DIR"
-cargo build --release -p melin-ec-server --features dpdk --no-default-features --quiet 2>&1
+cargo build --release -p melin-ec-server --features dpdk,synthetic-seed --no-default-features --quiet 2>&1
 echo "  server build: OK"
 
 echo "  Building keygen + bench (default features)..."
