@@ -37,6 +37,36 @@ full detail behind entries marked *(sequencer)*.
   ack policy, and connecting a client to a halted node blocks for the same
   reason. Monitor a halted node through the health endpoint. See "Halt on
   Replica Disconnect" in `docs/operations.md`.
+- **The per-account limits are journaled.** `--max-orders-per-account`,
+  `--max-orders-per-second` and `--max-orders-burst` used to be applied by
+  every node from its own flags, so nodes started with different values
+  enforced different limits and could diverge. Now a node records its values
+  in the journal each time it becomes primary, and every node enforces the
+  recorded ones: a replica follows the primary's limits, and its own flags
+  take effect only once it is promoted. Changing a limit takes a primary
+  restart or a failover. See "Per-account limits" in `docs/operations.md`.
+- **Snapshot format v19** carries the per-account limits. A node refuses to
+  start from a snapshot written by an earlier release.
+- **Replicas pre-allocate their memory before streaming** *(sequencer)*.
+  `--accounts` and `--instruments` now size a replica too, before it applies
+  its first event, instead of the replica growing its collections on the
+  primary's acknowledgement path. Expect a replica's resident memory to match
+  its primary's from startup.
+- **Rust dependents:** `AppFactory` is gone *(sequencer)*. The server is
+  started with `StartupConfig` (which builds the startup events and the
+  sizing), `ServerApp` implements `Default` and a sized `prefault`, and
+  `Exchange::prefault_seed` is replaced by `Exchange::prefault_for`.
+  `TradingEvent` gains `SetAccountLimits`.
+
+### Fixed
+
+- **Resting orders are no longer lost when a primary restarts or a replica is
+  promoted.** Pre-allocating memory at startup cleared the order books'
+  lookup indexes. It ran after the book had been rebuilt from the journal, so
+  every order resting at the time of a restart or failover stayed on the book
+  but could no longer be cancelled or amended. A cancel got an empty reply,
+  and the order id stayed blocked (`DuplicateOrderId`). Affects 0.15.0 and
+  0.16.0.
 
 ### Added
 

@@ -2202,6 +2202,59 @@ fn dual_replication_promote_replica1_after_replica2_dies() {
     );
 }
 
+/// The per-account limits in force are the primary's, journaled, not each
+/// node's flags. The primary caps open orders at 2; the replicas run the
+/// default cap. The primary refuses a third resting order, and a replica
+/// must refuse it too — it applies the primary's journaled cap, not its
+/// own. After failover the promoted replica journals its own flag, so the
+/// cap rises and the same order is now taken.
+///
+/// One assertion tells the two failure modes apart: `DuplicateOrderId`
+/// means the replica had accepted the refused order under its own flag;
+/// `ExceedsMaxOpenOrders` means the promoted node's flag never took effect.
+#[test]
+#[serial]
+fn replicas_enforce_the_primarys_account_limits() {
+    let mut cluster = DualCluster::start_with_primary_args(&["--max-orders-per-account", "2"]);
+    let mut client = cluster.connect_primary();
+
+    for id in 1..=2u64 {
+        let r = submit_order(&mut client, id, 1, 1, Side::Buy, 100, 1);
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_ec_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "order {id} within the cap must rest, got: {r:?}"
+        );
+    }
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::ExceedsMaxOpenOrders,
+                ..
+            }
+        )),
+        "the primary's cap of 2 must refuse a third order, got: {r:?}"
+    );
+    cluster.wait_replicated();
+
+    drop(client);
+    cluster.kill_primary();
+    let mut client = cluster.promote_replica1();
+
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "after failover the promoted node's own cap applies and the refused order is new to it, got: {r:?}"
+    );
+}
+
 /// Active fills during dual replication — crossing orders generate fills,
 /// then failover. Verifies the promoted replica's exchange state is
 /// consistent (balances correct, can continue trading).

@@ -157,6 +157,12 @@ impl<V> SlabMap<V> {
         self.lookup.len()
     }
 
+    /// True iff the map holds no live entries. Prefault checks it before
+    /// filling the map with dummies and clearing it again.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lookup.is_empty()
+    }
+
     /// Capacity of the underlying lookup hashmap (peak slot count). Used
     /// by the bench's capacity-report diagnostic to detect growth past
     /// the prefaulted region.

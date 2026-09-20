@@ -28,11 +28,29 @@ pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:53000,muzzy_decay_ms:57000\0";
 
 use clap::Parser;
-use melin_ec_server::app_factory::{Factory, FactoryConfig};
 use melin_ec_server::event_publisher;
 use melin_ec_server::request_decoder::RequestDecoder;
 use melin_ec_server::response_encoder::ResponseEncoder;
+use melin_ec_server::{ServerApp, StartupConfig};
 use melin_server_runtime::server::{self, ServerConfig};
+
+/// The node's command line: the sequencer runtime's flags, plus the
+/// trading-specific ones the runtime no longer carries.
+#[derive(Parser)]
+#[command(name = "melin-ec-server", about = "Melin Exchange Core server")]
+struct Cli {
+    #[command(flatten)]
+    server: ServerConfig,
+    /// Number of accounts to seed on first startup (fresh journal only),
+    /// and to reserve memory for on every start. Seeded with
+    /// `ProvisionAccount`, O(accounts) (~0.5 s for 1M).
+    #[arg(long, default_value_t = 100_000)]
+    accounts: u32,
+    /// Number of instruments to seed on first startup (fresh journal
+    /// only), and to reserve memory for on every start.
+    #[arg(long, default_value_t = 100)]
+    instruments: u32,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -41,19 +59,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_thread_names(true)
         .init();
 
-    let config = ServerConfig::parse();
+    let Cli {
+        server: config,
+        accounts,
+        instruments,
+    } = Cli::parse();
 
-    let factory = Factory::new(FactoryConfig {
-        accounts: config.accounts,
-        instruments: config.instruments,
+    let startup = StartupConfig {
+        accounts,
+        instruments,
         max_orders_per_account: config.max_orders_per_account,
         max_orders_per_second: config.max_orders_per_second,
         max_orders_burst: config.max_orders_burst,
-    });
+    };
 
-    server::run(
+    server::run::<ServerApp>(
         config,
-        factory,
+        startup.startup_events(),
+        startup.sizing(),
         RequestDecoder,
         ResponseEncoder,
         Some(event_publisher::run),

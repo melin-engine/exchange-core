@@ -95,6 +95,9 @@ impl Application for ServerApp {
     type Event = TradingEvent;
     type Report = ExecutionReport;
     type QueryResponse = QueryResponse;
+    /// Account and instrument counts to reserve for — see
+    /// [`crate::startup::ExchangeSizing`].
+    type Sizing = crate::startup::ExchangeSizing;
 
     /// Schema version for the snapshot payload. Tracks the underlying
     /// `snapshot` module's `PAYLOAD_VERSION` — any change there forces a
@@ -240,6 +243,21 @@ impl Application for ServerApp {
                     hwm: self.0.request_seq_hwm(ctx.key_hash),
                 })
             }
+            TradingEvent::SetAccountLimits {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            } => {
+                // Journaled on every promotion, so usually a re-apply of
+                // the values already in force — which both setters leave
+                // unchanged (the limiter keeps its buckets unless the
+                // rate or burst actually changes).
+                self.0
+                    .set_max_open_orders_per_account(max_open_orders_per_account);
+                self.0
+                    .set_max_orders_per_second(max_orders_per_second, max_orders_burst);
+                None
+            }
         }
     }
 
@@ -253,12 +271,15 @@ impl Application for ServerApp {
         Exchange::check_request_seq(&mut self.0, key_hash, seq)
     }
 
-    /// Route through `Exchange::prefault`, which walks the pre-allocated
-    /// slabs and indices so the first hot-path access after startup
-    /// doesn't soft-fault. Avoids the default snapshot-round-trip
-    /// implementation on a cold allocator.
-    fn prefault(&mut self) {
-        Exchange::prefault(&mut self.0);
+    /// Size the engine for the node's workload, then walk the
+    /// pre-allocated slabs and indices so the first hot-path access
+    /// doesn't soft-fault. The runtime calls this on engines that already
+    /// hold state (recovered, restored, replicated), which
+    /// `Exchange::prefault_for` handles by never replacing a populated
+    /// collection.
+    fn prefault(&mut self, sizing: &Self::Sizing) {
+        self.0
+            .prefault_for(sizing.accounts as usize, sizing.instruments as usize);
     }
 
     /// `Exchange` exposes an in-memory `clone_via_snapshot` that skips

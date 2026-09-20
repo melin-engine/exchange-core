@@ -44,8 +44,11 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
-| `--accounts` | `100000` | Number of accounts to seed on first startup (fresh journal only). |
-| `--instruments` | `100` | Number of instruments to seed on first startup (fresh journal only). |
+| `--accounts` | `100000` | Number of accounts to seed on first startup (fresh journal only). Also the account count the node reserves memory for on every start, primary or replica. |
+| `--instruments` | `100` | Number of instruments to seed on first startup (fresh journal only). Also the instrument count the node reserves memory for on every start. |
+| `--max-orders-per-account` | `10000` | Maximum simultaneously open orders per account (resting limits plus pending stops); beyond it, submissions reject with `ExceedsMaxOpenOrders`. `0` = unlimited. See [Per-account limits](#per-account-limits) for when a node's value takes effect. |
+| `--max-orders-per-second` | `1000` | Per-account sustained order rate; beyond it, submissions reject with `ExceedsOrderRate`. `0` disables the limiter. See [Per-account limits](#per-account-limits). |
+| `--max-orders-burst` | `5000` | Per-account burst allowance for the order-rate limiter. `0` disables the limiter. See [Per-account limits](#per-account-limits). |
 | `--heartbeat-interval-secs` | `10` | Seconds between heartbeats to idle connections. `0` to disable. |
 | `--connection-timeout-secs` | `30` | Seconds before disconnecting silent clients. `0` to disable. |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
@@ -54,6 +57,16 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 | `--snapshot-interval-ms` | `3_000_000` (50 min) | Interval in milliseconds between snapshots written by the shadow exchange — the sole snapshot writer. Set to `0` to disable; recovery then falls back to full journal replay. The shadow replays events on a dedicated thread, so snapshot writes never pause the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
 | `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
+
+#### Per-account limits
+
+The three per-account limits (`--max-orders-per-account`, `--max-orders-per-second`, `--max-orders-burst`) are recorded in the journal, not read locally by every node. Each time a node becomes primary — at startup, and when it is promoted after a failover — it records its own flag values before serving its first client, and from then on those are the limits in force on every node:
+
+- **A replica enforces the primary's limits, not its own flags.** Its flags matter only once it is promoted, and take effect then.
+- **Changing a limit takes a primary restart or a failover.** Restart the primary with the new values, or promote a replica started with them. The change applies from that point on; decisions already made keep the limits they were made under, including on replay.
+- **Nodes no longer need identical values to stay consistent.** Different values across nodes are safe. They just mean the limits change at the next failover, so keep them aligned unless that is what you want.
+
+Changing the rate or burst while the limiter is active resets every account's order-rate allowance to a full burst, as any change of these values always has.
 
 #### Replication Flags
 

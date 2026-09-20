@@ -325,6 +325,21 @@ impl AccountManager {
         // shave seed wall time further.
     }
 
+    /// Size the balance map for `balance_capacity` entries, if it holds
+    /// none yet. Pre-sizing eliminates the directory-doubling rehash
+    /// spikes of a bulk seed (see [`Self::prefault`]).
+    ///
+    /// A populated map is left as it is: `HashMap4` has no in-place
+    /// `reserve`, and rebuilding it would change its iteration order,
+    /// which is not worth risking on recovered state for a capacity hint.
+    /// Replacing an empty map is safe — it holds no state to lose.
+    pub fn size_balances_if_empty(&mut self, balance_capacity: usize) {
+        if self.balances.is_empty() {
+            self.balances =
+                HashMap4::with_capacity_and_hasher(balance_capacity, Default::default());
+        }
+    }
+
     /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
     /// where `slot_assignments` maps each `(AccountId, OrderId)` to its
     /// `ReservationSlot` so the caller can inject them into order books.
