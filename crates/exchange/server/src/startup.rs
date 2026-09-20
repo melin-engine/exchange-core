@@ -186,12 +186,12 @@ mod tests {
     /// What the binary journals depends on how it was built, and on
     /// nothing else: the counts stay sizing either way.
     #[test]
-    fn genesis_carries_the_seed_under_the_feature() {
+    fn seeding_build_journals_the_seed() {
         assert_eq!(cfg(5, 3).startup_events_seeding(true).genesis.len(), 8);
     }
 
     #[test]
-    fn genesis_is_empty_in_a_stock_build() {
+    fn stock_build_journals_no_genesis() {
         let events = cfg(5, 3).startup_events_seeding(false);
         assert!(events.genesis.is_empty());
         assert_eq!(cfg(5, 3).sizing().accounts, 5);

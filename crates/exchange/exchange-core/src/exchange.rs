@@ -721,10 +721,11 @@ impl Exchange {
         // Only insert if slot is empty (don't overwrite existing instrument).
         if self.instruments[idx].is_none() {
             // A production-sized book, allocated here. On a server this
-            // runs on the matching thread under MCL_FUTURE, so the
-            // allocation locks its pages as it is made and the listing
-            // pays a few milliseconds once. Listings are rare, and the
-            // genesis seed runs before the first client is served.
+            // runs on the matching thread, and the process locks pages on
+            // first touch, so a listing spreads the book's page faults
+            // over its first orders rather than paying them up front.
+            // Listings are rare, and the genesis seed runs before the
+            // first client is served.
             self.instruments[idx] = Some(Box::new(InstrumentState {
                 spec,
                 book: OrderBook::with_capacity(spec.symbol),

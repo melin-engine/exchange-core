@@ -21,10 +21,11 @@ full detail behind entries marked *(sequencer)*.
 This release adopts the sequencer's next release. The [Unreleased section of
 its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
 lists further fixes in the node runtime that apply here as they are; the
-entries below cover what changes for this product. One of
-them needs an operator action: a snapshot written by an earlier release may
-hold the effect of a request that was refused as a duplicate. The snapshot
-format bump below already makes every node rebuild from its journal, which
+entries below cover what changes for this product. One of them needs an
+operator action: a snapshot written by an earlier release may hold the
+effect of a request that was refused as a duplicate. The snapshot format
+bump below already has every node refuse such a snapshot, so the upgrade
+starts by moving the snapshot aside and rebuilding from the journal, which
 repairs this — a replica that was bootstrapped by snapshot transfer, and so
 has no journal from sequence 1, is re-bootstrapped from a node that has.
 
@@ -72,6 +73,15 @@ has no journal from sequence 1, is re-bootstrapped from a node that has.
   its first event, instead of the replica growing its collections on the
   primary's acknowledgement path. Expect a replica's resident memory to match
   its primary's from startup.
+- **Every engine a node builds is production-sized from the start.** A node
+  used to size its collections after replaying its journal, which left a
+  restarted node running on whatever the replay had grown and paying the
+  growth on the matching thread. The engine is now built at production
+  capacity before the first event, and a snapshot restore rebuilds it the
+  same way — including the shadow copy that writes snapshots. Expect
+  roughly 64 MB more resident memory per node for that copy; the rest of
+  the reserved capacity is locked on first touch and costs nothing until
+  used.
 - **Rust dependents:** `AppFactory` is gone *(sequencer)*. The server is
   started with `StartupConfig` (which builds the startup events and the
   sizing). `ServerApp` implements `Default` as an empty, production-sized,
