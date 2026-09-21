@@ -926,6 +926,35 @@ A server with 10K accounts, 100 instruments, and 50K resting orders uses approxi
 - 50K orders * 40 bytes = ~2 MiB
 - Total: ~34 MiB
 
+### Engine Memory
+
+Every node reserves the engine's memory before its first event and touches it, so the pages are resident from startup rather than faulted on the hot path. The reservation is the same on a primary, a replica and a node recovering a journal or a snapshot, and it does not grow with load until a collection exceeds its reserved capacity.
+
+**Fixed part** (independent of the flags, approximate):
+
+| Collection | Reserved for | Memory |
+|------------|--------------|--------|
+| Live-order set | 1M resting orders | ~34 MiB |
+| Per-account open-order counts and rate-limit buckets | 1M accounts | ~48 MiB |
+| Reservation slab and free list | 2M reservations | ~40 MiB |
+| Order books | 4K orders and 1K stops per instrument | ~0.7 MiB per instrument |
+
+About **190 MiB** with 100 instruments. `--accounts` raises the per-account maps above their 1M reservation when it exceeds it.
+
+**Balance map**, sized from the flags: room for `--accounts × --instruments × 2` balances (a base and a quote balance per instrument per account) at about **30 bytes each**, with the bucket count rounded up to a power of two, so the actual figure is between one and two times that:
+
+| `--accounts` | `--instruments` | Balances reserved | Memory |
+|--------------|-----------------|-------------------|--------|
+| 10,000 | 20 | 400K | ~15 MiB |
+| 100,000 (default) | 100 (default) | 20M | ~1 GiB |
+| 1,000,000 | 100 | 200M | ~8 GiB |
+
+Size the two flags to the deployment rather than leaving the defaults: they exist so that provisioning an account on a running node never grows this map on the matching thread, and the default reserves for a large venue.
+
+**Shadow copy.** A node that writes snapshots keeps a second engine for it, built from a snapshot of the first. It reserves the fixed part again, about 190 MiB, and holds its balance map at the size of the state it was built from.
+
+**Restarts.** A node restored from a snapshot has its balance map sized to the snapshot's entries; at startup it rebuilds the map to the flags' counts, so for a few seconds both copies exist. Budget for the balance map twice on a restore. A node recovering a journal reserves before replaying, so it needs no such headroom.
+
 ### Ring Buffer Memory
 
 The input and output ring buffers are allocated at startup:
@@ -942,12 +971,14 @@ Total ring buffer memory: approximately **144 MiB**. This is fixed regardless of
 | Component | Estimate |
 |-----------|----------|
 | Ring buffers | ~144 MiB |
-| Exchange state (order books, accounts) | 10-500 MiB (depends on active orders) |
+| Engine, fixed part | ~190 MiB with 100 instruments (see [Engine Memory](#engine-memory)) |
+| Engine, balance map | ~1 GiB at the default `--accounts` and `--instruments`; ~15 MiB at 10,000 accounts and 20 instruments |
+| Shadow copy (if snapshots are enabled) | ~190 MiB plus its own balance map at the snapshot's size |
 | Journal pre-allocation | 256 MiB chunk |
 | Replication ring (if enabled) | 128 MiB (256 slots × 512 KiB, tunable via `--replication-ring-size`) |
 | Connection state | ~4 KiB per connection |
 | jemalloc overhead | ~10-50 MiB |
-| **Total (typical)** | **300-800 MiB** (add replication ring if enabled) |
+| **Total (typical)** | **~1.8 GiB** at the default counts with snapshots and replication; **~700 MiB** at 10,000 accounts and 20 instruments |
 
 ### Replication Ring Sizing
 
