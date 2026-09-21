@@ -435,6 +435,43 @@ fn wait_metric(
     }
 }
 
+/// Wait until `replicas` replicas are connected and every replica slot
+/// has acked the primary's journal up to its current sequence. Stronger
+/// than the health line's lag, which covers only the slots the primary
+/// counts as engaged: a replica that has just attached is not one of them
+/// until its catch-up settles, and its slot is what this waits on. The
+/// sequence is read before the acks, so ticks journaled between the two
+/// reads cannot fail the comparison.
+fn wait_every_replica_acked(primary_health: SocketAddr, replicas: u64, timeout: Duration) {
+    let start = Instant::now();
+    let snapshot = || {
+        let seq = query_health(primary_health).ok().map(|(_, seq, _, _)| seq);
+        let connected = fetch_metric_u64(primary_health, "melin_replicas_connected ");
+        let acked = [
+            fetch_metric_u64(primary_health, "melin_replica_acked_sequence{slot=\"0\"} "),
+            fetch_metric_u64(primary_health, "melin_replica_acked_sequence{slot=\"1\"} "),
+        ];
+        (seq, connected, acked)
+    };
+    loop {
+        if let (Some(seq), Some(connected), [Some(a0), Some(a1)]) = snapshot()
+            && connected == replicas
+            && a0 >= seq
+            && a1 >= seq
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "timed out waiting for {replicas} replicas to ack the primary's journal; \
+                 last (journal_seq, connected, acked) = {:?}",
+                snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -2414,7 +2451,12 @@ fn replacement_replica_catches_up_from_journal() {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
         assert!(!r.is_empty(), "order {i}: no response after catch-up");
     }
-    cluster.wait_replicated();
+    // Not `wait_replicated`: the health line's lag covers the replicas the
+    // primary counts as engaged, and the replacement may not be one of
+    // them yet. Ask for both slots by name, so the replacement has every
+    // order in its journal before the primary goes away — otherwise the
+    // promotion below races the tail of this batch.
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(10));
 
     // Kill primary, promote the replacement replica.
     drop(client);
