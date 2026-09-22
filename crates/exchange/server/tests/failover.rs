@@ -35,6 +35,7 @@ use melin_ec_protocol::message::Request;
 use melin_ec_protocol::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce,
 };
+use melin_ec_server::ServerApp;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1835,6 +1836,155 @@ fn same_key_request_seq_hwm_survives_failover() {
     );
 }
 
+/// Wait for a snapshot beside `journal` that covers journal sequence
+/// `through`, and return its path with the engine it holds. The shadow
+/// copy snapshots on its own timer from wherever it has applied to, so a
+/// file found on disk may predate the caller's last acknowledged write: a
+/// stale one is read and passed over, never trusted. Reading beside a
+/// running node is safe — a snapshot lands by rename, so what is on disk
+/// is always a whole file.
+fn wait_for_snapshot_through(journal: &Path, through: u64) -> (PathBuf, ServerApp) {
+    let snap_path = journal.with_extension("snapshot");
+    let start = Instant::now();
+    loop {
+        if snap_path.exists() {
+            match melin_transport_core::snapshot::load::<ServerApp>(&snap_path) {
+                Ok((engine, seq, _, _)) if seq >= through => {
+                    eprintln!("Snapshot at {} covers sequence {seq}", snap_path.display());
+                    return (snap_path, engine);
+                }
+                Ok((_, seq, _, _)) => eprintln!("snapshot at sequence {seq} predates {through}"),
+                Err(e) => panic!("snapshot at {} unreadable: {e}", snap_path.display()),
+            }
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            panic!(
+                "no snapshot covering sequence {through} within 60s at {}",
+                snap_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Two processes sharing one key collide on the request sequence: both
+/// adopt the same mark at connect, so the second one's first write repeats
+/// the first one's sequence and is refused as a duplicate. The refusal
+/// used to be decided by the node runtime before `apply`, and the copy of
+/// the engine that writes snapshots never ran it, so a snapshot could hold
+/// the order its client was told was refused. The check now runs in
+/// `apply`, on that copy like everywhere else: the snapshot holds what the
+/// primary holds, and the mark the primary reached.
+#[test]
+#[serial]
+fn refused_duplicate_is_absent_from_the_snapshot() {
+    use melin_ec_protocol::types::{ExecutionReport, RejectReason};
+
+    let bin = server_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[0xFA; 32]);
+    let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+    let operator_key = SigningKey::from_bytes(&[0xFD; 32]);
+    let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+    let (keys_path, _) =
+        write_auth_keys_multi(tmp.path(), &[&key, &key2], &operator_key, &repl_key);
+
+    let client_port = free_port();
+    let health_port = free_port();
+    let journal = tmp.path().join("primary.journal");
+    let mut node = {
+        let child = Command::new(&bin)
+            .args([
+                "--bind",
+                &format!("127.0.0.1:{client_port}"),
+                "--health-bind",
+                &format!("127.0.0.1:{health_port}"),
+                "--journal",
+                journal.to_str().unwrap(),
+                "--authorized-keys",
+                keys_path.to_str().unwrap(),
+                "--accounts",
+                "10",
+                "--instruments",
+                "2",
+                "--connection-timeout-secs",
+                "0",
+                "--cores",
+                "none",
+                "--standalone",
+                "--ack-policy",
+                "disk",
+                "--snapshot-interval-ms",
+                "100",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .spawn()
+            .expect("spawn node");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{client_port}").parse().unwrap(),
+            health_addr: format!("127.0.0.1:{health_port}").parse().unwrap(),
+        }
+    };
+    wait_healthy(node.health_addr, Duration::from_secs(30));
+
+    // Both connections adopt the key's mark, 0, before either writes.
+    let mut first = connect_with_timeout(node.client_addr, &key);
+    let mut second = connect_with_timeout(node.client_addr, &key);
+
+    let r = submit_order(&mut first, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(rep, ExecutionReport::Placed { .. })),
+        "order 1: {r:?}"
+    );
+    // The second connection's counter is one behind: its first write
+    // repeats sequence 1, and is refused against order 2's own id.
+    let r = submit_order(&mut second, 2, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            ExecutionReport::Rejected {
+                order_id: OrderId(2),
+                reason: RejectReason::DuplicateRequest,
+                ..
+            }
+        )),
+        "order 2 repeats sequence 1: {r:?}"
+    );
+    // Resynchronised past the mark, it is served like the first.
+    assert_eq!(second.synchronize_request_seq().unwrap(), 1);
+    let r = submit_order(&mut second, 3, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(rep, ExecutionReport::Placed { .. })),
+        "order 3: {r:?}"
+    );
+    drop(first);
+    drop(second);
+
+    // Every reply above was gated on its journal write, so a snapshot
+    // covering the journal as it stands now holds all three requests.
+    let (_, through, _, _) = query_health(node.health_addr).expect("health");
+    let (_, engine) = wait_for_snapshot_through(&journal, through);
+    unsafe { libc::kill(node.child.id() as i32, libc::SIGINT) };
+    let _ = node.child.wait();
+
+    let mut live: Vec<u64> = engine
+        .snapshot_order_sides()
+        .into_iter()
+        .map(|((_, id), _)| id.0)
+        .collect();
+    live.sort_unstable();
+    assert_eq!(live, [1, 3], "the snapshot holds the refused order 2");
+    let marks = engine.snapshot_key_hwm();
+    assert_eq!(marks.len(), 1, "one key wrote: {marks:?}");
+    assert_eq!(
+        marks[0].1, 2,
+        "the mark is the two accepted sequences, not three"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dual replication helpers
 // ---------------------------------------------------------------------------
@@ -2908,26 +3058,10 @@ fn snapshot_transfer_when_archives_purged() {
     drop(client);
 
     // All 20 orders are now committed (each submit_order waited for a
-    // response gated on journal fsync). Remove any snapshot taken before
-    // this point — every thread is unpinned and yields, so the timer
-    // fires promptly and a partial snapshot (e.g. only orders 1–N) may
-    // already exist. The next snapshot is guaranteed to include all 20
-    // orders.
-    let snap_path = primary_journal.with_extension("snapshot");
-    let _ = std::fs::remove_file(&snap_path);
-
-    // Wait for a fresh snapshot that captures the full committed state.
-    let start = Instant::now();
-    while !snap_path.exists() {
-        if start.elapsed() > Duration::from_secs(60) {
-            panic!(
-                "snapshot was not created within 60s at {}",
-                snap_path.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    eprintln!("Snapshot created at {}", snap_path.display());
+    // response gated on journal fsync), so a snapshot covering the journal
+    // as it stands includes all of them — one already on disk may not.
+    let (_, through, _, _) = query_health(primary.health_addr).expect("health");
+    wait_for_snapshot_through(&primary_journal, through);
 
     // Stop the standalone primary. `wait()` already blocks until the
     // process exits and its files are flushed by the kernel — no extra
@@ -3397,7 +3531,6 @@ fn rotation_soak_under_load() {
     // would execute; the recovered writer must resume exactly one past
     // the replica's durable tail.
     {
-        use melin_ec_server::ServerApp;
         use melin_ec_trading::trading_event::TradingRequest;
         use melin_journal::BufferedWriter;
         use melin_transport_core::JournaledApp;
