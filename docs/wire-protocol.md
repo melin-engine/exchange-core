@@ -8,20 +8,22 @@ All multi-byte integers are **little-endian**. No CRC on the wire -- TCP handles
 
 ### Request Frame
 
-Every client-to-server message includes a per-key request sequence number for idempotency:
+Every client-to-server message starts with its tag and carries a per-key request sequence number for idempotency:
 
 ```
-+----------------+-----------+----------+-----------+
-| length (4B LE) | seq (8B)  | tag (1B) | payload   |
-+----------------+-----------+----------+-----------+
++----------------+----------+-----------+-----------+
+| length (4B LE) | tag (1B) | seq (8B)  | payload   |
++----------------+----------+-----------+-----------+
 ```
 
 | Field   | Type | Size    | Description                                              |
 |---------|------|---------|----------------------------------------------------------|
-| length  | u32  | 4 bytes | Byte count of seq + tag + payload (excludes itself)      |
-| seq     | u64  | 8 bytes | Per-key request sequence for idempotency (0 for heartbeat) |
+| length  | u32  | 4 bytes | Byte count of tag + seq + payload (excludes itself)      |
 | tag     | u8   | 1 byte  | Message type discriminant                                |
+| seq     | u64  | 8 bytes | Per-key request sequence for idempotency (0 for heartbeat) |
 | payload | ...  | 0..N    | Variant-specific fields                                  |
+
+The tag is the first byte after the length because the node reads it before anything else: a frame with no tag, or with a tag below `0x10` (the range the node keeps for its own frames), is dropped without reaching the exchange. Every request tag is `0x10` or above.
 
 The `seq` field is a monotonically increasing counter per authentication key. The engine tracks a high-water mark per key and rejects requests with `DuplicateRequest` if `seq <= hwm`. This makes retries safe after network failures -- the engine refuses already-processed requests. Heartbeats and the read-only queries are exempt and may carry any `seq`; heartbeats use `0`. The `ChallengeResponse` of the authentication handshake is a frame of the node runtime, not a request, and carries no `seq` (see "Authentication Handshake").
 
@@ -122,7 +124,7 @@ Total order size: 24 bytes (Market, no expiry) to 48 bytes (StopLimit + GTD expi
 | 38  | Subscribe         | Any (internal)    | 1 + count×4          |
 | 39  | QueryPosition     | Trader            | 4                    |
 
-Payload sizes above exclude the 1-byte tag and 8-byte seq. The frame length = 8 (seq) + 1 (tag) + payload size, except for `ChallengeResponse`, which has no seq: its frame length is 1 (tag) + 96.
+Payload sizes above exclude the 1-byte tag and 8-byte seq. The frame length = 1 (tag) + 8 (seq) + payload size, except for `ChallengeResponse`, which has no seq: its frame length is 1 (tag) + 96.
 
 ### Tag 1: SubmitOrder
 
@@ -160,7 +162,7 @@ Kill switch: cancels all resting orders and pending stops for the given account 
 | 0      | signature  | 64   |
 | 64     | public_key | 32   |
 
-Ed25519 signature (64 bytes) over the server-provided 32-byte nonce, followed by the client's Ed25519 public key (32 bytes). Total payload: 96 bytes. Unlike every other request, the frame carries no `seq` before the tag: the handshake belongs to the node runtime, which never reads one.
+Ed25519 signature (64 bytes) over the server-provided 32-byte nonce, followed by the client's Ed25519 public key (32 bytes). Total payload: 96 bytes. Unlike every other request, the frame carries no `seq` after the tag: the handshake belongs to the node runtime, which never reads one.
 
 ### Tag 6: AddInstrument
 

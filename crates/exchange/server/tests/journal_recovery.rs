@@ -110,13 +110,10 @@ mod tests {
             request_seq: u64,
             event: TradingEvent,
         ) -> Vec<ExecutionReport> {
-            use melin_app::{Application, ApplyCtx, WireSeq};
+            use melin_app::{Application, ApplyCtx};
             let mut reports = Vec::new();
             let ctx = ApplyCtx {
                 now_ns: 0,
-                journal_sequence: WireSeq::new(0),
-                active_connections: 0,
-                events_processed: 0,
                 key_hash,
             };
             self.inner

@@ -50,30 +50,33 @@ use melin_wire_protocol::error::ProtocolError;
 // they're typed; payloads keep the explicit le::put / le::get chain.
 
 /// Length-prefixed frame header for requests:
-/// `[length:u32] [seq:u64] [tag:u8] [payload]`. The 4-byte length value
-/// covers `seq + tag + payload`. Encoders back-fill this at the end.
+/// `[length:u32] [tag:u8] [seq:u64] [payload]`. The 4-byte length value
+/// covers `tag + seq + payload`. Encoders back-fill this at the end.
+///
+/// The tag comes first because the node runtime reads it before anything
+/// else: the sequencer's protocol is `[tag][body]` for every request, and
+/// the runtime drops a frame whose tag is in its reserved range before
+/// any decoder sees it. The sequence is the first thing in the body.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct RequestFrameHeader {
     length: U32,
+    tag: u8,
     seq: U64,
 }
 
 const REQUEST_FRAME_HEADER_LEN: usize = core::mem::size_of::<RequestFrameHeader>();
-const _: () = assert!(REQUEST_FRAME_HEADER_LEN == 12);
+const _: () = assert!(REQUEST_FRAME_HEADER_LEN == 13);
 
-/// Post-length-prefix view of a request received from the wire:
-/// `[seq:u64] [tag:u8]` (the 4-byte length prefix has been stripped
-/// by the framing layer). The decoder peels this 8-byte typed prefix
-/// and reads `tag` from the byte that follows.
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-#[repr(C)]
-struct RequestSeqHeader {
-    seq: U64,
-}
+/// Bytes of a request body ahead of the payload: the sequence.
+const REQUEST_SEQ_LEN: usize = core::mem::size_of::<U64>();
 
-const REQUEST_SEQ_HEADER_LEN: usize = core::mem::size_of::<RequestSeqHeader>();
-const _: () = assert!(REQUEST_SEQ_HEADER_LEN == 8);
+/// Bound on one request body — sequence and payload, after the tag. The
+/// widest request is a `StopLimit` + `GTD` `SubmitOrder`: a symbol and
+/// an order of 8 id + 4 account + 1 side + 1 type + 16 prices + 1 tif +
+/// 8 quantity + 1 stp + 8 expiry. A test encodes one and pins the number;
+/// the server checks it against the node runtime's bound at compile time.
+pub const MAX_REQUEST_BODY: usize = REQUEST_SEQ_LEN + 4 + 48;
 
 // Transport-level tags (0x00–0x0F) are the sequencer's: encoded by its
 // runtime and told apart by its client, they never reach this codec.
@@ -149,92 +152,82 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 // connections instead of rejecting. Reserved: never reassign it, or a client
 // built against an older release would misread the new reason.
 
-/// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
+/// Encode a request into `buf`. Returns total bytes written (length prefix + tag + seq + payload).
 ///
 /// The caller must ensure `buf` is large enough: 128 bytes bounds every
-/// request (the largest, a `StopLimit` + `GTD` `SubmitOrder`, is 4 prefix +
-/// 8 seq + 1 tag + 52 payload). The `ChallengeResponse` of the handshake
-/// is the sequencer's frame, built by its client, and never passes here.
-/// `seq` is the per-key monotonic request sequence the engine's
-/// idempotency check reads. A heartbeat uses `seq = 0`: the node runtime
-/// answers it, and it never reaches the engine.
+/// request (the largest is 4 prefix + 1 tag + [`MAX_REQUEST_BODY`]). The
+/// `ChallengeResponse` of the handshake is the sequencer's frame, built by
+/// its client, and never passes here. `seq` is the per-key monotonic
+/// request sequence the engine's idempotency check reads. A heartbeat
+/// uses `seq = 0`: the node runtime answers it, and it never reaches the
+/// engine.
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    // Reserve the request frame header (length + seq); back-filled below.
+    // Reserve the request frame header (length + tag + seq); back-filled
+    // below, once the payload has said how long it is and which tag names it.
     let mut pos = REQUEST_FRAME_HEADER_LEN;
 
-    match request {
+    let tag = match request {
         Request::SubmitOrder { symbol, order } => {
-            buf[pos] = TAG_SUBMIT_ORDER;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             pos += encode_order(order, &mut buf[pos..]);
+            TAG_SUBMIT_ORDER
         }
         Request::CancelOrder {
             symbol,
             account,
             order_id,
         } => {
-            buf[pos] = TAG_CANCEL_ORDER;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            TAG_CANCEL_ORDER
         }
         Request::CancelAll { account } => {
-            buf[pos] = TAG_CANCEL_ALL;
-            pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
+            TAG_CANCEL_ALL
         }
-        Request::Heartbeat => {
-            buf[pos] = TAG_REQUEST_HEARTBEAT;
-            pos += 1;
-        }
+        Request::Heartbeat => TAG_REQUEST_HEARTBEAT,
         Request::AddInstrument { spec } => {
-            buf[pos] = TAG_ADD_INSTRUMENT;
-            pos += 1;
             le::put_u32(&mut buf[pos..], spec.symbol.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], spec.base.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], spec.quote.0);
             pos += 4;
+            TAG_ADD_INSTRUMENT
         }
         Request::Deposit {
             account,
             currency,
             amount,
         } => {
-            buf[pos] = TAG_DEPOSIT;
-            pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], currency.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], *amount);
             pos += 8;
+            TAG_DEPOSIT
         }
         Request::Withdraw {
             account,
             currency,
             amount,
         } => {
-            buf[pos] = TAG_WITHDRAW;
-            pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], currency.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], *amount);
             pos += 8;
+            TAG_WITHDRAW
         }
         Request::SetRiskLimits { symbol, limits } => {
-            buf[pos] = TAG_SET_RISK_LIMITS;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             // Flags byte: bit 0 = has max_order_qty, bit 1 = has max_order_notional.
@@ -250,10 +243,9 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
                 le::put_u64(&mut buf[pos..], notional);
                 pos += 8;
             }
+            TAG_SET_RISK_LIMITS
         }
         Request::SetCircuitBreaker { symbol, config } => {
-            buf[pos] = TAG_SET_CIRCUIT_BREAKER;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             // Flags: bit 0 = has lower band, bit 1 = has upper band, bit 2 = halted.
@@ -270,6 +262,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
                 le::put_u64(&mut buf[pos..], upper.get());
                 pos += 8;
             }
+            TAG_SET_CIRCUIT_BREAKER
         }
         Request::CancelReplace {
             symbol,
@@ -278,8 +271,6 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             new_price,
             new_quantity,
         } => {
-            buf[pos] = TAG_CANCEL_REPLACE;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], account.0);
@@ -290,70 +281,57 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 8;
             le::put_u64(&mut buf[pos..], new_quantity.get());
             pos += 8;
+            TAG_CANCEL_REPLACE
         }
         Request::SetFeeSchedule { symbol, schedule } => {
-            buf[pos] = TAG_SET_FEE_SCHEDULE;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             le::put_i16(&mut buf[pos..], schedule.maker_fee_bps);
             pos += 2;
             le::put_i16(&mut buf[pos..], schedule.taker_fee_bps);
             pos += 2;
+            TAG_SET_FEE_SCHEDULE
         }
-        Request::QueryStats => {
-            buf[pos] = TAG_QUERY_STATS;
-            pos += 1;
-        }
-        Request::EndOfDay => {
-            buf[pos] = TAG_END_OF_DAY;
-            pos += 1;
-        }
+        Request::QueryStats => TAG_QUERY_STATS,
+        Request::EndOfDay => TAG_END_OF_DAY,
         Request::DisableInstrument { symbol } => {
-            buf[pos] = TAG_DISABLE_INSTRUMENT;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
+            TAG_DISABLE_INSTRUMENT
         }
         Request::EnableInstrument { symbol } => {
-            buf[pos] = TAG_ENABLE_INSTRUMENT;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
+            TAG_ENABLE_INSTRUMENT
         }
         Request::RemoveInstrument { symbol } => {
-            buf[pos] = TAG_REMOVE_INSTRUMENT;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
+            TAG_REMOVE_INSTRUMENT
         }
         Request::Subscribe { symbols, count } => {
-            buf[pos] = TAG_SUBSCRIBE;
-            pos += 1;
             buf[pos] = *count;
             pos += 1;
             for sym in &symbols[..(*count as usize)] {
                 le::put_u32(&mut buf[pos..], sym.0);
                 pos += 4;
             }
+            TAG_SUBSCRIBE
         }
         Request::QueryPosition { account } => {
-            buf[pos] = TAG_QUERY_POSITION;
-            pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
+            TAG_QUERY_POSITION
         }
-        Request::QueryRequestSeq => {
-            buf[pos] = TAG_QUERY_REQUEST_SEQ;
-            pos += 1;
-        }
-    }
+        Request::QueryRequestSeq => TAG_QUERY_REQUEST_SEQ,
+    };
 
-    // Write the length prefix (excludes the 4-byte length field itself).
+    // Write the header: the length excludes the 4-byte length field itself.
     let payload_len = pos - 4;
     let header = RequestFrameHeader::mut_from_bytes(&mut buf[..REQUEST_FRAME_HEADER_LEN])
         .expect("REQUEST_FRAME_HEADER_LEN slice matches struct size");
     header.length = U32::new(payload_len as u32);
+    header.tag = tag;
     header.seq = U64::new(seq);
 
     Ok(pos)
@@ -361,19 +339,21 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
 
 /// Decode a request from `buf` (after the length prefix has been stripped).
 ///
-/// `buf` should contain exactly the seq + tag + payload bytes (no length prefix).
-/// Returns `(seq, Request)` where `seq` is the per-key idempotency sequence.
+/// `buf` should contain exactly the tag + seq + payload bytes (no length
+/// prefix). For a request the node runtime has already split, see
+/// [`decode_request_body`], which this delegates to.
 pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
-    // Need at least seq(8) + tag(1) = 9 bytes.
-    let (header, after_header) =
-        RequestSeqHeader::ref_from_prefix(buf).map_err(|_| ProtocolError::Truncated)?;
-    if after_header.is_empty() {
-        return Err(ProtocolError::Truncated);
-    }
+    let (&tag, body) = buf.split_first().ok_or(ProtocolError::Truncated)?;
+    decode_request_body(tag, body)
+}
 
-    let seq = header.seq.get();
-    let tag = after_header[0];
-    let payload = &after_header[1..];
+/// Decode a request from its tag and the body after it (the sequence,
+/// then the payload) — the split the node runtime hands a decoder.
+///
+/// Returns `(seq, Request)` where `seq` is the per-key idempotency sequence.
+pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), ProtocolError> {
+    let (seq, payload) = U64::ref_from_prefix(body).map_err(|_| ProtocolError::Truncated)?;
+    let seq = seq.get();
 
     match tag {
         TAG_SUBMIT_ORDER => {
@@ -652,42 +632,72 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
     }
 }
 
-/// Encode a response into `buf`. Returns total bytes written (length prefix + tag + payload).
-///
-/// The caller must ensure `buf` is large enough. PositionSnapshot is the
-/// largest variant at up to 330 bytes (length(4) + tag(1) + account(4) +
-/// count(1) + 16*(currency(4)+free(8)+reserved(8))). 512 bytes is generous.
-pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    let mut pos = 4; // reserve for length prefix
+/// Bytes the wire puts ahead of a response body: the length prefix and
+/// the tag.
+const RESPONSE_HEADER_LEN: usize = 4 + 1;
 
-    match response {
+/// Bound on one response body — the payload after the tag. The widest is
+/// a `PositionSnapshot` with every balance slot used: account(4) +
+/// count(1) + 16 × (currency(4) + free(8) + reserved(8)). A test encodes
+/// one and pins the number; the server checks it against the node
+/// runtime's bound at compile time.
+pub const MAX_RESPONSE_BODY: usize = 4 + 1 + 16 * 20;
+
+/// Encode a response into `buf` as a complete wire frame. Returns total
+/// bytes written (length prefix + tag + body).
+///
+/// For the node's own response stage, which frames what it sends
+/// itself, see [`encode_response_body`]. The caller must ensure `buf` is
+/// large enough: the 5-byte header + [`MAX_RESPONSE_BODY`] bounds every
+/// frame.
+pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+    let (tag, body_len) = encode_response_body(response, &mut buf[RESPONSE_HEADER_LEN..])?;
+    // The length covers the tag and the body, not itself.
+    le::put_u32(&mut buf[0..], (1 + body_len) as u32);
+    buf[4] = tag;
+    Ok(RESPONSE_HEADER_LEN + body_len)
+}
+
+/// Encode a response's body — everything after the tag — at the start of
+/// `buf`. Returns the tag that names it and the body's length, for a
+/// caller that writes the frame around it: the node runtime frames what
+/// its response stage sends.
+///
+/// The caller must ensure `buf` holds [`MAX_RESPONSE_BODY`] bytes.
+pub fn encode_response_body(
+    response: &ResponseKind,
+    buf: &mut [u8],
+) -> Result<(u8, usize), ProtocolError> {
+    let mut pos = 0;
+
+    let tag = match response {
         ResponseKind::Report(report) => {
-            pos += encode_execution_report(report, &mut buf[pos..]);
+            let (tag, len) = encode_execution_report(report, buf);
+            pos += len;
+            tag
         }
         ResponseKind::StatsHeader {
             active_connections,
             events_processed,
             journal_sequence,
         } => {
-            buf[pos] = TAG_STATS_HEADER;
-            pos += 1;
             le::put_u64(&mut buf[pos..], *active_connections);
             pos += 8;
             le::put_u64(&mut buf[pos..], *events_processed);
             pos += 8;
             le::put_u64(&mut buf[pos..], *journal_sequence);
             pos += 8;
+            TAG_STATS_HEADER
         }
         ResponseKind::BookSnapshotBegin {
             symbol,
             last_applied_seq,
         } => {
-            buf[pos] = TAG_BOOK_SNAPSHOT_BEGIN;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], *last_applied_seq);
             pos += 8;
+            TAG_BOOK_SNAPSHOT_BEGIN
         }
         ResponseKind::BookSnapshotLevel {
             symbol,
@@ -696,8 +706,6 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             qty,
             order_count,
         } => {
-            buf[pos] = TAG_BOOK_SNAPSHOT_LEVEL;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             buf[pos] = le::encode_side(*side);
@@ -708,31 +716,28 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             pos += 8;
             le::put_u32(&mut buf[pos..], *order_count);
             pos += 4;
+            TAG_BOOK_SNAPSHOT_LEVEL
         }
         ResponseKind::BookSnapshotEnd {
             symbol,
             level_count,
         } => {
-            buf[pos] = TAG_BOOK_SNAPSHOT_END;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], *level_count);
             pos += 4;
+            TAG_BOOK_SNAPSHOT_END
         }
         ResponseKind::SnapshotComplete { last_applied_seq } => {
-            buf[pos] = TAG_SNAPSHOT_COMPLETE;
-            pos += 1;
             le::put_u64(&mut buf[pos..], *last_applied_seq);
             pos += 8;
+            TAG_SNAPSHOT_COMPLETE
         }
         ResponseKind::PositionSnapshot {
             account,
             balances,
             count,
         } => {
-            buf[pos] = TAG_POSITION_SNAPSHOT;
-            pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             buf[pos] = *count;
@@ -747,19 +752,16 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
                 le::put_u64(&mut buf[pos..], entry.reserved);
                 pos += 8;
             }
+            TAG_POSITION_SNAPSHOT
         }
         ResponseKind::RequestSeqHwm { hwm } => {
-            buf[pos] = TAG_REQUEST_SEQ_HWM;
-            pos += 1;
             le::put_u64(&mut buf[pos..], *hwm);
             pos += 8;
+            TAG_REQUEST_SEQ_HWM
         }
-    }
+    };
 
-    let payload_len = pos - 4;
-    le::put_u32(&mut buf[0..], payload_len as u32);
-
-    Ok(pos)
+    Ok((tag, pos))
 }
 
 /// Decode a response from `buf` (after the length prefix has been stripped).
@@ -1056,10 +1058,12 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
 // --- ExecutionReport encoding ---
 
 /// Encode an `ExecutionReport` into `buf`. Returns bytes written (includes tag byte).
-fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
+/// Encode an `ExecutionReport`'s body at the start of `buf`. Returns the
+/// tag that names the variant and the bytes written.
+fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usize) {
     let mut pos = 0;
 
-    match report {
+    let tag = match report {
         ExecutionReport::Placed {
             order_id,
             symbol,
@@ -1068,8 +1072,6 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             price,
             quantity,
         } => {
-            buf[pos] = TAG_PLACED;
-            pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -1082,6 +1084,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 8;
             le::put_u64(&mut buf[pos..], quantity.get());
             pos += 8;
+            TAG_PLACED
         }
         ExecutionReport::Fill {
             maker_order_id,
@@ -1094,8 +1097,6 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             maker_fee,
             taker_fee,
         } => {
-            buf[pos] = TAG_FILL;
-            pos += 1;
             le::put_u64(&mut buf[pos..], maker_order_id.0);
             pos += 8;
             le::put_u64(&mut buf[pos..], taker_order_id.0);
@@ -1114,6 +1115,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 8;
             le::put_u64(&mut buf[pos..], *taker_fee as u64);
             pos += 8;
+            TAG_FILL
         }
         ExecutionReport::Cancelled {
             order_id,
@@ -1121,8 +1123,6 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             account,
             remaining_quantity,
         } => {
-            buf[pos] = TAG_CANCELLED;
-            pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -1131,6 +1131,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 4;
             le::put_u64(&mut buf[pos..], remaining_quantity.get());
             pos += 8;
+            TAG_CANCELLED
         }
         ExecutionReport::Triggered {
             order_id,
@@ -1138,8 +1139,6 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             account,
             trigger_price,
         } => {
-            buf[pos] = TAG_TRIGGERED;
-            pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -1148,6 +1147,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 4;
             le::put_u64(&mut buf[pos..], trigger_price.get());
             pos += 8;
+            TAG_TRIGGERED
         }
         ExecutionReport::Rejected {
             order_id,
@@ -1155,8 +1155,6 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             account,
             reason,
         } => {
-            buf[pos] = TAG_REJECTED;
-            pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -1165,6 +1163,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 4;
             buf[pos] = encode_reject_reason(*reason);
             pos += 1;
+            TAG_REJECTED
         }
         ExecutionReport::Replaced {
             order_id,
@@ -1176,8 +1175,6 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             old_remaining,
             new_remaining,
         } => {
-            buf[pos] = TAG_REPLACED;
-            pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -1194,18 +1191,18 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 8;
             le::put_u64(&mut buf[pos..], new_remaining.get());
             pos += 8;
+            TAG_REPLACED
         }
         ExecutionReport::InstrumentStatusChanged { symbol, status } => {
-            buf[pos] = TAG_INSTRUMENT_STATUS_CHANGED;
-            pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             buf[pos] = *status as u8;
             pos += 1;
+            TAG_INSTRUMENT_STATUS_CHANGED
         }
-    }
+    };
 
-    pos
+    (tag, pos)
 }
 
 /// Decode an `ExecutionReport` from tag + payload.
@@ -1855,41 +1852,127 @@ mod tests {
         }
     }
 
+    /// The body form is the frame form without its header: the same
+    /// bytes, and the tag the frame would carry, for a caller that
+    /// frames the response itself.
+    #[test]
+    fn response_body_is_the_frame_without_its_header() {
+        let mut frame = [0u8; 512];
+        let mut body = [0u8; MAX_RESPONSE_BODY];
+
+        for (i, response) in make_responses().iter().enumerate() {
+            let written = encode_response(response, &mut frame).unwrap();
+            let (tag, len) = encode_response_body(response, &mut body).unwrap();
+            assert_eq!(tag, frame[4], "tag of variant {i}");
+            assert_eq!(1 + len, written - 4, "length of variant {i}");
+            assert_eq!(body[..len], frame[5..written], "body of variant {i}");
+        }
+    }
+
+    /// The widest response is the one `MAX_RESPONSE_BODY` is computed from.
+    #[test]
+    fn max_response_body_is_a_full_position_snapshot() {
+        let response = ResponseKind::PositionSnapshot {
+            account: AccountId(1),
+            balances: [AccountBalance::ZERO; 16],
+            count: 16,
+        };
+        let mut body = [0u8; MAX_RESPONSE_BODY];
+        let (_, len) = encode_response_body(&response, &mut body).unwrap();
+        assert_eq!(len, MAX_RESPONSE_BODY);
+    }
+
     #[test]
     fn truncated_request_detected() {
-        // Empty buffer — not enough for seq(8) + tag(1).
+        // Empty buffer — not even a tag.
         let result = decode_request(&[]);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // Only 3 bytes — still too short for seq(8) + tag(1).
-        let result = decode_request(&[0; 3]);
+        // A tag and 3 bytes — too short for the seq(8) behind it.
+        let mut short = [0u8; 1 + 3];
+        short[0] = TAG_CANCEL_ALL;
+        let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // seq(8) + tag present but payload too short for SubmitOrder.
+        // tag + seq(8) present but payload too short for SubmitOrder.
         let mut short = [0u8; 11];
-        short[8] = TAG_SUBMIT_ORDER;
+        short[0] = TAG_SUBMIT_ORDER;
         let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // CancelAll needs account(4) after the tag. 3 bytes after the
-        // tag must be rejected.
+        // CancelAll needs account(4) after the seq. 3 bytes after the
+        // seq must be rejected.
         let mut short = [0u8; 9 + 3];
-        short[8] = TAG_CANCEL_ALL;
+        short[0] = TAG_CANCEL_ALL;
         let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
-        // Exactly 4 bytes after the tag is the boundary — must succeed.
+        // Exactly 4 bytes after the seq is the boundary — must succeed.
         let mut ok_buf = [0u8; 9 + 4];
-        ok_buf[8] = TAG_CANCEL_ALL;
+        ok_buf[0] = TAG_CANCEL_ALL;
         assert!(decode_request(&ok_buf).is_ok());
     }
 
     #[test]
     fn unknown_request_tag_detected() {
-        // seq(8) + unknown tag byte.
+        // Unknown tag byte + seq(8).
         let mut buf = [0u8; 9];
-        buf[8] = 255;
+        buf[0] = 255;
         let result = decode_request(&buf);
         assert!(matches!(result, Err(ProtocolError::UnknownTag(255))));
+    }
+
+    /// The layout the node runtime relies on: the tag is the first byte
+    /// after the length prefix, and the body it hands the decoder starts
+    /// with the sequence. `decode_request_body` reads exactly that split.
+    #[test]
+    fn the_tag_leads_and_the_seq_opens_the_body() {
+        let request = Request::CancelAll {
+            account: AccountId(9),
+        };
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 0x0102_0304_0506_0708, &mut buf).unwrap();
+
+        assert_eq!(buf[4], TAG_CANCEL_ALL, "the tag follows the length");
+        assert_eq!(
+            buf[5..13],
+            0x0102_0304_0506_0708u64.to_le_bytes(),
+            "the seq follows the tag"
+        );
+        assert_eq!(le::get_u32(&buf[13..]), 9, "the payload follows the seq");
+
+        let (tag, body) = (buf[4], &buf[5..written]);
+        assert_eq!(
+            decode_request_body(tag, body).unwrap(),
+            (0x0102_0304_0506_0708, request)
+        );
+        assert!(matches!(
+            decode_request_body(tag, &body[..7]),
+            Err(ProtocolError::Truncated)
+        ));
+    }
+
+    /// The widest request is the one `MAX_REQUEST_BODY` is computed from.
+    #[test]
+    fn max_request_body_is_the_widest_submit_order() {
+        let request = Request::SubmitOrder {
+            symbol: Symbol(1),
+            order: Order {
+                id: OrderId(1),
+                account: AccountId(1),
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: Price(NonZeroU64::new(100).unwrap()),
+                    limit_price: Price(NonZeroU64::new(101).unwrap()),
+                },
+                quantity: Quantity(NonZeroU64::new(1).unwrap()),
+                time_in_force: TimeInForce::GTD,
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 1,
+            },
+        };
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 1, &mut buf).unwrap();
+        assert_eq!(written, 4 + 1 + MAX_REQUEST_BODY);
     }
 
     #[test]
@@ -1969,12 +2052,12 @@ mod tests {
 
     #[test]
     fn length_prefix_includes_seq_bytes() {
-        // The length field must include seq(8) + tag(1) + payload.
+        // The length field must include tag(1) + seq(8) + payload.
         let request = Request::Heartbeat;
         let mut buf = [0u8; 136];
         let written = encode_request(&request, 0, &mut buf).unwrap();
         let length = le::get_u32(&buf[0..]) as usize;
-        // Heartbeat has no payload, so length = seq(8) + tag(1) = 9.
+        // Heartbeat has no payload, so length = tag(1) + seq(8) = 9.
         assert_eq!(length, 9);
         assert_eq!(written, 4 + 9); // 4-byte prefix + 9 payload
     }

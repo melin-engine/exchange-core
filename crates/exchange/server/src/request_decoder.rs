@@ -12,6 +12,14 @@ use melin_ec_protocol::message::Request;
 use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_wire_protocol::error::ProtocolError;
 
+// A request the readers cannot hand over whole never reaches the decoder:
+// the connection is dropped instead. The widest request body must fit,
+// and this is where a change on either side is caught.
+const _: () = assert!(
+    codec::MAX_REQUEST_BODY <= melin_server_runtime::MAX_REQUEST_BODY,
+    "the widest request body must fit one client frame"
+);
+
 /// Decoder for the trading wire protocol.
 ///
 /// Zero-sized. The runtime owns an `Arc<dyn RequestDecoder<...>>`;
@@ -22,10 +30,11 @@ pub struct RequestDecoder;
 impl RequestDecoderTrait for RequestDecoder {
     type Event = TradingRequest;
 
-    /// The frame's request sequence travels on into the event: the
-    /// engine's idempotency check reads it from there, in `apply`.
-    fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<TradingRequest> {
-        let (request_seq, request) = match codec::decode_request(bytes) {
+    /// The runtime has read the tag; the body opens with the request
+    /// sequence, which travels on into the event: the engine's
+    /// idempotency check reads it from there, in `apply`.
+    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<TradingRequest> {
+        let (request_seq, request) = match codec::decode_request_body(tag, body) {
             Ok(pair) => pair,
             Err(e) => return Decoded::DecodeError(protocol_error_reason(&e)),
         };
@@ -166,13 +175,18 @@ mod tests {
     use melin_app::AppEvent;
     use melin_ec_types::types::*;
 
-    /// Wire-encode a Request into the byte form the decoder expects
-    /// (seq + tag + payload, with the framing length-prefix already
-    /// stripped — same shape `codec::decode_request` consumes).
-    fn encode(request: &Request, seq: u64) -> Vec<u8> {
+    /// Wire-encode a Request into the split the runtime hands the
+    /// decoder: the tag, and the body after it (seq + payload), with
+    /// the framing length-prefix already stripped.
+    fn encode(request: &Request, seq: u64) -> (u8, Vec<u8>) {
         let mut buf = vec![0u8; 256];
         let total = codec::encode_request(request, seq, &mut buf).unwrap();
-        buf[4..total].to_vec()
+        (buf[4], buf[5..total].to_vec())
+    }
+
+    /// Decode as the runtime would call it.
+    fn decode((tag, body): &(u8, Vec<u8>), permission: Permission) -> Decoded<TradingRequest> {
+        RequestDecoder.decode(*tag, body, permission)
     }
 
     fn order() -> Order {
@@ -192,7 +206,7 @@ mod tests {
     fn heartbeat_is_filtered() {
         let bytes = encode(&Request::Heartbeat, 0);
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Trader),
+            decode(&bytes, Permission::Trader),
             Decoded::Filter
         ));
     }
@@ -207,7 +221,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Trader),
+            decode(&bytes, Permission::Trader),
             Decoded::Filter
         ));
     }
@@ -221,7 +235,7 @@ mod tests {
             },
             42,
         );
-        match RequestDecoder.decode(&bytes, Permission::Trader) {
+        match decode(&bytes, Permission::Trader) {
             Decoded::Permitted(TradingRequest { request_seq, event }) => {
                 assert_eq!(request_seq, 42, "the frame's sequence rides in the event");
                 assert!(matches!(event, TradingEvent::SubmitOrder { .. }));
@@ -242,7 +256,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::ReadOnly),
+            decode(&bytes, Permission::ReadOnly),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -260,7 +274,7 @@ mod tests {
             7,
         );
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Operator),
+            decode(&bytes, Permission::Operator),
             Decoded::Permitted(_)
         ));
     }
@@ -278,7 +292,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Trader),
+            decode(&bytes, Permission::Trader),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -294,7 +308,7 @@ mod tests {
             3,
         );
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Custodian),
+            decode(&bytes, Permission::Custodian),
             Decoded::Permitted(_)
         ));
     }
@@ -310,7 +324,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            RequestDecoder.decode(&bytes, Permission::Trader),
+            decode(&bytes, Permission::Trader),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -320,7 +334,7 @@ mod tests {
         // QueryStats is an operator-only request — see
         // `Request::requires_operator`.
         let bytes = encode(&Request::QueryStats, 1);
-        match RequestDecoder.decode(&bytes, Permission::Operator) {
+        match decode(&bytes, Permission::Operator) {
             Decoded::Permitted(request) => {
                 assert!(matches!(request.event, TradingEvent::QueryStats));
                 assert!(request.is_query());
@@ -330,11 +344,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_frame_yields_decode_error() {
-        // Empty bytes can't even fit the request_seq prefix.
+    fn malformed_request_yields_decode_error() {
+        // A known tag over a body too short for the seq that opens it.
+        let (tag, _) = encode(&Request::Heartbeat, 0);
         assert!(matches!(
-            RequestDecoder.decode(&[], Permission::Trader),
-            Decoded::DecodeError(_)
+            RequestDecoder.decode(tag, &[0; 7], Permission::Trader),
+            Decoded::DecodeError("truncated frame")
+        ));
+        // A tag this codec does not know, over a well-formed body.
+        assert!(matches!(
+            RequestDecoder.decode(0xFF, &[0; 8], Permission::Trader),
+            Decoded::DecodeError("unknown variant tag")
         ));
     }
 
