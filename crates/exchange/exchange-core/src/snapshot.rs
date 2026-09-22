@@ -98,7 +98,12 @@ type StopLevels = Vec<(Price, Vec<PendingStopSnapshot>)>;
 ///            restore. v18 carries the bucket map (`account`, `tokens`,
 ///            `last_refill_ns`) so primary and replica converge bit-for-
 ///            bit on the very next event after restore.
-pub const PAYLOAD_VERSION: u16 = 18;
+/// v18 → v19: the per-account limits (SEC-03 open-order cap, SEC-04 rate
+///            and burst). They were node-local operator config, reapplied
+///            from flags after every restore; they are now journaled
+///            (`SetAccountLimits`) and so belong to the state a snapshot
+///            must reproduce.
+pub const PAYLOAD_VERSION: u16 = 19;
 
 /// Encode the Exchange's full state (the "payload" portion of a snapshot —
 /// everything between the header and the CRC) into a freshly allocated
@@ -156,7 +161,15 @@ pub(crate) struct ExchangeSnapshot {
     /// divergence window — see the version-history comment on
     /// `PAYLOAD_VERSION` for the v17 → v18 motivation.
     pub(crate) order_buckets: Vec<(AccountId, u64, u64)>,
+    /// Per-account limits (v19+): `(max_open_orders_per_account,
+    /// max_orders_per_second, max_orders_burst)`, the values the last
+    /// `SetAccountLimits` put in force.
+    pub(crate) account_limits: AccountLimitsEntry,
 }
+
+/// `(max_open_orders_per_account, max_orders_per_second,
+/// max_orders_burst)`. `u32` each, the engine's own field types.
+type AccountLimitsEntry = (u32, u32, u32);
 
 /// Serialized order book state for a single instrument.
 /// Uses Vec for each level to preserve insertion-order fidelity.
@@ -332,6 +345,15 @@ fn encode_order_buckets(buf: &mut Vec<u8>, buckets: &[OrderBucketEntry]) {
     }
 }
 
+// Per-account limits (v19+): three u32 = 12 bytes, no length prefix — the
+// section is a fixed-size record, always present.
+fn encode_account_limits(buf: &mut Vec<u8>, limits: &AccountLimitsEntry) {
+    let (max_open_orders, rate, burst) = *limits;
+    le::push_u32(buf, max_open_orders);
+    le::push_u32(buf, rate);
+    le::push_u32(buf, burst);
+}
+
 fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     // Exhaustive destructure (no `..`): if a new field is added to
     // `ExchangeSnapshot`, the compiler errors here, forcing us to update
@@ -350,6 +372,7 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
         disabled_instruments,
         fee_account_deficits,
         order_buckets,
+        account_limits,
     } = state;
     encode_instruments(buf, instruments);
     encode_balances(buf, balances);
@@ -363,6 +386,7 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     encode_disabled_instruments(buf, disabled_instruments);
     encode_fee_account_deficits(buf, fee_account_deficits);
     encode_order_buckets(buf, order_buckets);
+    encode_account_limits(buf, account_limits);
 }
 
 fn encode_book_snapshot(book: &BookSnapshot, buf: &mut Vec<u8>) {
@@ -823,6 +847,16 @@ fn decode_order_buckets(buf: &[u8]) -> Result<(usize, Vec<OrderBucketEntry>), Sn
     Ok((pos, out))
 }
 
+// Per-account limits (v19+): three u32 = 12 bytes. See
+// `encode_account_limits`.
+fn decode_account_limits(buf: &[u8]) -> Result<(usize, AccountLimitsEntry), SnapshotDecodeError> {
+    check(buf, 0, 12)?;
+    let max_open_orders = le::get_u32(buf);
+    let rate = le::get_u32(&buf[4..]);
+    let burst = le::get_u32(&buf[8..]);
+    Ok((12, (max_open_orders, rate, burst)))
+}
+
 fn decode_exchange_state(
     buf: &[u8],
     version: u16,
@@ -890,6 +924,20 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Before v19 the limits were node-local config, not state: an older
+    // payload leaves them at the engine defaults.
+    let account_limits = if version >= 19 {
+        let (consumed, v) = decode_account_limits(&buf[pos..])?;
+        pos += consumed;
+        v
+    } else {
+        (
+            crate::exchange::DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
+            crate::exchange::DEFAULT_MAX_ORDERS_PER_SECOND,
+            crate::exchange::DEFAULT_MAX_ORDERS_BURST,
+        )
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -905,6 +953,7 @@ fn decode_exchange_state(
             disabled_instruments,
             fee_account_deficits,
             order_buckets,
+            account_limits,
         },
     ))
 }
@@ -1287,7 +1336,7 @@ fn build_indexed_instruments(
         let idx = spec.symbol.0 as usize;
         let book = books_map
             .remove(&spec.symbol)
-            .unwrap_or_else(|| OrderBook::new(spec.symbol));
+            .unwrap_or_else(|| OrderBook::with_capacity(spec.symbol));
         instruments[idx] = Some(Box::new(InstrumentState {
             spec: *spec,
             book,
@@ -1335,6 +1384,8 @@ impl Exchange {
         let disabled_instruments = self.snapshot_disabled_instruments();
         let fee_account_deficits = self.accounts().snapshot_fee_deficits();
         let order_buckets = self.snapshot_order_buckets();
+        let (rate, burst) = self.max_orders_per_second();
+        let account_limits = (self.max_open_orders_per_account(), rate, burst);
 
         ExchangeSnapshot {
             instruments,
@@ -1349,6 +1400,7 @@ impl Exchange {
             disabled_instruments,
             fee_account_deficits,
             order_buckets,
+            account_limits,
         }
     }
 
@@ -1379,6 +1431,7 @@ impl Exchange {
             disabled_instruments,
             fee_account_deficits,
             order_buckets,
+            account_limits: (max_open_orders, rate, burst),
         } = state;
 
         let mut instruments = build_indexed_instruments(
@@ -1418,11 +1471,13 @@ impl Exchange {
         // Restore per-account rate-limiter bucket state (v18+). Empty
         // for older snapshots, in which case the limiter starts with
         // every account at full burst — same shape as a fresh start.
-        // The operator-config knobs (`max_orders_per_second`,
-        // `max_orders_burst`) are reapplied separately by the receiver
-        // wiring; the bucket state restored here will only be observed
-        // by the limiter once those knobs are non-zero.
         exchange.restore_order_buckets(order_buckets);
+        // Then the limits in force (v19+). The engine starts with the
+        // limiter disabled, and going from disabled to active never
+        // clears buckets (see `set_max_orders_per_second`), so the
+        // buckets restored above survive this.
+        exchange.set_max_open_orders_per_account(max_open_orders);
+        exchange.set_max_orders_per_second(rate, burst);
 
         // Snapshot-corruption detector: the rebuilt books must produce the
         // same `order_sides` set the snapshot serialized. A mismatch means
@@ -1472,24 +1527,10 @@ impl Exchange {
     ///
     /// Not suitable for the hot path — allocates extensively.
     pub fn clone_via_snapshot(&self) -> Self {
-        let mut cloned = Self::restore_state(self.snapshot_state());
-        // The cap is operator config, not journaled state, so it isn't in
-        // the snapshot payload. Carry it over in-process so the shadow
-        // clone applies the same Rejected reasons as the primary —
-        // otherwise a capped account on the primary would be unbounded
-        // on the shadow, and shadow validation would diverge.
-        cloned.set_max_open_orders_per_account(self.max_open_orders_per_account());
-        // Same reasoning as above for the SEC-04 rate-limit config: not
-        // journaled (operator config), but Rejected reports differ if
-        // the shadow clone runs unthrottled — carry it over so the
-        // shadow makes identical accept/reject decisions. The cloned
-        // engine starts at default `(0, 0)`; transitioning from
-        // disabled-to-active does NOT clear buckets (see the rule on
-        // `set_max_orders_per_second`), so the snapshot-restored bucket
-        // state is preserved through this call.
-        let (rate, burst) = self.max_orders_per_second();
-        cloned.set_max_orders_per_second(rate, burst);
-        cloned
+        // The account limits are part of the snapshot state (v19+), so the
+        // clone makes the same accept/reject decisions with nothing
+        // carried over by hand.
+        Self::restore_state(self.snapshot_state())
     }
 }
 
@@ -1550,130 +1591,6 @@ impl OrderBook {
             stop_index: self.snapshot_stop_index(),
             last_trade_price: self.last_trade_price(),
         }
-    }
-
-    /// Restore an order book from a snapshot.
-    pub(crate) fn restore(symbol: Symbol, snap: BookSnapshot) -> Self {
-        // Reconstruct a side and return the slab-index assignments so the
-        // caller can populate `order_index` with valid node handles.
-        let restore_side = |levels: Vec<(Price, Vec<RestingOrderSnapshot>)>, side: Side| {
-            let materialized: Vec<(Price, Vec<crate::orderbook::RestingOrder>)> = levels
-                .into_iter()
-                .map(|(price, orders)| {
-                    let restored = orders
-                        .into_iter()
-                        .map(|o| {
-                            crate::orderbook::RestingOrder::new(
-                                o.id,
-                                o.account,
-                                o.remaining,
-                                o.time_in_force,
-                                o.expiry_ns,
-                                side,
-                                ReservationSlot::DUMMY,
-                            )
-                        })
-                        .collect();
-                    (price, restored)
-                })
-                .collect();
-            crate::orderbook::BookSide::from_levels_snapshot(side, materialized)
-        };
-
-        let restore_stops = |levels: Vec<(Price, Vec<PendingStopSnapshot>)>| {
-            let materialized: Vec<(Price, Vec<crate::orderbook::PendingStop>)> = levels
-                .into_iter()
-                .map(|(trigger_price, stops)| {
-                    let pending = stops
-                        .into_iter()
-                        .map(|s| {
-                            crate::orderbook::PendingStop::new(
-                                s.id,
-                                s.account,
-                                s.side,
-                                s.trigger_price,
-                                s.quantity,
-                                s.time_in_force,
-                                s.limit_price,
-                                s.quote_budget,
-                                s.stp,
-                                s.expiry_ns,
-                                ReservationSlot::DUMMY,
-                            )
-                        })
-                        .collect();
-                    (trigger_price, pending)
-                })
-                .collect();
-            crate::orderbook::StopSide::from_levels_snapshot(materialized)
-        };
-
-        // Build sides first; they tell us each order's slab index, which
-        // we need to populate `order_index` so cancel/amend stay O(1).
-        let (bids, bid_node_idx) = restore_side(snap.bids, Side::Buy);
-        let (asks, ask_node_idx) = restore_side(snap.asks, Side::Sell);
-
-        // Combine slab-index assignments into a lookup keyed by
-        // (account, order_id). Both sides share the (account, order_id)
-        // namespace via the snapshot codec, but each order lives in
-        // exactly one side, so there are no key collisions.
-        let mut node_for: std::collections::HashMap<(AccountId, OrderId), u32> =
-            std::collections::HashMap::with_capacity(bid_node_idx.len() + ask_node_idx.len());
-        node_for.extend(bid_node_idx);
-        node_for.extend(ask_node_idx);
-
-        let order_index: crate::slab_map::SlabMap<(Side, Price, ReservationSlot, u32)> = snap
-            .order_index
-            .into_iter()
-            .map(|(id, account, side, price)| {
-                let node_idx = node_for
-                    .get(&(account, id))
-                    .copied()
-                    // Snapshot self-consistency: every order_index entry
-                    // must correspond to a resting order in the same
-                    // snapshot. If it doesn't, the snapshot is corrupt and
-                    // we'd rather fail loudly than silently skip cancels.
-                    .expect("snapshot order_index references missing book entry");
-                (
-                    (account, id),
-                    (side, price, ReservationSlot::DUMMY, node_idx),
-                )
-            })
-            .collect();
-
-        // Build stop sides; collect the slab-index mapping the same way
-        // as for resting orders so we can populate `stop_index` with
-        // valid handles. Buy and sell stops live in disjoint slabs but
-        // share the (account, order_id) namespace via the snapshot.
-        let (stop_buys, buy_stop_idx) = restore_stops(snap.stop_buys);
-        let (stop_sells, sell_stop_idx) = restore_stops(snap.stop_sells);
-        let mut stop_node_for: std::collections::HashMap<(AccountId, OrderId), u32> =
-            std::collections::HashMap::with_capacity(buy_stop_idx.len() + sell_stop_idx.len());
-        stop_node_for.extend(buy_stop_idx);
-        stop_node_for.extend(sell_stop_idx);
-
-        let stop_index: crate::slab_map::SlabMap<(Side, Price, u32)> = snap
-            .stop_index
-            .into_iter()
-            .map(|(id, account, side, price)| {
-                let node_idx = stop_node_for
-                    .get(&(account, id))
-                    .copied()
-                    .expect("snapshot stop_index references missing stop entry");
-                ((account, id), (side, price, node_idx))
-            })
-            .collect();
-
-        Self::from_parts(
-            symbol,
-            bids,
-            asks,
-            order_index,
-            stop_buys,
-            stop_sells,
-            stop_index,
-            snap.last_trade_price,
-        )
     }
 }
 
@@ -2009,6 +1926,77 @@ mod tests {
         assert!(matches!(clone_reports[0], ExecutionReport::Fill { .. }));
     }
 
+    /// The account limits are journaled state (v19+), so a restore must
+    /// bring back the values in force — not the engine defaults a node
+    /// would otherwise start from until the next `SetAccountLimits`.
+    #[test]
+    fn account_limits_survive_snapshot_round_trip() {
+        let mut exchange = Exchange::new();
+        exchange.set_max_open_orders_per_account(7);
+        exchange.set_max_orders_per_second(1_000, 5);
+
+        let payload = encode_exchange_payload(&exchange);
+        let restored = decode_exchange_payload(&payload).expect("decode");
+
+        assert_eq!(restored.max_open_orders_per_account(), 7);
+        assert_eq!(restored.max_orders_per_second(), (1_000, 5));
+    }
+
+    /// A seeded exchange with a resting order, a funded account and active
+    /// account limits: state in every collection `prefault` touches.
+    fn populated_exchange() -> Exchange {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 500);
+        exchange.set_max_open_orders_per_account(7);
+        exchange.set_max_orders_per_second(1_000, 5);
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 50),
+            &mut reports,
+        );
+        exchange
+    }
+
+    /// `prefault` runs on a restored engine, with orders resting, and on
+    /// one about to replay a journal. A resting order must stay
+    /// cancellable afterwards, and the state — everything replay and
+    /// failover depend on — may not move.
+    #[test]
+    fn prefault_keeps_resting_orders_cancellable() {
+        let mut exchange = populated_exchange();
+        let before = encode_exchange_payload(&exchange);
+
+        exchange.prefault();
+
+        assert_eq!(
+            encode_exchange_payload(&exchange),
+            before,
+            "prefault changed the state of a populated exchange"
+        );
+        let mut reports = Vec::new();
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(1), &mut reports);
+        assert!(
+            matches!(reports.as_slice(), [ExecutionReport::Cancelled { .. }]),
+            "resting order lost by prefault: {reports:?}"
+        );
+    }
+
+    /// Every node prefaults the engine it builds, and a replica does again
+    /// after a resync: the second call must be a no-op.
+    #[test]
+    fn prefault_is_idempotent() {
+        let mut exchange = populated_exchange();
+        exchange.prefault();
+        let once = encode_exchange_payload(&exchange);
+
+        exchange.prefault();
+
+        assert_eq!(encode_exchange_payload(&exchange), once);
+    }
+
     #[test]
     #[should_panic(expected = "snapshot corruption: order_sides mismatch")]
     fn restore_detects_order_sides_mismatch() {
@@ -2253,6 +2241,26 @@ mod tests {
         );
     }
 
+    /// Size of the v19 account-limits record that ends every payload:
+    /// three u32.
+    const ACCOUNT_LIMITS_LEN: usize = 12;
+
+    /// A payload cut inside the v19 account-limits record must fail
+    /// decode: restoring without the limits would run the node with the
+    /// engine defaults instead of the values the primary put in force.
+    #[test]
+    fn truncated_account_limits_record_errors() {
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(1_000, 5);
+        let full = encode_exchange_payload(&exchange);
+        let truncated = &full[..full.len() - 4];
+        match decode_exchange_payload(truncated) {
+            Err(SnapshotDecodeError::Truncated) => {}
+            Err(other) => panic!("expected Truncated, got {other:?}"),
+            Ok(_) => panic!("a payload missing its account limits must not decode"),
+        }
+    }
+
     /// A v18 snapshot whose bucket section is missing — physically
     /// truncated mid-stream — must fail decode rather than silently
     /// returning empty buckets. The pre-SF2 guard
@@ -2273,12 +2281,12 @@ mod tests {
             &mut reports,
         );
 
-        // Encode, then strip the trailing rate-limiter bucket section
-        // (length u32 + 1 entry of 20 bytes = 24 bytes). The truncated
-        // payload looks valid up to the bucket boundary, mirroring a
-        // real on-disk truncation.
+        // Encode, then strip the rate-limiter bucket section (length u32
+        // + 1 entry of 20 bytes = 24 bytes) and the v19 account-limits
+        // record after it (12 bytes). The truncated payload looks valid
+        // up to the bucket boundary, mirroring a real on-disk truncation.
         let full = encode_exchange_payload(&exchange);
-        let truncated = &full[..full.len() - 24];
+        let truncated = &full[..full.len() - 24 - ACCOUNT_LIMITS_LEN];
         match decode_exchange_payload(truncated) {
             Err(SnapshotDecodeError::Truncated) => {}
             Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
@@ -2307,9 +2315,12 @@ mod tests {
         );
 
         let mut payload = encode_exchange_payload(&exchange);
-        // Bucket section is the trailing run: [u32 count][entry × count],
-        // entry = AccountId(u32) + tokens(u64) + last_refill_ns(u64) = 20 B.
-        // Bump the count by one and append a duplicate of the existing entry.
+        // The v19 account-limits record ends the payload; set it aside so
+        // the bucket section is the trailing run, and put it back after.
+        let limits = payload.split_off(payload.len() - ACCOUNT_LIMITS_LEN);
+        // Bucket section: [u32 count][entry × count], entry = AccountId(u32)
+        // + tokens(u64) + last_refill_ns(u64) = 20 B. Bump the count by one
+        // and append a duplicate of the existing entry.
         let entry_start = payload.len() - 20;
         let dup_entry = payload[entry_start..].to_vec();
         let count_pos = entry_start - 4;
@@ -2321,6 +2332,7 @@ mod tests {
             .expect("test fixture must keep count within u32");
         payload[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
         payload.extend_from_slice(&dup_entry);
+        payload.extend_from_slice(&limits);
 
         match decode_exchange_payload(&payload) {
             Err(SnapshotDecodeError::Corrupt { reason, .. }) => {

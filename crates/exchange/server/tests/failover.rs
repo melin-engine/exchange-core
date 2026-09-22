@@ -50,7 +50,7 @@ fn server_bin() -> PathBuf {
 /// Connect a TCP client with a 60s socket read timeout so the test
 /// suite fails fast when a server stalls instead of soaking the host
 /// indefinitely. 60s sits well above every in-test wait
-/// (`wait_ready` / `wait_for_replacement_catchup` cap at 30s), so a
+/// (`wait_ready` / `wait_every_replica_acked` cap at 30s), so a
 /// healthy run never trips it.
 fn connect_with_timeout(addr: SocketAddr, key: &SigningKey) -> Client {
     let client = Client::connect(addr, key).expect("client connect");
@@ -435,6 +435,48 @@ fn wait_metric(
     }
 }
 
+/// Wait until `replicas` replicas are connected and that many replica
+/// slots have acked the primary's journal up to its current sequence.
+///
+/// The health line's lag is not enough for this: it covers only the
+/// slots the primary counts as engaged, and a replica that has just
+/// attached — a replacement catching up from its journal, or by snapshot
+/// transfer — is not one of them until its catch-up settles. The lag can
+/// read 0 from the other replica alone, and a lag that blips non-zero
+/// and back can be that replica too. Naming the slots removes the
+/// ambiguity: a disengaged slot's ack gauge is zeroed, so a slot acked up
+/// to the sequence is a live replica that holds everything. The sequence
+/// is read before the acks, so ticks journaled between the two reads
+/// cannot fail the comparison.
+fn wait_every_replica_acked(primary_health: SocketAddr, replicas: u64, timeout: Duration) {
+    let start = Instant::now();
+    let snapshot = || {
+        let seq = query_health(primary_health).ok().map(|(_, seq, _, _)| seq);
+        let connected = fetch_metric_u64(primary_health, "melin_replicas_connected ");
+        let acked = [
+            fetch_metric_u64(primary_health, "melin_replica_acked_sequence{slot=\"0\"} "),
+            fetch_metric_u64(primary_health, "melin_replica_acked_sequence{slot=\"1\"} "),
+        ];
+        (seq, connected, acked)
+    };
+    loop {
+        if let (Some(seq), Some(connected), acked) = snapshot()
+            && connected == replicas
+            && acked.iter().flatten().filter(|&&a| a >= seq).count() as u64 >= replicas
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "timed out waiting for {replicas} replicas to ack the primary's journal; \
+                 last (journal_seq, connected, acked) = {:?}",
+                snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -501,33 +543,6 @@ fn assert_trading(addr: SocketAddr, budget: Duration, what: &str) {
             );
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Wait for a freshly-spawned replacement replica to fully catch up via
-/// the primary's lag metric. The primary's `replication_lag` is
-/// `journal_seq - min(slot0, slot1)`, with disconnected slots pinned to
-/// `u64::MAX` (and thus excluded from the min). After a replica is killed
-/// its slot is excluded, so lag can read 0 from the surviving replica
-/// alone — even before the new replacement has connected. To avoid
-/// promoting a not-yet-caught-up replica, wait for lag to first transition
-/// to a nonzero value (replacement connected with a behind handshake) and
-/// then back to zero (caught up).
-fn wait_for_replacement_catchup(primary_health: SocketAddr) {
-    let start = Instant::now();
-    let mut saw_nonzero = false;
-    loop {
-        if let Ok((_, _, lag, _)) = query_health(primary_health) {
-            if lag > 0 {
-                saw_nonzero = true;
-            } else if saw_nonzero {
-                return;
-            }
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("replacement catch-up timeout (saw_nonzero={saw_nonzero})");
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -732,6 +747,66 @@ fn spawn_primary_with_extra_env(
         command.env(k, v);
     }
     let child = command.spawn().expect("spawn primary server");
+
+    ServerProcess {
+        child,
+        client_addr: format!("127.0.0.1:{client_port}").parse().unwrap(),
+        health_addr: format!("127.0.0.1:{health_port}").parse().unwrap(),
+    }
+}
+
+/// Spawn a standalone node on `tmp_dir`'s primary journal — no replication
+/// port, so nothing halts it when it runs without a replica, which is what
+/// a node recovering from a journal on its own needs. `--ack-policy disk`
+/// comes with `--standalone` and is the only policy it accepts.
+///
+/// Seeding counts stay at the fixture's: they apply to a fresh journal
+/// only, and a recovering node takes its state from the journal instead.
+fn spawn_standalone_with_extra_env(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    client_port: u16,
+    health_port: u16,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> ServerProcess {
+    let journal = tmp_dir.join("primary.journal");
+    assert!(journal.exists(), "primary journal must exist");
+    let mut args: Vec<String> = vec![
+        "--bind".into(),
+        format!("127.0.0.1:{client_port}"),
+        "--health-bind".into(),
+        format!("127.0.0.1:{health_port}"),
+        "--standalone".into(),
+        "--ack-policy".into(),
+        "disk".into(),
+        "--journal".into(),
+        journal.to_str().expect("valid path").into(),
+        "--authorized-keys".into(),
+        keys_path.to_str().expect("valid path").into(),
+        "--accounts".into(),
+        FIXTURE_ACCOUNTS.to_string(),
+        "--instruments".into(),
+        FIXTURE_INSTRUMENTS.to_string(),
+        "--connection-timeout-secs".into(),
+        "0".into(),
+        "--cores".into(),
+        "none".into(),
+    ];
+    for a in extra_args {
+        args.push((*a).into());
+    }
+    let mut command = Command::new(bin);
+    command
+        .args(&args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4");
+    for (k, v) in extra_env {
+        command.env(k, v);
+    }
+    let child = command.spawn().expect("spawn standalone server");
 
     ServerProcess {
         child,
@@ -1032,6 +1107,23 @@ impl TestCluster {
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
         connect_with_timeout(self.replica.client_addr, &self.key2)
+    }
+
+    /// Start a new standalone node on the (already stopped) primary's
+    /// journal, on fresh ports, and wait until it serves clients. Its state
+    /// is exactly what replaying that journal produces.
+    fn restart_primary_standalone(&self) -> ServerProcess {
+        let recovered = spawn_standalone_with_extra_env(
+            &self.bin,
+            self._tmp.path(),
+            &self.keys_path,
+            free_port(),
+            free_port(),
+            &[],
+            &[],
+        );
+        wait_ready(recovered.health_addr, Duration::from_secs(30));
+        recovered
     }
 }
 
@@ -1486,55 +1578,9 @@ fn crashed_primary_recovers_from_journal() {
     }
     let _ = cluster.primary.child.wait();
 
-    // Restart the old primary from its journal in standalone mode.
     // The journal may have a trailing partial write from the SIGKILL —
     // recovery must truncate it and continue.
-    let primary_journal = cluster._tmp.path().join("primary.journal");
-    assert!(primary_journal.exists(), "primary journal must exist");
-
-    let recovered_client_port = free_port();
-    let recovered_health_port = free_port();
-    let recovered = {
-        let child = Command::new(&cluster.bin)
-            .args([
-                "--bind",
-                &format!("127.0.0.1:{recovered_client_port}"),
-                "--health-bind",
-                &format!("127.0.0.1:{recovered_health_port}"),
-                "--standalone",
-                "--ack-policy",
-                "disk",
-                "--journal",
-                primary_journal.to_str().expect("valid path"),
-                "--authorized-keys",
-                cluster.keys_path.to_str().expect("valid path"),
-                "--accounts",
-                "10",
-                "--instruments",
-                "2",
-                "--connection-timeout-secs",
-                "0",
-                "--cores",
-                "none",
-            ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-            .spawn()
-            .expect("spawn recovered primary");
-        ServerProcess {
-            child,
-            client_addr: format!("127.0.0.1:{recovered_client_port}")
-                .parse()
-                .unwrap(),
-            health_addr: format!("127.0.0.1:{recovered_health_port}")
-                .parse()
-                .unwrap(),
-        }
-    };
-
-    wait_ready(recovered.health_addr, Duration::from_secs(30));
-
+    let recovered = cluster.restart_primary_standalone();
     let mut client3 = connect_with_timeout(recovered.client_addr, &cluster.key2);
 
     // New order must succeed — proves recovery restored instruments + balances.
@@ -1565,6 +1611,105 @@ fn crashed_primary_recovers_from_journal() {
             }
         )),
         "expected DuplicateOrderId on recovered primary, got: {r:?}"
+    );
+}
+
+/// A primary that loses its only replica refuses writes, and a refused
+/// write must leave no trace: not applied, and not journaled either, or
+/// replay would apply what the client was told failed. The refusal is
+/// counted on `/metrics`, which is where a halted node is observed from —
+/// it answers no query while halted (a known sequencer gap, see the note in
+/// `docs/operations.md`), so nothing here asks it one.
+///
+/// Replay is the witness. The refused order is a resting GTC order, so had
+/// it been journaled, the recovered node would hold it and reject a resend
+/// as `DuplicateOrderId` (or as `DuplicateRequest`, had it advanced the
+/// request-sequence HWM). The order accepted before the halt shows the
+/// opposite: replay did run, and does reject its id.
+#[test]
+#[serial]
+fn halted_primary_refuses_writes_without_journaling_them() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    let r = submit_order(&mut client, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "expected Placed before the halt, got: {r:?}"
+    );
+    cluster.wait_replicated();
+    // Taken while the node still answers queries: it is the sequence the
+    // refused write below takes, and the one the resend must reuse.
+    let hwm_before_refusal = client
+        .synchronize_request_seq()
+        .expect("query the request-sequence HWM");
+
+    unsafe {
+        libc::kill(cluster.replica.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.replica.child.wait();
+    wait_halted(cluster.primary.health_addr, Duration::from_secs(5));
+
+    let r = submit_order(&mut client, 2, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                order_id: melin_ec_protocol::types::OrderId(2),
+                reason: melin_ec_protocol::types::RejectReason::ReplicaDisconnected,
+                ..
+            }
+        )),
+        "expected ReplicaDisconnected while halted, got: {r:?}"
+    );
+    // The gate counts a refusal on the reading thread, which may still be
+    // ahead of the client's reply; wait rather than sample once.
+    wait_metric(
+        cluster.primary.health_addr,
+        "melin_writes_refused_total ",
+        Duration::from_secs(5),
+        "the refused write to be counted",
+        |v| v == 1,
+    );
+
+    drop(client);
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.primary.child.wait();
+    let recovered = cluster.restart_primary_standalone();
+    // Same key: connecting adopts the recovered HWM, so the resend below
+    // goes out under the sequence the refused write used.
+    let mut client = connect_with_timeout(recovered.client_addr, &cluster.key);
+    assert_eq!(
+        client
+            .synchronize_request_seq()
+            .expect("query the recovered request-sequence HWM"),
+        hwm_before_refusal,
+        "a refused write must not advance the request-sequence HWM"
+    );
+
+    let r = submit_order(&mut client, 2, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "the refused order, resent under the same request sequence, must be taken, got: {r:?}"
+    );
+    let r = submit_order(&mut client, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "the order accepted before the halt must survive replay, got: {r:?}"
     );
 }
 
@@ -2072,6 +2217,59 @@ fn dual_replication_promote_replica1_after_replica2_dies() {
     );
 }
 
+/// The per-account limits in force are the primary's, journaled, not each
+/// node's flags. The primary caps open orders at 2; the replicas run the
+/// default cap. The primary refuses a third resting order, and a replica
+/// must refuse it too — it applies the primary's journaled cap, not its
+/// own. After failover the promoted replica journals its own flag, so the
+/// cap rises and the same order is now taken.
+///
+/// One assertion tells the two failure modes apart: `DuplicateOrderId`
+/// means the replica had accepted the refused order under its own flag;
+/// `ExceedsMaxOpenOrders` means the promoted node's flag never took effect.
+#[test]
+#[serial]
+fn replicas_enforce_the_primarys_account_limits() {
+    let mut cluster = DualCluster::start_with_primary_args(&["--max-orders-per-account", "2"]);
+    let mut client = cluster.connect_primary();
+
+    for id in 1..=2u64 {
+        let r = submit_order(&mut client, id, 1, 1, Side::Buy, 100, 1);
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_ec_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "order {id} within the cap must rest, got: {r:?}"
+        );
+    }
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                reason: melin_ec_protocol::types::RejectReason::ExceedsMaxOpenOrders,
+                ..
+            }
+        )),
+        "the primary's cap of 2 must refuse a third order, got: {r:?}"
+    );
+    cluster.wait_replicated();
+
+    drop(client);
+    cluster.kill_primary();
+    let mut client = cluster.promote_replica1();
+
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "after failover the promoted node's own cap applies and the refused order is new to it, got: {r:?}"
+    );
+}
+
 /// Active fills during dual replication — crossing orders generate fills,
 /// then failover. Verifies the promoted replica's exchange state is
 /// consistent (balances correct, can continue trading).
@@ -2223,7 +2421,7 @@ fn replacement_replica_catches_up_from_journal() {
         }
     };
 
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
     eprintln!("Replacement replica caught up.");
 
     // Phase 3: submit orders after catch-up to verify live streaming works.
@@ -2231,7 +2429,10 @@ fn replacement_replica_catches_up_from_journal() {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
         assert!(!r.is_empty(), "order {i}: no response after catch-up");
     }
-    cluster.wait_replicated();
+    // Both slots by name, not `wait_replicated`: the replacement must hold
+    // every order of this batch before the primary goes away, or the
+    // promotion below races its tail.
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(10));
 
     // Kill primary, promote the replacement replica.
     drop(client);
@@ -2347,11 +2548,10 @@ fn catchup_with_fills_during_gap() {
         }
     };
 
-    // Wait for replacement to actually catch up. See
-    // `wait_for_replacement_catchup` for why polling primary lag once is
-    // insufficient (disconnected slot pinned to u64::MAX excludes it from
-    // the min cursor).
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    // Wait for the replacement to actually catch up — see
+    // `wait_every_replica_acked` for why the health line's lag is not
+    // enough on its own.
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
 
     // Kill primary, promote replacement.
     drop(client);
@@ -2462,16 +2662,12 @@ fn catchup_then_immediate_failover() {
         }
     };
 
-    // Wait for replacement_imm to actually catch up.
-    //
-    // Polling the primary's lag is insufficient on its own: replica1's slot
-    // is pinned to u64::MAX after disconnect (excluded from the min cursor),
-    // so the primary reports lag==0 from replica2 alone — even before
-    // replacement_imm has connected. Wait for lag to first transition to
-    // nonzero (replacement_imm connected and behind), then back to zero
-    // (caught up). The replica doesn't spawn a health endpoint of its own,
-    // so primary's view is the only signal available.
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    // Wait for the replacement to actually catch up: both slots by name,
+    // because the primary's lag can read 0 from replica 2 alone before the
+    // replacement has even connected, and its blip to non-zero and back
+    // can be replica 2 too — see `wait_every_replica_acked`. The kill
+    // that follows must find the replacement holding every order.
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
 
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
@@ -2581,7 +2777,7 @@ fn fresh_replica_full_catchup() {
         }
     };
 
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
     eprintln!("Fresh replica caught up.");
 
     // Submit more orders after catch-up (proves live streaming works).
@@ -2819,7 +3015,7 @@ fn snapshot_transfer_when_archives_purged() {
     wait_for_replicas(primary2.health_addr, 1, Duration::from_secs(30));
     eprintln!("Primary healthy with replica connected");
 
-    wait_for_replacement_catchup(primary2.health_addr);
+    wait_every_replica_acked(primary2.health_addr, 1, Duration::from_secs(30));
     eprintln!("Replica caught up via snapshot transfer.");
 
     // Submit a new order to verify the primary is functional.
@@ -3218,32 +3414,21 @@ fn rotation_soak_under_load() {
     }
 
     // ----- Restart and verify recovered state matches -----
-    // primary2 is brought up alone — no replica is spawned alongside it
-    // because this phase only validates journal recovery, not
-    // replication. Run with `--ack-policy disk` so the recovered
-    // primary is fully operational without a replica (same pattern the
-    // other "recovered primary, no replica" tests use); default policy
-    // would leave it halted and unable to service client requests.
-    let primary2_extra: Vec<&str> = primary_extra
-        .iter()
-        .copied()
-        .chain(["--ack-policy", "disk"])
-        .collect();
-    let mut primary2 = spawn_primary_with_extra_env(
+    // primary2 is brought up standalone — no replica is spawned alongside
+    // it because this phase only validates journal recovery, not
+    // replication, and a node that binds a replication port with no replica
+    // attached halts and refuses every write before it is journaled, which
+    // is exactly what the tail check below measures.
+    let mut primary2 = spawn_standalone_with_extra_env(
         &bin,
         tmp.path(),
         &keys_path,
         free_port(),
         free_port(),
-        free_port(),
-        &primary2_extra,
+        primary_extra,
         extra_env,
     );
-    // primary2 runs alone, so "the health endpoint answers" is the whole
-    // readiness condition — no replica gauge to wait on. A `wait_healthy`
-    // used to follow this line; it polled the identical predicate and so
-    // returned on its first iteration, every time.
-    wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(30));
+    wait_ready(primary2.health_addr, Duration::from_secs(30));
 
     // To validate that recovery picked up every archived segment, submit
     // one order on the recovered primary and then read the live segment

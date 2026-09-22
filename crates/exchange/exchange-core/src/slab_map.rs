@@ -78,6 +78,15 @@ impl<V> SlabMap<V> {
         }
     }
 
+    /// Room for `additional` more entries in both the lookup and the
+    /// slab, for a snapshot deeper than the production capacity. Called
+    /// on an empty map before `OrderBook::prefault`, so the extra pages
+    /// are touched with the rest.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.lookup.reserve(additional);
+        self.slots.reserve(additional);
+    }
+
     /// Insert an entry. Returns the previous value at `key` if it was
     /// present (mirroring `std::collections::HashMap::insert`). On
     /// overwrite the existing slot is reused (no slot churn / freelist
@@ -157,6 +166,12 @@ impl<V> SlabMap<V> {
         self.lookup.len()
     }
 
+    /// True iff the map holds no live entries. Prefault checks it before
+    /// filling the map with dummies and clearing it again.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lookup.is_empty()
+    }
+
     /// Capacity of the underlying lookup hashmap (peak slot count). Used
     /// by the bench's capacity-report diagnostic to detect growth past
     /// the prefaulted region.
@@ -186,22 +201,6 @@ impl<V> SlabMap<V> {
         self.lookup.clear();
         self.slots.clear();
         self.next_free = u32::MAX;
-    }
-}
-
-impl<V> FromIterator<((AccountId, OrderId), V)> for SlabMap<V> {
-    /// Build a `SlabMap` from an iterator of `(key, value)` pairs. The
-    /// `size_hint` lower bound is used to pre-size the underlying lookup
-    /// and slab so a known-length producer (e.g. snapshot restore) avoids
-    /// rehash / Vec-growth allocations during the build.
-    fn from_iter<I: IntoIterator<Item = ((AccountId, OrderId), V)>>(iter: I) -> Self {
-        let iter = iter.into_iter();
-        let (lower, _) = iter.size_hint();
-        let mut map = Self::with_capacity(lower);
-        for (key, value) in iter {
-            map.insert(key, value);
-        }
-        map
     }
 }
 

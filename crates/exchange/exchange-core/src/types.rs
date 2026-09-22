@@ -30,6 +30,27 @@ pub type HashMap<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher>;
 /// during growth.
 pub type HashMap4<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher, 4>;
 
+/// Give `map` room for `capacity` entries, keeping every entry it holds.
+/// `HashMap4` has no in-place reserve, so a map that is too small is
+/// rebuilt at the larger size and its entries moved across. That changes
+/// the map's iteration order and with it the bytes a snapshot of the same
+/// state encodes, which is fine: a snapshot is per node, and nothing
+/// compares bytes across nodes. A map that already has the room is left
+/// untouched, so a second call with the same capacity is a no-op.
+///
+/// Startup only: a rebuild of a large map takes seconds and doubles its
+/// memory while it runs.
+pub(crate) fn reserve_map<K: std::hash::Hash + Eq, V>(map: &mut HashMap4<K, V>, capacity: usize) {
+    if capacity <= map.capacity() {
+        return;
+    }
+    let mut grown = HashMap4::with_capacity_and_hasher(capacity, Default::default());
+    for (key, value) in map.drain() {
+        grown.insert(key, value);
+    }
+    *map = grown;
+}
+
 /// Open-addressing HashMap (hashbrown via `std`) with `FxHash`. Use this
 /// for high-churn maps with bounded live count and unbounded unique
 /// keys. Astenn's extendible hashing grows the directory based on

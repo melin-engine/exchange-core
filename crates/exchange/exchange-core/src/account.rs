@@ -260,7 +260,14 @@ pub struct AccountManager {
     fee_account_deficits: HashMap4<CurrencyId, u64>,
 }
 
+/// Production capacity of the reservation slab: 2M slots, 16 bytes each
+/// ≈ 32 MB. One slot per resting order, so it bounds the live orders a
+/// node can hold before the slab grows on the matching thread.
+pub(crate) const RESERVATION_SLAB_CAPACITY: usize = 2_000_000;
+
 impl AccountManager {
+    /// A manager with nothing reserved. For tests and embedded users; a
+    /// server node starts from [`Self::with_capacity`] instead.
     pub fn new() -> Self {
         Self {
             balances: HashMap4::default(),
@@ -271,31 +278,15 @@ impl AccountManager {
     }
 
     /// Create an AccountManager pre-sized for production workloads.
+    ///
+    /// The balance map starts at its default size: its steady-state size
+    /// is a property of the deployment, reserved by
+    /// [`Self::reserve_balances`] from the node's own counts.
     pub fn with_capacity() -> Self {
-        // Pre-allocate 2M reservation slots. At 16 bytes each this is 32 MB.
-        // Pages are faulted during prefault().
-        //
-        // Balance HashMap starts empty — deposits insert entries on demand.
-        // No pre-allocation needed since deposit is an admin operation.
         Self {
             balances: HashMap4::default(),
-            reservation_slab: Vec::with_capacity(2_000_000),
-            free_slots: Vec::with_capacity(2_000_000),
-            fee_account_deficits: HashMap4::default(),
-        }
-    }
-
-    /// Create an AccountManager with the balances HashMap pre-sized for a
-    /// known bulk-seed workload. `balance_capacity` should be the expected
-    /// total number of `(account, currency)` pairs after seeding completes.
-    /// Typically `num_accounts × num_instruments × 2` for the bench
-    /// `ProvisionAccount` flow which deposits both base and quote per
-    /// instrument.
-    pub fn with_balance_capacity(balance_capacity: usize) -> Self {
-        Self {
-            balances: HashMap4::with_capacity_and_hasher(balance_capacity, Default::default()),
-            reservation_slab: Vec::with_capacity(2_000_000),
-            free_slots: Vec::with_capacity(2_000_000),
+            reservation_slab: Vec::with_capacity(RESERVATION_SLAB_CAPACITY),
+            free_slots: Vec::with_capacity(RESERVATION_SLAB_CAPACITY),
             fee_account_deficits: HashMap4::default(),
         }
     }
@@ -303,9 +294,15 @@ impl AccountManager {
     /// Touch all pre-allocated pages so page faults happen at startup,
     /// not on the hot path. Pre-fills the slab with dummy reservations and
     /// builds the free list in reverse order (so slot 0 is allocated first).
+    /// A slab that already holds reservations (a restored manager) is left
+    /// alone: its pages are faulted by the entries, and its free list is
+    /// live state.
     pub fn prefault(&mut self) {
         if self.reservation_slab.is_empty() {
-            let cap = self.reservation_slab.capacity().max(2_000_000);
+            let cap = self
+                .reservation_slab
+                .capacity()
+                .max(RESERVATION_SLAB_CAPACITY);
             let dummy = Reservation::new(AccountId(0), CurrencyId(0), 0);
             self.reservation_slab.resize(cap, dummy);
             self.free_slots.clear();
@@ -315,7 +312,7 @@ impl AccountManager {
                 self.free_slots.push(i as u32);
             }
         }
-        // Balances HashMap: pre-sizing via `with_balance_capacity`
+        // Balances HashMap: pre-sizing via `reserve_balances`
         // eliminates the directory-doubling rehash spikes during bulk
         // seed (T1's >1 s outliers near the end of a 100K-account seed).
         // Page faults still happen lazily on first-touch — that cost is
@@ -323,6 +320,28 @@ impl AccountManager {
         // so it no longer shows up as a discrete tail event. A future
         // change could prefault the balance pages too if we want to
         // shave seed wall time further.
+    }
+
+    /// Slots the reservation slab can hold before it grows.
+    #[cfg(test)]
+    pub(crate) fn reservation_capacity(&self) -> usize {
+        self.reservation_slab.capacity()
+    }
+
+    /// Entries the balance map can hold before it grows.
+    #[cfg(test)]
+    pub(crate) fn balance_capacity(&self) -> usize {
+        self.balances.capacity()
+    }
+
+    /// Give the balance map room for `balance_capacity` entries, keeping
+    /// any it holds. Pre-sizing eliminates the directory-doubling rehash
+    /// spikes of a bulk seed (see [`Self::prefault`]), and of the accounts
+    /// a node provisions after a restart: a restored map is sized to its
+    /// snapshot (see [`Self::from_parts`]), so this is what gives it room
+    /// to grow. See `reserve_map` for the rebuild it takes.
+    pub fn reserve_balances(&mut self, balance_capacity: usize) {
+        crate::types::reserve_map(&mut self.balances, balance_capacity);
     }
 
     /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
@@ -334,38 +353,41 @@ impl AccountManager {
         reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
         fee_deficits: Vec<(CurrencyId, u64)>,
     ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
-        // Build balance HashMap4 directly from sparse entries (4-entry buckets for hot path).
-        let mut balances =
+        // A production-sized, pre-faulted manager (see `with_capacity`),
+        // filled through the same slot allocation a live reservation
+        // takes: the sizing lives in the constructor alone. A snapshot
+        // with more reservations than the slab's capacity reserves its
+        // excess before the prefault, so those pages are touched too.
+        let mut mgr = Self::with_capacity();
+        mgr.reservation_slab.reserve(reservations.len());
+        mgr.prefault();
+
+        // The balance map is sized to the snapshot: its production size
+        // is the node's to reserve afterwards (see `reserve_balances`).
+        mgr.balances =
             HashMap4::with_capacity_and_hasher(balance_entries.len(), Default::default());
         for (key, balance) in balance_entries {
             if !balance.is_zero() {
-                balances.insert(key, balance);
+                mgr.balances.insert(key, balance);
             }
         }
 
-        // Build slab sequentially — slots 0..n for n reservations.
-        let mut slab = Vec::with_capacity(reservations.len());
+        // The prefaulted free list hands out slot 0 first, so the
+        // reservations take slots 0..n in snapshot order.
         let mut slot_assignments = Vec::with_capacity(reservations.len());
         for (order_id, account, currency, remaining) in reservations {
-            let slot = ReservationSlot(slab.len() as u32);
-            slab.push(Reservation::new(account, currency, remaining));
+            let slot = mgr.alloc_slot(Reservation::new(account, currency, remaining));
             slot_assignments.push(((account, order_id), slot));
         }
 
-        let mut fee_account_deficits =
+        mgr.fee_account_deficits =
             HashMap4::with_capacity_and_hasher(fee_deficits.len(), Default::default());
         for (ccy, amt) in fee_deficits {
             if amt != 0 {
-                fee_account_deficits.insert(ccy, amt);
+                mgr.fee_account_deficits.insert(ccy, amt);
             }
         }
 
-        let mgr = Self {
-            balances,
-            reservation_slab: slab,
-            free_slots: Vec::new(),
-            fee_account_deficits,
-        };
         (mgr, slot_assignments)
     }
 

@@ -50,7 +50,9 @@ echo ""
 # --- 1. Build ---
 echo "=== Building ==="
 cd "$PROJECT_DIR"
-cargo build --release -p melin-ec-server -p melin-ec-bench -p melin-ec-admin --quiet 2>&1
+# `synthetic-seed`: the smoke test trades from the accounts the server
+# provisions at genesis, which a stock build does not create.
+cargo build --release -p melin-ec-server -p melin-ec-bench -p melin-ec-admin --features melin-ec-server/synthetic-seed --quiet 2>&1
 echo "  Build: OK"
 echo ""
 

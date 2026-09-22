@@ -601,10 +601,14 @@ if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
 # Internal feature-list variable for the skip-order-exec build;
 # deliberately distinct from the user-facing `SERVER_FEATURES` env var
 # below (the latter drives a separate diagnostic-rebuild step).
+#
+# Every server build here carries `synthetic-seed`: the bench trades from
+# the accounts the server provisions at genesis, and a stock build seeds
+# none.
 if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
-    SKIP_ORDER_EXEC_FEATURES="skip-order-exec"
+    SKIP_ORDER_EXEC_FEATURES="skip-order-exec,synthetic-seed"
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
-        SKIP_ORDER_EXEC_FEATURES="skip-order-exec,no-persist"
+        SKIP_ORDER_EXEC_FEATURES="${SKIP_ORDER_EXEC_FEATURES},no-persist"
     fi
     if [[ -n "${MAIN_EXTRA_FEATURES:-}" ]]; then
         SKIP_ORDER_EXEC_FEATURES="${SKIP_ORDER_EXEC_FEATURES},${MAIN_EXTRA_FEATURES}"
@@ -612,18 +616,14 @@ if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
     MAIN_BUILD="cargo build --release -p melin-ec-bench && \
         cargo build --release -p melin-ec-server --no-default-features --features ${SKIP_ORDER_EXEC_FEATURES}"
 else
-    MAIN_FEATURES=""
+    MAIN_FEATURES="melin-ec-server/synthetic-seed"
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
-        MAIN_FEATURES="no-persist"
+        MAIN_FEATURES="${MAIN_FEATURES},no-persist"
     fi
     if [[ -n "${MAIN_EXTRA_FEATURES:-}" ]]; then
-        MAIN_FEATURES="${MAIN_FEATURES:+${MAIN_FEATURES},}${MAIN_EXTRA_FEATURES}"
+        MAIN_FEATURES="${MAIN_FEATURES},${MAIN_EXTRA_FEATURES}"
     fi
-    if [[ -n "${MAIN_FEATURES}" ]]; then
-        MAIN_BUILD="cargo build --release --features ${MAIN_FEATURES}"
-    else
-        MAIN_BUILD="cargo build --release"
-    fi
+    MAIN_BUILD="cargo build --release --features ${MAIN_FEATURES}"
 fi
 
 CLEAN_CMD=""
@@ -660,7 +660,7 @@ if [[ -n "${SERVER_FEATURES:-}" ]]; then
     echo "  Rebuilding melin-ec-server on primary with --features ${SERVER_FEATURES}..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-        cargo build --release -p melin-ec-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
+        cargo build --release -p melin-ec-server --features synthetic-seed,${SERVER_FEATURES}" 2>&1 | tail -3
 fi
 
 # DPDK build on server (and replica if dpdk-repl).
@@ -671,9 +671,9 @@ fi
 if [[ "$NEED_DPDK" == "1" ]]; then
     # Feature set for the DPDK server build. Mirrors MAIN_BUILD above.
     if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
-        DPDK_SERVER_FEATURES="dpdk,skip-order-exec"
+        DPDK_SERVER_FEATURES="dpdk,skip-order-exec,synthetic-seed"
     else
-        DPDK_SERVER_FEATURES="dpdk,hash-chain,release-tracing"
+        DPDK_SERVER_FEATURES="dpdk,hash-chain,release-tracing,synthetic-seed"
     fi
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
         DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},no-persist"

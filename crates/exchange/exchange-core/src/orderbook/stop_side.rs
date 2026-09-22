@@ -346,23 +346,37 @@ impl StopSide {
             .collect()
     }
 
-    /// Reconstruct from snapshot levels and return the
-    /// `(account, order_id) -> node_idx` mapping so the caller can
-    /// populate `stop_index` with valid handles.
-    pub(crate) fn from_levels_snapshot(
+    /// Room for `nodes` stops, for a snapshot deeper than the production
+    /// capacity. Called on an empty side before `prefault`, so the extra
+    /// pages are touched with the rest.
+    pub(super) fn reserve(&mut self, nodes: usize) {
+        self.nodes.reserve(nodes);
+    }
+
+    /// Slots the node slab can hold before it grows.
+    #[cfg(test)]
+    pub(super) fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    /// Fill an empty side from snapshot levels through the same `add` a
+    /// live stop takes, and return the `(account, order_id) -> node_idx`
+    /// mapping so the caller can populate `stop_index` with valid handles.
+    pub(crate) fn restore_levels(
+        &mut self,
         levels: Vec<(Price, Vec<PendingStop>)>,
-    ) -> (Self, SnapshotNodeMapping) {
+    ) -> SnapshotNodeMapping {
+        debug_assert!(self.levels.is_empty(), "restore_levels on a populated side");
         let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
-        let mut side = Self::with_capacity(total.max(64));
         let mut mapping = Vec::with_capacity(total);
         for (price, stops) in levels {
             for stop in stops {
                 let key = (stop.account, stop.id);
-                let idx = side.add(price, stop);
+                let idx = self.add(price, stop);
                 mapping.push((key, idx));
             }
         }
-        (side, mapping)
+        mapping
     }
 
     /// Touch every slab page so first-use page faults happen at startup.

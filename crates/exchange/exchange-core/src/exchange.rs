@@ -70,20 +70,6 @@ pub struct Exchange {
     /// stage processes — see `drain_due_scheduled_tasks`. Empty until a
     /// feature pushes a task; the substrate alone never schedules anything.
     scheduled_tasks: ScheduledTaskHeap,
-    /// Pre-allocated empty `OrderBook`s, populated by
-    /// [`Self::prefault_seed`] and indexed by symbol. When
-    /// `add_instrument` runs on the matching thread, it takes the book
-    /// from this pool instead of allocating a fresh one — avoiding the
-    /// 5–11 ms first-touch + mlock spike that would otherwise show up
-    /// during seed (matching thread is mlock-MCL_FUTURE so any new
-    /// allocation triggers a per-page lock, faulting thousands of pages
-    /// at once). Empty slot in the pool means the book has been taken
-    /// or was never pre-allocated for that symbol; `add_instrument`
-    /// falls back to a fresh allocation in that case.
-    instrument_pool: Vec<Option<OrderBook>>,
-    /// When true, new order books are created with generous pre-allocation
-    /// to avoid HashMap resize spikes on the hot path.
-    presized: bool,
     /// Maximum number of open orders (resting limits + pending stops, across
     /// all instruments) per account. New submissions are rejected with
     /// `ExceedsMaxOpenOrders` once an account reaches this count. `0` means
@@ -95,10 +81,11 @@ pub struct Exchange {
     /// `u32` matches the type of the `order_counts` value field.
     ///
     /// Determinism note: the cap shapes Rejected reports, which are
-    /// observable state. Primary and every replica must run with the same
-    /// value or replay will diverge — the cap is operator config, not a
-    /// journaled event, so it is the operator's responsibility to keep it
-    /// consistent across the cluster (same shape as `--authorized-keys`).
+    /// observable state, so it is engine state like any other: set by the
+    /// journaled `SetAccountLimits` event (the server journals the
+    /// primary's value every time a node becomes primary) and carried in
+    /// the snapshot. Replicas and replay therefore apply the primary's
+    /// value, never a node-local one.
     max_open_orders_per_account: u32,
     /// Per-account order-submission rate limit (token bucket, SEC-04).
     /// `max_orders_per_second` is the steady-state refill rate;
@@ -107,11 +94,11 @@ pub struct Exchange {
     /// (opt-out). Buckets are populated lazily in `order_buckets` on first
     /// submission per account.
     ///
-    /// Determinism note: same as the open-orders cap above — Rejected
-    /// reports are observable, so primary and every replica must run
-    /// with matching values. The bucket math uses the journaled
-    /// `ApplyCtx::now_ns` (stamped by the reader at ingest), not wall-
-    /// clock, so bit-for-bit replay holds across the cluster.
+    /// Determinism note: same as the open-orders cap above — set by the
+    /// journaled `SetAccountLimits` event and carried in the snapshot. The
+    /// bucket math uses the journaled `ApplyCtx::now_ns` (stamped by the
+    /// reader at ingest), not wall-clock, so bit-for-bit replay holds
+    /// across the cluster.
     ///
     /// Snapshot continuity: per-account bucket state (`tokens` +
     /// `last_refill_ns`) is serialised in snapshot format v18+ via
@@ -205,7 +192,28 @@ pub const DEFAULT_MAX_ORDERS_PER_SECOND: u32 = 0;
 /// inert at the engine default — the CLI provides the production value.
 pub const DEFAULT_MAX_ORDERS_BURST: u32 = 0;
 
+/// Production capacity of the live-order set: 1M `(account, order_id)`
+/// pairs, ~24 bytes each ≈ 24 MB. Sized for the default benchmark's peak
+/// resting depth — orders turn over fast at 10M ord/s, so the live count
+/// is far below the lifetime total. hashbrown-backed: the bounded-live-
+/// count + unbounded-distinct-keys workload doesn't grow the table once
+/// warmup settles.
+pub(crate) const LIVE_ORDER_CAPACITY: usize = 1_000_000;
+
+/// Production capacity of the per-account maps (`order_counts`,
+/// `order_buckets`): 1M accounts, ~32 bytes each ≈ 32 MB per map. Covers
+/// the default benchmark (1M accounts) with no hot-path resizes. Both
+/// track the active-account count, hence one size.
+pub(crate) const ACCOUNT_MAP_CAPACITY: usize = 1_000_000;
+
+/// Instrument slots reserved up front. Each empty slot is 8 bytes (a null
+/// `Box` pointer), so over-reserving is free; a listing past this many
+/// grows the `Vec` once, on the matching thread, by 8 bytes per symbol.
+pub(crate) const INSTRUMENT_SLOTS: usize = 64;
+
 impl Exchange {
+    /// An engine with nothing reserved. For tests and embedded users; a
+    /// server node starts from [`Self::with_capacity`] instead.
     pub fn new() -> Self {
         Self {
             instruments: Vec::new(),
@@ -214,8 +222,6 @@ impl Exchange {
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
-            instrument_pool: Vec::new(),
-            presized: false,
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
             max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
@@ -228,116 +234,125 @@ impl Exchange {
         }
     }
 
-    /// Create an Exchange pre-sized for production workloads.
+    /// An empty engine with production capacity reserved: the state every
+    /// server node starts from, whether it then seeds a genesis, replays a
+    /// journal or applies a primary's stream. Reserving here, before any
+    /// event, is what keeps growth off the matching thread: the collections
+    /// only ever fill what was allocated at construction, and a journal
+    /// replayed into this engine lands in the same tables a live node runs
+    /// on. Call [`Self::prefault`] afterwards to touch the pages too.
+    ///
+    /// The balance map is the one collection left at its default size: its
+    /// steady-state size depends on the deployment (accounts × currencies),
+    /// so the node reserves it from its own counts through
+    /// [`Self::reserve_for_accounts`], which also raises the per-account
+    /// maps past their constant for a deployment beyond it.
     pub fn with_capacity() -> Self {
         Self {
-            // 64 instrument slots — each empty slot is 8 bytes (null Box ptr).
-            instruments: Vec::with_capacity(64),
+            instruments: Vec::with_capacity(INSTRUMENT_SLOTS),
             accounts: AccountManager::with_capacity(),
-            // 1M live-order slots × ~24 bytes per entry ≈ 24 MB. Sized
-            // for the default benchmark's peak resting depth — orders
-            // turn over fast at 10M ord/s so the live count is much
-            // smaller than the lifetime total. hashbrown-backed: the
-            // bounded-live-count + unbounded-distinct-keys workload
-            // doesn't grow the table once warmup settles.
-            live_order_ids: FxHashSet::with_capacity_and_hasher(1_000_000, Default::default()),
-            // 1M accounts × ~32 bytes per entry ≈ 32 MB. Covers the
-            // default benchmark (1M accounts) with no hot-path resizes.
+            live_order_ids: FxHashSet::with_capacity_and_hasher(
+                LIVE_ORDER_CAPACITY,
+                Default::default(),
+            ),
             // Pages are faulted during prefault() via insert/clear.
-            order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap4::with_capacity_and_hasher(
+                ACCOUNT_MAP_CAPACITY,
+                Default::default(),
+            ),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
-            instrument_pool: Vec::new(),
-            presized: true,
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
             max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
-            // Same 1M sizing as `order_counts` — bucket count tracks the
-            // active-account count.
-            order_buckets: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_buckets: HashMap4::with_capacity_and_hasher(
+                ACCOUNT_MAP_CAPACITY,
+                Default::default(),
+            ),
             current_event_ts_ns: 0,
             scratch_consumed: Vec::with_capacity(64),
             scratch_freed: Vec::with_capacity(64),
         }
     }
 
-    /// Pre-allocate collections for a known bulk-seed workload.
+    /// Reserve for `num_accounts` accounts trading `num_instruments`
+    /// instruments: the balance map for a base and a quote balance per
+    /// instrument per account, and the per-account maps for the accounts
+    /// themselves where the count exceeds [`ACCOUNT_MAP_CAPACITY`]. A
+    /// bulk seed then never hits a rehash as the maps grow, and accounts
+    /// provisioned later on the matching thread land in reserved space
+    /// instead of doubling it.
     ///
-    /// Sizes the balance map to `num_accounts × num_instruments × 2`
-    /// (base + quote per instrument per account) so the seed phase
-    /// doesn't hit multi-hundred-ms rehash stalls as the map grows.
-    ///
-    /// Populates the instrument pool with one `OrderBook` per expected
-    /// instrument (indexed by symbol). `add_instrument` pulls from
-    /// this pool instead of allocating fresh, avoiding the 5-11 ms
-    /// first-touch + mlock spike during seed (matching thread runs
-    /// under MCL_FUTURE so any new allocation faults thousands of
-    /// pages at once).
-    pub fn prefault_seed(&mut self, num_accounts: usize, num_instruments: usize) {
+    /// Capacity only: every entry survives, a map that already has the
+    /// room is untouched, and a second call with the same counts is a
+    /// no-op. A map that is too small is rebuilt at the larger size (see
+    /// `reserve_map`) — a restored engine's balance map is sized to its
+    /// snapshot, so this is what gives it room to grow.
+    pub fn reserve_for_accounts(&mut self, num_accounts: usize, num_instruments: usize) {
         let balance_capacity = num_accounts
             .saturating_mul(num_instruments)
             .saturating_mul(2);
-        self.accounts = AccountManager::with_balance_capacity(balance_capacity);
-        self.instruments.reserve(num_instruments.max(64));
-        self.instrument_pool = (0..num_instruments)
-            .map(|i| Some(OrderBook::with_capacity(Symbol(i as u32))))
-            .collect();
-        self.live_order_ids = FxHashSet::with_capacity_and_hasher(1_000_000, Default::default());
-        self.order_counts =
-            HashMap4::with_capacity_and_hasher(num_accounts.max(1_000_000), Default::default());
-        self.order_buckets =
-            HashMap4::with_capacity_and_hasher(num_accounts.max(1_000_000), Default::default());
+        self.accounts.reserve_balances(balance_capacity);
+        crate::types::reserve_map(&mut self.order_counts, num_accounts);
+        crate::types::reserve_map(&mut self.order_buckets, num_accounts);
     }
 
-    /// Reconstruct from pre-built parts (used by snapshot restore).
+    /// Reconstruct from restored parts (used by snapshot restore): a
+    /// production-sized engine (see [`Self::with_capacity`]) that takes
+    /// the parts, is pre-faulted, and derives the rest through ordinary
+    /// inserts. The sizing lives in the constructor alone; the parts
+    /// arrive sized and pre-faulted by their own restores, and `prefault`
+    /// leaves them alone. A snapshot with more live orders than
+    /// [`LIVE_ORDER_CAPACITY`] reserves the excess before the prefault;
+    /// the per-account map cannot be reserved in place and grows during
+    /// the fill in that case, which only a snapshot of over a million
+    /// resting orders reaches.
+    ///
+    /// The limiter starts disabled with an empty bucket map, as on a
+    /// fresh engine. `restore_state` then repopulates the buckets from the
+    /// snapshot's v18+ section and applies the v19+ account limits (which,
+    /// going from disabled `(0, 0)` to active, preserves the restored
+    /// buckets — see `set_max_orders_per_second`).
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
         key_hwm: HashMap<u64, u64>,
         scheduled_tasks: ScheduledTaskHeap,
     ) -> Self {
+        let mut exchange = Self::with_capacity();
+        exchange.instruments = instruments;
+        exchange
+            .instruments
+            .reserve(INSTRUMENT_SLOTS.saturating_sub(exchange.instruments.len()));
+        exchange.accounts = accounts;
+        exchange.key_hwm = key_hwm;
+        exchange.scheduled_tasks = scheduled_tasks;
         // Derive order_counts and live_order_ids from order_index across
         // all instruments. Both are fully reconstructible from the books,
         // so the snapshot doesn't carry them — the only source of truth
-        // is the order index.
-        let mut order_counts: HashMap4<AccountId, u32> = HashMap4::default();
-        let mut live_order_ids: FxHashSet<(AccountId, OrderId)> = FxHashSet::default();
-        for inst in &instruments {
-            if let Some(inst) = inst.as_deref() {
-                for ((account, order_id), _) in inst.book.active_order_slots() {
-                    *order_counts.entry(account).or_default() += 1;
-                    live_order_ids.insert((account, order_id));
-                }
-                for ((account, order_id), _) in inst.book.active_stop_slots() {
-                    *order_counts.entry(account).or_default() += 1;
-                    live_order_ids.insert((account, order_id));
-                }
-            }
+        // is the order index. Collected first so the live set can be
+        // reserved before the prefault.
+        let live: Vec<(AccountId, OrderId)> = exchange
+            .instruments
+            .iter()
+            .flatten()
+            .flat_map(|inst| {
+                let orders = inst.book.active_order_slots().map(|(key, _)| key);
+                let stops = inst
+                    .book
+                    .active_stop_slots()
+                    .into_iter()
+                    .map(|(key, _)| key);
+                orders.chain(stops)
+            })
+            .collect();
+        exchange.live_order_ids.reserve(live.len());
+        exchange.prefault();
+        for (account, order_id) in live {
+            *exchange.order_counts.entry(account).or_default() += 1;
+            exchange.live_order_ids.insert((account, order_id));
         }
-        Self {
-            instruments,
-            accounts,
-            live_order_ids,
-            order_counts,
-            key_hwm,
-            scheduled_tasks,
-            instrument_pool: Vec::new(),
-            presized: false,
-            max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
-            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
-            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
-            // Snapshot restore: limiter starts disabled by default and
-            // the bucket map starts empty. `restore_state` calls
-            // `restore_order_buckets` after `from_parts` to repopulate
-            // from the snapshot's v18+ bucket section, and the server
-            // wiring then reapplies the operator config (which, going
-            // from disabled `(0, 0)` to active, preserves the restored
-            // buckets — see `set_max_orders_per_second`).
-            order_buckets: HashMap4::default(),
-            current_event_ts_ns: 0,
-            scratch_consumed: Vec::with_capacity(64),
-            scratch_freed: Vec::with_capacity(64),
-        }
+        exchange
     }
 
     /// Configure the per-account open-order cap (`0` = unlimited). See the
@@ -374,8 +389,10 @@ impl Exchange {
     ///   later re-enables with the same values.
     /// - **No-op reapply** (values unchanged): obviously preserve.
     ///
-    /// Determinism: must match across primary and replicas — see the field
-    /// docs on `max_orders_per_second` / `max_orders_burst`.
+    /// Determinism: in the server this is only ever reached through the
+    /// journaled `SetAccountLimits` event, so every node applies the same
+    /// values at the same point in the history — see the field docs on
+    /// `max_orders_per_second` / `max_orders_burst`.
     ///
     /// Side effect (online-reconfig path only): clearing buckets resets
     /// every account to a full burst at next first-touch. Operators
@@ -665,10 +682,12 @@ impl Exchange {
         inst.fee_schedule = schedule;
     }
 
-    /// Touch all pre-allocated HashMap pages so page faults happen at startup,
-    /// not on the hot path. Call once after adding instruments, before accepting
-    /// orders. Skips maps that already contain data — their pages are already
-    /// faulted from the insertions that populated them.
+    /// Touch all pre-allocated pages so page faults happen at startup, not
+    /// on the hot path. Runs on every engine a node builds — an empty one
+    /// (see [`Self::with_capacity`]) and a restored one alike — so it
+    /// skips any collection that already holds entries: their pages are
+    /// faulted by the entries themselves, and the dummy-fill-then-clear
+    /// used to touch an empty one would drop live state. Idempotent.
     pub fn prefault(&mut self) {
         // Fault live_order_ids and order_counts pages. with_capacity()
         // allocated the backing table but didn't write to it — insert
@@ -708,26 +727,15 @@ impl Exchange {
         }
         // Only insert if slot is empty (don't overwrite existing instrument).
         if self.instruments[idx].is_none() {
-            // Take a pre-allocated book from the pool if one is waiting at
-            // this symbol's index — see `instrument_pool` field doc. Falls
-            // back to fresh allocation otherwise; the matching thread is
-            // mlock-MCL_FUTURE so the fresh path can stall for a few ms
-            // while pages are locked. The pool path keeps that cost on
-            // the main thread at startup.
-            let book = self
-                .instrument_pool
-                .get_mut(idx)
-                .and_then(|slot| slot.take())
-                .unwrap_or_else(|| {
-                    if self.presized {
-                        OrderBook::with_capacity(spec.symbol)
-                    } else {
-                        OrderBook::new(spec.symbol)
-                    }
-                });
+            // A production-sized book, allocated here. On a server this
+            // runs on the matching thread, and the process locks pages on
+            // first touch, so a listing spreads the book's page faults
+            // over its first orders rather than paying them up front.
+            // Listings are rare, and the genesis seed runs before the
+            // first client is served.
             self.instruments[idx] = Some(Box::new(InstrumentState {
                 spec,
-                book,
+                book: OrderBook::with_capacity(spec.symbol),
                 risk_limits: RiskLimits::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
                 fee_schedule: FeeSchedule::default(),

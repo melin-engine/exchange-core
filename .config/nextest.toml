@@ -9,6 +9,21 @@
 # only serialises *within* one test process — nextest forks per
 # test by default, so the annotation has no effect under nextest.
 #
+# A test that hangs — a query a halted node never answers, a read with
+# no deadline — would otherwise hang the pre-commit hook, and CI with
+# it. Every test but one finishes in under six seconds, even with the
+# failover binary running serially, so a test still running after two
+# minutes is stuck: nextest kills it and names it.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The exception, and the reason this is an override rather than a higher
+# default: the eviction soak drives sustained load through a catch-up
+# for ~165s by design. Six minutes is the ceiling for it alone.
+[[profile.default.overrides]]
+filter = 'test(evicted_replica_catchup_under_load_preserves_dense_lineage)'
+slow-timeout = { period = "180s", terminate-after = 2 }
+
 # Route the failover binary into a one-at-a-time test-group; other
 # crates keep nextest's default parallelism.
 [[profile.default.overrides]]

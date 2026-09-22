@@ -54,24 +54,31 @@ const _: () = assert!(size_of::<ExecutionReport>() == 64);
 /// neither `Application` (in `melin-app`) nor `Exchange` (in
 /// `melin-ec`) is local to `melin-ec-server`, but `ServerApp` is.
 ///
-/// The inner field is `pub` because the server frequently constructs an
-/// `Exchange` directly (`Exchange::with_capacity`) and wraps it; making
-/// the wrap explicit at every construction site is
-/// cheaper than introducing a parallel set of constructors here.
+/// The inner field is `pub` because benches and tests construct an
+/// `Exchange` directly and wrap it; making the wrap explicit at every
+/// construction site is cheaper than introducing a parallel set of
+/// constructors here.
 pub struct ServerApp(pub Exchange);
 
-impl ServerApp {
-    /// Construct a `ServerApp` wrapping a freshly-initialised `Exchange`.
-    /// Convenience for tests and bootstrap paths that want the default
-    /// `Exchange::new()` sizing without spelling the wrap.
-    pub fn new() -> Self {
-        ServerApp(Exchange::new())
-    }
-}
-
+/// The state every node starts from: an empty engine with production
+/// capacity reserved and its pages touched. The runtime builds one of
+/// these on every node and then seeds a genesis into it, replays a
+/// journal into it, or applies a primary's stream to it — so reserving
+/// here, before the first event, is what keeps growth and page faults off
+/// the matching thread whichever way the node comes up. A snapshot
+/// restore builds the same shape by another route (see `restore`).
+///
+/// Holds no state, and nothing local to the node: every node's history
+/// starts from the same empty engine, as `Application` requires.
+///
+/// A heavy constructor: it allocates and touches over a hundred
+/// megabytes. It is for the runtime, not for test fixtures — a test
+/// wraps `Exchange::new()` instead.
 impl Default for ServerApp {
     fn default() -> Self {
-        Self::new()
+        let mut exchange = Exchange::with_capacity();
+        exchange.prefault();
+        ServerApp(exchange)
     }
 }
 
@@ -95,6 +102,9 @@ impl Application for ServerApp {
     type Event = TradingEvent;
     type Report = ExecutionReport;
     type QueryResponse = QueryResponse;
+    /// Account and instrument counts to reserve for — see
+    /// [`crate::startup::ExchangeSizing`].
+    type Sizing = crate::startup::ExchangeSizing;
 
     /// Schema version for the snapshot payload. Tracks the underlying
     /// `snapshot` module's `PAYLOAD_VERSION` — any change there forces a
@@ -240,6 +250,21 @@ impl Application for ServerApp {
                     hwm: self.0.request_seq_hwm(ctx.key_hash),
                 })
             }
+            TradingEvent::SetAccountLimits {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            } => {
+                // Journaled on every promotion, so usually a re-apply of
+                // the values already in force — which both setters leave
+                // unchanged (the limiter keeps its buckets unless the
+                // rate or burst actually changes).
+                self.0
+                    .set_max_open_orders_per_account(max_open_orders_per_account);
+                self.0
+                    .set_max_orders_per_second(max_orders_per_second, max_orders_burst);
+                None
+            }
         }
     }
 
@@ -253,12 +278,16 @@ impl Application for ServerApp {
         Exchange::check_request_seq(&mut self.0, key_hash, seq)
     }
 
-    /// Route through `Exchange::prefault`, which walks the pre-allocated
-    /// slabs and indices so the first hot-path access after startup
-    /// doesn't soft-fault. Avoids the default snapshot-round-trip
-    /// implementation on a cold allocator.
-    fn prefault(&mut self) {
-        Exchange::prefault(&mut self.0);
+    /// Reserve what only the node knows the size of: the balance map and,
+    /// past its built-in capacity, the per-account maps, from
+    /// `--accounts` and `--instruments`. Everything else is reserved and
+    /// pre-faulted by `Default` and `restore`. The runtime calls this on
+    /// a genesis instance before it replays a journal into it, and again
+    /// before the instance serves, so a restored engine — whose balance
+    /// map is sized to its snapshot — gets its room here.
+    fn prefault(&mut self, sizing: &Self::Sizing) {
+        self.0
+            .reserve_for_accounts(sizing.accounts as usize, sizing.instruments as usize);
     }
 
     /// `Exchange` exposes an in-memory `clone_via_snapshot` that skips
@@ -273,7 +302,6 @@ impl Application for ServerApp {
         let engine_reason = match reason {
             TransportRejectReason::DuplicateRequest => EngineRejectReason::DuplicateRequest,
             TransportRejectReason::ReplicaDisconnected => EngineRejectReason::ReplicaDisconnected,
-            TransportRejectReason::Superseded => EngineRejectReason::Superseded,
         };
         ExecutionReport::Rejected {
             order_id: extract_order_id(event),
@@ -294,6 +322,9 @@ impl Application for ServerApp {
         w.write_all(&bytes)
     }
 
+    /// The decoder rebuilds the engine production-sized and pre-faulted,
+    /// the same shape `Default` produces, so a restored engine is as ready
+    /// to serve as a fresh one.
     fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
@@ -550,22 +581,6 @@ mod tests {
             }
             other => panic!("expected Rejected, got {other:?}"),
         }
-
-        let r = <ServerApp as Application>::build_reject(
-            &TradingEvent::CancelAll {
-                account: AccountId(9),
-            },
-            TransportRejectReason::Superseded,
-        );
-        match r {
-            ExecutionReport::Rejected {
-                account, reason, ..
-            } => {
-                assert_eq!(account, AccountId(9));
-                assert_eq!(reason, EngineRejectReason::Superseded);
-            }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
     }
 
     #[test]
@@ -680,7 +695,7 @@ mod tests {
 
         // 4. Successful withdraw on a clean account emits nothing.
         let mut reports = Vec::new();
-        let mut clean = ServerApp::new();
+        let mut clean = ServerApp(Exchange::new());
         clean.0.deposit(AccountId(7), CurrencyId(2), 500);
         <ServerApp as Application>::apply(
             &mut clean,

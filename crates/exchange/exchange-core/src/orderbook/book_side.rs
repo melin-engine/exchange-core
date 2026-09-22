@@ -495,34 +495,46 @@ impl BookSide {
             .collect()
     }
 
-    /// Reconstruct a `BookSide` from snapshot levels (canonical ascending
-    /// price order). Returns `(side, mapping)` where `mapping` records the
-    /// slab index assigned to each `(account, order_id)` so the caller can
-    /// populate `OrderBook::order_index` with valid node indices.
-    pub(crate) fn from_levels_snapshot(
-        side: Side,
+    /// Room for `nodes` orders, for a snapshot deeper than the production
+    /// capacity. Called on an empty side before `prefault`, so the extra
+    /// pages are touched with the rest.
+    pub(super) fn reserve(&mut self, nodes: usize) {
+        self.nodes.reserve(nodes);
+    }
+
+    /// Slots the node slab can hold before it grows.
+    #[cfg(test)]
+    pub(super) fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    /// Fill an empty side from snapshot levels (canonical ascending price
+    /// order), through the same `add` a live order takes. Returns the
+    /// slab index assigned to each `(account, order_id)` so the caller
+    /// can populate `OrderBook::order_index` with valid node indices.
+    pub(crate) fn restore_levels(
+        &mut self,
         mut levels: Vec<(Price, Vec<RestingOrder>)>,
-    ) -> (Self, SnapshotNodeMapping) {
-        // Pre-size the slab to the total order count to avoid re-allocations.
+    ) -> SnapshotNodeMapping {
+        debug_assert!(self.is_empty(), "restore_levels on a populated side");
         let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
-        let mut out = Self::with_capacity(side, total.max(64));
         let mut mapping = Vec::with_capacity(total);
         // Insert levels in this side's physical order (worst first) so
         // every level append lands at the Vec tail — O(1) instead of a
         // front-shifting O(n²) restore for the descending side. In-place
         // reverse of the level Vec, not the orders within a level (FIFO
         // time priority is per-level and must be preserved).
-        if out.key_mask != 0 {
+        if self.key_mask != 0 {
             levels.reverse();
         }
         for (price, orders) in levels {
             for order in orders {
                 let key = (order.account, order.id);
-                let idx = out.add(price, order);
+                let idx = self.add(price, order);
                 mapping.push((key, idx));
             }
         }
-        (out, mapping)
+        mapping
     }
 
     /// True if no resting orders remain on this side.
@@ -778,7 +790,8 @@ mod tests {
             }
 
             let snapshot = original.levels_snapshot();
-            let (restored, mapping) = BookSide::from_levels_snapshot(side, snapshot.clone());
+            let mut restored = BookSide::new(side);
+            let mapping = restored.restore_levels(snapshot.clone());
 
             assert_key_sorted(&restored);
             assert_eq!(restored.levels_snapshot(), snapshot, "{side:?}");

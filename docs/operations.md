@@ -44,8 +44,11 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
-| `--accounts` | `100000` | Number of accounts to seed on first startup (fresh journal only). |
-| `--instruments` | `100` | Number of instruments to seed on first startup (fresh journal only). |
+| `--accounts` | `100000` | Number of accounts the node reserves memory for on every start, primary or replica. A build with the `synthetic-seed` feature also provisions that many funded test accounts on a fresh journal; see [Starting empty](#starting-empty). |
+| `--instruments` | `100` | Number of instruments the node reserves memory for on every start. A build with the `synthetic-seed` feature also registers that many placeholder instruments on a fresh journal. |
+| `--max-orders-per-account` | `10000` | Maximum simultaneously open orders per account (resting limits plus pending stops); beyond it, submissions reject with `ExceedsMaxOpenOrders`. `0` = unlimited. See [Per-account limits](#per-account-limits) for when a node's value takes effect. |
+| `--max-orders-per-second` | `1000` | Per-account sustained order rate; beyond it, submissions reject with `ExceedsOrderRate`. `0` disables the limiter. See [Per-account limits](#per-account-limits). |
+| `--max-orders-burst` | `5000` | Per-account burst allowance for the order-rate limiter. `0` disables the limiter. See [Per-account limits](#per-account-limits). |
 | `--heartbeat-interval-secs` | `10` | Seconds between heartbeats to idle connections. `0` to disable. |
 | `--connection-timeout-secs` | `30` | Seconds before disconnecting silent clients. `0` to disable. |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
@@ -54,6 +57,28 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 | `--snapshot-interval-ms` | `3_000_000` (50 min) | Interval in milliseconds between snapshots written by the shadow exchange — the sole snapshot writer. Set to `0` to disable; recovery then falls back to full journal replay. The shadow replays events on a dedicated thread, so snapshot writes never pause the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
 | `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
+
+#### Starting empty
+
+A release build starts with no instrument and no account. On a fresh journal there is nothing to trade until an operator creates both, which is done at runtime through the admin client (`melin-ec-admin`): register each instrument, then provision the accounts.
+
+Development builds can seed instead. The `synthetic-seed` build feature registers `--instruments` placeholder instruments and provisions `--accounts` accounts, each funded in every currency out of nothing, as the first events of a fresh journal — the fixture the benches and smoke tests trade from:
+
+```sh
+cargo build --release -p melin-ec-server --features synthetic-seed
+```
+
+The feature is off by default so that a production binary cannot create balances. A node built with it logs a warning at startup when it seeds, and the seed is permanent: it is journaled, replicated, and carried in every snapshot, so a journal created by a seeded build keeps those funded accounts for its lifetime. Never point one at a production journal.
+
+#### Per-account limits
+
+The three per-account limits (`--max-orders-per-account`, `--max-orders-per-second`, `--max-orders-burst`) are recorded in the journal, not read locally by every node. Each time a node becomes primary — at startup, and when it is promoted after a failover — it records its own flag values before serving its first client, and from then on those are the limits in force on every node:
+
+- **A replica enforces the primary's limits, not its own flags.** Its flags matter only once it is promoted, and take effect then.
+- **Changing a limit takes a primary restart or a failover.** Restart the primary with the new values, or promote a replica started with them. The change applies from that point on; decisions already made keep the limits they were made under, including on replay.
+- **Nodes no longer need identical values to stay consistent.** Different values across nodes are safe. They just mean the limits change at the next failover, so keep them aligned unless that is what you want.
+
+Changing the rate or burst while the limiter is active resets every account's order-rate allowance to a full burst, as any change of these values always has.
 
 #### Replication Flags
 
@@ -79,7 +104,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 
 1. Load authorized keys from `--authorized-keys`.
 2. Initialize or recover the exchange (see [Recovery on Startup](#recovery-on-startup)).
-3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
+3. Reserve the exchange's memory and pre-fault it (avoids growth and page faults on the hot path). Every node reserves the same production capacity before its first event; the balance map alone is sized from `--accounts` and `--instruments`.
 4. Build the disruptor pipeline (input ring + output ring).
 5. Spawn I/O thread: in TCP mode, one io_uring reader thread that multiplexes every connection via multishot RECV; in DPDK mode, one poll thread per NIC queue.
 6. Spawn the pipeline OS threads: journal-seq, journal-disk, journal-prep, matching, response, optionally event-publisher, optionally the shadow exchange, and the replication handlers when replication is on -- each pinned to its `--cores` entry.
@@ -208,7 +233,7 @@ The `init_engine` function checks the following conditions in order:
 
 3. **Journal exists (no snapshot)**: Full replay from genesis. Every event in the journal is replayed to reconstruct exchange state.
 
-4. **Neither exists**: Fresh start. Creates a new journal and seeds test data based on `--accounts` and `--instruments`.
+4. **Neither exists**: Fresh start. Creates a new journal, empty — unless the node was built with `synthetic-seed`, which seeds test data per `--accounts` and `--instruments`. See [Starting empty](#starting-empty).
 
 ### Post-Recovery Rotation Check
 
@@ -381,6 +406,7 @@ Examples:
 - `connection rejected: max_connections reached` -- at the connection limit, new clients turned away
 - `replica disconnected` -- replication link lost, degraded to local-only durability
 - `replica connection error` -- replication connection failed
+- `built with the synthetic-seed feature` -- this node is seeding funded test accounts into a fresh journal; not a production build
 
 **Action**: Investigate promptly. These indicate resource pressure or infrastructure issues that could escalate.
 
@@ -395,7 +421,6 @@ Examples:
 - `listening` -- ready to accept connections
 - `pinned to core` -- thread affinity applied
 - `shutdown signal received` / `shutdown complete` -- orderly shutdown
-- `seeded test data` -- first startup
 
 ### `debug` -- Client-caused events
 
@@ -659,6 +684,7 @@ melin_trading_active 1
 | `melin_input_queue_depth` | gauge | Items pending in the input disruptor (`producer - matching`) |
 | `melin_input_queue_capacity` | gauge | Total input ring buffer capacity (constant 1,048,576) |
 | `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
+| `melin_writes_refused_total` | counter | Client writes rejected with `ReplicaDisconnected` while halted. A refused write is never journaled, so this counter is its only trace on the node |
 | `melin_stage_busy_total{stage="..."}` | counter | Cumulative busy iterations per stage (journal/response: batches, matching: events) |
 | `melin_stage_idle_total{stage="..."}` | counter | Cumulative idle iterations per stage |
 | `melin_journal_rotations_total{path="..."}` | counter | Journal segment rotation attempts by outcome: `fast` adopted a pre-staged segment; `sync_fallback` allocated synchronously on the journal thread; `failed` left the current segment in place |
@@ -680,9 +706,15 @@ scrape_configs:
 
 ### Halt on Replica Disconnect
 
-When replication is enabled (`--replication-bind`), the engine automatically halts trading if the replica disconnects. All state-mutating requests (orders, deposits, admin operations) are rejected with `ReplicaDisconnected` until the replica reconnects. QueryStats and heartbeats continue working.
+When replication is enabled (`--replication-bind`), the engine automatically halts trading if the replica disconnects. All state-mutating requests (orders, deposits, admin operations) are rejected with `ReplicaDisconnected` until the replica reconnects. Heartbeats continue working.
+
+**Queries are not answered while halted.** `QueryStats`, position queries and request-sequence queries get no reply until the halt clears, under every ack policy — the client sees only its own read timeout. Monitor a halted node through the health endpoint instead: `melin_trading_active` reports the halt itself, and `melin_journal_sequence`, `melin_replication_lag`, `melin_active_connections` and `melin_writes_refused_total` cover what the node is doing. Account positions and the request-sequence high-water mark are unavailable until trading resumes. A client that connects to a halted node also blocks, because connecting queries the request-sequence mark; point clients at the health endpoint, or at the operator admin endpoint, to tell a halted node from an unreachable one.
 
 This preserves the durability guarantee: the engine never acks a response that isn't durable on both primary and replica. Without this, a primary crash after replica disconnect could lose acked events.
+
+A refused request is turned away before it is journaled: it has no effect on the book or on balances, now or after a restart, a failover or a replica catch-up. It also consumes nothing, so a client may resend it with the same request sequence once trading resumes. Refusals are counted in `melin_writes_refused_total`.
+
+A primary superseded by a newer one (after a failover) behaves differently: it is shutting down, so it closes client connections instead of rejecting requests. Clients reconnect and land on the new primary, as they would after a crash.
 
 Trading resumes automatically when the replica reconnects — no operator intervention needed. In standalone mode (no `--replication-bind`), this check is disabled.
 
@@ -822,7 +854,7 @@ If only a snapshot file exists (journal deleted or on a different disk that fail
 
 ### 5. Complete Data Loss
 
-If both the journal and snapshot are gone, the server starts fresh with empty state and seeds test data per `--accounts`/`--instruments`.
+If both the journal and snapshot are gone, the server starts fresh with empty state: no instrument, no account, no balance. A build with `synthetic-seed` re-seeds test data per `--accounts`/`--instruments` instead — which is a fixture, not a recovery. Real state only comes back from a journal or a snapshot.
 
 ---
 
@@ -894,6 +926,35 @@ A server with 10K accounts, 100 instruments, and 50K resting orders uses approxi
 - 50K orders * 40 bytes = ~2 MiB
 - Total: ~34 MiB
 
+### Engine Memory
+
+Every node reserves the engine's memory before its first event and touches it, so the pages are resident from startup rather than faulted on the hot path. The reservation is the same on a primary, a replica and a node recovering a journal or a snapshot, and it does not grow with load until a collection exceeds its reserved capacity.
+
+**Fixed part** (independent of the flags, approximate):
+
+| Collection | Reserved for | Memory |
+|------------|--------------|--------|
+| Live-order set | 1M resting orders | ~34 MiB |
+| Per-account open-order counts and rate-limit buckets | 1M accounts | ~48 MiB |
+| Reservation slab and free list | 2M reservations | ~40 MiB |
+| Order books | 4K orders and 1K stops per instrument | ~0.7 MiB per instrument |
+
+About **190 MiB** with 100 instruments. `--accounts` raises the per-account maps above their 1M reservation when it exceeds it.
+
+**Balance map**, sized from the flags: room for `--accounts × --instruments × 2` balances (a base and a quote balance per instrument per account) at about **30 bytes each**, with the bucket count rounded up to a power of two, so the actual figure is between one and two times that:
+
+| `--accounts` | `--instruments` | Balances reserved | Memory |
+|--------------|-----------------|-------------------|--------|
+| 10,000 | 20 | 400K | ~15 MiB |
+| 100,000 (default) | 100 (default) | 20M | ~1 GiB |
+| 1,000,000 | 100 | 200M | ~8 GiB |
+
+Size the two flags to the deployment rather than leaving the defaults: they exist so that provisioning an account on a running node never grows this map on the matching thread, and the default reserves for a large venue.
+
+**Shadow copy.** A node that writes snapshots keeps a second engine for it, built from a snapshot of the first. It reserves the fixed part again, about 190 MiB, and holds its balance map at the size of the state it was built from.
+
+**Restarts.** A node restored from a snapshot has its balance map sized to the snapshot's entries; at startup it rebuilds the map to the flags' counts, so for a few seconds both copies exist. Budget for the balance map twice on a restore. A node recovering a journal reserves before replaying, so it needs no such headroom.
+
 ### Ring Buffer Memory
 
 The input and output ring buffers are allocated at startup:
@@ -910,12 +971,14 @@ Total ring buffer memory: approximately **144 MiB**. This is fixed regardless of
 | Component | Estimate |
 |-----------|----------|
 | Ring buffers | ~144 MiB |
-| Exchange state (order books, accounts) | 10-500 MiB (depends on active orders) |
+| Engine, fixed part | ~190 MiB with 100 instruments (see [Engine Memory](#engine-memory)) |
+| Engine, balance map | ~1 GiB at the default `--accounts` and `--instruments`; ~15 MiB at 10,000 accounts and 20 instruments |
+| Shadow copy (if snapshots are enabled) | ~190 MiB plus its own balance map at the snapshot's size |
 | Journal pre-allocation | 256 MiB chunk |
 | Replication ring (if enabled) | 128 MiB (256 slots × 512 KiB, tunable via `--replication-ring-size`) |
 | Connection state | ~4 KiB per connection |
 | jemalloc overhead | ~10-50 MiB |
-| **Total (typical)** | **300-800 MiB** (add replication ring if enabled) |
+| **Total (typical)** | **~1.8 GiB** at the default counts with snapshots and replication; **~700 MiB** at 10,000 accounts and 20 instruments |
 
 ### Replication Ring Sizing
 

@@ -17,10 +17,89 @@ pub(crate) use book_side::{BookSide, RestingOrder};
 pub(crate) use stop_side::{PendingStop, StopSide};
 
 use crate::slab_map::SlabMap;
+use crate::snapshot::{BookSnapshot, PendingStopSnapshot, RestingOrderSnapshot};
 use crate::types::{
     AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
     ReservationSlot, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
+
+/// Snapshot levels as the resting orders a side stores, with the
+/// reservation slot left for `inject_reservation_slots` to fill in.
+fn materialize_orders(
+    levels: Vec<(Price, Vec<RestingOrderSnapshot>)>,
+    side: Side,
+) -> Vec<(Price, Vec<RestingOrder>)> {
+    levels
+        .into_iter()
+        .map(|(price, orders)| {
+            let restored = orders
+                .into_iter()
+                .map(|o| {
+                    RestingOrder::new(
+                        o.id,
+                        o.account,
+                        o.remaining,
+                        o.time_in_force,
+                        o.expiry_ns,
+                        side,
+                        ReservationSlot::DUMMY,
+                    )
+                })
+                .collect();
+            (price, restored)
+        })
+        .collect()
+}
+
+/// Snapshot levels as the pending stops a stop side stores, with the
+/// reservation slot left for `inject_reservation_slots` to fill in.
+fn materialize_stops(
+    levels: Vec<(Price, Vec<PendingStopSnapshot>)>,
+) -> Vec<(Price, Vec<PendingStop>)> {
+    levels
+        .into_iter()
+        .map(|(trigger_price, stops)| {
+            let pending = stops
+                .into_iter()
+                .map(|s| {
+                    PendingStop::new(
+                        s.id,
+                        s.account,
+                        s.side,
+                        s.trigger_price,
+                        s.quantity,
+                        s.time_in_force,
+                        s.limit_price,
+                        s.quote_budget,
+                        s.stp,
+                        s.expiry_ns,
+                        ReservationSlot::DUMMY,
+                    )
+                })
+                .collect();
+            (trigger_price, pending)
+        })
+        .collect()
+}
+
+/// Production capacity of a book's order index: one entry per resting
+/// order for O(1) cancel lookups. 4096 slots covers typical book depth
+/// (100-2000 orders) without a hot-path resize. `SlabMap` keeps the
+/// structure bounded by peak live entries under churn, so this is a
+/// tighter "expected steady-state size" than the previous astenn capacity
+/// (which had to be over-allocated to hide the lifetime-insert growth
+/// pathology).
+pub(crate) const ORDER_INDEX_CAPACITY: usize = 4_096;
+
+/// Production capacity of each side's node slab: half the order index,
+/// since orders split roughly bid/ask. Avoids growing the slab during
+/// the warmup phase of a hot book.
+pub(crate) const SIDE_NODE_CAPACITY: usize = ORDER_INDEX_CAPACITY / 2;
+
+/// Production capacity of the stop index and of each stop side's slab.
+/// Stops are ~3% of order flow, so 1K covers a hot book without wasted
+/// space.
+pub(crate) const STOP_NODE_CAPACITY: usize = 1_024;
 
 /// Central limit order book for a single instrument.
 #[derive(Debug)]
@@ -109,7 +188,9 @@ impl OrderBook {
         }
     }
 
-    /// Create an OrderBook pre-sized for production workloads.
+    /// Create an OrderBook pre-sized for production workloads: what
+    /// `Exchange::add_instrument` builds, and what a snapshot restore
+    /// rebuilds a book to (see [`Self::restore`]).
     ///
     /// Capacity is intentionally modest (4K order slots, 1K stop slots) so
     /// the hash tables fit in L2 cache (~160 KB). Oversized tables cause
@@ -118,26 +199,14 @@ impl OrderBook {
     /// Hashbrown resizes by doubling, so a 4K→8K resize moves ~128 KB —
     /// a one-time ~5 µs stall that appears in p99.99 at most.
     pub fn with_capacity(symbol: Symbol) -> Self {
-        // Pre-size each side's slab to ~2K nodes — half the order_index
-        // capacity, since orders split roughly bid/ask. Avoids growing the
-        // slab during the warmup phase of a hot book.
         Self {
             symbol,
-            bids: BookSide::with_capacity(Side::Buy, 2_048),
-            asks: BookSide::with_capacity(Side::Sell, 2_048),
-            // One entry per resting order for O(1) cancel lookups. 4096
-            // slots covers typical book depth (100-2000 orders) without
-            // hot-path resize. `SlabMap` keeps the structure bounded by
-            // peak live entries under churn, so this is a tighter
-            // "expected steady-state size" than the previous astenn
-            // capacity (which had to be over-allocated to hide the
-            // lifetime-insert growth pathology).
-            order_index: SlabMap::with_capacity(4_096),
-            // Stops are ~3% of order flow so a 1K slab covers a hot
-            // book without wasted space.
-            stop_buys: StopSide::with_capacity(1_024),
-            stop_sells: StopSide::with_capacity(1_024),
-            stop_index: SlabMap::with_capacity(1_024),
+            bids: BookSide::with_capacity(Side::Buy, SIDE_NODE_CAPACITY),
+            asks: BookSide::with_capacity(Side::Sell, SIDE_NODE_CAPACITY),
+            order_index: SlabMap::with_capacity(ORDER_INDEX_CAPACITY),
+            stop_buys: StopSide::with_capacity(STOP_NODE_CAPACITY),
+            stop_sells: StopSide::with_capacity(STOP_NODE_CAPACITY),
+            stop_index: SlabMap::with_capacity(STOP_NODE_CAPACITY),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
@@ -149,33 +218,44 @@ impl OrderBook {
 
     /// Touch all pre-allocated HashMap pages so page faults happen at startup,
     /// not on the hot path. Insert dummy entries up to capacity, then clear.
+    ///
+    /// An index that already holds entries is skipped: its pages are faulted
+    /// by the entries themselves, and the clear would drop every live order
+    /// from it — orders still resting in the book, but no longer cancellable
+    /// or replaceable, their ids blocked and their funds reserved for good.
+    /// The runtime calls this on populated books (a primary recovering its
+    /// journal, a replica being promoted), so the guard is load-bearing.
     pub fn prefault(&mut self) {
-        let cap = self.order_index.capacity();
-        for i in 0..cap {
-            self.order_index.insert(
-                (AccountId(0), OrderId(i as u64)),
-                (
-                    Side::Buy,
-                    Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
-                    ReservationSlot::DUMMY,
-                    INVALID_NODE,
-                ),
-            );
+        if self.order_index.is_empty() {
+            let cap = self.order_index.capacity();
+            for i in 0..cap {
+                self.order_index.insert(
+                    (AccountId(0), OrderId(i as u64)),
+                    (
+                        Side::Buy,
+                        Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                        ReservationSlot::DUMMY,
+                        INVALID_NODE,
+                    ),
+                );
+            }
+            self.order_index.clear();
         }
-        self.order_index.clear();
 
-        let cap = self.stop_index.capacity();
-        for i in 0..cap {
-            self.stop_index.insert(
-                (AccountId(0), OrderId(i as u64)),
-                (
-                    Side::Buy,
-                    Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
-                    INVALID_NODE,
-                ),
-            );
+        if self.stop_index.is_empty() {
+            let cap = self.stop_index.capacity();
+            for i in 0..cap {
+                self.stop_index.insert(
+                    (AccountId(0), OrderId(i as u64)),
+                    (
+                        Side::Buy,
+                        Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                        INVALID_NODE,
+                    ),
+                );
+            }
+            self.stop_index.clear();
         }
-        self.stop_index.clear();
 
         // Touch every slab page on both sides so the first matching
         // pop / cancel after warmup doesn't pay a page-fault stall.
@@ -185,38 +265,74 @@ impl OrderBook {
         self.stop_sells.prefault();
     }
 
-    /// Reconstruct an OrderBook from pre-built parts (used by snapshot restore).
+    /// Restore an order book from a snapshot: a production-sized,
+    /// pre-faulted book (see [`Self::with_capacity`]) filled through the
+    /// same `add` and `insert` paths a live order takes. The sizing lives
+    /// in the constructor alone; a snapshot deeper than that capacity
+    /// reserves its excess before the prefault, so every page the
+    /// restored book can reach has been touched.
     ///
-    /// The order_index entries initially have `ReservationSlot::DUMMY`.
-    /// Call `inject_reservation_slots()` after account restore to set
-    /// the real slot values.
-    pub(crate) fn from_parts(
-        symbol: Symbol,
-        bids: BookSide,
-        asks: BookSide,
-        order_index: SlabMap<(Side, Price, ReservationSlot, u32)>,
-        stop_buys: StopSide,
-        stop_sells: StopSide,
-        stop_index: SlabMap<(Side, Price, u32)>,
-        last_trade_price: Option<Price>,
-    ) -> Self {
-        Self {
-            symbol,
-            bids,
-            asks,
-            order_index,
-            stop_buys,
-            stop_sells,
-            stop_index,
-            last_trade_price,
-            // Same hot-path scratch buffers as `new()`; pre-sized so the
-            // first match after snapshot restore doesn't realloc. See
-            // `new()` for the capacity rationale.
-            trigger_price_buf: Vec::with_capacity(64),
-            triggered_buf: Vec::with_capacity(64),
-            match_price_buf: Vec::with_capacity(64),
-            consumed_slots: Vec::with_capacity(64),
+    /// The restored orders carry `ReservationSlot::DUMMY`. Call
+    /// `inject_reservation_slots()` after account restore to set the real
+    /// slot values.
+    pub(crate) fn restore(symbol: Symbol, snap: BookSnapshot) -> Self {
+        fn count<T>(levels: &[(Price, Vec<T>)]) -> usize {
+            levels.iter().map(|(_, v)| v.len()).sum()
         }
+
+        let mut book = Self::with_capacity(symbol);
+        book.bids.reserve(count(&snap.bids));
+        book.asks.reserve(count(&snap.asks));
+        book.stop_buys.reserve(count(&snap.stop_buys));
+        book.stop_sells.reserve(count(&snap.stop_sells));
+        book.order_index.reserve(snap.order_index.len());
+        book.stop_index.reserve(snap.stop_index.len());
+        book.prefault();
+
+        // Sides first: they assign each order's slab index, which the
+        // index needs so cancel/amend stay O(1). Both sides share the
+        // `(account, order_id)` namespace, but each order lives in exactly
+        // one, so the two mappings never collide.
+        let bid_nodes = book
+            .bids
+            .restore_levels(materialize_orders(snap.bids, Side::Buy));
+        let ask_nodes = book
+            .asks
+            .restore_levels(materialize_orders(snap.asks, Side::Sell));
+        let node_for: std::collections::HashMap<(AccountId, OrderId), u32> =
+            bid_nodes.into_iter().chain(ask_nodes).collect();
+        for (id, account, side, price) in snap.order_index {
+            let node_idx = *node_for
+                .get(&(account, id))
+                // Snapshot self-consistency: every order_index entry must
+                // correspond to a resting order in the same snapshot. If
+                // it doesn't, the snapshot is corrupt and we'd rather fail
+                // loudly than silently skip cancels.
+                .expect("snapshot order_index references missing book entry");
+            book.order_index.insert(
+                (account, id),
+                (side, price, ReservationSlot::DUMMY, node_idx),
+            );
+        }
+
+        let buy_stops = book
+            .stop_buys
+            .restore_levels(materialize_stops(snap.stop_buys));
+        let sell_stops = book
+            .stop_sells
+            .restore_levels(materialize_stops(snap.stop_sells));
+        let stop_node_for: std::collections::HashMap<(AccountId, OrderId), u32> =
+            buy_stops.into_iter().chain(sell_stops).collect();
+        for (id, account, side, price) in snap.stop_index {
+            let node_idx = *stop_node_for
+                .get(&(account, id))
+                .expect("snapshot stop_index references missing stop entry");
+            book.stop_index
+                .insert((account, id), (side, price, node_idx));
+        }
+
+        book.last_trade_price = snap.last_trade_price;
+        book
     }
 
     // --- Snapshot accessors ---

@@ -572,16 +572,13 @@ fn main() {
                     melin_journal::StagingMode::default(),
                     std::time::Duration::ZERO,
                     8, // pipeline_depth
-                    std::sync::Arc::new(melin_ec_server::app_factory::Factory::new(
-                        melin_ec_server::app_factory::FactoryConfig {
-                            accounts: 0,
-                            instruments: 0,
-                            max_orders_per_account: 10_000,
-                            max_orders_per_second: 0,
-                            max_orders_burst: 0,
-                        },
-                    )),
                     replica_fence,
+                    // Nothing seeded, so nothing beyond the engine's base
+                    // capacity to reserve for.
+                    &melin_ec_server::startup::ExchangeSizing {
+                        accounts: 0,
+                        instruments: 0,
+                    },
                 );
             })
             .expect("spawn run_receiver");

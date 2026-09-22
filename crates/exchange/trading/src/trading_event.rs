@@ -47,6 +47,7 @@ const TAG_REMOVE_INSTRUMENT: u8 = 15;
 const TAG_QUERY_STATS: u8 = 16;
 const TAG_QUERY_POSITION: u8 = 17;
 const TAG_QUERY_REQUEST_SEQ: u8 = 18;
+const TAG_SET_ACCOUNT_LIMITS: u8 = 19;
 
 // Per-OrderType nested tag space inside SubmitOrder's payload.
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -132,6 +133,17 @@ pub enum TradingEvent {
     /// engine's dedup HWM and avoid spurious `DuplicateRequest`
     /// rejections of legitimate post-reconnect orders.
     QueryRequestSeq,
+    /// Put the per-account limits in force: the SEC-03 open-order cap and
+    /// the SEC-04 order-rate limiter (`0` disables either). Journaled by
+    /// the server every time a node becomes primary, from that node's own
+    /// configuration, so replicas and replay apply the primary's values.
+    /// Internal to the server — not exposed on the wire. `u32` each, the
+    /// engine's own field types.
+    SetAccountLimits {
+        max_open_orders_per_account: u32,
+        max_orders_per_second: u32,
+        max_orders_burst: u32,
+    },
 }
 
 impl AppEvent for TradingEvent {
@@ -190,6 +202,7 @@ impl AppEvent for TradingEvent {
             TradingEvent::QueryStats => 0,
             TradingEvent::QueryPosition { .. } => 4,
             TradingEvent::QueryRequestSeq => 0,
+            TradingEvent::SetAccountLimits { .. } => 4 + 4 + 4,
         }
     }
 
@@ -301,6 +314,16 @@ impl AppEvent for TradingEvent {
                 (TAG_QUERY_POSITION, 4)
             }
             TradingEvent::QueryRequestSeq => (TAG_QUERY_REQUEST_SEQ, 0),
+            TradingEvent::SetAccountLimits {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            } => {
+                le::put_u32(&mut buf[1..], *max_open_orders_per_account);
+                le::put_u32(&mut buf[5..], *max_orders_per_second);
+                le::put_u32(&mut buf[9..], *max_orders_burst);
+                (TAG_SET_ACCOUNT_LIMITS, 12)
+            }
         };
         buf[0] = tag;
         1 + payload_len
@@ -473,6 +496,14 @@ impl AppEvent for TradingEvent {
                 })
             }
             TAG_QUERY_REQUEST_SEQ => Ok(TradingEvent::QueryRequestSeq),
+            TAG_SET_ACCOUNT_LIMITS => {
+                need(payload, 12)?;
+                Ok(TradingEvent::SetAccountLimits {
+                    max_open_orders_per_account: le::get_u32(&payload[0..]),
+                    max_orders_per_second: le::get_u32(&payload[4..]),
+                    max_orders_burst: le::get_u32(&payload[8..]),
+                })
+            }
             other => Err(CodecError::UnknownTag(other)),
         }
     }
@@ -800,6 +831,11 @@ mod tests {
                 account: AccountId(1),
             },
             TradingEvent::QueryRequestSeq,
+            TradingEvent::SetAccountLimits {
+                max_open_orders_per_account: u32::MAX,
+                max_orders_per_second: u32::MAX,
+                max_orders_burst: u32::MAX,
+            },
         ]
     }
 
@@ -878,10 +914,57 @@ mod tests {
                 | TradingEvent::RemoveInstrument { .. }
                 | TradingEvent::QueryStats
                 | TradingEvent::QueryPosition { .. }
-                | TradingEvent::QueryRequestSeq => {}
+                | TradingEvent::QueryRequestSeq
+                | TradingEvent::SetAccountLimits { .. } => {}
             }
         }
         assert_covered(&TradingEvent::EndOfDay);
+    }
+
+    /// `is_query` is what a halted node refuses by: a write it misreads as a
+    /// query slips past the halt and is journaled without the durability
+    /// the halt defends, and a query misread as a write is refused for
+    /// nothing. The expectation is spelled out per variant, in a match with
+    /// no wildcard, so a new variant cannot build until someone decides.
+    #[test]
+    fn is_query_classifies_every_variant() {
+        fn expected(ev: &TradingEvent) -> bool {
+            match ev {
+                TradingEvent::QueryStats
+                | TradingEvent::QueryPosition { .. }
+                | TradingEvent::QueryRequestSeq => true,
+                TradingEvent::AddInstrument { .. }
+                | TradingEvent::Deposit { .. }
+                | TradingEvent::SubmitOrder { .. }
+                | TradingEvent::CancelOrder { .. }
+                | TradingEvent::SetRiskLimits { .. }
+                | TradingEvent::CancelAll { .. }
+                | TradingEvent::SetCircuitBreaker { .. }
+                | TradingEvent::CancelReplace { .. }
+                | TradingEvent::SetFeeSchedule { .. }
+                | TradingEvent::ProvisionAccount { .. }
+                | TradingEvent::Withdraw { .. }
+                | TradingEvent::EndOfDay
+                | TradingEvent::DisableInstrument { .. }
+                | TradingEvent::EnableInstrument { .. }
+                | TradingEvent::RemoveInstrument { .. }
+                | TradingEvent::SetAccountLimits { .. } => false,
+            }
+        }
+
+        let order = Order {
+            id: OrderId(1),
+            account: AccountId(2),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::IOC,
+            quantity: qty(10),
+            stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
+        };
+        for ev in all_variants_at_their_widest(order) {
+            assert_eq!(ev.is_query(), expected(&ev), "is_query for {ev:?}");
+        }
     }
 
     #[test]
@@ -892,6 +975,21 @@ mod tests {
                 base: CurrencyId(1),
                 quote: CurrencyId(2),
             },
+        });
+    }
+
+    #[test]
+    fn round_trip_set_account_limits() {
+        round_trip(TradingEvent::SetAccountLimits {
+            max_open_orders_per_account: 10_000,
+            max_orders_per_second: 1_000,
+            max_orders_burst: 5_000,
+        });
+        // `0` is meaningful (limiter or cap disabled), not absent.
+        round_trip(TradingEvent::SetAccountLimits {
+            max_open_orders_per_account: 0,
+            max_orders_per_second: 0,
+            max_orders_burst: 0,
         });
     }
 
