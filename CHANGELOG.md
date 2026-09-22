@@ -18,6 +18,8 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-22
+
 This release adopts Melin 0.17.0. The [0.17.0 section of its
 changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0170---2026-09-22)
 lists further fixes in the node runtime that apply here as they are; the
@@ -194,5 +196,6 @@ has no journal from sequence 1, is re-bootstrapped from a node that has.
 - An unpinned server thread runs on the process's own CPU set *(sequencer)*
   instead of inheriting an isolated core from the thread that started it.
 
-[Unreleased]: https://github.com/melin-engine/exchange-core/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/melin-engine/exchange-core/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.17.0
 [0.16.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.16.0
