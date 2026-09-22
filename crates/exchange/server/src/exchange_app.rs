@@ -14,7 +14,7 @@
 use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 
-use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
+use melin_app::{Application, ApplyCtx, QueryCtx, RejectReason as TransportRejectReason};
 use melin_ec::exchange::Exchange;
 use melin_ec::snapshot as engine_snapshot;
 use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
@@ -120,28 +120,24 @@ impl Application for ServerApp {
     /// methods (`execute`, `cancel`, …) own the real work and keep their
     /// own inlining attrs.
     #[inline]
-    fn apply(
-        &mut self,
-        request: Self::Event,
-        ctx: &ApplyCtx,
-        out: &mut Vec<Self::Report>,
-    ) -> Option<Self::QueryResponse> {
+    fn apply(&mut self, request: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         let TradingRequest { request_seq, event } = request;
 
         // A repeated request is refused before it touches any engine
         // state, the event-timestamp stash below included. The sequencer
-        // hands every event to `apply` — live, on replay, on a replica and
-        // in the shadow copy — and this one check is what keeps them all
-        // refusing the same ones. What a duplicate does not skip is the
-        // clock: the sequencer's dispatch ticks the scheduler to the
-        // event's timestamp before calling `apply`, on every path alike,
-        // so due work (an expiry, say) fires on a refused event as on an
-        // accepted one. Queries are exempt: they change nothing, are never
-        // journaled, and a client resynchronising its counter sends one
-        // first. Internal events carry key 0, which the engine exempts.
-        if !event.is_query() && !self.0.check_request_seq(ctx.key_hash, request_seq) {
+        // hands every journaled event to `apply` — live, on replay, on a
+        // replica and in the shadow copy — and this one check is what
+        // keeps them all refusing the same ones. What a duplicate does
+        // not skip is the clock: the sequencer's dispatch ticks the
+        // scheduler to the event's timestamp before calling `apply`, on
+        // every path alike, so due work (an expiry, say) fires on a
+        // refused event as on an accepted one. A query never comes here
+        // (it goes to `query`, and is never journaled), so a client
+        // resynchronising its counter can ask for the mark without moving
+        // it. Internal events carry key 0, which the engine exempts.
+        if !self.0.check_request_seq(ctx.key_hash, request_seq) {
             out.push(rejected(&event, EngineRejectReason::DuplicateRequest));
-            return None;
+            return;
         }
 
         // Stash the journaled event timestamp so per-event methods
@@ -151,41 +147,24 @@ impl Application for ServerApp {
         // applied — no risk of reading a stale stamp from an earlier event.
         self.0.set_current_event_ts_ns(ctx.now_ns);
         match event {
-            TradingEvent::AddInstrument { spec } => {
-                self.0.add_instrument(spec);
-                None
-            }
+            TradingEvent::AddInstrument { spec } => self.0.add_instrument(spec),
             TradingEvent::Deposit {
                 account,
                 currency,
                 amount,
-            } => {
-                self.0.deposit(account, currency, amount);
-                None
-            }
-            TradingEvent::SubmitOrder { symbol, order } => {
-                self.0.execute(symbol, order, out);
-                None
-            }
+            } => self.0.deposit(account, currency, amount),
+            TradingEvent::SubmitOrder { symbol, order } => self.0.execute(symbol, order, out),
             TradingEvent::CancelOrder {
                 symbol,
                 account,
                 order_id,
-            } => {
-                self.0.cancel(symbol, account, order_id, out);
-                None
-            }
+            } => self.0.cancel(symbol, account, order_id, out),
             TradingEvent::SetRiskLimits { symbol, limits } => {
-                self.0.set_risk_limits(symbol, limits);
-                None
+                self.0.set_risk_limits(symbol, limits)
             }
-            TradingEvent::CancelAll { account } => {
-                self.0.cancel_all(account, out);
-                None
-            }
+            TradingEvent::CancelAll { account } => self.0.cancel_all(account, out),
             TradingEvent::SetCircuitBreaker { symbol, config } => {
-                self.0.set_circuit_breaker(symbol, config);
-                None
+                self.0.set_circuit_breaker(symbol, config)
             }
             TradingEvent::CancelReplace {
                 symbol,
@@ -193,18 +172,14 @@ impl Application for ServerApp {
                 order_id,
                 new_price,
                 new_quantity,
-            } => {
-                self.0
-                    .cancel_replace(symbol, account, order_id, new_price, new_quantity, out);
-                None
-            }
+            } => self
+                .0
+                .cancel_replace(symbol, account, order_id, new_price, new_quantity, out),
             TradingEvent::SetFeeSchedule { symbol, schedule } => {
-                self.0.set_fee_schedule(symbol, schedule, out);
-                None
+                self.0.set_fee_schedule(symbol, schedule, out)
             }
             TradingEvent::ProvisionAccount { account, amount } => {
-                self.0.provision_account(account, amount);
-                None
+                self.0.provision_account(account, amount)
             }
             TradingEvent::Withdraw {
                 account,
@@ -216,28 +191,43 @@ impl Application for ServerApp {
                 if let Err(reason) = self.0.withdraw(account, currency, amount) {
                     out.push(rejected(&event, reason));
                 }
-                None
             }
-            TradingEvent::EndOfDay => {
-                self.0.end_of_day(out);
-                None
+            TradingEvent::EndOfDay => self.0.end_of_day(out),
+            TradingEvent::DisableInstrument { symbol } => self.0.disable_instrument(symbol, out),
+            TradingEvent::EnableInstrument { symbol } => self.0.enable_instrument(symbol, out),
+            TradingEvent::RemoveInstrument { symbol } => self.0.remove_instrument(symbol, out),
+            TradingEvent::SetAccountLimits {
+                max_open_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            } => {
+                // Journaled on every promotion, so usually a re-apply of
+                // the values already in force — which both setters leave
+                // unchanged (the limiter keeps its buckets unless the
+                // rate or burst actually changes).
+                self.0
+                    .set_max_open_orders_per_account(max_open_orders_per_account);
+                self.0
+                    .set_max_orders_per_second(max_orders_per_second, max_orders_burst);
             }
-            TradingEvent::DisableInstrument { symbol } => {
-                self.0.disable_instrument(symbol, out);
-                None
-            }
-            TradingEvent::EnableInstrument { symbol } => {
-                self.0.enable_instrument(symbol, out);
-                None
-            }
-            TradingEvent::RemoveInstrument { symbol } => {
-                self.0.remove_instrument(symbol, out);
-                None
-            }
+            // Queries are answered by `query`; the runtime never applies
+            // one. Nothing to do, so nothing to journal or replay.
+            TradingEvent::QueryStats
+            | TradingEvent::QueryPosition { .. }
+            | TradingEvent::QueryRequestSeq => {}
+        }
+    }
+
+    /// Answer a query from the engine as it stands, without changing it.
+    /// The request sequence a query carries plays no part: a query is
+    /// never journaled, and a client resynchronising its counter sends
+    /// one first.
+    #[inline]
+    fn query(&self, request: Self::Event, ctx: &QueryCtx) -> Option<Self::QueryResponse> {
+        match request.event {
             TradingEvent::QueryStats => {
-                // Read-only query: the transport owns the counters, so
-                // the app synthesises the report directly from the
-                // `ApplyCtx` it was handed. No `Exchange` state touched.
+                // The node owns the counters, so the report is synthesised
+                // from the `QueryCtx` alone. No `Exchange` state touched.
                 Some(QueryResponse::Stats {
                     active_connections: ctx.active_connections,
                     events_processed: ctx.events_processed,
@@ -254,28 +244,16 @@ impl Application for ServerApp {
             }
             TradingEvent::QueryRequestSeq => {
                 // Self-introspection: read the idempotency high-water
-                // mark for the calling connection's key (transport-
-                // supplied via `ApplyCtx`). The event itself carries no
-                // identity, so a client cannot ask about other keys.
+                // mark for the calling connection's key (node-supplied
+                // via `QueryCtx`). The event itself carries no identity,
+                // so a client cannot ask about other keys.
                 Some(QueryResponse::RequestSeqHwm {
                     hwm: self.0.request_seq_hwm(ctx.key_hash),
                 })
             }
-            TradingEvent::SetAccountLimits {
-                max_open_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            } => {
-                // Journaled on every promotion, so usually a re-apply of
-                // the values already in force — which both setters leave
-                // unchanged (the limiter keeps its buckets unless the
-                // rate or burst actually changes).
-                self.0
-                    .set_max_open_orders_per_account(max_open_orders_per_account);
-                self.0
-                    .set_max_orders_per_second(max_orders_per_second, max_orders_burst);
-                None
-            }
+            // Not a query: the runtime never asks, and the client would
+            // get an empty reply batch if it did.
+            _ => None,
         }
     }
 
@@ -423,24 +401,17 @@ mod tests {
     }
 
     /// The context the sequencer would hand `apply` for an event
-    /// submitted under `key_hash`; the advisory counters are zero.
+    /// submitted under `key_hash`.
     fn ctx(key_hash: u64) -> ApplyCtx {
         ApplyCtx {
             now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
             key_hash,
         }
     }
 
     /// Apply `event` as the node itself would journal it: key 0, no
     /// sequence.
-    fn apply_internal(
-        app: &mut ServerApp,
-        event: TradingEvent,
-        out: &mut Vec<ExecutionReport>,
-    ) -> Option<QueryResponse> {
+    fn apply_internal(app: &mut ServerApp, event: TradingEvent, out: &mut Vec<ExecutionReport>) {
         <ServerApp as Application>::apply(app, TradingRequest::internal(event), &ctx(0), out)
     }
 
@@ -452,9 +423,32 @@ mod tests {
         request_seq: u64,
         event: TradingEvent,
         out: &mut Vec<ExecutionReport>,
-    ) -> Option<QueryResponse> {
+    ) {
         let request = TradingRequest { request_seq, event };
         <ServerApp as Application>::apply(app, request, &ctx(key_hash), out)
+    }
+
+    /// Ask `event` as a client would, under its key, with the node
+    /// counters the sequencer reads at the time of the query. A query's
+    /// own sequence plays no part, so it is left at zero.
+    fn query_from(
+        app: &ServerApp,
+        key_hash: u64,
+        event: TradingEvent,
+        counters: (u64, u64, u64),
+    ) -> Option<QueryResponse> {
+        let (active_connections, events_processed, journal_sequence) = counters;
+        let ctx = QueryCtx {
+            journal_sequence: melin_app::WireSeq::new(journal_sequence),
+            active_connections,
+            events_processed,
+            key_hash,
+        };
+        let request = TradingRequest {
+            request_seq: 0,
+            event,
+        };
+        <ServerApp as Application>::query(app, request, &ctx)
     }
 
     fn deposit(account: u32, amount: u64) -> TradingEvent {
@@ -504,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_query_request_seq_returns_per_key_hwm() {
+    fn query_request_seq_returns_per_key_hwm() {
         let mut app = seeded_app();
         let mut reports = Vec::new();
 
@@ -523,33 +517,74 @@ mod tests {
 
         // Each key sees only its own mark — the engine reads
         // `ctx.key_hash`, not anything from the (payloadless) event
-        // itself — and the query's own sequence plays no part.
-        let mut query = |app: &mut ServerApp, key_hash| {
-            apply_from(
-                app,
-                key_hash,
-                0,
-                TradingEvent::QueryRequestSeq,
-                &mut reports,
-            )
+        // itself.
+        let query = |app: &ServerApp, key_hash| {
+            query_from(app, key_hash, TradingEvent::QueryRequestSeq, (0, 0, 0))
         };
         assert_eq!(
-            query(&mut app, key_a),
+            query(&app, key_a),
             Some(QueryResponse::RequestSeqHwm { hwm: 7 })
         );
         assert_eq!(
-            query(&mut app, key_b),
+            query(&app, key_b),
             Some(QueryResponse::RequestSeqHwm { hwm: 3 })
         );
         // A key with no prior activity reads back as zero.
         assert_eq!(
-            query(&mut app, 0xDEAD_BEEF),
+            query(&app, 0xDEAD_BEEF),
             Some(QueryResponse::RequestSeqHwm { hwm: 0 })
         );
+        // `query` borrows the engine immutably, so the marks are what
+        // they were; the signature, not a test, is what guarantees it.
+    }
 
-        // Query is read-only: the marks are unchanged after the queries above.
-        assert_eq!(app.0.request_seq_hwm(key_a), 7);
-        assert_eq!(app.0.request_seq_hwm(key_b), 3);
+    /// The stats query reports the node's counters, which reach the
+    /// engine only through the query context: nothing in the engine
+    /// holds them.
+    #[test]
+    fn query_stats_reports_the_node_counters() {
+        let app = seeded_app();
+        assert_eq!(
+            query_from(&app, 1, TradingEvent::QueryStats, (7, 12_345, 999)),
+            Some(QueryResponse::Stats {
+                active_connections: 7,
+                events_processed: 12_345,
+                journal_sequence: 999,
+            })
+        );
+    }
+
+    #[test]
+    fn query_position_reads_the_balances() {
+        let app = seeded_app();
+        match query_from(
+            &app,
+            1,
+            TradingEvent::QueryPosition {
+                account: AccountId(1),
+            },
+            (0, 0, 0),
+        ) {
+            Some(QueryResponse::Position {
+                account,
+                balances,
+                count,
+            }) => {
+                assert_eq!(account, AccountId(1));
+                assert_eq!(count, 1);
+                assert_eq!(balances[0].currency, CurrencyId(2));
+                assert_eq!(balances[0].free, 1_000_000);
+            }
+            other => panic!("expected a position, got {other:?}"),
+        }
+    }
+
+    /// A write is not a query: the runtime never asks, and the answer
+    /// for one is no answer.
+    #[test]
+    fn query_answers_nothing_for_a_write() {
+        let app = seeded_app();
+        assert_eq!(query_from(&app, 1, deposit(1, 1), (0, 0, 0)), None);
     }
 
     /// The idempotency check is `apply`'s first act. A sequence at or
@@ -639,30 +674,14 @@ mod tests {
         );
     }
 
-    /// Two things the check never refuses: a query, whatever sequence it
-    /// carries, since a client resynchronising its counter sends one
-    /// first; and an event the node journaled itself, which carries key 0
-    /// and sequence 0 every time.
+    /// What the check never refuses: an event the node journaled itself,
+    /// which carries key 0 and sequence 0 every time. (A query never
+    /// reaches the check at all: it goes to `query`, which has no mark to
+    /// move.)
     #[test]
-    fn apply_exempts_queries_and_internal_events_from_the_check() {
+    fn apply_exempts_internal_events_from_the_check() {
         let mut app = seeded_app();
         let mut reports = Vec::new();
-        let key = 42;
-        apply_from(&mut app, key, 5, deposit(1, 1), &mut reports);
-
-        // A stale sequence on a query is still answered, and moves no mark.
-        let position = apply_from(
-            &mut app,
-            key,
-            0,
-            TradingEvent::QueryPosition {
-                account: AccountId(1),
-            },
-            &mut reports,
-        );
-        assert!(matches!(position, Some(QueryResponse::Position { .. })));
-        assert!(reports.is_empty());
-        assert_eq!(app.0.request_seq_hwm(key), 5);
 
         // The same internal event twice over is applied twice over.
         apply_internal(&mut app, deposit(1, 1), &mut reports);
@@ -673,7 +692,7 @@ mod tests {
                 .accounts()
                 .balance(AccountId(1), CurrencyId(2))
                 .available,
-            1_000_003
+            1_000_002
         );
         assert_eq!(app.0.request_seq_hwm(0), 0, "key 0 keeps no mark");
     }
