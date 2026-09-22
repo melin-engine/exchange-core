@@ -119,10 +119,10 @@ impl Exchange {
         // order. Cancel/replace look up by the same key, so two live
         // orders sharing it would make those operations ambiguous.
         // Replay-safety is provided one layer up by `check_request_seq`
-        // (transport-level idempotency on `(key_hash, request_seq)`),
-        // not here — duplicate journaled SubmitOrder events never reach
-        // this point. Reuse of an `OrderId` after the original closes
-        // is permitted by design.
+        // (per-key idempotency on `(key_hash, request_seq)`, run before
+        // any event is applied), not here — a repeated SubmitOrder never
+        // reaches this point. Reuse of an `OrderId` after the original
+        // closes is permitted by design.
         if self.live_order_ids.contains(&(order.account, order.id)) {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,

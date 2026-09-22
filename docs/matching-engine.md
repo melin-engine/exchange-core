@@ -354,7 +354,7 @@ Circuit breaker price bands (`price_band_lower`, `price_band_upper`) apply only 
 
 ### Duplicate order ID detection
 
-The Exchange tracks the set of currently-live `(account, order_id)` pairs and rejects a submission with `DuplicateOrderId` whenever the pair is already in the set. Entries are added when an order is accepted by the matching engine and removed when it closes (full fill, cancel, expiry, instrument disable, end-of-session). Reuse of an `OrderId` after the original closes is permitted -- the dedup defends the cancel/replace lookup invariant ("no two simultaneously-live orders share `(account, order_id)`") rather than burning IDs forever. Replay-side idempotency is handled separately by `(key_hash, request_seq)` at the transport layer.
+The Exchange tracks the set of currently-live `(account, order_id)` pairs and rejects a submission with `DuplicateOrderId` whenever the pair is already in the set. Entries are added when an order is accepted by the matching engine and removed when it closes (full fill, cancel, expiry, instrument disable, end-of-session). Reuse of an `OrderId` after the original closes is permitted -- the dedup defends the cancel/replace lookup invariant ("no two simultaneously-live orders share `(account, order_id)`") rather than burning IDs forever. Request idempotency is handled separately, by the engine's per-key request-sequence check, which runs before any event is applied -- live, on replay and on every replica alike.
 
 ### Triggered stop cascade
 

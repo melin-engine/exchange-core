@@ -20,7 +20,7 @@ Cancel and replace operations look up resting orders by `(account, order_id)`. T
 
 A submission with a previously-used ID is **accepted** as long as the prior order is no longer live -- i.e., it was filled, cancelled, expired, rejected at submit time, or removed by an instrument disable / end-of-day. The dedup invariant is "no two simultaneously-live orders share `(account, order_id)`," not "an `OrderId` is consumed forever." This lets clients and gateways reuse IDs after reconnects without coordinating with the engine.
 
-Replay duplicates (the same `SubmitOrder` arriving twice on a journal recovery) are filtered one layer up by transport-level idempotency on `(key_hash, request_seq)`; they never reach this check.
+A repeated request (the same `SubmitOrder` sent twice under one key, or applied twice on a journal recovery) is refused one step earlier, by the engine's per-key request-sequence check, which runs before any event is applied; it never reaches this check.
 
 `OrderId` is a `u64` chosen by the client (or by the gateway on the client's behalf). The matching engine imposes no monotonicity requirement -- any scheme that avoids reusing an ID while the prior order is still live is acceptable.
 

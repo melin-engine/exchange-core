@@ -11,4 +11,4 @@
 
 pub mod trading_event;
 
-pub use trading_event::TradingEvent;
+pub use trading_event::{TradingEvent, TradingRequest};

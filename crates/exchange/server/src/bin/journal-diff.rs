@@ -13,14 +13,14 @@
 
 use std::path::{Path, PathBuf};
 
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::TradingRequest;
 use melin_journal::reader::{JournalEntry, JournalReader};
 
 /// Sequential reader over a lineage: archives oldest-first, then live.
 struct LineageWalker {
     segments: Vec<PathBuf>,
     next_segment: usize,
-    reader: Option<JournalReader<TradingEvent>>,
+    reader: Option<JournalReader<TradingRequest>>,
 }
 
 impl LineageWalker {
@@ -41,7 +41,7 @@ impl LineageWalker {
         }
     }
 
-    fn next(&mut self) -> Option<JournalEntry<TradingEvent>> {
+    fn next(&mut self) -> Option<JournalEntry<TradingRequest>> {
         loop {
             if self.reader.is_none() {
                 if self.next_segment >= self.segments.len() {
@@ -106,9 +106,8 @@ fn main() {
             if x.key_hash != y.key_hash {
                 println!("  key_hash:     a={:#x} b={:#x}", x.key_hash, y.key_hash);
             }
-            if x.request_seq != y.request_seq {
-                println!("  request_seq:  a={} b={}", x.request_seq, y.request_seq);
-            }
+            // The request sequence is inside the event, so a difference
+            // there shows up in the event lines.
             if x.event != y.event {
                 println!("  event a: {:?}", x.event);
                 println!("  event b: {:?}", y.event);

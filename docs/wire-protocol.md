@@ -19,11 +19,11 @@ Every client-to-server message includes a per-key request sequence number for id
 | Field   | Type | Size    | Description                                              |
 |---------|------|---------|----------------------------------------------------------|
 | length  | u32  | 4 bytes | Byte count of seq + tag + payload (excludes itself)      |
-| seq     | u64  | 8 bytes | Per-key request sequence for idempotency (0 for heartbeat/auth) |
+| seq     | u64  | 8 bytes | Per-key request sequence for idempotency (0 for heartbeat) |
 | tag     | u8   | 1 byte  | Message type discriminant                                |
 | payload | ...  | 0..N    | Variant-specific fields                                  |
 
-The `seq` field is a monotonically increasing counter per authentication key. The server tracks a high-water mark per key and rejects requests with `DuplicateRequest` if `seq <= hwm`. This makes retries safe after network failures -- the server silently deduplicates already-processed requests. Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
+The `seq` field is a monotonically increasing counter per authentication key. The engine tracks a high-water mark per key and rejects requests with `DuplicateRequest` if `seq <= hwm`. This makes retries safe after network failures -- the engine refuses already-processed requests. Heartbeats and the read-only queries are exempt and may carry any `seq`; heartbeats use `0`. The `ChallengeResponse` of the authentication handshake is a frame of the node runtime, not a request, and carries no `seq` (see "Authentication Handshake").
 
 ### Response Frame
 
@@ -122,7 +122,7 @@ Total order size: 24 bytes (Market, no expiry) to 48 bytes (StopLimit + GTD expi
 | 38  | Subscribe         | Any (internal)    | 1 + count×4          |
 | 39  | QueryPosition     | Trader            | 4                    |
 
-Payload sizes above exclude the 1-byte tag and 8-byte seq. The frame length = 8 (seq) + 1 (tag) + payload size.
+Payload sizes above exclude the 1-byte tag and 8-byte seq. The frame length = 8 (seq) + 1 (tag) + payload size, except for `ChallengeResponse`, which has no seq: its frame length is 1 (tag) + 96.
 
 ### Tag 1: SubmitOrder
 
@@ -160,7 +160,7 @@ Kill switch: cancels all resting orders and pending stops for the given account 
 | 0      | signature  | 64   |
 | 64     | public_key | 32   |
 
-Ed25519 signature (64 bytes) over the server-provided 32-byte nonce, followed by the client's Ed25519 public key (32 bytes). Total payload: 96 bytes.
+Ed25519 signature (64 bytes) over the server-provided 32-byte nonce, followed by the client's Ed25519 public key (32 bytes). Total payload: 96 bytes. Unlike every other request, the frame carries no `seq` before the tag: the handshake belongs to the node runtime, which never reads one.
 
 ### Tag 6: AddInstrument
 
@@ -633,11 +633,11 @@ Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed2
 
 ## Per-Key Idempotency
 
-Every request frame includes a `seq` field (u64) -- a per-key monotonic sequence number. The server tracks a high-water mark per authentication key (identified by a hash of the public key). If a request arrives with `seq <= hwm`, it is rejected with `DuplicateRequest`.
+Every request frame includes a `seq` field (u64) -- a per-key monotonic sequence number. The engine tracks a high-water mark per authentication key (identified by a hash of the public key). If a request arrives with `seq <= hwm`, it is rejected with `DuplicateRequest` before it touches any state.
 
 This makes retries safe: if a client sends an order, loses the connection before receiving the response, and reconnects with the same key, it can safely retry with the same `seq`. If the original request was already processed, the retry is rejected as a duplicate. If it wasn't processed (the server crashed before journaling it), the retry succeeds normally.
 
-The HWM is persisted in the journal and restored on recovery. Heartbeat and ChallengeResponse use `seq = 0` and are exempt from dedup.
+The `seq` is journaled with the request, so the check reaches the same verdict everywhere the request is applied: on a recovery from the journal, on a replica following the primary, and in the copy of the engine that snapshots are written from. The HWM itself is part of every snapshot. Heartbeats and the read-only queries (`QueryStats`, `QueryPosition`, `QueryRequestSeq`) are exempt from the check; the `ChallengeResponse` carries no `seq` at all.
 
 ---
 

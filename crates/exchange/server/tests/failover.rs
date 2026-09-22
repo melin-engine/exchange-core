@@ -1752,8 +1752,9 @@ fn journals_contiguous_across_replication() {
     let replica_journal = cluster._tmp.path().join("replica.journal");
 
     let walk = |label: &str, path: &Path| -> u64 {
-        let mut reader = JournalReader::<melin_ec_trading::trading_event::TradingEvent>::open(path)
-            .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
+        let mut reader =
+            JournalReader::<melin_ec_trading::trading_event::TradingRequest>::open(path)
+                .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
         let mut count = 0u64;
         loop {
             match reader.next_entry() {
@@ -3189,9 +3190,9 @@ fn count_archives(journal_path: &Path) -> usize {
 /// its first entry, successor anchors equal to predecessor tails) and
 /// return `(first_sequence, last_sequence)` over the whole lineage.
 fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
-    use melin_ec_trading::trading_event::TradingEvent;
+    use melin_ec_trading::trading_event::TradingRequest;
 
-    let report = melin_journal::segment::verify_lineage::<TradingEvent>(journal_path)
+    let report = melin_journal::segment::verify_lineage::<TradingRequest>(journal_path)
         .unwrap_or_else(|e| panic!("lineage of {} broken: {e}", journal_path.display()));
     // The verifier tolerates a live-tail crash gap (recovery's
     // allow_partial_tail); these journals were cleanly shut, so any
@@ -3397,11 +3398,11 @@ fn rotation_soak_under_load() {
     // the replica's durable tail.
     {
         use melin_ec_server::ServerApp;
-        use melin_ec_trading::trading_event::TradingEvent;
+        use melin_ec_trading::trading_event::TradingRequest;
         use melin_journal::BufferedWriter;
         use melin_transport_core::JournaledApp;
 
-        let recovered = JournaledApp::<ServerApp, BufferedWriter<TradingEvent>>::recover(
+        let recovered = JournaledApp::<ServerApp, BufferedWriter<TradingRequest>>::recover(
             ServerApp(melin_ec::exchange::Exchange::with_capacity()),
             &replica_journal,
         )
@@ -3461,7 +3462,7 @@ fn rotation_soak_under_load() {
     // Read the live segment back and check its tail sequence.
     use melin_journal::JournalReader;
     let mut reader =
-        JournalReader::<melin_ec_trading::trading_event::TradingEvent>::open(&primary_journal)
+        JournalReader::<melin_ec_trading::trading_event::TradingRequest>::open(&primary_journal)
             .expect("reopen primary live segment");
     while reader.next_entry().expect("scan live").is_some() {}
     let post_disk_seq = reader.last_sequence().unwrap_or(0);

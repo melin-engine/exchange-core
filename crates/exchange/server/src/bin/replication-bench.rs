@@ -36,7 +36,7 @@ use ed25519_dalek::SigningKey;
 use melin_app::auth::AuthorizedKeys;
 use melin_app::unix_epoch_nanos;
 use melin_ec_server::exchange_app::ServerApp;
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
@@ -46,7 +46,7 @@ use melin_server_runtime::replication::{
     ReplicaControlPlane, ReplicationListener, ReplicationMetrics, Sender, run_receiver, run_sender,
 };
 use melin_server_runtime::server::{PipelineCores, Placement};
-type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
+type InputSlot = melin_transport_core::pipeline::InputSlot<TradingRequest>;
 type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_ec_types::types::ExecutionReport,
     melin_ec_types::types::QueryResponse,
@@ -608,13 +608,12 @@ fn main() {
     input_producer.publish(InputSlot {
         connection_id: 0,
         key_hash: 0,
-        request_seq: 0,
         sequence: 0,
         timestamp_ns: unix_epoch_nanos(),
-        event: JournalEvent::App(TradingEvent::ProvisionAccount {
+        event: JournalEvent::App(TradingRequest::internal(TradingEvent::ProvisionAccount {
             account: AccountId(1),
             amount: u64::MAX / 2,
-        }),
+        })),
         publish_ts: mono_trace_ns(),
         recv_ts: mono_trace_ns(),
     });
@@ -667,14 +666,13 @@ fn main() {
                 input_producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 0,
                     timestamp_ns: unix_epoch_nanos(),
-                    event: JournalEvent::App(TradingEvent::Deposit {
+                    event: JournalEvent::App(TradingRequest::internal(TradingEvent::Deposit {
                         account: AccountId(1),
                         currency: CurrencyId(1),
                         amount: 1,
-                    }),
+                    })),
                     publish_ts: mono_trace_ns(),
                     recv_ts: mono_trace_ns(),
                 });

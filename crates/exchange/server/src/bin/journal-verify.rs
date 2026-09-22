@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::TradingRequest;
 use melin_journal::JournalReader;
 
 fn hex(h: [u8; 32]) -> String {
@@ -23,7 +23,7 @@ fn hex(h: [u8; 32]) -> String {
 /// via the caller's lineage walk, so this only runs on segments the
 /// verifier already accepted.
 fn print_segment(label: &str, path: &Path) {
-    let mut reader = match JournalReader::<TradingEvent>::open(path) {
+    let mut reader = match JournalReader::<TradingRequest>::open(path) {
         Ok(r) => r,
         Err(e) => {
             println!("  {label}: <unreadable: {e}>");
@@ -80,7 +80,7 @@ fn main() {
     // Authoritative verdict: dense sequences within and across
     // segments, first entry matching each header, successor anchors
     // equal to predecessor tails.
-    match melin_journal::segment::verify_lineage::<TradingEvent>(&path) {
+    match melin_journal::segment::verify_lineage::<TradingRequest>(&path) {
         Ok(report) => {
             println!("lineage:  OK");
             if let Some((expected, found)) = report.live_tail_gap {

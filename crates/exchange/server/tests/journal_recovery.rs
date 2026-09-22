@@ -19,7 +19,7 @@ mod tests {
     // Import the concrete newtype (not the `pub type App = ServerApp`
     // alias) so it's usable as a tuple-struct constructor in `App(...)`.
     use melin_ec_server::exchange_app::ServerApp as App;
-    use melin_ec_trading::trading_event::TradingEvent;
+    use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
     use melin_ec_types::types::*;
     use melin_journal::BufferedWriter;
 
@@ -38,9 +38,12 @@ mod tests {
     /// zeroed (see `apply_journaled` in transport-core). Tests that
     /// drive `TradingEvent::QueryStats` or similar query variants would
     /// see those zeros — fine for the recovery tests here, all of which
-    /// are state-mutation only.
+    /// are state-mutation only. Every event goes in as the node's own
+    /// (key 0, no request sequence), so the idempotency check never
+    /// refuses one; the two `key_hwm_*` tests write under a key
+    /// directly.
     struct TestExchange {
-        inner: JournaledApp<App, BufferedWriter<TradingEvent>>,
+        inner: JournaledApp<App, BufferedWriter<TradingRequest>>,
     }
 
     impl TestExchange {
@@ -87,12 +90,20 @@ mod tests {
             self.inner.next_sequence()
         }
 
+        /// Journal + apply `event` as the node's own.
+        fn apply(
+            &mut self,
+            event: TradingEvent,
+            reports: &mut Vec<ExecutionReport>,
+        ) -> Result<(), JournalError> {
+            self.inner
+                .apply_journaled(TradingRequest::internal(event), reports)?;
+            Ok(())
+        }
+
         /// Journal + apply `TradingEvent::AddInstrument`.
         fn add_instrument(&mut self, spec: InstrumentSpec) -> Result<(), JournalError> {
-            let mut reports = Vec::new();
-            self.inner
-                .apply_journaled(TradingEvent::AddInstrument { spec }, &mut reports)?;
-            Ok(())
+            self.apply(TradingEvent::AddInstrument { spec }, &mut Vec::new())
         }
 
         /// Journal + apply `TradingEvent::Deposit`.
@@ -102,16 +113,14 @@ mod tests {
             currency: CurrencyId,
             amount: u64,
         ) -> Result<(), JournalError> {
-            let mut reports = Vec::new();
-            self.inner.apply_journaled(
+            self.apply(
                 TradingEvent::Deposit {
                     account,
                     currency,
                     amount,
                 },
-                &mut reports,
-            )?;
-            Ok(())
+                &mut Vec::new(),
+            )
         }
 
         /// Journal the withdraw event unconditionally (so replay re-
@@ -128,11 +137,13 @@ mod tests {
         ) -> Result<(), RejectReason> {
             self.inner
                 .writer_mut()
-                .append(&JournalEvent::App(TradingEvent::Withdraw {
-                    account,
-                    currency,
-                    amount,
-                }))
+                .append(&JournalEvent::App(TradingRequest::internal(
+                    TradingEvent::Withdraw {
+                        account,
+                        currency,
+                        amount,
+                    },
+                )))
                 .expect("journal write");
             self.inner.app_mut().withdraw(account, currency, amount)
         }
@@ -143,10 +154,10 @@ mod tests {
             symbol: Symbol,
             limits: RiskLimits,
         ) -> Result<(), JournalError> {
-            let mut reports = Vec::new();
-            self.inner
-                .apply_journaled(TradingEvent::SetRiskLimits { symbol, limits }, &mut reports)?;
-            Ok(())
+            self.apply(
+                TradingEvent::SetRiskLimits { symbol, limits },
+                &mut Vec::new(),
+            )
         }
 
         /// Journal + apply `TradingEvent::SetCircuitBreaker`.
@@ -155,12 +166,10 @@ mod tests {
             symbol: Symbol,
             config: CircuitBreakerConfig,
         ) -> Result<(), JournalError> {
-            let mut reports = Vec::new();
-            self.inner.apply_journaled(
+            self.apply(
                 TradingEvent::SetCircuitBreaker { symbol, config },
-                &mut reports,
-            )?;
-            Ok(())
+                &mut Vec::new(),
+            )
         }
 
         /// Journal + apply `TradingEvent::SetFeeSchedule`. The new
@@ -172,9 +181,7 @@ mod tests {
             schedule: FeeSchedule,
             reports: &mut Vec<ExecutionReport>,
         ) -> Result<(), JournalError> {
-            self.inner
-                .apply_journaled(TradingEvent::SetFeeSchedule { symbol, schedule }, reports)?;
-            Ok(())
+            self.apply(TradingEvent::SetFeeSchedule { symbol, schedule }, reports)
         }
 
         /// Journal + apply `TradingEvent::SubmitOrder`. Fills + the
@@ -185,9 +192,7 @@ mod tests {
             order: Order,
             reports: &mut Vec<ExecutionReport>,
         ) -> Result<(), JournalError> {
-            self.inner
-                .apply_journaled(TradingEvent::SubmitOrder { symbol, order }, reports)?;
-            Ok(())
+            self.apply(TradingEvent::SubmitOrder { symbol, order }, reports)
         }
 
         /// Journal + apply `TradingEvent::CancelOrder`.
@@ -198,15 +203,14 @@ mod tests {
             order_id: OrderId,
             reports: &mut Vec<ExecutionReport>,
         ) -> Result<(), JournalError> {
-            self.inner.apply_journaled(
+            self.apply(
                 TradingEvent::CancelOrder {
                     symbol,
                     account,
                     order_id,
                 },
                 reports,
-            )?;
-            Ok(())
+            )
         }
 
         /// Journal a `Tick` and drain any scheduled tasks due at
@@ -539,53 +543,90 @@ mod tests {
 
         let key_hash: u64 = 0xCAFE;
 
-        // Write journal entries with key_hash + request_seq.
+        // Write journal entries under the key, each carrying its request
+        // sequence in the event.
         {
-            let mut writer =
-                BufferedWriter::<melin_ec_trading::trading_event::TradingEvent>::create(&path)
-                    .unwrap();
+            let mut writer = BufferedWriter::<TradingRequest>::create(&path).unwrap();
             let ts = melin_app::unix_epoch_nanos();
-            // Deposit with seq=1
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(TradingEvent::AddInstrument {
-                        spec: btc_usd_spec(),
+                    &JournalEvent::App(TradingRequest {
+                        request_seq: 1,
+                        event: TradingEvent::AddInstrument {
+                            spec: btc_usd_spec(),
+                        },
                     }),
                     ts,
                     key_hash,
-                    1,
                 )
                 .unwrap();
-            // Deposit with seq=2
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(TradingEvent::Deposit {
-                        account: ACCT_A,
-                        currency: USD,
-                        amount: 1000,
+                    &JournalEvent::App(TradingRequest {
+                        request_seq: 2,
+                        event: TradingEvent::Deposit {
+                            account: ACCT_A,
+                            currency: USD,
+                            amount: 1000,
+                        },
                     }),
                     ts,
                     key_hash,
-                    2,
                 )
                 .unwrap();
             writer.flush_batch_sync().unwrap();
         }
 
-        // Recover should rebuild the HWM.
+        // Recovery replays both through `apply`, whose idempotency check
+        // rebuilds the mark: 2 after the second event.
         let je = TestExchange::recover(&path).unwrap();
-        let exchange = je.exchange();
+        let hwm_snap = je.exchange().snapshot_key_hwm();
+        assert_eq!(hwm_snap, vec![(key_hash, 2)]);
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            1000
+        );
+    }
 
-        // The HWM for key_hash should be 2.
-        // Verify by checking that seq=2 would be rejected and seq=3 accepted.
-        let mut ex_clone = Exchange::new();
-        ex_clone.add_instrument(btc_usd_spec());
-        // Manually rebuild: check_request_seq(key_hash, 1) then (key_hash, 2)
-        // should advance HWM to 2.
-        // Since we can't directly read key_hwm, verify through snapshot.
-        let hwm_snap = exchange.snapshot_key_hwm();
-        assert_eq!(hwm_snap.len(), 1);
-        assert_eq!(hwm_snap[0], (key_hash, 2));
+    /// Replay refuses what the primary refused: a journaled event whose
+    /// sequence does not beat the key's mark is applied to nothing, so
+    /// a retry that landed twice in the journal credits once.
+    #[test]
+    fn journal_replay_refuses_a_repeated_request_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let key_hash: u64 = 0xD0D0;
+
+        {
+            let mut writer = BufferedWriter::<TradingRequest>::create(&path).unwrap();
+            let ts = melin_app::unix_epoch_nanos();
+            let deposit = TradingEvent::Deposit {
+                account: ACCT_A,
+                currency: USD,
+                amount: 1000,
+            };
+            for request_seq in [1, 1, 2, 1] {
+                writer
+                    .batch_append_with_ts(
+                        &JournalEvent::App(TradingRequest {
+                            request_seq,
+                            event: deposit,
+                        }),
+                        ts,
+                        key_hash,
+                    )
+                    .unwrap();
+            }
+            writer.flush_batch_sync().unwrap();
+        }
+
+        let je = TestExchange::recover(&path).unwrap();
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            2000,
+            "sequences 1 and 2 credit; the two repeats of 1 do not"
+        );
+        assert_eq!(je.exchange().snapshot_key_hwm(), vec![(key_hash, 2)]);
     }
 
     #[test]
@@ -598,32 +639,32 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer =
-                BufferedWriter::<melin_ec_trading::trading_event::TradingEvent>::create(
-                    &journal_path,
-                )
-                .unwrap();
+            let mut writer = BufferedWriter::<TradingRequest>::create(&journal_path).unwrap();
             let ts = melin_app::unix_epoch_nanos();
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(TradingEvent::AddInstrument {
-                        spec: btc_usd_spec(),
+                    &JournalEvent::App(TradingRequest {
+                        request_seq: 1,
+                        event: TradingEvent::AddInstrument {
+                            spec: btc_usd_spec(),
+                        },
                     }),
                     ts,
                     key_hash,
-                    1,
                 )
                 .unwrap();
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(TradingEvent::Deposit {
-                        account: ACCT_A,
-                        currency: USD,
-                        amount: 5000,
+                    &JournalEvent::App(TradingRequest {
+                        request_seq: 5,
+                        event: TradingEvent::Deposit {
+                            account: ACCT_A,
+                            currency: USD,
+                            amount: 5000,
+                        },
                     }),
                     ts,
                     key_hash,
-                    5,
                 )
                 .unwrap();
             writer.flush_batch_sync().unwrap();
@@ -652,10 +693,7 @@ mod tests {
     /// Helper: find the byte offset where valid journal data ends
     /// (after the last fully-written entry, before pre-allocated space).
     fn valid_data_end(path: &Path) -> u64 {
-        let mut reader = melin_journal::JournalReader::<
-            melin_ec_trading::trading_event::TradingEvent,
-        >::open(path)
-        .unwrap();
+        let mut reader = melin_journal::JournalReader::<TradingRequest>::open(path).unwrap();
         while reader.next_entry().unwrap().is_some() {}
         reader.valid_file_end()
     }

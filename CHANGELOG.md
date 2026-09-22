@@ -20,19 +20,42 @@ full detail behind entries marked *(sequencer)*.
 
 ## [0.17.0] - 2026-09-22
 
-This release adopts Melin 0.17.0. The [0.17.0 section of its
-changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0170---2026-09-22)
+This release adopts the sequencer's next release. The [Unreleased section of
+its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
 lists further fixes in the node runtime that apply here as they are; the
-entries below cover what changes for this product. One of them needs an
-operator action: a snapshot written by an earlier release may hold the
-effect of a request that was refused as a duplicate. The snapshot format
-bump below already has every node refuse such a snapshot, so the upgrade
-starts by moving the snapshot aside and rebuilding from the journal, which
-repairs this — a replica that was bootstrapped by snapshot transfer, and so
-has no journal from sequence 1, is re-bootstrapped from a node that has.
+entries below cover what changes for this product.
+
+This release carries no state over from an earlier one. The journal format
+and the snapshot format both change (see below), and a node refuses either
+written by an earlier release, so a node upgrades onto a fresh journal and
+is re-provisioned through the admin client. That also disposes of a defect
+in earlier snapshots, which could hold the effect of a request refused as a
+duplicate.
 
 ### Changed
 
+- **Duplicate requests are refused by the engine, on every path.** The
+  node runtime no longer keeps the per-key request-sequence gate
+  *(sequencer)*; the sequence a client stamps on each request now travels
+  inside the journaled event, and the engine refuses a repeat itself,
+  before applying anything. Clients see the same `DuplicateRequest`
+  rejection as before, from the same request sequence in the same frame.
+  What changes is where the verdict is reached: in the engine, on every
+  path an event takes — live, on a journal replay, on a replica, and in
+  the copy of the engine that snapshots are written from. That copy used
+  to apply what the primary had refused, so a retried request could land
+  twice in a snapshot; it cannot any more.
+- **Journal format 15** *(sequencer)*. Entries no longer carry a
+  runtime-level request sequence, which now lives in the event. A node
+  refuses a format-14 journal.
+- **Replication protocol 5** *(sequencer)*. A primary and a replica on
+  different releases refuse each other at the handshake; upgrade a cluster
+  together.
+- **The authentication handshake frame loses its sequence prefix**
+  *(sequencer)*. A `ChallengeResponse` is now `[tag][signature][public
+  key]`. Every client shipped here authenticates through the sequencer's
+  client and follows; a client built against an earlier release fails the
+  handshake and has its key refused. Request frames are unchanged.
 - **A halted node refuses a write before journaling it** *(sequencer)*. A
   primary that has lost its last replica rejects state-mutating requests with
   `ReplicaDisconnected`, as before, but the request is now turned away as it is
@@ -102,6 +125,16 @@ has no journal from sequence 1, is re-bootstrapped from a node that has.
   `SetAccountLimits`. `StartupConfig::startup_events` seeds only under
   `synthetic-seed`; a dependent that needs the seed regardless calls
   `synthetic_startup_events`.
+- **Rust dependents:** the sequencer's event is now `TradingRequest`, a
+  `TradingEvent` with its `request_seq`, and `TradingEvent` no longer
+  implements `AppEvent` (its codec is inherent). Journal readers and
+  writers, `InputSlot` and `StartupEvents` are typed on `TradingRequest`;
+  an event the node journals itself is `TradingRequest::internal(event)`.
+  `Application::check_request_seq` is gone *(sequencer)*: `ServerApp::apply`
+  runs `Exchange::check_request_seq` itself, and `build_reject` no longer
+  sees `DuplicateRequest`. `melin_journal`'s `encode`, `decode`,
+  `batch_append_with_ts` and `JournalEntry` lose their `request_seq`
+  *(sequencer)*.
 
 ### Fixed
 

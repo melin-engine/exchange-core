@@ -17,7 +17,7 @@ use std::ops::{Deref, DerefMut};
 use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
 use melin_ec::exchange::Exchange;
 use melin_ec::snapshot as engine_snapshot;
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_ec_types::types::{
     AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
 };
@@ -35,7 +35,8 @@ use melin_ec_types::types::{
 // attribute rounds either configuration up to two cache lines, so the
 // production footprint stays constant whether trace timestamps are
 // included or not — the assertion no longer needs a cfg-gate.
-const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 128);
+const _: () =
+    assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingRequest>>() == 128);
 // Bumped from 416 → 424 (one extra u64) when `OutputSlot.wire_seq` was
 // added so the response stage's durability gate can compare against
 // replica metrics in wire-seq space rather than the unsound local-vs-wire
@@ -45,7 +46,9 @@ const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<Tradin
 const _: () = assert!(
     size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 424
 );
-const _: () = assert!(size_of::<melin_journal::JournalEvent<TradingEvent>>() == 64);
+// The request sequence rides inside the event since the sequencer stopped
+// carrying it in the slot: eight bytes moved, none added.
+const _: () = assert!(size_of::<melin_journal::JournalEvent<TradingRequest>>() == 72);
 const _: () = assert!(size_of::<ExecutionReport>() == 64);
 
 /// Transparent newtype around [`Exchange`] that carries the
@@ -99,7 +102,7 @@ impl DerefMut for ServerApp {
 }
 
 impl Application for ServerApp {
-    type Event = TradingEvent;
+    type Event = TradingRequest;
     type Report = ExecutionReport;
     type QueryResponse = QueryResponse;
     /// Account and instrument counts to reserve for — see
@@ -111,17 +114,32 @@ impl Application for ServerApp {
     /// bump here too, surfaced through the transport-owned frame.
     const APP_VERSION: u16 = engine_snapshot::PAYLOAD_VERSION;
 
-    /// Thin dispatcher over `TradingEvent`. Marked `#[inline]` so the
-    /// matching stage's monomorphised hot loop can see through to each
-    /// concrete `Exchange` method: the inner methods (`execute`, `cancel`,
-    /// …) own the real work and keep their own inlining attrs.
+    /// The idempotency check, then a thin dispatcher over `TradingEvent`.
+    /// Marked `#[inline]` so the matching stage's monomorphised hot loop
+    /// can see through to each concrete `Exchange` method: the inner
+    /// methods (`execute`, `cancel`, …) own the real work and keep their
+    /// own inlining attrs.
     #[inline]
     fn apply(
         &mut self,
-        event: Self::Event,
+        request: Self::Event,
         ctx: &ApplyCtx,
         out: &mut Vec<Self::Report>,
     ) -> Option<Self::QueryResponse> {
+        let TradingRequest { request_seq, event } = request;
+
+        // A repeated request is refused before it touches anything, the
+        // clock included: the sequencer hands every event to `apply` —
+        // live, on replay, on a replica and in the shadow copy — and
+        // this one check is what keeps them all refusing the same ones.
+        // Queries are exempt: they change nothing, are never journaled,
+        // and a client resynchronising its counter sends one first.
+        // Internal events carry key 0, which the engine exempts.
+        if !event.is_query() && !self.0.check_request_seq(ctx.key_hash, request_seq) {
+            out.push(rejected(&event, EngineRejectReason::DuplicateRequest));
+            return None;
+        }
+
         // Stash the journaled event timestamp so per-event methods
         // (`execute` and friends) can read a deterministic clock for the
         // SEC-04 rate limiter without taking a `now_ns` parameter. Set
@@ -189,21 +207,10 @@ impl Application for ServerApp {
                 currency,
                 amount,
             } => {
+                // The engine reports a refused withdrawal as a `Result`;
+                // the client hears of it as a rejection like any other.
                 if let Err(reason) = self.0.withdraw(account, currency, amount) {
-                    // Withdraw carries no order id or symbol — mirror the
-                    // shape used by other non-order rejections (see
-                    // `extract_order_id` / `extract_symbol`, which both
-                    // return zero for `Withdraw`). Don't route this
-                    // through `Application::build_reject`: that path
-                    // only carries `TransportRejectReason` (dedup /
-                    // replica disconnect) and would lose the engine's
-                    // specific `RejectReason` we want to surface.
-                    out.push(ExecutionReport::Rejected {
-                        order_id: OrderId(0),
-                        symbol: Symbol(0),
-                        account,
-                        reason,
-                    });
+                    out.push(rejected(&event, reason));
                 }
                 None
             }
@@ -242,10 +249,10 @@ impl Application for ServerApp {
                 })
             }
             TradingEvent::QueryRequestSeq => {
-                // Self-introspection: read the dedup HWM for the
-                // calling connection's key (transport-supplied via
-                // `ApplyCtx`). The event itself carries no identity,
-                // so a client cannot ask about other keys.
+                // Self-introspection: read the idempotency high-water
+                // mark for the calling connection's key (transport-
+                // supplied via `ApplyCtx`). The event itself carries no
+                // identity, so a client cannot ask about other keys.
                 Some(QueryResponse::RequestSeqHwm {
                     hwm: self.0.request_seq_hwm(ctx.key_hash),
                 })
@@ -273,11 +280,6 @@ impl Application for ServerApp {
         self.0.drain_due_scheduled_tasks(now_ns, out);
     }
 
-    #[inline]
-    fn check_request_seq(&mut self, key_hash: u64, seq: u64) -> bool {
-        Exchange::check_request_seq(&mut self.0, key_hash, seq)
-    }
-
     /// Reserve what only the node knows the size of: the balance map and,
     /// past its built-in capacity, the per-account maps, from
     /// `--accounts` and `--instruments`. Everything else is reserved and
@@ -298,17 +300,13 @@ impl Application for ServerApp {
         Ok(ServerApp(Exchange::clone_via_snapshot(&self.0)))
     }
 
-    fn build_reject(event: &Self::Event, reason: TransportRejectReason) -> Self::Report {
+    /// A rejection the sequencer decided on its own, before `apply` saw
+    /// the event: today only a write refused while the node is halted.
+    fn build_reject(request: &Self::Event, reason: TransportRejectReason) -> Self::Report {
         let engine_reason = match reason {
-            TransportRejectReason::DuplicateRequest => EngineRejectReason::DuplicateRequest,
             TransportRejectReason::ReplicaDisconnected => EngineRejectReason::ReplicaDisconnected,
         };
-        ExecutionReport::Rejected {
-            order_id: extract_order_id(event),
-            symbol: extract_symbol(event),
-            account: extract_account_id(event),
-            reason: engine_reason,
-        }
+        rejected(&request.event, engine_reason)
     }
 
     /// Writes the engine payload bytes verbatim. The transport stores
@@ -334,9 +332,22 @@ impl Application for ServerApp {
     }
 }
 
+/// The rejection report for `event`, naming what the event named: its
+/// order, symbol and account where it carries them, zero where it does
+/// not. One shape for every rejection decided outside the matching
+/// methods — a duplicate, a halted node, a refused withdrawal — so a
+/// client reads them all the same way.
+fn rejected(event: &TradingEvent, reason: EngineRejectReason) -> ExecutionReport {
+    ExecutionReport::Rejected {
+        order_id: extract_order_id(event),
+        symbol: extract_symbol(event),
+        account: extract_account_id(event),
+        reason,
+    }
+}
+
 /// Order ID attached to reject reports, or `OrderId(0)` if the variant
-/// does not carry one. Mirrors `journal::pipeline::MatchingStage::extract_order_id`
-/// so the reject-report shape stays consistent across the pipeline.
+/// does not carry one.
 fn extract_order_id(event: &TradingEvent) -> OrderId {
     match event {
         TradingEvent::SubmitOrder { order, .. } => order.id,
@@ -407,17 +418,53 @@ mod tests {
         ServerApp(ex)
     }
 
-    #[test]
-    fn apply_submit_order_produces_placed_report() {
-        let mut app = seeded_app();
-        let mut reports = Vec::new();
-        let ctx = ApplyCtx {
+    /// The context the sequencer would hand `apply` for an event
+    /// submitted under `key_hash`; the advisory counters are zero.
+    fn ctx(key_hash: u64) -> ApplyCtx {
+        ApplyCtx {
             now_ns: 0,
             journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
-            key_hash: 0,
-        };
+            key_hash,
+        }
+    }
+
+    /// Apply `event` as the node itself would journal it: key 0, no
+    /// sequence.
+    fn apply_internal(
+        app: &mut ServerApp,
+        event: TradingEvent,
+        out: &mut Vec<ExecutionReport>,
+    ) -> Option<QueryResponse> {
+        <ServerApp as Application>::apply(app, TradingRequest::internal(event), &ctx(0), out)
+    }
+
+    /// Apply `event` as a client would submit it: under its key, with the
+    /// sequence it stamped on the request.
+    fn apply_from(
+        app: &mut ServerApp,
+        key_hash: u64,
+        request_seq: u64,
+        event: TradingEvent,
+        out: &mut Vec<ExecutionReport>,
+    ) -> Option<QueryResponse> {
+        let request = TradingRequest { request_seq, event };
+        <ServerApp as Application>::apply(app, request, &ctx(key_hash), out)
+    }
+
+    fn deposit(account: u32, amount: u64) -> TradingEvent {
+        TradingEvent::Deposit {
+            account: AccountId(account),
+            currency: CurrencyId(2),
+            amount,
+        }
+    }
+
+    #[test]
+    fn apply_submit_order_produces_placed_report() {
+        let mut app = seeded_app();
+        let mut reports = Vec::new();
         let ev = TradingEvent::SubmitOrder {
             symbol: Symbol(1),
             order: Order {
@@ -434,7 +481,7 @@ mod tests {
                 expiry_ns: 0,
             },
         };
-        <ServerApp as Application>::apply(&mut app, ev, &ctx, &mut reports);
+        apply_internal(&mut app, ev, &mut reports);
         assert!(
             !reports.is_empty(),
             "apply should emit at least one report for a resting order"
@@ -455,115 +502,186 @@ mod tests {
     #[test]
     fn apply_query_request_seq_returns_per_key_hwm() {
         let mut app = seeded_app();
+        let mut reports = Vec::new();
 
-        // Advance two distinct keys to different HWMs via the dedup gate.
-        // Same key+seq combinations the live pipeline would emit.
+        // Advance two distinct keys to different marks with accepted
+        // writes — the same key and sequence pairs the live pipeline
+        // would hand `apply`.
         let key_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
         let key_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
         for seq in 1..=7 {
-            assert!(<ServerApp as Application>::check_request_seq(
-                &mut app, key_a, seq
-            ));
+            apply_from(&mut app, key_a, seq, deposit(1, 1), &mut reports);
         }
         for seq in 1..=3 {
-            assert!(<ServerApp as Application>::check_request_seq(
-                &mut app, key_b, seq
-            ));
+            apply_from(&mut app, key_b, seq, deposit(1, 1), &mut reports);
         }
+        assert!(reports.is_empty(), "every write was accepted: {reports:?}");
 
-        let mut reports = Vec::new();
-        let mk_ctx = |kh| ApplyCtx {
-            now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
-            key_hash: kh,
+        // Each key sees only its own mark — the engine reads
+        // `ctx.key_hash`, not anything from the (payloadless) event
+        // itself — and the query's own sequence plays no part.
+        let mut query = |app: &mut ServerApp, key_hash| {
+            apply_from(
+                app,
+                key_hash,
+                0,
+                TradingEvent::QueryRequestSeq,
+                &mut reports,
+            )
         };
-
-        // Each key sees only its own HWM — the engine reads ctx.key_hash,
-        // not anything from the (payloadless) event itself.
-        let resp_a = <ServerApp as Application>::apply(
-            &mut app,
-            TradingEvent::QueryRequestSeq,
-            &mk_ctx(key_a),
-            &mut reports,
+        assert_eq!(
+            query(&mut app, key_a),
+            Some(QueryResponse::RequestSeqHwm { hwm: 7 })
         );
-        assert_eq!(resp_a, Some(QueryResponse::RequestSeqHwm { hwm: 7 }));
-
-        let resp_b = <ServerApp as Application>::apply(
-            &mut app,
-            TradingEvent::QueryRequestSeq,
-            &mk_ctx(key_b),
-            &mut reports,
+        assert_eq!(
+            query(&mut app, key_b),
+            Some(QueryResponse::RequestSeqHwm { hwm: 3 })
         );
-        assert_eq!(resp_b, Some(QueryResponse::RequestSeqHwm { hwm: 3 }));
-
         // A key with no prior activity reads back as zero.
-        let resp_unknown = <ServerApp as Application>::apply(
-            &mut app,
-            TradingEvent::QueryRequestSeq,
-            &mk_ctx(0xDEAD_BEEF),
-            &mut reports,
+        assert_eq!(
+            query(&mut app, 0xDEAD_BEEF),
+            Some(QueryResponse::RequestSeqHwm { hwm: 0 })
         );
-        assert_eq!(resp_unknown, Some(QueryResponse::RequestSeqHwm { hwm: 0 }));
 
-        // Query is read-only: HWMs are unchanged after the queries above.
+        // Query is read-only: the marks are unchanged after the queries above.
         assert_eq!(app.0.request_seq_hwm(key_a), 7);
         assert_eq!(app.0.request_seq_hwm(key_b), 3);
     }
 
+    /// The idempotency check is `apply`'s first act. A sequence at or
+    /// below the key's mark is refused as a duplicate, naming what the
+    /// request named, and leaves the engine as it was — the balance and
+    /// the mark included. The mark only ever moves forward, by however
+    /// much the client skipped.
     #[test]
-    fn check_request_seq_rejects_duplicates() {
-        let mut app = ServerApp(Exchange::new());
-        assert!(<ServerApp as Application>::check_request_seq(
-            &mut app, 42, 1
-        ));
-        assert!(<ServerApp as Application>::check_request_seq(
-            &mut app, 42, 2
-        ));
-        assert!(!<ServerApp as Application>::check_request_seq(
-            &mut app, 42, 2
-        ));
-        assert!(!<ServerApp as Application>::check_request_seq(
-            &mut app, 42, 1
-        ));
+    fn apply_refuses_a_repeated_sequence_before_it_touches_state() {
+        let mut app = seeded_app();
+        let mut reports = Vec::new();
+        let key = 42;
+        let balance = |app: &ServerApp| app.0.accounts().balance(AccountId(1), CurrencyId(2));
+
+        apply_from(&mut app, key, 1, deposit(1, 100), &mut reports);
+        assert!(reports.is_empty());
+        assert_eq!(balance(&app).available, 1_000_100);
+
+        for stale in [1, 0] {
+            apply_from(&mut app, key, stale, deposit(1, 100), &mut reports);
+            assert_eq!(
+                reports.pop(),
+                Some(ExecutionReport::Rejected {
+                    order_id: OrderId(0),
+                    symbol: Symbol(0),
+                    account: AccountId(1),
+                    reason: EngineRejectReason::DuplicateRequest,
+                }),
+                "sequence {stale} against a mark of 1"
+            );
+            assert!(reports.is_empty());
+            assert_eq!(
+                balance(&app).available,
+                1_000_100,
+                "a duplicate credits nothing"
+            );
+            assert_eq!(app.0.request_seq_hwm(key), 1, "a duplicate moves no mark");
+        }
+
+        // Skipping ahead is fine, and the mark follows.
+        apply_from(&mut app, key, 10, deposit(1, 100), &mut reports);
+        assert!(reports.is_empty());
+        assert_eq!(balance(&app).available, 1_000_200);
+        assert_eq!(app.0.request_seq_hwm(key), 10);
+        apply_from(&mut app, key, 5, deposit(1, 100), &mut reports);
+        assert_eq!(reports.len(), 1, "5 is behind the mark of 10");
     }
 
+    /// A refused order is reported against its own id and symbol, as any
+    /// other rejection of that order would be.
     #[test]
-    fn build_reject_maps_transport_reasons() {
-        let ev = TradingEvent::SubmitOrder {
-            symbol: Symbol(7),
+    fn apply_refuses_a_repeated_order_by_its_id() {
+        let mut app = seeded_app();
+        let mut reports = Vec::new();
+        let order = TradingEvent::SubmitOrder {
+            symbol: Symbol(1),
             order: Order {
                 id: OrderId(42),
-                account: AccountId(3),
+                account: AccountId(1),
                 side: Side::Buy,
-                order_type: OrderType::Market,
-                quantity: qty(1),
-                time_in_force: TimeInForce::IOC,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                quantity: qty(10),
+                time_in_force: TimeInForce::GTC,
                 stp: SelfTradeProtection::Allow,
                 expiry_ns: 0,
             },
         };
-        let r =
-            <ServerApp as Application>::build_reject(&ev, TransportRejectReason::DuplicateRequest);
-        match r {
-            ExecutionReport::Rejected {
-                order_id,
-                symbol,
-                account,
-                reason,
-            } => {
-                assert_eq!(order_id, OrderId(42));
-                assert_eq!(symbol, Symbol(7));
-                assert_eq!(account, AccountId(3));
-                assert_eq!(reason, EngineRejectReason::DuplicateRequest);
-            }
-            other => panic!("expected Rejected, got {other:?}"),
-        }
+        apply_from(&mut app, 7, 1, order, &mut reports);
+        assert!(matches!(
+            reports.as_slice(),
+            [ExecutionReport::Placed { .. }]
+        ));
+        reports.clear();
 
+        apply_from(&mut app, 7, 1, order, &mut reports);
+        assert_eq!(
+            reports,
+            vec![ExecutionReport::Rejected {
+                order_id: OrderId(42),
+                symbol: Symbol(1),
+                account: AccountId(1),
+                reason: EngineRejectReason::DuplicateRequest,
+            }]
+        );
+    }
+
+    /// Two things the check never refuses: a query, whatever sequence it
+    /// carries, since a client resynchronising its counter sends one
+    /// first; and an event the node journaled itself, which carries key 0
+    /// and sequence 0 every time.
+    #[test]
+    fn apply_exempts_queries_and_internal_events_from_the_check() {
+        let mut app = seeded_app();
+        let mut reports = Vec::new();
+        let key = 42;
+        apply_from(&mut app, key, 5, deposit(1, 1), &mut reports);
+
+        // A stale sequence on a query is still answered, and moves no mark.
+        let position = apply_from(
+            &mut app,
+            key,
+            0,
+            TradingEvent::QueryPosition {
+                account: AccountId(1),
+            },
+            &mut reports,
+        );
+        assert!(matches!(position, Some(QueryResponse::Position { .. })));
+        assert!(reports.is_empty());
+        assert_eq!(app.0.request_seq_hwm(key), 5);
+
+        // The same internal event twice over is applied twice over.
+        apply_internal(&mut app, deposit(1, 1), &mut reports);
+        apply_internal(&mut app, deposit(1, 1), &mut reports);
+        assert!(reports.is_empty());
+        assert_eq!(
+            app.0
+                .accounts()
+                .balance(AccountId(1), CurrencyId(2))
+                .available,
+            1_000_003
+        );
+        assert_eq!(app.0.request_seq_hwm(0), 0, "key 0 keeps no mark");
+    }
+
+    #[test]
+    fn build_reject_maps_transport_reasons() {
         let r = <ServerApp as Application>::build_reject(
-            &TradingEvent::CancelAll {
-                account: AccountId(9),
+            &TradingRequest {
+                request_seq: 3,
+                event: TradingEvent::CancelAll {
+                    account: AccountId(9),
+                },
             },
             TransportRejectReason::ReplicaDisconnected,
         );
@@ -586,25 +704,17 @@ mod tests {
     #[test]
     fn apply_withdraw_emits_rejection_on_failure() {
         let mut app = seeded_app();
-        let ctx = ApplyCtx {
-            now_ns: 0,
-            journal_sequence: melin_app::WireSeq::new(0),
-            active_connections: 0,
-            events_processed: 0,
-            key_hash: 0,
-        };
 
         // 1. Insufficient balance: account has 1_000_000 in CurrencyId(2),
         //    so a 2_000_000 withdrawal must reject.
         let mut reports = Vec::new();
-        <ServerApp as Application>::apply(
+        apply_internal(
             &mut app,
             TradingEvent::Withdraw {
                 account: AccountId(1),
                 currency: CurrencyId(2),
                 amount: 2_000_000,
             },
-            &ctx,
             &mut reports,
         );
         assert_eq!(reports.len(), 1);
@@ -626,14 +736,13 @@ mod tests {
         // 2. Unknown account: withdraw from an account that was never
         //    provisioned/deposited.
         let mut reports = Vec::new();
-        <ServerApp as Application>::apply(
+        apply_internal(
             &mut app,
             TradingEvent::Withdraw {
                 account: AccountId(999),
                 currency: CurrencyId(2),
                 amount: 1,
             },
-            &ctx,
             &mut reports,
         );
         assert_eq!(reports.len(), 1);
@@ -649,7 +758,7 @@ mod tests {
 
         // 3. Has resting orders: place an order, then attempt to withdraw.
         let mut placed = Vec::new();
-        <ServerApp as Application>::apply(
+        apply_internal(
             &mut app,
             TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
@@ -667,19 +776,17 @@ mod tests {
                     expiry_ns: 0,
                 },
             },
-            &ctx,
             &mut placed,
         );
 
         let mut reports = Vec::new();
-        <ServerApp as Application>::apply(
+        apply_internal(
             &mut app,
             TradingEvent::Withdraw {
                 account: AccountId(1),
                 currency: CurrencyId(2),
                 amount: 1,
             },
-            &ctx,
             &mut reports,
         );
         assert_eq!(reports.len(), 1);
@@ -697,14 +804,13 @@ mod tests {
         let mut reports = Vec::new();
         let mut clean = ServerApp(Exchange::new());
         clean.0.deposit(AccountId(7), CurrencyId(2), 500);
-        <ServerApp as Application>::apply(
+        apply_internal(
             &mut clean,
             TradingEvent::Withdraw {
                 account: AccountId(7),
                 currency: CurrencyId(2),
                 amount: 200,
             },
-            &ctx,
             &mut reports,
         );
         assert!(
