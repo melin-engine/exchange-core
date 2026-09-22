@@ -128,13 +128,17 @@ impl Application for ServerApp {
     ) -> Option<Self::QueryResponse> {
         let TradingRequest { request_seq, event } = request;
 
-        // A repeated request is refused before it touches anything, the
-        // clock included: the sequencer hands every event to `apply` —
-        // live, on replay, on a replica and in the shadow copy — and
-        // this one check is what keeps them all refusing the same ones.
-        // Queries are exempt: they change nothing, are never journaled,
-        // and a client resynchronising its counter sends one first.
-        // Internal events carry key 0, which the engine exempts.
+        // A repeated request is refused before it touches any engine
+        // state, the event-timestamp stash below included. The sequencer
+        // hands every event to `apply` — live, on replay, on a replica and
+        // in the shadow copy — and this one check is what keeps them all
+        // refusing the same ones. What a duplicate does not skip is the
+        // clock: the sequencer's dispatch ticks the scheduler to the
+        // event's timestamp before calling `apply`, on every path alike,
+        // so due work (an expiry, say) fires on a refused event as on an
+        // accepted one. Queries are exempt: they change nothing, are never
+        // journaled, and a client resynchronising its counter sends one
+        // first. Internal events carry key 0, which the engine exempts.
         if !event.is_query() && !self.0.check_request_seq(ctx.key_hash, request_seq) {
             out.push(rejected(&event, EngineRejectReason::DuplicateRequest));
             return None;
