@@ -1796,8 +1796,9 @@ fn journals_contiguous_across_replication() {
 /// Originally framed as "first replay request is rejected as
 /// DuplicateRequest" — that observation depended on a fresh client
 /// starting `next_seq` at 0 and colliding with the HWM. Now that
-/// `Client::connect` auto-syncs the HWM on connect, the collision
-/// cannot occur from the client side; we assert the same invariant by
+/// `Client::connect` auto-syncs the HWM on connect, a single client
+/// cannot collide with it (two connections under one key still can; see
+/// `collide_on_request_sequence`); we assert the same invariant by
 /// inspecting the HWM the auto-sync adopts.
 #[test]
 #[serial]

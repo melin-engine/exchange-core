@@ -40,8 +40,8 @@ mod tests {
     /// see those zeros — fine for the recovery tests here, all of which
     /// are state-mutation only. Every event goes in as the node's own
     /// (key 0, no request sequence), so the idempotency check never
-    /// refuses one; the two `key_hwm_*` tests write under a key
-    /// directly.
+    /// refuses one; the tests of the mark itself (`key_hwm_*` and
+    /// `journal_replay_refuses_*`) write under a key directly.
     struct TestExchange {
         inner: JournaledApp<App, BufferedWriter<TradingRequest>>,
     }
