@@ -53,20 +53,20 @@ melin-ec-types = { path = "crates/exchange/types", version = "0.17.0" }
 # mixes journal/wire formats across the pipeline rather than just looking
 # untidy.
 #
-# Temporarily pinned to the sequencer's `refactor/remove-request-seq-gate`
-# branch, to adopt it ahead of its merge and release; switch back to a
-# crates.io version once it is published.
-melin-app = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
+# Temporarily pinned to the sequencer's `main`, at the merge of its
+# `refactor/remove-request-seq-gate` branch, to adopt it ahead of its
+# release; switch back to a crates.io version once it is published.
+melin-app = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
 # The node's own wire-protocol client: framing, the Ed25519 handshake and
 # the reply batch. Every tool here that talks to a node authenticates
 # through it rather than re-rolling the handshake.
-melin-client = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
-melin-dpdk = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
-melin-journal = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
-melin-pipeline = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
-melin-server-runtime = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
-melin-transport-core = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
-melin-wire-protocol = { git = "https://github.com/melin-engine/melin.git", rev = "c283cca9e964ba45dbdbc07aea6930ee88ec3f58" }
+melin-client = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-journal = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
 
 base64 = "0.22"
 blake3 = "1"
