@@ -1873,11 +1873,13 @@ fn wait_for_snapshot_through(journal: &Path, through: u64) -> (PathBuf, ServerAp
 /// used to be decided by the node runtime before `apply`, and the copy of
 /// the engine that writes snapshots never ran it, so a snapshot could hold
 /// the order its client was told was refused. The check now runs in
-/// `apply`, on that copy like everywhere else: the snapshot holds what the
-/// primary holds, and the mark the primary reached.
+/// `apply`, on that copy like everywhere else. Three views of one history
+/// — the live node, the snapshot its shadow copy wrote, and a replay of
+/// the journal it wrote — must agree: the refused order is in none of
+/// them, and the mark is the one the live node reached.
 #[test]
 #[serial]
-fn refused_duplicate_is_absent_from_the_snapshot() {
+fn refused_duplicate_is_absent_from_snapshot_and_replay() {
     use melin_ec_protocol::types::{ExecutionReport, RejectReason};
 
     let bin = server_bin();
@@ -1966,7 +1968,7 @@ fn refused_duplicate_is_absent_from_the_snapshot() {
     // Every reply above was gated on its journal write, so a snapshot
     // covering the journal as it stands now holds all three requests.
     let (_, through, _, _) = query_health(node.health_addr).expect("health");
-    let (_, engine) = wait_for_snapshot_through(&journal, through);
+    let (snap_path, engine) = wait_for_snapshot_through(&journal, through);
     unsafe { libc::kill(node.child.id() as i32, libc::SIGINT) };
     let _ = node.child.wait();
 
@@ -1983,6 +1985,50 @@ fn refused_duplicate_is_absent_from_the_snapshot() {
         marks[0].1, 2,
         "the mark is the two accepted sequences, not three"
     );
+
+    // Replay: with the snapshot moved aside, a standalone restart rebuilds
+    // from sequence 1 of the journal, which holds the refused request as
+    // the live node journaled it. The mark and the book must come out as
+    // the snapshot's, so the repeat was refused again on the way.
+    std::fs::rename(&snap_path, tmp.path().join("aside.snapshot")).expect("move snapshot aside");
+    let recovered = spawn_standalone_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        free_port(),
+        free_port(),
+        &[],
+        &[],
+    );
+    wait_ready(recovered.health_addr, Duration::from_secs(30));
+    let mut client = connect_with_timeout(recovered.client_addr, &key);
+    assert_eq!(
+        client.synchronize_request_seq().unwrap(),
+        2,
+        "replay rebuilt the mark from the journaled sequences"
+    );
+    let cancel = |client: &mut Client, id: u64| {
+        client
+            .send_request(&Request::CancelOrder {
+                symbol: Symbol(1),
+                account: AccountId(1),
+                order_id: OrderId(id),
+            })
+            .expect("cancel")
+    };
+    // A cancel of an order the engine never held answers with nothing.
+    let r = cancel(&mut client, 2);
+    assert!(
+        r.is_empty(),
+        "replay must not have placed the refused order 2: {r:?}"
+    );
+    for id in [1, 3] {
+        let r = cancel(&mut client, id);
+        assert!(
+            has_report(&r, |rep| matches!(rep, ExecutionReport::Cancelled { .. })),
+            "replay must have placed order {id}: {r:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

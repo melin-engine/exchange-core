@@ -101,6 +101,30 @@ mod tests {
             Ok(())
         }
 
+        /// Apply `event` as a client would submit it, under `key_hash`
+        /// with `request_seq`, without journaling it: for asserting what
+        /// the engine's mark refuses after a recovery.
+        fn apply_from(
+            &mut self,
+            key_hash: u64,
+            request_seq: u64,
+            event: TradingEvent,
+        ) -> Vec<ExecutionReport> {
+            use melin_app::{Application, ApplyCtx, WireSeq};
+            let mut reports = Vec::new();
+            let ctx = ApplyCtx {
+                now_ns: 0,
+                journal_sequence: WireSeq::new(0),
+                active_connections: 0,
+                events_processed: 0,
+                key_hash,
+            };
+            self.inner
+                .app_mut()
+                .apply(TradingRequest { request_seq, event }, &ctx, &mut reports);
+            reports
+        }
+
         /// Journal + apply `TradingEvent::AddInstrument`.
         fn add_instrument(&mut self, spec: InstrumentSpec) -> Result<(), JournalError> {
             self.apply(TradingEvent::AddInstrument { spec }, &mut Vec::new())
@@ -620,13 +644,33 @@ mod tests {
             writer.flush_batch_sync().unwrap();
         }
 
-        let je = TestExchange::recover(&path).unwrap();
+        let mut je = TestExchange::recover(&path).unwrap();
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             2000,
             "sequences 1 and 2 credit; the two repeats of 1 do not"
         );
         assert_eq!(je.exchange().snapshot_key_hwm(), vec![(key_hash, 2)]);
+
+        // The recovered mark keeps refusing: a sequence at it is refused,
+        // and the next one is taken.
+        let deposit = TradingEvent::Deposit {
+            account: ACCT_A,
+            currency: USD,
+            amount: 1000,
+        };
+        assert!(matches!(
+            je.apply_from(key_hash, 2, deposit).as_slice(),
+            [ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateRequest,
+                ..
+            }]
+        ));
+        assert!(je.apply_from(key_hash, 3, deposit).is_empty());
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            3000
+        );
     }
 
     #[test]
