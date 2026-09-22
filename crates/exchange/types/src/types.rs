@@ -376,11 +376,11 @@ pub enum QueryResponse {
         count: u8,
     },
     /// Per-key request_seq HWM snapshot emitted in response to
-    /// `QueryRequestSeq`. The engine returns the value its dedup gate
-    /// has currently advanced to for the calling connection's key;
-    /// reconnecting clients should set their next outbound seq to
-    /// `hwm + 1` so subsequent requests bypass dedup. `0` for a key
-    /// that has never authenticated before.
+    /// `QueryRequestSeq`. The engine returns the mark its per-key
+    /// request-sequence check has advanced to for the calling
+    /// connection's key; reconnecting clients should set their next
+    /// outbound seq to `hwm + 1` so subsequent requests beat it. `0` for
+    /// a key the engine has accepted nothing from.
     RequestSeqHwm { hwm: u64 },
 }
 
