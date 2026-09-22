@@ -18,8 +18,8 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
-This release adopts the sequencer's next release. The [Unreleased section of
-its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+This release adopts Melin 0.17.0. The [0.17.0 section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0170---2026-09-22)
 lists further fixes in the node runtime that apply here as they are; the
 entries below cover what changes for this product. One of them needs an
 operator action: a snapshot written by an earlier release may hold the
