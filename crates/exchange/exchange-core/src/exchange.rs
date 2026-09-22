@@ -581,10 +581,14 @@ impl Exchange {
         });
     }
 
-    /// Check per-key request sequence for idempotency dedup.
-    /// Returns true if this is a new request (should be processed).
-    /// Returns false if duplicate (caller should reject with DuplicateRequest).
-    /// Exempt when key_hash == 0 (internal/seed events with no authenticated key).
+    /// The per-key idempotency check: `true` if `request_seq` beats the
+    /// high-water mark recorded for `key_hash`, advancing the mark;
+    /// `false` for a duplicate, which the caller rejects with
+    /// `DuplicateRequest` and applies to nothing. Run before every
+    /// state-mutating event, on every path an event reaches the engine
+    /// by — live, replay, a replica's stream, the shadow copy — so they
+    /// all refuse the same ones. Exempt when `key_hash == 0`: events the
+    /// node journaled itself, with no authenticated key.
     #[inline]
     pub fn check_request_seq(&mut self, key_hash: u64, request_seq: u64) -> bool {
         if key_hash == 0 {

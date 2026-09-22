@@ -24,12 +24,13 @@ pub struct Client {
     writer: BlockingFrameWriter<std::net::TcpStream>,
     /// Pre-allocated encode buffer. 128 bytes bounds every request this
     /// client encodes; the handshake frame, the largest on the wire
-    /// (4 prefix + 8 seq + 1 tag + 64 sig + 32 pubkey), is built by the
+    /// (4 prefix + 1 tag + 64 sig + 32 pubkey), is built by the
     /// sequencer's client in `connect()` and never passes through here.
     encode_buf: [u8; 128],
-    /// Per-connection monotonically increasing request sequence number.
-    /// Used with the server-side per-key idempotency dedup. Starts at 0
-    /// and increments before each send. Heartbeats use seq=0 (exempt).
+    /// Per-connection monotonically increasing request sequence number,
+    /// carried in every request frame and checked by the engine against
+    /// its per-key high-water mark. Starts at 0 and increments before
+    /// each send.
     next_seq: u64,
 }
 
@@ -151,7 +152,8 @@ impl Client {
     /// Returns the list of responses (excluding the BatchEnd marker itself).
     pub fn send_request(&mut self, request: &Request) -> Result<Vec<ResponseKind>, ClientError> {
         // Increment the per-connection request sequence before each send.
-        // The server uses (key_hash, request_seq) for idempotency dedup.
+        // The engine refuses a request whose sequence does not beat the
+        // mark it keeps for this key.
         self.next_seq += 1;
         let written = codec::encode_request(request, self.next_seq, &mut self.encode_buf)?;
         // write_frame expects payload without length prefix; encode_request
@@ -301,7 +303,7 @@ mod tests {
 
         // Read ChallengeResponse and verify the signature over the nonce.
         let frame = reader.read_frame().unwrap().unwrap();
-        let (_seq, response) = control_codec::decode_challenge_response(frame).unwrap();
+        let response = control_codec::decode_challenge_response(frame).unwrap();
         let vk = VerifyingKey::from_bytes(&response.public_key).unwrap();
         let sig = ed25519_dalek::Signature::from_bytes(&response.signature);
         vk.verify(&nonce, &sig).unwrap();

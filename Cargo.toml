@@ -52,17 +52,21 @@ melin-ec-types = { path = "crates/exchange/types", version = "0.17.0" }
 # numbers need not coincide. All eight must be bumped together — a straggler
 # mixes journal/wire formats across the pipeline rather than just looking
 # untidy.
-melin-app = "0.17.0"
+#
+# Temporarily pinned to the sequencer's `main`, at the merge of its
+# `refactor/remove-request-seq-gate` branch, to adopt it ahead of its
+# release; switch back to a crates.io version once it is published.
+melin-app = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
 # The node's own wire-protocol client: framing, the Ed25519 handshake and
 # the reply batch. Every tool here that talks to a node authenticates
 # through it rather than re-rolling the handshake.
-melin-client = "0.17.0"
-melin-dpdk = "0.17.0"
-melin-journal = "0.17.0"
-melin-pipeline = "0.17.0"
-melin-server-runtime = "0.17.0"
-melin-transport-core = "0.17.0"
-melin-wire-protocol = "0.17.0"
+melin-client = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-dpdk = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-journal = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-pipeline = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-server-runtime = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-transport-core = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
+melin-wire-protocol = { git = "https://github.com/melin-engine/melin.git", rev = "429a4e84e69c367fe6cd240f7f10b7034ca78d94" }
 
 base64 = "0.22"
 blake3 = "1"

@@ -5,7 +5,7 @@
 //! tests which only exercise valid inputs.
 
 use melin_ec_server::exchange_app::ServerApp;
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_journal::codec;
 
 /// Journal entry decoder must never panic on arbitrary input.
@@ -13,7 +13,7 @@ use melin_journal::codec;
 #[test]
 fn fuzz_journal_decode() {
     bolero::check!().for_each(|data: &[u8]| {
-        let _ = codec::decode::<TradingEvent>(data);
+        let _ = codec::decode::<TradingRequest>(data);
     });
 }
 
@@ -39,12 +39,12 @@ fn fuzz_journal_roundtrip() {
         let ts = 1_700_000_000_000_000_000u64;
         let mut buf = [0u8; 272];
 
-        let written = match codec::encode(seq, ts, 0, 0, &event, &mut buf) {
+        let written = match codec::encode(seq, ts, 0, &event, &mut buf) {
             Ok(n) => n,
             Err(_) => return,
         };
 
-        let (consumed, dec_seq, dec_ts, _kh, _rs, dec_event) =
+        let (consumed, dec_seq, dec_ts, _kh, dec_event) =
             codec::decode(&buf[..written]).expect("decode of freshly encoded event must succeed");
 
         assert_eq!(consumed, written);
@@ -106,8 +106,17 @@ fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
 }
 
 /// Construct a JournalEvent from arbitrary bytes. Returns None if the bytes
-/// are insufficient to build a valid event.
-fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
+/// are insufficient to build a valid event. The request sequence comes
+/// from the tail of the input, so it varies independently of the event.
+fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingRequest>> {
+    let event = trading_event_from_bytes(data)?;
+    let request_seq = data
+        .last()
+        .map_or(0, |&b| u64::from(b) * 0x0101_0101_0101_0101);
+    Some(JournalEvent::App(TradingRequest { request_seq, event }))
+}
+
+fn trading_event_from_bytes(data: &[u8]) -> Option<TradingEvent> {
     if data.is_empty() {
         return None;
     }
@@ -115,21 +124,21 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
     match data[0] % 11 {
         0 => {
             // AddInstrument.
-            Some(JournalEvent::App(TradingEvent::AddInstrument {
+            Some(TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(u32_at(data, 1)?),
                     base: CurrencyId(u32_at(data, 5)?),
                     quote: CurrencyId(u32_at(data, 9)?),
                 },
-            }))
+            })
         }
         1 => {
             // Deposit.
-            Some(JournalEvent::App(TradingEvent::Deposit {
+            Some(TradingEvent::Deposit {
                 account: AccountId(u32_at(data, 1)?),
                 currency: CurrencyId(u32_at(data, 5)?),
                 amount: u64_at(data, 9)?,
-            }))
+            })
         }
         2 => {
             // SubmitOrder.
@@ -173,7 +182,7 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
                     limit_price: Price(nz64(data, 37)?),
                 },
             };
-            Some(JournalEvent::App(TradingEvent::SubmitOrder {
+            Some(TradingEvent::SubmitOrder {
                 symbol,
                 order: Order {
                     id,
@@ -185,15 +194,15 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
                     stp,
                     expiry_ns: 0,
                 },
-            }))
+            })
         }
         3 => {
             // CancelOrder.
-            Some(JournalEvent::App(TradingEvent::CancelOrder {
+            Some(TradingEvent::CancelOrder {
                 symbol: Symbol(u32_at(data, 1)?),
                 account: AccountId(u32_at(data, 5)?),
                 order_id: OrderId(u64_at(data, 9)?),
-            }))
+            })
         }
         4 => {
             // SetRiskLimits.
@@ -217,37 +226,37 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
             } else {
                 None
             };
-            Some(JournalEvent::App(TradingEvent::SetRiskLimits {
+            Some(TradingEvent::SetRiskLimits {
                 symbol,
                 limits: RiskLimits {
                     max_order_qty,
                     max_order_notional,
                 },
-            }))
+            })
         }
         5 => {
             // CancelAll.
-            Some(JournalEvent::App(TradingEvent::CancelAll {
+            Some(TradingEvent::CancelAll {
                 account: AccountId(u32_at(data, 1)?),
-            }))
+            })
         }
         7 => {
             // DisableInstrument.
-            Some(JournalEvent::App(TradingEvent::DisableInstrument {
+            Some(TradingEvent::DisableInstrument {
                 symbol: Symbol(u32_at(data, 1)?),
-            }))
+            })
         }
         8 => {
             // EnableInstrument.
-            Some(JournalEvent::App(TradingEvent::EnableInstrument {
+            Some(TradingEvent::EnableInstrument {
                 symbol: Symbol(u32_at(data, 1)?),
-            }))
+            })
         }
         9 => {
             // RemoveInstrument.
-            Some(JournalEvent::App(TradingEvent::RemoveInstrument {
+            Some(TradingEvent::RemoveInstrument {
                 symbol: Symbol(u32_at(data, 1)?),
-            }))
+            })
         }
         _ => {
             // SetCircuitBreaker.
@@ -275,14 +284,14 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
                 None
             };
             let halted = data.len() > p && data[p] & 1 == 1;
-            Some(JournalEvent::App(TradingEvent::SetCircuitBreaker {
+            Some(TradingEvent::SetCircuitBreaker {
                 symbol,
                 config: CircuitBreakerConfig {
                     price_band_lower: lower,
                     price_band_upper: upper,
                     halted,
                 },
-            }))
+            })
         }
     }
 }

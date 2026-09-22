@@ -151,11 +151,13 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
-/// The caller must ensure `buf` is large enough (128 bytes is always sufficient
-/// — bound is set by `ChallengeResponse`: 4 prefix + 8 seq + 1 tag + 64 sig +
-/// 32 pubkey + 19 slack).
-/// `seq` is the per-key monotonic request sequence for idempotency dedup.
-/// Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
+/// The caller must ensure `buf` is large enough: 128 bytes bounds every
+/// request (the largest, a `StopLimit` + `GTD` `SubmitOrder`, is 4 prefix +
+/// 8 seq + 1 tag + 52 payload). The `ChallengeResponse` of the handshake
+/// is the sequencer's frame, built by its client, and never passes here.
+/// `seq` is the per-key monotonic request sequence the engine's
+/// idempotency check reads. A heartbeat uses `seq = 0`: the node runtime
+/// answers it, and it never reaches the engine.
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
     // Reserve the request frame header (length + seq); back-filled below.
     let mut pos = REQUEST_FRAME_HEADER_LEN;
@@ -1942,7 +1944,7 @@ mod tests {
 
     #[test]
     fn seq_zero_round_trips() {
-        // Heartbeat and ChallengeResponse use seq=0.
+        // A heartbeat uses seq=0; the frame still carries it.
         let request = Request::Heartbeat;
         let mut buf = [0u8; 136];
         let written = encode_request(&request, 0, &mut buf).unwrap();

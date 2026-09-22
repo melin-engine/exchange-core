@@ -1395,7 +1395,7 @@ struct PipelineInnerCfg<'a> {
     cores: PipelineBenchCores,
 }
 
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 
 /// Pipeline-mode body: builds the pipeline around `writer`, spawns the
 /// journal, matching and publisher threads, and drains from the calling
@@ -1403,7 +1403,7 @@ use melin_ec_trading::trading_event::TradingEvent;
 /// pinned per `cfg.cores` — see `--pipeline-cores`.
 fn run_pipeline_inner(
     app: ServerApp,
-    writer: melin_journal::BufferedWriter<TradingEvent>,
+    writer: melin_journal::BufferedWriter<TradingRequest>,
     cfg: PipelineInnerCfg<'_>,
 ) {
     use melin_journal::JournalEvent;
@@ -1610,27 +1610,26 @@ fn run_pipeline_inner(
                 producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash: 0,
-                    request_seq: 0,
                     sequence: 0,
                     timestamp_ns: tsc_clock.unix_ns(ts),
-                    event: JournalEvent::App(
-                        melin_ec_trading::trading_event::TradingEvent::SubmitOrder {
-                            symbol: Symbol(1),
-                            order: Order {
-                                id: order_id,
-                                account: AccountId(1),
-                                side,
-                                order_type: OrderType::Limit {
-                                    price: Price(nz(100)),
-                                    post_only: false,
-                                },
-                                time_in_force: TimeInForce::GTC,
-                                quantity: Quantity(nz(1)),
-                                stp: SelfTradeProtection::Allow,
-                                expiry_ns: 0,
+                    // Key 0 is exempt from the engine's idempotency check,
+                    // so the sequence can stay at zero.
+                    event: JournalEvent::App(TradingRequest::internal(TradingEvent::SubmitOrder {
+                        symbol: Symbol(1),
+                        order: Order {
+                            id: order_id,
+                            account: AccountId(1),
+                            side,
+                            order_type: OrderType::Limit {
+                                price: Price(nz(100)),
+                                post_only: false,
                             },
+                            time_in_force: TimeInForce::GTC,
+                            quantity: Quantity(nz(1)),
+                            stp: SelfTradeProtection::Allow,
+                            expiry_ns: 0,
                         },
-                    ),
+                    })),
                     publish_ts: mono_trace_ns(),
                     recv_ts: mono_trace_ns(),
                 });

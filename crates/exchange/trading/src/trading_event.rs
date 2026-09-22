@@ -1,20 +1,22 @@
-//! `TradingEvent` — the `melin-app` `AppEvent` for the Melin trading engine.
+//! `TradingEvent`, what the trading engine applies, and `TradingRequest`,
+//! the `melin-app` `AppEvent` that carries it through the sequencer.
 //!
-//! Mirrors the state-mutating and read-only query variants of the current
-//! `JournalEvent`, minus the transport-intrinsic variant (Tick) which
-//! stays with the transport. Phase 2 of the transport/app split will
-//! unify the journal's wire format around `JournalEvent<TradingEvent>`;
-//! for Phase 1 this enum and its codec live alongside the existing
-//! `JournalEvent` with deliberately independent encoding — both are
-//! reachable from tests so we can prove the `Application` trait
-//! round-trips.
+//! `TradingEvent` mirrors the state-mutating and read-only query variants
+//! the engine understands, minus the transport-intrinsic variant (Tick)
+//! which stays with the transport. `TradingRequest` adds the one thing the
+//! engine needs that is not in the event: the request sequence the
+//! submitting client stamped on it, which the engine's idempotency check
+//! runs on. The sequencer journals and replicates `TradingRequest`s, and
+//! hands them to `apply`.
 //!
-//! Wire layout (payload-only — transport supplies framing):
+//! Wire layout of a `TradingRequest` (payload-only — the transport
+//! supplies framing):
 //!
-//! | Byte | Field      | Purpose                                       |
-//! |------|------------|-----------------------------------------------|
-//! | 0    | tag        | Variant discriminant (see `TAG_*` constants)  |
-//! | 1..  | payload    | Per-variant fields, little-endian             |
+//! | Byte | Field        | Purpose                                       |
+//! |------|--------------|-----------------------------------------------|
+//! | 0..8 | request_seq  | Per-key request sequence, little-endian       |
+//! | 8    | tag          | Variant discriminant (see `TAG_*` constants)  |
+//! | 9..  | payload      | Per-variant fields, little-endian             |
 
 use std::num::NonZeroU64;
 
@@ -56,12 +58,87 @@ const ORDER_TYPE_STOP: u8 = 2;
 const ORDER_TYPE_STOP_LIMIT: u8 = 3;
 const ORDER_TYPE_LIMIT_POST_ONLY: u8 = 4;
 
+/// What the sequencer journals, replicates and hands to `apply`: a
+/// [`TradingEvent`] with the request sequence the submitting client
+/// stamped on it.
+///
+/// The sequence is the engine's idempotency key. Under a client's key it
+/// must be strictly greater than every sequence the engine has accepted
+/// from that key, or the event is refused as a duplicate — what makes a
+/// retry after a lost reply safe. The check is replayed state, so the
+/// sequence travels with the event: a node recovering from its journal, a
+/// replica applying the primary's stream and the shadow copy the
+/// snapshots are written from must all refuse exactly what the primary
+/// refused. Events the node journals on its own behalf — the genesis
+/// seed, the account limits — carry sequence 0 under key 0, which the
+/// check exempts.
+///
+/// `Copy`, like the event, so it lives inside the disruptor ring slot
+/// without heap indirection — the ring publishes by byte copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TradingRequest {
+    /// Per-key request sequence, as the client's frame carries it and
+    /// the engine's high-water mark records it: a `u64` on both.
+    pub request_seq: u64,
+    pub event: TradingEvent,
+}
+
+impl TradingRequest {
+    /// Bytes the sequence takes in front of the event's own encoding.
+    const SEQ_LEN: usize = 8;
+
+    /// An event the node journals on its own behalf: no client submitted
+    /// it, so it carries no sequence. Applied under key 0, which the
+    /// idempotency check exempts.
+    pub fn internal(event: TradingEvent) -> Self {
+        Self {
+            request_seq: 0,
+            event,
+        }
+    }
+}
+
+impl AppEvent for TradingRequest {
+    /// The event's bound plus the sequence in front of it. See
+    /// [`TradingEvent::MAX_ENCODED_SIZE`] for why the bound matters.
+    const MAX_ENCODED_SIZE: usize = Self::SEQ_LEN + TradingEvent::MAX_ENCODED_SIZE;
+
+    #[inline]
+    fn encoded_size(&self) -> usize {
+        Self::SEQ_LEN + self.event.encoded_size()
+    }
+
+    #[inline]
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        le::put_u64(buf, self.request_seq);
+        Self::SEQ_LEN + self.event.encode(&mut buf[Self::SEQ_LEN..])
+    }
+
+    #[inline]
+    fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+        need(buf, Self::SEQ_LEN)?;
+        Ok(Self {
+            request_seq: le::get_u64(buf),
+            event: TradingEvent::decode(&buf[Self::SEQ_LEN..])?,
+        })
+    }
+
+    #[inline]
+    fn is_query(&self) -> bool {
+        self.event.is_query()
+    }
+}
+
 /// Application-level events for the Melin trading engine.
 ///
 /// `Copy` so the event can live inside the disruptor ring slot without
 /// heap indirection — the ring publishes by byte copy. State-mutating
-/// variants are journaled; the two `Query*` variants are read-only and
-/// bypass the journal (see [`AppEvent::is_query`]).
+/// variants are journaled; the `Query*` variants are read-only and
+/// bypass the journal (see [`TradingEvent::is_query`]).
+///
+/// The engine's event, not the sequencer's: it reaches the journal and
+/// `apply` inside a [`TradingRequest`], which is the `AppEvent`. The
+/// codec here is the request's payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingEvent {
     /// Register a new instrument with its currency pair.
@@ -146,11 +223,11 @@ pub enum TradingEvent {
     },
 }
 
-impl AppEvent for TradingEvent {
-    /// Upper bound on `encoded_size` across every variant, required by
-    /// `AppEvent` since melin 0.15 — the journal computes its downstream
-    /// reservations from it, so a value below the true maximum is not
-    /// something it can recover from.
+impl TradingEvent {
+    /// Upper bound on `encoded_size` across every variant. The journal
+    /// computes its downstream reservations from the `AppEvent` bound,
+    /// which [`TradingRequest`] derives from this one, so a value below
+    /// the true maximum is not something it can recover from.
     ///
     /// The largest variant is `SubmitOrder` carrying a `StopLimit` order
     /// with `GTD` time-in-force:
@@ -172,9 +249,9 @@ impl AppEvent for TradingEvent {
     /// than silently under-reserving. Keep that test exhaustive — it is
     /// the only thing standing between a new variant and a bound that no
     /// longer holds.
-    const MAX_ENCODED_SIZE: usize = 53;
+    pub const MAX_ENCODED_SIZE: usize = 53;
 
-    fn encoded_size(&self) -> usize {
+    pub fn encoded_size(&self) -> usize {
         // 1 byte tag + per-variant payload size.
         1 + match self {
             TradingEvent::AddInstrument { .. } => 4 + 4 + 4, // symbol + base + quote
@@ -206,7 +283,7 @@ impl AppEvent for TradingEvent {
         }
     }
 
-    fn encode(&self, buf: &mut [u8]) -> usize {
+    pub fn encode(&self, buf: &mut [u8]) -> usize {
         let (tag, payload_len) = match self {
             TradingEvent::AddInstrument { spec } => {
                 buf[0] = TAG_ADD_INSTRUMENT;
@@ -329,7 +406,7 @@ impl AppEvent for TradingEvent {
         1 + payload_len
     }
 
-    fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+    pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         if buf.is_empty() {
             return Err(CodecError::Truncated);
         }
@@ -508,8 +585,10 @@ impl AppEvent for TradingEvent {
         }
     }
 
+    /// Read-only variants: answered from the matching thread but never
+    /// journaled, and exempt from the idempotency check.
     #[inline]
-    fn is_query(&self) -> bool {
+    pub fn is_query(&self) -> bool {
         matches!(
             self,
             TradingEvent::QueryStats
@@ -732,8 +811,8 @@ const _: fn() = || {
     let _ = core::mem::size_of::<Side>();
 };
 
-// The cache-line size bound on `JournalEvent<TradingEvent>` lives in
-// `melin-ec` alongside the other InputSlot assertions — this crate
+// The cache-line size bound on `JournalEvent<TradingRequest>` lives in
+// `melin-ec-server` alongside the other InputSlot assertions — this crate
 // stays dependency-free of the journal framing.
 
 #[cfg(test)]
@@ -1180,6 +1259,69 @@ mod tests {
         assert_eq!(err, CodecError::Truncated);
         let err = TradingEvent::decode(&[TAG_DEPOSIT, 0, 0]).unwrap_err();
         assert_eq!(err, CodecError::Truncated);
+    }
+
+    /// The request is the event with its sequence in front, and the
+    /// sequence is not optional: a payload too short to hold one is a
+    /// truncated request, whatever follows.
+    #[test]
+    fn request_round_trips_its_sequence_ahead_of_the_event() {
+        let request = TradingRequest {
+            request_seq: u64::MAX - 1,
+            event: TradingEvent::CancelAll {
+                account: AccountId(9),
+            },
+        };
+        let mut buf = [0u8; 64];
+        let n = request.encode(&mut buf);
+        assert_eq!(n, request.encoded_size());
+        assert_eq!(n, 8 + request.event.encoded_size());
+        assert_eq!(le::get_u64(&buf), u64::MAX - 1);
+        assert_eq!(
+            TradingEvent::decode(&buf[8..n]).unwrap(),
+            request.event,
+            "the event's own codec reads what follows the sequence"
+        );
+        assert_eq!(TradingRequest::decode(&buf[..n]).unwrap(), request);
+
+        assert_eq!(
+            TradingRequest::decode(&buf[..7]).unwrap_err(),
+            CodecError::Truncated
+        );
+        assert_eq!(
+            TradingRequest::decode(&buf[..8]).unwrap_err(),
+            CodecError::Truncated,
+            "a sequence with no event behind it"
+        );
+    }
+
+    /// The request's bound is the event's plus the sequence, and it is
+    /// reached: `max_encoded_size_bounds_every_variant` keeps the event's
+    /// tight, so this one only has to stay in step.
+    #[test]
+    fn request_bound_is_the_event_bound_plus_the_sequence() {
+        assert_eq!(
+            <TradingRequest as AppEvent>::MAX_ENCODED_SIZE,
+            8 + TradingEvent::MAX_ENCODED_SIZE
+        );
+    }
+
+    /// What is a query is the event's call; the sequence has no say.
+    #[test]
+    fn request_is_a_query_when_its_event_is() {
+        let query = TradingRequest {
+            request_seq: 7,
+            event: TradingEvent::QueryStats,
+        };
+        let write = TradingRequest {
+            request_seq: 7,
+            event: TradingEvent::EndOfDay,
+        };
+        assert!(query.is_query());
+        assert!(!write.is_query());
+        let internal = TradingRequest::internal(TradingEvent::EndOfDay);
+        assert_eq!(internal.request_seq, 0);
+        assert!(!internal.is_query());
     }
 
     #[test]

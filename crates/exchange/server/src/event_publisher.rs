@@ -549,8 +549,8 @@ fn authenticate_subscriber(
     let mut frame_buf = [0u8; 256];
     io::Read::read_exact(&mut read_stream, &mut frame_buf[..frame_len])?;
 
-    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
-        Ok(pair) => pair,
+    let cr = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
+        Ok(cr) => cr,
         Err(e) => {
             send_auth_failed(&mut write_stream);
             return Err(io::Error::other(format!("decode ChallengeResponse: {e}")).into());

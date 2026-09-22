@@ -18,6 +18,55 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+This release adopts the sequencer's next release. The [Unreleased section of
+its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+lists further fixes in the node runtime that apply here as they are; the
+entries below cover what changes for this product.
+
+This release carries no state over from 0.17.0. The journal format changes
+(see below) and a node refuses a journal written by an earlier release, so a
+node upgrades onto a fresh journal and is re-provisioned through the admin
+client. The snapshot repair that 0.17.0 asked for is moot on this path: a
+snapshot from an earlier release is never read.
+
+### Changed
+
+- **Duplicate requests are refused by the engine, on every path.** The
+  node runtime no longer keeps the per-key request-sequence gate
+  *(sequencer)*; the sequence a client stamps on each request now travels
+  inside the journaled event, and the engine refuses a repeat itself,
+  before applying anything. Clients see the same `DuplicateRequest`
+  rejection as before, from the same request sequence in the same frame.
+  What changes is where the verdict is reached: in the engine, on every
+  path an event takes — live, on a journal replay, on a replica, and in
+  the copy of the engine that snapshots are written from. That copy used
+  to apply what the primary had refused, so a retried request could land
+  twice in a snapshot; it cannot any more. One consequence: a refused
+  duplicate is still an event the node clocks, so scheduled work due at
+  its timestamp — an order expiry, say — fires on it as on any other
+  event, where it used to wait for the next accepted one.
+- **Journal format 15** *(sequencer)*. Entries no longer carry a
+  runtime-level request sequence, which now lives in the event. A node
+  refuses a format-14 journal.
+- **Replication protocol 5** *(sequencer)*. A primary and a replica on
+  different releases refuse each other at the handshake; upgrade a cluster
+  together.
+- **The authentication handshake frame loses its sequence prefix**
+  *(sequencer)*. A `ChallengeResponse` is now `[tag][signature][public
+  key]`. Every client shipped here authenticates through the sequencer's
+  client and follows; a client built against an earlier release fails the
+  handshake and has its key refused. Request frames are unchanged.
+- **Rust dependents:** the sequencer's event is now `TradingRequest`, a
+  `TradingEvent` with its `request_seq`, and `TradingEvent` no longer
+  implements `AppEvent` (its codec is inherent). Journal readers and
+  writers, `InputSlot` and `StartupEvents` are typed on `TradingRequest`;
+  an event the node journals itself is `TradingRequest::internal(event)`.
+  `Application::check_request_seq` is gone *(sequencer)*: `ServerApp::apply`
+  runs `Exchange::check_request_seq` itself, and `build_reject` no longer
+  sees `DuplicateRequest`. `melin_journal`'s `encode`, `decode`,
+  `batch_append_with_ts` and `JournalEntry` lose their `request_seq`
+  *(sequencer)*.
+
 ## [0.17.0] - 2026-09-22
 
 This release adopts Melin 0.17.0. The [0.17.0 section of its

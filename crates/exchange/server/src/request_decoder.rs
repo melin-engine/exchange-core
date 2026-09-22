@@ -9,7 +9,7 @@ use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::Request;
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_wire_protocol::error::ProtocolError;
 
 /// Decoder for the trading wire protocol.
@@ -20,9 +20,11 @@ use melin_wire_protocol::error::ProtocolError;
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
-    type Event = TradingEvent;
+    type Event = TradingRequest;
 
-    fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<TradingEvent> {
+    /// The frame's request sequence travels on into the event: the
+    /// engine's idempotency check reads it from there, in `apply`.
+    fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<TradingRequest> {
         let (request_seq, request) = match codec::decode_request(bytes) {
             Ok(pair) => pair,
             Err(e) => return Decoded::DecodeError(protocol_error_reason(&e)),
@@ -36,10 +38,10 @@ impl RequestDecoderTrait for RequestDecoder {
             return Decoded::PermissionDenied(reason);
         }
 
-        Decoded::Permitted {
+        Decoded::Permitted(TradingRequest {
             request_seq,
             event: to_trading_event(&request),
-        }
+        })
     }
 }
 
@@ -220,8 +222,8 @@ mod tests {
             42,
         );
         match RequestDecoder.decode(&bytes, Permission::Trader) {
-            Decoded::Permitted { request_seq, event } => {
-                assert_eq!(request_seq, 42);
+            Decoded::Permitted(TradingRequest { request_seq, event }) => {
+                assert_eq!(request_seq, 42, "the frame's sequence rides in the event");
                 assert!(matches!(event, TradingEvent::SubmitOrder { .. }));
                 // Trading-side query taxonomy: order submission is not a query.
                 assert!(!event.is_query());
@@ -259,7 +261,7 @@ mod tests {
         );
         assert!(matches!(
             RequestDecoder.decode(&bytes, Permission::Operator),
-            Decoded::Permitted { .. }
+            Decoded::Permitted(_)
         ));
     }
 
@@ -293,7 +295,7 @@ mod tests {
         );
         assert!(matches!(
             RequestDecoder.decode(&bytes, Permission::Custodian),
-            Decoded::Permitted { .. }
+            Decoded::Permitted(_)
         ));
     }
 
@@ -319,9 +321,9 @@ mod tests {
         // `Request::requires_operator`.
         let bytes = encode(&Request::QueryStats, 1);
         match RequestDecoder.decode(&bytes, Permission::Operator) {
-            Decoded::Permitted { event, .. } => {
-                assert!(matches!(event, TradingEvent::QueryStats));
-                assert!(event.is_query());
+            Decoded::Permitted(request) => {
+                assert!(matches!(request.event, TradingEvent::QueryStats));
+                assert!(request.is_query());
             }
             other => panic!("expected Permitted, got {:?}", debug_variant(&other)),
         }
@@ -339,7 +341,7 @@ mod tests {
     fn debug_variant<E: AppEvent>(d: &Decoded<E>) -> &'static str {
         match d {
             Decoded::Filter => "Filter",
-            Decoded::Permitted { .. } => "Permitted",
+            Decoded::Permitted(_) => "Permitted",
             Decoded::PermissionDenied(_) => "PermissionDenied",
             Decoded::DecodeError(_) => "DecodeError",
         }

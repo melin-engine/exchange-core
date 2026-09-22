@@ -19,7 +19,7 @@
 //!
 //! Keeps the runtime free of trading event variants.
 
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_ec_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 use melin_server_runtime::StartupEvents;
 
@@ -59,7 +59,10 @@ impl StartupConfig {
     /// Genesis is empty unless the crate is built with `synthetic-seed`.
     /// A node that seeds nothing starts with no instrument and no account;
     /// both are created at runtime through the admin client.
-    pub fn startup_events(&self) -> StartupEvents<TradingEvent> {
+    ///
+    /// The node journals these itself, so they carry no request sequence
+    /// (see [`TradingRequest::internal`]).
+    pub fn startup_events(&self) -> StartupEvents<TradingRequest> {
         // The only trace of the values a node brings to the cluster: they
         // take effect once journaled, when the node becomes primary.
         tracing::info!(
@@ -76,7 +79,7 @@ impl StartupConfig {
     /// run with `synthetic-seed` on (the test targets depend on the
     /// feature), so a `cfg`-gated test of the stock build would never
     /// compile, let alone run.
-    fn startup_events_seeding(&self, seed: bool) -> StartupEvents<TradingEvent> {
+    fn startup_events_seeding(&self, seed: bool) -> StartupEvents<TradingRequest> {
         StartupEvents {
             genesis: if seed { self.genesis() } else { Vec::new() },
             on_primary: vec![self.account_limits()],
@@ -94,7 +97,7 @@ impl StartupConfig {
     /// The same, always carrying the synthetic seed whatever the crate
     /// was built with. For a node driven by a bench or a test, which owns
     /// its journal and needs funded accounts to trade with.
-    pub fn synthetic_startup_events(&self) -> StartupEvents<TradingEvent> {
+    pub fn synthetic_startup_events(&self) -> StartupEvents<TradingRequest> {
         StartupEvents {
             genesis: self.synthetic_genesis(),
             on_primary: vec![self.account_limits()],
@@ -105,7 +108,7 @@ impl StartupConfig {
     /// instruments, for development, benches and smoke tests. A stock
     /// build journals no genesis at all: instruments and accounts are
     /// created through the admin client, against a running node.
-    fn genesis(&self) -> Vec<TradingEvent> {
+    fn genesis(&self) -> Vec<TradingRequest> {
         if self.accounts > 0 {
             // Not a production build: these accounts are funded from
             // nowhere, and the journal keeps that forever.
@@ -120,32 +123,32 @@ impl StartupConfig {
 
     /// Instruments first, then accounts: `ProvisionAccount` funds an
     /// account in every currency of every instrument registered so far.
-    pub fn synthetic_genesis(&self) -> Vec<TradingEvent> {
+    pub fn synthetic_genesis(&self) -> Vec<TradingRequest> {
         let mut events = Vec::with_capacity(self.instruments as usize + self.accounts as usize);
         for i in 0..self.instruments {
-            events.push(TradingEvent::AddInstrument {
+            events.push(TradingRequest::internal(TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(i),
                     base: CurrencyId(i * 2),
                     quote: CurrencyId(i * 2 + 1),
                 },
-            });
+            }));
         }
         for acct in 1..=self.accounts {
-            events.push(TradingEvent::ProvisionAccount {
+            events.push(TradingRequest::internal(TradingEvent::ProvisionAccount {
                 account: AccountId(acct),
                 amount: u64::MAX / 4,
-            });
+            }));
         }
         events
     }
 
-    fn account_limits(&self) -> TradingEvent {
-        TradingEvent::SetAccountLimits {
+    fn account_limits(&self) -> TradingRequest {
+        TradingRequest::internal(TradingEvent::SetAccountLimits {
             max_open_orders_per_account: self.max_orders_per_account,
             max_orders_per_second: self.max_orders_per_second,
             max_orders_burst: self.max_orders_burst,
-        }
+        })
     }
 }
 
@@ -172,10 +175,36 @@ mod tests {
     #[test]
     fn synthetic_genesis_order_is_instruments_then_accounts() {
         let events = cfg(2, 2).synthetic_genesis();
-        assert!(matches!(events[0], TradingEvent::AddInstrument { .. }));
-        assert!(matches!(events[1], TradingEvent::AddInstrument { .. }));
-        assert!(matches!(events[2], TradingEvent::ProvisionAccount { .. }));
-        assert!(matches!(events[3], TradingEvent::ProvisionAccount { .. }));
+        assert!(matches!(
+            events[0].event,
+            TradingEvent::AddInstrument { .. }
+        ));
+        assert!(matches!(
+            events[1].event,
+            TradingEvent::AddInstrument { .. }
+        ));
+        assert!(matches!(
+            events[2].event,
+            TradingEvent::ProvisionAccount { .. }
+        ));
+        assert!(matches!(
+            events[3].event,
+            TradingEvent::ProvisionAccount { .. }
+        ));
+    }
+
+    /// Nothing the node journals itself carries a sequence: it is applied
+    /// under key 0, and the engine's idempotency check exempts that key.
+    #[test]
+    fn startup_events_carry_no_request_sequence() {
+        let events = cfg(2, 2).synthetic_startup_events();
+        assert!(
+            events
+                .genesis
+                .iter()
+                .chain(&events.on_primary)
+                .all(|e| e.request_seq == 0)
+        );
     }
 
     #[test]
@@ -221,17 +250,17 @@ mod tests {
         let events = cfg(2, 2).synthetic_startup_events();
         assert_eq!(
             events.on_primary,
-            vec![TradingEvent::SetAccountLimits {
+            vec![TradingRequest::internal(TradingEvent::SetAccountLimits {
                 max_open_orders_per_account: 100,
                 max_orders_per_second: 1_000,
                 max_orders_burst: 100,
-            }]
+            })]
         );
         assert!(
             !events
                 .genesis
                 .iter()
-                .any(|e| matches!(e, TradingEvent::SetAccountLimits { .. }))
+                .any(|e| matches!(e.event, TradingEvent::SetAccountLimits { .. }))
         );
     }
 

@@ -36,7 +36,7 @@ use std::num::NonZero;
 use std::path::Path;
 use std::time::Instant;
 
-use melin_ec_trading::trading_event::TradingEvent;
+use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_journal::BufferedWriter;
 use melin_journal::JournalEvent;
 use melin_journal::JournalWrite;
@@ -70,7 +70,7 @@ fn main() {
 
 /// Build a `SubmitOrder` event for slot `i`. Alternates Buy/Sell so the
 /// generated stream is not trivially compressible.
-fn make_event(i: usize) -> JournalEvent<TradingEvent> {
+fn make_event(i: usize) -> JournalEvent<TradingRequest> {
     let nz = |v: u64| NonZero::new(v).expect("non-zero");
     let order_id = melin_ec_types::types::OrderId((i as u64) + 1);
     let side = if i.is_multiple_of(2) {
@@ -78,20 +78,25 @@ fn make_event(i: usize) -> JournalEvent<TradingEvent> {
     } else {
         melin_ec_types::types::Side::Sell
     };
-    JournalEvent::App(TradingEvent::SubmitOrder {
-        symbol: melin_ec_types::types::Symbol(1),
-        order: melin_ec_types::types::Order {
-            id: order_id,
-            account: melin_ec_types::types::AccountId(1),
-            side,
-            order_type: melin_ec_types::types::OrderType::Limit {
-                price: melin_ec_types::types::Price(nz(100)),
-                post_only: false,
+    // Sequenced as a client would: the entry is the size production
+    // writes.
+    JournalEvent::App(TradingRequest {
+        request_seq: i as u64 + 1,
+        event: TradingEvent::SubmitOrder {
+            symbol: melin_ec_types::types::Symbol(1),
+            order: melin_ec_types::types::Order {
+                id: order_id,
+                account: melin_ec_types::types::AccountId(1),
+                side,
+                order_type: melin_ec_types::types::OrderType::Limit {
+                    price: melin_ec_types::types::Price(nz(100)),
+                    post_only: false,
+                },
+                time_in_force: melin_ec_types::types::TimeInForce::GTC,
+                quantity: melin_ec_types::types::Quantity(nz(1)),
+                stp: melin_ec_types::types::SelfTradeProtection::Allow,
+                expiry_ns: 0,
             },
-            time_in_force: melin_ec_types::types::TimeInForce::GTC,
-            quantity: melin_ec_types::types::Quantity(nz(1)),
-            stp: melin_ec_types::types::SelfTradeProtection::Allow,
-            expiry_ns: 0,
         },
     })
 }
@@ -121,7 +126,7 @@ fn report(num_events: usize, elapsed_us: u128, journal_path: &Path) {
 /// not the split sequencer/disk-thread pair production runs; it matches
 /// production's syscall shape only while the disk keeps up. See the
 /// module docs.
-fn run_sync_mode<W: JournalWrite<TradingEvent>>(
+fn run_sync_mode<W: JournalWrite<TradingRequest>>(
     mut writer: W,
     num_events: usize,
     batch_size: usize,
@@ -138,7 +143,7 @@ fn run_sync_mode<W: JournalWrite<TradingEvent>>(
         for i in batch_start..batch_end {
             let event = make_event(i);
             writer
-                .batch_append_with_ts(&event, 0, 0, 0)
+                .batch_append_with_ts(&event, 0, 0)
                 .expect("batch_append_with_ts");
             events_written += 1;
             if events_written % 10_000 == 0 {
