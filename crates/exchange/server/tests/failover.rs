@@ -50,7 +50,7 @@ fn server_bin() -> PathBuf {
 /// Connect a TCP client with a 60s socket read timeout so the test
 /// suite fails fast when a server stalls instead of soaking the host
 /// indefinitely. 60s sits well above every in-test wait
-/// (`wait_ready` / `wait_for_replacement_catchup` cap at 30s), so a
+/// (`wait_ready` / `wait_every_replica_acked` cap at 30s), so a
 /// healthy run never trips it.
 fn connect_with_timeout(addr: SocketAddr, key: &SigningKey) -> Client {
     let client = Client::connect(addr, key).expect("client connect");
@@ -435,13 +435,19 @@ fn wait_metric(
     }
 }
 
-/// Wait until `replicas` replicas are connected and every replica slot
-/// has acked the primary's journal up to its current sequence. Stronger
-/// than the health line's lag, which covers only the slots the primary
-/// counts as engaged: a replica that has just attached is not one of them
-/// until its catch-up settles, and its slot is what this waits on. The
-/// sequence is read before the acks, so ticks journaled between the two
-/// reads cannot fail the comparison.
+/// Wait until `replicas` replicas are connected and that many replica
+/// slots have acked the primary's journal up to its current sequence.
+///
+/// The health line's lag is not enough for this: it covers only the
+/// slots the primary counts as engaged, and a replica that has just
+/// attached — a replacement catching up from its journal, or by snapshot
+/// transfer — is not one of them until its catch-up settles. The lag can
+/// read 0 from the other replica alone, and a lag that blips non-zero
+/// and back can be that replica too. Naming the slots removes the
+/// ambiguity: a disengaged slot's ack gauge is zeroed, so a slot acked up
+/// to the sequence is a live replica that holds everything. The sequence
+/// is read before the acks, so ticks journaled between the two reads
+/// cannot fail the comparison.
 fn wait_every_replica_acked(primary_health: SocketAddr, replicas: u64, timeout: Duration) {
     let start = Instant::now();
     let snapshot = || {
@@ -454,10 +460,9 @@ fn wait_every_replica_acked(primary_health: SocketAddr, replicas: u64, timeout: 
         (seq, connected, acked)
     };
     loop {
-        if let (Some(seq), Some(connected), [Some(a0), Some(a1)]) = snapshot()
+        if let (Some(seq), Some(connected), acked) = snapshot()
             && connected == replicas
-            && a0 >= seq
-            && a1 >= seq
+            && acked.iter().flatten().filter(|&&a| a >= seq).count() as u64 >= replicas
         {
             return;
         }
@@ -538,33 +543,6 @@ fn assert_trading(addr: SocketAddr, budget: Duration, what: &str) {
             );
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Wait for a freshly-spawned replacement replica to fully catch up via
-/// the primary's lag metric. The primary's `replication_lag` is
-/// `journal_seq - min(slot0, slot1)`, with disconnected slots pinned to
-/// `u64::MAX` (and thus excluded from the min). After a replica is killed
-/// its slot is excluded, so lag can read 0 from the surviving replica
-/// alone — even before the new replacement has connected. To avoid
-/// promoting a not-yet-caught-up replica, wait for lag to first transition
-/// to a nonzero value (replacement connected with a behind handshake) and
-/// then back to zero (caught up).
-fn wait_for_replacement_catchup(primary_health: SocketAddr) {
-    let start = Instant::now();
-    let mut saw_nonzero = false;
-    loop {
-        if let Ok((_, _, lag, _)) = query_health(primary_health) {
-            if lag > 0 {
-                saw_nonzero = true;
-            } else if saw_nonzero {
-                return;
-            }
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("replacement catch-up timeout (saw_nonzero={saw_nonzero})");
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -2443,7 +2421,7 @@ fn replacement_replica_catches_up_from_journal() {
         }
     };
 
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
     eprintln!("Replacement replica caught up.");
 
     // Phase 3: submit orders after catch-up to verify live streaming works.
@@ -2451,11 +2429,9 @@ fn replacement_replica_catches_up_from_journal() {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
         assert!(!r.is_empty(), "order {i}: no response after catch-up");
     }
-    // Not `wait_replicated`: the health line's lag covers the replicas the
-    // primary counts as engaged, and the replacement may not be one of
-    // them yet. Ask for both slots by name, so the replacement has every
-    // order in its journal before the primary goes away — otherwise the
-    // promotion below races the tail of this batch.
+    // Both slots by name, not `wait_replicated`: the replacement must hold
+    // every order of this batch before the primary goes away, or the
+    // promotion below races its tail.
     wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(10));
 
     // Kill primary, promote the replacement replica.
@@ -2572,11 +2548,10 @@ fn catchup_with_fills_during_gap() {
         }
     };
 
-    // Wait for replacement to actually catch up. See
-    // `wait_for_replacement_catchup` for why polling primary lag once is
-    // insufficient (disconnected slot pinned to u64::MAX excludes it from
-    // the min cursor).
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    // Wait for the replacement to actually catch up — see
+    // `wait_every_replica_acked` for why the health line's lag is not
+    // enough on its own.
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
 
     // Kill primary, promote replacement.
     drop(client);
@@ -2687,16 +2662,12 @@ fn catchup_then_immediate_failover() {
         }
     };
 
-    // Wait for replacement_imm to actually catch up.
-    //
-    // Polling the primary's lag is insufficient on its own: replica1's slot
-    // is pinned to u64::MAX after disconnect (excluded from the min cursor),
-    // so the primary reports lag==0 from replica2 alone — even before
-    // replacement_imm has connected. Wait for lag to first transition to
-    // nonzero (replacement_imm connected and behind), then back to zero
-    // (caught up). The replica doesn't spawn a health endpoint of its own,
-    // so primary's view is the only signal available.
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    // Wait for the replacement to actually catch up: both slots by name,
+    // because the primary's lag can read 0 from replica 2 alone before the
+    // replacement has even connected, and its blip to non-zero and back
+    // can be replica 2 too — see `wait_every_replica_acked`. The kill
+    // that follows must find the replacement holding every order.
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
 
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
@@ -2806,7 +2777,7 @@ fn fresh_replica_full_catchup() {
         }
     };
 
-    wait_for_replacement_catchup(cluster.primary.health_addr);
+    wait_every_replica_acked(cluster.primary.health_addr, 2, Duration::from_secs(30));
     eprintln!("Fresh replica caught up.");
 
     // Submit more orders after catch-up (proves live streaming works).
@@ -3044,7 +3015,7 @@ fn snapshot_transfer_when_archives_purged() {
     wait_for_replicas(primary2.health_addr, 1, Duration::from_secs(30));
     eprintln!("Primary healthy with replica connected");
 
-    wait_for_replacement_catchup(primary2.health_addr);
+    wait_every_replica_acked(primary2.health_addr, 1, Duration::from_secs(30));
     eprintln!("Replica caught up via snapshot transfer.");
 
     // Submit a new order to verify the primary is functional.
