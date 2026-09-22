@@ -1869,19 +1869,96 @@ fn wait_for_snapshot_through(journal: &Path, through: u64) -> (PathBuf, ServerAp
 
 /// Two processes sharing one key collide on the request sequence: both
 /// adopt the same mark at connect, so the second one's first write repeats
-/// the first one's sequence and is refused as a duplicate. The refusal
-/// used to be decided by the node runtime before `apply`, and the copy of
-/// the engine that writes snapshots never ran it, so a snapshot could hold
-/// the order its client was told was refused. The check now runs in
-/// `apply`, on that copy like everywhere else. Three views of one history
-/// — the live node, the snapshot its shadow copy wrote, and a replay of
-/// the journal it wrote — must agree: the refused order is in none of
-/// them, and the mark is the one the live node reached.
+/// the first one's sequence and is refused as a duplicate. Drives that
+/// collision against the node at `addr` under `key`: order 1 is placed by
+/// the first connection, order 2 is refused as the second's repeat of
+/// sequence 1, and order 3 is placed once the second has resynchronised.
+/// Every reply is gated on its journal write, so on return the node's
+/// journal holds all three requests, the refused one included.
+fn collide_on_request_sequence(addr: SocketAddr, key: &SigningKey) {
+    use melin_ec_protocol::types::{ExecutionReport, RejectReason};
+
+    // Both connections adopt the key's mark, 0, before either writes.
+    let mut first = connect_with_timeout(addr, key);
+    let mut second = connect_with_timeout(addr, key);
+
+    let r = submit_order(&mut first, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(rep, ExecutionReport::Placed { .. })),
+        "order 1: {r:?}"
+    );
+    // The second connection's counter is one behind: its first write
+    // repeats sequence 1, and is refused against order 2's own id.
+    let r = submit_order(&mut second, 2, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            ExecutionReport::Rejected {
+                order_id: OrderId(2),
+                reason: RejectReason::DuplicateRequest,
+                ..
+            }
+        )),
+        "order 2 repeats sequence 1: {r:?}"
+    );
+    // Resynchronised past the mark, it is served like the first.
+    assert_eq!(second.synchronize_request_seq().unwrap(), 1);
+    let r = submit_order(&mut second, 3, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(rep, ExecutionReport::Placed { .. })),
+        "order 3: {r:?}"
+    );
+}
+
+/// Assert that the node `client` is connected to, described as `view`,
+/// holds the history [`collide_on_request_sequence`] wrote the way the
+/// node that served it did: orders 1 and 3 resting, order 2 never placed,
+/// and the key's mark at the two accepted sequences. Probed through the
+/// client, which is what the node's state means to anyone.
+fn assert_holds_only_the_accepted_orders(client: &mut Client, view: &str) {
+    use melin_ec_protocol::types::ExecutionReport;
+
+    assert_eq!(
+        client.synchronize_request_seq().unwrap(),
+        2,
+        "{view}: the mark must be the two accepted sequences, not three"
+    );
+    let cancel = |client: &mut Client, id: u64| {
+        client
+            .send_request(&Request::CancelOrder {
+                symbol: Symbol(1),
+                account: AccountId(1),
+                order_id: OrderId(id),
+            })
+            .expect("cancel")
+    };
+    // A cancel of an order the engine never held answers with nothing.
+    let r = cancel(client, 2);
+    assert!(
+        r.is_empty(),
+        "{view} must not have placed the refused order 2: {r:?}"
+    );
+    for id in [1, 3] {
+        let r = cancel(client, id);
+        assert!(
+            has_report(&r, |rep| matches!(rep, ExecutionReport::Cancelled { .. })),
+            "{view} must have placed order {id}: {r:?}"
+        );
+    }
+}
+
+/// The refusal of a repeated request used to be decided by the node
+/// runtime before `apply`, and the copy of the engine that writes
+/// snapshots never ran it, so a snapshot could hold the order its client
+/// was told was refused. The check now runs in `apply`, on that copy like
+/// everywhere else. Three views of one history — the live node, the
+/// snapshot its shadow copy wrote, and a replay of the journal it wrote —
+/// must agree: the refused order is in none of them, and the mark is the
+/// one the live node reached. A replica is the fourth view, covered by
+/// [`refused_duplicate_is_absent_from_promoted_replica`].
 #[test]
 #[serial]
 fn refused_duplicate_is_absent_from_snapshot_and_replay() {
-    use melin_ec_protocol::types::{ExecutionReport, RejectReason};
-
     let bin = server_bin();
     let tmp = tempfile::tempdir().unwrap();
     let key = SigningKey::from_bytes(&[0xFA; 32]);
@@ -1932,41 +2009,10 @@ fn refused_duplicate_is_absent_from_snapshot_and_replay() {
     };
     wait_healthy(node.health_addr, Duration::from_secs(30));
 
-    // Both connections adopt the key's mark, 0, before either writes.
-    let mut first = connect_with_timeout(node.client_addr, &key);
-    let mut second = connect_with_timeout(node.client_addr, &key);
+    collide_on_request_sequence(node.client_addr, &key);
 
-    let r = submit_order(&mut first, 1, 1, 1, Side::Buy, 100, 10);
-    assert!(
-        has_report(&r, |rep| matches!(rep, ExecutionReport::Placed { .. })),
-        "order 1: {r:?}"
-    );
-    // The second connection's counter is one behind: its first write
-    // repeats sequence 1, and is refused against order 2's own id.
-    let r = submit_order(&mut second, 2, 1, 1, Side::Buy, 100, 10);
-    assert!(
-        has_report(&r, |rep| matches!(
-            rep,
-            ExecutionReport::Rejected {
-                order_id: OrderId(2),
-                reason: RejectReason::DuplicateRequest,
-                ..
-            }
-        )),
-        "order 2 repeats sequence 1: {r:?}"
-    );
-    // Resynchronised past the mark, it is served like the first.
-    assert_eq!(second.synchronize_request_seq().unwrap(), 1);
-    let r = submit_order(&mut second, 3, 1, 1, Side::Buy, 100, 10);
-    assert!(
-        has_report(&r, |rep| matches!(rep, ExecutionReport::Placed { .. })),
-        "order 3: {r:?}"
-    );
-    drop(first);
-    drop(second);
-
-    // Every reply above was gated on its journal write, so a snapshot
-    // covering the journal as it stands now holds all three requests.
+    // A snapshot covering the journal as it stands now holds all three
+    // requests.
     let (_, through, _, _) = query_health(node.health_addr).expect("health");
     let (snap_path, engine) = wait_for_snapshot_through(&journal, through);
     unsafe { libc::kill(node.child.id() as i32, libc::SIGINT) };
@@ -1978,12 +2024,16 @@ fn refused_duplicate_is_absent_from_snapshot_and_replay() {
         .map(|((_, id), _)| id.0)
         .collect();
     live.sort_unstable();
-    assert_eq!(live, [1, 3], "the snapshot holds the refused order 2");
+    assert_eq!(
+        live,
+        [1, 3],
+        "the snapshot must hold the two accepted orders and not the refused order 2"
+    );
     let marks = engine.snapshot_key_hwm();
     assert_eq!(marks.len(), 1, "one key wrote: {marks:?}");
     assert_eq!(
         marks[0].1, 2,
-        "the mark is the two accepted sequences, not three"
+        "the snapshot's mark must be the two accepted sequences, not three"
     );
 
     // Replay: with the snapshot moved aside, a standalone restart rebuilds
@@ -2002,33 +2052,28 @@ fn refused_duplicate_is_absent_from_snapshot_and_replay() {
     );
     wait_ready(recovered.health_addr, Duration::from_secs(30));
     let mut client = connect_with_timeout(recovered.client_addr, &key);
-    assert_eq!(
-        client.synchronize_request_seq().unwrap(),
-        2,
-        "replay rebuilt the mark from the journaled sequences"
-    );
-    let cancel = |client: &mut Client, id: u64| {
-        client
-            .send_request(&Request::CancelOrder {
-                symbol: Symbol(1),
-                account: AccountId(1),
-                order_id: OrderId(id),
-            })
-            .expect("cancel")
-    };
-    // A cancel of an order the engine never held answers with nothing.
-    let r = cancel(&mut client, 2);
-    assert!(
-        r.is_empty(),
-        "replay must not have placed the refused order 2: {r:?}"
-    );
-    for id in [1, 3] {
-        let r = cancel(&mut client, id);
-        assert!(
-            has_report(&r, |rep| matches!(rep, ExecutionReport::Cancelled { .. })),
-            "replay must have placed order {id}: {r:?}"
-        );
-    }
+    assert_holds_only_the_accepted_orders(&mut client, "replay");
+}
+
+/// The fourth view of the history in
+/// [`refused_duplicate_is_absent_from_snapshot_and_replay`]: a replica
+/// following the primary's stream. The stream carries each event under
+/// its client's key, and the replica hands it to the same `apply`, so the
+/// repeat must be refused there too — a promoted replica that had placed
+/// the order its primary refused would hand the client a book it was
+/// never told about.
+#[test]
+#[serial]
+fn refused_duplicate_is_absent_from_promoted_replica() {
+    let mut cluster = TestCluster::start();
+    collide_on_request_sequence(cluster.primary.client_addr, &cluster.key);
+    cluster.wait_replicated();
+
+    // `kill_and_promote` hands back a client under the second key; the
+    // history was written under the first, so probe under that one.
+    drop(cluster.kill_and_promote());
+    let mut client = connect_with_timeout(cluster.replica.client_addr, &cluster.key);
+    assert_holds_only_the_accepted_orders(&mut client, "the promoted replica");
 }
 
 // ---------------------------------------------------------------------------
