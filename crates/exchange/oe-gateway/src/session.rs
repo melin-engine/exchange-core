@@ -441,7 +441,7 @@ impl Session {
     /// session down.
     fn melin_response<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
         match melin_client::classify(payload) {
-            Ok(Reply::Response(bytes)) => Some(bytes),
+            Ok(Reply::Response(body)) => Some(body),
             Ok(Reply::Heartbeat | Reply::BatchEnd) => None,
             Ok(Reply::ServerBusy) => {
                 warn!(sender = %self.sender_comp_id, "Melin server busy");
@@ -2024,9 +2024,9 @@ lot_size_inverse = 1
         assert!(matches!(s.state, SessionState::Closing));
     }
 
-    /// Encode a response with the codec and strip the 4-byte length
-    /// prefix to match what the dispatcher hands to the handlers (it
-    /// consumes the prefix when framing).
+    /// Encode a response as a whole frame and strip the 4-byte length
+    /// prefix: what the dispatcher reads off the Melin socket, the tag
+    /// still on, before `classify` hands the handlers its body.
     fn encode_response_payload(resp: &ResponseKind) -> Vec<u8> {
         let mut buf = [0u8; 64];
         let n = codec::encode_response(resp, &mut buf).unwrap();

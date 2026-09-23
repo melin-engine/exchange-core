@@ -674,14 +674,14 @@ pub fn decode_request_body(body: &[u8]) -> Result<(u64, Request), ProtocolError>
 }
 
 /// Bytes of a response body ahead of the payload: the kind.
-const RESPONSE_TAG_LEN: usize = 1;
+const RESPONSE_KIND_LEN: usize = 1;
 
 /// Bound on one response body — kind and payload. The widest is a
 /// `PositionSnapshot` with every balance slot used: account(4) +
 /// count(1) + 16 × (currency(4) + free(8) + reserved(8)). A test encodes
 /// one and pins the number; the server checks it against the node
 /// runtime's bound at compile time.
-pub const MAX_RESPONSE_BODY: usize = RESPONSE_TAG_LEN + 4 + 1 + 16 * 20;
+pub const MAX_RESPONSE_BODY: usize = RESPONSE_KIND_LEN + 4 + 1 + 16 * 20;
 
 /// Encode a response into `buf` as a complete wire frame. Returns total
 /// bytes written (length prefix + tag + body).
@@ -709,7 +709,7 @@ pub fn encode_response_body(
 ) -> Result<usize, ProtocolError> {
     // Reserve the kind; back-filled below, once the payload has said
     // which kind names it.
-    let mut pos = RESPONSE_TAG_LEN;
+    let mut pos = RESPONSE_KIND_LEN;
 
     let kind = match response {
         ResponseKind::Report(report) => {

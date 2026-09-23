@@ -22,7 +22,7 @@ Every frame, in either direction, is a length prefix, a one-byte frame tag, and 
 
 The frame tag belongs to the node. Tag `0x09` marks an exchange message: every request and every exchange response travels under it, and its body is laid out as described below. Every other tag is a node frame with a fixed meaning (see "Node Frames"). The node drops a client frame under any tag but `0x09` once the handshake is over, so a request framed any other way never reaches the exchange.
 
-**Maximum frame size**: 1024 bytes (1 KiB) after the length prefix, tag and body together. A frame exceeding this limit is rejected and the connection is closed.
+**Maximum frame size**: 1024 bytes (1 KiB) for the tag and body together, not counting the length prefix. A frame exceeding this limit is rejected and the connection is closed.
 
 ### Request Body
 

@@ -66,9 +66,14 @@ snapshot from an earlier release is never read.
   `[length][seq][kind][payload]`) and an exchange response
   `[length][0x09][kind][payload]` (it was `[length][kind][payload]`).
   Every client shipped here follows. A client built against an earlier
-  release has its requests dropped or refused as malformed: the node logs
-  each at `debug!` and keeps the connection, so the client sees only its
-  own read timeouts. It reads every exchange response as a protocol error.
+  release must not be pointed at this one. Most of its requests are
+  dropped or refused as malformed: the node logs each at `debug!` and
+  keeps the connection, so the client sees only its own read timeouts.
+  But the node reads the low byte of its `seq` as the tag, so a request
+  whose `seq` ends in `0x09` is taken as an exchange message and can
+  decode as a different request, with a sequence that locks the key out
+  of later ones. The client reads every exchange response as a protocol
+  error.
 - **The node reads and writes the protocol's framing** *(sequencer)*. A
   client frame under any tag but `0x09` after the handshake is dropped at
   `debug!` before the exchange sees it, like any other malformed request.
