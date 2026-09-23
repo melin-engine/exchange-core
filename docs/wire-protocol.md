@@ -627,7 +627,7 @@ readonly DDDD...base64...= monitoring
 replication EEEE...base64...= replica-1
 ```
 
-Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. If a key appears multiple times, the last entry wins.
+Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. Each key is listed once: a file that lists a key twice, under the same role or another, is refused, and the node does not start. The error names the second line.
 
 ---
 

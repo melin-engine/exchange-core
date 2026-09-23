@@ -102,7 +102,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 
 ### Startup Sequence
 
-1. Load authorized keys from `--authorized-keys`.
+1. Load authorized keys from `--authorized-keys`. A file that lists a public key twice is refused, and the node does not start.
 2. Initialize or recover the exchange (see [Recovery on Startup](#recovery-on-startup)).
 3. Reserve the exchange's memory and pre-fault it (avoids growth and page faults on the hot path). Every node reserves the same production capacity before its first event; the balance map alone is sized from `--accounts` and `--instruments`.
 4. Build the disruptor pipeline (input ring + output ring).

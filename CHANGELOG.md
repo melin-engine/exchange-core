@@ -94,6 +94,9 @@ snapshot from an earlier release is never read.
   disconnected — trading halted` is now `all replicas disconnected —
   halted, refusing client writes`, and `raft core stopped — control plane
   down, trading unaffected` now ends `sequencing unaffected`.
+- **An `authorized_keys` file that lists a key twice no longer loads**
+  *(sequencer)*. The last line used to win silently. The node refuses to
+  start and names the line, so remove the duplicate before upgrading.
 - **Rust dependents:** `RequestDecoder::decode` takes `(body,
   permission)` and `ResponseEncoder` returns the length of the body it
   wrote, both as the sequencer now asks *(sequencer)*. The codec's
