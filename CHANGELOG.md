@@ -94,6 +94,12 @@ snapshot from an earlier release is never read.
   disconnected — trading halted` is now `all replicas disconnected —
   halted, refusing client writes`, and `raft core stopped — control plane
   down, trading unaffected` now ends `sequencing unaffected`.
+- **A replication key can no longer connect as a client.** It authorizes
+  streaming between nodes and nothing else. The trading port refuses it
+  during the handshake *(sequencer)*, and so does the event feed
+  (`--event-bind`), which used to admit any listed key and stream every
+  execution to it. A client or subscriber that used a replication key
+  needs a key of its own, under a client role.
 - **An `authorized_keys` file that lists a key twice no longer loads**
   *(sequencer)*. The last line used to win silently. The node refuses to
   start and names the line, so remove the duplicate before upgrading.

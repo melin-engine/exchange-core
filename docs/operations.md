@@ -180,7 +180,7 @@ Both consumers are parallel. The producer is gated on the **slowest** consumer. 
 
 ### Subscriber protocol
 
-Subscribers connect to the `--event-bind` port and authenticate with the standard Ed25519 challenge-response handshake (same as the main trading port). Any permission level (ReadOnly or above) is accepted.
+Subscribers connect to the `--event-bind` port and authenticate with the standard Ed25519 challenge-response handshake (same as the main trading port). Any client role (operator, trader, custodian, readonly) is accepted. A replication key is refused, as on the trading port: it authorizes streaming between nodes and nothing else.
 
 After auth, the server sends a continuous stream of frames:
 
