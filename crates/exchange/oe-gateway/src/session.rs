@@ -441,7 +441,7 @@ impl Session {
     /// session down.
     fn melin_response<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
         match melin_client::classify(payload) {
-            Ok(Reply::Response(bytes)) => Some(bytes),
+            Ok(Reply::Response(body)) => Some(body),
             Ok(Reply::Heartbeat | Reply::BatchEnd) => None,
             Ok(Reply::ServerBusy) => {
                 warn!(sender = %self.sender_comp_id, "Melin server busy");
@@ -533,7 +533,7 @@ impl Session {
     /// the transport's frames and the session stays parked until the
     /// real response.
     fn handle_request_seq_sync(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
-        let response = match codec::decode_response(payload) {
+        let response = match codec::decode_response_body(payload) {
             Ok(r) => r,
             Err(e) => {
                 error!(error = %e, "failed to decode RequestSeqHwm response");
@@ -830,7 +830,7 @@ impl Session {
         config: &GatewayConfig,
         _symbol_map: &HashMap<String, SymbolConfig>,
     ) -> SessionAction {
-        let response = match codec::decode_response(payload) {
+        let response = match codec::decode_response_body(payload) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "failed to decode Melin response");
@@ -2024,13 +2024,21 @@ lot_size_inverse = 1
         assert!(matches!(s.state, SessionState::Closing));
     }
 
-    /// Encode a response with the codec and strip the 4-byte length
-    /// prefix to match what the dispatcher hands to the handlers (it
-    /// consumes the prefix when framing).
+    /// Encode a response as a whole frame and strip the 4-byte length
+    /// prefix: what the dispatcher reads off the Melin socket, the tag
+    /// still on, before `classify` hands the handlers its body.
     fn encode_response_payload(resp: &ResponseKind) -> Vec<u8> {
         let mut buf = [0u8; 64];
         let n = codec::encode_response(resp, &mut buf).unwrap();
         buf[4..n].to_vec()
+    }
+
+    /// Encode a response's body alone: what the dispatcher hands the
+    /// response handlers once `classify` has stripped the frame's tag.
+    fn encode_response_body(resp: &ResponseKind) -> Vec<u8> {
+        let mut buf = [0u8; codec::MAX_RESPONSE_BODY];
+        let n = codec::encode_response_body(resp, &mut buf).unwrap();
+        buf[..n].to_vec()
     }
 
     use ed25519_dalek::SigningKey;
@@ -2090,7 +2098,7 @@ lot_size_inverse = 1
         s.fix_outbound_seq = 1;
         s.melin_seq = 1; // pretend we sent the QueryRequestSeq with seq=1
 
-        let payload = encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 8423 });
+        let payload = encode_response_body(&ResponseKind::RequestSeqHwm { hwm: 8423 });
         let action = s.handle_request_seq_sync(&payload, &config);
 
         assert_eq!(action, SessionAction::SendFix);
@@ -2146,7 +2154,7 @@ lot_size_inverse = 1
     #[test]
     fn transport_frames_are_dropped_while_active() {
         // Heartbeats, batch ends, a busy node, an engine error, and a
-        // frame with a reserved tag (the handshake's ServerReady, over
+        // frame no reply carries (the handshake's ServerReady, over
         // long ago) are the transport's business: none produces FIX
         // traffic or moves the session.
         let config = make_config("FIRM_A", "MELIN");
@@ -2185,7 +2193,7 @@ lot_size_inverse = 1
         s.sender_comp_id = "FIRM_A".to_owned();
         s.heartbeat_interval = Duration::from_secs(30);
 
-        let payload = encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 0 });
+        let payload = encode_response_body(&ResponseKind::RequestSeqHwm { hwm: 0 });
         let action = s.handle_request_seq_sync(&payload, &config);
 
         assert_eq!(action, SessionAction::SendFix);
@@ -3760,12 +3768,13 @@ lot_size_inverse = 1
         let sym = symbol_map(&config);
         let mut s = active_session(&config, Instant::now());
 
-        // Inject a length-prefixed frame with a bogus tag byte that
-        // codec::decode_response will reject. `handle_active_melin`
+        // Inject a well-framed application response whose body opens
+        // with a kind the codec does not know, so it gets past
+        // `classify` and reaches the codec. `handle_active_melin`
         // should log a warning and return SessionAction::None — NOT
         // close the session (decode errors from the engine must not
         // take the session down).
-        let payload = [0xFFu8]; // Invalid tag.
+        let payload = [control_codec::TAG_APP, 0xFF]; // Unknown kind.
         let len = (payload.len() as u32).to_le_bytes();
         s.melin_parse_buf.extend_from_slice(&len);
         s.melin_parse_buf.extend_from_slice(&payload);

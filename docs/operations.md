@@ -185,11 +185,11 @@ Subscribers connect to the `--event-bind` port and authenticate with the standar
 After auth, the server sends a continuous stream of frames:
 
 ```
-| ring_sequence (u64 LE) | length (u32 LE) | tag (u8) | payload (var) |
+| ring_sequence (u64 LE) | length (u32 LE) | tag (u8) | body (var) |
 ```
 
 - **ring_sequence**: Monotonically increasing output ring sequence. Subscribers can detect gaps (missed events) if their last-seen sequence jumps by more than 1.
-- **length + tag + payload**: Standard response codec (same as the per-client response frames). Decodable with the `melin-ec-protocol` crate's `codec::decode_response()`.
+- **length + tag + body**: A standard response frame, the same as the per-client response frames. Tag `0x09` carries an exchange response in its body, decodable with the `melin-ec-protocol` crate's `codec::decode_response()`; any other tag is one of the node's own frames, such as a heartbeat or a batch end.
 
 Every event the matching stage produces appears on the event channel — fills, placements, cancellations, batch-end markers, stats snapshots, and engine errors. There is no filtering; subscribers receive the full firehose.
 

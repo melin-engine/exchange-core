@@ -6,7 +6,7 @@
 //! runtime frames. Transport-shaped variants (`BatchEnd`, `EngineError`)
 //! are handled by the runtime directly and never reach this encoder.
 
-use melin_app::encoder::{Encoded, ResponseEncoder as ResponseEncoderTrait};
+use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::ResponseKind;
 use melin_ec_types::types::{ExecutionReport, QueryResponse};
@@ -26,12 +26,10 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseEncoder;
 
-/// Encode `kind`'s body into `buf` and name it for the runtime.
+/// Encode `kind`'s body into `buf` and return its length.
 #[inline]
-fn encode_body(kind: &ResponseKind, buf: &mut [u8]) -> Result<Encoded, &'static str> {
-    codec::encode_response_body(kind, buf)
-        .map(|(tag, len)| Encoded { tag, len })
-        .map_err(|_| "encode error")
+fn encode_body(kind: &ResponseKind, buf: &mut [u8]) -> Result<usize, &'static str> {
+    codec::encode_response_body(kind, buf).map_err(|_| "encode error")
 }
 
 impl ResponseEncoderTrait for ResponseEncoder {
@@ -42,11 +40,11 @@ impl ResponseEncoderTrait for ResponseEncoder {
         &self,
         report: &ExecutionReport,
         buf: &mut [u8],
-    ) -> Result<Encoded, &'static str> {
+    ) -> Result<usize, &'static str> {
         encode_body(&ResponseKind::Report(*report), buf)
     }
 
-    fn encode_query(&self, query: &QueryResponse, buf: &mut [u8]) -> Result<Encoded, &'static str> {
+    fn encode_query(&self, query: &QueryResponse, buf: &mut [u8]) -> Result<usize, &'static str> {
         let kind = match *query {
             QueryResponse::Stats {
                 active_connections,
@@ -81,13 +79,11 @@ mod tests {
 
     const SCRATCH: usize = melin_server_runtime::MAX_RESPONSE_BODY;
 
-    /// Put the tag back in front of the body, as the runtime's framing
-    /// does, and hand the result to `decode_response`. Keeps the
-    /// round-trip asserts below symmetric.
-    fn round_trip(encoded: Encoded, body: &[u8]) -> ResponseKind {
-        let mut payload = vec![encoded.tag];
-        payload.extend_from_slice(&body[..encoded.len]);
-        codec::decode_response(&payload).expect("decode")
+    /// Decode the body the encoder wrote, as a client does once its
+    /// library has stripped the runtime's framing. Keeps the round-trip
+    /// asserts below symmetric.
+    fn round_trip(len: usize, body: &[u8]) -> ResponseKind {
+        codec::decode_response_body(&body[..len]).expect("decode")
     }
 
     fn sample_placed() -> ExecutionReport {
@@ -112,25 +108,6 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Placed { order_id, .. })
                 if order_id == OrderId(1)
         ));
-    }
-
-    /// The tag is the runtime's to write, so it must be an application
-    /// tag: the runtime refuses one in the protocol's reserved range.
-    #[test]
-    fn every_tag_is_an_application_tag() {
-        let mut buf = [0u8; SCRATCH];
-        let report = ResponseEncoder
-            .encode_report(&sample_placed(), &mut buf)
-            .unwrap();
-        let query = ResponseEncoder
-            .encode_query(&QueryResponse::RequestSeqHwm { hwm: 1 }, &mut buf)
-            .unwrap();
-        for encoded in [report, query] {
-            assert!(
-                encoded.tag >= melin_wire_protocol::control_codec::FIRST_APP_TAG,
-                "{encoded:?}"
-            );
-        }
     }
 
     #[test]
@@ -167,7 +144,7 @@ mod tests {
         };
         let mut buf = [0u8; SCRATCH];
         let encoded = ResponseEncoder.encode_query(&q, &mut buf).unwrap();
-        assert_eq!(encoded.len, codec::MAX_RESPONSE_BODY);
+        assert_eq!(encoded, codec::MAX_RESPONSE_BODY);
         assert!(matches!(
             round_trip(encoded, &buf),
             ResponseKind::PositionSnapshot { account, count: 16, .. }

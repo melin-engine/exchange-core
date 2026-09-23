@@ -112,12 +112,10 @@ The main action menu lists all operations, grouped by category:
 | 13 | Set Risk Limits | Admin | Operator |
 | 14 | Set Circuit Breaker | Admin | Operator |
 | 15 | Set Fee Schedule | Admin | Operator |
-| 16 | Withdraw | Admin | Custodian |
-| 17 | Disable Instrument | Admin | Operator |
-| 18 | Enable Instrument | Admin | Operator |
-| 19 | Remove Instrument | Admin | Operator |
-| 20 | End of Day | Admin | Operator |
-| 21 | Expire Orders | Admin | Operator |
+| 16 | End of Day | Admin | Operator |
+| 17 | Disable Instrument | Lifecycle | Operator |
+| 18 | Enable Instrument | Lifecycle | Operator |
+| 19 | Remove Instrument | Lifecycle | Operator |
 
 Navigate with arrow keys and press Enter to start the corresponding wizard.
 

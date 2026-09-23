@@ -306,7 +306,7 @@ fn try_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(buf.drain(..4 + len).skip(4).collect())
 }
 
-/// If `buf` contains at least one complete `[u32 len][tag+seq+payload]`
+/// If `buf` contains at least one complete `[u32 len][tag][body]`
 /// frame, drain it and decode. Returns Ok(None) if the frame is not
 /// yet complete.
 fn try_extract_request(buf: &mut Vec<u8>) -> Result<Option<(u64, Request)>, String> {

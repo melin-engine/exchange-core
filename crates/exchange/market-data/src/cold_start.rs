@@ -159,7 +159,7 @@ pub(crate) fn read_response(
     loop {
         let (seq, frame) = read_frame(reader)?;
         match melin_client::classify(&frame)? {
-            Reply::Response(bytes) => return Ok((seq, codec::decode_response(bytes)?)),
+            Reply::Response(body) => return Ok((seq, codec::decode_response_body(body)?)),
             Reply::Heartbeat | Reply::BatchEnd | Reply::ServerBusy | Reply::EngineError => {}
         }
     }
@@ -192,7 +192,7 @@ pub enum SnapshotError {
     /// The exchange codec could not decode an application response.
     Protocol(melin_wire_protocol::error::ProtocolError),
     /// The sequencer's client refused a frame: an empty one, or a tag
-    /// from the protocol's reserved range where a reply belongs.
+    /// no reply carries.
     Transport(melin_client::Error),
     FrameTooLarge(usize),
     DuplicateSymbol(Symbol),
