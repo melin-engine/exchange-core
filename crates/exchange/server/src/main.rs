@@ -35,23 +35,14 @@ use melin_ec_server::{ServerApp, StartupConfig};
 use melin_server_runtime::server::{self, ServerConfig};
 
 /// The node's command line: the sequencer runtime's flags, plus the
-/// trading-specific ones the runtime no longer carries.
+/// trading-specific ones the runtime does not carry.
 #[derive(Parser)]
 #[command(name = "melin-ec-server", about = "Melin Exchange Core server")]
 struct Cli {
     #[command(flatten)]
     server: ServerConfig,
-    /// Number of accounts to reserve memory for on every start, primary
-    /// or replica. A build with the `synthetic-seed` feature also
-    /// provisions that many funded accounts on a fresh journal, which
-    /// costs O(accounts) (~0.5 s for 1M).
-    #[arg(long, default_value_t = 100_000)]
-    accounts: u32,
-    /// Number of instruments to reserve memory for on every start. A
-    /// build with the `synthetic-seed` feature also registers that many
-    /// placeholder instruments on a fresh journal.
-    #[arg(long, default_value_t = 100)]
-    instruments: u32,
+    #[command(flatten)]
+    startup: StartupConfig,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,17 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let Cli {
         server: config,
-        accounts,
-        instruments,
+        startup,
     } = Cli::parse();
-
-    let startup = StartupConfig {
-        accounts,
-        instruments,
-        max_orders_per_account: config.max_orders_per_account,
-        max_orders_per_second: config.max_orders_per_second,
-        max_orders_burst: config.max_orders_burst,
-    };
 
     server::run::<ServerApp>(
         config,
@@ -83,4 +65,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ResponseEncoder,
         Some(event_publisher::run),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The runtime's flags and the node's share one namespace, and the
+    /// runtime's change on the sequencer's schedule. clap reports a clash
+    /// only when it builds the command, so build it here rather than on a
+    /// node's first start.
+    #[test]
+    fn command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn node_and_runtime_flags_parse_together() {
+        let cli = Cli::try_parse_from([
+            "melin-ec-server",
+            "--journal",
+            "node.journal",
+            "--max-orders-per-account",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(cli.server.journal, std::path::Path::new("node.journal"));
+        assert_eq!(cli.startup.max_orders_per_account, 2);
+    }
 }
