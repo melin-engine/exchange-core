@@ -64,8 +64,10 @@ impl TokenBucket {
     ///    600 µs apart correctly issues exactly one token, not zero.
     #[inline]
     pub(super) fn refill(&mut self, now_ns: u64, rate: u32, burst: u32) {
-        // Defensive cap: a tampered snapshot, a primary/replica `--max-orders-burst`
-        // mismatch, or any future bug that produces `tokens > burst` would otherwise
+        // Defensive cap: a tampered snapshot, buckets kept while the limiter was
+        // off and then re-enabled with a smaller burst (`set_max_orders_per_second`
+        // clears them only between two active configs), or any future bug that
+        // produces `tokens > burst` would otherwise
         // grant unbounded credit on the next event (the `now_ns > last_refill_ns`
         // branch below can leave `tokens` untouched). Clamping at the point of use
         // keeps the bucket invariant `tokens <= burst` independent of how the state
