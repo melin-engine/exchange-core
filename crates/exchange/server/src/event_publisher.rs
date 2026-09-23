@@ -7,11 +7,12 @@
 //!
 //! Wire format per firehose frame:
 //! ```text
-//! | sequence (u64 LE) | length (u32 LE) | tag (u8) | payload (var) |
+//! | sequence (u64 LE) | length (u32 LE) | tag (u8) | body (var) |
 //! ```
 //! The sequence number is the output ring's monotonic sequence for gap
-//! detection by subscribers. The rest is the standard response codec
-//! from `crates/exchange/protocol/src/codec.rs`.
+//! detection by subscribers. The rest is the node's own framing: the
+//! sequencer's tag, then, under its application tag, a body in the
+//! standard response codec from `crates/exchange/protocol/src/codec.rs`.
 //!
 //! Subscription protocol (after Ed25519 auth + ServerReady):
 //! 1. Client sends `Subscribe { symbols, count }` (count=0 → all symbols)

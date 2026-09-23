@@ -30,11 +30,11 @@ pub struct RequestDecoder;
 impl RequestDecoderTrait for RequestDecoder {
     type Event = TradingRequest;
 
-    /// The runtime has read the tag; the body opens with the request
-    /// sequence, which travels on into the event: the engine's
-    /// idempotency check reads it from there, in `apply`.
-    fn decode(&self, tag: u8, body: &[u8], permission: Permission) -> Decoded<TradingRequest> {
-        let (request_seq, request) = match codec::decode_request_body(tag, body) {
+    /// The runtime has stripped its tag; the body opens with the request's
+    /// kind, then its sequence, which travels on into the event: the
+    /// engine's idempotency check reads it from there, in `apply`.
+    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<TradingRequest> {
+        let (request_seq, request) = match codec::decode_request_body(body) {
             Ok(pair) => pair,
             Err(e) => return Decoded::DecodeError(protocol_error_reason(&e)),
         };
@@ -62,7 +62,7 @@ impl RequestDecoderTrait for RequestDecoder {
 fn protocol_error_reason(e: &ProtocolError) -> &'static str {
     match e {
         ProtocolError::Truncated => "truncated frame",
-        ProtocolError::UnknownTag(_) => "unknown variant tag",
+        ProtocolError::UnknownTag(_) => "unknown request kind",
         ProtocolError::InvalidField(_) => "invalid field",
         ProtocolError::MessageTooLarge(_) => "message too large",
         ProtocolError::Io(_) => "io error",
@@ -175,18 +175,18 @@ mod tests {
     use melin_app::AppEvent;
     use melin_ec_types::types::*;
 
-    /// Wire-encode a Request into the split the runtime hands the
-    /// decoder: the tag, and the body after it (seq + payload), with
-    /// the framing length-prefix already stripped.
-    fn encode(request: &Request, seq: u64) -> (u8, Vec<u8>) {
-        let mut buf = vec![0u8; 256];
-        let total = codec::encode_request(request, seq, &mut buf).unwrap();
-        (buf[4], buf[5..total].to_vec())
+    /// Encode a Request into what the runtime hands the decoder: the
+    /// body (kind + seq + payload), its framing already stripped.
+    fn encode(request: &Request, seq: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; codec::MAX_REQUEST_BODY];
+        let len = codec::encode_request_body(request, seq, &mut buf).unwrap();
+        buf.truncate(len);
+        buf
     }
 
     /// Decode as the runtime would call it.
-    fn decode((tag, body): &(u8, Vec<u8>), permission: Permission) -> Decoded<TradingRequest> {
-        RequestDecoder.decode(*tag, body, permission)
+    fn decode(body: &[u8], permission: Permission) -> Decoded<TradingRequest> {
+        RequestDecoder.decode(body, permission)
     }
 
     fn order() -> Order {
@@ -345,16 +345,23 @@ mod tests {
 
     #[test]
     fn malformed_request_yields_decode_error() {
-        // A known tag over a body too short for the seq that opens it.
-        let (tag, _) = encode(&Request::Heartbeat, 0);
+        // A known kind, cut short inside the seq behind it.
+        let body = encode(&Request::Heartbeat, 0);
         assert!(matches!(
-            RequestDecoder.decode(tag, &[0; 7], Permission::Trader),
+            decode(&body[..8], Permission::Trader),
             Decoded::DecodeError("truncated frame")
         ));
-        // A tag this codec does not know, over a well-formed body.
+        // Nothing at all: the runtime hands on an empty body as it is.
         assert!(matches!(
-            RequestDecoder.decode(0xFF, &[0; 8], Permission::Trader),
-            Decoded::DecodeError("unknown variant tag")
+            decode(&[], Permission::Trader),
+            Decoded::DecodeError("truncated frame")
+        ));
+        // A kind this codec does not know, over a well-formed seq.
+        let mut unknown = [0u8; 9];
+        unknown[0] = 0xFF;
+        assert!(matches!(
+            decode(&unknown, Permission::Trader),
+            Decoded::DecodeError("unknown request kind")
         ));
     }
 

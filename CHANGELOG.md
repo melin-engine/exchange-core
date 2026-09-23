@@ -56,37 +56,44 @@ snapshot from an earlier release is never read.
   key]`. Every client shipped here authenticates through the sequencer's
   client and follows; a client built against an earlier release fails the
   handshake and has its key refused.
-- **Request frames put the tag first.** A request is now `[length][tag]
-  [seq][payload]`; the sequence moves from before the tag to right after
-  it, and nothing else in the frame changes. The node reads a request's
-  tag before anything else *(sequencer)* and drops a frame whose tag is
-  in its reserved range, so a sequence in that position was read as a
-  tag. Every client shipped here follows. A client built against an
-  earlier release has its requests dropped or refused as malformed: the
-  node logs each at `debug!` and keeps the connection, so the client sees
-  only its own read timeouts. Rust dependents that build frames by hand
-  read the tag from the first byte after the length and the sequence
-  from the eight that follow; `codec::decode_request_body(tag, body)`
-  decodes a request the node has already split.
+- **Exchange messages travel under the node's frame tag.** Every frame is
+  now `[length][tag][body]`, and the tag is the node's alone
+  *(sequencer)*: requests and exchange responses travel under tag `0x09`,
+  and every other tag is one of the node's own frames — the handshake,
+  heartbeats, `BatchEnd`, `ServerBusy`, `EngineError`. The message kind
+  that used to be the tag opens the body instead, with unchanged values.
+  A request is now `[length][0x09][kind][seq][payload]` (it was
+  `[length][seq][kind][payload]`) and an exchange response
+  `[length][0x09][kind][payload]` (it was `[length][kind][payload]`).
+  Every client shipped here follows. A client built against an earlier
+  release has its requests dropped or refused as malformed: the node logs
+  each at `debug!` and keeps the connection, so the client sees only its
+  own read timeouts. It reads every exchange response as a protocol error.
 - **The node reads and writes the protocol's framing** *(sequencer)*. A
-  request frame with no tag, or with a tag in the node's reserved range,
-  is dropped at `debug!` before the exchange sees it, like any other
-  malformed request. A response the node would have to send under a
-  reserved tag — a bug in this product, not something a client can
-  cause — is dropped and logged at `error!` instead of reaching the
-  client as a protocol frame.
+  client frame under any tag but `0x09` after the handshake is dropped at
+  `debug!` before the exchange sees it, like any other malformed request.
+  The node writes the length and the tag around every response body the
+  exchange encodes.
 - **A query cannot change engine state** *(sequencer)*. The stats,
   position and request-sequence queries are answered from a read-only
   view of the engine, and no longer advance its clock, so a query cannot
   fire scheduled work — an order expiry, say — that a journal replay or
   a replica would then not fire. The counters a stats query reports are
   the node's own, read when the query is answered.
-- **Rust dependents:** `RequestDecoder::decode` takes `(tag, body,
-  permission)` and `ResponseEncoder` returns `Encoded { tag, len }` for a
-  body it wrote, both as the sequencer now asks *(sequencer)*;
-  `codec::encode_response_body` is the body form of `encode_response`,
-  and `codec::MAX_REQUEST_BODY` and `MAX_RESPONSE_BODY` are the widest of
-  each, checked against the node runtime's bounds at compile time.
+- **Rust dependents:** `RequestDecoder::decode` takes `(body,
+  permission)` and `ResponseEncoder` returns the length of the body it
+  wrote, both as the sequencer now asks *(sequencer)*. The codec's
+  unsuffixed functions work on whole frames: `encode_request` and
+  `encode_response` write the length and the tag, and `decode_request`
+  and `decode_response` take a frame after its length prefix and refuse
+  one under any tag but `0x09`. Their `_body` forms work on the body
+  alone: `encode_request_body`, `decode_request_body`,
+  `encode_response_body` and `decode_response_body`. A reply that
+  `melin_client::classify` returns is a body, so decode it with
+  `decode_response_body`. `codec::app_frame_body` strips the tag from a
+  frame, and `codec::MAX_REQUEST_BODY` and `MAX_RESPONSE_BODY` are the
+  widest body of each, checked against the node runtime's bounds at
+  compile time.
   `ServerApp::apply` returns nothing and `ServerApp::query` answers the
   queries, from a `QueryCtx` that carries the node counters `ApplyCtx`
   used to *(sequencer)*.

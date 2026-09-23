@@ -157,7 +157,7 @@ impl Client {
         self.next_seq += 1;
         let written = codec::encode_request(request, self.next_seq, &mut self.encode_buf)?;
         // write_frame expects payload without length prefix; encode_request
-        // writes [length(4) | tag+payload], so skip the prefix.
+        // writes [length(4) | tag | body], so skip the prefix.
         self.writer.write_frame(&self.encode_buf[4..written])?;
         self.writer.flush()?;
 
@@ -174,7 +174,7 @@ impl Client {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
             match melin_client::classify(frame).map_err(transport_error)? {
-                Reply::Response(bytes) => responses.push(codec::decode_response(bytes)?),
+                Reply::Response(body) => responses.push(codec::decode_response_body(body)?),
                 Reply::Heartbeat => continue,
                 Reply::BatchEnd => break,
                 Reply::ServerBusy => return Err(ClientError::ServerBusy),
@@ -248,7 +248,7 @@ impl Client {
 /// and `classify` only return the first four; the rest belong to the
 /// sequencer's `Connection` and are folded into an I/O error rather
 /// than left unmapped. A protocol violation — a frame out of place in
-/// the handshake, a reserved tag in a reply — keeps its variant and
+/// the handshake, a tag no reply carries — keeps its variant and
 /// loses its detail: `ProtocolError` carries no message.
 fn transport_error(e: melin_client::Error) -> ClientError {
     match e {

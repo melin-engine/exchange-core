@@ -3,28 +3,40 @@
 //! Manual serialization (no serde) for zero allocation, predictable layout,
 //! and no format stability concerns across dependency versions.
 //!
-//! ## Request frame layout (little-endian)
+//! ## Frames and bodies
 //!
-//! | Field     | Type | Bytes | Purpose                              |
-//! |-----------|------|-------|--------------------------------------|
-//! | length    | u32  | 4     | Byte count of seq + type_tag + payload |
+//! Every frame is the sequencer's `[length: u32 LE][tag: u8][body]`. The
+//! tag is the sequencer protocol's alone: this codec's messages travel
+//! under its application tag, `TAG_APP`, and the body behind it is this
+//! codec's from its first byte. The node runtime strips the tag before
+//! the request decoder sees a body, and writes it before the body the
+//! response encoder produced.
+//!
+//! Functions come in two layers. The `_body` functions read and write the
+//! body alone, for the node's decoder and encoder and for a reader whose
+//! client library has already stripped the tag
+//! (`melin_client::classify`). The unsuffixed functions read and write
+//! whole frames, for programs that frame by hand: `encode_*` writes the
+//! length prefix and the tag, and `decode_*` takes a frame after its
+//! length prefix and refuses one that is not an application frame.
+//!
+//! ## Request body layout (little-endian)
+//!
+//! | Field     | Type | Bytes | Purpose                                |
+//! |-----------|------|-------|----------------------------------------|
+//! | kind      | u8   | 1     | Message discriminant                   |
 //! | seq       | u64  | 8     | Per-key request sequence (idempotency) |
-//! | type_tag  | u8   | 1     | Message discriminant                 |
-//! | payload   | ...  | var   | Variant-specific fields              |
+//! | payload   | ...  | var   | Variant-specific fields                |
 //!
-//! ## Response frame layout (little-endian)
+//! ## Response body layout (little-endian)
 //!
-//! | Field     | Type | Bytes | Purpose                              |
-//! |-----------|------|-------|--------------------------------------|
-//! | length    | u32  | 4     | Byte count of type_tag + payload     |
-//! | type_tag  | u8   | 1     | Message discriminant                 |
-//! | payload   | ...  | var   | Variant-specific fields              |
+//! | Field     | Type | Bytes | Purpose                                |
+//! |-----------|------|-------|----------------------------------------|
+//! | kind      | u8   | 1     | Message discriminant                   |
+//! | payload   | ...  | var   | Variant-specific fields                |
 //!
 //! No CRC on the wire — TCP handles integrity. The 4-byte length prefix
-//! provides framing; the type tag selects the variant.
-//!
-//! Only trading operations (submit/cancel) are on the wire. Administrative
-//! operations (instrument registration, deposits) use a separate admin API.
+//! provides framing; the kind selects the variant.
 
 use std::num::NonZeroU64;
 
@@ -34,10 +46,11 @@ use melin_ec_types::types::{
     InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason,
     RiskLimits, Symbol, TimeInForce,
 };
-use zerocopy::little_endian::{U32, U64};
+use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::message::{Request, ResponseKind};
+use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
 use melin_wire_protocol::error::ProtocolError;
 
 // --- Wire header structs ---
@@ -46,78 +59,81 @@ use melin_wire_protocol::error::ProtocolError;
 // length fields (Order has Market/Limit/Stop/StopLimit variants of
 // 0/8/8/16 extra bytes, plus an optional 8-byte expiry for GTD).
 // Per-variant zerocopy structs would multiply the type surface without
-// matching gain. The frame headers are universal and fixed-shape, so
-// they're typed; payloads keep the explicit le::put / le::get chain.
+// matching gain. The request body's head is universal and fixed-shape, so
+// it's typed; payloads keep the explicit le::put / le::get chain.
 
-/// Length-prefixed frame header for requests:
-/// `[length:u32] [tag:u8] [seq:u64] [payload]`. The 4-byte length value
-/// covers `tag + seq + payload`. Encoders back-fill this at the end.
-///
-/// The tag comes first because the node runtime reads it before anything
-/// else: the sequencer's protocol is `[tag][body]` for every request, and
-/// the runtime drops a frame whose tag is in its reserved range before
-/// any decoder sees it. The sequence is the first thing in the body.
+/// Bytes a frame puts ahead of its body: the length prefix and the
+/// sequencer protocol's tag.
+const FRAME_PREFIX_LEN: usize = 4 + TAG_LEN;
+
+/// The head of a request body: `[kind:u8] [seq:u64]`, then the payload.
+/// Typed because it is fixed-shape; the payload behind it is not.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
-struct RequestFrameHeader {
-    length: U32,
-    tag: u8,
+struct RequestBodyHeader {
+    kind: u8,
     seq: U64,
 }
 
-const REQUEST_FRAME_HEADER_LEN: usize = core::mem::size_of::<RequestFrameHeader>();
-const _: () = assert!(REQUEST_FRAME_HEADER_LEN == 13);
+/// Bytes of a request body ahead of the payload: the kind and the sequence.
+const REQUEST_BODY_HEADER_LEN: usize = core::mem::size_of::<RequestBodyHeader>();
+const _: () = assert!(REQUEST_BODY_HEADER_LEN == 9);
 
-/// Bytes of a request body ahead of the payload: the sequence.
-const REQUEST_SEQ_LEN: usize = core::mem::size_of::<U64>();
-
-/// Bound on one request body — sequence and payload, after the tag. The
-/// widest request is a `StopLimit` + `GTD` `SubmitOrder`: a symbol and
-/// an order of 8 id + 4 account + 1 side + 1 type + 16 prices + 1 tif +
-/// 8 quantity + 1 stp + 8 expiry. A test encodes one and pins the number;
+/// Bound on one request body — kind, sequence and payload. The widest
+/// request is a `StopLimit` + `GTD` `SubmitOrder`: a symbol and an order
+/// of 8 id + 4 account + 1 side + 1 type + 16 prices + 1 tif + 8
+/// quantity + 1 stp + 8 expiry. A test encodes one and pins the number;
 /// the server checks it against the node runtime's bound at compile time.
-pub const MAX_REQUEST_BODY: usize = REQUEST_SEQ_LEN + 4 + 48;
+pub const MAX_REQUEST_BODY: usize = REQUEST_BODY_HEADER_LEN + 4 + 48;
 
-// Transport-level tags (0x00–0x0F) are the sequencer's: encoded by its
-// runtime and told apart by its client, they never reach this codec.
+// Kinds are the first byte of a body, never the frame's tag: that byte is
+// the sequencer's. The kinds still start well clear of `TAG_APP` (asserted
+// below the response kinds), so a frame handed to a `_body` decoder with
+// its tag still on fails as an unknown kind rather than decoding as some
+// message. And none is `0x00`, so a zeroed body is an unknown kind too.
 
-// --- Domain request tags (0x10–0x2F) ---
-const TAG_SUBMIT_ORDER: u8 = 0x10;
-const TAG_CANCEL_ORDER: u8 = 0x11;
-const TAG_REQUEST_HEARTBEAT: u8 = 0x12;
-const TAG_CANCEL_ALL: u8 = 0x13;
-const TAG_CANCEL_REPLACE: u8 = 0x14;
-const TAG_ADD_INSTRUMENT: u8 = 0x15;
-const TAG_DEPOSIT: u8 = 0x16;
-const TAG_WITHDRAW: u8 = 0x17;
-const TAG_SET_RISK_LIMITS: u8 = 0x18;
-const TAG_SET_CIRCUIT_BREAKER: u8 = 0x19;
-const TAG_SET_FEE_SCHEDULE: u8 = 0x1A;
-const TAG_END_OF_DAY: u8 = 0x1B;
-const TAG_DISABLE_INSTRUMENT: u8 = 0x1C;
-const TAG_ENABLE_INSTRUMENT: u8 = 0x1D;
-const TAG_REMOVE_INSTRUMENT: u8 = 0x1E;
-const TAG_SUBSCRIBE: u8 = 0x1F;
-const TAG_QUERY_STATS: u8 = 0x20;
-const TAG_QUERY_POSITION: u8 = 0x21;
-const TAG_QUERY_REQUEST_SEQ: u8 = 0x22;
+// --- Request kinds (0x10–0x2F) ---
+const KIND_SUBMIT_ORDER: u8 = 0x10;
+const KIND_CANCEL_ORDER: u8 = 0x11;
+const KIND_REQUEST_HEARTBEAT: u8 = 0x12;
+const KIND_CANCEL_ALL: u8 = 0x13;
+const KIND_CANCEL_REPLACE: u8 = 0x14;
+const KIND_ADD_INSTRUMENT: u8 = 0x15;
+const KIND_DEPOSIT: u8 = 0x16;
+const KIND_WITHDRAW: u8 = 0x17;
+const KIND_SET_RISK_LIMITS: u8 = 0x18;
+const KIND_SET_CIRCUIT_BREAKER: u8 = 0x19;
+const KIND_SET_FEE_SCHEDULE: u8 = 0x1A;
+const KIND_END_OF_DAY: u8 = 0x1B;
+const KIND_DISABLE_INSTRUMENT: u8 = 0x1C;
+const KIND_ENABLE_INSTRUMENT: u8 = 0x1D;
+const KIND_REMOVE_INSTRUMENT: u8 = 0x1E;
+const KIND_SUBSCRIBE: u8 = 0x1F;
+const KIND_QUERY_STATS: u8 = 0x20;
+const KIND_QUERY_POSITION: u8 = 0x21;
+const KIND_QUERY_REQUEST_SEQ: u8 = 0x22;
 
-// --- Domain response tags (0x30–0x4F) ---
-// Transport-level response tags (0x01–0x0F) imported from wire-protocol above.
-const TAG_PLACED: u8 = 0x30;
-const TAG_FILL: u8 = 0x31;
-const TAG_CANCELLED: u8 = 0x32;
-const TAG_TRIGGERED: u8 = 0x33;
-const TAG_REJECTED: u8 = 0x34;
-const TAG_REPLACED: u8 = 0x35;
-const TAG_INSTRUMENT_STATUS_CHANGED: u8 = 0x36;
-const TAG_STATS_HEADER: u8 = 0x37;
-const TAG_BOOK_SNAPSHOT_BEGIN: u8 = 0x38;
-const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 0x39;
-const TAG_BOOK_SNAPSHOT_END: u8 = 0x3A;
-const TAG_SNAPSHOT_COMPLETE: u8 = 0x3B;
-const TAG_POSITION_SNAPSHOT: u8 = 0x3C;
-const TAG_REQUEST_SEQ_HWM: u8 = 0x3D;
+// --- Response kinds (0x30–0x4F) ---
+const KIND_PLACED: u8 = 0x30;
+const KIND_FILL: u8 = 0x31;
+const KIND_CANCELLED: u8 = 0x32;
+const KIND_TRIGGERED: u8 = 0x33;
+const KIND_REJECTED: u8 = 0x34;
+const KIND_REPLACED: u8 = 0x35;
+const KIND_INSTRUMENT_STATUS_CHANGED: u8 = 0x36;
+const KIND_STATS_HEADER: u8 = 0x37;
+const KIND_BOOK_SNAPSHOT_BEGIN: u8 = 0x38;
+const KIND_BOOK_SNAPSHOT_LEVEL: u8 = 0x39;
+const KIND_BOOK_SNAPSHOT_END: u8 = 0x3A;
+const KIND_SNAPSHOT_COMPLETE: u8 = 0x3B;
+const KIND_POSITION_SNAPSHOT: u8 = 0x3C;
+const KIND_REQUEST_SEQ_HWM: u8 = 0x3D;
+
+// Each block of kinds starts at its lowest value above.
+const _: () = assert!(
+    TAG_APP < KIND_SUBMIT_ORDER && TAG_APP < KIND_PLACED,
+    "no kind may equal the frame tag a misframed body would still carry"
+);
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -152,7 +168,8 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 // connections instead of rejecting. Reserved: never reassign it, or a client
 // built against an older release would misread the new reason.
 
-/// Encode a request into `buf`. Returns total bytes written (length prefix + tag + seq + payload).
+/// Encode a request into `buf` as a complete wire frame. Returns total
+/// bytes written (length prefix + tag + body).
 ///
 /// The caller must ensure `buf` is large enough: 128 bytes bounds every
 /// request (the largest is 4 prefix + 1 tag + [`MAX_REQUEST_BODY`]). The
@@ -162,16 +179,33 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 /// uses `seq = 0`: the node runtime answers it, and it never reaches the
 /// engine.
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    // Reserve the request frame header (length + tag + seq); back-filled
-    // below, once the payload has said how long it is and which tag names it.
-    let mut pos = REQUEST_FRAME_HEADER_LEN;
+    let body_len = encode_request_body(request, seq, &mut buf[FRAME_PREFIX_LEN..])?;
+    // The length covers the tag and the body, not itself.
+    le::put_u32(&mut buf[0..], (TAG_LEN + body_len) as u32);
+    buf[4] = TAG_APP;
+    Ok(FRAME_PREFIX_LEN + body_len)
+}
 
-    let tag = match request {
+/// Encode a request's body — kind, sequence, payload — at the start of
+/// `buf`, for a caller whose client library frames it (the sequencer's
+/// `Connection::send`). Returns the body's length.
+///
+/// The caller must ensure `buf` holds [`MAX_REQUEST_BODY`] bytes.
+pub fn encode_request_body(
+    request: &Request,
+    seq: u64,
+    buf: &mut [u8],
+) -> Result<usize, ProtocolError> {
+    // Reserve the body header (kind + seq); back-filled below, once the
+    // payload has said which kind names it.
+    let mut pos = REQUEST_BODY_HEADER_LEN;
+
+    let kind = match request {
         Request::SubmitOrder { symbol, order } => {
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             pos += encode_order(order, &mut buf[pos..]);
-            TAG_SUBMIT_ORDER
+            KIND_SUBMIT_ORDER
         }
         Request::CancelOrder {
             symbol,
@@ -184,14 +218,14 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
-            TAG_CANCEL_ORDER
+            KIND_CANCEL_ORDER
         }
         Request::CancelAll { account } => {
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
-            TAG_CANCEL_ALL
+            KIND_CANCEL_ALL
         }
-        Request::Heartbeat => TAG_REQUEST_HEARTBEAT,
+        Request::Heartbeat => KIND_REQUEST_HEARTBEAT,
         Request::AddInstrument { spec } => {
             le::put_u32(&mut buf[pos..], spec.symbol.0);
             pos += 4;
@@ -199,7 +233,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 4;
             le::put_u32(&mut buf[pos..], spec.quote.0);
             pos += 4;
-            TAG_ADD_INSTRUMENT
+            KIND_ADD_INSTRUMENT
         }
         Request::Deposit {
             account,
@@ -212,7 +246,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 4;
             le::put_u64(&mut buf[pos..], *amount);
             pos += 8;
-            TAG_DEPOSIT
+            KIND_DEPOSIT
         }
         Request::Withdraw {
             account,
@@ -225,7 +259,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 4;
             le::put_u64(&mut buf[pos..], *amount);
             pos += 8;
-            TAG_WITHDRAW
+            KIND_WITHDRAW
         }
         Request::SetRiskLimits { symbol, limits } => {
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -243,7 +277,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
                 le::put_u64(&mut buf[pos..], notional);
                 pos += 8;
             }
-            TAG_SET_RISK_LIMITS
+            KIND_SET_RISK_LIMITS
         }
         Request::SetCircuitBreaker { symbol, config } => {
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -262,7 +296,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
                 le::put_u64(&mut buf[pos..], upper.get());
                 pos += 8;
             }
-            TAG_SET_CIRCUIT_BREAKER
+            KIND_SET_CIRCUIT_BREAKER
         }
         Request::CancelReplace {
             symbol,
@@ -281,7 +315,7 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 8;
             le::put_u64(&mut buf[pos..], new_quantity.get());
             pos += 8;
-            TAG_CANCEL_REPLACE
+            KIND_CANCEL_REPLACE
         }
         Request::SetFeeSchedule { symbol, schedule } => {
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -290,24 +324,24 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 2;
             le::put_i16(&mut buf[pos..], schedule.taker_fee_bps);
             pos += 2;
-            TAG_SET_FEE_SCHEDULE
+            KIND_SET_FEE_SCHEDULE
         }
-        Request::QueryStats => TAG_QUERY_STATS,
-        Request::EndOfDay => TAG_END_OF_DAY,
+        Request::QueryStats => KIND_QUERY_STATS,
+        Request::EndOfDay => KIND_END_OF_DAY,
         Request::DisableInstrument { symbol } => {
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
-            TAG_DISABLE_INSTRUMENT
+            KIND_DISABLE_INSTRUMENT
         }
         Request::EnableInstrument { symbol } => {
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
-            TAG_ENABLE_INSTRUMENT
+            KIND_ENABLE_INSTRUMENT
         }
         Request::RemoveInstrument { symbol } => {
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
-            TAG_REMOVE_INSTRUMENT
+            KIND_REMOVE_INSTRUMENT
         }
         Request::Subscribe { symbols, count } => {
             buf[pos] = *count;
@@ -316,47 +350,54 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
                 le::put_u32(&mut buf[pos..], sym.0);
                 pos += 4;
             }
-            TAG_SUBSCRIBE
+            KIND_SUBSCRIBE
         }
         Request::QueryPosition { account } => {
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
-            TAG_QUERY_POSITION
+            KIND_QUERY_POSITION
         }
-        Request::QueryRequestSeq => TAG_QUERY_REQUEST_SEQ,
+        Request::QueryRequestSeq => KIND_QUERY_REQUEST_SEQ,
     };
 
-    // Write the header: the length excludes the 4-byte length field itself.
-    let payload_len = pos - 4;
-    let header = RequestFrameHeader::mut_from_bytes(&mut buf[..REQUEST_FRAME_HEADER_LEN])
-        .expect("REQUEST_FRAME_HEADER_LEN slice matches struct size");
-    header.length = U32::new(payload_len as u32);
-    header.tag = tag;
+    let header = RequestBodyHeader::mut_from_bytes(&mut buf[..REQUEST_BODY_HEADER_LEN])
+        .expect("REQUEST_BODY_HEADER_LEN slice matches struct size");
+    header.kind = kind;
     header.seq = U64::new(seq);
 
     Ok(pos)
 }
 
-/// Decode a request from `buf` (after the length prefix has been stripped).
-///
-/// `buf` should contain exactly the tag + seq + payload bytes (no length
-/// prefix). For a request the node runtime has already split, see
-/// [`decode_request_body`], which this delegates to.
-pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
-    let (&tag, body) = buf.split_first().ok_or(ProtocolError::Truncated)?;
-    decode_request_body(tag, body)
+/// The body of an application frame, from the frame after its length
+/// prefix: `[tag][body]`. A frame under any other tag is one of the
+/// sequencer protocol's own, never this codec's, and is `UnknownTag`.
+#[inline]
+pub fn app_frame_body(frame: &[u8]) -> Result<&[u8], ProtocolError> {
+    match frame.split_first() {
+        Some((&TAG_APP, body)) => Ok(body),
+        Some((&tag, _)) => Err(ProtocolError::UnknownTag(tag)),
+        None => Err(ProtocolError::Truncated),
+    }
 }
 
-/// Decode a request from its tag and the body after it (the sequence,
-/// then the payload) — the split the node runtime hands a decoder.
+/// Decode a request frame from `buf`, after its length prefix: the
+/// protocol's tag, then the body. For a body the node runtime has
+/// already unframed, see [`decode_request_body`].
+pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
+    decode_request_body(app_frame_body(buf)?)
+}
+
+/// Decode a request body — kind, sequence, payload — as the node runtime
+/// hands it to the decoder.
 ///
 /// Returns `(seq, Request)` where `seq` is the per-key idempotency sequence.
-pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), ProtocolError> {
-    let (seq, payload) = U64::ref_from_prefix(body).map_err(|_| ProtocolError::Truncated)?;
-    let seq = seq.get();
+pub fn decode_request_body(body: &[u8]) -> Result<(u64, Request), ProtocolError> {
+    let (header, payload) =
+        RequestBodyHeader::ref_from_prefix(body).map_err(|_| ProtocolError::Truncated)?;
+    let seq = header.seq.get();
 
-    match tag {
-        TAG_SUBMIT_ORDER => {
+    match header.kind {
+        KIND_SUBMIT_ORDER => {
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
             }
@@ -364,7 +405,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
             let (_, order) = decode_order(&payload[4..])?;
             Ok((seq, Request::SubmitOrder { symbol, order }))
         }
-        TAG_CANCEL_ORDER => {
+        KIND_CANCEL_ORDER => {
             // symbol(4) + account(4) + order_id(8) = 16
             if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
@@ -378,7 +419,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_CANCEL_ALL => {
+        KIND_CANCEL_ALL => {
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
             }
@@ -389,8 +430,8 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_REQUEST_HEARTBEAT => Ok((seq, Request::Heartbeat)),
-        TAG_ADD_INSTRUMENT => {
+        KIND_REQUEST_HEARTBEAT => Ok((seq, Request::Heartbeat)),
+        KIND_ADD_INSTRUMENT => {
             if payload.len() < 12 {
                 return Err(ProtocolError::Truncated);
             }
@@ -405,7 +446,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_DEPOSIT => {
+        KIND_DEPOSIT => {
             if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
             }
@@ -418,7 +459,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_WITHDRAW => {
+        KIND_WITHDRAW => {
             if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
             }
@@ -431,7 +472,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_SET_RISK_LIMITS => {
+        KIND_SET_RISK_LIMITS => {
             if payload.len() < 5 {
                 return Err(ProtocolError::Truncated);
             }
@@ -472,7 +513,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_SET_CIRCUIT_BREAKER => {
+        KIND_SET_CIRCUIT_BREAKER => {
             if payload.len() < 5 {
                 return Err(ProtocolError::Truncated);
             }
@@ -517,7 +558,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_CANCEL_REPLACE => {
+        KIND_CANCEL_REPLACE => {
             // symbol(4) + account(4) + order_id(8) + new_price(8) + new_quantity(8) = 32
             if payload.len() < 32 {
                 return Err(ProtocolError::Truncated);
@@ -542,9 +583,9 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_QUERY_STATS => Ok((seq, Request::QueryStats)),
-        TAG_END_OF_DAY => Ok((seq, Request::EndOfDay)),
-        TAG_SET_FEE_SCHEDULE => {
+        KIND_QUERY_STATS => Ok((seq, Request::QueryStats)),
+        KIND_END_OF_DAY => Ok((seq, Request::EndOfDay)),
+        KIND_SET_FEE_SCHEDULE => {
             // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
             if payload.len() < 8 {
                 return Err(ProtocolError::Truncated);
@@ -563,7 +604,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_DISABLE_INSTRUMENT => {
+        KIND_DISABLE_INSTRUMENT => {
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
             }
@@ -574,7 +615,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_ENABLE_INSTRUMENT => {
+        KIND_ENABLE_INSTRUMENT => {
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
             }
@@ -585,7 +626,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_REMOVE_INSTRUMENT => {
+        KIND_REMOVE_INSTRUMENT => {
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
             }
@@ -596,7 +637,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_SUBSCRIBE => {
+        KIND_SUBSCRIBE => {
             // count(1) + count×symbol(4)
             if payload.is_empty() {
                 return Err(ProtocolError::Truncated);
@@ -615,7 +656,7 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
             }
             Ok((seq, Request::Subscribe { symbols, count }))
         }
-        TAG_QUERY_POSITION => {
+        KIND_QUERY_POSITION => {
             // account(4)
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
@@ -627,54 +668,54 @@ pub fn decode_request_body(tag: u8, body: &[u8]) -> Result<(u64, Request), Proto
                 },
             ))
         }
-        TAG_QUERY_REQUEST_SEQ => Ok((seq, Request::QueryRequestSeq)),
-        _ => Err(ProtocolError::UnknownTag(tag)),
+        KIND_QUERY_REQUEST_SEQ => Ok((seq, Request::QueryRequestSeq)),
+        kind => Err(ProtocolError::UnknownTag(kind)),
     }
 }
 
-/// Bytes the wire puts ahead of a response body: the length prefix and
-/// the tag.
-const RESPONSE_HEADER_LEN: usize = 4 + 1;
+/// Bytes of a response body ahead of the payload: the kind.
+const RESPONSE_TAG_LEN: usize = 1;
 
-/// Bound on one response body — the payload after the tag. The widest is
-/// a `PositionSnapshot` with every balance slot used: account(4) +
+/// Bound on one response body — kind and payload. The widest is a
+/// `PositionSnapshot` with every balance slot used: account(4) +
 /// count(1) + 16 × (currency(4) + free(8) + reserved(8)). A test encodes
 /// one and pins the number; the server checks it against the node
 /// runtime's bound at compile time.
-pub const MAX_RESPONSE_BODY: usize = 4 + 1 + 16 * 20;
+pub const MAX_RESPONSE_BODY: usize = RESPONSE_TAG_LEN + 4 + 1 + 16 * 20;
 
 /// Encode a response into `buf` as a complete wire frame. Returns total
 /// bytes written (length prefix + tag + body).
 ///
 /// For the node's own response stage, which frames what it sends
 /// itself, see [`encode_response_body`]. The caller must ensure `buf` is
-/// large enough: the 5-byte header + [`MAX_RESPONSE_BODY`] bounds every
+/// large enough: the 5-byte prefix + [`MAX_RESPONSE_BODY`] bounds every
 /// frame.
 pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    let (tag, body_len) = encode_response_body(response, &mut buf[RESPONSE_HEADER_LEN..])?;
+    let body_len = encode_response_body(response, &mut buf[FRAME_PREFIX_LEN..])?;
     // The length covers the tag and the body, not itself.
-    le::put_u32(&mut buf[0..], (1 + body_len) as u32);
-    buf[4] = tag;
-    Ok(RESPONSE_HEADER_LEN + body_len)
+    le::put_u32(&mut buf[0..], (TAG_LEN + body_len) as u32);
+    buf[4] = TAG_APP;
+    Ok(FRAME_PREFIX_LEN + body_len)
 }
 
-/// Encode a response's body — everything after the tag — at the start of
-/// `buf`. Returns the tag that names it and the body's length, for a
-/// caller that writes the frame around it: the node runtime frames what
-/// its response stage sends.
+/// Encode a response's body — kind, then payload — at the start of
+/// `buf`, and return its length, for a caller that writes the frame
+/// around it: the node runtime frames what its response stage sends.
 ///
 /// The caller must ensure `buf` holds [`MAX_RESPONSE_BODY`] bytes.
 pub fn encode_response_body(
     response: &ResponseKind,
     buf: &mut [u8],
-) -> Result<(u8, usize), ProtocolError> {
-    let mut pos = 0;
+) -> Result<usize, ProtocolError> {
+    // Reserve the kind; back-filled below, once the payload has said
+    // which kind names it.
+    let mut pos = RESPONSE_TAG_LEN;
 
-    let tag = match response {
+    let kind = match response {
         ResponseKind::Report(report) => {
-            let (tag, len) = encode_execution_report(report, buf);
+            let (kind, len) = encode_execution_report(report, &mut buf[pos..]);
             pos += len;
-            tag
+            kind
         }
         ResponseKind::StatsHeader {
             active_connections,
@@ -687,7 +728,7 @@ pub fn encode_response_body(
             pos += 8;
             le::put_u64(&mut buf[pos..], *journal_sequence);
             pos += 8;
-            TAG_STATS_HEADER
+            KIND_STATS_HEADER
         }
         ResponseKind::BookSnapshotBegin {
             symbol,
@@ -697,7 +738,7 @@ pub fn encode_response_body(
             pos += 4;
             le::put_u64(&mut buf[pos..], *last_applied_seq);
             pos += 8;
-            TAG_BOOK_SNAPSHOT_BEGIN
+            KIND_BOOK_SNAPSHOT_BEGIN
         }
         ResponseKind::BookSnapshotLevel {
             symbol,
@@ -716,7 +757,7 @@ pub fn encode_response_body(
             pos += 8;
             le::put_u32(&mut buf[pos..], *order_count);
             pos += 4;
-            TAG_BOOK_SNAPSHOT_LEVEL
+            KIND_BOOK_SNAPSHOT_LEVEL
         }
         ResponseKind::BookSnapshotEnd {
             symbol,
@@ -726,12 +767,12 @@ pub fn encode_response_body(
             pos += 4;
             le::put_u32(&mut buf[pos..], *level_count);
             pos += 4;
-            TAG_BOOK_SNAPSHOT_END
+            KIND_BOOK_SNAPSHOT_END
         }
         ResponseKind::SnapshotComplete { last_applied_seq } => {
             le::put_u64(&mut buf[pos..], *last_applied_seq);
             pos += 8;
-            TAG_SNAPSHOT_COMPLETE
+            KIND_SNAPSHOT_COMPLETE
         }
         ResponseKind::PositionSnapshot {
             account,
@@ -752,39 +793,43 @@ pub fn encode_response_body(
                 le::put_u64(&mut buf[pos..], entry.reserved);
                 pos += 8;
             }
-            TAG_POSITION_SNAPSHOT
+            KIND_POSITION_SNAPSHOT
         }
         ResponseKind::RequestSeqHwm { hwm } => {
             le::put_u64(&mut buf[pos..], *hwm);
             pos += 8;
-            TAG_REQUEST_SEQ_HWM
+            KIND_REQUEST_SEQ_HWM
         }
     };
 
-    Ok((tag, pos))
+    buf[0] = kind;
+    Ok(pos)
 }
 
-/// Decode a response from `buf` (after the length prefix has been stripped).
+/// Decode a response frame from `buf`, after its length prefix: the
+/// protocol's tag, then the body. For a body whose tag the client library
+/// has already stripped (`melin_client::classify`), see
+/// [`decode_response_body`].
 pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
-    if buf.is_empty() {
-        return Err(ProtocolError::Truncated);
-    }
+    decode_response_body(app_frame_body(buf)?)
+}
 
-    let tag = buf[0];
-    let payload = &buf[1..];
+/// Decode a response body — kind, then payload.
+pub fn decode_response_body(body: &[u8]) -> Result<ResponseKind, ProtocolError> {
+    let (&kind, payload) = body.split_first().ok_or(ProtocolError::Truncated)?;
 
-    match tag {
-        TAG_PLACED
-        | TAG_FILL
-        | TAG_CANCELLED
-        | TAG_TRIGGERED
-        | TAG_REJECTED
-        | TAG_REPLACED
-        | TAG_INSTRUMENT_STATUS_CHANGED => {
-            let report = decode_execution_report(tag, payload)?;
+    match kind {
+        KIND_PLACED
+        | KIND_FILL
+        | KIND_CANCELLED
+        | KIND_TRIGGERED
+        | KIND_REJECTED
+        | KIND_REPLACED
+        | KIND_INSTRUMENT_STATUS_CHANGED => {
+            let report = decode_execution_report(kind, payload)?;
             Ok(ResponseKind::Report(report))
         }
-        TAG_STATS_HEADER => {
+        KIND_STATS_HEADER => {
             // active_connections(8) + events_processed(8) + journal_sequence(8) = 24
             if payload.len() < 24 {
                 return Err(ProtocolError::Truncated);
@@ -795,7 +840,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 journal_sequence: le::get_u64(&payload[16..]),
             })
         }
-        TAG_BOOK_SNAPSHOT_BEGIN => {
+        KIND_BOOK_SNAPSHOT_BEGIN => {
             // symbol(4) + last_applied_seq(8) = 12
             if payload.len() < 12 {
                 return Err(ProtocolError::Truncated);
@@ -805,7 +850,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 last_applied_seq: le::get_u64(&payload[4..]),
             })
         }
-        TAG_BOOK_SNAPSHOT_LEVEL => {
+        KIND_BOOK_SNAPSHOT_LEVEL => {
             // symbol(4) + side(1) + price(8) + qty(8) + order_count(4) = 25
             if payload.len() < 25 {
                 return Err(ProtocolError::Truncated);
@@ -824,7 +869,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 order_count,
             })
         }
-        TAG_BOOK_SNAPSHOT_END => {
+        KIND_BOOK_SNAPSHOT_END => {
             // symbol(4) + level_count(4) = 8
             if payload.len() < 8 {
                 return Err(ProtocolError::Truncated);
@@ -834,7 +879,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 level_count: le::get_u32(&payload[4..]),
             })
         }
-        TAG_SNAPSHOT_COMPLETE => {
+        KIND_SNAPSHOT_COMPLETE => {
             // last_applied_seq(8)
             if payload.len() < 8 {
                 return Err(ProtocolError::Truncated);
@@ -843,7 +888,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 last_applied_seq: le::get_u64(&payload[0..]),
             })
         }
-        TAG_POSITION_SNAPSHOT => {
+        KIND_POSITION_SNAPSHOT => {
             // account(4) + count(1) + count*(currency(4) + free(8) + reserved(8))
             if payload.len() < 5 {
                 return Err(ProtocolError::Truncated);
@@ -872,7 +917,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 count,
             })
         }
-        TAG_REQUEST_SEQ_HWM => {
+        KIND_REQUEST_SEQ_HWM => {
             if payload.len() < 8 {
                 return Err(ProtocolError::Truncated);
             }
@@ -880,7 +925,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 hwm: le::get_u64(&payload[0..]),
             })
         }
-        _ => Err(ProtocolError::UnknownTag(tag)),
+        _ => Err(ProtocolError::UnknownTag(kind)),
     }
 }
 
@@ -1057,13 +1102,12 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
 
 // --- ExecutionReport encoding ---
 
-/// Encode an `ExecutionReport` into `buf`. Returns bytes written (includes tag byte).
-/// Encode an `ExecutionReport`'s body at the start of `buf`. Returns the
-/// tag that names the variant and the bytes written.
+/// Encode an `ExecutionReport`'s payload at the start of `buf`. Returns
+/// the kind that names the variant and the bytes written.
 fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usize) {
     let mut pos = 0;
 
-    let tag = match report {
+    let kind = match report {
         ExecutionReport::Placed {
             order_id,
             symbol,
@@ -1084,7 +1128,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usi
             pos += 8;
             le::put_u64(&mut buf[pos..], quantity.get());
             pos += 8;
-            TAG_PLACED
+            KIND_PLACED
         }
         ExecutionReport::Fill {
             maker_order_id,
@@ -1115,7 +1159,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usi
             pos += 8;
             le::put_u64(&mut buf[pos..], *taker_fee as u64);
             pos += 8;
-            TAG_FILL
+            KIND_FILL
         }
         ExecutionReport::Cancelled {
             order_id,
@@ -1131,7 +1175,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usi
             pos += 4;
             le::put_u64(&mut buf[pos..], remaining_quantity.get());
             pos += 8;
-            TAG_CANCELLED
+            KIND_CANCELLED
         }
         ExecutionReport::Triggered {
             order_id,
@@ -1147,7 +1191,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usi
             pos += 4;
             le::put_u64(&mut buf[pos..], trigger_price.get());
             pos += 8;
-            TAG_TRIGGERED
+            KIND_TRIGGERED
         }
         ExecutionReport::Rejected {
             order_id,
@@ -1163,7 +1207,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usi
             pos += 4;
             buf[pos] = encode_reject_reason(*reason);
             pos += 1;
-            TAG_REJECTED
+            KIND_REJECTED
         }
         ExecutionReport::Replaced {
             order_id,
@@ -1191,24 +1235,24 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> (u8, usi
             pos += 8;
             le::put_u64(&mut buf[pos..], new_remaining.get());
             pos += 8;
-            TAG_REPLACED
+            KIND_REPLACED
         }
         ExecutionReport::InstrumentStatusChanged { symbol, status } => {
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
             buf[pos] = *status as u8;
             pos += 1;
-            TAG_INSTRUMENT_STATUS_CHANGED
+            KIND_INSTRUMENT_STATUS_CHANGED
         }
     };
 
-    (tag, pos)
+    (kind, pos)
 }
 
-/// Decode an `ExecutionReport` from tag + payload.
-fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, ProtocolError> {
-    match tag {
-        TAG_PLACED => {
+/// Decode an `ExecutionReport` from its kind and the payload behind it.
+fn decode_execution_report(kind: u8, payload: &[u8]) -> Result<ExecutionReport, ProtocolError> {
+    match kind {
+        KIND_PLACED => {
             // order_id(8) + symbol(4) + account(4) + side(1) + price(8) + quantity(8) = 33
             if payload.len() < 33 {
                 return Err(ProtocolError::Truncated);
@@ -1230,7 +1274,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 quantity: Quantity(quantity),
             })
         }
-        TAG_FILL => {
+        KIND_FILL => {
             // maker_id(8) + taker_id(8) + symbol(4) + maker_acct(4) + taker_acct(4) +
             // price(8) + qty(8) + maker_fee(8) + taker_fee(8) = 60
             if payload.len() < 60 {
@@ -1259,7 +1303,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 taker_fee,
             })
         }
-        TAG_CANCELLED => {
+        KIND_CANCELLED => {
             // order_id(8) + symbol(4) + account(4) + remaining(8) = 24
             if payload.len() < 24 {
                 return Err(ProtocolError::Truncated);
@@ -1276,7 +1320,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 remaining_quantity: Quantity(remaining),
             })
         }
-        TAG_TRIGGERED => {
+        KIND_TRIGGERED => {
             // order_id(8) + symbol(4) + account(4) + trigger_price(8) = 24
             if payload.len() < 24 {
                 return Err(ProtocolError::Truncated);
@@ -1293,7 +1337,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 trigger_price: Price(trigger_price),
             })
         }
-        TAG_REJECTED => {
+        KIND_REJECTED => {
             // order_id(8) + symbol(4) + account(4) + reason(1) = 17
             if payload.len() < 17 {
                 return Err(ProtocolError::Truncated);
@@ -1309,7 +1353,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 reason,
             })
         }
-        TAG_REPLACED => {
+        KIND_REPLACED => {
             // order_id(8) + symbol(4) + account(4) + side(1) + old_price(8) + new_price(8) +
             // old_remaining(8) + new_remaining(8) = 49
             if payload.len() < 49 {
@@ -1340,7 +1384,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 new_remaining: Quantity(new_remaining),
             })
         }
-        TAG_INSTRUMENT_STATUS_CHANGED => {
+        KIND_INSTRUMENT_STATUS_CHANGED => {
             // symbol(4) + status(1) = 5
             if payload.len() < 5 {
                 return Err(ProtocolError::Truncated);
@@ -1354,7 +1398,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
             };
             Ok(ExecutionReport::InstrumentStatusChanged { symbol, status })
         }
-        _ => Err(ProtocolError::UnknownTag(tag)),
+        _ => Err(ProtocolError::UnknownTag(kind)),
     }
 }
 
@@ -1852,20 +1896,46 @@ mod tests {
         }
     }
 
-    /// The body form is the frame form without its header: the same
-    /// bytes, and the tag the frame would carry, for a caller that
-    /// frames the response itself.
+    /// The body form is the frame form without its prefix: the same
+    /// bytes, for a caller that frames the response itself.
     #[test]
-    fn response_body_is_the_frame_without_its_header() {
+    fn response_body_is_the_frame_without_its_prefix() {
         let mut frame = [0u8; 512];
         let mut body = [0u8; MAX_RESPONSE_BODY];
 
         for (i, response) in make_responses().iter().enumerate() {
             let written = encode_response(response, &mut frame).unwrap();
-            let (tag, len) = encode_response_body(response, &mut body).unwrap();
-            assert_eq!(tag, frame[4], "tag of variant {i}");
-            assert_eq!(1 + len, written - 4, "length of variant {i}");
+            let len = encode_response_body(response, &mut body).unwrap();
+            assert_eq!(frame[4], TAG_APP, "tag of variant {i}");
+            assert_eq!(TAG_LEN + len, written - 4, "length of variant {i}");
             assert_eq!(body[..len], frame[5..written], "body of variant {i}");
+            assert_eq!(
+                &decode_response_body(&body[..len]).unwrap(),
+                response,
+                "variant {i}"
+            );
+        }
+    }
+
+    /// The same on the request side, for a caller whose client library
+    /// frames the request (`melin_client::Connection::send`).
+    #[test]
+    fn request_body_is_the_frame_without_its_prefix() {
+        let mut frame = [0u8; 256];
+        let mut body = [0u8; MAX_REQUEST_BODY];
+
+        for (i, request) in make_requests().iter().enumerate() {
+            let seq = i as u64;
+            let written = encode_request(request, seq, &mut frame).unwrap();
+            let len = encode_request_body(request, seq, &mut body).unwrap();
+            assert_eq!(frame[4], TAG_APP, "tag of variant {i}");
+            assert_eq!(TAG_LEN + len, written - 4, "length of variant {i}");
+            assert_eq!(body[..len], frame[5..written], "body of variant {i}");
+            assert_eq!(
+                decode_request_body(&body[..len]).unwrap(),
+                (seq, *request),
+                "variant {i}"
+            );
         }
     }
 
@@ -1878,76 +1948,113 @@ mod tests {
             count: 16,
         };
         let mut body = [0u8; MAX_RESPONSE_BODY];
-        let (_, len) = encode_response_body(&response, &mut body).unwrap();
+        let len = encode_response_body(&response, &mut body).unwrap();
         assert_eq!(len, MAX_RESPONSE_BODY);
     }
 
     #[test]
     fn truncated_request_detected() {
-        // Empty buffer — not even a tag.
-        let result = decode_request(&[]);
-        assert!(matches!(result, Err(ProtocolError::Truncated)));
+        // Empty frame and empty body — not even a tag, or a kind.
+        assert!(matches!(decode_request(&[]), Err(ProtocolError::Truncated)));
+        assert!(matches!(
+            decode_request_body(&[]),
+            Err(ProtocolError::Truncated)
+        ));
+        // A frame that is its tag alone has an empty body.
+        assert!(matches!(
+            decode_request(&[TAG_APP]),
+            Err(ProtocolError::Truncated)
+        ));
 
-        // A tag and 3 bytes — too short for the seq(8) behind it.
+        // A kind and 3 bytes — too short for the seq(8) behind it.
         let mut short = [0u8; 1 + 3];
-        short[0] = TAG_CANCEL_ALL;
-        let result = decode_request(&short);
+        short[0] = KIND_CANCEL_ALL;
+        let result = decode_request_body(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // tag + seq(8) present but payload too short for SubmitOrder.
+        // kind + seq(8) present but payload too short for SubmitOrder.
         let mut short = [0u8; 11];
-        short[0] = TAG_SUBMIT_ORDER;
-        let result = decode_request(&short);
+        short[0] = KIND_SUBMIT_ORDER;
+        let result = decode_request_body(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
         // CancelAll needs account(4) after the seq. 3 bytes after the
         // seq must be rejected.
         let mut short = [0u8; 9 + 3];
-        short[0] = TAG_CANCEL_ALL;
-        let result = decode_request(&short);
+        short[0] = KIND_CANCEL_ALL;
+        let result = decode_request_body(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
         // Exactly 4 bytes after the seq is the boundary — must succeed.
         let mut ok_buf = [0u8; 9 + 4];
-        ok_buf[0] = TAG_CANCEL_ALL;
-        assert!(decode_request(&ok_buf).is_ok());
+        ok_buf[0] = KIND_CANCEL_ALL;
+        assert!(decode_request_body(&ok_buf).is_ok());
     }
 
     #[test]
-    fn unknown_request_tag_detected() {
-        // Unknown tag byte + seq(8).
+    fn unknown_request_kind_detected() {
+        // Unknown kind byte + seq(8).
         let mut buf = [0u8; 9];
         buf[0] = 255;
-        let result = decode_request(&buf);
+        let result = decode_request_body(&buf);
         assert!(matches!(result, Err(ProtocolError::UnknownTag(255))));
     }
 
-    /// The layout the node runtime relies on: the tag is the first byte
-    /// after the length prefix, and the body it hands the decoder starts
-    /// with the sequence. `decode_request_body` reads exactly that split.
+    /// The layout the node runtime relies on: its tag is the first byte
+    /// after the length prefix, and the body it hands the decoder opens
+    /// with the kind, then the sequence.
     #[test]
-    fn the_tag_leads_and_the_seq_opens_the_body() {
+    fn the_app_tag_leads_and_the_body_opens_with_kind_then_seq() {
         let request = Request::CancelAll {
             account: AccountId(9),
         };
         let mut buf = [0u8; 136];
         let written = encode_request(&request, 0x0102_0304_0506_0708, &mut buf).unwrap();
 
-        assert_eq!(buf[4], TAG_CANCEL_ALL, "the tag follows the length");
+        assert_eq!(buf[4], TAG_APP, "the protocol's tag follows the length");
+        assert_eq!(buf[5], KIND_CANCEL_ALL, "the kind opens the body");
         assert_eq!(
-            buf[5..13],
+            buf[6..14],
             0x0102_0304_0506_0708u64.to_le_bytes(),
-            "the seq follows the tag"
+            "the seq follows the kind"
         );
-        assert_eq!(le::get_u32(&buf[13..]), 9, "the payload follows the seq");
+        assert_eq!(le::get_u32(&buf[14..]), 9, "the payload follows the seq");
 
-        let (tag, body) = (buf[4], &buf[5..written]);
+        let body = &buf[5..written];
         assert_eq!(
-            decode_request_body(tag, body).unwrap(),
+            decode_request_body(body).unwrap(),
             (0x0102_0304_0506_0708, request)
         );
         assert!(matches!(
-            decode_request_body(tag, &body[..7]),
+            decode_request_body(&body[..8]),
             Err(ProtocolError::Truncated)
+        ));
+    }
+
+    /// A frame is not a body: handed to a `_body` decoder with its tag
+    /// still on, it fails as an unknown kind rather than decoding as some
+    /// message. And a frame under any tag but the application's is the
+    /// sequencer protocol's, never this codec's.
+    #[test]
+    fn frames_and_bodies_do_not_mix() {
+        let mut buf = [0u8; 136];
+        let written = encode_request(&Request::QueryStats, 1, &mut buf).unwrap();
+        assert!(matches!(
+            decode_request_body(&buf[4..written]),
+            Err(ProtocolError::UnknownTag(TAG_APP))
+        ));
+        let written = encode_response(&ResponseKind::RequestSeqHwm { hwm: 1 }, &mut buf).unwrap();
+        assert!(matches!(
+            decode_response_body(&buf[4..written]),
+            Err(ProtocolError::UnknownTag(TAG_APP))
+        ));
+
+        // A frame as the protocol framed application messages before
+        // `TAG_APP`, the kind in the tag's place: after its length prefix,
+        // that is today's body.
+        let written = encode_request(&Request::QueryStats, 1, &mut buf).unwrap();
+        assert!(matches!(
+            decode_request(&buf[5..written]),
+            Err(ProtocolError::UnknownTag(KIND_QUERY_STATS))
         ));
     }
 
@@ -1980,22 +2087,27 @@ mod tests {
         let result = decode_response(&[]);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // StatsHeader needs 3 × u64 = 24 bytes after the tag. 23 bytes
+        assert!(matches!(
+            decode_response_body(&[]),
+            Err(ProtocolError::Truncated)
+        ));
+
+        // StatsHeader needs 3 × u64 = 24 bytes after the kind. 23 bytes
         // must be rejected.
         let mut short = [0u8; 1 + 23];
-        short[0] = TAG_STATS_HEADER;
-        let result = decode_response(&short);
+        short[0] = KIND_STATS_HEADER;
+        let result = decode_response_body(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
-        // Exactly 24 bytes after the tag is the boundary — must succeed.
+        // Exactly 24 bytes after the kind is the boundary — must succeed.
         let mut ok_buf = [0u8; 1 + 24];
-        ok_buf[0] = TAG_STATS_HEADER;
-        assert!(decode_response(&ok_buf).is_ok());
+        ok_buf[0] = KIND_STATS_HEADER;
+        assert!(decode_response_body(&ok_buf).is_ok());
     }
 
     #[test]
-    fn transport_tags_are_not_this_codecs() {
-        // The reserved range below 0x10 is the sequencer's: a heartbeat
-        // or a batch end handed to this codec is an unknown tag, since
+    fn transport_frames_are_not_this_codecs() {
+        // Every tag but `TAG_APP` is the sequencer's: a heartbeat or a
+        // batch end handed to this codec is an unknown tag, since
         // `melin_client::classify` is meant to have taken it first.
         for tag in [0x01u8, 0x02, 0x0F] {
             assert!(matches!(
@@ -2006,8 +2118,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_response_tag_detected() {
-        let result = decode_response(&[99]);
+    fn unknown_response_kind_detected() {
+        let result = decode_response_body(&[99]);
+        assert!(matches!(result, Err(ProtocolError::UnknownTag(99))));
+        let result = decode_response(&[TAG_APP, 99]);
         assert!(matches!(result, Err(ProtocolError::UnknownTag(99))));
     }
 
@@ -2052,14 +2166,14 @@ mod tests {
 
     #[test]
     fn length_prefix_includes_seq_bytes() {
-        // The length field must include tag(1) + seq(8) + payload.
+        // The length field must include tag(1) + kind(1) + seq(8) + payload.
         let request = Request::Heartbeat;
         let mut buf = [0u8; 136];
         let written = encode_request(&request, 0, &mut buf).unwrap();
         let length = le::get_u32(&buf[0..]) as usize;
-        // Heartbeat has no payload, so length = tag(1) + seq(8) = 9.
-        assert_eq!(length, 9);
-        assert_eq!(written, 4 + 9); // 4-byte prefix + 9 payload
+        // Heartbeat has no payload, so length = tag(1) + kind(1) + seq(8) = 10.
+        assert_eq!(length, 10);
+        assert_eq!(written, 4 + 10); // 4-byte prefix + 10 behind it
     }
 
     #[test]
@@ -2167,12 +2281,12 @@ mod tests {
     #[test]
     fn position_snapshot_count_over_16_rejected() {
         // Manually build a payload with count=17 — should be rejected.
-        // Layout: tag(1) + account(4) + count(1) = 6 bytes minimum.
+        // Layout: kind(1) + account(4) + count(1) = 6 bytes minimum.
         let mut payload = vec![0u8; 6];
-        payload[0] = TAG_POSITION_SNAPSHOT;
+        payload[0] = KIND_POSITION_SNAPSHOT;
         le::put_u32(&mut payload[1..], 1); // account
         payload[5] = 17; // count > 16
-        let result = decode_response(&payload);
+        let result = decode_response_body(&payload);
         assert!(
             matches!(result, Err(ProtocolError::InvalidField(_))),
             "expected InvalidField, got {result:?}"

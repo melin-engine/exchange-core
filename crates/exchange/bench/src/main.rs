@@ -3064,8 +3064,8 @@ impl OutcomeReport {
             Reply::EngineError => self.engine_errors += 1,
             Reply::ServerBusy => self.server_busy += 1,
             Reply::Heartbeat => {}
-            Reply::Response(bytes) => {
-                if let ResponseKind::Report(report) = codec::decode_response(bytes)? {
+            Reply::Response(body) => {
+                if let ResponseKind::Report(report) = codec::decode_response_body(body)? {
                     self.record_execution_report(&report);
                 }
             }
@@ -3561,12 +3561,16 @@ mod outcome_report_tests {
         Price(NonZeroU64::new(100).unwrap())
     }
 
-    /// A response as it comes off the wire: the codec's bytes without
-    /// the length prefix, which is what `classify` is fed.
+    /// A response as `classify` hands it back: the body, with the length
+    /// prefix and the protocol's tag stripped.
     fn wire(kind: &ResponseKind) -> Vec<u8> {
         let mut buf = [0u8; 512];
         let written = codec::encode_response(kind, &mut buf).unwrap();
-        buf[4..written].to_vec()
+        let reply = melin_client::classify(&buf[4..written]).unwrap();
+        let Reply::Response(body) = reply else {
+            panic!("an encoded response classifies as one, got {reply:?}");
+        };
+        body.to_vec()
     }
 
     #[test]

@@ -22,6 +22,27 @@ fn fuzz_wire_response_decode() {
     });
 }
 
+/// Request body decoder must never panic on arbitrary input. This is the
+/// node's own path: the runtime hands the decoder whatever body a client
+/// framed under the application tag. Fuzzed on its own because the frame
+/// decoder above refuses all but one first byte, so random frames would
+/// seldom reach it.
+#[test]
+fn fuzz_wire_request_body_decode() {
+    bolero::check!().for_each(|data: &[u8]| {
+        let _ = codec::decode_request_body(data);
+    });
+}
+
+/// Response body decoder must never panic on arbitrary input: a client
+/// feeds it whatever body the sequencer's client handed back.
+#[test]
+fn fuzz_wire_response_body_decode() {
+    bolero::check!().for_each(|data: &[u8]| {
+        let _ = codec::decode_response_body(data);
+    });
+}
+
 /// Wire request encode → decode round-trip must be lossless.
 #[test]
 fn fuzz_wire_request_roundtrip() {
@@ -42,6 +63,17 @@ fn fuzz_wire_request_roundtrip() {
             .expect("decode of freshly encoded request must succeed");
         assert_eq!(decoded_seq, seq, "seq round-trip mismatch");
         assert_eq!(decoded, request, "request round-trip mismatch");
+
+        // The body form is the frame's tail, and round-trips the same.
+        let mut body = [0u8; codec::MAX_REQUEST_BODY];
+        let len = codec::encode_request_body(&request, seq, &mut body)
+            .expect("a request that encodes as a frame encodes as a body");
+        assert_eq!(body[..len], buf[5..written], "body is not the frame's tail");
+        assert_eq!(
+            codec::decode_request_body(&body[..len]).expect("decode of fresh body"),
+            (seq, request),
+            "request body round-trip mismatch"
+        );
     });
 }
 
@@ -62,6 +94,17 @@ fn fuzz_wire_response_roundtrip() {
         let decoded = codec::decode_response(&buf[4..written])
             .expect("decode of freshly encoded response must succeed");
         assert_eq!(decoded, response, "response round-trip mismatch");
+
+        // The body form is the frame's tail, and round-trips the same.
+        let mut body = [0u8; codec::MAX_RESPONSE_BODY];
+        let len = codec::encode_response_body(&response, &mut body)
+            .expect("a response that encodes as a frame encodes as a body");
+        assert_eq!(body[..len], buf[5..written], "body is not the frame's tail");
+        assert_eq!(
+            codec::decode_response_body(&body[..len]).expect("decode of fresh body"),
+            response,
+            "response body round-trip mismatch"
+        );
     });
 }
 
