@@ -21,7 +21,10 @@ full detail behind entries marked *(sequencer)*.
 This release adopts the sequencer's next release. The [Unreleased section of
 its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
 lists further fixes in the node runtime that apply here as they are; the
-entries below cover what changes for this product.
+entries below cover what changes for this product. One entry there does not
+apply: `--max-orders-per-account`, `--max-orders-per-second` and
+`--max-orders-burst` leave the sequencer's flags, but the exchange node
+declares them itself, with the same names, defaults and behavior.
 
 This release carries no state over from 0.17.0. The journal format changes
 (see below) and a node refuses a journal written by an earlier release, so a
@@ -90,9 +93,7 @@ snapshot from an earlier release is never read.
   an alert that matches on message text needs updating: `all replicas
   disconnected — trading halted` is now `all replicas disconnected —
   halted, refusing client writes`, and `raft core stopped — control plane
-  down, trading unaffected` now ends `sequencing unaffected`. The
-  per-account limit flags are unchanged: the exchange node now declares
-  them itself, with the same names and defaults.
+  down, trading unaffected` now ends `sequencing unaffected`.
 - **Rust dependents:** `RequestDecoder::decode` takes `(body,
   permission)` and `ResponseEncoder` returns the length of the body it
   wrote, both as the sequencer now asks *(sequencer)*. The codec's
