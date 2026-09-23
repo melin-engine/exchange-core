@@ -32,7 +32,7 @@ Executes at the specified `price` or better. The order first matches against the
 - **IOC**: remainder is cancelled.
 - **FOK**: see the FOK section below -- the order is rejected upfront if it cannot fill entirely.
 - **Day**: remainder rests like GTC, but is automatically cancelled when an `EndOfDay` event is processed.
-- **GTD**: remainder rests like GTC, but is automatically cancelled when an `ExpireOrders` event with `timestamp_ns >= order.expiry_ns` is processed.
+- **GTD**: remainder rests like GTC, but is automatically cancelled once the venue's clock reaches `order.expiry_ns` (see GTD below).
 
 **Post-Only mode**: When `post_only` is `true`, the order is rejected with `PostOnlyWouldCross` if it would immediately match against resting liquidity (cross the spread). This guarantees maker-only execution. Post-only is only meaningful for GTC/Day/GTD limit orders -- IOC and FOK are inherently taker-side.
 
@@ -89,7 +89,9 @@ The unfilled remainder is placed on the book like GTC. However, when the operato
 
 ### GTD (Good-Til-Date)
 
-The unfilled remainder is placed on the book like GTC, but carries an `expiry_ns` timestamp (nanoseconds since Unix epoch). When the operator sends an `ExpireOrders { timestamp_ns }` event, all GTD orders with `expiry_ns <= timestamp_ns` are cancelled. The operator is responsible for sending `ExpireOrders` at the appropriate time (e.g., via a periodic timer).
+The unfilled remainder is placed on the book like GTC, but carries an `expiry_ns` timestamp (nanoseconds since Unix epoch). The engine cancels it on its own once the venue's clock reaches that deadline, with a `Cancelled` report; no operator action is needed. The same applies to a pending GTD stop that has not triggered yet.
+
+The venue's clock is the timestamp the node stamps on each journaled event, so expiry is part of the journal: a recovery or a replica expires exactly the same orders at the same point in the event stream. Under load the clock advances with every event, so an order expires at the first event at or after its deadline. On a quiet market the node journals a clock tick every `--tick-interval-ms` (250 ms by default), so an order expires within that interval of its deadline even when nothing else happens. Setting `--tick-interval-ms 0` disables the ticks, and GTD orders then expire only when the next event arrives.
 
 GTD orders must carry an `expiry_ns` strictly in the future of the venue's event clock at submission — an order that is missing its expiry or already at/past its deadline is rejected with `InvalidExpiry`, never placed. Non-GTD orders must have `expiry_ns == 0`; violations are also rejected with `InvalidExpiry`.
 
@@ -326,9 +328,7 @@ Permanently removes a disabled instrument and reclaims its memory. Only succeeds
 
 Cancels all resting orders and pending stops with `TimeInForce::Day` across all instruments. Each cancelled order emits a `Cancelled` report.
 
-### ExpireOrders
-
-Cancels all resting orders and pending stops with `TimeInForce::GTD` whose `expiry_ns <= timestamp_ns`. Each cancelled order emits a `Cancelled` report.
+GTD orders need no such command: they expire on their own at their deadline (see "GTD (Good-Til-Date)").
 
 ---
 
