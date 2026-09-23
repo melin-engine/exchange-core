@@ -123,8 +123,18 @@ pub fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
 /// framing and CRC before handing bytes to this function. Decoding is
 /// always at [`PAYLOAD_VERSION`]; the transport rejects mismatched
 /// `APP_VERSION` before this is ever called.
+///
+/// The payload must end where its last section does. Bytes past it mean
+/// the encoder and this decoder disagree about the layout (a section
+/// added without a version bump, say), so the decoded state is not the
+/// one that was saved.
 pub fn decode_exchange_payload(buf: &[u8]) -> Result<Exchange, SnapshotDecodeError> {
-    let (_consumed, state) = decode_exchange_state(buf, PAYLOAD_VERSION)?;
+    let (consumed, state) = decode_exchange_state(buf, PAYLOAD_VERSION)?;
+    if consumed != buf.len() {
+        return Err(SnapshotDecodeError::Corrupt {
+            reason: "bytes left after the last section",
+        });
+    }
     Ok(Exchange::restore_state(state))
 }
 
@@ -2258,6 +2268,24 @@ mod tests {
             Err(SnapshotDecodeError::Truncated) => {}
             Err(other) => panic!("expected Truncated, got {other:?}"),
             Ok(_) => panic!("a payload missing its account limits must not decode"),
+        }
+    }
+
+    /// The mirror of truncation: a payload running past its last section
+    /// was written to a layout this decoder does not know, so it must not
+    /// restore as though the extra bytes were not there.
+    #[test]
+    fn payload_with_bytes_after_the_last_section_errors() {
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(1_000, 5);
+        let mut payload = encode_exchange_payload(&exchange);
+        payload.push(0);
+        match decode_exchange_payload(&payload) {
+            Err(SnapshotDecodeError::Corrupt { reason }) => {
+                assert!(reason.contains("after the last section"), "{reason}");
+            }
+            Err(other) => panic!("expected Corrupt, got {other:?}"),
+            Ok(_) => panic!("a payload with trailing bytes must not decode"),
         }
     }
 
