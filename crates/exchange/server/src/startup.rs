@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(parse(&[]).unwrap(), StartupConfig::default());
     }
 
-    /// The node now owns these flags; the runtime no longer parses them.
+    /// The limits the node journals are the ones its flags carry.
     #[test]
     fn limit_flags_parse_into_the_journaled_event() {
         let startup = parse(&[

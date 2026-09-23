@@ -66,3 +66,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(event_publisher::run),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The runtime's flags and the node's share one namespace, and the
+    /// runtime's change on the sequencer's schedule. clap reports a clash
+    /// only when it builds the command, so build it here rather than on a
+    /// node's first start.
+    #[test]
+    fn command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn node_and_runtime_flags_parse_together() {
+        let cli = Cli::try_parse_from([
+            "melin-ec-server",
+            "--journal",
+            "node.journal",
+            "--max-orders-per-account",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(cli.server.journal, std::path::Path::new("node.journal"));
+        assert_eq!(cli.startup.max_orders_per_account, 2);
+    }
+}
