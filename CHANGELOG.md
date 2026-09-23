@@ -85,6 +85,14 @@ snapshot from an earlier release is never read.
   fire scheduled work — an order expiry, say — that a journal replay or
   a replica would then not fire. The counters a stats query reports are
   the node's own, read when the query is answered.
+- **Some node log lines and metric descriptions are reworded**
+  *(sequencer)*. No metric, flag or health-endpoint field is renamed, but
+  an alert that matches on message text needs updating: `all replicas
+  disconnected — trading halted` is now `all replicas disconnected —
+  halted, refusing client writes`, and `raft core stopped — control plane
+  down, trading unaffected` now ends `sequencing unaffected`. The
+  per-account limit flags are unchanged: the exchange node now declares
+  them itself, with the same names and defaults.
 - **Rust dependents:** `RequestDecoder::decode` takes `(body,
   permission)` and `ResponseEncoder` returns the length of the body it
   wrote, both as the sequencer now asks *(sequencer)*. The codec's
@@ -112,6 +120,11 @@ snapshot from an earlier release is never read.
   sees `DuplicateRequest`. `melin_journal`'s `encode`, `decode`,
   `batch_append_with_ts` and `JournalEntry` lose their `request_seq`
   *(sequencer)*.
+- **Rust dependents:** `ServerConfig` no longer has `max_orders_per_account`,
+  `max_orders_per_second` or `max_orders_burst` *(sequencer)*. They live on
+  `StartupConfig` alone, which now derives `clap::Args` (flatten it into a
+  command line) and `Default` (the flags' defaults). `melin_app::EncodeReport`
+  is removed *(sequencer)*.
 
 ## [0.17.0] - 2026-09-22
 

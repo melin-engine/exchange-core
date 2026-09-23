@@ -1905,9 +1905,7 @@ fn run_roundtrip_bench(
     let startup = melin_ec_server::StartupConfig {
         accounts: num_accounts,
         instruments: num_instruments,
-        max_orders_per_account: config.max_orders_per_account,
-        max_orders_per_second: config.max_orders_per_second,
-        max_orders_burst: config.max_orders_burst,
+        ..melin_ec_server::StartupConfig::default()
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));

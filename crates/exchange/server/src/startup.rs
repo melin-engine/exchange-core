@@ -23,22 +23,62 @@ use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_ec_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 use melin_server_runtime::StartupEvents;
 
-/// The trading node's startup configuration, built from the command line.
-#[derive(Debug, Clone, Copy)]
+/// The trading node's startup configuration: the node's own flags,
+/// flattened into its command line next to the sequencer runtime's.
+///
+/// `u32` throughout: the counts match the `AccountId` and `Symbol` spaces
+/// they size, and the limits are the engine's own field types.
+///
+/// The field docs are the `--help` text. [`Default`] gives the same values
+/// as the flags' defaults, for a node started without a command line (the
+/// bench's embedded server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]
 pub struct StartupConfig {
-    /// Accounts to size for, and to provision in the synthetic seed.
+    /// Number of accounts to reserve memory for on every start, primary
+    /// or replica. A build with the `synthetic-seed` feature also
+    /// provisions that many funded accounts on a fresh journal, which
+    /// costs O(accounts) (~0.5 s for 1M).
+    #[arg(long, default_value_t = 100_000)]
     pub accounts: u32,
-    /// Instruments to size for, and to register in the synthetic seed.
+    /// Number of instruments to reserve memory for on every start. A
+    /// build with the `synthetic-seed` feature also registers that many
+    /// placeholder instruments on a fresh journal.
+    #[arg(long, default_value_t = 100)]
     pub instruments: u32,
-    /// SEC-03: maximum simultaneously open orders per account. `0` means
-    /// unlimited.
+    /// Maximum open orders (resting limits + pending stops, across all
+    /// instruments) per account (SEC-03). New submissions are rejected
+    /// with `ExceedsMaxOpenOrders` once an account hits this cap. `0`
+    /// means unlimited. Journaled when this node becomes primary, and in
+    /// force on every node from then on.
+    #[arg(long, default_value_t = 10_000)]
     pub max_orders_per_account: u32,
-    /// SEC-04: token-bucket refill rate, orders per second. `0` disables
-    /// the limiter.
+    /// Per-account sustained order-submission rate, orders per second
+    /// (SEC-04). A token bucket refills at this rate; an account that has
+    /// spent its burst is rejected with `ExceedsOrderRate`. `0` disables
+    /// the limiter. Journaled like `--max-orders-per-account`. The
+    /// default suits algorithmic and retail flow; raise it (and the
+    /// burst) for market makers that re-quote faster.
+    #[arg(long, default_value_t = 1_000)]
     pub max_orders_per_second: u32,
-    /// SEC-04: token-bucket capacity (max burst). `0` disables the
-    /// limiter.
+    /// Per-account burst capacity: the most consecutive orders allowed
+    /// after a quiet period (SEC-04). Paired with
+    /// `--max-orders-per-second`; `0` disables the limiter. Journaled
+    /// like `--max-orders-per-account`.
+    #[arg(long, default_value_t = 5_000)]
     pub max_orders_burst: u32,
+}
+
+/// The flags' defaults; `default_matches_the_flags` holds the two together.
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            accounts: 100_000,
+            instruments: 100,
+            max_orders_per_account: 10_000,
+            max_orders_per_second: 1_000,
+            max_orders_burst: 5_000,
+        }
+    }
 }
 
 /// What the node reserves memory for: `ServerApp`'s `Application::Sizing`.
@@ -261,6 +301,49 @@ mod tests {
                 .genesis
                 .iter()
                 .any(|e| matches!(e.event, TradingEvent::SetAccountLimits { .. }))
+        );
+    }
+
+    /// Parses the node's flags alone, as the binary does after its
+    /// runtime flags.
+    #[derive(clap::Parser)]
+    struct Flags {
+        #[command(flatten)]
+        startup: StartupConfig,
+    }
+
+    fn parse(args: &[&str]) -> Result<StartupConfig, clap::Error> {
+        use clap::Parser;
+        Flags::try_parse_from(std::iter::once("melin-ec-server").chain(args.iter().copied()))
+            .map(|f| f.startup)
+    }
+
+    /// A node started without flags and the bench's embedded node, which
+    /// takes `Default`, must run under the same limits.
+    #[test]
+    fn default_matches_the_flags() {
+        assert_eq!(parse(&[]).unwrap(), StartupConfig::default());
+    }
+
+    /// The node now owns these flags; the runtime no longer parses them.
+    #[test]
+    fn limit_flags_parse_into_the_journaled_event() {
+        let startup = parse(&[
+            "--max-orders-per-account",
+            "2",
+            "--max-orders-per-second",
+            "30",
+            "--max-orders-burst",
+            "40",
+        ])
+        .unwrap();
+        assert_eq!(
+            startup.synthetic_startup_events().on_primary,
+            vec![TradingRequest::internal(TradingEvent::SetAccountLimits {
+                max_open_orders_per_account: 2,
+                max_orders_per_second: 30,
+                max_orders_burst: 40,
+            })]
         );
     }
 

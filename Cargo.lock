@@ -1681,7 +1681,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "base64",
  "libc",
@@ -1691,7 +1691,7 @@ dependencies = [
 [[package]]
 name = "melin-client"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1701,7 +1701,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "bindgen",
  "cc",
@@ -1933,7 +1933,7 @@ version = "0.17.0"
 [[package]]
 name = "melin-journal"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1950,12 +1950,12 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 
 [[package]]
 name = "melin-raft"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -1972,7 +1972,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "base64",
  "blake3",
@@ -1998,7 +1998,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2014,7 +2014,7 @@ dependencies = [
 [[package]]
 name = "melin-wire-protocol"
 version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=main#7724085275f17844646bf31021a5b098e2387f8b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#0b0e3b5d9366fce95aca567f3656f73a444ae105"
 
 [[package]]
 name = "memchr"
