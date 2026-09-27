@@ -2276,9 +2276,7 @@ mod tests {
     /// restore as though the extra bytes were not there.
     #[test]
     fn payload_with_bytes_after_the_last_section_errors() {
-        let mut exchange = Exchange::new();
-        exchange.set_max_orders_per_second(1_000, 5);
-        let mut payload = encode_exchange_payload(&exchange);
+        let mut payload = encode_exchange_payload(&Exchange::new());
         payload.push(0);
         match decode_exchange_payload(&payload) {
             Err(SnapshotDecodeError::Corrupt { reason }) => {
