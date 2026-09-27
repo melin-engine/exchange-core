@@ -94,6 +94,15 @@ snapshot from an earlier release is never read.
   disconnected — trading halted` is now `all replicas disconnected —
   halted, refusing client writes`, and `raft core stopped — control plane
   down, trading unaffected` now ends `sequencing unaffected`.
+- **A replication key can no longer connect as a client.** It authorizes
+  streaming between nodes and nothing else. The trading port refuses it
+  during the handshake *(sequencer)*, and so does the event feed
+  (`--event-bind`), which used to admit any listed key and stream every
+  execution to it. A client or subscriber that used a replication key
+  needs a key of its own, under a client role.
+- **An `authorized_keys` file that lists a key twice no longer loads**
+  *(sequencer)*. The last line used to win silently. The node refuses to
+  start and names the line, so remove the duplicate before upgrading.
 - **Rust dependents:** `RequestDecoder::decode` takes `(body,
   permission)` and `ResponseEncoder` returns the length of the body it
   wrote, both as the sequencer now asks *(sequencer)*. The codec's
@@ -126,6 +135,14 @@ snapshot from an earlier release is never read.
   `StartupConfig` alone, which now derives `clap::Args` (flatten it into a
   command line) and `Default` (the flags' defaults). `melin_app::EncodeReport`
   is removed *(sequencer)*.
+
+### Fixed
+
+- **A snapshot with bytes after the end of the exchange state is
+  refused.** Extra bytes mean it was written to a layout this release does
+  not know, so the state it would restore is not the one saved. A node
+  refuses to start from it, as from any corrupt snapshot, and the shadow
+  stage's copy of the engine fails the same way.
 
 ## [0.17.0] - 2026-09-22
 

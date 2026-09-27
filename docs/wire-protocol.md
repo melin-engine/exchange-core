@@ -609,9 +609,9 @@ Permission levels are assigned per public key in the `authorized_keys` file and 
 - Deposit, Withdraw
 
 **Replication** (require `Replication`):
-- Used for replica-to-primary connections only. Not available for client operations.
+- Used for replica-to-primary connections only. The trading port and the event publisher's port refuse a replication key during the handshake, so it cannot open a client connection at all.
 
-**Universal operations** (any permission level):
+**Universal operations** (any client role — every level but `Replication`):
 - Heartbeat, and Subscribe on the event publisher's port
 
 Requests that fail the permission check are dropped on the reader thread and never reach the matching engine.
@@ -627,7 +627,7 @@ readonly DDDD...base64...= monitoring
 replication EEEE...base64...= replica-1
 ```
 
-Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. If a key appears multiple times, the last entry wins.
+Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. Each key is listed once: a file that lists a key twice, under the same role or another, is refused, and the node does not start. The error names the second line.
 
 ---
 
