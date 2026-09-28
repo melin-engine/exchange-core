@@ -1680,8 +1680,8 @@ dependencies = [
 
 [[package]]
 name = "melin-app"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "base64",
  "libc",
@@ -1690,8 +1690,8 @@ dependencies = [
 
 [[package]]
 name = "melin-client"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1700,8 +1700,8 @@ dependencies = [
 
 [[package]]
 name = "melin-dpdk"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "bindgen",
  "cc",
@@ -1934,8 +1934,8 @@ version = "0.18.0"
 
 [[package]]
 name = "melin-journal"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1951,13 +1951,13 @@ dependencies = [
 
 [[package]]
 name = "melin-pipeline"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 
 [[package]]
 name = "melin-raft"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -1973,8 +1973,8 @@ dependencies = [
 
 [[package]]
 name = "melin-server-runtime"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "base64",
  "blake3",
@@ -1999,8 +1999,8 @@ dependencies = [
 
 [[package]]
 name = "melin-transport-core"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2015,8 +2015,8 @@ dependencies = [
 
 [[package]]
 name = "melin-wire-protocol"
-version = "0.17.0"
-source = "git+https://github.com/melin-engine/melin.git?branch=feat%2Fclient-roles#e873a18e54429bb2560ab41b1b3169bc4bd97f20"
+version = "0.18.0"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#9b72ddcd90e147f092f6befda5eda13d1b0bf219"
 
 [[package]]
 name = "memchr"
