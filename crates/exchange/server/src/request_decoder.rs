@@ -5,10 +5,11 @@
 //! so the server runtime never needs to pattern-match on
 //! application-shaped variants.
 
-use melin_app::auth::Permission;
+use melin_app::auth::ClientRole;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::Request;
+use melin_ec_protocol::role::{ExchangeRole, RequestCategory};
 use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_wire_protocol::error::ProtocolError;
 
@@ -22,29 +23,34 @@ const _: () = assert!(
 
 /// Decoder for the trading wire protocol.
 ///
-/// Zero-sized. The runtime owns an `Arc<dyn RequestDecoder<...>>`;
-/// constructing one is `Arc::new(RequestDecoder)`.
+/// Zero-sized. The runtime holds it with its role type erased, as an
+/// `Arc<dyn ErasedDecoder<...>>`; the server hands it over by value.
 #[derive(Debug, Clone, Copy)]
 pub struct RequestDecoder;
 
 impl RequestDecoderTrait for RequestDecoder {
     type Event = TradingRequest;
+    type Role = ExchangeRole;
 
     /// The runtime has stripped its tag; the body opens with the request's
     /// kind, then its sequence, which travels on into the event: the
     /// engine's idempotency check reads it from there, in `apply`.
-    fn decode(&self, body: &[u8], permission: Permission) -> Decoded<TradingRequest> {
+    fn decode(&self, body: &[u8], role: ClientRole<ExchangeRole>) -> Decoded<TradingRequest> {
         let (request_seq, request) = match codec::decode_request_body(body) {
             Ok(pair) => pair,
             Err(e) => return Decoded::DecodeError(protocol_error_reason(&e)),
         };
 
-        if should_filter(&request) {
-            return Decoded::Filter;
+        // The protocol's access rule decides; this only enforces it.
+        let category = request.category();
+        if !category.admits(role) {
+            return Decoded::PermissionDenied(denial_reason(category));
         }
 
-        if let Err(reason) = check_permission(&request, permission) {
-            return Decoded::PermissionDenied(reason);
+        // Heartbeats and subscription control are the node's business:
+        // never published to the pipeline.
+        if category == RequestCategory::Connection {
+            return Decoded::Filter;
         }
 
         Decoded::Permitted(TradingRequest {
@@ -69,33 +75,18 @@ fn protocol_error_reason(e: &ProtocolError) -> &'static str {
     }
 }
 
-/// Connection-level requests the runtime never publishes to the
-/// pipeline: heartbeats and subscription control.
+/// The reason carried by `Decoded::PermissionDenied` for a request of
+/// `category` that its connection's role may not send. The reader's debug
+/// log surfaces it.
 #[inline]
-fn should_filter(request: &Request) -> bool {
-    matches!(request, Request::Heartbeat | Request::Subscribe { .. })
-}
-
-/// Permission model — separation of duties:
-/// - Operator: exchange configuration (instruments, risk, circuit breakers, fees, EOD, stats)
-/// - Custodian: fund management (deposit, withdraw)
-/// - Trader: order submission and cancellation
-/// - ReadOnly: rejected here for anything that isn't filtered out above
-///   (heartbeats / handshakes / subscribe never reach this function;
-///   any other request from a ReadOnly connection falls into the final
-///   clause and is denied for lacking `can_trade`).
-#[inline]
-fn check_permission(request: &Request, permission: Permission) -> Result<(), &'static str> {
-    if request.requires_operator() && !permission.is_operator() {
-        return Err("non-operator attempted operator command");
+fn denial_reason(category: RequestCategory) -> &'static str {
+    match category {
+        RequestCategory::Trading => "non-trader attempted trading",
+        RequestCategory::FundManagement => "non-custodian attempted fund management",
+        RequestCategory::Administration => "non-operator attempted operator command",
+        // Every client role may send these today; named for completeness.
+        RequestCategory::Connection => "role may not send connection messages",
     }
-    if request.is_fund_management() && !permission.can_manage_funds() {
-        return Err("non-custodian attempted fund management");
-    }
-    if !request.requires_operator() && !request.is_fund_management() && !permission.can_trade() {
-        return Err("connection lacks trading permission");
-    }
-    Ok(())
 }
 
 /// Per-variant `Request -> TradingEvent` mapping. Caller must have
@@ -184,9 +175,14 @@ mod tests {
         buf
     }
 
+    const OPERATOR: ClientRole<ExchangeRole> = ClientRole::Operator;
+    const TRADER: ClientRole<ExchangeRole> = ClientRole::App(ExchangeRole::Trader);
+    const CUSTODIAN: ClientRole<ExchangeRole> = ClientRole::App(ExchangeRole::Custodian);
+    const READONLY: ClientRole<ExchangeRole> = ClientRole::App(ExchangeRole::ReadOnly);
+
     /// Decode as the runtime would call it.
-    fn decode(body: &[u8], permission: Permission) -> Decoded<TradingRequest> {
-        RequestDecoder.decode(body, permission)
+    fn decode(body: &[u8], role: ClientRole<ExchangeRole>) -> Decoded<TradingRequest> {
+        RequestDecoder.decode(body, role)
     }
 
     fn order() -> Order {
@@ -205,10 +201,7 @@ mod tests {
     #[test]
     fn heartbeat_is_filtered() {
         let bytes = encode(&Request::Heartbeat, 0);
-        assert!(matches!(
-            decode(&bytes, Permission::Trader),
-            Decoded::Filter
-        ));
+        assert!(matches!(decode(&bytes, TRADER), Decoded::Filter));
     }
 
     #[test]
@@ -220,10 +213,7 @@ mod tests {
             },
             0,
         );
-        assert!(matches!(
-            decode(&bytes, Permission::Trader),
-            Decoded::Filter
-        ));
+        assert!(matches!(decode(&bytes, TRADER), Decoded::Filter));
     }
 
     #[test]
@@ -235,7 +225,7 @@ mod tests {
             },
             42,
         );
-        match decode(&bytes, Permission::Trader) {
+        match decode(&bytes, TRADER) {
             Decoded::Permitted(TradingRequest { request_seq, event }) => {
                 assert_eq!(request_seq, 42, "the frame's sequence rides in the event");
                 assert!(matches!(event, TradingEvent::SubmitOrder { .. }));
@@ -256,7 +246,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            decode(&bytes, Permission::ReadOnly),
+            decode(&bytes, READONLY),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -273,10 +263,7 @@ mod tests {
             },
             7,
         );
-        assert!(matches!(
-            decode(&bytes, Permission::Operator),
-            Decoded::Permitted(_)
-        ));
+        assert!(matches!(decode(&bytes, OPERATOR), Decoded::Permitted(_)));
     }
 
     #[test]
@@ -292,7 +279,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            decode(&bytes, Permission::Trader),
+            decode(&bytes, TRADER),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -307,10 +294,7 @@ mod tests {
             },
             3,
         );
-        assert!(matches!(
-            decode(&bytes, Permission::Custodian),
-            Decoded::Permitted(_)
-        ));
+        assert!(matches!(decode(&bytes, CUSTODIAN), Decoded::Permitted(_)));
     }
 
     #[test]
@@ -324,17 +308,16 @@ mod tests {
             0,
         );
         assert!(matches!(
-            decode(&bytes, Permission::Trader),
+            decode(&bytes, TRADER),
             Decoded::PermissionDenied(_)
         ));
     }
 
     #[test]
     fn query_stats_is_permitted_and_flagged() {
-        // QueryStats is an operator-only request — see
-        // `Request::requires_operator`.
+        // QueryStats is an operator-only request: see `Request::category`.
         let bytes = encode(&Request::QueryStats, 1);
-        match decode(&bytes, Permission::Operator) {
+        match decode(&bytes, OPERATOR) {
             Decoded::Permitted(request) => {
                 assert!(matches!(request.event, TradingEvent::QueryStats));
                 assert!(request.is_query());
@@ -348,21 +331,96 @@ mod tests {
         // A known kind, cut short inside the seq behind it.
         let body = encode(&Request::Heartbeat, 0);
         assert!(matches!(
-            decode(&body[..8], Permission::Trader),
+            decode(&body[..8], TRADER),
             Decoded::DecodeError("truncated frame")
         ));
         // Nothing at all: the runtime hands on an empty body as it is.
         assert!(matches!(
-            decode(&[], Permission::Trader),
+            decode(&[], TRADER),
             Decoded::DecodeError("truncated frame")
         ));
         // A kind this codec does not know, over a well-formed seq.
         let mut unknown = [0u8; 9];
         unknown[0] = 0xFF;
         assert!(matches!(
-            decode(&unknown, Permission::Trader),
+            decode(&unknown, TRADER),
             Decoded::DecodeError("unknown request kind")
         ));
+    }
+
+    /// The full path an access decision takes on a node: a token in the
+    /// keys file, the role the runtime carries for it, turned back into an
+    /// [`ExchangeRole`] by the runtime's erased decoder, and gated here.
+    /// Pins that existing key files keep their meaning and that the
+    /// decoder enforces the protocol's rule, one request per category (the
+    /// rule itself, per request, is pinned in `melin-ec-protocol`).
+    #[test]
+    fn each_keys_file_role_may_send_exactly_its_own_category() {
+        use base64::Engine;
+        use melin_app::auth::AuthorizedKeys;
+        use melin_app::decoder::ErasedDecoder;
+
+        let operator_command = encode(&Request::EndOfDay, 1);
+        let fund_management = encode(
+            &Request::Withdraw {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: 5,
+            },
+            1,
+        );
+        let trading = encode(
+            &Request::CancelAll {
+                account: AccountId(1),
+            },
+            1,
+        );
+        let heartbeat = encode(&Request::Heartbeat, 1);
+
+        let categories = [
+            (&operator_command, RequestCategory::Administration),
+            (&fund_management, RequestCategory::FundManagement),
+            (&trading, RequestCategory::Trading),
+        ];
+
+        let listed = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        // Each token, and whether it may send each of `categories`.
+        for (token, permitted) in [
+            ("operator", [true, false, false]),
+            ("custodian", [false, true, false]),
+            ("trader", [false, false, true]),
+            ("readonly", [false, false, false]),
+        ] {
+            let keys = AuthorizedKeys::parse::<ExchangeRole>(&format!("{token} {listed} k\n"))
+                .unwrap_or_else(|e| panic!("'{token}' must load: {e}"));
+            assert!(RequestDecoder.matches_keys(&keys));
+            let role = keys
+                .lookup(&[0u8; 32])
+                .unwrap()
+                .client()
+                .unwrap_or_else(|| panic!("'{token}' must be a client role"));
+
+            for ((body, category), permitted) in categories.into_iter().zip(permitted) {
+                match RequestDecoder.decode_erased(body, role) {
+                    Decoded::Permitted(_) => assert!(permitted, "{token} {category:?}"),
+                    Decoded::PermissionDenied(reason) => {
+                        assert!(!permitted, "{token} {category:?}");
+                        assert_eq!(reason, denial_reason(category));
+                    }
+                    other => panic!("{token} {category:?}: {}", debug_variant(&other)),
+                }
+            }
+            // Connection-level messages pass whatever the role.
+            assert!(matches!(
+                RequestDecoder.decode_erased(&heartbeat, role),
+                Decoded::Filter
+            ));
+        }
+
+        // A replication key never gets as far as the decoder.
+        let keys =
+            AuthorizedKeys::parse::<ExchangeRole>(&format!("replication {listed} k\n")).unwrap();
+        assert_eq!(keys.lookup(&[0u8; 32]).unwrap().client(), None);
     }
 
     fn debug_variant<E: AppEvent>(d: &Decoded<E>) -> &'static str {

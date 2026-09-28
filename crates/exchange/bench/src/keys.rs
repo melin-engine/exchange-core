@@ -32,7 +32,7 @@ pub fn derive_client_key(master: &SigningKey, client_id: u32) -> SigningKey {
     SigningKey::from_bytes(&seed)
 }
 
-/// Format an `authorized_keys` line for `trader` permission, base64-
+/// Format an `authorized_keys` line for the `trader` role, base64-
 /// encoding the verifying key in the format the server's auth loader
 /// expects.
 pub fn authorized_keys_line(key: &SigningKey, label: &str) -> String {

@@ -1456,7 +1456,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use melin_ec_types::types::{SelfTradeProtection, Side, TimeInForce};
 
@@ -1464,7 +1464,10 @@ mod tests {
         NonZeroU64::new(v).unwrap()
     }
 
-    fn make_requests() -> Vec<Request> {
+    /// At least one of every request kind, with the variable-width ones in
+    /// several shapes. Also the sample the access-category test in
+    /// `message` walks.
+    pub(crate) fn make_requests() -> Vec<Request> {
         vec![
             Request::SubmitOrder {
                 symbol: Symbol(1),

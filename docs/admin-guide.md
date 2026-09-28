@@ -9,16 +9,18 @@ A companion tool, `melin-ec-keygen`, generates the Ed25519 keypairs required for
 Before connecting, you need an Ed25519 keypair. The `melin-ec-keygen` binary creates one:
 
 ```sh
-melin-ec-keygen <name> <permission>
+melin-ec-keygen <name> <role>
 ```
 
-**Permissions** are one of:
+**Roles** are one of:
 
-- `operator` -- exchange configuration (instruments, risk limits, circuit breakers, fee schedules, lifecycle management)
-- `trader` -- trading operations (submit, cancel, cancel-replace, cancel-all)
+- `operator` -- exchange configuration (instruments, risk limits, circuit breakers, fee schedules, lifecycle management, stats)
+- `trader` -- trading operations (submit, cancel, cancel-replace, cancel-all, position and request-sequence queries), for any account
 - `custodian` -- fund management (deposit, withdraw)
-- `readonly` -- observation only (heartbeats)
+- `readonly` -- observation only (heartbeats and the event feed)
 - `replication` -- replica-to-primary connections only
+
+The tool checks the role the same way the server reads its `authorized_keys` file, and writes nothing if the server would refuse it. See [Roles](wire-protocol.md#roles) for exactly what each role may send.
 
 **Example:**
 
@@ -94,28 +96,28 @@ The screen is divided into three regions:
 
 The main action menu lists all operations, grouped by category:
 
-| # | Action | Category | Permission |
-|---|--------|----------|------------|
-| 0 | Limit Buy | Trading | Trader |
-| 1 | Limit Sell | Trading | Trader |
-| 2 | Market Buy | Trading | Trader |
-| 3 | Market Sell | Trading | Trader |
-| 4 | Stop Buy | Trading | Trader |
-| 5 | Stop Sell | Trading | Trader |
-| 6 | Stop-Limit Buy | Trading | Trader |
-| 7 | Stop-Limit Sell | Trading | Trader |
-| 8 | Cancel Order | Cancel / Amend | Trader |
-| 9 | Cancel All | Cancel / Amend | Trader |
-| 10 | Cancel-Replace | Cancel / Amend | Trader |
-| 11 | Add Instrument | Admin | Operator |
-| 12 | Deposit | Admin | Custodian |
-| 13 | Set Risk Limits | Admin | Operator |
-| 14 | Set Circuit Breaker | Admin | Operator |
-| 15 | Set Fee Schedule | Admin | Operator |
-| 16 | End of Day | Admin | Operator |
-| 17 | Disable Instrument | Lifecycle | Operator |
-| 18 | Enable Instrument | Lifecycle | Operator |
-| 19 | Remove Instrument | Lifecycle | Operator |
+| # | Action | Category | Role |
+|---|--------|----------|------|
+| 0 | Limit Buy | Trading | `trader` |
+| 1 | Limit Sell | Trading | `trader` |
+| 2 | Market Buy | Trading | `trader` |
+| 3 | Market Sell | Trading | `trader` |
+| 4 | Stop Buy | Trading | `trader` |
+| 5 | Stop Sell | Trading | `trader` |
+| 6 | Stop-Limit Buy | Trading | `trader` |
+| 7 | Stop-Limit Sell | Trading | `trader` |
+| 8 | Cancel Order | Cancel / Amend | `trader` |
+| 9 | Cancel All | Cancel / Amend | `trader` |
+| 10 | Cancel-Replace | Cancel / Amend | `trader` |
+| 11 | Add Instrument | Admin | `operator` |
+| 12 | Deposit | Admin | `custodian` |
+| 13 | Set Risk Limits | Admin | `operator` |
+| 14 | Set Circuit Breaker | Admin | `operator` |
+| 15 | Set Fee Schedule | Admin | `operator` |
+| 16 | End of Day | Admin | `operator` |
+| 17 | Disable Instrument | Lifecycle | `operator` |
+| 18 | Enable Instrument | Lifecycle | `operator` |
+| 19 | Remove Instrument | Lifecycle | `operator` |
 
 Navigate with arrow keys and press Enter to start the corresponding wizard.
 

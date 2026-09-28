@@ -209,9 +209,9 @@ echo ""
 # --- 3. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-ec-keygen" repl_key trader
-# The DPDK primary now authenticates connecting replicas: the key must carry
-# Replication permission (the primary rejects Trader/Operator/etc.).
+"$PROJECT_DIR/target/release/melin-ec-keygen" repl_key replication
+# The DPDK primary authenticates connecting replicas: the key must be listed
+# under the `replication` role (the primary refuses every other role).
 echo "replication $(cat repl_key.pub | tr -d '\n') repl" > authorized_keys
 echo "  Generated repl_key.key + authorized_keys"
 echo ""

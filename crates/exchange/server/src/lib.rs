@@ -11,7 +11,8 @@
 //!   the genesis seed and account limits the runtime journals, and the
 //!   sizing it hands to `prefault`.
 //! - [`request_decoder::RequestDecoder`] — wire-`Request` →
-//!   `TradingRequest` decoder.
+//!   `TradingRequest` decoder, enforcing the access rule of
+//!   `melin_ec_protocol::role`.
 //! - [`response_encoder::ResponseEncoder`] —
 //!   `ExecutionReport` / `QueryResponse` → wire encoder.
 //! - [`event_publisher`] — market-data firehose.

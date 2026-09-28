@@ -74,7 +74,7 @@ Logical errors, security gaps, and design concerns found during review of all do
 
 ### 6. Authorized keys loaded once at startup — no hot reload
 
-**Location**: `docs/operations.md` (startup sequence), `docs/wire-protocol.md` (permission model)
+**Location**: `docs/operations.md` (startup sequence), `docs/wire-protocol.md` (roles)
 
 **Description**: The `authorized_keys` file is loaded at server startup and cached in memory. There is no mechanism to reload it without restarting the server.
 

@@ -1,9 +1,11 @@
-//! Trading-shaped wire protocol: `Request` / `Response` enums and the
-//! binary codec. Framing, transport listeners, and the protocol error
-//! type live in `melin-wire-protocol`.
+//! Trading-shaped wire protocol: `Request` / `Response` enums, the binary
+//! codec, and the access model deciding which role may send which
+//! request. Framing, transport listeners, and the protocol error type
+//! live in `melin-wire-protocol`.
 
 pub mod codec;
 pub mod message;
+pub mod role;
 
 /// Re-export engine types that clients need to construct requests and
 /// interpret responses, so they don't need a direct dependency on the

@@ -73,7 +73,7 @@ fn write_auth_keys_multi(
             &base64::engine::general_purpose::STANDARD,
             key.verifying_key().to_bytes(),
         );
-        // Use trader permission so orders can be submitted.
+        // List the key under the `trader` role so it can submit orders.
         content.push_str(&format!("trader {pub_key_b64} test-key-{i}\n"));
     }
     // Add operator key (used for authenticated promotion).
