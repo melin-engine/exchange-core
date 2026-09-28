@@ -336,18 +336,26 @@ fn wait_for_policy_degraded(addr: SocketAddr, expected: u32, timeout: Duration) 
 /// prefix. Include labels and the trailing space in `line_prefix`, e.g.
 /// `melin_replica_catching_up{slot="0"} `.
 fn fetch_metric_u64(addr: SocketAddr, line_prefix: &str) -> Option<u64> {
+    metric_value(&scrape_metrics(addr)?, line_prefix)
+}
+
+/// Scrape the Prometheus endpoint once and return the response.
+fn scrape_metrics(addr: SocketAddr) -> Option<String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
     let mut body = Vec::new();
     stream.read_to_end(&mut body).ok()?;
-    let text = std::str::from_utf8(&body).ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix(line_prefix) {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
+    String::from_utf8(body).ok()
+}
+
+/// The value on the line of a scrape that starts with `line_prefix`
+/// (see [`fetch_metric_u64`] for the prefix's shape).
+fn metric_value(scrape: &str, line_prefix: &str) -> Option<u64> {
+    scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(line_prefix))
+        .and_then(|rest| rest.trim().parse().ok())
 }
 
 /// Poll a metric until `pred(value)` holds, or panic on timeout with
@@ -374,45 +382,111 @@ fn wait_metric(
     }
 }
 
-/// Wait until `replicas` replicas are connected and that many replica
-/// slots have acked the primary's journal up to its current sequence.
-///
-/// The health line's lag is not enough for this: it covers only the
-/// slots the primary counts as engaged, and a replica that has just
-/// attached — a replacement catching up from its journal, or by snapshot
-/// transfer — is not one of them until its catch-up settles. The lag can
-/// read 0 from the other replica alone, and a lag that blips non-zero
-/// and back can be that replica too. Naming the slots removes the
-/// ambiguity: a disengaged slot's ack gauge is zeroed, so a slot acked up
-/// to the sequence is a live replica that holds everything. The sequence
-/// is read before the acks, so ticks journaled between the two reads
-/// cannot fail the comparison.
+/// Wait until exactly `replicas` replicas are connected and each has
+/// persisted every request answered so far. See
+/// [`wait_connected_replicas_persisted`].
 fn wait_every_replica_acked(primary_health: SocketAddr, replicas: u64, timeout: Duration) {
+    wait_connected_replicas_persisted(primary_health, Some(replicas), timeout);
+}
+
+/// The primary's replication positions, all from one metrics scrape.
+#[derive(Debug)]
+struct ReplicationProgress {
+    /// The primary's own durable journal position.
+    journal: u64,
+    /// Replicas past authentication, still catching up or live.
+    connected: u64,
+    /// Per slot, the position the replica has persisted; 0 while no
+    /// replica holds the slot or its catch-up has not settled.
+    persisted: [u64; 2],
+    /// Per slot, the position the replica has taken into memory.
+    in_memory: [u64; 2],
+}
+
+impl ReplicationProgress {
+    fn fetch(primary_health: SocketAddr) -> Option<Self> {
+        let scrape = scrape_metrics(primary_health)?;
+        let slot =
+            |name: &str, slot: u8| metric_value(&scrape, &format!("{name}{{slot=\"{slot}\"}} "));
+        Some(Self {
+            journal: metric_value(&scrape, "melin_journal_sequence ")?,
+            connected: metric_value(&scrape, "melin_replicas_connected ")?,
+            persisted: [
+                slot("melin_replica_acked_sequence", 0)?,
+                slot("melin_replica_acked_sequence", 1)?,
+            ],
+            in_memory: [
+                slot("melin_replica_in_memory_sequence", 0)?,
+                slot("melin_replica_in_memory_sequence", 1)?,
+            ],
+        })
+    }
+
+    /// The furthest position any node holds, on disk or in memory.
+    ///
+    /// Every request a client has been answered for sits at or below it,
+    /// whatever the ack policy. The primary's own journal position is not
+    /// enough: the primary streams each batch to its replicas before its
+    /// disk thread syncs it, and under `disk+ram` a replica's disk can
+    /// carry the answer, so a loaded primary can answer a request its own
+    /// journal does not hold yet.
+    fn high_water(&self) -> u64 {
+        self.persisted
+            .into_iter()
+            .chain(self.in_memory)
+            .fold(self.journal, u64::max)
+    }
+
+    /// How many slots have persisted everything up to `target`.
+    fn slots_holding(&self, target: u64) -> u64 {
+        self.persisted.iter().filter(|&&p| p >= target).count() as u64
+    }
+}
+
+/// Wait until the replicas connected to the primary — exactly
+/// `replicas` of them when given, at least one otherwise — have each
+/// persisted every request answered before the call, so that any of them
+/// can be promoted without losing one.
+///
+/// The target is the high water on entry (see
+/// [`ReplicationProgress::high_water`]), fixed so that ticks journaled
+/// later are not waited for. The slots are counted by name rather than
+/// through the health line's lag, which covers only the slots the primary
+/// counts as engaged: a replica that has just attached is not one of them
+/// until its catch-up settles, so the lag can read 0 from another replica
+/// alone. A slot whose replica has gone is zeroed together with the
+/// connected count, so a slot at the target is a live replica holding
+/// everything.
+fn wait_connected_replicas_persisted(
+    primary_health: SocketAddr,
+    replicas: Option<u64>,
+    timeout: Duration,
+) {
     let start = Instant::now();
-    let snapshot = || {
-        let seq = query_health(primary_health).ok().map(|(_, seq, _, _)| seq);
-        let connected = fetch_metric_u64(primary_health, "melin_replicas_connected ");
-        let acked = [
-            fetch_metric_u64(primary_health, "melin_replica_acked_sequence{slot=\"0\"} "),
-            fetch_metric_u64(primary_health, "melin_replica_acked_sequence{slot=\"1\"} "),
-        ];
-        (seq, connected, acked)
+    let timed_out = |last: Option<ReplicationProgress>, what: &str| {
+        if start.elapsed() >= timeout {
+            panic!("timed out waiting for {what}; last progress: {last:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let target = loop {
+        match ReplicationProgress::fetch(primary_health) {
+            Some(progress) => break progress.high_water(),
+            None => timed_out(None, "the primary's replication metrics"),
+        }
     };
     loop {
-        if let (Some(seq), Some(connected), acked) = snapshot()
-            && connected == replicas
-            && acked.iter().flatten().filter(|&&a| a >= seq).count() as u64 >= replicas
+        let progress = ReplicationProgress::fetch(primary_health);
+        if let Some(p) = &progress
+            && replicas.map_or(p.connected >= 1, |n| p.connected == n)
+            && p.slots_holding(target) >= p.connected
         {
             return;
         }
-        if start.elapsed() >= timeout {
-            panic!(
-                "timed out waiting for {replicas} replicas to ack the primary's journal; \
-                 last (journal_seq, connected, acked) = {:?}",
-                snapshot()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        timed_out(
+            progress,
+            &format!("{replicas:?} connected replicas to persist through {target}"),
+        );
     }
 }
 
@@ -1008,18 +1082,10 @@ impl TestCluster {
         connect_with_timeout(self.primary.client_addr, &self.key)
     }
 
-    /// Wait for replication lag to reach 0.
+    /// Wait until the attached replica has persisted every request
+    /// answered so far.
     fn wait_replicated(&self) {
-        let start = Instant::now();
-        loop {
-            if let Ok((_, _, 0, _)) = query_health(self.primary.health_addr) {
-                return;
-            }
-            if start.elapsed() > Duration::from_secs(10) {
-                panic!("replication lag did not reach 0 within 10s");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_connected_replicas_persisted(self.primary.health_addr, None, Duration::from_secs(10));
     }
 
     /// SIGKILL the primary and promote the replica. Returns a client
@@ -1337,10 +1403,8 @@ fn recovered_primary_ack_gate_holds() {
 
     // The primary is a *new* process, so its `replicas_connected` gauge
     // starts at 0 and cannot be satisfied by the dead replica's socket —
-    // `>= 1` here means the restarted replica genuinely attached. The
-    // `wait_replicated` below is not a substitute: the primary reports
-    // lag only for engaged slots, so it returns immediately and vacuously
-    // while nothing is attached.
+    // `>= 1` here means the restarted replica genuinely attached. It gets
+    // the reconnect its own budget, apart from `wait_replicated`'s.
     wait_for_replicas(cluster.primary.health_addr, 1, Duration::from_secs(30));
     cluster.wait_replicated();
 
@@ -1460,10 +1524,9 @@ fn replica_reconnects_after_primary_restart_without_journal_wipe() {
     // The replica was never restarted: its journal file still exists, and
     // its in-process pipeline still owns the writer. Before the fix this
     // reconnect would fail with `AlreadyExists` from the fresh-journal
-    // creation path and replication lag would never converge. Waiting on
-    // the *new* primary's gauge is what proves the reconnect happened —
-    // `wait_replicated` alone is vacuous while no slot is engaged, so it
-    // would report success against a replica that never came back.
+    // creation path and replication would never converge. Waiting on the
+    // *new* primary's gauge is what proves the reconnect happened, with a
+    // budget sized for the replica's reconnect backoff.
     wait_for_replicas(cluster.primary.health_addr, 1, Duration::from_secs(30));
     cluster.wait_replicated();
 
@@ -2134,17 +2197,10 @@ impl DualCluster {
         connect_with_timeout(self.primary.client_addr, &self.key)
     }
 
+    /// Wait until every attached replica, however many are left, has
+    /// persisted every request answered so far.
     fn wait_replicated(&self) {
-        let start = Instant::now();
-        loop {
-            if let Ok((_, _, 0, _)) = query_health(self.primary.health_addr) {
-                return;
-            }
-            if start.elapsed() > Duration::from_secs(10) {
-                panic!("replication lag did not reach 0 within 10s");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_connected_replicas_persisted(self.primary.health_addr, None, Duration::from_secs(10));
     }
 
     fn kill_primary(&mut self) {
@@ -3216,23 +3272,8 @@ fn snapshot_transfer_when_archives_purged() {
     );
 
     // Make sure orders 20-21 (the post-transfer traffic above) have
-    // durably reached the replica before the primary goes away: capture
-    // the primary's tail, then wait for replication lag 0 at-or-past it.
-    let (_, tail_after_orders, _, _) =
-        query_health(primary2.health_addr).expect("health after post-transfer orders");
-    let start = Instant::now();
-    loop {
-        if let Ok((_, journal_seq, lag, _)) = query_health(primary2.health_addr)
-            && lag == 0
-            && journal_seq >= tail_after_orders
-        {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("replica never drained post-transfer orders (lag != 0)");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // durably reached the replica before the primary goes away.
+    wait_connected_replicas_persisted(primary2.health_addr, None, Duration::from_secs(30));
     drop(client2);
 
     // ----- Promote the replica and interrogate ITS state -----
@@ -3466,19 +3507,8 @@ fn rotation_soak_under_load() {
         next_id += per_round;
     }
 
-    // Wait for replication lag = 0 so all events are durable on both nodes.
-    let start = Instant::now();
-    loop {
-        let h = query_health(primary.health_addr);
-        if let Ok((_, _, 0, _)) = h {
-            break;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "replication lag did not reach 0; last health = {h:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Wait until all events are durable on both nodes.
+    wait_connected_replicas_persisted(primary.health_addr, None, Duration::from_secs(30));
 
     // Clean shutdown via SIGINT.
     drop(client);
@@ -3740,7 +3770,7 @@ fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
 
     // Stop the sampler before `wait_replicated` so the metrics
     // endpoint isn't being hammered while the test loop is polling
-    // it for the lag-zero condition. The sampler shares the
+    // it for the replicated condition. The sampler shares the
     // single-threaded HTTP server with `query_health` and under
     // concurrent test load that contention has shown up as a
     // wait_replicated timeout.
@@ -4100,17 +4130,7 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
             |v| v == 0,
         );
     }
-    let start = Instant::now();
-    loop {
-        if let Ok((_, _, 0, _)) = query_health(primary_health) {
-            break;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "replication lag did not reach 0 after load stopped"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_every_replica_acked(primary_health, 2, Duration::from_secs(30));
 
     // Clean shutdown so the dense walk sees fully-drained journals.
     unsafe {
