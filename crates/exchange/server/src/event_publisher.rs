@@ -920,7 +920,8 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
-        let keys = Arc::new(AuthorizedKeys::parse::<crate::role::ExchangeRole>("").unwrap());
+        let keys =
+            Arc::new(AuthorizedKeys::parse::<melin_ec_protocol::role::ExchangeRole>("").unwrap());
         let handle = std::thread::Builder::new()
             .name("test-publisher".into())
             .spawn(move || {

@@ -1,20 +1,27 @@
 //! Wire message types for the trading protocol.
 //!
-//! Includes both trading operations (submit/cancel) and administrative
-//! commands (add instrument, deposit, set risk limits). Administrative
-//! commands require the `operator` role and are gated on the reader thread.
+//! Includes trading operations (submit/cancel), fund management
+//! (deposit/withdraw) and administrative commands (add instrument, set risk
+//! limits). Each request belongs to one [`RequestCategory`], which decides
+//! the roles that may send it (see [`crate::role`]); the node checks it on
+//! the reader thread.
 
 use melin_ec_types::types::{
     AccountBalance, AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule,
     InstrumentSpec, Order, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
 };
 
+use crate::role::RequestCategory;
+
 pub use melin_wire_protocol::control::ConnectionId;
 
 /// Client → server request.
+///
+/// The section comments below name the role that may send each request;
+/// [`Request::category`] is what the node enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
-    // --- Trading operations (Admin + Trader) ---
+    // --- Trading operations (trader) ---
     /// Submit an order for matching.
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
@@ -37,7 +44,7 @@ pub enum Request {
         new_quantity: Quantity,
     },
 
-    // --- Administrative operations (Admin only) ---
+    // --- Administrative operations (operator; Deposit and Withdraw: custodian) ---
     /// Register a new instrument with its base/quote currency pair.
     AddInstrument { spec: InstrumentSpec },
     /// Credit funds to an account. Used for initial seeding and
@@ -83,14 +90,14 @@ pub enum Request {
     /// instrument is disabled and has no resting orders.
     RemoveInstrument { symbol: Symbol },
 
-    // --- Query operations (Admin only) ---
+    // --- Query operations (operator) ---
     /// Request a snapshot of server stats (connections, throughput, book
     /// depth, balances). Tag-only, no payload. Flows through the pipeline
     /// like any other request so the matching stage can read Exchange state
     /// without concurrency issues.
     QueryStats,
 
-    // --- Control messages (all permission levels) ---
+    // --- Control messages (any client role) ---
     /// Keepalive heartbeat. Resets the server's idle timeout for this
     /// connection. Tag-only, no payload. The auth handshake is not
     /// here: it is the sequencer's, run before any request.
@@ -101,6 +108,7 @@ pub enum Request {
     /// Fixed-size array avoids heap allocation on the codec hot path.
     Subscribe { symbols: [Symbol; 8], count: u8 },
 
+    // --- Trader queries (trader) ---
     /// Query balances for an account. Flows through the pipeline like QueryStats
     /// so the matching stage can read Exchange state without concurrency issues.
     QueryPosition { account: AccountId },
@@ -120,30 +128,34 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether this request requires the runtime's `operator` role
-    /// (`ClientRole::Operator`). Deposit and Withdraw are excluded: they
-    /// are fund management, which the `custodian` role alone may send.
-    pub fn requires_operator(&self) -> bool {
-        matches!(
-            self,
+    /// The duty this request belongs to, which decides the roles that may
+    /// send it ([`RequestCategory::admits`]).
+    ///
+    /// Exhaustive on purpose, with no wildcard arm: a request added to
+    /// [`Request`] does not compile until it is given a category, so it
+    /// can never fall into one by default. The same holds per variant, so
+    /// each request has exactly one category.
+    #[inline]
+    pub fn category(&self) -> RequestCategory {
+        match self {
+            Request::SubmitOrder { .. }
+            | Request::CancelOrder { .. }
+            | Request::CancelAll { .. }
+            | Request::CancelReplace { .. }
+            | Request::QueryPosition { .. }
+            | Request::QueryRequestSeq => RequestCategory::Trading,
+            Request::Deposit { .. } | Request::Withdraw { .. } => RequestCategory::FundManagement,
             Request::AddInstrument { .. }
-                | Request::SetRiskLimits { .. }
-                | Request::SetCircuitBreaker { .. }
-                | Request::SetFeeSchedule { .. }
-                | Request::EndOfDay
-                | Request::DisableInstrument { .. }
-                | Request::EnableInstrument { .. }
-                | Request::RemoveInstrument { .. }
-                | Request::QueryStats
-        )
-    }
-
-    /// Whether this request is a fund management operation (deposit/withdraw).
-    /// Requires the exchange's `custodian` role (`ExchangeRole::Custodian`).
-    /// Disjoint from [`Request::requires_operator`]: the server's access
-    /// check relies on each request belonging to one category.
-    pub fn is_fund_management(&self) -> bool {
-        matches!(self, Request::Deposit { .. } | Request::Withdraw { .. })
+            | Request::SetRiskLimits { .. }
+            | Request::SetCircuitBreaker { .. }
+            | Request::SetFeeSchedule { .. }
+            | Request::EndOfDay
+            | Request::DisableInstrument { .. }
+            | Request::EnableInstrument { .. }
+            | Request::RemoveInstrument { .. }
+            | Request::QueryStats => RequestCategory::Administration,
+            Request::Heartbeat | Request::Subscribe { .. } => RequestCategory::Connection,
+        }
     }
 }
 
@@ -210,4 +222,64 @@ pub enum ResponseKind {
     /// its next outbound seq to `hwm + 1` to bypass dedup. `0` for a
     /// key with no prior accepted activity.
     RequestSeqHwm { hwm: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec;
+
+    /// Every request kind with its category, as the request table in
+    /// `docs/wire-protocol.md` states it: an oracle written from the spec,
+    /// not from [`Request::category`]. A kind missing here fails the test
+    /// below, so a new request is placed in this table as well as in the
+    /// match.
+    const DOCUMENTED: [(u8, RequestCategory); 19] = [
+        (0x10, RequestCategory::Trading),        // SubmitOrder
+        (0x11, RequestCategory::Trading),        // CancelOrder
+        (0x12, RequestCategory::Connection),     // Heartbeat
+        (0x13, RequestCategory::Trading),        // CancelAll
+        (0x14, RequestCategory::Trading),        // CancelReplace
+        (0x15, RequestCategory::Administration), // AddInstrument
+        (0x16, RequestCategory::FundManagement), // Deposit
+        (0x17, RequestCategory::FundManagement), // Withdraw
+        (0x18, RequestCategory::Administration), // SetRiskLimits
+        (0x19, RequestCategory::Administration), // SetCircuitBreaker
+        (0x1A, RequestCategory::Administration), // SetFeeSchedule
+        (0x1B, RequestCategory::Administration), // EndOfDay
+        (0x1C, RequestCategory::Administration), // DisableInstrument
+        (0x1D, RequestCategory::Administration), // EnableInstrument
+        (0x1E, RequestCategory::Administration), // RemoveInstrument
+        (0x1F, RequestCategory::Connection),     // Subscribe
+        (0x20, RequestCategory::Administration), // QueryStats
+        (0x21, RequestCategory::Trading),        // QueryPosition
+        (0x22, RequestCategory::Trading),        // QueryRequestSeq
+    ];
+
+    #[test]
+    fn every_request_has_its_documented_category() {
+        let mut seen = [false; DOCUMENTED.len()];
+        for request in codec::tests::make_requests() {
+            let mut body = [0u8; codec::MAX_REQUEST_BODY];
+            codec::encode_request_body(&request, 0, &mut body).unwrap();
+            // A body opens with its request kind.
+            let kind = body[0];
+            let index = DOCUMENTED
+                .iter()
+                .position(|&(documented, _)| documented == kind)
+                .unwrap_or_else(|| panic!("kind {kind:#04x} is not in the documented table"));
+            assert_eq!(request.category(), DOCUMENTED[index].1, "{request:?}");
+            seen[index] = true;
+        }
+        let unsampled: Vec<u8> = DOCUMENTED
+            .iter()
+            .zip(seen)
+            .filter(|&(_, seen)| !seen)
+            .map(|(&(kind, _), _)| kind)
+            .collect();
+        assert!(
+            unsampled.is_empty(),
+            "no sample request of kind {unsampled:#04x?}"
+        );
+    }
 }

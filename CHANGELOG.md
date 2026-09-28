@@ -18,21 +18,38 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+This release adopts the sequencer's next release and its
+application-defined client roles; the [Unreleased section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+has the detail. The node runtime now keeps only the two roles it acts on,
+`operator` and `replication`, and the exchange declares its own. Every
+existing `authorized_keys` file loads unchanged, and each role may send
+exactly what it could before.
+
 ### Added
 
-- **`melin_ec_server::role::ExchangeRole`**, the exchange's own client
-  roles: `trader`, `custodian` and `readonly`. The node runtime now keeps
-  only the two roles it acts on, `operator` and `replication`, and each
-  application declares the rest *(sequencer)*. The tokens are the ones key
-  files already use, so every existing `authorized_keys` file loads
-  unchanged, and each role may send exactly what it could before.
+- **The exchange's access model, in `melin_ec_protocol::role`.**
+  `ExchangeRole` holds the exchange's own roles, `trader`, `custodian` and
+  `readonly`, under the tokens key files already use.
+  `Request::category` places every request in one `RequestCategory`
+  (connection, trading, fund management, administration), and
+  `RequestCategory::admits` says which roles may send it. Both are
+  exhaustive matches with no default: a new request or role does not
+  compile until someone decides who may send it, where a request left out
+  of the old operator and fund-management lists was open to every trader
+  key. The node enforces exactly this rule.
 
 ### Changed
 
 - **A keys file naming an unknown role reports it as a role.** The node
   still refuses to start, and the error now reads `unknown role 'x'
   (expected operator, replication, trader, custodian, readonly)` where it
-  said `unknown permission` *(sequencer)*.
+  said `unknown permission` *(sequencer)*. Handshake logs name a key's role
+  by its token in the file, `trader` rather than `Trader` *(sequencer)*.
+- **`melin-ec-keygen` takes a role, checked as the node checks it.** It
+  validates the role with the node's own keys-file parser before writing
+  anything, so a line it prints always loads, and a refused role leaves no
+  files behind. The error is the node's, listing every valid role.
 - **`melin_ec_server::RequestDecoder` decodes for `ExchangeRole`.** It
   declares `type Role = ExchangeRole`, and `decode` takes a
   `ClientRole<ExchangeRole>` in place of the sequencer's `Permission`,
@@ -40,12 +57,22 @@ full detail behind entries marked *(sequencer)*.
   *(sequencer)*. Source-breaking for a Rust dependent that calls the
   decoder directly: pass `ClientRole::Operator` or
   `ClientRole::App(ExchangeRole::Trader)` and the like. A keys table built
-  by hand is parsed with `AuthorizedKeys::parse::<ExchangeRole>`.
+  by hand is parsed with `AuthorizedKeys::parse::<ExchangeRole>`. A
+  refused trading request now logs `non-trader attempted trading`.
+- **`melin-ec-protocol` depends on `melin-app`,** for the `Role` trait and
+  the `ClientRole` the access rule takes. It adds base64, libc and tracing
+  to a client's dependency tree.
 - **The event feed admits subscribers through the node's own client
   check.** The feed used to keep a copy of the client listener's rule; it
   now calls the listener's check itself *(sequencer)*, so the two cannot
   drift. Who may subscribe is unchanged: any client role, never
   `replication`.
+
+### Removed
+
+- **`Request::requires_operator` and `Request::is_fund_management`.**
+  Match on `Request::category` instead, or ask
+  `request.category().admits(role)`.
 
 ## [0.18.0] - 2026-09-28
 

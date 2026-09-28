@@ -22,7 +22,8 @@ pub enum ClientError {
     /// Server closed the connection before sending BatchEnd.
     Disconnected,
     /// Server rejected the Ed25519 challenge-response authentication
-    /// (unknown key, invalid signature, or wrong key permissions).
+    /// (unknown key, invalid signature, or a key listed under the
+    /// `replication` role, which may not connect as a client).
     AuthFailed,
     /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,

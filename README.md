@@ -63,7 +63,7 @@ End-to-end numbers (including journal, replication, and network) are in the [seq
 ## [Authentication & Authorization](docs/admin-guide.md)
 
 - Ed25519 challenge-response handshake
-- Four permission roles: Operator (exchange configuration), Trader (order submission/cancellation), Custodian (deposit/withdraw), ReadOnly (heartbeats)
+- Separation of duties across four client roles: `operator` (exchange configuration), `trader` (order submission/cancellation), `custodian` (deposit/withdraw), `readonly` (heartbeats and the event feed); `replication` keys serve replicas only
 - Operator API (instrument management and lifecycle, circuit breakers, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
 - Per-key idempotency (sequence numbers with duplicate rejection; safe to retry on timeout without double-applying)
 

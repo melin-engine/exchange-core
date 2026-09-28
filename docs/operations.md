@@ -93,7 +93,7 @@ Under the default `disk+ram` ack policy the response stage releases an acknowled
 | `--replication-bind` | (none) | Address to listen for replica connections (enables primary mode with synchronous replication). |
 | `--standalone` | `false` | Disable replication entirely (dev/test). Sets the replication cursor to `u64::MAX` so responses are gated only by the journal. |
 | `--replica-of` | (none) | Run as a replica connected to the given primary address. The server does not accept client connections in this mode. |
-| `--replication-key` | (none) | Path to the Ed25519 private key for replication authentication. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
+| `--replication-key` | (none) | Path to the Ed25519 private key for replication authentication. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` under the `replication` role. |
 | `--replication-batch-size` | `32` | Maximum replication ring batches to coalesce into a single TCP write+flush. Higher values reduce syscall overhead but increase per-write latency. |
 | `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
 | `--replication-ring-size` | `256` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 256 (128 MiB). See [Replication Ring Sizing](#replication-ring-sizing). |

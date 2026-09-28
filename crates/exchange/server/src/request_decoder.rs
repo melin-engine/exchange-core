@@ -9,10 +9,9 @@ use melin_app::auth::ClientRole;
 use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::Request;
+use melin_ec_protocol::role::{ExchangeRole, RequestCategory};
 use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
 use melin_wire_protocol::error::ProtocolError;
-
-use crate::role::ExchangeRole;
 
 // A request the readers cannot hand over whole never reaches the decoder:
 // the connection is dropped instead. The widest request body must fit,
@@ -42,12 +41,16 @@ impl RequestDecoderTrait for RequestDecoder {
             Err(e) => return Decoded::DecodeError(protocol_error_reason(&e)),
         };
 
-        if should_filter(&request) {
-            return Decoded::Filter;
+        // The protocol's access rule decides; this only enforces it.
+        let category = request.category();
+        if !category.admits(role) {
+            return Decoded::PermissionDenied(denial_reason(category));
         }
 
-        if let Err(reason) = check_permission(&request, role) {
-            return Decoded::PermissionDenied(reason);
+        // Heartbeats and subscription control are the node's business:
+        // never published to the pipeline.
+        if category == RequestCategory::Connection {
+            return Decoded::Filter;
         }
 
         Decoded::Permitted(TradingRequest {
@@ -72,47 +75,17 @@ fn protocol_error_reason(e: &ProtocolError) -> &'static str {
     }
 }
 
-/// Connection-level requests the runtime never publishes to the
-/// pipeline: heartbeats and subscription control.
+/// The reason carried by `Decoded::PermissionDenied` for a request of
+/// `category` that its connection's role may not send. The reader's debug
+/// log surfaces it.
 #[inline]
-fn should_filter(request: &Request) -> bool {
-    matches!(request, Request::Heartbeat | Request::Subscribe { .. })
-}
-
-/// Separation of duties: every request belongs to one category, and
-/// exactly one role may send it.
-/// - Operator: exchange configuration (instruments, risk, circuit breakers, fees, EOD, stats)
-/// - Custodian: fund management (deposit, withdraw)
-/// - Trader: everything else (orders, cancels, position and sequence queries)
-/// - ReadOnly: nothing that reaches this function (heartbeats and
-///   subscribe are filtered out above).
-///
-/// Each match names every role, with no wildcard arm: a role added to
-/// [`ExchangeRole`] (or a client role added by the runtime) fails to
-/// compile here until it is given its rights, rather than inheriting a
-/// wildcard's.
-#[inline]
-fn check_permission(request: &Request, role: ClientRole<ExchangeRole>) -> Result<(), &'static str> {
-    use ClientRole::{App, Operator};
-    use ExchangeRole::{Custodian, ReadOnly, Trader};
-
-    // `requires_operator` and `is_fund_management` are disjoint (see
-    // `Request`), so the first match decides.
-    if request.requires_operator() {
-        return match role {
-            Operator => Ok(()),
-            App(Trader | Custodian | ReadOnly) => Err("non-operator attempted operator command"),
-        };
-    }
-    if request.is_fund_management() {
-        return match role {
-            App(Custodian) => Ok(()),
-            Operator | App(Trader | ReadOnly) => Err("non-custodian attempted fund management"),
-        };
-    }
-    match role {
-        App(Trader) => Ok(()),
-        Operator | App(Custodian | ReadOnly) => Err("connection lacks trading permission"),
+fn denial_reason(category: RequestCategory) -> &'static str {
+    match category {
+        RequestCategory::Trading => "non-trader attempted trading",
+        RequestCategory::FundManagement => "non-custodian attempted fund management",
+        RequestCategory::Administration => "non-operator attempted operator command",
+        // Every client role may send these today; named for completeness.
+        RequestCategory::Connection => "role may not send connection messages",
     }
 }
 
@@ -342,8 +315,7 @@ mod tests {
 
     #[test]
     fn query_stats_is_permitted_and_flagged() {
-        // QueryStats is an operator-only request — see
-        // `Request::requires_operator`.
+        // QueryStats is an operator-only request: see `Request::category`.
         let bytes = encode(&Request::QueryStats, 1);
         match decode(&bytes, OPERATOR) {
             Decoded::Permitted(request) => {
@@ -379,8 +351,9 @@ mod tests {
     /// The full path an access decision takes on a node: a token in the
     /// keys file, the role the runtime carries for it, turned back into an
     /// [`ExchangeRole`] by the runtime's erased decoder, and gated here.
-    /// Pins both that existing key files keep their meaning and the
-    /// separation of duties: each request category admits exactly one role.
+    /// Pins that existing key files keep their meaning and that the
+    /// decoder enforces the protocol's rule, one request per category (the
+    /// rule itself, per request, is pinned in `melin-ec-protocol`).
     #[test]
     fn each_keys_file_role_may_send_exactly_its_own_category() {
         use base64::Engine;
@@ -404,8 +377,14 @@ mod tests {
         );
         let heartbeat = encode(&Request::Heartbeat, 1);
 
+        let categories = [
+            (&operator_command, RequestCategory::Administration),
+            (&fund_management, RequestCategory::FundManagement),
+            (&trading, RequestCategory::Trading),
+        ];
+
         let listed = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        // (token, operator command, fund management, trading) permitted.
+        // Each token, and whether it may send each of `categories`.
         for (token, permitted) in [
             ("operator", [true, false, false]),
             ("custodian", [false, true, false]),
@@ -421,17 +400,15 @@ mod tests {
                 .client()
                 .unwrap_or_else(|| panic!("'{token}' must be a client role"));
 
-            for (body, permitted) in [&operator_command, &fund_management, &trading]
-                .into_iter()
-                .zip(permitted)
-            {
-                let decoded = RequestDecoder.decode_erased(body, role);
-                let expected = if permitted {
-                    "Permitted"
-                } else {
-                    "PermissionDenied"
-                };
-                assert_eq!(debug_variant(&decoded), expected, "{token}");
+            for ((body, category), permitted) in categories.into_iter().zip(permitted) {
+                match RequestDecoder.decode_erased(body, role) {
+                    Decoded::Permitted(_) => assert!(permitted, "{token} {category:?}"),
+                    Decoded::PermissionDenied(reason) => {
+                        assert!(!permitted, "{token} {category:?}");
+                        assert_eq!(reason, denial_reason(category));
+                    }
+                    other => panic!("{token} {category:?}: {}", debug_variant(&other)),
+                }
             }
             // Connection-level messages pass whatever the role.
             assert!(matches!(

@@ -13,6 +13,10 @@ description = "Binary wire protocol with typed request/response enums for the Me
 # replaces hand-rolled le::put / le::get pairs. derive feature for
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
+# The exchange's roles implement the sequencer's `Role` trait, and the
+# access rule takes the `ClientRole` the node hands its decoder. Light:
+# melin-app pulls in base64, libc and tracing only.
+melin-app = { workspace = true }
 melin-ec-types = { workspace = true }
 melin-wire-protocol = { workspace = true }
 

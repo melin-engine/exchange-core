@@ -133,27 +133,27 @@ Total order size: 24 bytes (Market, no expiry) to 48 bytes (StopLimit + GTD expi
 
 ## Request Messages (Client to Server)
 
-| Kind | Name              | Permission     | Payload size         |
+| Kind | Name              | Role           | Payload size         |
 |------|-------------------|----------------|----------------------|
-| 0x10 | SubmitOrder       | Trader         | 4 + 24..48 (variable)|
-| 0x11 | CancelOrder       | Trader         | 16                   |
+| 0x10 | SubmitOrder       | `trader`       | 4 + 24..48 (variable)|
+| 0x11 | CancelOrder       | `trader`       | 16                   |
 | 0x12 | Heartbeat         | Any            | 0                    |
-| 0x13 | CancelAll         | Trader         | 4                    |
-| 0x14 | CancelReplace     | Trader         | 32                   |
-| 0x15 | AddInstrument     | Operator       | 12                   |
-| 0x16 | Deposit           | Custodian      | 16                   |
-| 0x17 | Withdraw          | Custodian      | 16                   |
-| 0x18 | SetRiskLimits     | Operator       | 5..21 (variable)     |
-| 0x19 | SetCircuitBreaker | Operator       | 5..21 (variable)     |
-| 0x1A | SetFeeSchedule    | Operator       | 8                    |
-| 0x1B | EndOfDay          | Operator       | 0                    |
-| 0x1C | DisableInstrument | Operator       | 4                    |
-| 0x1D | EnableInstrument  | Operator       | 4                    |
-| 0x1E | RemoveInstrument  | Operator       | 4                    |
+| 0x13 | CancelAll         | `trader`       | 4                    |
+| 0x14 | CancelReplace     | `trader`       | 32                   |
+| 0x15 | AddInstrument     | `operator`     | 12                   |
+| 0x16 | Deposit           | `custodian`    | 16                   |
+| 0x17 | Withdraw          | `custodian`    | 16                   |
+| 0x18 | SetRiskLimits     | `operator`     | 5..21 (variable)     |
+| 0x19 | SetCircuitBreaker | `operator`     | 5..21 (variable)     |
+| 0x1A | SetFeeSchedule    | `operator`     | 8                    |
+| 0x1B | EndOfDay          | `operator`     | 0                    |
+| 0x1C | DisableInstrument | `operator`     | 4                    |
+| 0x1D | EnableInstrument  | `operator`     | 4                    |
+| 0x1E | RemoveInstrument  | `operator`     | 4                    |
 | 0x1F | Subscribe         | Any (event port) | 1 + count×4        |
-| 0x20 | QueryStats        | Operator       | 0                    |
-| 0x21 | QueryPosition     | Trader         | 4                    |
-| 0x22 | QueryRequestSeq   | Trader         | 0                    |
+| 0x20 | QueryStats        | `operator`     | 0                    |
+| 0x21 | QueryPosition     | `trader`       | 4                    |
+| 0x22 | QueryRequestSeq   | `trader`       | 0                    |
 
 Payload sizes above exclude the 1-byte kind and 8-byte seq. The frame length = 1 (frame tag) + 1 (kind) + 8 (seq) + payload size.
 
@@ -585,41 +585,45 @@ After authentication, a `ChallengeResponse`, like any frame under a tag other th
 
 ---
 
-## Permission Model
+## Roles
 
-Permission levels are assigned per public key in the `authorized_keys` file and checked on the reader thread (zero cost on the hot path).
+Each public key in the `authorized_keys` file is listed under one role. Every request is checked against the role of the key its connection authenticated with, on the reader thread (zero cost on the hot path).
 
-### Permission levels
+### What each role may send
 
-| Level       | Trading | Operator (Config) | Fund Mgmt | Heartbeat |
-|-------------|---------|-------------------|-----------|-----------|
-| Operator    | No      | Yes               | No        | Yes       |
-| Trader      | Yes     | No                | No        | Yes       |
-| Custodian   | No      | No                | Yes       | Yes       |
-| ReadOnly    | No      | No                | No        | Yes       |
-| Replication | --      | --                | --        | --        |
+| Role          | Trading | Administration | Fund management | Heartbeat |
+|---------------|---------|----------------|-----------------|-----------|
+| `operator`    | No      | Yes            | No              | Yes       |
+| `trader`      | Yes     | No             | No              | Yes       |
+| `custodian`   | No      | No             | Yes             | Yes       |
+| `readonly`    | No      | No             | No              | Yes       |
+| `replication` | --      | --             | --              | --        |
 
-**Trading operations** (require `Trader`):
+Duties are separated: each kind of operation is open to exactly one role, so a trading key cannot move funds and a custody key cannot trade.
+
+**Trading operations** (`trader` only):
 - SubmitOrder, CancelOrder, CancelAll, CancelReplace, QueryPosition, QueryRequestSeq
 
-**Operator operations** (require `Operator`):
+A key is not tied to accounts: a `trader` key may trade, cancel and query positions for any account on the node. Issue one only to a party trusted with every account.
+
+**Administrative operations** (`operator` only):
 - AddInstrument, SetRiskLimits, SetCircuitBreaker, SetFeeSchedule, QueryStats, EndOfDay, DisableInstrument, EnableInstrument, RemoveInstrument
 
-**Fund management operations** (require `Custodian`):
+**Fund management operations** (`custodian` only):
 - Deposit, Withdraw
 
-**Replication** (require `Replication`):
+**Replication** (`replication` only):
 - Used for replica-to-primary connections only. The trading port and the event publisher's port refuse a replication key during the handshake, so it cannot open a client connection at all.
 
-**Universal operations** (any client role — every level but `Replication`):
+**Universal operations** (any role but `replication`):
 - Heartbeat, and Subscribe on the event publisher's port
 
-Requests that fail the permission check are dropped on the reader thread and never reach the matching engine.
+Requests that fail the role check are dropped on the reader thread and never reach the matching engine.
 
 ### Authorized keys file format
 
 ```
-# <permission> <base64-public-key> <optional-comment>
+# <role> <base64-public-key> <optional-comment>
 operator AAAA...base64...= ops-team
 trader BBBB...base64...= market-maker-1
 custodian CCCC...base64...= treasury
@@ -629,7 +633,7 @@ replication EEEE...base64...= replica-1
 
 Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. Each key is listed once: a file that lists a key twice, under the same role or another, is refused, and the node does not start. The error names the second line.
 
-The role at the start of each line must be one of the five above, written exactly as shown, in lowercase. A file naming any other role is refused at startup too, and the error names the line and lists the valid roles: `line 3: unknown role 'Trader' (expected operator, replication, trader, custodian, readonly)`.
+The role at the start of each line is one of `operator`, `replication`, `trader`, `custodian` and `readonly`, in lowercase and spelled exactly so. A file naming any other role is refused at startup too, and the error names the line and lists the valid roles: `line 3: unknown role 'Trader' (expected operator, replication, trader, custodian, readonly)`.
 
 ---
 
