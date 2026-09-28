@@ -25,7 +25,6 @@
 //! Ed25519 challenge-response auth is required, from a key the node's
 //! client listener would admit: any client role, never `replication`.
 
-use std::fmt;
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -33,14 +32,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
-use ed25519_dalek::{Signature, SignatureError, Verifier, VerifyingKey};
-use melin_app::auth::{AuthorizedKeys, Permission};
+use melin_app::auth::AuthorizedKeys;
 use melin_ec_market_data::mirror::BookMirror;
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_ec_types::types::{ExecutionReport, QueryResponse, Symbol};
 use melin_pipeline::ring;
 use melin_pipeline::wait::WaitStrategy;
+use melin_server_runtime::client_auth::verify_client;
 use melin_transport_core::pipeline::{
     OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
 };
@@ -509,70 +508,15 @@ fn write_snapshot_frame(
     stream.write_all(&buf[..8 + response_len])
 }
 
-/// Why the event listener refused a subscriber's challenge response.
-#[derive(Debug)]
-enum SubscriberAuthError {
-    /// The key is not in the authorized keys file.
-    UnknownKey,
-    /// The key is listed, under a role that may not connect as a client
-    /// (see [`Permission::may_connect_as_client`]).
-    RoleRefused(Permission),
-    /// The listed bytes are not a valid Ed25519 public key.
-    InvalidKey(SignatureError),
-    /// The signature over the nonce does not verify.
-    BadSignature(SignatureError),
-}
-
-impl fmt::Display for SubscriberAuthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownKey => f.write_str("unknown public key"),
-            Self::RoleRefused(permission) => {
-                write!(f, "{permission:?} key refused on the event listener")
-            }
-            Self::InvalidKey(e) => write!(f, "invalid public key: {e}"),
-            Self::BadSignature(e) => write!(f, "signature verification failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for SubscriberAuthError {}
-
-/// Decide a subscriber's challenge response: the key must be listed,
-/// under a role that may connect as a client, and must have signed
-/// `nonce`.
-///
-/// The node's client listener decides by the same rules, in the
-/// sequencer's own (crate-private) handshake. Keeping the two in step is
-/// what stops a `replication` key, which authorizes streaming between
-/// nodes and nothing else, from reading every execution on the venue
-/// here. The role is checked before the signature, so a refused key
-/// costs no verification.
-fn verify_subscriber(
-    authorized_keys: &AuthorizedKeys,
-    nonce: &[u8; 32],
-    public_key: &[u8; 32],
-    signature: &[u8; 64],
-) -> Result<Permission, SubscriberAuthError> {
-    let permission = authorized_keys
-        .lookup(public_key)
-        .ok_or(SubscriberAuthError::UnknownKey)?;
-    if !permission.may_connect_as_client() {
-        return Err(SubscriberAuthError::RoleRefused(permission));
-    }
-    let verifying_key =
-        VerifyingKey::from_bytes(public_key).map_err(SubscriberAuthError::InvalidKey)?;
-    verifying_key
-        .verify(nonce, &Signature::from_bytes(signature))
-        .map_err(SubscriberAuthError::BadSignature)?;
-    Ok(permission)
-}
-
 /// Run Ed25519 challenge-response authentication on a subscriber connection.
 ///
-/// Reuses the same protocol as `server.rs` — Challenge/ChallengeResponse/ServerReady —
-/// and admits the keys [`verify_subscriber`] does. Blocks briefly during
-/// handshake (cold path, before setting non-blocking for data).
+/// Reuses the same protocol as the node's client listener —
+/// Challenge/ChallengeResponse/ServerReady — and decides it with the
+/// listener's own check, [`verify_client`], so the feed admits exactly the
+/// keys the client listener does. That is what stops a `replication` key,
+/// which authorizes streaming between nodes and nothing else, from reading
+/// every execution on the venue here. Blocks briefly during handshake
+/// (cold path, before setting non-blocking for data).
 fn authenticate_subscriber(
     stream: &TcpStream,
     addr: SocketAddr,
@@ -620,7 +564,7 @@ fn authenticate_subscriber(
 
     // The subscriber sees the same AuthFailed whatever the reason; the
     // reason goes to the log.
-    if let Err(e) = verify_subscriber(authorized_keys, &nonce, &cr.public_key, &cr.signature) {
+    if let Err(e) = verify_client(authorized_keys, &nonce, &cr.public_key, &cr.signature) {
         send_auth_failed(&mut write_stream);
         return Err(e.into());
     }
@@ -663,92 +607,9 @@ mod tests {
         }
     }
 
-    mod subscriber_auth {
-        use super::super::*;
-        use base64::Engine;
-        use ed25519_dalek::{Signer, SigningKey};
-
-        const NONCE: [u8; 32] = [0x5A; 32];
-
-        fn key() -> SigningKey {
-            SigningKey::from_bytes(&[0x11; 32])
-        }
-
-        fn keys_listing(role: &str, key: &SigningKey) -> AuthorizedKeys {
-            let public =
-                base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
-            AuthorizedKeys::parse(&format!("{role} {public} test\n")).unwrap()
-        }
-
-        /// `key()` presents itself; `signer` signs the nonce.
-        fn verify(
-            keys: &AuthorizedKeys,
-            signer: &SigningKey,
-        ) -> Result<Permission, SubscriberAuthError> {
-            let public_key = key().verifying_key().to_bytes();
-            let signature = signer.sign(&NONCE).to_bytes();
-            verify_subscriber(keys, &NONCE, &public_key, &signature)
-        }
-
-        #[test]
-        fn every_client_role_may_subscribe() {
-            for (role, permission) in [
-                ("operator", Permission::Operator),
-                ("trader", Permission::Trader),
-                ("custodian", Permission::Custodian),
-                ("readonly", Permission::ReadOnly),
-            ] {
-                assert_eq!(
-                    verify(&keys_listing(role, &key()), &key()).unwrap(),
-                    permission
-                );
-            }
-        }
-
-        /// Listed and correctly signed, yet refused: a replication key
-        /// streams the journal between nodes, and the feed is not that.
-        #[test]
-        fn a_replication_key_is_refused() {
-            let err = verify(&keys_listing("replication", &key()), &key()).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    SubscriberAuthError::RoleRefused(Permission::Replication)
-                ),
-                "{err}"
-            );
-        }
-
-        #[test]
-        fn an_unlisted_key_is_refused() {
-            let other = SigningKey::from_bytes(&[0x22; 32]);
-            let err = verify(&keys_listing("readonly", &other), &key()).unwrap_err();
-            assert!(matches!(err, SubscriberAuthError::UnknownKey), "{err}");
-        }
-
-        #[test]
-        fn a_signature_by_another_key_is_refused() {
-            let impostor = SigningKey::from_bytes(&[0x33; 32]);
-            let err = verify(&keys_listing("readonly", &key()), &impostor).unwrap_err();
-            assert!(matches!(err, SubscriberAuthError::BadSignature(_)), "{err}");
-        }
-
-        /// A keys file can list any 32 bytes; ones that are not a curve
-        /// point cannot verify anything.
-        #[test]
-        fn a_listed_key_that_is_not_a_curve_point_is_refused() {
-            let not_a_point = [0x02; 32];
-            assert!(
-                VerifyingKey::from_bytes(&not_a_point).is_err(),
-                "the fixture must not decompress to a point"
-            );
-            let listed = base64::engine::general_purpose::STANDARD.encode(not_a_point);
-            let keys = AuthorizedKeys::parse(&format!("readonly {listed} test\n")).unwrap();
-            let signature = key().sign(&NONCE).to_bytes();
-            let err = verify_subscriber(&keys, &NONCE, &not_a_point, &signature).unwrap_err();
-            assert!(matches!(err, SubscriberAuthError::InvalidKey(_)), "{err}");
-        }
-    }
+    // The subscriber handshake's verdict is the runtime's `verify_client`,
+    // tested there. `tests/event_feed.rs` checks the wiring end to end: a
+    // `readonly` key streams, a `replication` key is refused.
 
     #[test]
     fn frame_encoding_with_sequence_prefix() {
@@ -1059,7 +920,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
-        let keys = Arc::new(AuthorizedKeys::parse("").unwrap());
+        let keys = Arc::new(AuthorizedKeys::parse::<crate::role::ExchangeRole>("").unwrap());
         let handle = std::thread::Builder::new()
             .name("test-publisher".into())
             .spawn(move || {

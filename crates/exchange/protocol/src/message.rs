@@ -2,7 +2,7 @@
 //!
 //! Includes both trading operations (submit/cancel) and administrative
 //! commands (add instrument, deposit, set risk limits). Administrative
-//! commands require `Permission::Operator` and are gated on the reader thread.
+//! commands require the `operator` role and are gated on the reader thread.
 
 use melin_ec_types::types::{
     AccountBalance, AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule,
@@ -120,9 +120,9 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether this request requires `Permission::Operator`.
-    /// Deposit and Withdraw are excluded — they require `can_manage_funds`
-    /// instead, which is satisfied by Custodian only.
+    /// Whether this request requires the runtime's `operator` role
+    /// (`ClientRole::Operator`). Deposit and Withdraw are excluded: they
+    /// are fund management, which the `custodian` role alone may send.
     pub fn requires_operator(&self) -> bool {
         matches!(
             self,
@@ -139,7 +139,9 @@ impl Request {
     }
 
     /// Whether this request is a fund management operation (deposit/withdraw).
-    /// Requires `Permission::Custodian`.
+    /// Requires the exchange's `custodian` role (`ExchangeRole::Custodian`).
+    /// Disjoint from [`Request::requires_operator`]: the server's access
+    /// check relies on each request belonging to one category.
     pub fn is_fund_management(&self) -> bool {
         matches!(self, Request::Deposit { .. } | Request::Withdraw { .. })
     }

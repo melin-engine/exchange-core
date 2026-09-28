@@ -33,7 +33,7 @@ use base64::Engine as _;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 
-use melin_app::auth::AuthorizedKeys;
+use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_app::unix_epoch_nanos;
 use melin_ec_server::exchange_app::ServerApp;
 use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
@@ -349,8 +349,10 @@ fn main() {
             base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
         auth_text.push_str(&format!("replication {pub_b64} bench-replica-{i}\n"));
     }
+    // `NoRoles`: the table lists replication keys only, and nothing here
+    // decodes a client request.
     let authorized_keys =
-        Arc::new(AuthorizedKeys::parse(&auth_text).expect("parse authorized_keys"));
+        Arc::new(AuthorizedKeys::parse::<NoRoles>(&auth_text).expect("parse authorized_keys"));
 
     // --- Tempdir for journal files ---
     let tmp_root: PathBuf =

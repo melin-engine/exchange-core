@@ -12,6 +12,8 @@
 //!   sizing it hands to `prefault`.
 //! - [`request_decoder::RequestDecoder`] — wire-`Request` →
 //!   `TradingRequest` decoder.
+//! - [`role::ExchangeRole`] — the exchange's own client roles
+//!   (`trader`, `custodian`, `readonly`), which the decoder gates on.
 //! - [`response_encoder::ResponseEncoder`] —
 //!   `ExecutionReport` / `QueryResponse` → wire encoder.
 //! - [`event_publisher`] — market-data firehose.
@@ -21,6 +23,7 @@
 pub mod exchange_app;
 pub mod request_decoder;
 pub mod response_encoder;
+pub mod role;
 pub mod startup;
 
 pub mod event_publisher;

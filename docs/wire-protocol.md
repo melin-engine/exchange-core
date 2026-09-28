@@ -629,6 +629,8 @@ replication EEEE...base64...= replica-1
 
 Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. Each key is listed once: a file that lists a key twice, under the same role or another, is refused, and the node does not start. The error names the second line.
 
+The role at the start of each line must be one of the five above, written exactly as shown, in lowercase. A file naming any other role is refused at startup too, and the error names the line and lists the valid roles: `line 3: unknown role 'Trader' (expected operator, replication, trader, custodian, readonly)`.
+
 ---
 
 ## Per-Key Idempotency

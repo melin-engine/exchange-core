@@ -18,6 +18,35 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+### Added
+
+- **`melin_ec_server::role::ExchangeRole`**, the exchange's own client
+  roles: `trader`, `custodian` and `readonly`. The node runtime now keeps
+  only the two roles it acts on, `operator` and `replication`, and each
+  application declares the rest *(sequencer)*. The tokens are the ones key
+  files already use, so every existing `authorized_keys` file loads
+  unchanged, and each role may send exactly what it could before.
+
+### Changed
+
+- **A keys file naming an unknown role reports it as a role.** The node
+  still refuses to start, and the error now reads `unknown role 'x'
+  (expected operator, replication, trader, custodian, readonly)` where it
+  said `unknown permission` *(sequencer)*.
+- **`melin_ec_server::RequestDecoder` decodes for `ExchangeRole`.** It
+  declares `type Role = ExchangeRole`, and `decode` takes a
+  `ClientRole<ExchangeRole>` in place of the sequencer's `Permission`,
+  which is gone along with `can_trade` and `can_manage_funds`
+  *(sequencer)*. Source-breaking for a Rust dependent that calls the
+  decoder directly: pass `ClientRole::Operator` or
+  `ClientRole::App(ExchangeRole::Trader)` and the like. A keys table built
+  by hand is parsed with `AuthorizedKeys::parse::<ExchangeRole>`.
+- **The event feed admits subscribers through the node's own client
+  check.** The feed used to keep a copy of the client listener's rule; it
+  now calls the listener's check itself *(sequencer)*, so the two cannot
+  drift. Who may subscribe is unchanged: any client role, never
+  `replication`.
+
 ## [0.18.0] - 2026-09-28
 
 This release adopts Melin 0.18.0. The [0.18.0 section of its
