@@ -18,8 +18,8 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
-This release adopts the sequencer's next release. The [Unreleased section of
-its changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+This release adopts Melin 0.18.0. The [0.18.0 section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0180---2026-09-27)
 lists further fixes in the node runtime that apply here as they are; the
 entries below cover what changes for this product. One entry there does not
 apply: `--max-orders-per-account`, `--max-orders-per-second` and
