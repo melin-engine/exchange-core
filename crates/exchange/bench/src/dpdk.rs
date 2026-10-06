@@ -797,16 +797,16 @@ pub fn run_dpdk_roundtrip(
                 }
             }
 
-            // A poisoned decoder (a length over the limit) only repeats
-            // its error, so stop there rather than spin on it.
-            while !conn.decoder.is_poisoned() {
+            loop {
                 // Malformed frames are dropped intentionally, here and
                 // in the outcome tally below: they are not the bench's
                 // responsibility to diagnose, and panicking would mask
-                // genuine throughput regressions during a long run.
+                // genuine throughput regressions during a long run. A
+                // length over the limit poisons the decoder, which only
+                // repeats it, so stop there rather than spin on it.
                 let reply = match melin_client::next_reply(&mut conn.decoder) {
                     Ok(Some(reply)) => reply,
-                    Ok(None) => break,
+                    Ok(None) | Err(melin_client::Error::FrameTooLarge { .. }) => break,
                     Err(_) => continue,
                 };
                 if matches!(reply, Reply::BatchEnd) {
