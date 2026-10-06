@@ -20,6 +20,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 use melin_client::Reply;
+use melin_client::framing::FrameDecoder;
 use melin_dpdk::device::DpdkDevice;
 use melin_dpdk::eal::Eal;
 use melin_dpdk::mempool::Mempool;
@@ -45,8 +46,10 @@ const TIMESTAMP_REFRESH_INTERVAL: u32 = 1;
 /// Per-connection state for the DPDK benchmark.
 struct DpdkBenchConn {
     handle: SocketHandle,
-    /// Accumulated received bytes for frame parsing.
-    parse_buf: Vec<u8>,
+    /// Received bytes, split into the node's frames: the handshake's,
+    /// then replies. One decoder for both, so bytes that arrive behind
+    /// the handshake's last frame are kept for the reply loop.
+    decoder: FrameDecoder,
     /// Order generator — produces frames on-the-fly. No pre-allocated cap:
     /// the bench runs until the wall-clock cooldown deadline expires.
     flow: generator::OrderFlowGenerator,
@@ -459,7 +462,7 @@ pub fn run_dpdk_roundtrip(
 
         connections.push(DpdkBenchConn {
             handle,
-            parse_buf: Vec::with_capacity(1028),
+            decoder: FrameDecoder::new(),
             flow,
             scratch_frame: Vec::with_capacity(generator::MAX_REQUEST_FRAME_BYTES),
             pending_unsent: None,
@@ -783,10 +786,10 @@ pub fn run_dpdk_roundtrip(
                 }
             }
 
-            // --- Recv: drain directly into parse_buf (no intermediate copy) ---
+            // --- Recv: drain straight into the decoder (no intermediate copy) ---
             while socket.can_recv() {
                 match socket.recv(|data| {
-                    conn.parse_buf.extend_from_slice(data);
+                    conn.decoder.push(data);
                     (data.len(), ())
                 }) {
                     Ok(()) => {}
@@ -794,77 +797,53 @@ pub fn run_dpdk_roundtrip(
                 }
             }
 
-            // Parse frames from parse_buf.
-            let mut cursor = 0;
-            while cursor + 4 <= conn.parse_buf.len() {
-                let frame_len = u32::from_le_bytes([
-                    conn.parse_buf[cursor],
-                    conn.parse_buf[cursor + 1],
-                    conn.parse_buf[cursor + 2],
-                    conn.parse_buf[cursor + 3],
-                ]) as usize;
-
-                if cursor + 4 + frame_len > conn.parse_buf.len() {
-                    break;
-                }
-
-                let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
+            loop {
                 // Malformed frames are dropped intentionally, here and
                 // in the outcome tally below: they are not the bench's
                 // responsibility to diagnose, and panicking would mask
-                // genuine throughput regressions during a long run.
-                if let Ok(reply) = melin_client::classify(payload) {
-                    if matches!(reply, Reply::BatchEnd) {
-                        diag_batch_ends += 1;
-                        // Capture `rdtscp()` BEFORE any per-frame
-                        // bookkeeping (outcome tally below) so the
-                        // histogram reflects only the wire roundtrip.
-                        // Always pop the inflight entry to keep the FIFO
-                        // aligned with sends — without this, cooldown
-                        // completions would leak the queue. Phase
-                        // classification by *receive* time, reusing the
-                        // outer-iter `now`: past `measured_end` we
-                        // discard the sample, before `warmup_end` too.
-                        if let Some(sent_tsc) = conn.inflight_ts.pop_front()
-                            && now >= deadlines.warmup_end
-                            && now < deadlines.measured_end
+                // genuine throughput regressions during a long run. A
+                // length over the limit poisons the decoder, which only
+                // repeats it, so stop there rather than spin on it.
+                let reply = match melin_client::next_reply(&mut conn.decoder) {
+                    Ok(Some(reply)) => reply,
+                    Ok(None) | Err(melin_client::Error::FrameTooLarge { .. }) => break,
+                    Err(_) => continue,
+                };
+                if matches!(reply, Reply::BatchEnd) {
+                    diag_batch_ends += 1;
+                    // Capture `rdtscp()` BEFORE any per-frame
+                    // bookkeeping (outcome tally below) so the
+                    // histogram reflects only the wire roundtrip.
+                    // Always pop the inflight entry to keep the FIFO
+                    // aligned with sends — without this, cooldown
+                    // completions would leak the queue. Phase
+                    // classification by *receive* time, reusing the
+                    // outer-iter `now`: past `measured_end` we
+                    // discard the sample, before `warmup_end` too.
+                    if let Some(sent_tsc) = conn.inflight_ts.pop_front()
+                        && now >= deadlines.warmup_end
+                        && now < deadlines.measured_end
+                    {
+                        if measured_start.is_none() {
+                            measured_start = Some(now);
+                        }
+                        let latency_ns = crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
+                        histogram.record(latency_ns).ok();
+                        interval_hist.record(latency_ns).ok();
+                        interval_count += 1;
+                        maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
+                        progress.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "latency-trace")]
                         {
-                            if measured_start.is_none() {
-                                measured_start = Some(now);
-                            }
-                            let latency_ns =
-                                crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
-                            histogram.record(latency_ns).ok();
-                            interval_hist.record(latency_ns).ok();
-                            interval_count += 1;
-                            maybe_sample(
-                                &mut interval_hist,
-                                &mut interval_count,
-                                &mut series,
-                                start,
-                            );
-                            progress.fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "latency-trace")]
-                            {
-                                work_done_this_iter = true;
-                            }
+                            work_done_this_iter = true;
                         }
                     }
-                    // Outcome tally runs *after* the latency capture
-                    // above so this counter increment is not billed to
-                    // the wire roundtrip. An undecodable response is
-                    // dropped for the reason given above.
-                    let _ = conn.outcomes.record(&reply);
                 }
-
-                cursor += 4 + frame_len;
-            }
-
-            // Compact parse buffer.
-            if cursor > 0 {
-                let remaining = conn.parse_buf.len() - cursor;
-                conn.parse_buf.copy_within(cursor.., 0);
-                conn.parse_buf.truncate(remaining);
+                // Outcome tally runs *after* the latency capture
+                // above so this counter increment is not billed to
+                // the wire roundtrip. An undecodable response is
+                // dropped for the reason given above.
+                let _ = conn.outcomes.record(&reply);
             }
         }
 
@@ -1065,49 +1044,31 @@ fn dpdk_auth_all(
             }
 
             let n = socket.recv_slice(&mut recv_buf).unwrap_or(0);
-            if n > 0 {
-                conn.parse_buf.extend_from_slice(&recv_buf[..n]);
-            }
+            conn.decoder.push(&recv_buf[..n]);
 
-            // Try to extract a frame.
-            if conn.parse_buf.len() < 4 {
-                continue;
-            }
-            let frame_len = u32::from_le_bytes([
-                conn.parse_buf[0],
-                conn.parse_buf[1],
-                conn.parse_buf[2],
-                conn.parse_buf[3],
-            ]) as usize;
-            if conn.parse_buf.len() < 4 + frame_len {
-                continue;
-            }
-
-            // Borrow payload directly from parse_buf — no allocation needed.
-            // Use a cursor approach: process the frame, then compact once.
-            let consumed = 4 + frame_len;
-
-            match handshakes[i].feed(&conn.parse_buf[4..consumed]) {
-                // The challenge response, length prefix included.
-                Ok(Step::Send(frame)) => {
-                    let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
-                    socket.send_slice(frame).expect("send ChallengeResponse");
+            // Feed the handshake every frame it is waiting for. Anything
+            // behind its last frame stays in the decoder for the reply
+            // loop.
+            while !handshakes[i].is_done() {
+                let frame = match conn.decoder.next() {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(e) => panic!("client {i}: auth handshake failed: {e}"),
+                };
+                match handshakes[i].feed(frame) {
+                    // The challenge response, length prefix included.
+                    Ok(Step::Send(response)) => {
+                        let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
+                        socket.send_slice(response).expect("send ChallengeResponse");
+                    }
+                    Ok(Step::Ready) => {}
+                    Err(e) => panic!("client {i}: auth handshake failed: {e}"),
                 }
-                Ok(Step::Ready) => {}
-                Err(e) => panic!("client {i}: auth handshake failed: {e}"),
             }
-
-            // Compact parse buffer after processing the frame.
-            conn.parse_buf.drain(..consumed);
         }
 
         if all_done {
             break;
         }
-    }
-
-    // Clear parse buffers after auth (they may have leftover bytes).
-    for conn in connections.iter_mut() {
-        conn.parse_buf.clear();
     }
 }

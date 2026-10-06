@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 
-use melin_client::{Handshake, Reply, Step};
+use melin_client::framing::FrameDecoder;
+use melin_client::{Handshake, MAX_FRAME_SIZE, Reply, Step};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_ec_types::types::{AccountId, OrderId, Side};
@@ -116,7 +117,11 @@ pub struct Session {
 
     // ── Melin server side ──
     pub melin_fd: Option<RawFd>,
-    pub melin_parse_buf: Vec<u8>,
+    /// Bytes received from the node, split into frames. The sequencer's
+    /// decoder rather than a hand-rolled buffer: it refuses a length over
+    /// the protocol's limit the moment the prefix arrives, instead of
+    /// buffering towards a frame that can never be valid.
+    pub melin_decoder: FrameDecoder,
     pub melin_send_buf: Vec<u8>,
     /// Buffer currently being sent by io_uring — must not be mutated
     /// until the corresponding SEND CQE arrives.
@@ -215,7 +220,7 @@ impl Session {
             resend_high_water: None,
 
             melin_fd: None,
-            melin_parse_buf: Vec::with_capacity(256),
+            melin_decoder: FrameDecoder::new(),
             melin_send_buf: Vec::with_capacity(256),
             melin_inflight: Vec::with_capacity(256),
             melin_seq: 0,
@@ -391,37 +396,47 @@ impl Session {
         self.state = SessionState::AwaitingChallenge;
     }
 
-    /// Try to process one complete Melin frame from `melin_parse_buf`.
-    /// Returns an action for the event loop.
+    /// Process the next complete Melin frame in `melin_decoder`, and
+    /// return the action it calls for. `None` when no whole frame has
+    /// arrived yet: a frame that calls for nothing (`SessionAction::None`,
+    /// a heartbeat say) may have more frames queued behind it, so the
+    /// event loop keeps calling until this returns `None`.
     pub fn try_process_melin_frame(
         &mut self,
         config: &GatewayConfig,
         symbol_map: &HashMap<String, SymbolConfig>,
         _now: Instant,
-    ) -> SessionAction {
-        // Melin uses length-prefixed framing: [u32 LE length][payload].
-        let buf = &self.melin_parse_buf;
-        if buf.len() < 4 {
-            return SessionAction::None;
-        }
-        let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if buf.len() < 4 + frame_len {
-            return SessionAction::None; // Incomplete frame.
-        }
-
-        // Extract the frame payload.
-        let payload = self.melin_parse_buf[4..4 + frame_len].to_vec();
-        self.melin_parse_buf.drain(..4 + frame_len);
-
-        match self.state {
-            SessionState::AwaitingChallenge | SessionState::AwaitingAuthResult => {
-                self.handle_handshake_frame(&payload, config)
+    ) -> Option<SessionAction> {
+        // Copied out of the decoder so the handlers below can take the
+        // whole session. The decoder admits nothing over `MAX_FRAME_SIZE`
+        // (1 KiB), so the copy fits on the stack and allocates nothing.
+        let mut frame = [0u8; MAX_FRAME_SIZE];
+        let len = match self.melin_decoder.next() {
+            Ok(Some(payload)) => {
+                frame[..payload.len()].copy_from_slice(payload);
+                payload.len()
             }
-            SessionState::SyncingRequestSeq => match self.melin_response(&payload) {
+            Ok(None) => return None,
+            Err(e) => {
+                // A length over the limit leaves the stream with no frame
+                // boundary to resume from: the decoder refuses everything
+                // after it, so the session cannot go on.
+                warn!(sender = %self.sender_comp_id, error = %e, "malformed Melin frame length");
+                self.queue_fix_logout(config, "internal error");
+                return Some(SessionAction::Close);
+            }
+        };
+        let payload = &frame[..len];
+
+        Some(match self.state {
+            SessionState::AwaitingChallenge | SessionState::AwaitingAuthResult => {
+                self.handle_handshake_frame(payload, config)
+            }
+            SessionState::SyncingRequestSeq => match self.melin_response(payload) {
                 Some(response) => self.handle_request_seq_sync(response, config),
                 None => SessionAction::None,
             },
-            SessionState::Active => match self.melin_response(&payload) {
+            SessionState::Active => match self.melin_response(payload) {
                 Some(response) => self.handle_active_melin(response, config, symbol_map),
                 None => SessionAction::None,
             },
@@ -429,7 +444,7 @@ impl Session {
                 debug!(state = ?self.state, "Melin frame in unexpected state");
                 SessionAction::None
             }
-        }
+        })
     }
 
     /// Tell a Melin frame past the handshake apart, the way the
@@ -1942,12 +1957,12 @@ lot_size_inverse = 1
             .build(sender, target, seq)
     }
 
-    /// Push a Melin response onto the session's parse buffer in the
+    /// Push a Melin response into the session's frame decoder in the
     /// length-prefixed wire format.
     fn push_melin_response(session: &mut Session, response: &ResponseKind) {
         let mut buf = [0u8; 256];
         let n = melin_ec_protocol::codec::encode_response(response, &mut buf).unwrap();
-        session.melin_parse_buf.extend_from_slice(&buf[..n]);
+        session.melin_decoder.push(&buf[..n]);
     }
 
     fn px(v: u64) -> Price {
@@ -2114,9 +2129,8 @@ lot_size_inverse = 1
 
     /// Queue one length-prefixed Melin frame for the dispatcher.
     fn push_melin_frame(s: &mut Session, payload: &[u8]) {
-        s.melin_parse_buf
-            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        s.melin_parse_buf.extend_from_slice(payload);
+        s.melin_decoder.push(&(payload.len() as u32).to_le_bytes());
+        s.melin_decoder.push(payload);
     }
 
     #[test]
@@ -2135,7 +2149,9 @@ lot_size_inverse = 1
 
         for transport in [TransportResponse::Heartbeat, TransportResponse::BatchEnd] {
             push_melin_frame(&mut s, &transport_payload(&transport));
-            let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+            let action = s
+                .try_process_melin_frame(&config, &sym, Instant::now())
+                .expect("a whole frame");
             assert_eq!(action, SessionAction::None, "{transport:?}");
             assert!(matches!(s.state, SessionState::SyncingRequestSeq));
             assert!(s.fix_send_buf.is_empty());
@@ -2145,7 +2161,9 @@ lot_size_inverse = 1
             &mut s,
             &encode_response_payload(&ResponseKind::RequestSeqHwm { hwm: 5 }),
         );
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
         assert!(matches!(s.state, SessionState::Active));
         assert_eq!(s.melin_seq, 5);
@@ -2169,17 +2187,69 @@ lot_size_inverse = 1
             TransportResponse::ServerReady,
         ] {
             push_melin_frame(&mut s, &transport_payload(&transport));
-            let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+            let action = s
+                .try_process_melin_frame(&config, &sym, Instant::now())
+                .expect("a whole frame");
             assert_eq!(action, SessionAction::None, "{transport:?}");
             assert!(matches!(s.state, SessionState::Active));
             assert!(s.fix_send_buf.is_empty());
         }
         // An empty frame is a protocol violation, dropped the same way.
         push_melin_frame(&mut s, &[]);
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::None);
         assert!(matches!(s.state, SessionState::Active));
-        assert!(s.melin_parse_buf.is_empty());
+        // Every frame was taken, and nothing waits behind them.
+        assert!(s.melin_decoder.pending().is_empty());
+        assert_eq!(
+            s.try_process_melin_frame(&config, &sym, Instant::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_partial_frame_waits_for_the_rest() {
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let mut frame = Vec::new();
+        let payload = transport_payload(&TransportResponse::Heartbeat);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let (head, tail) = frame.split_at(3);
+
+        s.melin_decoder.push(head);
+        assert_eq!(
+            s.try_process_melin_frame(&config, &sym, Instant::now()),
+            None
+        );
+        s.melin_decoder.push(tail);
+        assert_eq!(
+            s.try_process_melin_frame(&config, &sym, Instant::now()),
+            Some(SessionAction::None)
+        );
+    }
+
+    #[test]
+    fn an_oversized_melin_frame_length_closes_the_session() {
+        // Past a length over the protocol's limit the stream has no frame
+        // boundary left: the session logs the FIX client out and closes,
+        // rather than buffering towards a frame that can never arrive.
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        s.melin_decoder
+            .push(&((MAX_FRAME_SIZE + 1) as u32).to_le_bytes());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("refused on the prefix alone");
+        assert_eq!(action, SessionAction::Close);
+        let logout = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(logout.msg_type(), tags::MSG_LOGOUT);
     }
 
     #[test]
@@ -2543,7 +2613,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
 
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
@@ -2590,7 +2662,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
 
         // Two ExecutionReports should be in the buffer back-to-back.
@@ -2641,7 +2715,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::None);
         assert!(s.fix_send_buf.is_empty());
     }
@@ -2671,7 +2747,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
 
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
@@ -2698,7 +2776,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
 
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
@@ -2740,7 +2820,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
         assert!(!s.pending_cancels.contains_key(&order_id));
 
@@ -2763,7 +2845,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::None);
         assert!(s.fix_send_buf.is_empty());
     }
@@ -2842,7 +2926,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
 
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
@@ -2880,7 +2966,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
 
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
@@ -2929,7 +3017,9 @@ lot_size_inverse = 1
             }),
         );
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::SendFix);
         assert!(
             !s.pending_cancels.contains_key(&order_id),
@@ -3291,7 +3381,8 @@ lot_size_inverse = 1
                     quantity: qty(10),
                 }),
             );
-            s.try_process_melin_frame(&config, &sym, Instant::now());
+            s.try_process_melin_frame(&config, &sym, Instant::now())
+                .expect("a whole frame");
         }
         assert_eq!(s.outbound_store.len(), 3);
         let _ = drain_send_buf(&mut s); // Discard the original sends.
@@ -3389,7 +3480,8 @@ lot_size_inverse = 1
                 quantity: qty(10),
             }),
         );
-        s.try_process_melin_frame(&config, &sym, Instant::now());
+        s.try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         // HB seqs 3 and 4.
         for seq in [3u64, 4] {
             let hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", seq);
@@ -3407,7 +3499,8 @@ lot_size_inverse = 1
                 quantity: qty(10),
             }),
         );
-        s.try_process_melin_frame(&config, &sym, Instant::now());
+        s.try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         // HB seq 6.
         let hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("MELIN", "FIRM_A", 6);
         s.queue_fix_raw(&hb);
@@ -3614,7 +3707,8 @@ lot_size_inverse = 1
                 quantity: qty(10),
             }),
         );
-        s.try_process_melin_frame(&config, &sym, Instant::now());
+        s.try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         let seq_after_send = s.fix_outbound_seq;
         let store_len_after_send = s.outbound_store.len();
         let _ = drain_send_buf(&mut s);
@@ -3774,12 +3868,11 @@ lot_size_inverse = 1
         // should log a warning and return SessionAction::None — NOT
         // close the session (decode errors from the engine must not
         // take the session down).
-        let payload = [control_codec::TAG_APP, 0xFF]; // Unknown kind.
-        let len = (payload.len() as u32).to_le_bytes();
-        s.melin_parse_buf.extend_from_slice(&len);
-        s.melin_parse_buf.extend_from_slice(&payload);
+        push_melin_frame(&mut s, &[control_codec::TAG_APP, 0xFF]); // Unknown kind.
 
-        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
         assert_eq!(action, SessionAction::None);
         // Session stays Active.
         assert!(matches!(s.state, SessionState::Active));
