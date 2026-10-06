@@ -67,12 +67,51 @@ exactly what it could before.
   now calls the listener's check itself *(sequencer)*, so the two cannot
   drift. Who may subscribe is unchanged: any client role, never
   `replication`.
+- **Replication protocol 7, journal format 16, snapshot framing 3**
+  *(sequencer)*. Replicated entries now carry their primary's checksum and
+  the journal records how long the genesis is. Existing journals and
+  snapshots are read as they are, with no migration, but nodes on
+  different protocol versions refuse each other at the handshake: stop
+  the cluster, upgrade every node, and restart on the existing files.
+- **Genesis is written as the journal is created** *(sequencer)*. A
+  first boot either leaves a journal holding the whole genesis or leaves
+  nothing, and a failed one is retried as a first boot. The genesis's
+  reports are no longer published on the event feed, and all its events
+  carry the journal's creation time.
+- **A DPDK replica refuses client connections until it is promoted**
+  *(sequencer)*, where a connect used to complete and then go
+  unanswered. Clients retry either way.
 
 ### Removed
 
 - **`Request::requires_operator` and `Request::is_fund_management`.**
   Match on `Request::category` instead, or ask
   `request.category().admits(role)`.
+
+### Fixed
+
+- **DPDK failover** *(sequencer)*. A promoted DPDK replica now serves as
+  a DPDK primary; it used to exit, or quietly fall back to kernel TCP. A
+  stopped or silent DPDK peer is now noticed within five seconds, so a
+  primary whose last replica has left halts and a replica can depose a
+  dead primary. A replica that stops reading while it finishes catching
+  up no longer freezes the primary's clients, and a joining replica's
+  catch-up reads now run on a separate worker instead of the poll thread.
+- **Replication integrity** *(sequencer)*. A replica now checks each
+  replicated entry against its primary's checksum, refusing a damaged
+  batch and fetching it again. A replica that reconnects no longer
+  journals entries it already held, and a release build now refuses an
+  out-of-order sequence instead of journaling it (it used to then refuse
+  to recover).
+- **Genesis** *(sequencer)*. A node started from a snapshot alone no
+  longer applies the genesis twice, and a first boot that failed after
+  creating the journal no longer leaves a node serving without its
+  genesis.
+- **DPDK client and metric fixes** *(sequencer)*. A failed client
+  authentication now closes the connection, as on kernel TCP. Frames the
+  NIC flags with a bad checksum are dropped. `melin_replica_ack_latency_us`
+  is now reported on DPDK, and on kernel TCP
+  `melin_replica_evictions_total` counts each eviction once.
 
 ## [0.18.0] - 2026-09-28
 
