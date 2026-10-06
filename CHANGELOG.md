@@ -81,6 +81,10 @@ exactly what it could before.
 - **A DPDK replica refuses client connections until it is promoted**
   *(sequencer)*, where a connect used to complete and then go
   unanswered. Clients retry either way.
+- **The FIX gateway logs a session out when its node sends a frame
+  length over the protocol's limit.** Such a length leaves no frame
+  boundary to resume from; the gateway used to keep buffering towards a
+  frame that could never arrive, leaving the FIX session silent.
 
 ### Removed
 
@@ -90,6 +94,12 @@ exactly what it could before.
 
 ### Fixed
 
+- **The FIX gateway could hold an execution report back.** When one
+  receive from the node carried a heartbeat, a batch end or a report the
+  session had nothing to forward for, ahead of other replies, the gateway
+  stopped there, and the replies behind it waited for the node's next
+  write: up to a heartbeat interval on a quiet connection. Every reply is
+  now forwarded as soon as it arrives.
 - **DPDK failover** *(sequencer)*. A promoted DPDK replica now serves as
   a DPDK primary; it used to exit, or quietly fall back to kernel TCP. A
   stopped or silent DPDK peer is now noticed within five seconds, so a
