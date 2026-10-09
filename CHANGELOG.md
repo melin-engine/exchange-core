@@ -117,6 +117,16 @@ exactly what it could before.
   longer applies the genesis twice, and a first boot that failed after
   creating the journal no longer leaves a node serving without its
   genesis.
+- **Journal recovery could delete acknowledged entries, or refuse an
+  ordinary crash** *(sequencer)*. A sequence gap, a run of zeros or a
+  flipped bit in the last entry's length used to make recovery truncate
+  the live segment there, replicated entries included, while a write cut
+  inside its checksum was refused and kept the node down. Recovery now
+  discards only what a crash can have left, a malformed final write
+  followed by zeros, and stops with an error on anything else, leaving
+  the journal untouched. `journal-verify` reports such a torn write by
+  its byte range instead of as a sequence gap, and reads each archived
+  segment under the stricter archive rule.
 - **DPDK client and metric fixes** *(sequencer)*. A failed client
   authentication now closes the connection, as on kernel TCP. Frames the
   NIC flags with a bad checksum are dropped. `melin_replica_ack_latency_us`

@@ -833,12 +833,14 @@ No action needed. The journal is fully synced. On next startup, the server recov
 
 The journal uses CRC32C checksums on every entry. If the server crashes during a write:
 
-- The partially written entry will fail CRC validation on recovery.
-- The `JournalReader` detects the truncated/corrupt entry and stops replaying at the last valid entry.
-- The journal reopens the file for appending at the valid data boundary, effectively truncating the garbage.
-- **One event may be lost** (the one being written at crash time). All prior events are intact.
+- The partially written entry fails validation on recovery (a cut-off entry, a bad checksum, or zeros where the entry should be).
+- Recovery discards exactly what a crash can have left: a malformed final write in the live segment, within one unsynced write (40 MiB) of the last whole entry, followed by nothing but zeros.
+- The journal reopens for appending right after the last whole entry.
+- **No acknowledged event is lost.** The discarded write was never synced, so its event was never acknowledged to the client.
 
 This is handled automatically. No manual intervention required.
+
+Anything else — a whole entry with the wrong sequence, an over-long entry length, data beyond that reach, or anything but zeros after an archived segment's last entry — is not a crash artifact. Recovery then stops the node with an error and leaves the journal untouched, so that the file can be examined (`journal-verify` reports where it stands) rather than silently cut short. Earlier versions truncated the journal at the first such anomaly, which could delete acknowledged entries.
 
 ### 3. Crash During Rotation
 

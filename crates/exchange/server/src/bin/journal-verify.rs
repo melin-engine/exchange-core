@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use melin_ec_trading::trading_event::TradingRequest;
-use melin_journal::JournalReader;
+use melin_journal::{JournalReader, SegmentKind};
 
 fn hex(h: [u8; 32]) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
@@ -21,9 +21,11 @@ fn hex(h: [u8; 32]) -> String {
 /// Per-segment summary line. Walks the segment fully so the printed
 /// tail hash reflects every entry; per-entry validation errors abort
 /// via the caller's lineage walk, so this only runs on segments the
-/// verifier already accepted.
-fn print_segment(label: &str, path: &Path) {
-    let mut reader = match JournalReader::<TradingRequest>::open(path) {
+/// verifier already accepted. Opened as the kind it is, the same
+/// live/archived rule the lineage walk applies, so the two cannot
+/// disagree about where a segment's data ends.
+fn print_segment(label: &str, path: &Path, kind: SegmentKind) {
+    let mut reader = match JournalReader::<TradingRequest>::open_segment(path, kind) {
         Ok(r) => r,
         Err(e) => {
             println!("  {label}: <unreadable: {e}>");
@@ -64,17 +66,18 @@ fn main() {
     // Per-segment detail first, so a failing lineage still shows where
     // each segment stands (the boundary at fault is the one whose
     // anchor differs from its predecessor's tail).
-    let mut segments: Vec<(String, PathBuf)> = melin_journal::segment::list_archives(&path)
-        .expect("list archives")
-        .into_iter()
-        .map(|(n, p)| (format!("archive {n:06}"), p))
-        .collect();
+    let mut segments: Vec<(String, PathBuf, SegmentKind)> =
+        melin_journal::segment::list_archives(&path)
+            .expect("list archives")
+            .into_iter()
+            .map(|(n, p)| (format!("archive {n:06}"), p, SegmentKind::Archived))
+            .collect();
     if path.exists() {
-        segments.push(("live".to_string(), path.clone()));
+        segments.push(("live".to_string(), path.clone(), SegmentKind::Live));
     }
     println!("segments ({}):", segments.len());
-    for (label, p) in &segments {
-        print_segment(label, p);
+    for (label, p, kind) in &segments {
+        print_segment(label, p, *kind);
     }
 
     // Authoritative verdict: dense sequences within and across
@@ -83,12 +86,13 @@ fn main() {
     match melin_journal::segment::verify_lineage::<TradingRequest>(&path) {
         Ok(report) => {
             println!("lineage:  OK");
-            if let Some((expected, found)) = report.live_tail_gap {
+            if let Some(torn) = report.live_torn_tail {
                 println!(
-                    "  note: live segment tail has a sequence gap (expected {expected}, \
-                     found {found}) — a recoverable crash artifact, not tampering. \
-                     Entries before the gap verified; recovery will truncate at the gap \
-                     and nothing past it was ever acknowledged."
+                    "  note: live segment ends in a torn write ({} bytes at offset {}) — \
+                     a recoverable crash artifact, not tampering. Every whole entry \
+                     verified; recovery will discard the torn write, which was never \
+                     acknowledged.",
+                    torn.len, torn.offset
                 );
             }
             println!("  segments:      {}", report.segments);
