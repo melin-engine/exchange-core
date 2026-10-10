@@ -934,13 +934,11 @@ wait_for_replicas() {
     for i in $(seq 1 "$timeout"); do
         metrics=$(ssh $SSH_OPTS "$SERVER" "curl -s --max-time 2 http://${health_addr}/metrics" 2>/dev/null || true)
         connected=$(echo "$metrics" | awk '$1 == "melin_replicas_connected" { print $2 }')
-        # Slots below `expected` still catching up. The label is slot="N".
-        catching=$(echo "$metrics" | awk -v n="$expected" '
-            /^melin_replica_catching_up\{/ {
-                match($1, /slot="[0-9]+"/)
-                slot = substr($1, RSTART + 6, RLENGTH - 7)
-                if (slot + 0 < n && $2 + 0 != 0) c++
-            }
+        # Slots still catching up, whichever slot: the primary hands a
+        # connecting replica the first free slot, so a lone replica can
+        # sit in slot 1 while slot 0 is still being torn down.
+        catching=$(echo "$metrics" | awk '
+            /^melin_replica_catching_up\{/ { if ($2 + 0 != 0) c++ }
             END { print c + 0 }')
         if [[ "${connected:-0}" -ge "$expected" && "${catching}" -eq 0 ]]; then
             echo "  ${expected} replica(s) live (took ${i}s)."
@@ -987,9 +985,11 @@ except (OSError, ValueError) as exc:
 samples = doc.get("health") or []
 evictions = max((s.get("melin_replica_evictions_total") or 0) for s in samples) if samples else 0
 short = sum(1 for s in samples if (s.get("melin_replicas_connected") or 0) < expected)
+# Every slot, not just the first `expected`: a replica takes the first
+# free slot, so a lone replica can be catching up in slot 1.
 catching = sum(
     1 for s in samples
-    if any((s.get("melin_replica_catching_up_slot_%d" % i) or 0) for i in range(expected))
+    if any(v for k, v in s.items() if k.startswith("melin_replica_catching_up_slot_"))
 )
 degraded = expected > 0 and (evictions > 0 or short > 0 or catching > 0)
 doc["cluster"] = {
