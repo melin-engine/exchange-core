@@ -51,10 +51,11 @@
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #
 # Replicated transports wait for every replica to be connected and on
-# the live stream before load starts, and each run's primary health
+# the live stream before load starts (a transport whose replicas are not
+# live within two minutes is skipped), and each run's primary health
 # samples are checked afterwards: a replica evicted, missing or catching
 # up at any point marks the run degraded (`cluster.degraded` in its
-# JSON) and the suite exits non-zero once every workload has run.
+# JSON). Either way the suite exits non-zero once every workload has run.
 #   SINGLE_DURATION=T      Measured-phase duration for single-order workload
 #                          (humantime, default: 30s)
 #   WARMUP_DURATION=T      Warmup duration (humantime, default: bench default 5s)
@@ -928,28 +929,38 @@ CURRENT_REPLICAS=0
 # finish before the ring fills again, and the run then measures a
 # primary serving replication reads. `check_cluster_health` catches the
 # same condition after the fact.
+#
+# Usage: wait_for_replicas <health_addr> <expected> <transport> [timeout]
+# A cluster that is not ready in time is recorded against `transport`
+# with the degraded runs and `CLUSTER_UNREADY` is set, for the caller to
+# stop that transport and skip its workloads; the suite goes on to the
+# next transport and fails at the end, rather than aborting here with
+# nothing reported.
+CLUSTER_UNREADY=0
 wait_for_replicas() {
-    local health_addr="$1" expected="$2" timeout="${3:-120}"
+    local health_addr="$1" expected="$2" transport="$3" timeout="${4:-120}"
     local metrics connected catching
+    CLUSTER_UNREADY=0
     for i in $(seq 1 "$timeout"); do
         metrics=$(ssh $SSH_OPTS "$SERVER" "curl -s --max-time 2 http://${health_addr}/metrics" 2>/dev/null || true)
         connected=$(echo "$metrics" | awk '$1 == "melin_replicas_connected" { print $2 }')
-        # Slots below `expected` still catching up. The label is slot="N".
-        catching=$(echo "$metrics" | awk -v n="$expected" '
-            /^melin_replica_catching_up\{/ {
-                match($1, /slot="[0-9]+"/)
-                slot = substr($1, RSTART + 6, RLENGTH - 7)
-                if (slot + 0 < n && $2 + 0 != 0) c++
-            }
+        # Slots still catching up, whichever slot: the primary hands a
+        # connecting replica the first free slot, so a lone replica can
+        # sit in slot 1 while slot 0 is still being torn down.
+        catching=$(echo "$metrics" | awk '
+            /^melin_replica_catching_up\{/ { if ($2 + 0 != 0) c++ }
             END { print c + 0 }')
         if [[ "${connected:-0}" -ge "$expected" && "${catching}" -eq 0 ]]; then
             echo "  ${expected} replica(s) live (took ${i}s)."
             return 0
         fi
         if [[ $i -eq "$timeout" ]]; then
-            echo "  ERROR: expected ${expected} live replica(s) within ${timeout}s (connected=${connected:-none}, catching up=${catching})."
+            local verdict="UNREADY: expected ${expected} live replica(s) within ${timeout}s, got connected=${connected:-none}, catching up=${catching}"
+            echo "  ERROR: ${verdict}; skipping the ${transport} workloads."
             ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-ec-server.log" 2>/dev/null || true
-            return 1
+            DEGRADED_RUNS+=("${transport} (start): ${verdict}")
+            CLUSTER_UNREADY=1
+            return 0
         fi
         sleep 1
     done
@@ -987,11 +998,17 @@ except (OSError, ValueError) as exc:
 samples = doc.get("health") or []
 evictions = max((s.get("melin_replica_evictions_total") or 0) for s in samples) if samples else 0
 short = sum(1 for s in samples if (s.get("melin_replicas_connected") or 0) < expected)
+# Every slot, not just the first `expected`: a replica takes the first
+# free slot, so a lone replica can be catching up in slot 1.
 catching = sum(
     1 for s in samples
-    if any((s.get("melin_replica_catching_up_slot_%d" % i) or 0) for i in range(expected))
+    if any(v for k, v in s.items() if k.startswith("melin_replica_catching_up_slot_"))
 )
-degraded = expected > 0 and (evictions > 0 or short > 0 or catching > 0)
+# No samples at all on a replicated run is not a pass: the primary's
+# /metrics was never scraped, which is what a saturated primary looks
+# like, so there is nothing to clear the run with.
+unjudged = expected > 0 and not samples
+degraded = unjudged or (expected > 0 and (evictions > 0 or short > 0 or catching > 0))
 doc["cluster"] = {
     "replicas_expected": expected,
     "health_samples": len(samples),
@@ -1005,8 +1022,11 @@ with open(path, "w") as f:
 
 if expected == 0:
     print("ok: no replicas")
-elif not samples:
-    print("ok: no health samples to judge")
+elif unjudged:
+    print(
+        "UNJUDGED: no health samples, so %d replica(s) cannot be shown live; the primary's "
+        "/metrics was never scraped" % expected
+    )
 elif degraded:
     print(
         "DEGRADED: %d eviction(s), %d/%d sample(s) short of %d replica(s), %d/%d catching up"
@@ -1020,6 +1040,11 @@ PY
         DEGRADED*)
             echo "  cluster health: ${verdict}"
             echo "  ERROR: the cluster did not stay healthy during ${name}; its numbers measure a degraded primary."
+            DEGRADED_RUNS+=("${name}: ${verdict}")
+            ;;
+        UNJUDGED*)
+            echo "  cluster health: ${verdict}"
+            echo "  ERROR: the cluster's health during ${name} is unknown; its numbers cannot be trusted."
             DEGRADED_RUNS+=("${name}: ${verdict}")
             ;;
         *)
@@ -1209,8 +1234,12 @@ run_bench() {
     return $rc
 }
 
+# Usage: collect_result <name> [label]
+# `name` is the JSON's file name; `label`, when the file is a temporary
+# one a caller renames afterwards (a sweep point), is how the run is
+# reported.
 collect_result() {
-    local name="$1"
+    local name="$1" label="${2:-$1}"
     # Tag NO_PERSIST runs so persist and no-persist JSONs can coexist
     # in the same directory and appear side-by-side in the CDF plot.
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
@@ -1220,7 +1249,7 @@ collect_result() {
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:${BENCH_JSON}" "$out" 2>/dev/null || true
     if [[ -f "$out" ]]; then
         merge_vmstat_delta "$out"
-        check_cluster_health "$out" "$name"
+        check_cluster_health "$out" "$label"
     fi
 }
 
@@ -1299,7 +1328,7 @@ transport_start_tcp_repl() {
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=1
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "tcp-repl"
 
     perf_capture_start "tcp-repl"
 }
@@ -1363,7 +1392,7 @@ transport_start_tcp_dual_repl() {
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=2
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "tcp-dual-repl"
 
     perf_capture_start "tcp-dual-repl"
 }
@@ -1931,7 +1960,7 @@ transport_start_dpdk_repl() {
     # — same as transport_start_dpdk. Empty would break --health-addr arg.
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=1
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "dpdk-repl"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-repl"
@@ -2059,7 +2088,7 @@ transport_start_dpdk_dual_repl() {
     # — same as transport_start_dpdk. Empty would break --health-addr arg.
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=2
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "dpdk-dual-repl"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-dual-repl"
@@ -2246,8 +2275,15 @@ run_sweep() {
         SERVER_EXTRA_ARGS="${server_extra}"
         "${stop_fn}" 2>/dev/null || true
         "${start_fn}"
+        if [[ "$CLUSTER_UNREADY" == "1" ]]; then
+            # Recorded by the readiness gate against the transport; the
+            # rest of this sweep would start the same cluster again.
+            "${stop_fn}" 2>/dev/null || true
+            SERVER_EXTRA_ARGS=""
+            return 0
+        fi
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SWEEP_DURATION}" ${bench_args}
-        collect_result "_sweep_tmp"
+        collect_result "_sweep_tmp" "${transport}-sweep-${sweep_name}/${label}"
         cp "${RESULTS_DIR}/_sweep_tmp.json" "${sweep_dir}/${label}.json" 2>/dev/null || true
         rm -f "${RESULTS_DIR}/_sweep_tmp.json"
         "${stop_fn}"
@@ -2358,6 +2394,12 @@ for transport in "${ORDERED_TRANSPORTS[@]}"; do
             fi
             "$start_fn"
             first=0
+            if [[ "$CLUSTER_UNREADY" == "1" ]]; then
+                # Recorded by the readiness gate; the servers may be half
+                # up, so stop them without the post-run verification.
+                "$stop_fn" 2>/dev/null || true
+                continue 2
+            fi
 
             fn="workload_${workload//-/_}"
             "$fn" "$transport"
@@ -2463,7 +2505,7 @@ find "${RESULTS_DIR}" -type f | sort
 
 if [[ ${#DEGRADED_RUNS[@]} -gt 0 ]]; then
     echo ""
-    echo "  FAILED: ${#DEGRADED_RUNS[@]} run(s) measured a degraded cluster (a replica evicted, missing or catching up):"
+    echo "  FAILED: ${#DEGRADED_RUNS[@]} run(s) measured a degraded cluster (a replica evicted, missing or catching up), or one whose health was never sampled:"
     for r in "${DEGRADED_RUNS[@]}"; do
         echo "    - ${r}"
     done
