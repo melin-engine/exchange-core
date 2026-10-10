@@ -94,6 +94,15 @@ exactly what it could before.
 
 ### Fixed
 
+- **The LAN benchmark suite could pass a run on a degraded cluster.** On
+  a replicated transport it now waits for every replica to be connected
+  and on the live stream before starting load, and afterwards checks the
+  primary's health samples: a replica evicted, missing or catching up
+  during a run marks it degraded (`cluster.degraded` in its JSON) and
+  fails the suite once every workload has run. A dual-replica run used to
+  report a clean pass while one replica was evicted into a catch-up loop
+  and the primary served journal reads against its own writes, which
+  showed up only as a few percent of throughput and a wider tail.
 - **The FIX gateway could hold an execution report back.** When one
   receive from the node carried a heartbeat, a batch end or a report the
   session had nothing to forward for, ahead of other replies, the gateway
