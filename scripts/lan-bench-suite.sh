@@ -51,10 +51,11 @@
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #
 # Replicated transports wait for every replica to be connected and on
-# the live stream before load starts, and each run's primary health
+# the live stream before load starts (a transport whose replicas are not
+# live within two minutes is skipped), and each run's primary health
 # samples are checked afterwards: a replica evicted, missing or catching
 # up at any point marks the run degraded (`cluster.degraded` in its
-# JSON) and the suite exits non-zero once every workload has run.
+# JSON). Either way the suite exits non-zero once every workload has run.
 #   SINGLE_DURATION=T      Measured-phase duration for single-order workload
 #                          (humantime, default: 30s)
 #   WARMUP_DURATION=T      Warmup duration (humantime, default: bench default 5s)
@@ -928,9 +929,18 @@ CURRENT_REPLICAS=0
 # finish before the ring fills again, and the run then measures a
 # primary serving replication reads. `check_cluster_health` catches the
 # same condition after the fact.
+#
+# Usage: wait_for_replicas <health_addr> <expected> <transport> [timeout]
+# A cluster that is not ready in time is recorded against `transport`
+# with the degraded runs and `CLUSTER_UNREADY` is set, for the caller to
+# stop that transport and skip its workloads; the suite goes on to the
+# next transport and fails at the end, rather than aborting here with
+# nothing reported.
+CLUSTER_UNREADY=0
 wait_for_replicas() {
-    local health_addr="$1" expected="$2" timeout="${3:-120}"
+    local health_addr="$1" expected="$2" transport="$3" timeout="${4:-120}"
     local metrics connected catching
+    CLUSTER_UNREADY=0
     for i in $(seq 1 "$timeout"); do
         metrics=$(ssh $SSH_OPTS "$SERVER" "curl -s --max-time 2 http://${health_addr}/metrics" 2>/dev/null || true)
         connected=$(echo "$metrics" | awk '$1 == "melin_replicas_connected" { print $2 }')
@@ -945,9 +955,12 @@ wait_for_replicas() {
             return 0
         fi
         if [[ $i -eq "$timeout" ]]; then
-            echo "  ERROR: expected ${expected} live replica(s) within ${timeout}s (connected=${connected:-none}, catching up=${catching})."
+            local verdict="UNREADY: expected ${expected} live replica(s) within ${timeout}s, got connected=${connected:-none}, catching up=${catching}"
+            echo "  ERROR: ${verdict}; skipping the ${transport} workloads."
             ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-ec-server.log" 2>/dev/null || true
-            return 1
+            DEGRADED_RUNS+=("${transport} (start): ${verdict}")
+            CLUSTER_UNREADY=1
+            return 0
         fi
         sleep 1
     done
@@ -1315,7 +1328,7 @@ transport_start_tcp_repl() {
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=1
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "tcp-repl"
 
     perf_capture_start "tcp-repl"
 }
@@ -1379,7 +1392,7 @@ transport_start_tcp_dual_repl() {
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=2
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "tcp-dual-repl"
 
     perf_capture_start "tcp-dual-repl"
 }
@@ -1947,7 +1960,7 @@ transport_start_dpdk_repl() {
     # — same as transport_start_dpdk. Empty would break --health-addr arg.
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=1
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "dpdk-repl"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-repl"
@@ -2075,7 +2088,7 @@ transport_start_dpdk_dual_repl() {
     # — same as transport_start_dpdk. Empty would break --health-addr arg.
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
     CURRENT_REPLICAS=2
-    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS" "dpdk-dual-repl"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-dual-repl"
@@ -2262,6 +2275,13 @@ run_sweep() {
         SERVER_EXTRA_ARGS="${server_extra}"
         "${stop_fn}" 2>/dev/null || true
         "${start_fn}"
+        if [[ "$CLUSTER_UNREADY" == "1" ]]; then
+            # Recorded by the readiness gate against the transport; the
+            # rest of this sweep would start the same cluster again.
+            "${stop_fn}" 2>/dev/null || true
+            SERVER_EXTRA_ARGS=""
+            return 0
+        fi
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SWEEP_DURATION}" ${bench_args}
         collect_result "_sweep_tmp" "${transport}-sweep-${sweep_name}/${label}"
         cp "${RESULTS_DIR}/_sweep_tmp.json" "${sweep_dir}/${label}.json" 2>/dev/null || true
@@ -2374,6 +2394,12 @@ for transport in "${ORDERED_TRANSPORTS[@]}"; do
             fi
             "$start_fn"
             first=0
+            if [[ "$CLUSTER_UNREADY" == "1" ]]; then
+                # Recorded by the readiness gate; the servers may be half
+                # up, so stop them without the post-run verification.
+                "$stop_fn" 2>/dev/null || true
+                continue 2
+            fi
 
             fn="workload_${workload//-/_}"
             "$fn" "$transport"
