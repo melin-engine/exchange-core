@@ -991,7 +991,11 @@ catching = sum(
     1 for s in samples
     if any(v for k, v in s.items() if k.startswith("melin_replica_catching_up_slot_"))
 )
-degraded = expected > 0 and (evictions > 0 or short > 0 or catching > 0)
+# No samples at all on a replicated run is not a pass: the primary's
+# /metrics was never scraped, which is what a saturated primary looks
+# like, so there is nothing to clear the run with.
+unjudged = expected > 0 and not samples
+degraded = unjudged or (expected > 0 and (evictions > 0 or short > 0 or catching > 0))
 doc["cluster"] = {
     "replicas_expected": expected,
     "health_samples": len(samples),
@@ -1005,8 +1009,11 @@ with open(path, "w") as f:
 
 if expected == 0:
     print("ok: no replicas")
-elif not samples:
-    print("ok: no health samples to judge")
+elif unjudged:
+    print(
+        "UNJUDGED: no health samples, so %d replica(s) cannot be shown live; the primary's "
+        "/metrics was never scraped" % expected
+    )
 elif degraded:
     print(
         "DEGRADED: %d eviction(s), %d/%d sample(s) short of %d replica(s), %d/%d catching up"
@@ -1020,6 +1027,11 @@ PY
         DEGRADED*)
             echo "  cluster health: ${verdict}"
             echo "  ERROR: the cluster did not stay healthy during ${name}; its numbers measure a degraded primary."
+            DEGRADED_RUNS+=("${name}: ${verdict}")
+            ;;
+        UNJUDGED*)
+            echo "  cluster health: ${verdict}"
+            echo "  ERROR: the cluster's health during ${name} is unknown; its numbers cannot be trusted."
             DEGRADED_RUNS+=("${name}: ${verdict}")
             ;;
         *)
@@ -2463,7 +2475,7 @@ find "${RESULTS_DIR}" -type f | sort
 
 if [[ ${#DEGRADED_RUNS[@]} -gt 0 ]]; then
     echo ""
-    echo "  FAILED: ${#DEGRADED_RUNS[@]} run(s) measured a degraded cluster (a replica evicted, missing or catching up):"
+    echo "  FAILED: ${#DEGRADED_RUNS[@]} run(s) measured a degraded cluster (a replica evicted, missing or catching up), or one whose health was never sampled:"
     for r in "${DEGRADED_RUNS[@]}"; do
         echo "    - ${r}"
     done
