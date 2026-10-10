@@ -1221,8 +1221,12 @@ run_bench() {
     return $rc
 }
 
+# Usage: collect_result <name> [label]
+# `name` is the JSON's file name; `label`, when the file is a temporary
+# one a caller renames afterwards (a sweep point), is how the run is
+# reported.
 collect_result() {
-    local name="$1"
+    local name="$1" label="${2:-$1}"
     # Tag NO_PERSIST runs so persist and no-persist JSONs can coexist
     # in the same directory and appear side-by-side in the CDF plot.
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
@@ -1232,7 +1236,7 @@ collect_result() {
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:${BENCH_JSON}" "$out" 2>/dev/null || true
     if [[ -f "$out" ]]; then
         merge_vmstat_delta "$out"
-        check_cluster_health "$out" "$name"
+        check_cluster_health "$out" "$label"
     fi
 }
 
@@ -2259,7 +2263,7 @@ run_sweep() {
         "${stop_fn}" 2>/dev/null || true
         "${start_fn}"
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SWEEP_DURATION}" ${bench_args}
-        collect_result "_sweep_tmp"
+        collect_result "_sweep_tmp" "${transport}-sweep-${sweep_name}/${label}"
         cp "${RESULTS_DIR}/_sweep_tmp.json" "${sweep_dir}/${label}.json" 2>/dev/null || true
         rm -f "${RESULTS_DIR}/_sweep_tmp.json"
         "${stop_fn}"
