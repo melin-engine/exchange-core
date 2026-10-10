@@ -18,13 +18,17 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
-This release adopts the sequencer's next release and its
-application-defined client roles; the [Unreleased section of its
-changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+This release adopts sequencer 0.19.0 and its application-defined client
+roles; the [0.19.0 section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0190---2026-10-10)
 has the detail. The node runtime now keeps only the two roles it acts on,
 `operator` and `replication`, and the exchange declares its own. Every
 existing `authorized_keys` file loads unchanged, and each role may send
-exactly what it could before.
+exactly what it could before. Upgrading is a cluster-wide stop: the
+release changes the replication protocol, and nodes on different versions
+refuse each other at the handshake, so stop the cluster, upgrade every
+node, and restart on the existing journals and snapshots, which need no
+migration.
 
 ### Added
 
@@ -67,12 +71,38 @@ exactly what it could before.
   now calls the listener's check itself *(sequencer)*, so the two cannot
   drift. Who may subscribe is unchanged: any client role, never
   `replication`.
+- **The FIX gateway logs a session out when its node sends a frame
+  length over the protocol's limit.** Such a length leaves no frame
+  boundary to resume from; the gateway used to keep buffering towards a
+  frame that could never arrive, leaving the FIX session silent.
 
 ### Removed
 
 - **`Request::requires_operator` and `Request::is_fund_management`.**
   Match on `Request::category` instead, or ask
   `request.category().admits(role)`.
+
+### Fixed
+
+- **The LAN benchmark suite could pass a run on a degraded cluster.** On
+  a replicated transport it now waits for every replica to be connected
+  and on the live stream before starting load, and afterwards checks the
+  primary's health samples: a replica evicted, missing or catching up
+  during a run marks it degraded (`cluster.degraded` in its JSON) and
+  fails the suite once every workload has run. A dual-replica run used to
+  report a clean pass while one replica was evicted into a catch-up loop
+  and the primary served journal reads against its own writes, which
+  showed up only as a few percent of throughput and a wider tail.
+- **The FIX gateway could hold an execution report back.** When one
+  receive from the node carried a heartbeat, a batch end or a report the
+  session had nothing to forward for, ahead of other replies, the gateway
+  stopped there, and the replies behind it waited for the node's next
+  write: up to a heartbeat interval on a quiet connection. Every reply is
+  now forwarded as soon as it arrives.
+- **`journal-verify` follows the sequencer's new recovery rule**
+  *(sequencer)*: it reports a torn final write by its byte range instead
+  of as a sequence gap, which is now always an error, and reads each
+  archived segment under the stricter archive rule.
 
 ## [0.18.0] - 2026-09-28
 

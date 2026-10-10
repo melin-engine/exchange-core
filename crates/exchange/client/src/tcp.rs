@@ -244,21 +244,31 @@ impl Client {
     }
 }
 
-/// The sequencer client's outcomes in this crate's terms. `authenticate`
-/// and `classify` only return the first four; the rest belong to the
-/// sequencer's `Connection` and are folded into an I/O error rather
-/// than left unmapped. A protocol violation — a frame out of place in
-/// the handshake, a tag no reply carries — keeps its variant and
-/// loses its detail: `ProtocolError` carries no message.
+/// The sequencer client's outcomes in this crate's terms. A protocol
+/// violation — a frame out of place in the handshake, a tag no reply
+/// carries, a length over the frame limit — keeps its variant and loses
+/// its detail: `ProtocolError` carries no message. `authenticate` and
+/// `classify` return nothing else; the rest belong to the sequencer's
+/// `Connection` and its request framing, which this client does not use,
+/// and are folded into an I/O error rather than left unmapped. No
+/// wildcard: a variant the sequencer adds must be placed here.
 fn transport_error(e: melin_client::Error) -> ClientError {
+    use melin_client::Error;
     match e {
-        melin_client::Error::AuthFailed { .. } => ClientError::AuthFailed,
-        melin_client::Error::Io(e) => ClientError::Io(e),
-        melin_client::Error::Disconnected => ClientError::Disconnected,
-        melin_client::Error::Protocol(_) => {
+        Error::AuthFailed { .. } => ClientError::AuthFailed,
+        Error::Io(e) => ClientError::Io(e),
+        Error::Disconnected => ClientError::Disconnected,
+        Error::Protocol(_) | Error::FrameTooLarge { .. } => {
             ClientError::Protocol(ProtocolError::InvalidField("frame from the node"))
         }
-        other => ClientError::Io(std::io::Error::other(other.to_string())),
+        other @ (Error::Connect { .. }
+        | Error::Deadline { .. }
+        | Error::Key(_)
+        | Error::NoReply { .. }
+        | Error::RequestTooLarge { .. }
+        | Error::BufferTooSmall { .. }
+        | Error::ServerBusy
+        | Error::EngineError) => ClientError::Io(std::io::Error::other(other.to_string())),
     }
 }
 

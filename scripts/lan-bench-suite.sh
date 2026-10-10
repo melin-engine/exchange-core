@@ -49,6 +49,12 @@
 #                          use THROUGHPUT_CLIENTS=8 THROUGHPUT_WINDOW=128.
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
+#
+# Replicated transports wait for every replica to be connected and on
+# the live stream before load starts, and each run's primary health
+# samples are checked afterwards: a replica evicted, missing or catching
+# up at any point marks the run degraded (`cluster.degraded` in its
+# JSON) and the suite exits non-zero once every workload has run.
 #   SINGLE_DURATION=T      Measured-phase duration for single-order workload
 #                          (humantime, default: 30s)
 #   WARMUP_DURATION=T      Warmup duration (humantime, default: bench default 5s)
@@ -907,6 +913,121 @@ wait_for_log() {
     done
 }
 
+# Replicas the running transport is expected to keep live for the whole
+# run: set by each transport_start_<t>, read by the readiness gate and
+# the post-run cluster check.
+CURRENT_REPLICAS=0
+
+# Wait until the primary reports every expected replica connected and on
+# the live stream (none catching up from the journal). Scraped from the
+# primary's /metrics on the server host, where the kernel-side health
+# endpoint is reachable whatever the transport. The primary starts
+# serving as soon as its first replica is ready, so without this gate a
+# second replica can still be mid-handoff when load begins; under load a
+# replica that falls behind is evicted into a journal catch-up it cannot
+# finish before the ring fills again, and the run then measures a
+# primary serving replication reads. `check_cluster_health` catches the
+# same condition after the fact.
+wait_for_replicas() {
+    local health_addr="$1" expected="$2" timeout="${3:-120}"
+    local metrics connected catching
+    for i in $(seq 1 "$timeout"); do
+        metrics=$(ssh $SSH_OPTS "$SERVER" "curl -s --max-time 2 http://${health_addr}/metrics" 2>/dev/null || true)
+        connected=$(echo "$metrics" | awk '$1 == "melin_replicas_connected" { print $2 }')
+        # Slots below `expected` still catching up. The label is slot="N".
+        catching=$(echo "$metrics" | awk -v n="$expected" '
+            /^melin_replica_catching_up\{/ {
+                match($1, /slot="[0-9]+"/)
+                slot = substr($1, RSTART + 6, RLENGTH - 7)
+                if (slot + 0 < n && $2 + 0 != 0) c++
+            }
+            END { print c + 0 }')
+        if [[ "${connected:-0}" -ge "$expected" && "${catching}" -eq 0 ]]; then
+            echo "  ${expected} replica(s) live (took ${i}s)."
+            return 0
+        fi
+        if [[ $i -eq "$timeout" ]]; then
+            echo "  ERROR: expected ${expected} live replica(s) within ${timeout}s (connected=${connected:-none}, catching up=${catching})."
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-ec-server.log" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# Runs whose cluster did not stay healthy, for the exit code and the
+# final summary.
+DEGRADED_RUNS=()
+
+# Judge a run by the primary's health samples the bench recorded: every
+# expected replica connected and live in every sample, and no eviction
+# over the run. A replica evicted for ring backpressure reconnects and
+# catches up from the journal, so its ack policy may still be met and the
+# bench itself passes; but the primary is then reading its own journal
+# for the catch-up while writing it, and the latency measured is not the
+# transport's. Such a run is recorded in the JSON (`cluster.degraded`),
+# reported, and fails the suite at the end — after the other workloads,
+# so their results are not lost.
+check_cluster_health() {
+    local json="$1" name="$2"
+    local verdict
+    verdict=$(CLUSTER_REPLICAS="$CURRENT_REPLICAS" python3 - "$json" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+expected = int(os.environ["CLUSTER_REPLICAS"])
+
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except (OSError, ValueError) as exc:
+    print("unreadable: %s" % exc)
+    sys.exit(0)
+
+samples = doc.get("health") or []
+evictions = max((s.get("melin_replica_evictions_total") or 0) for s in samples) if samples else 0
+short = sum(1 for s in samples if (s.get("melin_replicas_connected") or 0) < expected)
+catching = sum(
+    1 for s in samples
+    if any((s.get("melin_replica_catching_up_slot_%d" % i) or 0) for i in range(expected))
+)
+degraded = expected > 0 and (evictions > 0 or short > 0 or catching > 0)
+doc["cluster"] = {
+    "replicas_expected": expected,
+    "health_samples": len(samples),
+    "evictions": evictions,
+    "samples_short_of_replicas": short,
+    "samples_catching_up": catching,
+    "degraded": degraded,
+}
+with open(path, "w") as f:
+    json.dump(doc, f, indent=1)
+
+if expected == 0:
+    print("ok: no replicas")
+elif not samples:
+    print("ok: no health samples to judge")
+elif degraded:
+    print(
+        "DEGRADED: %d eviction(s), %d/%d sample(s) short of %d replica(s), %d/%d catching up"
+        % (evictions, short, len(samples), expected, catching, len(samples))
+    )
+else:
+    print("ok: %d replica(s) live in all %d samples, no evictions" % (expected, len(samples)))
+PY
+    )
+    case "$verdict" in
+        DEGRADED*)
+            echo "  cluster health: ${verdict}"
+            echo "  ERROR: the cluster did not stay healthy during ${name}; its numbers measure a degraded primary."
+            DEGRADED_RUNS+=("${name}: ${verdict}")
+            ;;
+        *)
+            echo "  cluster health: ${verdict}"
+            ;;
+    esac
+}
+
 stop_servers() {
     for host in "$@"; do
         # `pkill -x` is exact-match; the dpdk binary has a suffix so
@@ -1099,6 +1220,7 @@ collect_result() {
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:${BENCH_JSON}" "$out" 2>/dev/null || true
     if [[ -f "$out" ]]; then
         merge_vmstat_delta "$out"
+        check_cluster_health "$out" "$name"
     fi
 }
 
@@ -1132,6 +1254,7 @@ transport_start_tcp() {
     wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Server"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    CURRENT_REPLICAS=0
 
     perf_capture_start "tcp"
 }
@@ -1175,6 +1298,8 @@ transport_start_tcp_repl() {
     wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    CURRENT_REPLICAS=1
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
 
     perf_capture_start "tcp-repl"
 }
@@ -1237,6 +1362,8 @@ transport_start_tcp_dual_repl() {
     wait_for_log "$SERVER" "/tmp/melin-ec-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    CURRENT_REPLICAS=2
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
 
     perf_capture_start "tcp-dual-repl"
 }
@@ -1715,6 +1842,7 @@ transport_start_dpdk() {
     else
         CURRENT_HEALTH="${SERVER_VLAN}:9878"
     fi
+    CURRENT_REPLICAS=0
     DPDK_RAN=1
 
     perf_capture_start "dpdk"
@@ -1802,6 +1930,8 @@ transport_start_dpdk_repl() {
     # Health endpoint stays on kernel TCP via SERVER_VLAN even in DPDK mode
     # — same as transport_start_dpdk. Empty would break --health-addr arg.
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    CURRENT_REPLICAS=1
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-repl"
@@ -1928,6 +2058,8 @@ transport_start_dpdk_dual_repl() {
     # Health endpoint stays on kernel TCP via SERVER_VLAN even in DPDK mode
     # — same as transport_start_dpdk. Empty would break --health-addr arg.
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    CURRENT_REPLICAS=2
+    wait_for_replicas "$CURRENT_HEALTH" "$CURRENT_REPLICAS"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-dual-repl"
@@ -2328,3 +2460,13 @@ echo "  Suite complete. Results in ${RESULTS_DIR}/"
 echo "============================================================"
 echo ""
 find "${RESULTS_DIR}" -type f | sort
+
+if [[ ${#DEGRADED_RUNS[@]} -gt 0 ]]; then
+    echo ""
+    echo "  FAILED: ${#DEGRADED_RUNS[@]} run(s) measured a degraded cluster (a replica evicted, missing or catching up):"
+    for r in "${DEGRADED_RUNS[@]}"; do
+        echo "    - ${r}"
+    done
+    echo "  Their JSON carries cluster.degraded=true; the primary's log names the eviction."
+    exit 1
+fi

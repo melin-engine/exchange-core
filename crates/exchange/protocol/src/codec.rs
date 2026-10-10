@@ -52,6 +52,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::message::{Request, ResponseKind};
 use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
 use melin_wire_protocol::error::ProtocolError;
+#[cfg(doc)]
+use melin_wire_protocol::framing::REQUEST_HEADER_LEN;
+use melin_wire_protocol::framing::{self, PREFIX_LEN};
 
 // --- Wire header structs ---
 //
@@ -62,9 +65,11 @@ use melin_wire_protocol::error::ProtocolError;
 // matching gain. The request body's head is universal and fixed-shape, so
 // it's typed; payloads keep the explicit le::put / le::get chain.
 
-/// Bytes a frame puts ahead of its body: the length prefix and the
-/// sequencer protocol's tag.
-const FRAME_PREFIX_LEN: usize = 4 + TAG_LEN;
+/// Bytes a response frame puts ahead of its body: the length prefix and
+/// the sequencer protocol's tag. Requests are framed by the sequencer
+/// (`framing::frame_request`); it has no response framer, the node's
+/// runtime framing what its response stage sends itself.
+const FRAME_PREFIX_LEN: usize = PREFIX_LEN + TAG_LEN;
 
 /// The head of a request body: `[kind:u8] [seq:u64]`, then the payload.
 /// Typed because it is fixed-shape; the payload behind it is not.
@@ -171,19 +176,17 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 /// Encode a request into `buf` as a complete wire frame. Returns total
 /// bytes written (length prefix + tag + body).
 ///
-/// The caller must ensure `buf` is large enough: 128 bytes bounds every
-/// request (the largest is 4 prefix + 1 tag + [`MAX_REQUEST_BODY`]). The
-/// `ChallengeResponse` of the handshake is the sequencer's frame, built by
-/// its client, and never passes here. `seq` is the per-key monotonic
-/// request sequence the engine's idempotency check reads. A heartbeat
-/// uses `seq = 0`: the node runtime answers it, and it never reaches the
-/// engine.
+/// The body is encoded in place and the sequencer frames it, so the
+/// header is written exactly as the node reads it. The caller must
+/// ensure `buf` is large enough: 128 bytes bounds every request (the
+/// largest is [`REQUEST_HEADER_LEN`] + [`MAX_REQUEST_BODY`]); a buffer
+/// shorter than the header is `Truncated`. The `ChallengeResponse` of the
+/// handshake is the sequencer's frame, built by its client, and never
+/// passes here. `seq` is the per-key monotonic request sequence the
+/// engine's idempotency check reads. A heartbeat uses `seq = 0`: the node
+/// runtime answers it, and it never reaches the engine.
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    let body_len = encode_request_body(request, seq, &mut buf[FRAME_PREFIX_LEN..])?;
-    // The length covers the tag and the body, not itself.
-    le::put_u32(&mut buf[0..], (TAG_LEN + body_len) as u32);
-    buf[4] = TAG_APP;
-    Ok(FRAME_PREFIX_LEN + body_len)
+    framing::frame_request(buf, |body| encode_request_body(request, seq, body))
 }
 
 /// Encode a request's body — kind, sequence, payload — at the start of

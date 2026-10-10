@@ -75,15 +75,12 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 
 use melin_client::Reply;
+#[cfg(not(feature = "dpdk"))]
+use melin_client::framing::FrameDecoder;
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::ResponseKind;
 use melin_ec_server::exchange_app::ServerApp;
-// The server's own frame ceiling, so the handshake frames this bench
-// builds are bounded by the number the server actually enforces rather
-// than a copy that could drift.
 use melin_ec_types::types::*;
-#[cfg(not(feature = "dpdk"))]
-use melin_server_runtime::MAX_FRAME_SIZE;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::server::ServerConfig;
 #[cfg(not(feature = "dpdk"))]
@@ -2334,7 +2331,7 @@ fn run_uring_roundtrip<R, W, F>(
             _read_owner: Box::new(read_stream),
             _write_owner: Box::new(write_stream),
             recv_buf: Box::new([0u8; URING_RECV_BUF_SIZE]),
-            parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
+            decoder: FrameDecoder::new(),
             recv_pending: false,
             send_buf: Vec::with_capacity(4096),
             send_pending: false,
@@ -2548,7 +2545,8 @@ struct UringBenchConn {
 
     // Recv state
     recv_buf: Box<[u8; URING_RECV_BUF_SIZE]>,
-    parse_buf: Vec<u8>,
+    /// Received bytes, split into the node's reply frames.
+    decoder: FrameDecoder,
     recv_pending: bool,
 
     // Send state
@@ -2742,29 +2740,17 @@ fn run_uring_loop(
                 let n_bytes = result as usize;
                 let conn = &mut connections[idx];
                 conn.recv_pending = false;
-                conn.parse_buf.extend_from_slice(&conn.recv_buf[..n_bytes]);
+                conn.decoder.push(&conn.recv_buf[..n_bytes]);
 
-                // Parse complete frames.
-                let mut cursor = 0;
-                while cursor + 4 <= conn.parse_buf.len() {
-                    let len_bytes: [u8; 4] = conn.parse_buf[cursor..cursor + 4]
-                        .try_into()
-                        .expect("4 bytes");
-                    let frame_len = u32::from_le_bytes(len_bytes) as usize;
-                    if cursor + 4 + frame_len > conn.parse_buf.len() {
-                        break;
-                    }
-
-                    let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                    let reply = melin_client::classify(frame).expect("classify reply");
-                    cursor += 4 + frame_len;
-
+                // Every complete reply received so far.
+                while let Some(reply) =
+                    melin_client::next_reply(&mut conn.decoder).expect("classify reply")
+                {
                     if matches!(reply, Reply::BatchEnd) {
                         // `rdtscp()` is captured FIRST — before any
-                        // per-frame bookkeeping (outcome tally, parse
-                        // buffer compaction) — so the histogram reflects
-                        // only the wire roundtrip, not the bench's own
-                        // post-processing cost.
+                        // per-frame bookkeeping (the outcome tally) — so
+                        // the histogram reflects only the wire roundtrip,
+                        // not the bench's own post-processing cost.
                         let sent_tsc = conn.inflight_ts.pop_front().expect(
                             "inflight timestamp desync: got BatchEnd without matching send",
                         );
@@ -2797,14 +2783,6 @@ fn run_uring_loop(
                     // before `rdtscp()` would inflate every sample by
                     // the cost of this match.
                     conn.outcomes.record(&reply).expect("decode response");
-                }
-                if cursor > 0 {
-                    // Shift remaining bytes to front without allocating.
-                    // `copy_within` + `truncate` avoids the O(n) memmove
-                    // overhead of `Vec::drain` which must drop + shift.
-                    let remaining = conn.parse_buf.len() - cursor;
-                    conn.parse_buf.copy_within(cursor.., 0);
-                    conn.parse_buf.truncate(remaining);
                 }
 
                 // Re-arm RECV. The outer loop's wall-clock check is the

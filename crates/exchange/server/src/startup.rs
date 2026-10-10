@@ -3,11 +3,12 @@
 //! Three things, deliberately kept apart because they travel differently:
 //!
 //! - **Genesis** — the bulk `AddInstrument` / `ProvisionAccount` seed.
-//!   Journaled once, by the node that creates the journal as primary;
-//!   every other node receives it in the history. It is a development
-//!   fixture: the accounts it provisions are funded out of nothing, so a
-//!   stock build seeds nothing and only a build with the `synthetic-seed`
-//!   feature emits it.
+//!   Journaled once, by the node that creates the journal as primary, as
+//!   part of creating it; every other node receives it in the history,
+//!   and no node publishes its reports on the event feed. It is a
+//!   development fixture: the accounts it provisions are funded out of
+//!   nothing, so a stock build seeds nothing and only a build with the
+//!   `synthetic-seed` feature emits it.
 //! - **Account limits** — the SEC-03 open-order cap and SEC-04 rate
 //!   limiter. Journaled as a `SetAccountLimits` event every time a node
 //!   becomes primary, from that node's own flags, so the limits in force

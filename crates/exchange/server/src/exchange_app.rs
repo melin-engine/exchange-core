@@ -65,10 +65,11 @@ pub struct ServerApp(pub Exchange);
 
 /// The state every node starts from: an empty engine with production
 /// capacity reserved and its pages touched. The runtime builds one of
-/// these on every node and then seeds a genesis into it, replays a
-/// journal into it, or applies a primary's stream to it — so reserving
-/// here, before the first event, is what keeps growth and page faults off
-/// the matching thread whichever way the node comes up. A snapshot
+/// these on every node and then replays a journal into it (genesis
+/// included: a fresh journal is created with it already written), or
+/// applies a primary's stream to it — so reserving here, before the first
+/// event, is what keeps growth and page faults off the matching thread
+/// whichever way the node comes up. A snapshot
 /// restore builds the same shape by another route (see `restore`).
 ///
 /// Holds no state, and nothing local to the node: every node's history

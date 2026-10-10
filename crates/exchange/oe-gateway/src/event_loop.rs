@@ -587,7 +587,7 @@ impl Gateway {
             return;
         };
 
-        // Copy from pool into session's Melin parse buffer.
+        // Copy from pool into session's Melin frame decoder.
         let buf_start = buf_id * BUF_SIZE;
         let data = &self.buffer_pool[buf_start..buf_start + n];
 
@@ -595,7 +595,7 @@ impl Gateway {
             if !has_more {
                 session.melin_multishot_active = false;
             }
-            session.melin_parse_buf.extend_from_slice(data);
+            session.melin_decoder.push(data);
         }
 
         // Re-provide the consumed buffer.
@@ -617,10 +617,17 @@ impl Gateway {
                 None => return,
             };
 
-            let action = session.try_process_melin_frame(self.config, &self.symbol_map, now);
+            // Every complete frame, not just up to the first that calls
+            // for nothing: a heartbeat or a batch end ahead of a report in
+            // the same receive must not leave the report waiting for the
+            // next one.
+            let Some(action) = session.try_process_melin_frame(self.config, &self.symbol_map, now)
+            else {
+                return;
+            };
 
             match action {
-                SessionAction::None => return, // No complete frame or nothing to do.
+                SessionAction::None => {}
                 SessionAction::SendFix => {
                     self.dirty_fix.push(idx);
                 }
@@ -1474,6 +1481,64 @@ lot_size_inverse = 1
         assert_eq!(er.get_str(tags::EXEC_TYPE), Some("0")); // New
         assert_eq!(er.get_str(tags::SYMBOL), Some("BTC/USD"));
         assert_eq!(er.get_str(tags::PRICE), Some("50000.00"));
+
+        drop(client);
+        gw.shutdown();
+        drop(stub);
+    }
+
+    /// A frame that calls for nothing, here a heartbeat, must not hold up
+    /// the frames that arrived with it: the report behind it reaches the
+    /// FIX client at once, not on the node's next write.
+    #[test]
+    fn report_behind_a_heartbeat_in_one_receive_is_forwarded() {
+        use crate::test_stub::MelinStub;
+        use melin_ec_protocol::message::{Request, ResponseKind};
+        use melin_ec_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
+        use std::num::NonZeroU64;
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        // The stub writes nothing it is not told to, so a report left in
+        // the gateway's buffer would stay there until `read_fix_message`
+        // times out.
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let ack = read_fix_message(&mut client);
+        assert_eq!(FixMessage::parse(&ack).unwrap().msg_type(), tags::MSG_LOGON);
+
+        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        client.write_all(&nos).unwrap();
+        let (_seq, req) = stub.next_request(Duration::from_secs(3));
+        let Request::SubmitOrder { order, .. } = req else {
+            panic!("expected SubmitOrder, got {req:?}");
+        };
+
+        stub.send_response_behind_heartbeat(ResponseKind::Report(ExecutionReport::Placed {
+            order_id: order.id,
+            symbol: Symbol(1),
+            account: AccountId(7),
+            side: Side::Buy,
+            price: Price(NonZeroU64::new(5_000_000).unwrap()),
+            quantity: Quantity(NonZeroU64::new(10).unwrap()),
+        }));
+
+        let raw = read_fix_message(&mut client);
+        let er = FixMessage::parse(&raw).unwrap();
+        assert_eq!(er.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(er.get_str(tags::CL_ORD_ID), Some("ORD1"));
 
         drop(client);
         gw.shutdown();
