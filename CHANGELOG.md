@@ -18,13 +18,17 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
-This release adopts the sequencer's next release and its
-application-defined client roles; the [Unreleased section of its
-changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#unreleased)
+This release adopts sequencer 0.19.0 and its application-defined client
+roles; the [0.19.0 section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0190---2026-10-10)
 has the detail. The node runtime now keeps only the two roles it acts on,
 `operator` and `replication`, and the exchange declares its own. Every
 existing `authorized_keys` file loads unchanged, and each role may send
-exactly what it could before.
+exactly what it could before. Upgrading is a cluster-wide stop: the
+release changes the replication protocol, and nodes on different versions
+refuse each other at the handshake, so stop the cluster, upgrade every
+node, and restart on the existing journals and snapshots, which need no
+migration.
 
 ### Added
 
@@ -67,20 +71,6 @@ exactly what it could before.
   now calls the listener's check itself *(sequencer)*, so the two cannot
   drift. Who may subscribe is unchanged: any client role, never
   `replication`.
-- **Replication protocol 7, journal format 16, snapshot framing 3**
-  *(sequencer)*. Replicated entries now carry their primary's checksum and
-  the journal records how long the genesis is. Existing journals and
-  snapshots are read as they are, with no migration, but nodes on
-  different protocol versions refuse each other at the handshake: stop
-  the cluster, upgrade every node, and restart on the existing files.
-- **Genesis is written as the journal is created** *(sequencer)*. A
-  first boot either leaves a journal holding the whole genesis or leaves
-  nothing, and a failed one is retried as a first boot. The genesis's
-  reports are no longer published on the event feed, and all its events
-  carry the journal's creation time.
-- **A DPDK replica refuses client connections until it is promoted**
-  *(sequencer)*, where a connect used to complete and then go
-  unanswered. Clients retry either way.
 - **The FIX gateway logs a session out when its node sends a frame
   length over the protocol's limit.** Such a length leaves no frame
   boundary to resume from; the gateway used to keep buffering towards a
@@ -109,38 +99,10 @@ exactly what it could before.
   stopped there, and the replies behind it waited for the node's next
   write: up to a heartbeat interval on a quiet connection. Every reply is
   now forwarded as soon as it arrives.
-- **DPDK failover** *(sequencer)*. A promoted DPDK replica now serves as
-  a DPDK primary; it used to exit, or quietly fall back to kernel TCP. A
-  stopped or silent DPDK peer is now noticed within five seconds, so a
-  primary whose last replica has left halts and a replica can depose a
-  dead primary. A replica that stops reading while it finishes catching
-  up no longer freezes the primary's clients, and a joining replica's
-  catch-up reads now run on a separate worker instead of the poll thread.
-- **Replication integrity** *(sequencer)*. A replica now checks each
-  replicated entry against its primary's checksum, refusing a damaged
-  batch and fetching it again. A replica that reconnects no longer
-  journals entries it already held, and a release build now refuses an
-  out-of-order sequence instead of journaling it (it used to then refuse
-  to recover).
-- **Genesis** *(sequencer)*. A node started from a snapshot alone no
-  longer applies the genesis twice, and a first boot that failed after
-  creating the journal no longer leaves a node serving without its
-  genesis.
-- **Journal recovery could delete acknowledged entries, or refuse an
-  ordinary crash** *(sequencer)*. A sequence gap, a run of zeros or a
-  flipped bit in the last entry's length used to make recovery truncate
-  the live segment there, replicated entries included, while a write cut
-  inside its checksum was refused and kept the node down. Recovery now
-  discards only what a crash can have left, a malformed final write
-  followed by zeros, and stops with an error on anything else, leaving
-  the journal untouched. `journal-verify` reports such a torn write by
-  its byte range instead of as a sequence gap, and reads each archived
-  segment under the stricter archive rule.
-- **DPDK client and metric fixes** *(sequencer)*. A failed client
-  authentication now closes the connection, as on kernel TCP. Frames the
-  NIC flags with a bad checksum are dropped. `melin_replica_ack_latency_us`
-  is now reported on DPDK, and on kernel TCP
-  `melin_replica_evictions_total` counts each eviction once.
+- **`journal-verify` follows the sequencer's new recovery rule**
+  *(sequencer)*: it reports a torn final write by its byte range instead
+  of as a sequence gap, which is now always an error, and reads each
+  archived segment under the stricter archive rule.
 
 ## [0.18.0] - 2026-09-28
 
