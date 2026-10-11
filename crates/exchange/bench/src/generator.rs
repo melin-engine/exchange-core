@@ -47,6 +47,7 @@ fn fast_powf(base: f64, exp: f64) -> f64 {
 
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::Request;
+use melin_wire_protocol::error::ProtocolError;
 
 /// Upper bound on the size (in bytes) of any single length-prefixed request
 /// frame this generator can produce. Matches the largest fixed encoding the
@@ -336,8 +337,35 @@ impl OrderFlowGenerator {
     /// (`[u32 LE length][payload]`) to `out`. Used by transport benchmarks
     /// that generate orders on-the-fly to keep bench memory bounded.
     pub fn next_wire_frame(&mut self, out: &mut Vec<u8>) {
+        let request = self.next_request();
+        self.seq += 1;
+        // Stack scratch sized to the largest encoded request — codec writes
+        // [u32 LE length][payload] starting at offset 0.
+        let mut encode_buf = [0u8; MAX_REQUEST_FRAME_BYTES];
+        let written = codec::encode_request(&request, self.seq, &mut encode_buf).expect("encode");
+        out.extend_from_slice(&encode_buf[..written]);
+    }
+
+    /// Generate the next event and encode its request body (kind,
+    /// sequence, payload; no frame header) at the start of `body`, for a
+    /// transport whose client library frames the request where it sends
+    /// it from. `body` must hold [`codec::MAX_REQUEST_BODY`] bytes. The
+    /// same events, in the same order and with the same sequence numbers,
+    /// as [`Self::next_wire_frame`]: framed with the sequencer's
+    /// `frame_request`, a body is the frame `next_wire_frame` writes.
+    // The binary compiles this module too, and only its DPDK client
+    // calls this; the library exports it in every build.
+    #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+    pub fn next_request_body(&mut self, body: &mut [u8]) -> Result<usize, ProtocolError> {
+        let request = self.next_request();
+        self.seq += 1;
+        codec::encode_request_body(&request, self.seq, body)
+    }
+
+    /// The next event as the request that carries it.
+    fn next_request(&mut self) -> Request {
         let event = self.next_event();
-        let request = match event {
+        match event {
             GeneratedEvent::Submit { symbol, order } => Request::SubmitOrder { symbol, order },
             GeneratedEvent::Cancel {
                 symbol,
@@ -361,14 +389,7 @@ impl OrderFlowGenerator {
                 new_price,
                 new_quantity,
             },
-        };
-
-        self.seq += 1;
-        // Stack scratch sized to the largest encoded request — codec writes
-        // [u32 LE length][payload] starting at offset 0.
-        let mut encode_buf = [0u8; MAX_REQUEST_FRAME_BYTES];
-        let written = codec::encode_request(&request, self.seq, &mut encode_buf).expect("encode");
-        out.extend_from_slice(&encode_buf[..written]);
+        }
     }
 
     fn generate_submit(&mut self) -> GeneratedEvent {
@@ -824,6 +845,33 @@ mod tests {
             cursor += 4 + len;
         }
         assert_eq!(cursor, buf.len(), "all bytes consumed");
+    }
+
+    /// A body framed by the sequencer client's `frame_request`, as the
+    /// DPDK client's in-place send frames it, is byte for byte the frame
+    /// `next_wire_frame` writes for the same seed: the two transports
+    /// send the same requests in the same order.
+    #[test]
+    fn a_framed_request_body_is_the_wire_frame() {
+        let config = GeneratorConfig {
+            num_accounts: 50,
+            num_instruments: 5,
+            ..Default::default()
+        };
+        let mut by_frame = OrderFlowGenerator::new(config.clone());
+        let mut by_body = OrderFlowGenerator::new(config);
+        let mut frame = Vec::new();
+        let mut framed = [0u8; MAX_REQUEST_FRAME_BYTES];
+        for i in 0..10_000 {
+            frame.clear();
+            by_frame.next_wire_frame(&mut frame);
+            let written = melin_client::frame_request(&mut framed, |body: &mut [u8]| {
+                assert!(body.len() >= codec::MAX_REQUEST_BODY);
+                by_body.next_request_body(body)
+            })
+            .expect("frame");
+            assert_eq!(&framed[..written], &frame[..], "request {i}");
+        }
     }
 
     #[test]

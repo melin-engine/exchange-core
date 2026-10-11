@@ -391,8 +391,8 @@ impl PaceClock {
     /// pop optimistically but may need to roll back when the wire send
     /// fails — without it, a transient send error would drop a scheduled
     /// slot and skew the achieved rate downward. Only the DPDK path
-    /// currently rolls back (smoltcp can return Ok(0) on transient
-    /// back-pressure); the kernel-TCP uring path never reaches a state
+    /// currently rolls back (a send there can fail before it frames
+    /// anything); the kernel-TCP uring path never reaches a state
     /// where a popped frame isn't queued for send.
     #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
     #[inline]
@@ -754,30 +754,40 @@ fn main() {
                 });
                 let key = load_signing_key(key_path);
 
-                dpdk::run_dpdk_roundtrip(
+                // A malformed MAC is refused as the other malformed
+                // `--dpdk-*` values are, with the parser's own message
+                // naming the input.
+                let parse_mac = |s: &str| -> [u8; 6] {
+                    melin_client::try_parse_mac(s).unwrap_or_else(|e| panic!("{e}"))
+                };
+                if let Err(e) = dpdk::run_dpdk_roundtrip(
                     args.max_reject_pct,
                     dpdk::DpdkBenchConfig {
-                        eal_args: args
-                            .dpdk_eal_args
-                            .split_whitespace()
-                            .map(String::from)
-                            .collect(),
-                        port_ids: args.dpdk_ports.clone(),
-                        local_ip: args.dpdk_ip.parse().expect("invalid --dpdk-ip"),
-                        prefix_len: args.dpdk_prefix_len,
-                        gateway: args
-                            .dpdk_gateway
-                            .as_deref()
-                            .map(|s| s.parse().expect("invalid --dpdk-gateway")),
+                        // Flag for field onto the sequencer's NIC
+                        // configuration, the one a node takes.
+                        nic: melin_client::NicConfig {
+                            eal_args: args
+                                .dpdk_eal_args
+                                .split_whitespace()
+                                .map(String::from)
+                                .collect(),
+                            port_ids: args.dpdk_ports.clone(),
+                            ip_addr: args.dpdk_ip.parse().expect("invalid --dpdk-ip"),
+                            prefix_len: args.dpdk_prefix_len,
+                            gateway: args
+                                .dpdk_gateway
+                                .as_deref()
+                                .map(|s| s.parse().expect("invalid --dpdk-gateway")),
+                            peer_ip: args
+                                .dpdk_peer_ip
+                                .as_deref()
+                                .map(|s| s.parse().expect("invalid --dpdk-peer-ip")),
+                            gateway_mac: args.dpdk_gateway_mac.as_deref().map(parse_mac),
+                            peer_mac: args.dpdk_peer_mac.as_deref().map(parse_mac),
+                            mtu: args.dpdk_mtu,
+                            vlan_id: args.dpdk_vlan,
+                        },
                         server_addr: addr,
-                        mtu: args.dpdk_mtu,
-                        vlan_id: args.dpdk_vlan,
-                        peer_ip: args
-                            .dpdk_peer_ip
-                            .as_deref()
-                            .map(|s| s.parse().expect("invalid --dpdk-peer-ip")),
-                        gateway_mac: args.dpdk_gateway_mac.as_deref().map(melin_dpdk::parse_mac),
-                        peer_mac: args.dpdk_peer_mac.as_deref().map(melin_dpdk::parse_mac),
                     },
                     phases,
                     args.window,
@@ -789,7 +799,10 @@ fn main() {
                     args.dpdk_core,
                     args.health_addr,
                     args.target_rate,
-                );
+                ) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
 
             #[cfg(not(feature = "dpdk"))]

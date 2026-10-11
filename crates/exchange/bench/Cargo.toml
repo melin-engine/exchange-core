@@ -47,14 +47,14 @@ latency-trace = [
 tick-to-trade = ["latency-trace", "melin-server-runtime/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
-## DPDK userspace TCP transport. Implies `release-tracing` to match the
-## production-style binary the DPDK rig benches against. Add
-## `--features=hash-chain` separately if you want to measure with the
-## journal hash chain on; add `skip-order-exec` to bench transport-only.
+## DPDK userspace TCP transport, through the sequencer client's NIC handle
+## (`melin-client/dpdk`, which turns on `melin-dpdk/dpdk-sys`). Implies
+## `release-tracing` to match the production-style binary the DPDK rig
+## benches against. Add `--features=hash-chain` separately if you want to
+## measure with the journal hash chain on; add `skip-order-exec` to bench
+## transport-only.
 dpdk = [
-    "dep:melin-dpdk",
-    "melin-dpdk/dpdk-sys",
-    "dep:smoltcp",
+    "melin-client/dpdk",
     "release-tracing",
 ]
 pipeline-stats = [
@@ -109,8 +109,6 @@ tikv-jemallocator = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
-melin-dpdk = { workspace = true, optional = true }
-smoltcp = { package = "fastcp", version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "bitmap_backend", "bitmap_encoder", "ttf", "line_series"] }

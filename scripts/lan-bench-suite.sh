@@ -332,10 +332,13 @@ cleanup() {
     ssh $SSH_OPTS "$BENCH" "${SUDO} pkill -INT -x melin-ec-bench 2>/dev/null; \
                             ${SUDO} pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Clean DPDK EAL lock files so the next run doesn't fail with
-    # "Cannot create lock on '/var/run/dpdk/rte/config'".
+    # "Cannot create lock on '/var/run/dpdk/rte/config'". The bench's
+    # EAL runs under the `melin-client` file prefix (the sequencer
+    # client's default when its EAL args name none), the nodes' under
+    # DPDK's default `rte`.
     if [[ "${DPDK_RAN:-0}" == "1" ]]; then
         for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
-            ssh $SSH_OPTS "$host" "${SUDO} rm -rf /var/run/dpdk/rte 2>/dev/null; true" 2>/dev/null || true
+            ssh $SSH_OPTS "$host" "${SUDO} rm -rf /var/run/dpdk/rte /var/run/dpdk/melin-client 2>/dev/null; true" 2>/dev/null || true
         done
     fi
     # Close ssh master connections and remove their control sockets.
@@ -1092,10 +1095,12 @@ stop_servers() {
 
 # Remove DPDK EAL lock files left by a previous run. Without this,
 # restarting a DPDK process on the same host fails with
-# "Cannot create lock on '/var/run/dpdk/rte/config'".
+# "Cannot create lock on '/var/run/dpdk/rte/config'". Nodes run under
+# DPDK's default file prefix (`rte`), the bench under the sequencer
+# client's (`melin-client`).
 clean_eal_lockfiles() {
     for host in "$@"; do
-        ssh $SSH_OPTS "$host" "${SUDO} rm -rf /var/run/dpdk/rte 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "${SUDO} rm -rf /var/run/dpdk/rte /var/run/dpdk/melin-client 2>/dev/null; true"
     done
 }
 

@@ -1,30 +1,32 @@
 //! DPDK kernel-bypass benchmark client.
 //!
-//! Replaces the io_uring event loop with a single-threaded smoltcp
-//! poll loop over DPDK. All connections share one smoltcp interface on
-//! one DPDK port. The bench client initiates outbound TCP connections
-//! to the server via `socket.connect()`.
+//! Replaces the io_uring event loop with a single-threaded poll loop over
+//! the sequencer client's DPDK NIC handle (`melin_client::NicHandle`). All
+//! connections share the handle's one TCP/IP stack on one DPDK port (or an
+//! LACP bond's ports), and the handle dials each of them to the server in
+//! turn. The handle owns the NIC: EAL, the mbuf pool, the ports, the
+//! device, the interface, the neighbour seeding and the sockets' tuning.
+//! The bench keeps its loop: the window, the open-loop pacer, the
+//! per-connection keys, the TSC samples and the outcome tally.
+//!
+//! Each connection is a `melin_client::PolledConnection`, the protocol
+//! state with no stream of its own: every call is handed the stream's view
+//! (`nic.stream(&id)`, which borrows the handle for that call only) and the
+//! bench's own time, so the handshake runs inside `poll` and a request is
+//! framed with `send_with` straight into the socket's transmit buffer.
 //!
 //! This module is only compiled with `--features dpdk`.
 
 use std::collections::VecDeque;
-use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{self, State};
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use melin_client::Reply;
-use melin_client::framing::FrameDecoder;
-use melin_dpdk::device::DpdkDevice;
-use melin_dpdk::eal::Eal;
-use melin_dpdk::mempool::Mempool;
-use melin_dpdk::port::Port;
+use melin_client::{Frame, NicConfig, NicHandle, PeerMacSource, PolledConnection, Reply, StreamId};
+use melin_ec_protocol::codec;
 
 use crate::generator;
 use crate::{
@@ -32,40 +34,37 @@ use crate::{
     print_results, spawn_progress_reporter,
 };
 
-/// TCP socket buffer size. 64KB gives plenty of headroom for pipelined
-/// frames in flight.
+/// TCP socket buffer size, receive and transmit alike. 64KB gives plenty
+/// of headroom for pipelined frames in flight.
 const SOCKET_BUF_SIZE: usize = 65536;
 
-/// How often to refresh the smoltcp timestamp (poll iterations).
-/// During connection setup (ARP + TCP handshake), smoltcp needs
-/// advancing timestamps to drive retransmit timers. Using 1 here
-/// (refresh every poll) to avoid stalls. The SystemTime call is
-/// vDSO-accelerated (~20ns) so the overhead is negligible.
-const TIMESTAMP_REFRESH_INTERVAL: u32 = 1;
+/// How long one connection's dial may take, SYN to established. The NIC
+/// handle needs a deadline; a wrong peer MAC is silent and shows only as a
+/// dial that never completes, so the bound turns a hang into an error that
+/// names the MAC. Generous next to a LAN round trip, which is microseconds.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connection's handshake may wait on the node: the challenge,
+/// then the verdict. Only the handshake: once a connection is ready, its
+/// read timeout is lifted (see [`authenticate`]).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-connection state for the DPDK benchmark.
 struct DpdkBenchConn {
-    handle: SocketHandle,
-    /// Received bytes, split into the node's frames: the handshake's,
-    /// then replies. One decoder for both, so bytes that arrive behind
-    /// the handshake's last frame are kept for the reply loop.
-    decoder: FrameDecoder,
-    /// Order generator — produces frames on-the-fly. No pre-allocated cap:
-    /// the bench runs until the wall-clock cooldown deadline expires.
+    /// The stream this connection runs on, which the NIC handle lends per
+    /// call (`nic.stream(&id)`).
+    id: StreamId,
+    /// The protocol state: the handshake, the receive buffer replies are
+    /// split in, and the scratch buffer holding what a send could not hand
+    /// the stream at once. Its unsent bytes are the partial-send remainder
+    /// the loop drains before framing another request.
+    connection: PolledConnection,
+    /// Order generator — produces request bodies on-the-fly. No
+    /// pre-allocated cap: the bench runs until the wall-clock cooldown
+    /// deadline expires. Advanced only when a request is framed, so a
+    /// send that frames nothing leaves it where it was, and the next
+    /// iteration sends the request that would have gone.
     flow: generator::OrderFlowGenerator,
-    /// Reusable scratch buffer holding the current wire frame
-    /// (`[u32 LE len][payload]`) until it's fully sent. Sized for the
-    /// largest encoded request.
-    scratch_frame: Vec<u8>,
-    /// A frame that was pulled from the generator but never attempted on
-    /// the wire (socket couldn't send or returned an error). Held here so
-    /// the next poll iteration can retry without re-generating — the
-    /// generator is stateful and cannot be rewound. Distinct from
-    /// `send_pending`, which holds *partial-send remainders* of frames
-    /// that have already started hitting the wire.
-    pending_unsent: Option<Vec<u8>>,
-    /// Pending send bytes (partial frame that didn't fit in smoltcp TX buffer).
-    send_pending: Vec<u8>,
     /// FIFO of send timestamps (TSC ticks) for in-flight orders.
     /// `u64` instead of `Instant` to avoid ~15-25ns vDSO overhead per
     /// timestamp on the hot path. With pacing enabled this stores the
@@ -80,42 +79,113 @@ struct DpdkBenchConn {
     outcomes: OutcomeReport,
 }
 
-/// DPDK benchmark configuration.
+/// DPDK benchmark configuration: the NIC, one field per `--dpdk-*` flag,
+/// and the server to dial on it.
 pub struct DpdkBenchConfig {
-    pub eal_args: Vec<String>,
-    /// DPDK port IDs to poll. First port is used for TX; all are polled
-    /// for RX. For LACP bonds, pass both VF port IDs.
-    pub port_ids: Vec<u16>,
-    pub local_ip: Ipv4Addr,
-    pub prefix_len: u8,
-    pub gateway: Option<Ipv4Addr>,
-    pub server_addr: std::net::SocketAddr,
-    /// MTU for the DPDK interface. Must match the server's MTU.
-    pub mtu: usize,
-    /// VLAN ID for hardware strip/insert. Required for dedicated NIC mode.
-    pub vlan_id: Option<u16>,
-    /// When set, the port is opened in bifurcated mode and an `rte_flow`
-    /// rule steers IPv4 packets sourced from this IP into DPDK queue 0.
-    /// All other traffic stays with the kernel (SSH, ARP, etc.).
-    /// Used for L3 setups that share the NIC with the host's public IP.
-    pub peer_ip: Option<Ipv4Addr>,
-    /// MAC to seed into smoltcp for the gateway IP. In L3 bifurcated
-    /// mode, ARP for the gateway wouldn't reach DPDK (the reply has a
-    /// different source IP than `peer_ip`), so the operator pulls the
-    /// gateway MAC from `ip neigh` and passes it in here.
-    pub gateway_mac: Option<[u8; 6]>,
-    /// MAC of the server at `server_addr`, seeded into smoltcp so the
-    /// first frame can be addressed without waiting on ARP. Required
-    /// wherever the server's port does not follow the SR-IOV
-    /// `02:00:<ip>` convention that the fallback below assumes —
-    /// notably the mlx5 bifurcated path, where the DPDK port shares the
-    /// kernel netdev's real hardware MAC. Getting this wrong is silent:
-    /// frames are addressed to a MAC nothing owns, so every connect
-    /// simply times out.
-    pub peer_mac: Option<[u8; 6]>,
+    /// The NIC the bench's connections share: the sequencer's own NIC
+    /// configuration, the one a node's DPDK transport takes, so the bench
+    /// runs in every mode the node does (SR-IOV with a VLAN, an mlx5 port
+    /// shared with the kernel, L3 through a gateway). Its fields' docs say
+    /// what each flag means for the NIC.
+    pub nic: NicConfig,
+    pub server_addr: SocketAddr,
+}
+
+/// The bench's TSC as the NIC handle's clock: a monotonic nanosecond count
+/// from a TSC reading taken just before the handle opens, which the handle
+/// requires to be fixed for its life. One calibration converts ticks to
+/// nanoseconds for the stack's clock and for the latency samples alike, so
+/// the handle needs no clock of its own and the loop reads one counter.
+#[derive(Clone, Copy)]
+struct BenchClock {
+    /// The TSC reading the count starts from.
+    origin_tsc: u64,
+    /// From the bench's calibration (`crate::calibrate_tsc`). `f64`, as
+    /// the calibration and `tsc_to_ns` have it.
+    ticks_per_ns: f64,
+}
+
+impl BenchClock {
+    /// Nanoseconds from the origin to a TSC reading the caller already
+    /// took. A reading before the origin (an unsynchronised counter on
+    /// another core) counts as the origin; the stack clamps a reading
+    /// that goes backwards anyway.
+    #[inline(always)]
+    fn ns_at(&self, tsc: u64) -> u64 {
+        crate::tsc_to_ns(tsc.saturating_sub(self.origin_tsc), self.ticks_per_ns)
+    }
+
+    /// Nanoseconds from the origin to now.
+    #[inline(always)]
+    fn now_ns(&self) -> u64 {
+        self.ns_at(crate::rdtscp())
+    }
+}
+
+/// A frame from a polled connection as the outcome tally takes it. A
+/// heartbeat never surfaces from `poll`, so `Reply::Heartbeat`, which the
+/// tally does not count, never comes from here.
+fn reply_of(frame: Frame<'_>) -> Reply<'_> {
+    match frame {
+        Frame::Response(body) => Reply::Response(body),
+        Frame::BatchEnd => Reply::BatchEnd,
+        Frame::ServerBusy => Reply::ServerBusy,
+        Frame::EngineError => Reply::EngineError,
+    }
+}
+
+/// Whether the stream `id` names would queue anything now. An error is
+/// only an id another handle dialed, which this module never makes; it is
+/// logged and taken as no room, which stops sending on that connection.
+#[inline]
+fn can_send(nic: &mut NicHandle, id: &StreamId) -> bool {
+    match nic.stream(id).can_send() {
+        Ok(room) => room,
+        Err(e) => {
+            tracing::debug!("dpdk can_send error: {e:?}");
+            false
+        }
+    }
+}
+
+/// Run the handshake of a freshly dialed connection to its end, servicing
+/// the NIC on the bench's clock meanwhile. The handshake runs inside
+/// `poll`, which answers the node's challenge as it arrives and makes the
+/// connection ready on the node's verdict; nothing else is sent until then.
+///
+/// Once ready, the connection's read timeout is lifted: the bench's loop
+/// has always waited on the node for as long as the run lasts, and a slow
+/// reply is a sample, not an error.
+fn authenticate(
+    nic: &mut NicHandle,
+    id: &StreamId,
+    connection: &mut PolledConnection,
+    clock: &BenchClock,
+) -> Result<(), melin_client::Error> {
+    while !connection.is_ready() {
+        let now_ns = clock.now_ns();
+        nic.service(now_ns);
+        if let Some(frame) = connection.poll(&mut nic.stream(id), now_ns)? {
+            // Nothing was sent but the challenge response, so nothing but
+            // the handshake is owed.
+            return Err(melin_client::Error::Protocol(format!(
+                "a reply ({frame:?}) before any request"
+            )));
+        }
+    }
+    connection.set_read_timeout(Duration::MAX);
+    Ok(())
 }
 
 /// Run the DPDK roundtrip benchmark.
+///
+/// # Errors
+///
+/// A NIC that cannot be brought up, a server address that is not IPv4, a
+/// dial that fails (a timeout, whose message names the MAC the SYN was
+/// addressed to, or a refusal), or a handshake the node refuses or does not
+/// answer. The message is the one to print; the NIC, and with it every
+/// connection already dialed, is closed by then.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_roundtrip(
     max_reject_pct: f64,
@@ -130,213 +200,60 @@ pub fn run_dpdk_roundtrip(
     core_id: usize,
     health_addr: Option<std::net::SocketAddr>,
     target_rate: u64,
-) {
+) -> Result<(), String> {
     // Pin to dedicated core.
     if let Err(e) = melin_app::affinity::pin_to_core(core_id) {
         eprintln!("warning: could not pin bench to core {core_id}: {e}");
     }
 
-    // Initialize DPDK.
-    let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
-    let eal = Eal::init(&eal_args).expect("EAL init failed");
-    let port_count = eal.port_count();
-    for &pid in &config.port_ids {
-        assert!(
-            pid < port_count,
-            "DPDK port {pid} not found (available: {port_count})",
-        );
-    }
-
-    // Use more mbufs for the bench client — many connections with large windows.
-    // Increase for extra ports.
-    let num_mbufs: u32 = if config.port_ids.len() > 1 {
-        24576
-    } else {
-        16384
-    };
-    let mempool = if config.mtu > 1500 {
-        Mempool::create_for_mtu("bench_pool", num_mbufs, config.mtu as u16, 0)
-            .expect("mempool failed")
-    } else {
-        Mempool::create_with_size("bench_pool", num_mbufs, 0).expect("mempool failed")
+    let server_addr = match config.server_addr {
+        SocketAddr::V4(v4) => v4,
+        SocketAddr::V6(_) => return Err("IPv6 not supported".to_owned()),
     };
 
-    // Configure and start all ports. Use intersection of offload caps.
-    // In bifurcated mode (peer_ip set), open in isolated mode and install
-    // an src-IP steering rule so DPDK only sees the server's traffic.
-    let bifurcated = config.peer_ip.is_some();
-    let mut ports = Vec::with_capacity(config.port_ids.len());
-    let mut combined_offloads: Option<melin_dpdk::port::ChecksumOffloads> = None;
-    for &pid in &config.port_ids {
-        let mut port = Port::configure(pid, &mempool, config.vlan_id, 1, bifurcated)
-            .expect("port config failed");
-        port.start().expect("port start failed");
-        if let Some(peer) = config.peer_ip {
-            port.install_src_ipv4_steering(peer)
-                .expect("rte_flow steering rule install failed");
-        }
-        combined_offloads = Some(match combined_offloads {
-            None => port.offloads,
-            Some(prev) => prev.intersect(port.offloads),
-        });
-        ports.push(port);
-    }
-    let offloads = combined_offloads.unwrap_or_default();
+    // Calibrated before the NIC opens rather than just before the loop:
+    // the handle's stack runs on the bench's TSC from its first dial, so
+    // the dials and the loop share one clock and one conversion.
+    let ticks_per_ns = crate::calibrate_tsc();
+    let clock = BenchClock {
+        origin_tsc: crate::rdtscp(),
+        ticks_per_ns,
+    };
 
-    let mac = ports[0].mac_addr();
-    let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads, 0);
-    if config.mtu != 1500 {
-        device.set_mtu(config.mtu);
-        eprintln!("  DPDK jumbo frames: MTU {}", config.mtu);
-    }
-    if let Some(vlan_id) = config.vlan_id {
-        device.set_vlan_id(vlan_id);
+    // EAL, the mbuf pool, the ports (each with its steering rule in
+    // bifurcated mode), the device and the interface, as a node brings
+    // them up. Outside L3 mode the handle announces itself with a
+    // gratuitous ARP as it opens.
+    let mut nic =
+        NicHandle::open(&config.nic).map_err(|e| format!("DPDK NIC setup failed: {e}"))?;
+    if config.nic.mtu != 1500 {
+        eprintln!("  DPDK jumbo frames: MTU {}", config.nic.mtu);
     }
 
-    let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
-    let iface_config = Config::new(hw_addr);
-    let now = SmolInstant::from_millis(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64,
-    );
-    let mut iface = Interface::new(iface_config, &mut device, now);
-
-    let ip = Ipv4Address::new(
-        config.local_ip.octets()[0],
-        config.local_ip.octets()[1],
-        config.local_ip.octets()[2],
-        config.local_ip.octets()[3],
-    );
-    iface.update_ip_addrs(|addrs| {
-        addrs
-            .push(IpCidr::new(IpAddress::Ipv4(ip), config.prefix_len))
-            .expect("IP address capacity");
-    });
-
-    if let Some(gw) = config.gateway {
-        let gw_addr = Ipv4Address::new(
-            gw.octets()[0],
-            gw.octets()[1],
-            gw.octets()[2],
-            gw.octets()[3],
-        );
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(gw_addr)
-            .expect("default route");
-    }
-
-    // Two seeding strategies, picked by mode:
-    //   - L3 bifurcated: smoltcp routes the server IP via the gateway,
+    // Two seeding strategies, picked by mode, both the handle's:
+    //   - L3 bifurcated: the stack routes the server IP via the gateway,
     //     and the gateway's ARP reply has a different source IP than
-    //     `peer_ip`, so it never reaches DPDK. Seed (gateway, gateway_mac)
-    //     statically — the operator pulled it from `ip neigh`.
-    //   - Legacy SR-IOV: VFs can't receive broadcast ARP, so smoltcp
-    //     can't resolve the server either. Send a gratuitous ARP for
-    //     the switch's benefit and seed the server's deterministic VF
-    //     MAC (02:00:IP[0..4]).
-    if let (Some(gw), Some(gw_mac)) = (config.gateway, config.gateway_mac) {
-        // Build a synthetic ARP reply: peer = gateway. The pre-existing
-        // ARP reply path on the device populates smoltcp's neighbor cache
-        // without going through the wire.
-        let our_ip_bytes = config.local_ip.octets();
-        let gw_bytes = gw.octets();
-        let mut arp_reply = [0u8; 42];
-        arp_reply[0..6].copy_from_slice(&mac); // dst: us
-        arp_reply[6..12].copy_from_slice(&gw_mac); // src: gateway
-        arp_reply[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
-        arp_reply[14..16].copy_from_slice(&[0x00, 0x01]);
-        arp_reply[16..18].copy_from_slice(&[0x08, 0x00]);
-        arp_reply[18] = 6;
-        arp_reply[19] = 4;
-        arp_reply[20..22].copy_from_slice(&[0x00, 0x02]); // opcode: reply
-        arp_reply[22..28].copy_from_slice(&gw_mac);
-        arp_reply[28..32].copy_from_slice(&gw_bytes);
-        arp_reply[32..38].copy_from_slice(&mac);
-        arp_reply[38..42].copy_from_slice(&our_ip_bytes);
-        device.inject_rx(arp_reply.to_vec());
-
-        // Poll once so smoltcp consumes the injected ARP reply.
-        let mut tmp_sockets = SocketSet::new(Vec::new());
-        device.poll_rx();
-        iface.poll(now, &mut device, &mut tmp_sockets);
-        device.flush_tx();
-
+    //     `peer_ip`, so it never reaches DPDK. The handle seeds (gateway,
+    //     gateway_mac) statically — the operator pulled it from `ip neigh`.
+    //   - Legacy SR-IOV: VFs can't receive broadcast ARP, so the stack
+    //     can't resolve the server either. The handle sends a gratuitous
+    //     ARP for the switch's benefit and seeds the server's MAC on each
+    //     dial: the supplied one, or the deterministic VF MAC
+    //     (02:00:IP[0..4]).
+    if let (Some(gw), Some(gw_mac)) = (config.nic.gateway, config.nic.gateway_mac) {
         eprintln!(
             "  ARP: seeded gateway {gw} = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (L3 mode)",
             gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5],
         );
     } else {
-        let our_ip = config.local_ip.octets();
-        let mut frame = [0u8; 42];
-        // Ethernet header: broadcast destination
-        frame[0..6].copy_from_slice(&[0xff; 6]);
-        frame[6..12].copy_from_slice(&mac);
-        frame[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
-        // ARP: Ethernet + IPv4, request
-        frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
-        frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
-        frame[18] = 6; // hardware size
-        frame[19] = 4; // protocol size
-        frame[20..22].copy_from_slice(&[0x00, 0x01]); // opcode: request
-        frame[22..28].copy_from_slice(&mac); // sender MAC
-        frame[28..32].copy_from_slice(&our_ip); // sender IP
-        frame[32..38].copy_from_slice(&[0xff; 6]); // target MAC
-        frame[38..42].copy_from_slice(&our_ip); // target IP = sender IP (gratuitous)
-        device.send_raw_frame(&frame);
-
-        // Seed the server's MAC into our neighbor cache.
-        let server_ip_bytes = match config.server_addr.ip() {
-            std::net::IpAddr::V4(v4) => v4.octets(),
-            _ => panic!("IPv6 not supported"),
-        };
-        // An operator-supplied MAC always wins. The `02:00:<ip>` form is
-        // the SR-IOV convention — `dpdk-setup.sh` assigns VFs exactly
-        // that address — and is only correct on that path. Ports that
-        // keep a real hardware MAC (mlx5 bifurcated shares the kernel
-        // netdev's) must pass `--dpdk-peer-mac`, or the frames below go
-        // to an address nothing on the segment answers for.
-        let server_mac = config.peer_mac.unwrap_or([
-            0x02,
-            0x00,
-            server_ip_bytes[0],
-            server_ip_bytes[1],
-            server_ip_bytes[2],
-            server_ip_bytes[3],
-        ]);
-        // Inject a crafted ARP reply into smoltcp so it learns the server's MAC.
-        let mut arp_reply = [0u8; 42];
-        arp_reply[0..6].copy_from_slice(&mac); // dest: us
-        arp_reply[6..12].copy_from_slice(&server_mac); // src: server
-        arp_reply[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
-        arp_reply[14..16].copy_from_slice(&[0x00, 0x01]); // HW type
-        arp_reply[16..18].copy_from_slice(&[0x08, 0x00]); // Proto type
-        arp_reply[18] = 6;
-        arp_reply[19] = 4;
-        arp_reply[20..22].copy_from_slice(&[0x00, 0x02]); // opcode: reply
-        arp_reply[22..28].copy_from_slice(&server_mac);
-        arp_reply[28..32].copy_from_slice(&server_ip_bytes);
-        arp_reply[32..38].copy_from_slice(&mac);
-        arp_reply[38..42].copy_from_slice(&our_ip);
-        device.inject_rx(arp_reply.to_vec());
-
-        // Process the injected ARP reply so smoltcp populates its cache.
-        // Use a temporary empty socket set — no sockets needed for ARP.
-        let mut tmp_sockets = SocketSet::new(Vec::new());
-        device.poll_rx();
-        iface.poll(now, &mut device, &mut tmp_sockets);
-        device.flush_tx();
-
         // Name the source: a derived MAC on a port that keeps its real
         // hardware address is the failure mode this path is most likely
         // to hit, and it is otherwise indistinguishable from success —
-        // the connect just hangs.
-        let mac_source = if config.peer_mac.is_some() {
-            "supplied"
-        } else {
-            "derived 02:00:<ip>"
+        // the connect just times out, with this MAC in its error.
+        let (server_mac, source) = nic.peer_mac(*server_addr.ip());
+        let mac_source = match source {
+            PeerMacSource::Supplied => "supplied",
+            PeerMacSource::DerivedSrIov => "derived 02:00:<ip>",
         };
         eprintln!(
             "  ARP: sent gratuitous, seeded server MAC \
@@ -350,50 +267,13 @@ pub fn run_dpdk_roundtrip(
         );
     }
 
-    let mut sockets = SocketSet::new(Vec::with_capacity(num_clients + 1));
-    let mut cached_ts = now;
-    let mut poll_count: u32 = 0;
-
-    let server_ip = match config.server_addr.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        _ => panic!("IPv6 not supported"),
-    };
-    let server_endpoint = smoltcp::wire::IpEndpoint {
-        addr: IpAddress::Ipv4(Ipv4Address::new(
-            server_ip.octets()[0],
-            server_ip.octets()[1],
-            server_ip.octets()[2],
-            server_ip.octets()[3],
-        )),
-        port: config.server_addr.port(),
-    };
-
-    // Helper: poll NIC + smoltcp.
-    let poll = |device: &mut DpdkDevice,
-                iface: &mut Interface,
-                sockets: &mut SocketSet,
-                poll_count: &mut u32,
-                cached_ts: &mut SmolInstant| {
-        *poll_count = poll_count.wrapping_add(1);
-        if poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
-            *cached_ts = SmolInstant::from_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            );
-        }
-        device.poll_rx();
-        iface.poll(*cached_ts, device, sockets);
-        device.flush_tx();
-    };
-
     // --- Connect, auth, and set up each client sequentially ---
     //
-    // Each socket must be created, connected, and authenticated one at a
-    // time. smoltcp's connect() sends the SYN on the next poll — if we
-    // create all sockets upfront, all SYNs go out simultaneously and the
-    // server may accept them in arbitrary order, causing auth deadlocks.
+    // Each connection is dialed and authenticated before the next is
+    // dialed. A DPDK node keeps one listening socket per port and answers
+    // a SYN that arrives during another connection's handshake with an
+    // RST, so dials in flight together would be refused, not queued; the
+    // NIC handle's dial returns only once its connection is established.
     // Build a generator per client. Phases are driven by wall-clock
     // deadlines on the shared `start` instant, so there is no
     // per-client total to compute — generators run indefinitely.
@@ -422,85 +302,32 @@ pub fn run_dpdk_roundtrip(
         .map(|i| crate::keys::derive_client_key(key, i as u32))
         .collect();
 
-    // Sequential connect + auth — smoltcp's TCP stack is single-threaded
-    // and shared across all sockets via the same `Interface` poll loop.
-    // Per-client SYN-then-auth ordering avoids the auth-deadlock risk of
-    // sending all SYNs at once and accepting them in arbitrary order.
+    let dial_timeout_ns = DIAL_TIMEOUT.as_nanos() as u64;
     let mut connections: Vec<DpdkBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
     eprintln!("  connecting {num_clients} clients via DPDK...");
     for (client_id, flow) in per_client.into_iter().enumerate() {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        // Low-latency TCP tuning for dedicated LAN.
-        socket.set_nagle_enabled(false);
-        socket.set_ack_delay(None);
-        // Retransmit timeouts at fastcp's floor (1ms), down from its
-        // internet-tuned defaults (min 10ms / initial 50ms). On the µs-RTT
-        // shared-mem/LAN link a lost segment otherwise stalls the in-flight
-        // window for tens of ms (a ~50ms p99 cliff at 1M ops/s). 1ms is as
-        // low as fastcp goes: its RttEstimator — RTO, min/max RTO, and RTT
-        // sampling — is u32-millisecond, so any sub-ms Duration truncates to
-        // 0 (which panics on min_rto). True sub-ms would need a fork change.
-        socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
-        socket.set_initial_rto(smoltcp::time::Duration::from_millis(1));
-        socket.set_initial_congestion_window(64 * 1024);
+        // Each dial takes a fresh local port from the handle, so a run
+        // never reuses the four-tuple of a connection the server may
+        // still hold from a previous run.
+        let deadline_ns = clock.now_ns().saturating_add(dial_timeout_ns);
+        let id = nic
+            .dial(server_addr, SOCKET_BUF_SIZE, deadline_ns, || clock.now_ns())
+            .map_err(|e| format!("connect failed for client {client_id}: {e}"))?;
 
-        // Randomize ephemeral port base to avoid colliding with TIME_WAIT
-        // entries from a previous bench run against the same server.
-        let local_port = 49152 + (std::process::id() as u16 % 8192) + client_id as u16;
-        socket
-            .connect(
-                iface.context(),
-                server_endpoint,
-                (IpAddress::Ipv4(ip), local_port),
-            )
-            .unwrap_or_else(|e| panic!("connect failed for client {client_id}: {e}"));
-
-        let handle = sockets.add(socket);
+        let mut connection =
+            PolledConnection::with_timeout(&client_keys[client_id], HANDSHAKE_TIMEOUT);
+        authenticate(&mut nic, &id, &mut connection, &clock)
+            .map_err(|e| format!("client {client_id}: auth handshake failed: {e}"))?;
 
         connections.push(DpdkBenchConn {
-            handle,
-            decoder: FrameDecoder::new(),
+            id,
+            connection,
             flow,
-            scratch_frame: Vec::with_capacity(generator::MAX_REQUEST_FRAME_BYTES),
-            pending_unsent: None,
-            send_pending: Vec::new(),
             inflight_ts: VecDeque::with_capacity(window),
             pacer: None,
             outcomes: OutcomeReport::default(),
         });
-
-        // Wait for TCP handshake to complete.
-        loop {
-            poll(
-                &mut device,
-                &mut iface,
-                &mut sockets,
-                &mut poll_count,
-                &mut cached_ts,
-            );
-            let s = sockets.get_mut::<tcp::Socket>(handle);
-            if s.state() == State::Established {
-                break;
-            }
-        }
-
-        // Auth handshake.
-        {
-            let conn = std::slice::from_mut(connections.last_mut().unwrap());
-            let conn_key = std::slice::from_ref(&client_keys[client_id]);
-            dpdk_auth_all(
-                conn,
-                &mut device,
-                &mut iface,
-                &mut sockets,
-                &mut poll_count,
-                &mut cached_ts,
-                conn_key,
-            );
-        }
 
         eprintln!("  client {}/{num_clients}: connected", client_id + 1);
     }
@@ -523,7 +350,6 @@ pub fn run_dpdk_roundtrip(
 
     let health_poller = health_addr.map(crate::health_poller::HealthPoller::start);
 
-    let ticks_per_ns = crate::calibrate_tsc();
     let start = Instant::now();
     let deadlines = phases.deadlines(start);
     let mut measured_start: Option<Instant> = None;
@@ -566,28 +392,18 @@ pub fn run_dpdk_roundtrip(
     let mut poll_iter_hist =
         Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("poll iter histogram bounds");
 
-    // Per-component histograms for the poll closure's three sub-calls.
-    // The outer poll iter is ~1 µs typical (p99 ~1.5 µs) — nowhere near
-    // the 30 µs we want to attribute. Splitting into `poll_rx`,
-    // `iface.poll`, `flush_tx` tells us if any one of them occasionally
-    // takes ~30 µs. Most likely candidate: `iface.poll` when smoltcp's
-    // TCP state machine fires a timer-driven action (delayed ACK,
-    // window update, retransmit). Recorded only on calls invoked from
-    // the main measurement loop, never on connect-phase calls.
+    // The NIC's service step (device RX poll, the stack's poll over every
+    // socket, TX flush) as one call, timed whole: the handle does the
+    // three in one step. Recorded only on the call at the top of each
+    // main-loop iteration, never on connect-phase calls.
     #[cfg(feature = "latency-trace")]
-    let mut poll_rx_hist =
-        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("poll_rx hist bounds");
-    #[cfg(feature = "latency-trace")]
-    let mut iface_poll_hist =
-        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("iface.poll hist bounds");
-    #[cfg(feature = "latency-trace")]
-    let mut flush_tx_hist =
-        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("flush_tx hist bounds");
+    let mut service_hist =
+        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("service hist bounds");
 
     // Poll every N connections to keep the NIC busy during the
-    // connection iteration. Without this, smoltcp's TX buffer fills
+    // connection iteration. Without this, the stack's TX buffer fills
     // up with 16 connections at window 256, and the NIC sits idle
-    // until the next flush_tx() at the end of the loop.
+    // until the next service step at the top of the loop.
     const POLL_EVERY_N_CONNS: usize = 4;
 
     let mut diag_sends: u64 = 0;
@@ -605,43 +421,20 @@ pub fn run_dpdk_roundtrip(
         #[cfg(feature = "latency-trace")]
         let mut work_done_this_iter = false;
 
-        // Inlined poll with per-component timing. Mirrors the `poll`
-        // closure at the top of the function, except with rdtscp stamps
-        // around `poll_rx`, `iface.poll`, and `flush_tx`. Only the main
-        // loop's poll call is instrumented; connect-phase calls go
-        // through the original closure unchanged.
-        poll_count = poll_count.wrapping_add(1);
-        if poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
-            cached_ts = SmolInstant::from_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            );
-        }
+        // The NIC's service step, once per iteration, at the bench's TSC
+        // time. The same reading is the time the connections are handed
+        // below; it only ever starts a read deadline, and none runs once
+        // the connections are ready.
+        let service_tsc = crate::rdtscp();
+        let now_ns = clock.ns_at(service_tsc);
+        nic.service(now_ns);
         #[cfg(feature = "latency-trace")]
-        let t0 = crate::rdtscp();
-        device.poll_rx();
-        #[cfg(feature = "latency-trace")]
-        let t1 = crate::rdtscp();
-        iface.poll(cached_ts, &mut device, &mut sockets);
-        #[cfg(feature = "latency-trace")]
-        let t2 = crate::rdtscp();
-        device.flush_tx();
-        #[cfg(feature = "latency-trace")]
-        let t3 = crate::rdtscp();
-        #[cfg(feature = "latency-trace")]
-        {
-            poll_rx_hist
-                .record(crate::tsc_to_ns(t1 - t0, ticks_per_ns))
-                .ok();
-            iface_poll_hist
-                .record(crate::tsc_to_ns(t2 - t1, ticks_per_ns))
-                .ok();
-            flush_tx_hist
-                .record(crate::tsc_to_ns(t3 - t2, ticks_per_ns))
-                .ok();
-        }
+        service_hist
+            .record(crate::tsc_to_ns(
+                crate::rdtscp() - service_tsc,
+                ticks_per_ns,
+            ))
+            .ok();
 
         // Sample the wall clock once per outer iter and reuse it for
         // both the cooldown break and the per-completion phase
@@ -663,52 +456,44 @@ pub fn run_dpdk_roundtrip(
         }
 
         for (i, conn) in connections.iter_mut().enumerate() {
-            // Mid-iteration poll to flush TX and receive new data.
+            // Mid-iteration service step to flush TX and receive new data.
             if i > 0 && i % POLL_EVERY_N_CONNS == 0 {
-                poll(
-                    &mut device,
-                    &mut iface,
-                    &mut sockets,
-                    &mut poll_count,
-                    &mut cached_ts,
-                );
+                nic.service(clock.now_ns());
             }
-
-            let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
 
             // --- Send: fill the window ---
-            // First, drain any pending partial send.
-            if !conn.send_pending.is_empty()
-                && socket.can_send()
-                && let Ok(sent) = socket.send_slice(&conn.send_pending)
+            // First, drain any pending partial send: what the stream did
+            // not take of an earlier request, held by the connection.
+            if conn.connection.unsent() > 0
+                && let Err(e) = conn.connection.flush(&mut nic.stream(&conn.id))
             {
-                if sent >= conn.send_pending.len() {
-                    conn.send_pending.clear();
-                } else if sent > 0 {
-                    // Partial send — compact. This is rare (only under
-                    // backpressure) so the memmove cost is acceptable.
-                    conn.send_pending.drain(..sent);
-                }
+                // Client-side TCP error — debug! per project log-level
+                // convention. The bytes stay queued for the next try.
+                tracing::debug!("dpdk flush error: {e:?}");
             }
 
-            // Send new frames while window has room. Each frame is generated
-            // on-the-fly into `scratch_frame` as [u32 LE len][payload]. When
-            // the socket can't accept any bytes, the unsent frame is parked
-            // in `pending_unsent` and `inflight_ts` is *not* advanced — so
-            // the recorded send timestamp reflects the moment bytes actually
-            // start hitting the wire, not the moment generation completed.
+            // Send new frames while window has room. Each request is
+            // generated on-the-fly and framed straight into the socket's
+            // transmit buffer (`send_with` over the stream's in-place
+            // send). When the socket has no room, nothing is generated
+            // and `inflight_ts` is *not* advanced — so the recorded send
+            // timestamp reflects the moment bytes actually start hitting
+            // the wire, not the moment generation completed. A request
+            // the contiguous room cannot hold whole is framed in the
+            // connection's scratch buffer and as much of it as fits goes
+            // out now; the remainder is the pending partial send above.
             //
             // With pacing, `pop_due` gates each new frame on the schedule
             // and the recorded timestamp is the *scheduled* tick (closes
             // the coordinated-omission loophole).
-            if !socket.can_send() {
+            if !can_send(&mut nic, &conn.id) {
                 diag_cant_send += 1;
             } else if conn.inflight_ts.len() >= window {
                 diag_window_full += 1;
             }
-            while conn.send_pending.is_empty()
+            while conn.connection.unsent() == 0
                 && conn.inflight_ts.len() < window
-                && socket.can_send()
+                && can_send(&mut nic, &conn.id)
             {
                 // Pacing gate first — if the next slot isn't due yet,
                 // stop filling for this conn this iteration.
@@ -733,83 +518,88 @@ pub fn run_dpdk_roundtrip(
                     None
                 };
 
-                // Reuse a previously-generated-but-never-sent frame if there
-                // is one; otherwise pull a fresh frame from the generator.
-                if let Some(prev) = conn.pending_unsent.take() {
-                    conn.scratch_frame = prev;
-                } else {
-                    conn.scratch_frame.clear();
-                    conn.flow.next_wire_frame(&mut conn.scratch_frame);
-                }
-                let wire_frame = &conn.scratch_frame;
-                match socket.send_slice(wire_frame) {
-                    Ok(n) if n == wire_frame.len() => {
+                // The generator advances only inside the encoder, which
+                // runs once if the request is framed and not at all
+                // otherwise, so a send that frames nothing loses no
+                // request. A generated request always encodes; a failure
+                // there is a bug in the generator or the codec.
+                let mut framed = false;
+                let flow = &mut conn.flow;
+                let sent = conn.connection.send_with(
+                    &mut nic.stream(&conn.id),
+                    now_ns,
+                    codec::MAX_REQUEST_BODY,
+                    |body: &mut [u8]| {
+                        framed = true;
+                        Ok::<usize, melin_client::Error>(
+                            flow.next_request_body(body).expect("encode"),
+                        )
+                    },
+                );
+                match sent {
+                    Ok(()) => {
+                        // Framed in place, or framed in the scratch buffer
+                        // and flushed. `send_with` alone does not promise
+                        // the flush took anything (it may take 0 bytes);
+                        // what does is the loop's `can_send` gate above:
+                        // with room in the send buffer, the stream's send
+                        // takes at least one byte. So the request has
+                        // started going out, and it counts. Keep that gate
+                        // ahead of this send: without it, a request still
+                        // parked in the connection would be timestamped
+                        // here.
                         conn.inflight_ts
                             .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
                         diag_sends += 1;
-                    }
-                    Ok(n) if n > 0 => {
-                        // Partial send — remainder goes to send_pending; the
-                        // frame has started hitting the wire so it counts.
-                        conn.send_pending.extend_from_slice(&wire_frame[n..]);
-                        conn.inflight_ts
-                            .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
-                        diag_sends += 1;
-                    }
-                    Ok(_) => {
-                        // Zero bytes sent — socket transiently full. Park the
-                        // frame and exit; retry on the next poll iteration.
-                        // Roll back the pacer so the same scheduled slot
-                        // is re-issued for the parked frame.
-                        if paced_ts.is_some()
-                            && let Some(p) = conn.pacer.as_mut()
-                        {
-                            p.unpop();
-                        }
-                        conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
-                        break;
                     }
                     Err(e) => {
                         // Client-side TCP error — debug! per project log-level
                         // convention (silent at default RUST_LOG level so a
-                        // noisy network doesn't spam stderr). Park the frame
-                        // for retry. Roll back the pacer (see above).
-                        tracing::debug!("dpdk send_slice error: {e:?}");
-                        if paced_ts.is_some()
+                        // noisy network doesn't spam stderr).
+                        tracing::debug!("dpdk send error: {e:?}");
+                        if framed {
+                            // The request is queued in the connection and
+                            // goes out with the next flush that succeeds:
+                            // it counts, so the FIFO stays aligned with
+                            // what the server will acknowledge.
+                            conn.inflight_ts
+                                .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
+                            diag_sends += 1;
+                        } else if paced_ts.is_some()
                             && let Some(p) = conn.pacer.as_mut()
                         {
+                            // Nothing was generated: roll back the pacer
+                            // so the same scheduled slot is re-issued for
+                            // the next request.
                             p.unpop();
                         }
-                        conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
                         break;
                     }
                 }
             }
 
-            // --- Recv: drain straight into the decoder (no intermediate copy) ---
-            while socket.can_recv() {
-                match socket.recv(|data| {
-                    conn.decoder.push(data);
-                    (data.len(), ())
-                }) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-            }
-
+            // --- Recv: replies, split where they were received ---
             loop {
                 // Malformed frames are dropped intentionally, here and
                 // in the outcome tally below: they are not the bench's
                 // responsibility to diagnose, and panicking would mask
                 // genuine throughput regressions during a long run. A
-                // length over the limit poisons the decoder, which only
-                // repeats it, so stop there rather than spin on it.
-                let reply = match melin_client::next_reply(&mut conn.decoder) {
-                    Ok(Some(reply)) => reply,
-                    Ok(None) | Err(melin_client::Error::FrameTooLarge { .. }) => break,
-                    Err(_) => continue,
+                // frame no reply carries is consumed, so the next poll
+                // moves on. Any other error ends this connection's
+                // receive for the iteration and comes back on the next:
+                // a length over the limit poisons the connection, which
+                // only repeats it, and a stream the server closed or
+                // that failed has nothing more to give. Neither is
+                // logged, as the loop meets it once per iteration; the
+                // connection's line in the diagnostics after the run
+                // shows its requests left in flight.
+                let frame = match conn.connection.poll(&mut nic.stream(&conn.id), now_ns) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(melin_client::Error::Protocol(_)) => continue,
+                    Err(_) => break,
                 };
-                if matches!(reply, Reply::BatchEnd) {
+                if matches!(frame, Frame::BatchEnd) {
                     diag_batch_ends += 1;
                     // Capture `rdtscp()` BEFORE any per-frame
                     // bookkeeping (outcome tally below) so the
@@ -843,7 +633,7 @@ pub fn run_dpdk_roundtrip(
                 // above so this counter increment is not billed to
                 // the wire roundtrip. An undecodable response is
                 // dropped for the reason given above.
-                let _ = conn.outcomes.record(&reply);
+                let _ = conn.outcomes.record(&reply_of(frame));
             }
         }
 
@@ -876,12 +666,10 @@ pub fn run_dpdk_roundtrip(
          window_full hits: {diag_window_full}"
     );
     for (ci, conn) in connections.iter().enumerate() {
-        let socket = sockets.get::<tcp::Socket>(conn.handle);
         eprintln!(
-            "  conn[{ci}]: state={:?} inflight={} pending={}",
-            socket.state(),
+            "  conn[{ci}]: inflight={} pending={}",
             conn.inflight_ts.len(),
-            conn.send_pending.len(),
+            conn.connection.unsent(),
         );
     }
 
@@ -892,7 +680,7 @@ pub fn run_dpdk_roundtrip(
     series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
 
     let mut extra_lines = vec![
-        format!("  Transport: DPDK (smoltcp)"),
+        "  Transport: DPDK (smoltcp)".to_owned(),
         format!("  DPDK core: {core_id}"),
         format!("  Window: {window}, Clients: {num_clients}"),
     ];
@@ -948,9 +736,7 @@ pub fn run_dpdk_roundtrip(
             "bench poll: outer iteration (work-iters only)",
             &poll_iter_hist,
         );
-        report("bench poll: device.poll_rx()", &poll_rx_hist);
-        report("bench poll: iface.poll() (smoltcp)", &iface_poll_hist);
-        report("bench poll: device.flush_tx()", &flush_tx_hist);
+        report("bench poll: nic.service()", &service_hist);
     }
 
     // Fetch the server-side per-stage histogram dump before the
@@ -983,92 +769,64 @@ pub fn run_dpdk_roundtrip(
         Some(&outcomes),
     );
 
+    // Close the NIC before the rejection gate, which may exit the
+    // process: every stream is reset, so the server frees the
+    // connections' slots at once rather than at its next heartbeat, and
+    // EAL is cleaned up.
+    drop(connections);
+    drop(nic);
+
     enforce_rejection_threshold(&outcomes, max_reject_pct);
+    Ok(())
 }
 
-/// Run the auth handshake for all connections over smoltcp.
-/// Polls until all connections complete Challenge → ChallengeResponse → ServerReady.
-///
-/// `keys` must have one entry per connection — each connection signs the
-/// challenge with its own key so the engine's per-key dedup HWM is
-/// partitioned per connection. See `keys::derive_client_key` for the
-/// derivation contract.
-fn dpdk_auth_all(
-    connections: &mut [DpdkBenchConn],
-    device: &mut DpdkDevice,
-    iface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
-    poll_count: &mut u32,
-    cached_ts: &mut SmolInstant,
-    keys: &[ed25519_dalek::SigningKey],
-) {
-    assert_eq!(
-        connections.len(),
-        keys.len(),
-        "dpdk_auth_all: one key required per connection",
-    );
-    use melin_client::{Handshake, Step};
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // One handshake state machine per connection: fed each frame smoltcp
-    // delivers, it hands back the response to send. Vec: one per
-    // connection, indexed alongside `connections`.
-    let mut handshakes: Vec<Handshake> = keys.iter().map(Handshake::new).collect();
-    let mut recv_buf = [0u8; 512];
+    #[test]
+    fn the_clock_counts_nanoseconds_from_its_origin() {
+        let clock = BenchClock {
+            origin_tsc: 1_000,
+            ticks_per_ns: 2.0,
+        };
+        assert_eq!(clock.ns_at(1_000), 0);
+        assert_eq!(clock.ns_at(3_000), 1_000);
+        // A reading before the origin counts as the origin.
+        assert_eq!(clock.ns_at(10), 0);
+    }
 
-    loop {
-        // Poll NIC + smoltcp.
-        *poll_count = poll_count.wrapping_add(1);
-        if poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
-            *cached_ts = SmolInstant::from_millis(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            );
+    #[test]
+    fn the_clock_never_goes_backwards() {
+        let clock = BenchClock {
+            origin_tsc: crate::rdtscp(),
+            ticks_per_ns: crate::calibrate_tsc(),
+        };
+        let mut last = clock.now_ns();
+        for _ in 0..10_000 {
+            let now = clock.now_ns();
+            assert!(now >= last, "{now} after {last}");
+            last = now;
         }
-        device.poll_rx();
-        iface.poll(*cached_ts, device, sockets);
-        device.flush_tx();
+    }
 
-        let mut all_done = true;
+    /// Every frame a polled connection surfaces reaches the tally as the
+    /// reply it is, so the outcome counts are the ones the decoder-fed
+    /// loop kept.
+    #[test]
+    fn each_frame_is_tallied_as_its_reply() {
+        let body = [1u8, 2, 3];
+        assert_eq!(reply_of(Frame::Response(&body)), Reply::Response(&body));
+        assert_eq!(reply_of(Frame::BatchEnd), Reply::BatchEnd);
+        assert_eq!(reply_of(Frame::ServerBusy), Reply::ServerBusy);
+        assert_eq!(reply_of(Frame::EngineError), Reply::EngineError);
 
-        for (i, conn) in connections.iter_mut().enumerate() {
-            if handshakes[i].is_done() {
-                continue;
-            }
-            all_done = false;
-
-            let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
-            if !socket.can_recv() {
-                continue;
-            }
-
-            let n = socket.recv_slice(&mut recv_buf).unwrap_or(0);
-            conn.decoder.push(&recv_buf[..n]);
-
-            // Feed the handshake every frame it is waiting for. Anything
-            // behind its last frame stays in the decoder for the reply
-            // loop.
-            while !handshakes[i].is_done() {
-                let frame = match conn.decoder.next() {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => break,
-                    Err(e) => panic!("client {i}: auth handshake failed: {e}"),
-                };
-                match handshakes[i].feed(frame) {
-                    // The challenge response, length prefix included.
-                    Ok(Step::Send(response)) => {
-                        let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
-                        socket.send_slice(response).expect("send ChallengeResponse");
-                    }
-                    Ok(Step::Ready) => {}
-                    Err(e) => panic!("client {i}: auth handshake failed: {e}"),
-                }
-            }
+        let mut outcomes = OutcomeReport::default();
+        for frame in [Frame::BatchEnd, Frame::ServerBusy, Frame::EngineError] {
+            outcomes.record(&reply_of(frame)).unwrap();
         }
-
-        if all_done {
-            break;
-        }
+        assert_eq!(outcomes.batch_ends, 1);
+        assert_eq!(outcomes.server_busy, 1);
+        assert_eq!(outcomes.engine_errors, 1);
     }
 }

@@ -18,6 +18,70 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+### Changed
+
+- **The DPDK benchmark client runs on the sequencer's client NIC handle.**
+  `melin-ec-bench` built with `dpdk` now brings its NIC up, dials its
+  connections and authenticates them through the sequencer client
+  (`melin-client`'s `dpdk` feature) instead of a DPDK stack of its own;
+  its load, pacing, sampling and outcome tally are unchanged, and so are
+  its flags, their defaults, its help and its results. What an operator
+  can notice:
+  - Without `--file-prefix` in `--dpdk-eal-args`, the bench's EAL now
+    runs under the file prefix `melin-client` (its runtime directory is
+    `/var/run/dpdk/melin-client`) rather than DPDK's default `rte`, so a
+    bench on the same host as a DPDK node no longer contends for the
+    node's runtime lock. The LAN suite cleans both directories.
+  - Its mbuf pool is the node's: 8192 mbufs per port, where the bench
+    sized its own at 16384, or 24576 for a bond. The client's receive
+    path copies each segment out, so the pool no longer has to grow with
+    the connection count or the window.
+  - A connection that cannot be dialed fails the run: after 10 s with no
+    answer, with an error naming the MAC the server was addressed by (the
+    first thing to check), or at once when the server refuses it, where
+    the bench used to wait indefinitely. A handshake gets 10 s too. These
+    failures, and a NIC that cannot be brought up, print `error: ...` and
+    exit with status 1 instead of panicking.
+  - One bench process opens at most 1024 connections: `--clients` above
+    that fails the run at the 1025th dial (the node's default
+    `--max-connections` is also 1024).
+  - Until this lands with a sequencer release, the branch builds the
+    sequencer crates from a sibling checkout at `../melin` on branch
+    `docs/dpdk-client-plan`. A LAN suite run with `BENCH_BRANCH` or
+    `BENCH_COMMIT` builds on the server and bench hosts, so each of them
+    needs that checkout beside the repository too, or the build fails.
+  - The per-connection lines of the diagnostics printed after a run no
+    longer carry the TCP state (`state=...`). In a `latency-trace` build,
+    the NIC's poll is timed as one step (`bench poll: nic.service()`)
+    instead of three.
+- **`melin_client::Error` has a new variant, `Error::Nic`,** for a DPDK
+  NIC that cannot be brought up *(sequencer)*. Source-breaking for a Rust
+  dependent that matches the sequencer client's errors exhaustively,
+  `melin_ec_market_data`'s `SnapshotError::Transport` among the places it
+  surfaces. `melin-ec-client` reports it as `ClientError::Io`, the error
+  it reports a failed connect as; nothing it does today can produce it.
+- **`--max-connections` must be between 1 and 8192** *(sequencer)*. `0`,
+  which meant unlimited, is refused at startup, and so is anything above
+  8192; a deployment passing `--max-connections 0` must pick a cap. The
+  kernel-TCP transport now sizes its io_uring rings from the cap, so a
+  cap near the clients a node actually serves takes less locked memory;
+  the default (1024) keeps the sizes they always had.
+- **A DPDK node's NIC setup errors name their port and pool**
+  *(sequencer)*: on an LACP bond, which member failed to configure, start
+  or take its steering rule is now said.
+
+### Fixed
+
+- **A node that cannot create its io_uring rings refuses to start, and
+  says why** *(sequencer)*, naming `RLIMIT_MEMLOCK` and systemd's
+  `LimitMEMLOCK=` when the locked-memory limit is the cause, where it used
+  to go down later with an error that did not name it.
+- **A `--max-connections` above about a thousand could panic the node's
+  kernel-TCP stages** under enough simultaneous connections *(sequencer)*;
+  the rings are now sized from the cap.
+- **The node's legacy receive-buffer fallback could overrun its submission
+  queue** on hosts that refuse the ring-mapped buffer pool *(sequencer)*.
+
 ## [0.19.0] - 2026-10-10
 
 This release adopts sequencer 0.19.0 and its application-defined client

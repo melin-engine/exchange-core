@@ -1693,6 +1693,7 @@ version = "0.19.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
+ "melin-dpdk",
  "melin-wire-protocol",
 ]
 
@@ -1746,7 +1747,6 @@ dependencies = [
  "clap",
  "crossterm",
  "ed25519-dalek",
- "fastcp",
  "flate2",
  "getrandom 0.4.3",
  "hdrhistogram",
@@ -1755,7 +1755,6 @@ dependencies = [
  "libc",
  "melin-app",
  "melin-client",
- "melin-dpdk",
  "melin-ec",
  "melin-ec-protocol",
  "melin-ec-server",
