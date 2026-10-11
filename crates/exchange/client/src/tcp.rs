@@ -252,11 +252,17 @@ impl Client {
 /// `Connection` and its request framing, which this client does not use,
 /// and are folded into an I/O error rather than left unmapped. No
 /// wildcard: a variant the sequencer adds must be placed here.
+///
+/// A DPDK NIC that cannot be brought up (`Error::Nic`, from the
+/// sequencer client's `dpdk` feature, which this crate does not use) is a
+/// failure to connect, and this client reports a failure to connect as the
+/// socket's own `io::Error`: it is passed through as it is, kind and
+/// message intact, rather than flattened into a string.
 fn transport_error(e: melin_client::Error) -> ClientError {
     use melin_client::Error;
     match e {
         Error::AuthFailed { .. } => ClientError::AuthFailed,
-        Error::Io(e) => ClientError::Io(e),
+        Error::Io(e) | Error::Nic(e) => ClientError::Io(e),
         Error::Disconnected => ClientError::Disconnected,
         Error::Protocol(_) | Error::FrameTooLarge { .. } => {
             ClientError::Protocol(ProtocolError::InvalidField("frame from the node"))
@@ -706,5 +712,22 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    /// A NIC that cannot be brought up is a failure to connect, reported
+    /// as the I/O error it is, kind and message kept, as a refused socket
+    /// connect is.
+    #[test]
+    fn a_nic_that_cannot_come_up_is_an_io_error_kept_whole() {
+        let source = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "DPDK port 3 not found (available: 1)",
+        );
+        let mapped = transport_error(melin_client::Error::Nic(source));
+        let ClientError::Io(e) = mapped else {
+            panic!("expected ClientError::Io, got {mapped:?}");
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(e.to_string(), "DPDK port 3 not found (available: 1)");
     }
 }

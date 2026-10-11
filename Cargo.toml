@@ -75,6 +75,27 @@ tikv-jemallocator = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# TEMPORARY: build against the unreleased sequencer branch
+# (`docs/dpdk-client-plan`, checked out beside this repository at
+# `../melin`), which carries the client NIC handle (`melin_dpdk::NicHandle`)
+# and `melin-client`'s polled connection and `dpdk` feature that the bench's
+# DPDK client is built on. Every melin crate the lockfile resolves is
+# patched, not only the two the bench names, so that no type is resolved
+# from two sources (a `melin-wire-protocol` from crates.io beside the
+# branch's would be a second, incompatible copy of every wire type). Drop
+# this whole section when the sequencer pins above move to the release that
+# carries the NIC handle.
+[patch.crates-io]
+melin-app = { path = "../melin/crates/core/app" }
+melin-client = { path = "../melin/crates/core/client" }
+melin-dpdk = { path = "../melin/crates/core/dpdk" }
+melin-journal = { path = "../melin/crates/core/journal" }
+melin-pipeline = { path = "../melin/crates/core/pipeline" }
+melin-raft = { path = "../melin/crates/core/raft" }
+melin-server-runtime = { path = "../melin/crates/core/server-runtime" }
+melin-transport-core = { path = "../melin/crates/core/transport-core" }
+melin-wire-protocol = { path = "../melin/crates/core/wire-protocol" }
+
 [profile.release]
 # Full cross-crate LTO: allows LLVM to inline across crate boundaries
 # (e.g., disruptor ring ops into engine hot path). Major win for multi-crate
