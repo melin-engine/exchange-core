@@ -52,10 +52,10 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_ec_types::types::QueryResponse,
 >;
 use melin_ec_types::types::{AccountId, CurrencyId};
-use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::{StageWaits, build_pipeline_with_replication};
 use melin_transport_core::replica_presence::ReplicaPresence;
 use melin_transport_core::trace::mono_trace_ns;
+use melin_transport_core::{JournaledApp, NodeStore};
 
 #[derive(Parser)]
 struct Args {
@@ -501,7 +501,8 @@ fn main() {
         repl_consumer_1,
         repl_consumer_2,
         replica_slots: Arc::clone(&replica_slots),
-        journal_path: primary_journal.clone(),
+        // The derived `primary.snapshot`, which the bench never writes.
+        store: NodeStore::resolve(primary_journal.clone(), None).expect("resolve primary store"),
         authorized_keys: Arc::clone(&authorized_keys),
         evict_flags: replication_ring_progress.evict_flags.clone(),
         active_flags: replication_ring_progress.active_flags.clone(),
@@ -560,8 +561,10 @@ fn main() {
             journal_prep: Placement::unpinned(),
             journal_disk: place(replica_core(4)),
         };
-        let replica_journal: PathBuf = tmp_root.join(format!("replica-{i}.journal"));
-        let replica_snapshot: PathBuf = tmp_root.join(format!("replica-{i}.snapshot"));
+        // The snapshot is the derived `replica-{i}.snapshot`, beside the
+        // journal in the bench's own directory.
+        let replica_store = NodeStore::resolve(tmp_root.join(format!("replica-{i}.journal")), None)
+            .expect("resolve replica store");
         let s = Arc::clone(&repl_shutdown);
         // Fresh handles: nothing promoted, tip not yet trustworthy, link
         // down until the handshake completes. The bench never files a
@@ -573,12 +576,11 @@ fn main() {
             .spawn(move || {
                 let _ = run_receiver::<ServerApp>(
                     bind_addr,
-                    &replica_journal,
+                    &replica_store,
                     &replica_key,
                     &s,
                     &control,
                     3_000_000, // snapshot_interval_ms (effectively never)
-                    replica_snapshot,
                     cores,
                     // Zero-fill staging, the production default; the
                     // bench measures streaming, not segment rotation.

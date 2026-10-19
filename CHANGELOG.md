@@ -78,6 +78,38 @@ protocol error on the first degraded ack it receives.
 - **`melin-ec-replication-bench --ack-policy` is journaled** ahead of the
   generated events, as replicas now learn the policy from the journal, and
   the bench waits for every replica to stream live rather than to connect.
+- **`--snapshot-path` is the node's one snapshot location**: recovered
+  from at startup by a primary and a replica alike, sent to a replica that
+  needs a resync, and written by the shadow exchange. A node refuses to
+  start on a snapshot location it cannot use: a directory, a missing
+  directory, the journal path, or an empty explicit path while a snapshot
+  sits at the default `<journal>.snapshot` on a node with no journal
+  *(sequencer)*.
+- **A snapshot save leaves at most 8 MiB of unwritten data in the page
+  cache**, so a large snapshot no longer pushes the host past its
+  dirty-page limit and throttles the journal's writes *(sequencer)*.
+
+### Removed
+
+- **`--snapshot`.** A command line that still carries it is refused. It
+  was read only at a primary's startup, while the shadow exchange kept
+  writing to `--snapshot-path` (or `<journal>.snapshot`), so that file is
+  the freshest snapshot. With `--snapshot-path` set, drop `--snapshot`.
+  With `--snapshot X` alone, move the current `<journal>.snapshot` to the
+  location you want and set `--snapshot-path` to it; to restore a backup,
+  copy it to the snapshot path *(sequencer)*.
+
+### Fixed
+
+- **A snapshot deferred under load is retried** rather than skipped until
+  the next interval, which could leave a busy node without a snapshot for
+  several intervals; a save still waiting at the next interval logs a
+  warning *(sequencer)*.
+- **A primary with `--snapshot-path` recovers from, and serves, its own
+  snapshot**, where it used to ignore it and could serve a stale
+  `<journal>.snapshot` to a resyncing replica *(sequencer)*.
+- **A replica whose `--snapshot-path` is on another filesystem than its
+  journal no longer fails every resync** *(sequencer)*.
 
 ## [0.19.0] - 2026-10-10
 
