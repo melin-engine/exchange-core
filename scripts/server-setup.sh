@@ -9,8 +9,13 @@
 #   # or manually:
 #   ssh root@<server-ip>
 #   bash /tmp/server-setup.sh
+#
+# Deprecated in favour of the sequencer's scripts/bench/server-setup.sh.
 
 set -euo pipefail
+
+echo "warning: scripts/server-setup.sh is deprecated; set up bench hosts with the" \
+    "sequencer's scripts/bench/server-setup.sh (https://github.com/melin-engine/melin)" >&2
 
 if [[ $EUID -ne 0 ]]; then
     echo "error: must run as root" >&2

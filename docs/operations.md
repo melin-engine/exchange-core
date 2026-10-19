@@ -495,7 +495,7 @@ printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} isolcpus=nohz,domain,1-9 nohz_
 
 Append to `GRUB_CMDLINE_LINUX`, not `GRUB_CMDLINE_LINUX_DEFAULT`. Only the former is guaranteed to be defined — several hosting images ship without a `GRUB_CMDLINE_LINUX_DEFAULT` line at all, so an edit targeting it silently does nothing — and `GRUB_CMDLINE_LINUX` applies to the recovery entry too.
 
-Note the filename. `scripts/server-setup.sh` owns `99-melin-ec-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
+Note the filename. The bench-host setup script (the sequencer's `scripts/bench/server-setup.sh`, which replaces this repository's deprecated `scripts/server-setup.sh`) owns `99-melin-ec-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
 
 Then apply:
 
@@ -530,7 +530,7 @@ To revert, remove the drop-in — the vendor's `/etc/default/grub` was never mod
 sudo rm /etc/default/grub.d/99-melin-manual.cfg && sudo update-grub && sudo reboot
 ```
 
-On a host provisioned by `scripts/server-setup.sh`, remove `99-melin-ec-bench.cfg` the same way to undo the parameters it applied.
+On a host provisioned by the setup script, remove `99-melin-ec-bench.cfg` the same way to undo the parameters it applied.
 
 ### Runtime Tuning (bench-isolate.sh)
 
@@ -545,7 +545,7 @@ The `scripts/bench-isolate.sh` script applies runtime tuning that does not requi
 sudo ./scripts/bench-isolate.sh [bench args]
 ```
 
-For production, apply these settings permanently. `scripts/server-setup.sh` installs the governor and IRQ pinning as `systemd` oneshot units (`melin-cpu-governor`, `melin-irq-pin`) so they survive reboots; the equivalent by hand is:
+For production, apply these settings permanently. The sequencer's `scripts/bench/server-setup.sh` installs the governor and IRQ pinning as `systemd` oneshot units (`melin-cpu-governor`, `melin-irq-pin`) so they survive reboots; the equivalent by hand is:
 
 ```sh
 # CPU governor (install as a systemd unit, not a one-off shell loop)
@@ -906,7 +906,7 @@ For best journal performance, use an NVMe drive with:
 
 - **Power Loss Protection (PLP)**: Required. The journal relies on PLP capacitors to flush controller DRAM to NAND on power loss. Consumer SSDs and drives without confirmed PLP support are not safe for production use.
 - **Dedicated journal disk**: Avoids contention with OS I/O. Sharing the disk with the OS or other workloads increases p99 latency.
-- **Use xfs, not ext4**: ext4's jbd2 batches metadata commits at internal extent-group boundaries (~256 MiB on the layouts we see), which adds a ~1–2 ms `fdatasync` stall every ~10 s of sustained writes. Under the `disk+ram` ack policy with ≥ 2 replicas the stalls usually mask each other, but because the bench's event stream is byte-deterministic the same offset triggers the same stall on every node simultaneously — defeating the masking. xfs allocates extents through a different bookkeeping path that doesn't fire at write-time, so the periodic spike vanishes. Mount xfs with `noatime,logbsize=256k,logbufs=8`. `scripts/server-setup.sh` does this automatically.
+- **Use xfs, not ext4**: ext4's jbd2 batches metadata commits at internal extent-group boundaries (~256 MiB on the layouts we see), which adds a ~1–2 ms `fdatasync` stall every ~10 s of sustained writes. Under the `disk+ram` ack policy with ≥ 2 replicas the stalls usually mask each other, but because the bench's event stream is byte-deterministic the same offset triggers the same stall on every node simultaneously — defeating the masking. xfs allocates extents through a different bookkeeping path that doesn't fire at write-time, so the periodic spike vanishes. Mount xfs with `noatime,logbsize=256k,logbufs=8`. The sequencer's `scripts/bench/server-setup.sh` does this automatically.
 
 ---
 

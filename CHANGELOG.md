@@ -86,6 +86,16 @@ protocol error on the first degraded ack it receives.
   sits at the default `<journal>.snapshot` on a node with no journal
   *(sequencer)*.
 
+### Deprecated
+
+- **`scripts/server-setup.sh`, `scripts/server-deploy.sh`,
+  `scripts/lan-bench-suite.sh` and `scripts/lan-bench.sh`**, in favour of
+  the sequencer's `scripts/bench/` copies: its `server-setup.sh` and
+  `server-deploy.sh` prepare bench hosts, and its `lan-bench-suite.sh`
+  benchmarks this exchange as its `ec` application. Each deprecated script
+  prints a warning and still runs. See "Reproducing Published Benchmarks"
+  in the benchmarking guide.
+
 ### Removed
 
 - **`--snapshot`.** A command line that still carries it is refused. It

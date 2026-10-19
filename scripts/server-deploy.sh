@@ -9,8 +9,13 @@
 #
 # Example:
 #   ./scripts/server-deploy.sh root@84.32.176.142
+#
+# Deprecated in favour of the sequencer's scripts/bench/server-deploy.sh.
 
 set -euo pipefail
+
+echo "warning: scripts/server-deploy.sh is deprecated; deploy bench hosts with the" \
+    "sequencer's scripts/bench/server-deploy.sh (https://github.com/melin-engine/melin)" >&2
 
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 <remote>"

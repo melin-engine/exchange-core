@@ -141,8 +141,15 @@
 #   - VLAN/private network between machines — scripts/private-net-setup.sh
 #     configures and verifies one (docs/operations.md, "Private Network")
 #   - bench-isolate.sh run on all machines for stable numbers
+#
+# Deprecated in favour of the sequencer's scripts/bench/lan-bench-suite.sh,
+# which benchmarks this exchange as its `ec` application.
 
 set -euo pipefail
+
+echo "warning: scripts/lan-bench-suite.sh is deprecated; benchmark the exchange with the" \
+    "sequencer's scripts/bench/lan-bench-suite.sh ec ..., EC_REPO pointing at this checkout" \
+    "(https://github.com/melin-engine/melin)" >&2
 
 if [[ $# -lt 3 ]]; then
     echo "usage: $0 <server-pub-ip> <bench-pub-ip> <server-vlan-ip> [user] [replica-pub-ip] [replica-vlan-ip] [replica2-pub-ip] [replica2-vlan-ip]"
