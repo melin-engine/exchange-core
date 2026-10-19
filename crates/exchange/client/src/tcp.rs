@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
-use melin_client::Reply;
+use melin_client::{Ack, Reply};
 
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
@@ -57,10 +57,11 @@ impl Client {
     /// Steps 1, 3 and 5 each wait for a server response and will block
     /// indefinitely if the server never replies. Step 5 in particular
     /// goes through the engine pipeline, so its response is gated on
-    /// the configured durability policy: connecting to a primary whose
-    /// policy is unsatisfiable (e.g. `primary-needs-replica` with no
-    /// replica attached) will hang here forever. Callers that need a
-    /// bounded wait should use [`Client::connect_with_timeout`].
+    /// the configured durability policy: connecting to a primary halted
+    /// for want of a replica waits out its degraded-ack grace period, and
+    /// hangs here forever if the node runs with `--no-degraded-acks`.
+    /// Callers that need a bounded wait should use
+    /// [`Client::connect_with_timeout`].
     pub fn connect(addr: SocketAddr, key: &SigningKey) -> Result<Self, ClientError> {
         Self::connect_inner(addr, key, None)
     }
@@ -149,8 +150,25 @@ impl Client {
 
     /// Send a request and collect all responses until BatchEnd.
     ///
-    /// Returns the list of responses (excluding the BatchEnd marker itself).
+    /// Returns the list of responses (excluding the BatchEnd marker
+    /// itself) of a reply backed as the node's ack policy requires. A
+    /// reply only the primary's disk backs is [`ClientError::Degraded`],
+    /// which carries the responses, so a weaker reply is never taken for
+    /// a full one unawares.
     pub fn send_request(&mut self, request: &Request) -> Result<Vec<ResponseKind>, ClientError> {
+        match self.request_batch(request)? {
+            (responses, Ack::Policy) => Ok(responses),
+            (responses, Ack::PrimaryOnly) => Err(ClientError::Degraded(responses)),
+        }
+    }
+
+    /// [`Client::send_request`] with the reply's backing returned rather
+    /// than judged: for a query, whose answer is no less true for being
+    /// backed by the primary's disk alone.
+    fn request_batch(
+        &mut self,
+        request: &Request,
+    ) -> Result<(Vec<ResponseKind>, Ack), ClientError> {
         // Increment the per-connection request sequence before each send.
         // The engine refuses a request whose sequence does not beat the
         // mark it keeps for this key.
@@ -170,22 +188,22 @@ impl Client {
         // connection's framing stays intact, then report the error.
         let mut responses = Vec::new();
         let mut engine_error = false;
-        loop {
+        let ack = loop {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
             match melin_client::classify(frame).map_err(transport_error)? {
                 Reply::Response(body) => responses.push(codec::decode_response_body(body)?),
                 Reply::Heartbeat => continue,
-                Reply::BatchEnd => break,
+                Reply::BatchEnd(ack) => break ack,
                 Reply::ServerBusy => return Err(ClientError::ServerBusy),
                 Reply::EngineError => engine_error = true,
             }
-        }
+        };
 
         if engine_error {
             return Err(ClientError::EngineError);
         }
-        Ok(responses)
+        Ok((responses, ack))
     }
 
     /// Query and adopt the engine's current request_seq HWM for this
@@ -207,7 +225,7 @@ impl Client {
     /// bypasses dedup for it — the query goes through even though our
     /// local seq is stale.
     pub fn synchronize_request_seq(&mut self) -> Result<u64, ClientError> {
-        let responses = self.send_request(&Request::QueryRequestSeq)?;
+        let (responses, _ack) = self.request_batch(&Request::QueryRequestSeq)?;
         for resp in &responses {
             if let ResponseKind::RequestSeqHwm { hwm } = resp {
                 self.next_seq = *hwm;
@@ -223,7 +241,7 @@ impl Client {
     ///
     /// Sends `QueryStats` and extracts the `StatsHeader` from the response batch.
     pub fn query_stats(&mut self) -> Result<StatsSnapshot, ClientError> {
-        let responses = self.send_request(&Request::QueryStats)?;
+        let (responses, _ack) = self.request_batch(&Request::QueryStats)?;
         for resp in &responses {
             if let ResponseKind::StatsHeader {
                 active_connections,
@@ -262,6 +280,8 @@ fn transport_error(e: melin_client::Error) -> ClientError {
             ClientError::Protocol(ProtocolError::InvalidField("frame from the node"))
         }
         other @ (Error::Connect { .. }
+        | Error::Nic(_)
+        | Error::Degraded { .. }
         | Error::Deadline { .. }
         | Error::Key(_)
         | Error::NoReply { .. }
@@ -680,6 +700,64 @@ mod tests {
         // The BatchEnd was consumed with the error: the next request
         // reads its own batch, not a stale terminator.
         assert!(client.send_request(&request).unwrap().is_empty());
+    }
+
+    /// A reply backed by the primary's disk alone is never taken for a
+    /// full one: `send_request` reports it as `Degraded` with its
+    /// responses, and the connection stays good. A query, whose answer
+    /// a degraded backing does not weaken, takes it as it is.
+    #[test]
+    fn degraded_reply_is_reported_with_its_responses() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+
+            // A write, answered with one response and a degraded end.
+            let _frame = reader.read_frame().unwrap().unwrap();
+            let mut buf = [0u8; 64];
+            let written =
+                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: 7 }, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            write_transport(&mut writer, &TransportResponse::BatchEndDegraded);
+
+            // A stats query, answered the same way.
+            let _frame = reader.read_frame().unwrap().unwrap();
+            let written = codec::encode_response(
+                &ResponseKind::StatsHeader {
+                    active_connections: 1,
+                    events_processed: 2,
+                    journal_sequence: 3,
+                },
+                &mut buf,
+            )
+            .unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            write_transport(&mut writer, &TransportResponse::BatchEndDegraded);
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        let result = client.send_request(&Request::CancelOrder {
+            symbol: Symbol(1),
+            account: melin_ec_protocol::types::AccountId(1),
+            order_id: OrderId(42),
+        });
+        match result {
+            Err(ClientError::Degraded(responses)) => assert!(
+                matches!(responses[..], [ResponseKind::RequestSeqHwm { hwm: 7 }]),
+                "expected the reply's one response, got {responses:?}"
+            ),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+
+        let stats = client.query_stats().unwrap();
+        assert_eq!(stats.journal_sequence, 3);
     }
 
     #[test]

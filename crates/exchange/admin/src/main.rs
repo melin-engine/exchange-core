@@ -1411,48 +1411,54 @@ fn client_thread(
 
     while let Ok(request) = request_rx.recv() {
         let start = std::time::Instant::now();
-        match client.send_request(&request) {
-            Ok(responses) => {
-                let latency = start.elapsed();
-                if responses.is_empty() {
-                    let _ = response_tx.send(format!("(no reports)  [{latency:.3?}]"));
-                }
-                for resp in &responses {
-                    let msg = match resp {
-                        ResponseKind::Report(report) => format_report(report),
-                        ResponseKind::BookSnapshotBegin { .. }
-                        | ResponseKind::BookSnapshotLevel { .. }
-                        | ResponseKind::BookSnapshotEnd { .. }
-                        | ResponseKind::SnapshotComplete { .. }
-                        | ResponseKind::PositionSnapshot { .. }
-                        | ResponseKind::RequestSeqHwm { .. } => continue,
-                        ResponseKind::StatsHeader {
-                            active_connections,
-                            events_processed,
-                            journal_sequence,
-                        } => {
-                            // Best-effort: receiver may be gone if UI quit.
-                            let _ = stats_tx.send(StatsSnapshot {
-                                active_connections: *active_connections,
-                                events_processed: *events_processed,
-                                journal_sequence: *journal_sequence,
-                            });
-                            continue;
-                        }
-                    };
-                    let _ = response_tx.send(format!("{msg}  [{latency:.3?}]"));
-                }
-            }
+        // A degraded reply is shown like any other, then flagged: its
+        // reports happened, but only the primary's disk holds them yet.
+        let (responses, degraded) = match client.send_request(&request) {
+            Ok(responses) => (responses, false),
+            Err(ClientError::Degraded(responses)) => (responses, true),
             // The engine's verdict on one request, not a connection
             // failure: the next command goes through as usual.
             Err(ClientError::EngineError) => {
                 let latency = start.elapsed();
                 let _ = response_tx.send(format!("ENGINE ERROR  [{latency:.3?}]"));
+                continue;
             }
             Err(e) => {
                 let _ = response_tx.send(format!("Request failed: {e}"));
                 break;
             }
+        };
+        let latency = start.elapsed();
+        if responses.is_empty() {
+            let _ = response_tx.send(format!("(no reports)  [{latency:.3?}]"));
+        }
+        for resp in &responses {
+            let msg = match resp {
+                ResponseKind::Report(report) => format_report(report),
+                ResponseKind::BookSnapshotBegin { .. }
+                | ResponseKind::BookSnapshotLevel { .. }
+                | ResponseKind::BookSnapshotEnd { .. }
+                | ResponseKind::SnapshotComplete { .. }
+                | ResponseKind::PositionSnapshot { .. }
+                | ResponseKind::RequestSeqHwm { .. } => continue,
+                ResponseKind::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                } => {
+                    // Best-effort: receiver may be gone if UI quit.
+                    let _ = stats_tx.send(StatsSnapshot {
+                        active_connections: *active_connections,
+                        events_processed: *events_processed,
+                        journal_sequence: *journal_sequence,
+                    });
+                    continue;
+                }
+            };
+            let _ = response_tx.send(format!("{msg}  [{latency:.3?}]"));
+        }
+        if degraded {
+            let _ = response_tx.send("DEGRADED ACK: primary's disk only, no replica yet".into());
         }
     }
 }

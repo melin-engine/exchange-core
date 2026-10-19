@@ -120,7 +120,8 @@ impl Frame {
 ///
 /// Returns `None` for `OutputPayload::BatchEnd` — that slot carries
 /// no payload of its own; the wire `BatchEnd` is emitted from the
-/// `is_last_in_request` flag (see `slot_to_frames`).
+/// `is_last_in_request` flag (see `slot_to_frames`) — and for
+/// `OutputPayload::AckPolicyChange`, the response gate's own slot.
 fn payload_to_frame(payload: OutputPayload) -> Option<Frame> {
     Some(match payload {
         OutputPayload::QueryResponse(QueryResponse::Stats {
@@ -145,7 +146,7 @@ fn payload_to_frame(payload: OutputPayload) -> Option<Frame> {
             Frame::Response(ResponseKind::RequestSeqHwm { hwm })
         }
         OutputPayload::Report(report) => Frame::Response(ResponseKind::Report(report)),
-        OutputPayload::BatchEnd => return None,
+        OutputPayload::BatchEnd | OutputPayload::AckPolicyChange(_) => return None,
         OutputPayload::EngineError => Frame::Transport(TransportResponse::EngineError),
     })
 }
@@ -156,6 +157,12 @@ fn payload_to_frame(payload: OutputPayload) -> Option<Frame> {
 /// (`0..=2`); the array is filled from index 0.
 fn slot_to_frames(slot: &OutputSlot) -> ([Frame; 2], usize) {
     let mut frames = [Frame::Transport(TransportResponse::BatchEnd); 2];
+    // A journaled ack-policy change is the response gate's slot, not a
+    // reply: it is flagged last-in-request only to close the gate's own
+    // batch, so it expands to nothing, not even a `BatchEnd`.
+    if matches!(slot.payload, OutputPayload::AckPolicyChange(_)) {
+        return (frames, 0);
+    }
     let mut len = 0;
     if let Some(frame) = payload_to_frame(slot.payload) {
         frames[len] = frame;
@@ -704,8 +711,25 @@ mod tests {
         let n = frames[1].encode(&mut buf).unwrap();
         assert_eq!(
             melin_client::classify(&buf[4..n]).unwrap(),
-            melin_client::Reply::BatchEnd
+            melin_client::Reply::BatchEnd(melin_client::Ack::Policy)
         );
+    }
+
+    #[test]
+    fn an_ack_policy_change_slot_reaches_no_subscriber() {
+        // The runtime flags the change's slot last-in-request to close
+        // the response gate's own batch; on the feed it would be a
+        // `BatchEnd` closing nobody's request.
+        let slot = OutputSlot {
+            payload: OutputPayload::AckPolicyChange(melin_journal::AckPolicyChange {
+                policy: melin_journal::AckPolicyByte(0),
+                unwitnessed: false,
+            }),
+            is_last_in_request: true,
+            ..OutputSlot::default()
+        };
+        let (_frames, len) = slot_to_frames(&slot);
+        assert_eq!(len, 0);
     }
 
     #[test]

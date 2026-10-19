@@ -72,9 +72,11 @@ These frames carry no exchange body. The node sends and reads them itself; a cli
 | 0x07 | AuthFailed        | Server to client | none                               |
 | 0x08 | ServerReady       | Server to client | none                               |
 | 0x09 | *(exchange message)* | Both          | a request or response body         |
+| 0x0A | BatchEndDegraded  | Server to client | none                               |
 
 - **Heartbeat**: server-initiated keepalive sent to idle connections (see "Heartbeat and Keepalive").
 - **BatchEnd**: the last frame of the reply to one request (see "BatchEnd Semantics").
+- **BatchEndDegraded**: the last frame of a reply backed by the primary's own disk alone, weaker than the ack policy, which a primary that lost its last replica sends once its grace period has passed (see "BatchEnd Semantics").
 - **EngineError**: the matching engine hit an internal error on the request. The batch still ends with a `BatchEnd`.
 - **ServerBusy**: the server's input pipeline is full and the request was not accepted. Retry after a brief backoff. The reader answers this directly, without entering the pipeline, so the server can always respond even when saturated.
 - **Challenge**, **ChallengeResponse**, **AuthFailed**, **ServerReady**: the authentication handshake (see "Authentication Handshake").
@@ -677,6 +679,8 @@ A single request can produce multiple response messages. For example, a `SubmitO
 The **BatchEnd** node frame (tag `0x02`) tells the client that all reports for the preceding request have been sent. This allows pipelined clients to correlate responses with requests: after sending N requests, the client reads responses until it receives N BatchEnd markers.
 
 For requests that produce a single response (e.g., `CancelOrder` produces one `Cancelled` or `Rejected`), BatchEnd still follows to maintain the uniform protocol.
+
+A reply can instead end with **BatchEndDegraded** (tag `0x0A`). It closes the request's batch exactly as a BatchEnd does, and also says that the reports before it are held only on the primary's disk, not as the ack policy requires: the request was applied and survives a primary restart, but a failover to a node that never received it would lose it. A client that needs the policy's guarantee treats such a reply as unconfirmed and reconciles once the cluster is whole again; one that accepts a single disk copy treats it as done. A primary sends it only after it has had no replica connected for its degraded-ack grace period (see the operations guide), never under the `disk` policy, and never when started with `--no-degraded-acks`. A write the halted node refuses (`ReplicaDisconnected`) is never applied, and its reply always ends in a plain BatchEnd.
 
 ---
 

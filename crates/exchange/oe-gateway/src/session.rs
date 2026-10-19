@@ -453,11 +453,14 @@ impl Session {
     /// A heartbeat and a `BatchEnd` carry nothing the session tracks; a
     /// busy node and an engine error are logged; a malformed frame is
     /// dropped, since a bad frame from the engine must not take the
-    /// session down.
+    /// session down. A degraded `BatchEnd` (the reply backed by the
+    /// primary's disk alone) is no different here: the reports before it
+    /// have already gone out as FIX messages, which have no way to mark
+    /// them, and the node itself warns and counts while it acks degraded.
     fn melin_response<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
         match melin_client::classify(payload) {
             Ok(Reply::Response(body)) => Some(body),
-            Ok(Reply::Heartbeat | Reply::BatchEnd) => None,
+            Ok(Reply::Heartbeat | Reply::BatchEnd(_)) => None,
             Ok(Reply::ServerBusy) => {
                 warn!(sender = %self.sender_comp_id, "Melin server busy");
                 None

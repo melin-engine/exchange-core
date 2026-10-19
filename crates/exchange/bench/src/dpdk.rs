@@ -809,7 +809,7 @@ pub fn run_dpdk_roundtrip(
                     Ok(None) | Err(melin_client::Error::FrameTooLarge { .. }) => break,
                     Err(_) => continue,
                 };
-                if matches!(reply, Reply::BatchEnd) {
+                if matches!(reply, Reply::BatchEnd(_)) {
                     diag_batch_ends += 1;
                     // Capture `rdtscp()` BEFORE any per-frame
                     // bookkeeping (outcome tally below) so the

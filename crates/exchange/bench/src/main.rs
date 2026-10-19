@@ -74,9 +74,9 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-use melin_client::Reply;
 #[cfg(not(feature = "dpdk"))]
 use melin_client::framing::FrameDecoder;
+use melin_client::{Ack, Reply};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::ResponseKind;
 use melin_ec_server::exchange_app::ServerApp;
@@ -1667,6 +1667,13 @@ fn run_pipeline_inner(
             std::hint::spin_loop();
             continue;
         };
+        // A journaled ack-policy change is the response gate's slot, not
+        // a reply to anything this bench sent, though it is flagged last
+        // in its request: pairing it with a send timestamp would shift
+        // every latency after it by one request.
+        if matches!(slot.payload, OutputPayload::AckPolicyChange(_)) {
+            continue;
+        }
         // The matching stage now signals end-of-request via the
         // `is_last_in_request` flag on the final slot for one input
         // event, instead of a separate `OutputPayload::BatchEnd` slot.
@@ -1702,7 +1709,9 @@ fn run_pipeline_inner(
         match slot.payload {
             OutputPayload::Report(report) => outcomes.record_execution_report(&report),
             OutputPayload::EngineError => outcomes.engine_errors += 1,
-            OutputPayload::BatchEnd | OutputPayload::QueryResponse(_) => {}
+            OutputPayload::BatchEnd
+            | OutputPayload::QueryResponse(_)
+            | OutputPayload::AckPolicyChange(_) => {}
         }
     }
 
@@ -2746,7 +2755,7 @@ fn run_uring_loop(
                 while let Some(reply) =
                     melin_client::next_reply(&mut conn.decoder).expect("classify reply")
                 {
-                    if matches!(reply, Reply::BatchEnd) {
+                    if matches!(reply, Reply::BatchEnd(_)) {
                         // `rdtscp()` is captured FIRST — before any
                         // per-frame bookkeeping (the outcome tally) — so
                         // the histogram reflects only the wire roundtrip,
@@ -3018,6 +3027,11 @@ pub(crate) struct OutcomeReport {
     pub rejected: u64,
     pub engine_errors: u64,
     pub server_busy: u64,
+    /// The `BatchEnd`s above that only the primary's disk backed: a
+    /// primary that lost its last replica acks degraded once its grace
+    /// period passes, so a replicated run that counts any did not
+    /// measure the ack policy it was set up for.
+    pub degraded_acks: u64,
     /// Per-reason rejection counts. Index space defined by
     /// [`REJECT_REASONS`] / [`reject_reason_index`].
     pub reject_reasons: [u64; REJECT_REASONS.len()],
@@ -3036,7 +3050,11 @@ impl OutcomeReport {
         reply: &Reply<'_>,
     ) -> Result<(), melin_wire_protocol::error::ProtocolError> {
         match *reply {
-            Reply::BatchEnd => self.batch_ends += 1,
+            Reply::BatchEnd(Ack::Policy) => self.batch_ends += 1,
+            Reply::BatchEnd(Ack::PrimaryOnly) => {
+                self.batch_ends += 1;
+                self.degraded_acks += 1;
+            }
             Reply::EngineError => self.engine_errors += 1,
             Reply::ServerBusy => self.server_busy += 1,
             Reply::Heartbeat => {}
@@ -3080,6 +3098,7 @@ impl OutcomeReport {
         self.rejected += other.rejected;
         self.engine_errors += other.engine_errors;
         self.server_busy += other.server_busy;
+        self.degraded_acks += other.degraded_acks;
         for (a, b) in self
             .reject_reasons
             .iter_mut()
@@ -3171,6 +3190,13 @@ pub(crate) fn print_outcome_summary(outcomes: &OutcomeReport) {
             "    server-busy:   {} ({:.2}%)",
             outcomes.server_busy,
             pct(outcomes.server_busy)
+        );
+    }
+    if outcomes.degraded_acks > 0 {
+        println!(
+            "    degraded acks: {} ({:.2}%) — backed by the primary's disk alone",
+            outcomes.degraded_acks,
+            pct(outcomes.degraded_acks)
         );
     }
     if outcomes.rejected > 0 {
@@ -3408,7 +3434,7 @@ pub(crate) fn print_results(
                 }
                 reasons.push('}');
                 format!(
-                    ",\"outcomes\":{{\"batch_ends\":{},\"placed\":{},\"fills\":{},\"cancelled\":{},\"triggered\":{},\"replaced\":{},\"rejected\":{},\"engine_errors\":{},\"server_busy\":{},\"reject_reasons\":{reasons}}}",
+                    ",\"outcomes\":{{\"batch_ends\":{},\"placed\":{},\"fills\":{},\"cancelled\":{},\"triggered\":{},\"replaced\":{},\"rejected\":{},\"engine_errors\":{},\"server_busy\":{},\"degraded_acks\":{},\"reject_reasons\":{reasons}}}",
                     o.batch_ends,
                     o.placed,
                     o.fills,
@@ -3418,6 +3444,7 @@ pub(crate) fn print_results(
                     o.rejected,
                     o.engine_errors,
                     o.server_busy,
+                    o.degraded_acks,
                 )
             }
             None => String::new(),
@@ -3553,7 +3580,10 @@ mod outcome_report_tests {
     fn records_each_variant_into_the_right_bucket() {
         let (oid, sym, acc) = dummy_order();
         let mut r = OutcomeReport::default();
-        r.record(&Reply::BatchEnd).unwrap();
+        r.record(&Reply::BatchEnd(Ack::Policy)).unwrap();
+        // A degraded batch end still ends its request, and is counted
+        // apart as well.
+        r.record(&Reply::BatchEnd(Ack::PrimaryOnly)).unwrap();
         let placed = wire(&ResponseKind::Report(ExecutionReport::Placed {
             order_id: oid,
             symbol: sym,
@@ -3580,7 +3610,8 @@ mod outcome_report_tests {
         // A response the codec cannot decode is the caller's to judge.
         assert!(r.record(&Reply::Response(&[0xFF])).is_err());
 
-        assert_eq!(r.batch_ends, 1);
+        assert_eq!(r.batch_ends, 2);
+        assert_eq!(r.degraded_acks, 1);
         assert_eq!(r.placed, 1);
         assert_eq!(r.rejected, 1);
         assert_eq!(r.engine_errors, 1);
@@ -3602,15 +3633,16 @@ mod outcome_report_tests {
         }));
         let mut a = OutcomeReport::default();
         a.record(&Reply::Response(&rejected)).unwrap();
-        a.record(&Reply::BatchEnd).unwrap();
+        a.record(&Reply::BatchEnd(Ack::Policy)).unwrap();
 
         let mut b = OutcomeReport::default();
         b.record(&Reply::Response(&rejected)).unwrap();
-        b.record(&Reply::BatchEnd).unwrap();
-        b.record(&Reply::BatchEnd).unwrap();
+        b.record(&Reply::BatchEnd(Ack::Policy)).unwrap();
+        b.record(&Reply::BatchEnd(Ack::PrimaryOnly)).unwrap();
 
         a.merge(&b);
         assert_eq!(a.batch_ends, 3);
+        assert_eq!(a.degraded_acks, 1);
         assert_eq!(a.rejected, 2);
         assert_eq!(
             a.reject_reasons[reject_reason_index(RejectReason::NoLiquidity)],
