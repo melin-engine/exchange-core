@@ -42,13 +42,6 @@ protocol error on the first degraded ack it receives.
   so it is never taken for a full acknowledgement. `query_stats` and
   `synchronize_request_seq` take a degraded answer as it is. The admin and
   TUI tools show a degraded reply's reports, flagged `DEGRADED ACK`.
-- **`melin_ack_policy_journaled` and `melin_ack_policy_in_force`** gauges
-  on `/metrics` *(sequencer)*.
-- **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib` and
-  `--dpdk-client-tx-queue-kib`** size a DPDK node's client connections;
-  the send buffer's default rises from 16 to 64 KiB and the queue's from
-  64 KiB to 8 MiB, so a fast client no longer drops on the first round-trip
-  hiccup *(sequencer)*.
 - **`degraded_acks` in the bench's outcomes**, printed and in its JSON: a
   replicated run that counts any did not measure the policy it was set up
   for.
@@ -65,25 +58,9 @@ protocol error on the first degraded ack it receives.
   **Failover runbooks need a change:** `PROMOTE` answers before the node
   serves as primary, and an `ACK-POLICY disk` sent in between is only
   staged (`OK staged`), which no longer releases replies or lifts the
-  halt. Resend it until the reply is a plain `OK`.
-- **`ACK-POLICY` can answer `ERR ACK-POLICY not journaled: <cause>`**
-  when the switch cannot be journaled: the input ring stayed full for 2 s
-  (resend once the pipeline drains), the node stopped serving as primary,
-  another `ACK-POLICY` is still waiting, or the policy needs a replica on a
-  node without `--replication-bind`. Scripts driving the admin endpoint
-  must handle it. The info log "ack policy changed by operator" is
-  replaced by "ack policy change requested by operator" (or "staged"),
-  "ack policy change journaled" and "ack policy switched", the last when
-  the switch takes effect; update log-based alerts *(sequencer)*.
-- **Thread placement on hosts with isolated CPUs.** Every pipeline thread
-  with a core assignment is now created on its core, and one that does not
-  start within 10 s fails startup with an error naming it and its core.
-  Threads with no core of their own stay off isolated CPUs even when the
-  process was started on them (`taskset`, `numactl --cpunodebind`), unless
-  isolated CPUs are all it was given, and DPDK given no core list (`-l`)
-  sees only the housekeeping cores. Previously a thread could start on an
-  isolated core held by a real-time thread and never run. Review
-  `isolcpus` deployments that relied on the old placement *(sequencer)*.
+  halt. Resend it until the reply is a plain `OK`. Scripts driving the
+  admin endpoint must also handle the new `ERR ACK-POLICY not journaled:
+  <cause>` reply, which asks for a resend when the input ring stayed full.
 - **`--max-connections` must be between 1 and 8192**; `0`, which meant
   unlimited, is refused at startup. It also sizes the kernel-TCP
   transport's I/O rings, and a node that cannot create them refuses to
@@ -101,17 +78,6 @@ protocol error on the first degraded ack it receives.
 - **`melin-ec-replication-bench --ack-policy` is journaled** ahead of the
   generated events, as replicas now learn the policy from the journal, and
   the bench waits for every replica to stream live rather than to connect.
-
-### Fixed
-
-- **A runtime `ACK-POLICY` swap reaches replicas while orders flow**, so
-  auto-failover judges promotion by the policy actually in force
-  *(sequencer)*.
-- **A DPDK node no longer refuses a client that connects right behind
-  another**, and frees a client's slot as soon as the client closes
-  *(sequencer)*.
-- **A DPDK primary no longer skips a replication batch when a replica's
-  socket is full** *(sequencer)*.
 
 ## [0.19.0] - 2026-10-10
 
