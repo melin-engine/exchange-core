@@ -24,8 +24,9 @@ has the detail. Upgrading is a cluster-wide stop: the replication protocol
 and the snapshot format change, so stop the cluster, upgrade every node, and
 restart on the existing journals and snapshots. An older release refuses a
 journal or snapshot written by this one rather than misread it. Upgrade
-clients and gateways along with the nodes: one built on an earlier release
-cannot read the new degraded-ack frame.
+clients and gateways before the nodes: one built on this release works
+against an older node, while one built on an earlier release fails with a
+protocol error on the first degraded ack it receives.
 
 ### Added
 
@@ -65,6 +66,24 @@ cannot read the new degraded-ack frame.
   serves as primary, and an `ACK-POLICY disk` sent in between is only
   staged (`OK staged`), which no longer releases replies or lifts the
   halt. Resend it until the reply is a plain `OK`.
+- **`ACK-POLICY` can answer `ERR ACK-POLICY not journaled: <cause>`**
+  when the switch cannot be journaled: the input ring stayed full for 2 s
+  (resend once the pipeline drains), the node stopped serving as primary,
+  another `ACK-POLICY` is still waiting, or the policy needs a replica on a
+  node without `--replication-bind`. Scripts driving the admin endpoint
+  must handle it. The info log "ack policy changed by operator" is
+  replaced by "ack policy change requested by operator" (or "staged"),
+  "ack policy change journaled" and "ack policy switched", the last when
+  the switch takes effect; update log-based alerts *(sequencer)*.
+- **Thread placement on hosts with isolated CPUs.** Every pipeline thread
+  with a core assignment is now created on its core, and one that does not
+  start within 10 s fails startup with an error naming it and its core.
+  Threads with no core of their own stay off isolated CPUs even when the
+  process was started on them (`taskset`, `numactl --cpunodebind`), unless
+  isolated CPUs are all it was given, and DPDK given no core list (`-l`)
+  sees only the housekeeping cores. Previously a thread could start on an
+  isolated core held by a real-time thread and never run. Review
+  `isolcpus` deployments that relied on the old placement *(sequencer)*.
 - **`--max-connections` must be between 1 and 8192**; `0`, which meant
   unlimited, is refused at startup. It also sizes the kernel-TCP
   transport's I/O rings, and a node that cannot create them refuses to

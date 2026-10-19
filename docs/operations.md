@@ -166,19 +166,19 @@ When `--event-bind` is omitted, the output ring has a single consumer (the respo
 
 ### How it works
 
-The matching stage publishes to an output disruptor ring. Without `--event-bind`, the ring has one consumer (response stage). With it, the builder adds a second consumer for the event publisher thread:
+The matching stage publishes to an output disruptor ring. Without `--event-bind`, the ring has one consumer (response stage). With it, the builder adds a second consumer for the event publisher thread, chained behind the first:
 
 ```
 Matching Stage
     │
     │ ring::Producer::publish()
     ▼
-Output Disruptor Ring (1M slots, multi-consumer)
-    ├──► Consumer 0: Response Stage (per-client, gated on journal+repl cursors)
-    └──► Consumer 1: Event Publisher (TCP broadcast to all subscribers)
+Output Disruptor Ring (1M slots)
+    └──► Response Stage (per-client replies, released once the ack policy is met)
+             └──► Event Publisher (TCP broadcast to all subscribers)
 ```
 
-Both consumers are parallel. The producer is gated on the **slowest** consumer. In practice, the response stage (which waits for journal fsync) will always be the bottleneck — the event publisher does non-blocking writes with no durability gating, so it runs faster.
+The event publisher sees an event only after the response stage has released its reply, so subscribers never see an event before the client it answers does. The feed trails the replies by the time the publisher takes to read them, and stalls with them whenever replies are held, such as while a halted primary waits for a replica; heartbeats keep flowing meanwhile. The producer is gated on the publisher, which can only be as far along as the response stage.
 
 ### Subscriber protocol
 
@@ -193,7 +193,7 @@ After auth, the server sends a continuous stream of frames:
 - **ring_sequence**: Monotonically increasing output ring sequence. Subscribers can detect gaps (missed events) if their last-seen sequence jumps by more than 1.
 - **length + tag + body**: A standard response frame, the same as the per-client response frames. Tag `0x09` carries an exchange response in its body, decodable with the `melin-ec-protocol` crate's `codec::decode_response()`; any other tag is one of the node's own frames, such as a heartbeat or a batch end.
 
-Every event the matching stage produces appears on the event channel — fills, placements, cancellations, batch-end markers, stats snapshots, and engine errors. There is no filtering; subscribers receive the full firehose.
+Every event the matching stage produces appears on the event channel — fills, placements, cancellations, the batch-end markers that close each reply, stats snapshots, and engine errors. There is no filtering; subscribers receive the full firehose.
 
 ### Slow subscriber policy
 
