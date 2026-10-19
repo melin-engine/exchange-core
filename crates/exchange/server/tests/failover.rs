@@ -574,7 +574,8 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
 /// in between is only staged: journaled by the promotion, but never
 /// forced, so it neither releases held replies nor lifts the write halt.
 /// The playbook is to resend until the node answers a plain `OK`, which
-/// is what this does; any other answer fails the test.
+/// is what this does. A swap refused because the input ring stayed full
+/// is resent too, as the node asks; any other answer fails the test.
 fn set_ack_policy(addr: SocketAddr, operator_key: &SigningKey, policy: &str) {
     // `ACK-POLICY` since melin 0.15. The old `DURABILITY` verb still works
     // — it is kept for one release and maps the legacy policy names — but
@@ -584,13 +585,15 @@ fn set_ack_policy(addr: SocketAddr, operator_key: &SigningKey, policy: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let response = admin_command(addr, operator_key, &cmd);
-        match response.as_str() {
-            "OK" => return,
-            "OK staged" if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => panic!("set ack policy {policy} on {addr} failed: {response}"),
+        if response == "OK" {
+            return;
         }
+        let retry = response == "OK staged"
+            || response.starts_with("ERR ACK-POLICY not journaled: the input ring stayed full");
+        if !retry || Instant::now() >= deadline {
+            panic!("set ack policy {policy} on {addr} failed: {response}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
