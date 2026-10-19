@@ -1130,23 +1130,36 @@ fn submit_order(
     qty_val: u64,
 ) -> Vec<melin_ec_protocol::message::ResponseKind> {
     client
-        .send_request(&Request::SubmitOrder {
-            symbol: Symbol(symbol),
-            order: Order {
-                id: OrderId(id),
-                account: AccountId(account),
-                side,
-                order_type: OrderType::Limit {
-                    price: price(price_val),
-                    post_only: false,
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: qty(qty_val),
-                stp: melin_ec_protocol::types::SelfTradeProtection::Allow,
-                expiry_ns: 0,
-            },
-        })
+        .send_request(&limit_order(id, account, symbol, side, price_val, qty_val))
         .expect("submit order")
+}
+
+/// The GTC limit order [`submit_order`] sends, for a test that needs the
+/// reply's `Result` rather than a panic on anything but a full ack.
+fn limit_order(
+    id: u64,
+    account: u32,
+    symbol: u32,
+    side: Side,
+    price_val: u64,
+    qty_val: u64,
+) -> Request {
+    Request::SubmitOrder {
+        symbol: Symbol(symbol),
+        order: Order {
+            id: OrderId(id),
+            account: AccountId(account),
+            side,
+            order_type: OrderType::Limit {
+                price: price(price_val),
+                post_only: false,
+            },
+            time_in_force: TimeInForce::GTC,
+            quantity: qty(qty_val),
+            stp: melin_ec_protocol::types::SelfTradeProtection::Allow,
+            expiry_ns: 0,
+        },
+    }
 }
 
 fn has_report(
@@ -3894,6 +3907,163 @@ fn disk_ram_gate_stalls_while_replica_frozen() {
         )),
         "expected a normal Placed ack after thaw, got: {r:?}"
     );
+    submitter.join().expect("submitter thread panicked");
+}
+
+/// The reply to a write the halted primary holds: the client's verdict on
+/// it, as `send_request` returns it.
+type HeldReply =
+    Result<Vec<melin_ec_protocol::message::ResponseKind>, melin_ec_client::ClientError>;
+
+/// Hold a write at the primary's `disk+ram` gate, then take its only
+/// replica away for good: freezing the replica first keeps it counted as
+/// connected, so the write is accepted and journaled before the halt, and
+/// its reply is one the primary owes. Returns the halted cluster, the
+/// pending reply, and the thread waiting on it, which hands the client
+/// back once the reply (or the connection's end) arrives.
+fn hold_a_write_then_lose_the_replica(
+    extra_args: &[&str],
+) -> (
+    TestCluster,
+    std::sync::mpsc::Receiver<HeldReply>,
+    std::thread::JoinHandle<Client>,
+) {
+    let mut cluster = TestCluster::start_with_extra_args(extra_args);
+    let mut client = cluster.connect_primary();
+
+    let r = submit_order(&mut client, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(!r.is_empty(), "warm-up order got no response");
+    cluster.wait_replicated();
+
+    freeze_process(&cluster.replica.child);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let submitter = std::thread::spawn(move || {
+        let r = client.send_request(&limit_order(2, 1, 1, Side::Buy, 101, 10));
+        // Fails only if the test already panicked, and no longer wants it.
+        let _ = tx.send(r);
+        client
+    });
+    // A frozen replica still counts as connected: no halt, no grace
+    // period, so the write waits for the replica's ack.
+    match rx.recv_timeout(Duration::from_millis(500)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("the gate released a write while its replica was frozen: {other:?}"),
+    }
+
+    // SIGKILL ends a stopped process too; the primary sees its socket
+    // close and halts.
+    unsafe {
+        libc::kill(cluster.replica.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.replica.child.wait();
+    wait_halted(cluster.primary.health_addr, Duration::from_secs(5));
+    (cluster, rx, submitter)
+}
+
+/// Degraded acks end to end. Once a halted primary has had no replica for
+/// its grace period, the write it accepted before the halt is answered
+/// with a degraded batch end, which the client reports as
+/// `ClientError::Degraded` carrying the reply's reports, never as a full
+/// ack. A query sent after that goes the same way, and a client
+/// connecting then is not blocked by the halt; a write refused for the
+/// halt still ends in a plain batch end, and the node counts each
+/// degraded ack.
+#[test]
+#[serial]
+fn halted_primary_sends_degraded_acks_after_the_grace_period() {
+    use melin_ec_client::ClientError;
+    use melin_ec_protocol::message::ResponseKind;
+
+    // A short grace period keeps the test quick; the default is 2 s.
+    let (cluster, rx, submitter) =
+        hold_a_write_then_lose_the_replica(&["--degraded-ack-grace-ms", "200"]);
+
+    match rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("no reply to the held write after the grace period")
+    {
+        Err(ClientError::Degraded(responses)) => assert!(
+            has_report(&responses, |rep| matches!(
+                rep,
+                melin_ec_protocol::types::ExecutionReport::Placed {
+                    order_id: OrderId(2),
+                    ..
+                }
+            )),
+            "expected the held order's Placed in the degraded reply, got: {responses:?}"
+        ),
+        other => panic!("expected a degraded reply to the held write, got: {other:?}"),
+    }
+    let mut client = submitter.join().expect("submitter thread panicked");
+
+    // Degraded acks have begun: a query sent now is answered the same way.
+    // `QueryRequestSeq`, since the test keys are traders, and a request a
+    // key's role may not send is dropped unanswered.
+    match client.send_request(&Request::QueryRequestSeq) {
+        Err(ClientError::Degraded(responses)) => assert!(
+            matches!(responses[..], [ResponseKind::RequestSeqHwm { .. }]),
+            "expected the request-sequence mark in the degraded reply, got: {responses:?}"
+        ),
+        other => panic!("expected a degraded reply to a query while halted, got: {other:?}"),
+    }
+    // Connecting queries the same mark and takes a degraded answer as it
+    // is, so a client is not locked out of a halted node.
+    let mut late = connect_with_timeout(cluster.primary.client_addr, &cluster.key2);
+
+    // `submit_order` takes only a full ack: a refusal is never applied,
+    // so nothing about it is degraded.
+    let r = submit_order(&mut late, 3, 1, 1, Side::Buy, 102, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_ec_protocol::types::ExecutionReport::Rejected {
+                order_id: OrderId(3),
+                reason: melin_ec_protocol::types::RejectReason::ReplicaDisconnected,
+                ..
+            }
+        )),
+        "expected ReplicaDisconnected while halted, got: {r:?}"
+    );
+
+    // The held write, the query, and the late client's connect.
+    wait_metric(
+        cluster.primary.health_addr,
+        "melin_degraded_acks_total ",
+        Duration::from_secs(5),
+        "the degraded acks to be counted",
+        |v| v == 3,
+    );
+}
+
+/// `--no-degraded-acks` keeps the strict behaviour: the write the halted
+/// primary owes is never answered, however long the halt lasts, and only
+/// the node going down ends the client's wait.
+#[test]
+#[serial]
+fn no_degraded_acks_holds_replies_through_the_halt() {
+    use melin_ec_client::ClientError;
+
+    // The same short grace period as the degraded test, so a reply after
+    // it can only mean the flag was ignored.
+    let (cluster, rx, submitter) = hold_a_write_then_lose_the_replica(&[
+        "--degraded-ack-grace-ms",
+        "200",
+        "--no-degraded-acks",
+    ]);
+
+    match rx.recv_timeout(Duration::from_millis(1500)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("a reply left the halted primary under --no-degraded-acks: {other:?}"),
+    }
+
+    drop(cluster);
+    match rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the client did not notice the primary go down")
+    {
+        Err(ClientError::Disconnected | ClientError::Io(_)) => {}
+        other => panic!("expected the connection to end without a reply, got: {other:?}"),
+    }
     submitter.join().expect("submitter thread panicked");
 }
 
