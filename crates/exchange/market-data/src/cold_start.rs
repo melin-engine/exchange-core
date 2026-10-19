@@ -160,7 +160,7 @@ pub(crate) fn read_response(
         let (seq, frame) = read_frame(reader)?;
         match melin_client::classify(&frame)? {
             Reply::Response(body) => return Ok((seq, codec::decode_response_body(body)?)),
-            Reply::Heartbeat | Reply::BatchEnd | Reply::ServerBusy | Reply::EngineError => {}
+            Reply::Heartbeat | Reply::BatchEnd(_) | Reply::ServerBusy | Reply::EngineError => {}
         }
     }
 }

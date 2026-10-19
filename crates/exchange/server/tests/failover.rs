@@ -564,22 +564,34 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
     assert!(response == "OK", "promotion failed: {response}");
 }
 
-/// Send `ACK-POLICY <policy>` to a node's admin endpoint and assert it
-/// succeeds. Used by tests that drive runtime policy swaps (e.g. the
-/// promoted-replica-without-replicas case where `disk+ram` is
+/// Send `ACK-POLICY <policy>` to a node's admin endpoint until a serving
+/// primary journals it. Used by tests that drive runtime policy swaps
+/// (e.g. the promoted-replica-without-replicas case where `disk+ram` is
 /// structurally unsatisfiable and the operator must downgrade to `disk`
 /// for the gate to open).
+///
+/// `PROMOTE` answers before the node serves as primary, and a swap sent
+/// in between is only staged: journaled by the promotion, but never
+/// forced, so it neither releases held replies nor lifts the write halt.
+/// The playbook is to resend until the node answers a plain `OK`, which
+/// is what this does; any other answer fails the test.
 fn set_ack_policy(addr: SocketAddr, operator_key: &SigningKey, policy: &str) {
     // `ACK-POLICY` since melin 0.15. The old `DURABILITY` verb still works
     // — it is kept for one release and maps the legacy policy names — but
     // exercising the deprecated spelling here would mean these tests stop
     // covering the command operators are actually told to use.
     let cmd = format!("ACK-POLICY {policy}");
-    let response = admin_command(addr, operator_key, &cmd);
-    assert!(
-        response == "OK",
-        "set ack policy {policy} on {addr} failed: {response}"
-    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = admin_command(addr, operator_key, &cmd);
+        match response.as_str() {
+            "OK" => return,
+            "OK staged" if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => panic!("set ack policy {policy} on {addr} failed: {response}"),
+        }
+    }
 }
 
 struct ServerProcess {
@@ -1824,11 +1836,15 @@ fn wait_for_snapshot_through(journal: &Path, through: u64) -> (PathBuf, ServerAp
     loop {
         if snap_path.exists() {
             match melin_transport_core::snapshot::load::<ServerApp>(&snap_path) {
-                Ok((engine, seq, _, _)) if seq >= through => {
+                Ok((engine, header)) if header.sequence >= through => {
+                    let seq = header.sequence;
                     eprintln!("Snapshot at {} covers sequence {seq}", snap_path.display());
                     return (snap_path, engine);
                 }
-                Ok((_, seq, _, _)) => eprintln!("snapshot at sequence {seq} predates {through}"),
+                Ok((_, header)) => {
+                    let seq = header.sequence;
+                    eprintln!("snapshot at sequence {seq} predates {through}");
+                }
                 Err(e) => panic!("snapshot at {} unreadable: {e}", snap_path.display()),
             }
         }

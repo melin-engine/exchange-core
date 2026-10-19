@@ -18,6 +18,79 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+This release adopts sequencer 0.20.0; the [0.20.0 section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0200---2026-10-19)
+has the detail. Upgrading is a cluster-wide stop: the replication protocol
+and the snapshot format change, so stop the cluster, upgrade every node, and
+restart on the existing journals and snapshots. An older release refuses a
+journal or snapshot written by this one rather than misread it. Upgrade
+clients and gateways along with the nodes: one built on an earlier release
+cannot read the new degraded-ack frame.
+
+### Added
+
+- **Degraded acks.** A primary that has lost its last replica no longer
+  holds the replies it owes indefinitely: once the halt has lasted
+  `--degraded-ack-grace-ms` (2 s by default), each is sent as soon as the
+  primary's own disk holds it, ending in the new `BatchEndDegraded` frame
+  (tag `0x0A`). `--no-degraded-acks` keeps the previous behaviour, and
+  `melin_degraded_acks_total` counts them *(sequencer)*. See "Halt on
+  Replica Disconnect" in the operations guide.
+- **`ClientError::Degraded`** in `melin-ec-client`: `send_request`
+  reports a degraded reply as this error, carrying the reply's responses,
+  so it is never taken for a full acknowledgement. `query_stats` and
+  `synchronize_request_seq` take a degraded answer as it is. The admin and
+  TUI tools show a degraded reply's reports, flagged `DEGRADED ACK`.
+- **`melin_ack_policy_journaled` and `melin_ack_policy_in_force`** gauges
+  on `/metrics` *(sequencer)*.
+- **`--dpdk-client-rx-buf-kib`, `--dpdk-client-tx-buf-kib` and
+  `--dpdk-client-tx-queue-kib`** size a DPDK node's client connections;
+  the send buffer's default rises from 16 to 64 KiB and the queue's from
+  64 KiB to 8 MiB, so a fast client no longer drops on the first round-trip
+  hiccup *(sequencer)*.
+- **`degraded_acks` in the bench's outcomes**, printed and in its JSON: a
+  replicated run that counts any did not measure the policy it was set up
+  for.
+
+### Changed
+
+- **The ack policy is journaled** *(sequencer)*. `ACK-POLICY` replies `OK`
+  once the switch is journaled, which can be before it is in force; it
+  takes effect once the nodes the previous policy relied on hold it. A
+  primary starts under the policy its journal last recorded, and journals
+  its `--ack-policy` when that differs. `ACK-POLICY disk` sent while no
+  replica is connected takes effect at once and lifts the write halt. A
+  node without `--replication-bind` refuses a policy that needs a replica.
+  **Failover runbooks need a change:** `PROMOTE` answers before the node
+  serves as primary, and an `ACK-POLICY disk` sent in between is only
+  staged (`OK staged`), which no longer releases replies or lifts the
+  halt. Resend it until the reply is a plain `OK`.
+- **`--max-connections` must be between 1 and 8192**; `0`, which meant
+  unlimited, is refused at startup. It also sizes the kernel-TCP
+  transport's I/O rings, and a node that cannot create them refuses to
+  start, naming `RLIMIT_MEMLOCK` *(sequencer)*. A deployment passing
+  `--max-connections 0` must pick a cap.
+- **The event feed trails the replies.** It sees an event only once the
+  event holds the copies the ack policy demands, so a crash or failover
+  can no longer take back a trade subscribers had seen; the feed stalls
+  with the replies while the policy cannot be met *(sequencer)*.
+- **`melin_ec_client::ClientError` has a new variant**, `Degraded`.
+  Source-breaking for an exhaustive `match` on it.
+- **`melin-ec-replication-bench --ack-policy` is journaled** ahead of the
+  generated events, as replicas now learn the policy from the journal, and
+  the bench waits for every replica to stream live rather than to connect.
+
+### Fixed
+
+- **A runtime `ACK-POLICY` swap reaches replicas while orders flow**, so
+  auto-failover judges promotion by the policy actually in force
+  *(sequencer)*.
+- **A DPDK node no longer refuses a client that connects right behind
+  another**, and frees a client's slot as soon as the client closes
+  *(sequencer)*.
+- **A DPDK primary no longer skips a replication batch when a replica's
+  socket is full** *(sequencer)*.
+
 ## [0.19.0] - 2026-10-10
 
 This release adopts sequencer 0.19.0 and its application-defined client

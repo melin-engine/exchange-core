@@ -31,6 +31,12 @@ pub enum ClientError {
     /// batch has been read to its end, so the connection is still
     /// usable for the next request.
     EngineError,
+    /// The reply is backed by the primary's own disk alone, weaker than
+    /// the node's ack policy: a primary that lost its last replica sends
+    /// it once its degraded-ack grace period has passed. The responses
+    /// are the reply's, in order; the request is unconfirmed until the
+    /// cluster is whole again, and the connection is still usable.
+    Degraded(Vec<melin_ec_protocol::message::ResponseKind>),
 }
 
 impl std::fmt::Display for ClientError {
@@ -42,6 +48,11 @@ impl std::fmt::Display for ClientError {
             Self::AuthFailed => write!(f, "authentication failed"),
             Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
             Self::EngineError => write!(f, "engine error on the request, do not retry"),
+            Self::Degraded(_) => write!(
+                f,
+                "reply backed by the primary's disk alone, not the ack policy: \
+                 unconfirmed until the cluster is whole again"
+            ),
         }
     }
 }

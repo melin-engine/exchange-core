@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -37,9 +37,9 @@ use melin_app::auth::{AuthorizedKeys, NoRoles};
 use melin_app::unix_epoch_nanos;
 use melin_ec_server::exchange_app::ServerApp;
 use melin_ec_trading::trading_event::{TradingEvent, TradingRequest};
-use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
+use melin_journal::{AckPolicyByte, AckPolicyChange, JournalEvent};
 use melin_pipeline::wait::WaitStrategy;
 use melin_server_runtime::ack_policy::AckPolicy;
 use melin_server_runtime::replication::{
@@ -54,6 +54,7 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<
 use melin_ec_types::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::{StageWaits, build_pipeline_with_replication};
+use melin_transport_core::replica_presence::ReplicaPresence;
 use melin_transport_core::trace::mono_trace_ns;
 
 #[derive(Parser)]
@@ -74,10 +75,11 @@ struct Args {
     #[arg(long, default_value_t = melin_transport_core::ReplicaSlotCursors::SLOTS)]
     replicas: usize,
 
-    /// Ack policy advertised to replicas on `StreamStart` and every
-    /// heartbeat. This bench drains the output ring with a no-op instead of
-    /// running the response gate, so the policy does not throttle the
-    /// generator — it only sets what replicas judge auto-promotion against.
+    /// Ack policy journaled ahead of the generated events, as a primary
+    /// journals the one it requests on startup. This bench drains the
+    /// output ring with a no-op instead of running the response gate, so
+    /// the policy does not throttle the generator — it only sets what
+    /// replicas judge auto-promotion against.
     ///
     /// Renamed from `--durability` in melin 0.15, along with the variants:
     /// `hybrid` is now `disk+ram`. The guarantees are unchanged, so a
@@ -481,15 +483,24 @@ fn main() {
     .expect("set replication listener non-blocking");
     let metrics = Arc::new(ReplicationMetrics::default());
     let ready_flag = Arc::new(AtomicBool::new(false));
-    let connected_counter = Arc::new(AtomicU32::new(0));
-    let ack_policy_bits = Arc::new(std::sync::atomic::AtomicU8::new(ack_policy.as_u8()));
+    // The sender counts replicas into it; nothing here reads it, since
+    // the bench runs no halt gate and its count is the runtime's alone.
+    let presence = Arc::new(ReplicaPresence::new());
+    // Replicas streaming live, by slot: the sender sets a slot's flag as
+    // its replica leaves catch-up and clears it when the replica goes.
+    let active_flags = replication_ring_progress.active_flags.clone();
+    let streaming = || {
+        active_flags
+            .iter()
+            .filter(|f| f.load(Ordering::Acquire))
+            .count()
+    };
 
     let sender_config = Sender {
         listener,
         repl_consumer_1,
         repl_consumer_2,
         replica_slots: Arc::clone(&replica_slots),
-        ack_policy: Arc::clone(&ack_policy_bits),
         journal_path: primary_journal.clone(),
         authorized_keys: Arc::clone(&authorized_keys),
         evict_flags: replication_ring_progress.evict_flags.clone(),
@@ -506,13 +517,13 @@ fn main() {
 
     let s = Arc::clone(&repl_shutdown);
     let r = Arc::clone(&ready_flag);
-    let c = Arc::clone(&connected_counter);
+    let p = Arc::clone(&presence);
     let sender_core = primary_cores.repl_sender;
     let sender_handle = std::thread::Builder::new()
         .name("bench-repl-sender".into())
         .spawn(move || {
             pin("repl-sender", sender_core);
-            run_sender::<ServerApp>(sender_config, &s, &r, &c)
+            run_sender::<ServerApp>(sender_config, &s, &r, &p)
         })
         .expect("spawn run_sender");
 
@@ -587,15 +598,15 @@ fn main() {
         receiver_handles.push(handle);
     }
 
-    // Wait for every replica to connect — quorum is only meaningful once
-    // all slots are engaged, and starting the generator early would credit
-    // the warm-up to a smaller quorum.
+    // Wait for every replica to stream live — quorum is only meaningful
+    // once all slots are engaged, and starting the generator early would
+    // credit the warm-up to a smaller quorum.
     let connect_deadline = Instant::now() + Duration::from_secs(10);
-    while (connected_counter.load(Ordering::Acquire) as usize) < n_replicas {
+    while streaming() < n_replicas {
         if Instant::now() > connect_deadline {
             eprintln!(
-                "FATAL: only {}/{n_replicas} replicas connected within 10s",
-                connected_counter.load(Ordering::Acquire)
+                "FATAL: only {}/{n_replicas} replicas streaming within 10s",
+                streaming()
             );
             shutdown.store(true, Ordering::Release);
             repl_shutdown.store(true, Ordering::Release);
@@ -604,6 +615,17 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
     }
     eprintln!("{n_replicas} replica(s) connected, ack_policy={ack_policy:?}");
+
+    // The policy is journaled, as a primary journals the one it requests
+    // as it starts: replicas learn it from this entry, in order with the
+    // events it governs.
+    input_producer.publish(InputSlot::node_event(
+        JournalEvent::AckPolicyChange(AckPolicyChange {
+            policy: AckPolicyByte(ack_policy.as_u8()),
+            unwitnessed: false,
+        }),
+        unix_epoch_nanos(),
+    ));
 
     // Seed: register one account so subsequent Deposit events
     // succeed under any future App that validates them.
@@ -650,12 +672,12 @@ fn main() {
         // state ceiling; pacing keeps us at that ceiling.
         let lead_cap = (BATCH_SIZE * REPLICATION_RING_SIZE / 2) as u64;
         let cur = quorum();
-        // Watch the connection count, not the quorum cursor: `quorum_acked`
+        // Watch the streaming slots, not the quorum cursor: `quorum_acked`
         // is a min over *engaged* slots, so a replica dropping mid-run
         // silently degrades the quorum to the survivors rather than
         // surfacing a sentinel. Only an all-slots-disengaged run reads as
         // `None`, which would be indistinguishable from a slow start.
-        if (connected_counter.load(Ordering::Acquire) as usize) < n_replicas {
+        if streaming() < n_replicas {
             eprintln!("WARN: a replica disconnected mid-run — stopping");
             break 'outer;
         }

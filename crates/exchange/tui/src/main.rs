@@ -561,38 +561,44 @@ fn client_thread(
 
     while let Ok(request) = request_rx.recv() {
         let start = std::time::Instant::now();
-        match client.send_request(&request) {
-            Ok(responses) => {
-                let latency = start.elapsed();
-                for resp in &responses {
-                    let msg = match resp {
-                        ResponseKind::Report(report) => format_report(report),
-                        ResponseKind::StatsHeader { .. }
-                        | ResponseKind::BookSnapshotBegin { .. }
-                        | ResponseKind::BookSnapshotLevel { .. }
-                        | ResponseKind::BookSnapshotEnd { .. }
-                        | ResponseKind::SnapshotComplete { .. }
-                        | ResponseKind::PositionSnapshot { .. }
-                        | ResponseKind::RequestSeqHwm { .. } => continue,
-                    };
-                    let _ = response_tx.send(msg);
-                }
-                if responses.is_empty() {
-                    let _ = response_tx.send("(no reports)".into());
-                }
-                let _ = response_tx.send(format!("  ⏱ {latency:.3?}"));
-            }
+        // A degraded reply is shown like any other, then flagged: its
+        // reports happened, but only the primary's disk holds them yet.
+        let (responses, degraded) = match client.send_request(&request) {
+            Ok(responses) => (responses, false),
+            Err(ClientError::Degraded(responses)) => (responses, true),
             // The engine's verdict on one request, not a connection
             // failure: the next command goes through as usual.
             Err(ClientError::EngineError) => {
                 let _ = response_tx.send("ENGINE ERROR".into());
                 let _ = response_tx.send(format!("  ⏱ {:.3?}", start.elapsed()));
+                continue;
             }
             Err(e) => {
                 let _ = response_tx.send(format!("Request failed: {e}"));
                 break;
             }
+        };
+        let latency = start.elapsed();
+        for resp in &responses {
+            let msg = match resp {
+                ResponseKind::Report(report) => format_report(report),
+                ResponseKind::StatsHeader { .. }
+                | ResponseKind::BookSnapshotBegin { .. }
+                | ResponseKind::BookSnapshotLevel { .. }
+                | ResponseKind::BookSnapshotEnd { .. }
+                | ResponseKind::SnapshotComplete { .. }
+                | ResponseKind::PositionSnapshot { .. }
+                | ResponseKind::RequestSeqHwm { .. } => continue,
+            };
+            let _ = response_tx.send(msg);
         }
+        if responses.is_empty() {
+            let _ = response_tx.send("(no reports)".into());
+        }
+        if degraded {
+            let _ = response_tx.send("DEGRADED ACK: primary's disk only, no replica yet".into());
+        }
+        let _ = response_tx.send(format!("  ⏱ {latency:.3?}"));
     }
 }
 
