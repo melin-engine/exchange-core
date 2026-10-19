@@ -92,7 +92,10 @@ protocol error on the first degraded ack it receives.
 - **The event feed trails the replies.** It sees an event only once the
   event holds the copies the ack policy demands, so a crash or failover
   can no longer take back a trade subscribers had seen; the feed stalls
-  with the replies while the policy cannot be met *(sequencer)*.
+  with the replies while the policy cannot be met *(sequencer)*. The
+  exception is degraded acks: the events behind them reach the feed once
+  released, unmarked, as they reach FIX clients. A venue whose feed is
+  authoritative should run with `--no-degraded-acks`.
 - **`melin_ec_client::ClientError` has a new variant**, `Degraded`.
   Source-breaking for an exhaustive `match` on it.
 - **`melin-ec-replication-bench --ack-policy` is journaled** ahead of the
