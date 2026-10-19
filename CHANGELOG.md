@@ -96,6 +96,14 @@ protocol error on the first degraded ack it receives.
   location you want and set `--snapshot-path` to it; to restore a backup,
   copy it to the snapshot path *(sequencer)*.
 
+### Fixed
+
+- **A node whose state exceeds 256 MiB can take snapshots.** That was the
+  sequencer's limit, and an exchange of about 100,000 accounts (around
+  480 MB of state) failed every save, logged an error each interval, and
+  recovered by replaying its whole journal. The limit is now 1 TiB. A load
+  still reads the snapshot into memory whole *(sequencer)*.
+
 ## [0.19.0] - 2026-10-10
 
 This release adopts sequencer 0.19.0 and its application-defined client

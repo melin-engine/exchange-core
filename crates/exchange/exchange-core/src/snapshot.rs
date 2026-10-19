@@ -111,8 +111,8 @@ pub const PAYLOAD_VERSION: u16 = 19;
 pub fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
     let state = exchange.snapshot_state();
     // Exchange snapshots grow with account/order count; start with a
-    // generously sized buffer to minimise reallocations but avoid
-    // pre-reserving the 256 MiB cap.
+    // generously sized buffer to minimise reallocations rather than
+    // reserve anything near the sequencer's snapshot size cap.
     let mut buf = Vec::with_capacity(64 * 1024);
     encode_exchange_state(&state, &mut buf);
     buf
