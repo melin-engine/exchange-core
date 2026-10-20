@@ -190,9 +190,9 @@ After auth, the server sends a continuous stream of frames:
 ```
 
 - **ring_sequence**: Monotonically increasing output ring sequence. Subscribers can detect gaps (missed events) if their last-seen sequence jumps by more than 1.
-- **length + tag + body**: A standard response frame, the same as the per-client response frames. Tag `0x09` carries an exchange response in its body, decodable with the `melin-ec-protocol` crate's `codec::decode_response()`; any other tag is one of the node's own frames, such as a heartbeat or a batch end.
+- **length + tag + body**: A standard response frame, the same as the per-client response frames. Tag `0x09` carries an exchange response in its body, decodable with the `melin-ec-protocol` crate's `codec::decode_response()`; any other tag is one of the node's own frames, such as a heartbeat or a batch end. A batch end on the feed names no request: its request ID is always 0, since a request's ID belongs to the connection that sent it.
 
-Every event the matching stage produces appears on the event channel — fills, placements, cancellations, the batch-end markers that close each reply, stats snapshots, and engine errors. There is no filtering; subscribers receive the full firehose.
+Every event the matching stage produces appears on the event channel — fills, placements, cancellations, the batch-end markers that close each reply, and stats snapshots. There is no filtering; subscribers receive the full firehose. A request the node answers without applying it (shed while busy, refused, or refused while halted) produces no event, and its answer goes only to the client that sent it.
 
 ### Slow subscriber policy
 
@@ -686,6 +686,11 @@ melin_trading_active 1
 | `melin_input_queue_capacity` | gauge | Total input ring buffer capacity (constant 1,048,576) |
 | `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
 | `melin_writes_refused_total` | counter | Client writes rejected with `ReplicaDisconnected` while halted. A refused write is never journaled, so this counter is its only trace on the node |
+| `melin_requests_shed_total` | counter | Requests answered `ServerBusy` because the input ring was full, the requests buffered behind each one included. None was applied or journaled |
+| `melin_requests_refused_total{kind="..."}` | counter | Requests refused before the engine saw them: `kind="permission_denied"` for a key whose role may not send them, `kind="malformed"` for a body the exchange cannot decode |
+| `melin_requests_filtered_total` | counter | Requests answered with an empty batch and never published, such as client heartbeats |
+| `melin_connections_parked` | gauge | Connections the node has stopped reading because it had no room to queue an answer for them |
+| `melin_connection_parks_total` | counter | Times a connection was parked |
 | `melin_degraded_acks_total` | counter | Replies a halted primary sent as degraded acks, backed by its own disk alone (queries included). Any growth means clients were told of orders no replica is known to hold |
 | `melin_ack_policy_journaled` | gauge | The ack policy the newest journaled switch names, as its wire value (`0` `disk`, `1` `disk+ram`, `2` `two-disks`, `3` `ram`) |
 | `melin_ack_policy_in_force` | gauge | The ack policy replies are held to, as the same wire value. Differs from `melin_ack_policy_journaled` while a switch waits for the nodes the previous policy relied on |
@@ -695,6 +700,8 @@ melin_trading_active 1
 | `melin_replica_divergence_total` | counter | Divergent replica handshakes on this primary (journal chain failed validation; replica routed through archive + re-seed). Alert on any growth — outside an expected failover rejoin it indicates possible data corruption |
 
 `melin_journal_rotations_total{path="sync_fallback"}` should stay flat in steady state — the first rotation after startup may take the synchronous path while the background staging warms up, but sustained growth means rotation stalls are landing on the order pipeline's critical path and is worth an alert. Any growth in `path="failed"` is alert-worthy on every configuration: rotation is failing (disk full, read-only filesystem) and the live segment keeps growing past its threshold. On a replica, a rotation that fails at a primary-announced boundary stalls the journal stage *at* that boundary and retries on the same backoff — the replica stops acking until the rotation succeeds (under `disk+ram`/`two-disks` gating the primary feels that as ack backpressure), but it does not exit and recovers without intervention once the disk condition clears.
+
+`melin_requests_shed_total` growing means clients send faster than the engine drains its input ring; each shed request was answered `ServerBusy` and is for the client to resend. `melin_requests_refused_total{kind="permission_denied"}` growing usually means a client authenticates with a key of the wrong role, such as a FIX gateway session whose key is not a `trader`. A parked connection resumes on its own once the node has room to answer it again; one parked for over a second is degraded operation, which the node logs at `warn` at most once a second while any stays parked.
 
 Use `rate(melin_stage_busy_total) / (rate(melin_stage_busy_total) + rate(melin_stage_idle_total))` for per-stage utilization percentage. The matching stage counts events (not batches), so its utilization is directly proportional to throughput.
 
@@ -722,7 +729,7 @@ With `--no-degraded-acks`, a halted node holds every such reply until a replica 
 
 This preserves the durability guarantee: the engine never sends a full acknowledgement for a response that isn't held as the ack policy requires, and every acknowledgement to a client connection that falls short of it is marked (the FIX gateway and the event feed carry no mark, as above). Without the halt, a primary crash after replica disconnect could lose acked events.
 
-A refused request is turned away before it is journaled: it has no effect on the book or on balances, now or after a restart, a failover or a replica catch-up. It also consumes nothing, so a client may resend it with the same request sequence once trading resumes. Refusals are counted in `melin_writes_refused_total`.
+A refused request is turned away before it is journaled: it has no effect on the book or on balances, now or after a restart, a failover or a replica catch-up. It also consumes nothing, so a client may resend it with the same request sequence once trading resumes. The refusal is answered at once, even while the node holds the reply to a write the same client sent before it. Refusals are counted in `melin_writes_refused_total`.
 
 A primary superseded by a newer one (after a failover) behaves differently: it is shutting down, so it closes client connections instead of rejecting requests. Clients reconnect and land on the new primary, as they would after a crash.
 

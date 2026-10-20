@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use melin_client::framing::FrameDecoder;
-use melin_client::{Handshake, MAX_FRAME_SIZE, Reply, Step};
+use melin_client::{Handshake, InFlight, MAX_FRAME_SIZE, RefusalKind, Reply, RequestId, Step};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
-use melin_ec_types::types::{AccountId, OrderId, Side};
+use melin_ec_types::types::{AccountBalance, AccountId, OrderId, Side};
+use melin_wire_protocol::error::ProtocolError;
 
 use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
@@ -54,6 +55,50 @@ struct PendingCancel {
     cancel_clord_id: String,
     /// True for cancel-replace (35=G), false for cancel (35=F).
     is_replace: bool,
+}
+
+/// What a request in flight to the node stands for, kept until the
+/// answer naming it: what the session tells the FIX client if the node
+/// turns the request away, and which RequestForPositions a position
+/// answers.
+#[derive(Debug)]
+enum InFlightRequest {
+    /// The `QueryRequestSeq` that syncs `melin_seq` at Logon.
+    SyncRequestSeq,
+    /// A NewOrderSingle's order.
+    Order { order_id: OrderId },
+    /// An OrderCancelRequest or OrderCancelReplaceRequest, on the order
+    /// `pending_cancels` holds it under.
+    Cancel { order_id: OrderId },
+    /// A RequestForPositions.
+    Position { pos_req_id: String },
+    /// Any other request: nothing to answer on FIX but a session reject.
+    Other,
+}
+
+/// Why the node turned a request away without applying it.
+enum TurnedAway<'a> {
+    /// Shed under load: the request may be resent.
+    Busy,
+    /// Refused, with the node's kind and reason.
+    Refused { kind: RefusalKind, reason: &'a str },
+}
+
+impl TurnedAway<'_> {
+    /// The FIX Text of the rejection.
+    fn text(&self) -> &str {
+        match self {
+            Self::Busy => "exchange busy, not applied: resend",
+            Self::Refused { reason, .. } => reason,
+        }
+    }
+}
+
+/// A position the node answered with, held until the end of its reply
+/// names the request it answers.
+struct HeldPosition {
+    balances: [AccountBalance; 16],
+    count: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +173,17 @@ pub struct Session {
     pub melin_inflight: Vec<u8>,
     /// Melin request sequence number (per-key monotonic).
     melin_seq: u64,
+    /// The ID of the last request sent to the node, numbered from 1 on
+    /// each connection. Apart from `melin_seq`, which the Logon sync
+    /// moves: an ID must not repeat while its request is in flight.
+    melin_last_id: u64,
+    /// The requests sent to the node and not yet answered, by ID: an
+    /// answer names its request, and one the node turned away may arrive
+    /// ahead of answers to requests sent before it. The sequencer's
+    /// lookup, built for IDs allocated in increasing order.
+    in_flight: InFlight<InFlightRequest>,
+    /// A position answered in a reply whose end has not arrived yet.
+    held_position: Option<HeldPosition>,
     /// Reusable encode buffer for Melin requests. 128 bytes is the
     /// upper bound (set by ChallengeResponse: 4 prefix + 8 seq + 1
     /// tag + 64 sig + 32 pubkey + slack).
@@ -163,10 +219,6 @@ pub struct Session {
     /// Tracks pending cancel/replace requests by original order ID.
     /// Used to distinguish OrderCancelReject from ExecutionReport on rejection.
     pending_cancels: HashMap<OrderId, PendingCancel>,
-    /// FIFO queue of pending QueryPosition PosReqIDs. Responses arrive in
-    /// request order (single melin connection per session), so the oldest
-    /// entry matches the next PositionSnapshot. VecDeque for O(1) push/pop.
-    pending_positions: VecDeque<String>,
     account_id: AccountId,
     /// Index into config.sessions for this FIX session.
     session_config_idx: Option<usize>,
@@ -224,6 +276,9 @@ impl Session {
             melin_send_buf: Vec::with_capacity(256),
             melin_inflight: Vec::with_capacity(256),
             melin_seq: 0,
+            melin_last_id: 0,
+            in_flight: InFlight::new(),
+            held_position: None,
             melin_encode_buf: [0u8; 128],
             melin_multishot_active: false,
 
@@ -232,7 +287,6 @@ impl Session {
             id_map: ClOrdIdMap::new(),
             order_symbols: HashMap::new(),
             pending_cancels: HashMap::new(),
-            pending_positions: VecDeque::new(),
             account_id: AccountId(0),
             session_config_idx: None,
             exec_id: 1,
@@ -432,14 +486,17 @@ impl Session {
             SessionState::AwaitingChallenge | SessionState::AwaitingAuthResult => {
                 self.handle_handshake_frame(payload, config)
             }
-            SessionState::SyncingRequestSeq => match self.melin_response(payload) {
-                Some(response) => self.handle_request_seq_sync(response, config),
-                None => SessionAction::None,
-            },
-            SessionState::Active => match self.melin_response(payload) {
-                Some(response) => self.handle_active_melin(response, config, symbol_map),
-                None => SessionAction::None,
-            },
+            SessionState::SyncingRequestSeq | SessionState::Active => {
+                match melin_client::classify(payload) {
+                    Ok(reply) => self.handle_melin_reply(reply, config, symbol_map),
+                    // A bad frame from the engine must not take the
+                    // session down: dropped.
+                    Err(e) => {
+                        warn!(error = %e, "malformed Melin frame");
+                        SessionAction::None
+                    }
+                }
+            }
             _ => {
                 debug!(state = ?self.state, "Melin frame in unexpected state");
                 SessionAction::None
@@ -447,33 +504,206 @@ impl Session {
         })
     }
 
-    /// Tell a Melin frame past the handshake apart, the way the
-    /// sequencer's client does: an application response is handed
-    /// back for the exchange codec, everything else is dealt with here.
-    /// A heartbeat and a `BatchEnd` carry nothing the session tracks; a
-    /// busy node and an engine error are logged; a malformed frame is
-    /// dropped, since a bad frame from the engine must not take the
-    /// session down. A degraded `BatchEnd` (the reply backed by the
-    /// primary's disk alone) is no different here: the reports before it
-    /// have already gone out as FIX messages, which have no way to mark
-    /// them, and the node itself warns and counts while it acks degraded.
-    fn melin_response<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
-        match melin_client::classify(payload) {
-            Ok(Reply::Response(body)) => Some(body),
-            Ok(Reply::Heartbeat | Reply::BatchEnd(_)) => None,
-            Ok(Reply::ServerBusy) => {
-                warn!(sender = %self.sender_comp_id, "Melin server busy");
-                None
-            }
-            Ok(Reply::EngineError) => {
-                error!(sender = %self.sender_comp_id, "Melin engine error");
-                None
-            }
-            Err(e) => {
-                warn!(error = %e, "malformed Melin frame");
-                None
+    /// Act on a Melin frame past the handshake, as the sequencer's client
+    /// tells it apart: an application response goes to the exchange codec;
+    /// a heartbeat carries nothing; the frame that ends an answer names
+    /// its request, which leaves flight. A degraded `BatchEnd` (the reply
+    /// backed by the primary's disk alone) is no different here: the
+    /// reports before it have already gone out as FIX messages, which
+    /// have no way to mark them, and the node itself warns and counts
+    /// while it acks degraded.
+    fn handle_melin_reply(
+        &mut self,
+        reply: Reply<'_>,
+        config: &GatewayConfig,
+        symbol_map: &HashMap<String, SymbolConfig>,
+    ) -> SessionAction {
+        match reply {
+            Reply::Response(body) => match self.state {
+                SessionState::SyncingRequestSeq => self.handle_request_seq_sync(body, config),
+                _ => self.handle_active_melin(body, config, symbol_map),
+            },
+            Reply::Heartbeat => SessionAction::None,
+            Reply::BatchEnd { id, .. } => self.handle_batch_end(id, config),
+            Reply::ServerBusy { id } => self.handle_turned_away(id, TurnedAway::Busy, config),
+            Reply::Refused { id, kind, reason } => {
+                self.handle_turned_away(id, TurnedAway::Refused { kind, reason }, config)
             }
         }
+    }
+
+    /// The end of a reply: its request leaves flight, and a position
+    /// held for it goes out as the PositionReport its RequestForPositions
+    /// asked for.
+    fn handle_batch_end(&mut self, id: RequestId, config: &GatewayConfig) -> SessionAction {
+        let held = self.held_position.take();
+        match (self.in_flight.remove(id), held) {
+            (Some(InFlightRequest::Position { pos_req_id }), Some(held)) => {
+                self.queue_position_report(&pos_req_id, &held, config);
+                SessionAction::SendFix
+            }
+            (Some(InFlightRequest::Position { pos_req_id }), None) => {
+                warn!(sender = %self.sender_comp_id, pos_req_id, "position query answered without a position");
+                SessionAction::None
+            }
+            (Some(_), Some(_)) => {
+                warn!(sender = %self.sender_comp_id, id = id.0, "position in the reply to another request");
+                SessionAction::None
+            }
+            (Some(_), None) => SessionAction::None,
+            (None, _) => {
+                warn!(sender = %self.sender_comp_id, id = id.0, "Melin reply for no request in flight");
+                SessionAction::None
+            }
+        }
+    }
+
+    /// A request the node turned away without applying it: the FIX
+    /// client hears of it the way it hears of the engine rejecting the
+    /// message it sent, so nothing it sent goes unanswered. Each request
+    /// shed behind a busy one is answered busy too, so a burst shed under
+    /// load is rejected message by message.
+    fn handle_turned_away(
+        &mut self,
+        id: RequestId,
+        why: TurnedAway<'_>,
+        config: &GatewayConfig,
+    ) -> SessionAction {
+        let Some(request) = self.in_flight.remove(id) else {
+            warn!(sender = %self.sender_comp_id, id = id.0, "Melin answer for no request in flight");
+            return SessionAction::None;
+        };
+        match &why {
+            TurnedAway::Busy => warn!(sender = %self.sender_comp_id, "Melin server busy"),
+            // The node refuses what the gateway's key may not send, or
+            // what it cannot decode: a misconfigured key, or a gateway
+            // bug, either way the operator's to see.
+            TurnedAway::Refused { kind, reason } => {
+                warn!(sender = %self.sender_comp_id, ?kind, reason, "Melin refused a request")
+            }
+        }
+        let text = why.text();
+
+        match request {
+            InFlightRequest::SyncRequestSeq => match why {
+                // A query, safe to resend: nothing else is in flight
+                // before the Logon is acknowledged.
+                TurnedAway::Busy => self.queue_request_seq_sync(config),
+                TurnedAway::Refused { .. } => {
+                    self.queue_fix_logout(config, "not permitted");
+                    SessionAction::Close
+                }
+            },
+            InFlightRequest::Order { order_id } => {
+                let OrderSymbolView {
+                    fix_symbol,
+                    tick_inverse,
+                    lot_inverse,
+                    side,
+                } = sym_info_or_default(self.order_symbols.get(&order_id));
+                let ctx = translate::FixCtx {
+                    id_map: &self.id_map,
+                    symbol_str: fix_symbol,
+                    tick_inverse,
+                    lot_inverse,
+                    sender: &config.target_comp_id,
+                    target: &self.sender_comp_id,
+                };
+                let msg = translate::order_reject_to_fix(
+                    order_id,
+                    &ctx,
+                    side,
+                    text,
+                    self.fix_outbound_seq,
+                    self.exec_id,
+                );
+                self.queue_fix_raw(&msg);
+                self.exec_id += 1;
+                SessionAction::SendFix
+            }
+            InFlightRequest::Cancel { order_id } => {
+                let Some(pending) = self.pending_cancels.remove(&order_id) else {
+                    self.queue_fix_reject(config, text);
+                    return SessionAction::SendFix;
+                };
+                let reject = translate::CancelReject {
+                    order_id,
+                    cancel_clord_id: &pending.cancel_clord_id,
+                    orig_clord_id: self.id_map.get_clord_id(order_id).unwrap_or("UNKNOWN"),
+                    is_replace: pending.is_replace,
+                };
+                let msg = reject.to_fix(
+                    "99",
+                    text,
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                );
+                self.queue_fix_raw(&msg);
+                SessionAction::SendFix
+            }
+            InFlightRequest::Position { pos_req_id } => {
+                // PosReqResult: 3 = not authorized, 99 = other.
+                let result = match why {
+                    TurnedAway::Refused {
+                        kind: RefusalKind::PermissionDenied,
+                        ..
+                    } => "3",
+                    _ => "99",
+                };
+                let msg = translate::position_reject_to_fix(
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                    &pos_req_id,
+                    &self.account_id.0.to_string(),
+                    result,
+                    text,
+                );
+                self.queue_fix_raw(&msg);
+                SessionAction::SendFix
+            }
+            InFlightRequest::Other => {
+                self.queue_fix_reject(config, text);
+                SessionAction::SendFix
+            }
+        }
+    }
+
+    /// Frame `request` for the node under the next request ID, and keep
+    /// it in flight as `in_flight` until the answer naming it arrives.
+    fn queue_melin_request(
+        &mut self,
+        request: &Request,
+        seq: u64,
+        in_flight: InFlightRequest,
+    ) -> Result<(), ProtocolError> {
+        let id = RequestId(self.melin_last_id + 1);
+        let written = codec::encode_request(request, id, seq, &mut self.melin_encode_buf)?;
+        self.melin_send_buf
+            .extend_from_slice(&self.melin_encode_buf[..written]);
+        self.melin_last_id = id.0;
+        self.in_flight.insert(id, in_flight);
+        Ok(())
+    }
+
+    /// Queue the `QueryRequestSeq` that syncs `melin_seq`, and wait in
+    /// `SyncingRequestSeq` for its answer. The engine treats queries as
+    /// dedup-exempt, so the seq it goes with doesn't matter (it gets
+    /// reset from the response).
+    fn queue_request_seq_sync(&mut self, config: &GatewayConfig) -> SessionAction {
+        self.melin_seq += 1;
+        if let Err(e) = self.queue_melin_request(
+            &Request::QueryRequestSeq,
+            self.melin_seq,
+            InFlightRequest::SyncRequestSeq,
+        ) {
+            error!(error = %e, "failed to encode QueryRequestSeq");
+            self.queue_fix_logout(config, "internal error");
+            return SessionAction::Close;
+        }
+        self.state = SessionState::SyncingRequestSeq;
+        SessionAction::SendMelin
     }
 
     /// Feed one frame to the Melin handshake, in either of its states:
@@ -499,34 +729,14 @@ impl Session {
                     "Melin authentication succeeded"
                 );
 
-                // Defer the FIX Logon ack until we've learned the
-                // engine's request_seq HWM for this key — see
-                // SessionState::SyncingRequestSeq for the rationale.
-                // Queue QueryRequestSeq immediately; the engine treats
-                // queries as dedup-exempt so the seq we send it with
-                // doesn't matter (it gets reset from the response).
-                self.melin_seq += 1;
-                let written = match codec::encode_request(
-                    &Request::QueryRequestSeq,
-                    self.melin_seq,
-                    &mut self.melin_encode_buf,
-                ) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!(error = %e, "failed to encode QueryRequestSeq");
-                        self.queue_fix_logout(config, "internal error");
-                        return SessionAction::Close;
-                    }
-                };
-                self.melin_send_buf
-                    .extend_from_slice(&self.melin_encode_buf[..written]);
-
                 // The handshake is over; dropping it drops what was
                 // left of the auth state.
                 self.handshake = None;
 
-                self.state = SessionState::SyncingRequestSeq;
-                SessionAction::SendMelin
+                // Defer the FIX Logon ack until we've learned the
+                // engine's request_seq HWM for this key — see
+                // SessionState::SyncingRequestSeq for the rationale.
+                self.queue_request_seq_sync(config)
             }
             Err(melin_client::Error::AuthFailed { .. }) => {
                 warn!(sender = %self.sender_comp_id, "Melin authentication failed");
@@ -816,13 +1026,19 @@ impl Session {
                     }
                 }
 
-                self.melin_seq += 1;
-                match codec::encode_request(&req, self.melin_seq, &mut self.melin_encode_buf) {
-                    Ok(written) => {
-                        self.melin_send_buf
-                            .extend_from_slice(&self.melin_encode_buf[..written]);
-                        SessionAction::SendMelin
+                let in_flight = match &req {
+                    Request::SubmitOrder { order, .. } => {
+                        InFlightRequest::Order { order_id: order.id }
                     }
+                    Request::CancelOrder { order_id, .. }
+                    | Request::CancelReplace { order_id, .. } => InFlightRequest::Cancel {
+                        order_id: *order_id,
+                    },
+                    _ => InFlightRequest::Other,
+                };
+                self.melin_seq += 1;
+                match self.queue_melin_request(&req, self.melin_seq, in_flight) {
+                    Ok(()) => SessionAction::SendMelin,
                     Err(e) => {
                         error!(error = %e, "failed to encode Melin request");
                         self.queue_fix_reject(config, "internal error");
@@ -1053,46 +1269,59 @@ impl Session {
                     }
                 }
             }
+            // Responses carry no request ID: which RequestForPositions
+            // this answers is known at the end of its reply, which names
+            // the request. Held until then.
             ResponseKind::PositionSnapshot {
                 account: _,
                 balances,
                 count,
             } => {
-                let pos_req_id = self
-                    .pending_positions
-                    .pop_front()
-                    .unwrap_or_else(|| "UNKNOWN".to_owned());
-
-                // Look up currency names from the session config index.
-                let session_account_str = self.account_id.0.to_string();
-                // Cap count to array length defensively — the codec already
-                // validates count ≤ 16, but we don't trust wire data here.
-                let n = std::cmp::min(count as usize, balances.len());
-                let bal_entries: Vec<translate::BalanceEntry> = balances[..n]
-                    .iter()
-                    .map(|b| translate::BalanceEntry {
-                        currency: b.currency.0.to_string(),
-                        free: b.free,
-                        reserved: b.reserved,
-                    })
-                    .collect();
-
-                let msg = translate::position_report_to_fix(
-                    &config.target_comp_id,
-                    &self.sender_comp_id,
-                    self.fix_outbound_seq,
-                    &pos_req_id,
-                    &session_account_str,
-                    &bal_entries,
-                );
-                self.queue_fix_raw(&msg);
-                SessionAction::SendFix
+                if self
+                    .held_position
+                    .replace(HeldPosition { balances, count })
+                    .is_some()
+                {
+                    warn!(sender = %self.sender_comp_id, "two positions in one Melin reply");
+                }
+                SessionAction::None
             }
             _ => {
                 warn!(?response, "unexpected Melin response type");
                 SessionAction::None
             }
         }
+    }
+
+    /// The PositionReport answering RequestForPositions `pos_req_id`.
+    fn queue_position_report(
+        &mut self,
+        pos_req_id: &str,
+        held: &HeldPosition,
+        config: &GatewayConfig,
+    ) {
+        let session_account_str = self.account_id.0.to_string();
+        // Cap count to array length defensively — the codec already
+        // validates count ≤ 16, but we don't trust wire data here.
+        let n = std::cmp::min(held.count as usize, held.balances.len());
+        let bal_entries: Vec<translate::BalanceEntry> = held.balances[..n]
+            .iter()
+            .map(|b| translate::BalanceEntry {
+                currency: b.currency.0.to_string(),
+                free: b.free,
+                reserved: b.reserved,
+            })
+            .collect();
+
+        let msg = translate::position_report_to_fix(
+            &config.target_comp_id,
+            &self.sender_comp_id,
+            self.fix_outbound_seq,
+            pos_req_id,
+            &session_account_str,
+            &bal_entries,
+        );
+        self.queue_fix_raw(&msg);
     }
 
     // -----------------------------------------------------------------------
@@ -1344,12 +1573,12 @@ impl Session {
         };
         let melin_seq = self.melin_seq;
         self.melin_seq += 1;
-        let written = codec::encode_request(&request, melin_seq, &mut self.melin_encode_buf)
-            .expect("QueryPosition encodes within 136 bytes");
-        self.melin_send_buf
-            .extend_from_slice(&self.melin_encode_buf[..written]);
-
-        self.pending_positions.push_back(pos_req_id);
+        self.queue_melin_request(
+            &request,
+            melin_seq,
+            InFlightRequest::Position { pos_req_id },
+        )
+        .expect("QueryPosition encodes within 128 bytes");
         SessionAction::SendMelin
     }
 
@@ -2098,10 +2327,14 @@ lot_size_inverse = 1
         // FIX Logon ack is NOT sent yet — the client must wait until
         // we've seeded melin_seq from the engine's HWM.
         assert!(s.fix_send_buf.is_empty());
-        // QueryRequestSeq was queued for the engine.
-        let melin_payload = &s.melin_send_buf[4..]; // strip length prefix
-        let (_seq, req) = codec::decode_request(melin_payload).unwrap();
-        assert!(matches!(req, Request::QueryRequestSeq));
+        // QueryRequestSeq was queued for the engine, as the connection's
+        // first request, and is in flight.
+        let sent = take_melin_requests(&mut s);
+        assert!(matches!(
+            sent[..],
+            [(RequestId(1), Request::QueryRequestSeq)]
+        ));
+        assert!(s.in_flight.contains(RequestId(1)));
     }
 
     #[test]
@@ -2136,29 +2369,81 @@ lot_size_inverse = 1
         s.melin_decoder.push(payload);
     }
 
+    /// The requests the session queued for the node, with their IDs,
+    /// taken off its send buffer.
+    fn take_melin_requests(s: &mut Session) -> Vec<(RequestId, Request)> {
+        let mut sent = Vec::new();
+        let mut rest = &s.melin_send_buf[..];
+        while !rest.is_empty() {
+            let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let (id, _seq, request) = codec::decode_request(&rest[4..4 + len]).unwrap();
+            sent.push((id, request));
+            rest = &rest[4 + len..];
+        }
+        s.melin_send_buf.clear();
+        sent
+    }
+
+    /// Process every frame queued for the dispatcher.
+    fn drain_melin(s: &mut Session, config: &GatewayConfig) {
+        let sym = symbol_map(config);
+        while s
+            .try_process_melin_frame(config, &sym, Instant::now())
+            .is_some()
+        {}
+    }
+
+    /// The FIX messages the session queued for the client, taken off its
+    /// send buffer.
+    fn take_fix(s: &mut Session) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rest = &s.fix_send_buf[..];
+        while !rest.is_empty() {
+            // A message ends with its checksum field, `10=xxx\x01`.
+            let end = rest
+                .windows(4)
+                .position(|w| w == b"\x0110=")
+                .map(|at| at + 8)
+                .unwrap();
+            out.push(rest[..end].to_vec());
+            rest = &rest[end..];
+        }
+        s.fix_send_buf.clear();
+        out
+    }
+
+    /// Build a RequestForPositions.
+    fn positions_msg(sender: &str, target: &str, seq: u64, pos_req_id: &str) -> Vec<u8> {
+        FixMessageBuilder::new(tags::MSG_REQUEST_FOR_POSITIONS)
+            .str_tag(tags::POS_REQ_ID, pos_req_id)
+            .str_tag(tags::POS_REQ_TYPE, "0")
+            .build(sender, target, seq)
+    }
+
     #[test]
-    fn transport_frames_keep_the_session_parked_until_the_hwm_arrives() {
-        // The node heartbeats a quiet connection, and the query's batch
-        // ends after its one response. Neither is the response: the
-        // session stays in SyncingRequestSeq, without a word to the FIX
-        // client, until the HWM arrives.
+    fn a_heartbeat_keeps_the_session_parked_until_the_hwm_arrives() {
+        // The node heartbeats a quiet connection: not the response, so
+        // the session stays in SyncingRequestSeq, without a word to the
+        // FIX client, until the HWM arrives. The query's batch end
+        // behind it takes the query out of flight.
         let config = make_config("FIRM_A", "MELIN");
         let sym = symbol_map(&config);
         let mut s = new_session(Instant::now());
-        s.state = SessionState::SyncingRequestSeq;
         s.sender_comp_id = "FIRM_A".to_owned();
         s.heartbeat_interval = Duration::from_secs(30);
         s.fix_outbound_seq = 1;
+        assert_eq!(s.queue_request_seq_sync(&config), SessionAction::SendMelin);
+        let [(id, _)] = take_melin_requests(&mut s)[..] else {
+            panic!("one request");
+        };
 
-        for transport in [TransportResponse::Heartbeat, TransportResponse::BatchEnd] {
-            push_melin_frame(&mut s, &transport_payload(&transport));
-            let action = s
-                .try_process_melin_frame(&config, &sym, Instant::now())
-                .expect("a whole frame");
-            assert_eq!(action, SessionAction::None, "{transport:?}");
-            assert!(matches!(s.state, SessionState::SyncingRequestSeq));
-            assert!(s.fix_send_buf.is_empty());
-        }
+        push_melin_frame(&mut s, &transport_payload(&TransportResponse::Heartbeat));
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
+        assert_eq!(action, SessionAction::None);
+        assert!(matches!(s.state, SessionState::SyncingRequestSeq));
+        assert!(s.fix_send_buf.is_empty());
 
         push_melin_frame(
             &mut s,
@@ -2170,23 +2455,56 @@ lot_size_inverse = 1
         assert_eq!(action, SessionAction::SendFix);
         assert!(matches!(s.state, SessionState::Active));
         assert_eq!(s.melin_seq, 5);
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::BatchEnd { id }),
+        );
+        drain_melin(&mut s, &config);
+        assert!(s.in_flight.is_empty());
+    }
+
+    /// A busy answer to the Logon sync's query is resent: nothing else is
+    /// in flight, and the FIX client still waits for its Logon ack.
+    #[test]
+    fn a_busy_sync_query_is_resent_under_a_new_id() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = new_session(Instant::now());
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.queue_request_seq_sync(&config);
+        let [(first, _)] = take_melin_requests(&mut s)[..] else {
+            panic!("one request");
+        };
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::ServerBusy { id: first }),
+        );
+        drain_melin(&mut s, &config);
+
+        let resent = take_melin_requests(&mut s);
+        assert!(
+            matches!(resent[..], [(id, Request::QueryRequestSeq)] if id != first),
+            "{resent:?}"
+        );
+        assert!(matches!(s.state, SessionState::SyncingRequestSeq));
+        assert!(s.fix_send_buf.is_empty());
     }
 
     #[test]
     fn transport_frames_are_dropped_while_active() {
-        // Heartbeats, batch ends, a busy node, an engine error, and a
-        // frame no reply carries (the handshake's ServerReady, over
-        // long ago) are the transport's business: none produces FIX
-        // traffic or moves the session.
+        // Heartbeats, answers naming no request in flight, and a frame no
+        // reply carries (the handshake's ServerReady, over long ago) are
+        // the transport's business: none produces FIX traffic or moves
+        // the session.
         let config = make_config("FIRM_A", "MELIN");
         let sym = symbol_map(&config);
         let mut s = active_session(&config, Instant::now());
 
         for transport in [
             TransportResponse::Heartbeat,
-            TransportResponse::BatchEnd,
-            TransportResponse::ServerBusy,
-            TransportResponse::EngineError,
+            TransportResponse::BatchEnd { id: RequestId(9) },
+            TransportResponse::ServerBusy { id: RequestId(9) },
             TransportResponse::ServerReady,
         ] {
             push_melin_frame(&mut s, &transport_payload(&transport));
@@ -2210,6 +2528,152 @@ lot_size_inverse = 1
             s.try_process_melin_frame(&config, &sym, Instant::now()),
             None
         );
+    }
+
+    /// An order the node sheds under load is rejected to the FIX client
+    /// as the engine's rejections are, so the client knows to resend it.
+    #[test]
+    fn a_busy_order_is_rejected_to_the_fix_client() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let raw = new_order_msg("FIRM_A", "MELIN", 2, "ORD1");
+        assert_eq!(
+            s.handle_fix_message(&raw, &config, &smap, &sym),
+            SessionAction::SendMelin
+        );
+        let [(id, Request::SubmitOrder { .. })] = take_melin_requests(&mut s)[..] else {
+            panic!("one order");
+        };
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::ServerBusy { id }),
+        );
+        drain_melin(&mut s, &config);
+
+        let sent = take_fix(&mut s);
+        let [reject] = &sent[..] else {
+            panic!("one FIX message, got {}", sent.len());
+        };
+        let reject = FixMessage::parse(reject).unwrap();
+        assert_eq!(reject.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(reject.get_str(tags::CL_ORD_ID), Some("ORD1"));
+        assert_eq!(reject.get_str(tags::EXEC_TYPE), Some("8"));
+        assert_eq!(reject.get_str(tags::ORD_STATUS), Some("8"));
+        assert!(reject.get_str(tags::TEXT).unwrap().contains("resend"));
+        assert!(s.in_flight.is_empty());
+    }
+
+    /// A cancel the node refuses is an OrderCancelReject carrying the
+    /// node's reason.
+    #[test]
+    fn a_refused_cancel_is_an_order_cancel_reject() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let raw = new_order_msg("FIRM_A", "MELIN", 2, "ORD1");
+        s.handle_fix_message(&raw, &config, &smap, &sym);
+        let raw = cancel_msg("FIRM_A", "MELIN", 3, "CXL1", "ORD1");
+        assert_eq!(
+            s.handle_fix_message(&raw, &config, &smap, &sym),
+            SessionAction::SendMelin
+        );
+        let [_, (cancel, Request::CancelOrder { .. })] = take_melin_requests(&mut s)[..] else {
+            panic!("an order, then its cancel");
+        };
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::Refused {
+                id: cancel,
+                kind: RefusalKind::PermissionDenied,
+                reason: "not for this role",
+            }),
+        );
+        drain_melin(&mut s, &config);
+
+        let sent = take_fix(&mut s);
+        let [reject] = &sent[..] else {
+            panic!("one FIX message, got {}", sent.len());
+        };
+        let reject = FixMessage::parse(reject).unwrap();
+        assert_eq!(reject.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
+        assert_eq!(reject.get_str(tags::CL_ORD_ID), Some("CXL1"));
+        assert_eq!(reject.get_str(tags::ORIG_CL_ORD_ID), Some("ORD1"));
+        assert_eq!(reject.get_str(tags::CXL_REJ_REASON), Some("99"));
+        assert_eq!(reject.get_str(tags::TEXT), Some("not for this role"));
+        // The order itself is still in flight.
+        assert_eq!(s.in_flight.len(), 1);
+    }
+
+    /// A position goes to the RequestForPositions its reply names, even
+    /// when the node answered an earlier one out of turn: refused ahead
+    /// of the replies to requests sent before it.
+    #[test]
+    fn positions_are_paired_by_request_id() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        for (seq, pos_req_id) in [(2, "POS1"), (3, "POS2")] {
+            let raw = positions_msg("FIRM_A", "MELIN", seq, pos_req_id);
+            assert_eq!(
+                s.handle_fix_message(&raw, &config, &smap, &sym),
+                SessionAction::SendMelin
+            );
+        }
+        let [(first, _), (second, _)] = take_melin_requests(&mut s)[..] else {
+            panic!("two position queries");
+        };
+
+        // The first is refused; the second is answered.
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::Refused {
+                id: first,
+                kind: RefusalKind::PermissionDenied,
+                reason: "not for this role",
+            }),
+        );
+        push_melin_frame(
+            &mut s,
+            &encode_response_payload(&ResponseKind::PositionSnapshot {
+                account: AccountId(7),
+                balances: [AccountBalance::ZERO; 16],
+                count: 0,
+            }),
+        );
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::BatchEnd { id: second }),
+        );
+        drain_melin(&mut s, &config);
+
+        let reports: Vec<(Option<String>, Option<String>)> = take_fix(&mut s)
+            .iter()
+            .map(|raw| {
+                let msg = FixMessage::parse(raw).unwrap();
+                assert_eq!(msg.msg_type(), tags::MSG_POSITION_REPORT);
+                (
+                    msg.get_str(tags::POS_REQ_ID).map(str::to_owned),
+                    msg.get_str(tags::POS_REQ_RESULT).map(str::to_owned),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            [
+                (Some("POS1".to_owned()), Some("3".to_owned())),
+                (Some("POS2".to_owned()), Some("0".to_owned())),
+            ]
+        );
+        assert!(s.in_flight.is_empty());
     }
 
     #[test]

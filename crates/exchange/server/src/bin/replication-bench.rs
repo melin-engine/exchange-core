@@ -54,7 +54,6 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<
 use melin_ec_types::types::{AccountId, CurrencyId};
 use melin_transport_core::pipeline::{StageWaits, build_pipeline_with_replication};
 use melin_transport_core::replica_presence::ReplicaPresence;
-use melin_transport_core::trace::mono_trace_ns;
 use melin_transport_core::{JournaledApp, NodeStore};
 
 #[derive(Parser)]
@@ -631,18 +630,13 @@ fn main() {
 
     // Seed: register one account so subsequent Deposit events
     // succeed under any future App that validates them.
-    input_producer.publish(InputSlot {
-        connection_id: 0,
-        key_hash: 0,
-        sequence: 0,
-        timestamp_ns: unix_epoch_nanos(),
-        event: JournalEvent::App(TradingRequest::internal(TradingEvent::ProvisionAccount {
+    input_producer.publish(InputSlot::node_event(
+        JournalEvent::App(TradingRequest::internal(TradingEvent::ProvisionAccount {
             account: AccountId(1),
             amount: u64::MAX / 2,
         })),
-        publish_ts: mono_trace_ns(),
-        recv_ts: mono_trace_ns(),
-    });
+        unix_epoch_nanos(),
+    ));
 
     // --- Generator + stats reporter ---
     eprintln!("generator running for {RUN_SECS}s...");
@@ -689,19 +683,14 @@ fn main() {
             std::thread::sleep(Duration::from_micros(50));
         } else {
             for _ in 0..1024 {
-                input_producer.publish(InputSlot {
-                    connection_id: 0,
-                    key_hash: 0,
-                    sequence: 0,
-                    timestamp_ns: unix_epoch_nanos(),
-                    event: JournalEvent::App(TradingRequest::internal(TradingEvent::Deposit {
+                input_producer.publish(InputSlot::node_event(
+                    JournalEvent::App(TradingRequest::internal(TradingEvent::Deposit {
                         account: AccountId(1),
                         currency: CurrencyId(1),
                         amount: 1,
                     })),
-                    publish_ts: mono_trace_ns(),
-                    recv_ts: mono_trace_ns(),
-                });
+                    unix_epoch_nanos(),
+                ));
                 total_published += 1;
             }
         }

@@ -3,8 +3,8 @@
 //! Mirror of [`crate::request_decoder::RequestDecoder`] on the
 //! outbound path: maps trading-shaped output payloads
 //! (`ExecutionReport`, `QueryResponse`) to response bodies, which the
-//! runtime frames. Transport-shaped variants (`BatchEnd`, `EngineError`)
-//! are handled by the runtime directly and never reach this encoder.
+//! runtime frames. Transport-shaped variants (`BatchEnd`) are handled by
+//! the runtime directly and never reach this encoder.
 
 use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_ec_protocol::codec;

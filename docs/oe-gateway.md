@@ -113,6 +113,22 @@ Execution reports from Melin are translated back into
 `ExecutionReport (35=8)` or `OrderCancelReject (35=9)` as appropriate
 and queued for the FIX client.
 
+A request the exchange turns away without applying it is answered the
+same way, so no FIX message goes unanswered. When the exchange is too
+busy to take a request, a new order is rejected with an
+`ExecutionReport (35=8)` (`ExecType=8`, `OrdRejReason=99`) whose `Text`
+asks the client to resend it, and a cancel or cancel-replace with an
+`OrderCancelReject (35=9)` (`CxlRejReason=99`). Under load the exchange
+sheds a burst at a time, so several messages in a row may be rejected
+this way; a client whose orders depend on each other's order waits for
+the answers it is owed before it resends. A request the exchange refuses
+(the session's key may not send it) is rejected the same way, with the
+exchange's reason as the `Text`. A `RequestForPositions (35=AN)` turned
+away is answered with a `PositionReport (35=AP)` carrying no positions
+and `PosReqResult=3` (not authorized) or `99` (other). Each session's
+key must be listed under the `trader` role in the exchange's
+`authorized_keys`.
+
 ## Metrics
 
 When `metrics_addr` is set in the config, the gateway exposes a

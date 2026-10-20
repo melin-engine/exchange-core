@@ -5,6 +5,8 @@
 //! server or client — decoders must return Err gracefully.
 
 use melin_ec_protocol::codec;
+use melin_wire_protocol::control::RequestId;
+use melin_wire_protocol::framing::REQUEST_HEADER_LEN;
 
 /// Wire request decoder must never panic on arbitrary input.
 #[test]
@@ -24,9 +26,9 @@ fn fuzz_wire_response_decode() {
 
 /// Request body decoder must never panic on arbitrary input. This is the
 /// node's own path: the runtime hands the decoder whatever body a client
-/// framed under the application tag. Fuzzed on its own because the frame
-/// decoder above refuses all but one first byte, so random frames would
-/// seldom reach it.
+/// framed behind the request tag and its ID. Fuzzed on its own because the
+/// frame decoder above refuses all but one first byte, so random frames
+/// would seldom reach it.
 #[test]
 fn fuzz_wire_request_body_decode() {
     bolero::check!().for_each(|data: &[u8]| {
@@ -52,15 +54,17 @@ fn fuzz_wire_request_roundtrip() {
         };
 
         let mut buf = [0u8; 256];
+        let id = RequestId(7);
         let seq = 42u64;
-        let written = match codec::encode_request(&request, seq, &mut buf) {
+        let written = match codec::encode_request(&request, id, seq, &mut buf) {
             Ok(n) => n,
             Err(_) => return,
         };
 
         // decode_request expects payload after the 4-byte length prefix.
-        let (decoded_seq, decoded) = codec::decode_request(&buf[4..written])
+        let (decoded_id, decoded_seq, decoded) = codec::decode_request(&buf[4..written])
             .expect("decode of freshly encoded request must succeed");
+        assert_eq!(decoded_id, id, "id round-trip mismatch");
         assert_eq!(decoded_seq, seq, "seq round-trip mismatch");
         assert_eq!(decoded, request, "request round-trip mismatch");
 
@@ -68,7 +72,11 @@ fn fuzz_wire_request_roundtrip() {
         let mut body = [0u8; codec::MAX_REQUEST_BODY];
         let len = codec::encode_request_body(&request, seq, &mut body)
             .expect("a request that encodes as a frame encodes as a body");
-        assert_eq!(body[..len], buf[5..written], "body is not the frame's tail");
+        assert_eq!(
+            body[..len],
+            buf[REQUEST_HEADER_LEN..written],
+            "body is not the frame's tail"
+        );
         assert_eq!(
             codec::decode_request_body(&body[..len]).expect("decode of fresh body"),
             (seq, request),

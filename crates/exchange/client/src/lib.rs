@@ -10,6 +10,7 @@
 
 use std::io;
 
+pub use melin_client::RefusalKind;
 use melin_wire_protocol::error::ProtocolError;
 
 /// Error returned by client operations.
@@ -19,18 +20,24 @@ pub enum ClientError {
     Io(io::Error),
     /// Protocol encoding/decoding error.
     Protocol(ProtocolError),
+    /// The node speaks client protocol `node`, this client `client`:
+    /// found in the node's challenge, before anything was signed.
+    /// Upgrade clients with the nodes.
+    ProtocolVersion { node: u16, client: u16 },
     /// Server closed the connection before sending BatchEnd.
     Disconnected,
     /// Server rejected the Ed25519 challenge-response authentication
     /// (unknown key, invalid signature, or a key listed under the
     /// `replication` role, which may not connect as a client).
     AuthFailed,
-    /// Server pipeline is full. The caller should retry after a brief backoff.
+    /// The node shed the request under load: it was not applied, and may
+    /// be resent after a brief backoff. The connection is still usable.
     ServerBusy,
-    /// The engine failed on the request; do not retry it. The reply
-    /// batch has been read to its end, so the connection is still
-    /// usable for the next request.
-    EngineError,
+    /// The node refused the request, which was not applied: `kind` says
+    /// why (a key whose role may not send it, or a request the node
+    /// cannot decode), `reason` is the node's text, for people. The
+    /// connection is still usable.
+    Refused { kind: RefusalKind, reason: String },
     /// The reply is backed by the primary's own disk alone, weaker than
     /// the node's ack policy: a primary that lost its last replica sends
     /// it once its degraded-ack grace period has passed. The responses
@@ -44,10 +51,24 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
+            Self::ProtocolVersion { node, client } => write!(
+                f,
+                "the node speaks client protocol {node}, this client {client}: \
+                 upgrade clients with the nodes"
+            ),
             Self::Disconnected => write!(f, "disconnected from server"),
             Self::AuthFailed => write!(f, "authentication failed"),
-            Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
-            Self::EngineError => write!(f, "engine error on the request, do not retry"),
+            Self::ServerBusy => write!(
+                f,
+                "server busy: the request was not applied, resend it after a backoff"
+            ),
+            Self::Refused { kind, reason } => {
+                let kind = match kind {
+                    RefusalKind::PermissionDenied => "not permitted",
+                    RefusalKind::Malformed => "malformed",
+                };
+                write!(f, "request refused ({kind}): {reason}")
+            }
             Self::Degraded(_) => write!(
                 f,
                 "reply backed by the primary's disk alone, not the ack policy: \

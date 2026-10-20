@@ -215,15 +215,18 @@ fn run_stub(
     // shape, then enter the regular request loop. Tests don't see this
     // exchange — it stays inside the stub.
     let payload = read_frame_blocking(&mut stream, &mut decoder, &shutdown)?;
-    match codec::decode_request(&payload).map_err(|e| format!("decode_request: {e:?}"))? {
-        (_, Request::QueryRequestSeq) => {}
-        (_, other) => return Err(format!("expected QueryRequestSeq, got {other:?}")),
-    }
+    let id = match codec::decode_request(&payload).map_err(|e| format!("decode_request: {e:?}"))? {
+        (id, _, Request::QueryRequestSeq) => id,
+        (_, _, other) => return Err(format!("expected QueryRequestSeq, got {other:?}")),
+    };
     write_bytes(
         &mut stream,
         &encode_response(&ResponseKind::RequestSeqHwm { hwm: 0 }),
     )?;
-    write_bytes(&mut stream, &encode_transport(&TransportResponse::BatchEnd))?;
+    write_bytes(
+        &mut stream,
+        &encode_transport(&TransportResponse::BatchEnd { id }),
+    )?;
 
     // --- Request/response loop ---
     let mut tmp = [0u8; 256];
@@ -263,12 +266,14 @@ fn run_stub(
             Err(e) => return Err(format!("read: {e}")),
         }
 
-        // Decode as many complete requests as have arrived.
+        // Decode as many complete requests as have arrived. The tests
+        // answer with the responses alone, never the batch end naming
+        // the request, so its ID goes no further.
         while let Some(payload) = decoder.next().map_err(|e| e.to_string())? {
-            let request =
+            let (_id, seq, request) =
                 codec::decode_request(payload).map_err(|e| format!("decode_request: {e:?}"))?;
             requests
-                .send(request)
+                .send((seq, request))
                 .map_err(|_| "request channel closed".to_string())?;
         }
     }

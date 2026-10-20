@@ -24,9 +24,9 @@ has the detail. Upgrading is a cluster-wide stop: the replication protocol
 and the snapshot format change, so stop the cluster, upgrade every node, and
 restart on the existing journals and snapshots. An older release refuses a
 journal or snapshot written by this one rather than misread it. Upgrade
-clients and gateways before the nodes: one built on this release works
-against an older node, while one built on an earlier release fails with a
-protocol error on the first degraded ack it receives.
+clients and gateways with the nodes: the client wire protocol changes, and
+a client refuses a node of another protocol at the handshake, before it
+signs anything.
 
 ### Added
 
@@ -45,8 +45,47 @@ protocol error on the first degraded ack it receives.
 - **`degraded_acks` in the bench's outcomes**, printed and in its JSON: a
   replicated run that counts any did not measure the policy it was set up
   for.
+- **Counters for the requests a node answers without applying them**, on
+  `/metrics`: `melin_requests_shed_total`, `melin_requests_refused_total`
+  by `kind`, `melin_requests_filtered_total`, and the parked-connection
+  gauge and counter `melin_connections_parked` and
+  `melin_connection_parks_total` *(sequencer)*. See the health endpoint's
+  metrics in the operations guide.
 
 ### Changed
+
+- **Client protocol 1: every request carries an ID, and is answered once,
+  naming it** *(sequencer)*. Wire-breaking: upgrade every client, the FIX
+  gateway and the market-data gateway with the nodes. The node's challenge
+  carries the protocol version ahead of its nonce. A request is
+  `[len][0x0B][id: u64][body]`, and after the handshake anything else
+  closes the connection. `BatchEnd`, `BatchEndDegraded` and `ServerBusy`
+  carry the ID of the request they answer, and a new `Refused` frame
+  (`0x0C`) answers a request the node refuses, with a kind and a reason.
+  Replies to accepted requests still arrive in request order, but a request
+  the node does not apply may be answered ahead of earlier ones, so a
+  pipelining client pairs answers by ID. A request shed on a full input
+  ring takes the requests buffered behind it with it, each answered
+  `ServerBusy`, and the connection is kept, on DPDK too. See "Request IDs"
+  in the wire protocol guide.
+- **`melin_ec_protocol::codec`'s request framing carries the ID**:
+  `encode_request(request, id, seq, buf)`, and `decode_request` returns
+  `(id, seq, request)`. Source-breaking.
+- **`melin_ec_client::ClientError`** gains `Refused { kind, reason }`, for
+  a request the node refused, and `ProtocolVersion { node, client }`, for a
+  node of another client protocol; `RefusalKind` is re-exported.
+  `ServerBusy` now means the request was not applied and may be resent on
+  the same connection. Source-breaking for an exhaustive `match`.
+- **The event feed's batch ends name request 0**, whichever client's
+  request they close: a request's ID belongs to its connection. Each grows
+  by the eight bytes of the ID.
+- **The reasons a node gives for refusing a request reach its client**, and
+  read as messages to it: `only a trader key may trade` where the log said
+  `non-trader attempted trading`.
+- **The bench pairs answers with requests by ID.** A shed request leaves
+  the window unmeasured, counted under `server_busy` (printed as `shed
+  (busy)`); a refused one fails the run, as the bench's keys may send every
+  request it makes.
 
 - **The ack policy is journaled** *(sequencer)*. `ACK-POLICY` replies `OK`
   once the switch is journaled, which can be before it is in force; it
@@ -105,9 +144,28 @@ protocol error on the first degraded ack it receives.
   With `--snapshot X` alone, move the current `<journal>.snapshot` to the
   location you want and set `--snapshot-path` to it; to restore a backup,
   copy it to the snapshot path *(sequencer)*.
+- **`ClientError::EngineError`**, and the bench's `engine_errors` outcome
+  and JSON key. No node ever sent the frame, whose tag is retired
+  *(sequencer)*.
 
 ### Fixed
 
+- **A request the node refuses is answered** *(sequencer)*. A request its
+  key's role may not send, or one the exchange cannot decode, used to be
+  dropped without a reply, so the client waited out its own timeout: an
+  operator query sent from a trader key looked like a hung node.
+- **The FIX gateway answers every message the exchange turns away.** An
+  order or cancel the exchange shed under load was logged and dropped,
+  leaving the FIX client waiting for an answer that never came; it is now
+  rejected as the engine's rejections are, with a `Text` asking for a
+  resend. See "Translation to Melin" in the FIX gateway guide.
+- **FIX position reports answer the request they belong to.** The gateway
+  paired them with RequestForPositions messages in arrival order, so a
+  position query the node dropped gave every later report the previous
+  request's `PosReqID`.
+- **A refusal no longer waits behind a write the ack policy holds**
+  *(sequencer)*. With degraded acks off, a write refused while halted
+  waited behind an earlier held write until a replica came back.
 - **A node whose state exceeds 256 MiB can take snapshots.** That was the
   sequencer's limit, and an exchange of about 100,000 accounts (around
   480 MB of state) failed every save, logged an error each interval, and

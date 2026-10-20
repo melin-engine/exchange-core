@@ -480,24 +480,15 @@ pub fn execution_report_to_fix(
         }
         ExecutionReport::Rejected {
             order_id, reason, ..
-        } => {
-            let clord_id = resolve_clord_id(id_map, *order_id, "Rejected");
-            FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
-                .str_tag(tags::ORDER_ID, &order_id.0.to_string())
-                .str_tag(tags::CL_ORD_ID, clord_id)
-                .str_tag(tags::EXEC_ID, &exec_id.to_string())
-                .str_tag(tags::EXEC_TYPE, "8") // Rejected
-                .str_tag(tags::ORD_STATUS, "8") // Rejected
-                .str_tag(tags::SYMBOL, symbol_str)
-                .str_tag(tags::SIDE, hint_side)
-                .str_tag(tags::ORDER_QTY, "0")
-                .str_tag(tags::LEAVES_QTY, "0")
-                .str_tag(tags::CUM_QTY, "0")
-                .str_tag(tags::AVG_PX, "0")
-                .str_tag(tags::ORD_REJ_REASON, &reject_reason_code(reason))
-                .str_tag(tags::TEXT, &format!("{reason:?}"))
-                .build(sender, target, seq)
-        }
+        } => rejected_report(
+            *order_id,
+            ctx,
+            hint_side,
+            &reject_reason_code(reason),
+            &format!("{reason:?}"),
+            seq,
+            exec_id,
+        ),
         ExecutionReport::Replaced {
             order_id,
             side,
@@ -555,6 +546,49 @@ pub fn execution_report_to_fix(
             Vec::new()
         }
     }
+}
+
+/// Build a rejection ExecutionReport (35=8, ExecType=8) for a new order
+/// the node turned away before the engine saw it: shed under load, or
+/// refused. OrdRejReason 99 (Other); `text` says why.
+pub fn order_reject_to_fix(
+    order_id: OrderId,
+    ctx: &FixCtx<'_>,
+    side: Side,
+    text: &str,
+    seq: u64,
+    exec_id: u64,
+) -> Vec<u8> {
+    rejected_report(order_id, ctx, fix_side(side), "99", text, seq, exec_id)
+}
+
+/// The rejection ExecutionReport both the engine's rejections and the
+/// node's own share.
+fn rejected_report(
+    order_id: OrderId,
+    ctx: &FixCtx<'_>,
+    side: &str,
+    ord_rej_reason: &str,
+    text: &str,
+    seq: u64,
+    exec_id: u64,
+) -> Vec<u8> {
+    let clord_id = resolve_clord_id(ctx.id_map, order_id, "Rejected");
+    FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+        .str_tag(tags::ORDER_ID, &order_id.0.to_string())
+        .str_tag(tags::CL_ORD_ID, clord_id)
+        .str_tag(tags::EXEC_ID, &exec_id.to_string())
+        .str_tag(tags::EXEC_TYPE, "8") // Rejected
+        .str_tag(tags::ORD_STATUS, "8") // Rejected
+        .str_tag(tags::SYMBOL, ctx.symbol_str)
+        .str_tag(tags::SIDE, side)
+        .str_tag(tags::ORDER_QTY, "0")
+        .str_tag(tags::LEAVES_QTY, "0")
+        .str_tag(tags::CUM_QTY, "0")
+        .str_tag(tags::AVG_PX, "0")
+        .str_tag(tags::ORD_REJ_REASON, ord_rej_reason)
+        .str_tag(tags::TEXT, text)
+        .build(ctx.sender, ctx.target, seq)
 }
 
 pub(crate) fn fix_side(side: Side) -> &'static str {
@@ -659,18 +693,49 @@ pub fn cancel_reject_to_fix(
         RejectReason::DuplicateRequest => "3",
         _ => "99",
     };
-    FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REJECT)
-        .str_tag(tags::ORDER_ID, &order_id.0.to_string())
-        .str_tag(tags::CL_ORD_ID, cancel_clord_id)
-        .str_tag(tags::ORIG_CL_ORD_ID, orig_clord_id)
-        .str_tag(tags::ORD_STATUS, "8") // Rejected
-        .str_tag(
-            tags::CXL_REJ_RESPONSE_TO,
-            if is_replace { "2" } else { "1" },
-        )
-        .str_tag(tags::CXL_REJ_REASON, cxl_reason)
-        .str_tag(tags::TEXT, &format!("{reason:?}"))
-        .build(sender, target, seq)
+    let cancel = CancelReject {
+        order_id,
+        cancel_clord_id,
+        orig_clord_id,
+        is_replace,
+    };
+    cancel.to_fix(cxl_reason, &format!("{reason:?}"), sender, target, seq)
+}
+
+/// A cancel or cancel-replace request to reject, as an OrderCancelReject
+/// (35=9) names it.
+pub struct CancelReject<'a> {
+    pub order_id: OrderId,
+    pub cancel_clord_id: &'a str,
+    pub orig_clord_id: &'a str,
+    pub is_replace: bool,
+}
+
+impl CancelReject<'_> {
+    /// The OrderCancelReject, with CxlRejReason `cxl_reason` and `text`.
+    /// For a request the node turned away before the engine saw it (shed
+    /// under load, or refused), the reason is 99 (Other).
+    pub fn to_fix(
+        &self,
+        cxl_reason: &str,
+        text: &str,
+        sender: &str,
+        target: &str,
+        seq: u64,
+    ) -> Vec<u8> {
+        FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REJECT)
+            .str_tag(tags::ORDER_ID, &self.order_id.0.to_string())
+            .str_tag(tags::CL_ORD_ID, self.cancel_clord_id)
+            .str_tag(tags::ORIG_CL_ORD_ID, self.orig_clord_id)
+            .str_tag(tags::ORD_STATUS, "8") // Rejected
+            .str_tag(
+                tags::CXL_REJ_RESPONSE_TO,
+                if self.is_replace { "2" } else { "1" },
+            )
+            .str_tag(tags::CXL_REJ_REASON, cxl_reason)
+            .str_tag(tags::TEXT, text)
+            .build(sender, target, seq)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +840,28 @@ pub fn position_report_to_fix(
     }
 
     builder.build(sender, target, seq)
+}
+
+/// Build a PositionReport (35=AP) answering a RequestForPositions (AN)
+/// the node turned away: PosReqResult `result` (3 = not authorized,
+/// 99 = other), no positions, and `text` saying why.
+pub fn position_reject_to_fix(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    pos_req_id: &str,
+    account: &str,
+    result: &str,
+    text: &str,
+) -> Vec<u8> {
+    FixMessageBuilder::new(tags::MSG_POSITION_REPORT)
+        .str_tag(tags::POS_REQ_ID, pos_req_id)
+        .str_tag(tags::POS_REQ_RESULT, result)
+        .str_tag(tags::ACCOUNT, account)
+        .str_tag(tags::TOTAL_NUM_POS_REPORTS, "0")
+        .str_tag(tags::NO_POSITIONS, "0")
+        .str_tag(tags::TEXT, text)
+        .build(sender, target, seq)
 }
 
 #[cfg(test)]

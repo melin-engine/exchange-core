@@ -7,7 +7,6 @@
 //!
 //! This module is only compiled with `--features dpdk`.
 
-use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,8 +18,8 @@ use smoltcp::socket::tcp::{self, State};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use melin_client::Reply;
 use melin_client::framing::FrameDecoder;
+use melin_client::{InFlight, Reply, RequestId};
 use melin_dpdk::device::DpdkDevice;
 use melin_dpdk::eal::Eal;
 use melin_dpdk::mempool::Mempool;
@@ -63,14 +62,17 @@ struct DpdkBenchConn {
     /// generator is stateful and cannot be rewound. Distinct from
     /// `send_pending`, which holds *partial-send remainders* of frames
     /// that have already started hitting the wire.
-    pending_unsent: Option<Vec<u8>>,
+    /// With the request ID the frame carries.
+    pending_unsent: Option<(RequestId, Vec<u8>)>,
     /// Pending send bytes (partial frame that didn't fit in smoltcp TX buffer).
     send_pending: Vec<u8>,
-    /// FIFO of send timestamps (TSC ticks) for in-flight orders.
-    /// `u64` instead of `Instant` to avoid ~15-25ns vDSO overhead per
-    /// timestamp on the hot path. With pacing enabled this stores the
-    /// *scheduled* TSC, not the actual send TSC (coordinated-omission fix).
-    inflight_ts: VecDeque<u64>,
+    /// Send timestamps (TSC ticks) of in-flight orders, by request ID: an
+    /// answer names its request, and one the node sheds may arrive ahead
+    /// of answers to requests sent before it. `u64` instead of `Instant`
+    /// to avoid ~15-25ns vDSO overhead per timestamp on the hot path. With
+    /// pacing enabled this stores the *scheduled* TSC, not the actual send
+    /// TSC (coordinated-omission fix).
+    in_flight: InFlight<u64>,
     /// Open-loop scheduler when `--target-rate > 0`. Built after auth
     /// handshake so its TSC anchor is close to the measurement start.
     pacer: Option<crate::PaceClock>,
@@ -467,7 +469,7 @@ pub fn run_dpdk_roundtrip(
             scratch_frame: Vec::with_capacity(generator::MAX_REQUEST_FRAME_BYTES),
             pending_unsent: None,
             send_pending: Vec::new(),
-            inflight_ts: VecDeque::with_capacity(window),
+            in_flight: InFlight::with_capacity(window),
             pacer: None,
             outcomes: OutcomeReport::default(),
         });
@@ -694,7 +696,7 @@ pub fn run_dpdk_roundtrip(
             // Send new frames while window has room. Each frame is generated
             // on-the-fly into `scratch_frame` as [u32 LE len][payload]. When
             // the socket can't accept any bytes, the unsent frame is parked
-            // in `pending_unsent` and `inflight_ts` is *not* advanced — so
+            // in `pending_unsent` and `in_flight` is *not* advanced — so
             // the recorded send timestamp reflects the moment bytes actually
             // start hitting the wire, not the moment generation completed.
             //
@@ -703,12 +705,10 @@ pub fn run_dpdk_roundtrip(
             // the coordinated-omission loophole).
             if !socket.can_send() {
                 diag_cant_send += 1;
-            } else if conn.inflight_ts.len() >= window {
+            } else if conn.in_flight.len() >= window {
                 diag_window_full += 1;
             }
-            while conn.send_pending.is_empty()
-                && conn.inflight_ts.len() < window
-                && socket.can_send()
+            while conn.send_pending.is_empty() && conn.in_flight.len() < window && socket.can_send()
             {
                 // Pacing gate first — if the next slot isn't due yet,
                 // stop filling for this conn this iteration.
@@ -735,25 +735,26 @@ pub fn run_dpdk_roundtrip(
 
                 // Reuse a previously-generated-but-never-sent frame if there
                 // is one; otherwise pull a fresh frame from the generator.
-                if let Some(prev) = conn.pending_unsent.take() {
+                let id = if let Some((id, prev)) = conn.pending_unsent.take() {
                     conn.scratch_frame = prev;
+                    id
                 } else {
                     conn.scratch_frame.clear();
-                    conn.flow.next_wire_frame(&mut conn.scratch_frame);
-                }
+                    conn.flow.next_wire_frame(&mut conn.scratch_frame)
+                };
                 let wire_frame = &conn.scratch_frame;
                 match socket.send_slice(wire_frame) {
                     Ok(n) if n == wire_frame.len() => {
-                        conn.inflight_ts
-                            .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
+                        conn.in_flight
+                            .insert(id, paced_ts.unwrap_or_else(crate::rdtscp));
                         diag_sends += 1;
                     }
                     Ok(n) if n > 0 => {
                         // Partial send — remainder goes to send_pending; the
                         // frame has started hitting the wire so it counts.
                         conn.send_pending.extend_from_slice(&wire_frame[n..]);
-                        conn.inflight_ts
-                            .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
+                        conn.in_flight
+                            .insert(id, paced_ts.unwrap_or_else(crate::rdtscp));
                         diag_sends += 1;
                     }
                     Ok(_) => {
@@ -766,7 +767,7 @@ pub fn run_dpdk_roundtrip(
                         {
                             p.unpop();
                         }
-                        conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
+                        conn.pending_unsent = Some((id, std::mem::take(&mut conn.scratch_frame)));
                         break;
                     }
                     Err(e) => {
@@ -780,7 +781,7 @@ pub fn run_dpdk_roundtrip(
                         {
                             p.unpop();
                         }
-                        conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
+                        conn.pending_unsent = Some((id, std::mem::take(&mut conn.scratch_frame)));
                         break;
                     }
                 }
@@ -809,35 +810,55 @@ pub fn run_dpdk_roundtrip(
                     Ok(None) | Err(melin_client::Error::FrameTooLarge { .. }) => break,
                     Err(_) => continue,
                 };
-                if matches!(reply, Reply::BatchEnd(_)) {
-                    diag_batch_ends += 1;
-                    // Capture `rdtscp()` BEFORE any per-frame
-                    // bookkeeping (outcome tally below) so the
-                    // histogram reflects only the wire roundtrip.
-                    // Always pop the inflight entry to keep the FIFO
-                    // aligned with sends — without this, cooldown
-                    // completions would leak the queue. Phase
-                    // classification by *receive* time, reusing the
-                    // outer-iter `now`: past `measured_end` we
-                    // discard the sample, before `warmup_end` too.
-                    if let Some(sent_tsc) = conn.inflight_ts.pop_front()
-                        && now >= deadlines.warmup_end
-                        && now < deadlines.measured_end
-                    {
-                        if measured_start.is_none() {
-                            measured_start = Some(now);
-                        }
-                        let latency_ns = crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
-                        histogram.record(latency_ns).ok();
-                        interval_hist.record(latency_ns).ok();
-                        interval_count += 1;
-                        maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
-                        progress.fetch_add(1, Ordering::Relaxed);
-                        #[cfg(feature = "latency-trace")]
+                match reply {
+                    Reply::BatchEnd { id, .. } => {
+                        // Capture `rdtscp()` BEFORE any per-frame
+                        // bookkeeping (outcome tally below) so the
+                        // histogram reflects only the wire roundtrip.
+                        // Always take the in-flight entry out — without
+                        // this, cooldown completions would fill the
+                        // window. Phase classification by *receive*
+                        // time, reusing the outer-iter `now`: past
+                        // `measured_end` we discard the sample, before
+                        // `warmup_end` too.
+                        let received_tsc = crate::rdtscp();
+                        diag_batch_ends += 1;
+                        if let Some(sent_tsc) = conn.in_flight.remove(id)
+                            && now >= deadlines.warmup_end
+                            && now < deadlines.measured_end
                         {
-                            work_done_this_iter = true;
+                            if measured_start.is_none() {
+                                measured_start = Some(now);
+                            }
+                            let latency_ns =
+                                crate::tsc_to_ns(received_tsc - sent_tsc, ticks_per_ns);
+                            histogram.record(latency_ns).ok();
+                            interval_hist.record(latency_ns).ok();
+                            interval_count += 1;
+                            maybe_sample(
+                                &mut interval_hist,
+                                &mut interval_count,
+                                &mut series,
+                                start,
+                            );
+                            progress.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "latency-trace")]
+                            {
+                                work_done_this_iter = true;
+                            }
                         }
                     }
+                    // A shed request leaves the window, unmeasured: it
+                    // made no round trip through the engine.
+                    Reply::ServerBusy { id } => {
+                        conn.in_flight.remove(id);
+                    }
+                    // The bench's keys may send every request it
+                    // generates: a refusal is a misconfigured run.
+                    Reply::Refused { kind, reason, .. } => {
+                        panic!("the node refused a bench request ({kind:?}): {reason}")
+                    }
+                    Reply::Response(_) | Reply::Heartbeat => {}
                 }
                 // Outcome tally runs *after* the latency capture
                 // above so this counter increment is not billed to
@@ -880,7 +901,7 @@ pub fn run_dpdk_roundtrip(
         eprintln!(
             "  conn[{ci}]: state={:?} inflight={} pending={}",
             socket.state(),
-            conn.inflight_ts.len(),
+            conn.in_flight.len(),
             conn.send_pending.len(),
         );
     }
