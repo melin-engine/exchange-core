@@ -427,7 +427,7 @@ On AMD CPUs, SMI counts cannot be measured (MSR 0x34 is Intel-specific). The `be
 
 When the response stage waits on a local journal `fdatasync` for every order (standalone, or single-replication where the primary needs both local disk and the replica), the tail-latency floor is set by the *filesystem*, not the drive. With ext4, jbd2 batches metadata commits at internal extent-group boundaries and fires a 1–2 ms `fdatasync` every ~256 MiB of sustained writes. The drive itself doesn't pause — we verified with OCP `latency-monitor-log` (zero NVMe commands above 10 ms during a 60 s run on a Micron 7400 PRO) that no individual NVMe command exceeds the threshold. The stall is between the syscall and the device.
 
-xfs doesn't exhibit this behaviour on the same hardware: same throughput, p50/p99 unchanged, max latency cut from ~2.6 ms to ~1.5 ms, and the periodic cadence vanishes. `scripts/server-setup.sh` formats the journal disk as xfs with `noatime,logbsize=256k,logbufs=8` for this reason.
+xfs doesn't exhibit this behaviour on the same hardware: same throughput, p50/p99 unchanged, max latency cut from ~2.6 ms to ~1.5 ms, and the periodic cadence vanishes. The sequencer's `scripts/bench/server-setup.sh` formats the journal disk as xfs with `noatime,logbsize=256k,logbufs=8` for this reason.
 
 Symptoms you will see on ext4 at this floor:
 
@@ -437,15 +437,17 @@ Symptoms you will see on ext4 at this floor:
 
 **Mitigations when a tighter tail matters:**
 
-- **Use xfs for the journal disk.** This is the single biggest win on ext4 systems. See `server-setup.sh` for the formatting and mount options.
+- **Use xfs for the journal disk.** This is the single biggest win on ext4 systems. See the sequencer's `scripts/bench/server-setup.sh` for the formatting and mount options.
 - **Run with dual replication and the default `disk+ram` ack policy.** The response stage releases as soon as any node has the event on PLP-backed NVMe AND at least one replica has acked in memory — single-node fsync stalls are usually masked. (The ~10 s ext4 spike defeats this masking specifically because deterministic event flow correlates the spike across every node; xfs eliminates the correlation.)
 - **Raise drive over-provisioning** if you stay on ext4. Smaller namespace + more unallocated capacity reduces drive-internal GC pressure that compounds with the fs-level spike.
 
 ## Reproducing Published Benchmarks
 
-See the [sequencer README](https://github.com/melin-engine/melin#benchmarks) for the current hardware setup, benchmark parameters, and end-to-end performance numbers, and the [README](../README.md#performance) here for the exchange-core hot-path numbers. All LAN benchmarks are reproducible via `scripts/lan-bench-suite.sh`.
+See the [sequencer README](https://github.com/melin-engine/melin#benchmarks) for the current hardware setup, benchmark parameters, and end-to-end performance numbers, and the [README](../README.md#performance) here for the exchange-core hot-path numbers.
 
-On a replicated transport the suite only starts load once the primary reports every replica connected and on the live stream. If they are not within two minutes, that transport's workloads are skipped and recorded as failed, and the suite moves on to the next transport. It judges each run afterwards by the primary's health samples. A replica that was evicted, missing or catching up from the journal at any point during a run makes that run **degraded**: the primary was serving replication reads from its own journal while being measured, and the latency recorded is not the transport's. A degraded run keeps its results, with `cluster.degraded` set in its JSON, and the suite exits non-zero once every workload has finished. A replicated run with no health samples at all is treated the same way: nothing shows its replicas were live, and a primary too saturated to answer its metrics endpoint is exactly the case the check exists for. The primary's log names the eviction (`evicting slow replica`). A replicated run that passes the ack policy can still be degraded this way, because the policy may be satisfied by the replicas that stayed live.
+LAN benchmarks run with the sequencer's suite, which benchmarks this exchange as its `ec` application: from a sequencer checkout next to this one (or with `EC_REPO` pointing at this checkout), prepare each host with its `scripts/bench/server-setup.sh`, then run `./scripts/bench/lan-bench-suite.sh ec <server-pub-ip> <bench-pub-ip> <server-vlan-ip> <replica-pub-ip> <replica2-pub-ip>`. The suite builds both binaries on your machine for the hosts' CPU and copies them over; its own header lists the transports, workloads and settings. This repository's `scripts/lan-bench-suite.sh`, `scripts/lan-bench.sh`, `scripts/server-setup.sh` and `scripts/server-deploy.sh` are deprecated.
+
+The suite only starts load once the primary reports every replica on the live stream, and judges each run afterwards by the primary's health samples. A replica that was evicted, missing or catching up from the journal at any point during a run makes that run **degraded**: the primary was serving replication reads from its own journal while being measured, and the latency recorded is not the transport's. A degraded run keeps its results, and the suite exits non-zero once every run has finished. The primary's log names the eviction (`evicting slow replica`). A replicated run that passes the ack policy can still be degraded this way, because the policy may be satisfied by the replicas that stayed live.
 
 ### Peak-load with full durability
 

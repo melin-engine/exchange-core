@@ -1887,7 +1887,6 @@ fn run_roundtrip_bench(
 
     let config = ServerConfig {
         journal: effective_journal,
-        snapshot: None,
         group_commit_us,
         // Disable connection timeout for benchmarks — pre-generation
         // can take longer than the default 30s for large runs.

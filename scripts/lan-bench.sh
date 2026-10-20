@@ -40,8 +40,15 @@
 #     provider's private port ships unconfigured; scripts/private-net-setup.sh
 #     configures and verifies it (see docs/operations.md, "Private Network").
 #   - The bench machine can reach <server-vlan-ip> over the private network
+#
+# Deprecated in favour of the sequencer's scripts/bench/lan-bench-suite.sh,
+# which benchmarks this exchange as its `ec` application.
 
 set -euo pipefail
+
+echo "warning: scripts/lan-bench.sh is deprecated; benchmark the exchange with the" \
+    "sequencer's scripts/bench/lan-bench-suite.sh ec ..., EC_REPO pointing at this checkout" \
+    "(https://github.com/melin-engine/melin)" >&2
 
 # ---------------------------------------------------------------------------
 # Parse arguments: positional args, then "-- server-args -- bench-args"

@@ -38,7 +38,6 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 |------|---------|-------------|
 | `--bind` | `127.0.0.1:9876` | TCP address to bind. Use `0.0.0.0:9876` for LAN access. |
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
-| `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
 | `--cores` | `journal-seq=1,matching=2,response=3,reader=4,event-publisher=6,shadow=7,repl-handler-0=8,repl-handler-1=9,journal-prep=10,journal-disk=11` | One `thread=core` entry per pipeline thread, in any order; every thread must be named. Each entry takes an optional wait-policy suffix: a bare core (or `7s`) busy-spins and needs the core to itself, `7y` spins briefly then yields and may share it; `journal-prep` blocks in file I/O and takes no suffix. `0` leaves a thread unpinned (and therefore yielding), and `none` unpins every thread. Core 0 should be reserved for OS/IRQ. The server refuses to start on a positional list, a missing, unknown or repeated name, or two threads on one core unless both entries carry `y`, and warns at boot when `journal-seq`, `matching`, `response`, `reader` or `journal-disk` has no core. See [Core Pinning](#core-pinning---cores). |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
@@ -56,7 +55,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--health-bind` | `127.0.0.1:9878` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Served by primaries and replicas alike, so a primary and a replica on one host need distinct binds. Omit to disable. |
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 | `--snapshot-interval-ms` | `3_000_000` (50 min) | Interval in milliseconds between snapshots written by the shadow exchange — the sole snapshot writer. Set to `0` to disable; recovery then falls back to full journal replay. The shadow replays events on a dedicated thread, so snapshot writes never pause the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
-| `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
+| `--snapshot-path` | (derived) | The node's one snapshot file: recovered from at startup, sent to a replica that needs a resync, and written by the shadow exchange. Defaults to the journal path with a `.snapshot` extension (e.g., `melin.snapshot`). The node refuses to start when the path names a directory or no file, when its directory does not exist, when it is the journal path, or when it holds nothing on a node with no journal while a snapshot sits at the default path (move that snapshot here to continue from it). **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
 
 #### Starting empty
 
@@ -496,7 +495,7 @@ printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} isolcpus=nohz,domain,1-9 nohz_
 
 Append to `GRUB_CMDLINE_LINUX`, not `GRUB_CMDLINE_LINUX_DEFAULT`. Only the former is guaranteed to be defined — several hosting images ship without a `GRUB_CMDLINE_LINUX_DEFAULT` line at all, so an edit targeting it silently does nothing — and `GRUB_CMDLINE_LINUX` applies to the recovery entry too.
 
-Note the filename. `scripts/server-setup.sh` owns `99-melin-ec-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
+Note the filename. The bench-host setup script (the sequencer's `scripts/bench/server-setup.sh`, which replaces this repository's deprecated `scripts/server-setup.sh`) owns `99-melin-ec-bench.cfg` in the same directory and rewrites it from scratch on every run, so anything you put there is lost the next time the script is used. Keep manual tuning in a drop-in of your own; both are sourced, and the parameters combine. If you are running `server-setup.sh` on this host, prefer editing its `KERNEL_PARAMS` list to hand-writing a second file — it applies a wider set of parameters than the three above and verifies afterwards that each one actually reached the boot config.
 
 Then apply:
 
@@ -531,7 +530,7 @@ To revert, remove the drop-in — the vendor's `/etc/default/grub` was never mod
 sudo rm /etc/default/grub.d/99-melin-manual.cfg && sudo update-grub && sudo reboot
 ```
 
-On a host provisioned by `scripts/server-setup.sh`, remove `99-melin-ec-bench.cfg` the same way to undo the parameters it applied.
+On a host provisioned by the setup script, remove `99-melin-ec-bench.cfg` the same way to undo the parameters it applied.
 
 ### Runtime Tuning (bench-isolate.sh)
 
@@ -546,7 +545,7 @@ The `scripts/bench-isolate.sh` script applies runtime tuning that does not requi
 sudo ./scripts/bench-isolate.sh [bench args]
 ```
 
-For production, apply these settings permanently. `scripts/server-setup.sh` installs the governor and IRQ pinning as `systemd` oneshot units (`melin-cpu-governor`, `melin-irq-pin`) so they survive reboots; the equivalent by hand is:
+For production, apply these settings permanently. The sequencer's `scripts/bench/server-setup.sh` installs the governor and IRQ pinning as `systemd` oneshot units (`melin-cpu-governor`, `melin-irq-pin`) so they survive reboots; the equivalent by hand is:
 
 ```sh
 # CPU governor (install as a systemd unit, not a one-off shell loop)
@@ -907,7 +906,7 @@ For best journal performance, use an NVMe drive with:
 
 - **Power Loss Protection (PLP)**: Required. The journal relies on PLP capacitors to flush controller DRAM to NAND on power loss. Consumer SSDs and drives without confirmed PLP support are not safe for production use.
 - **Dedicated journal disk**: Avoids contention with OS I/O. Sharing the disk with the OS or other workloads increases p99 latency.
-- **Use xfs, not ext4**: ext4's jbd2 batches metadata commits at internal extent-group boundaries (~256 MiB on the layouts we see), which adds a ~1–2 ms `fdatasync` stall every ~10 s of sustained writes. Under the `disk+ram` ack policy with ≥ 2 replicas the stalls usually mask each other, but because the bench's event stream is byte-deterministic the same offset triggers the same stall on every node simultaneously — defeating the masking. xfs allocates extents through a different bookkeeping path that doesn't fire at write-time, so the periodic spike vanishes. Mount xfs with `noatime,logbsize=256k,logbufs=8`. `scripts/server-setup.sh` does this automatically.
+- **Use xfs, not ext4**: ext4's jbd2 batches metadata commits at internal extent-group boundaries (~256 MiB on the layouts we see), which adds a ~1–2 ms `fdatasync` stall every ~10 s of sustained writes. Under the `disk+ram` ack policy with ≥ 2 replicas the stalls usually mask each other, but because the bench's event stream is byte-deterministic the same offset triggers the same stall on every node simultaneously — defeating the masking. xfs allocates extents through a different bookkeeping path that doesn't fire at write-time, so the periodic spike vanishes. Mount xfs with `noatime,logbsize=256k,logbufs=8`. The sequencer's `scripts/bench/server-setup.sh` does this automatically.
 
 ---
 

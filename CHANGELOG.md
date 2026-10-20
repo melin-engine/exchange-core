@@ -78,6 +78,41 @@ protocol error on the first degraded ack it receives.
 - **`melin-ec-replication-bench --ack-policy` is journaled** ahead of the
   generated events, as replicas now learn the policy from the journal, and
   the bench waits for every replica to stream live rather than to connect.
+- **`--snapshot-path` is the node's one snapshot location**: recovered
+  from at startup by a primary and a replica alike, sent to a replica that
+  needs a resync, and written by the shadow exchange. A node refuses to
+  start on a snapshot location it cannot use: a directory, a missing
+  directory, the journal path, or an empty explicit path while a snapshot
+  sits at the default `<journal>.snapshot` on a node with no journal
+  *(sequencer)*.
+
+### Deprecated
+
+- **`scripts/server-setup.sh`, `scripts/server-deploy.sh`,
+  `scripts/lan-bench-suite.sh` and `scripts/lan-bench.sh`**, in favour of
+  the sequencer's `scripts/bench/` copies: its `server-setup.sh` and
+  `server-deploy.sh` prepare bench hosts, and its `lan-bench-suite.sh`
+  benchmarks this exchange as its `ec` application. Each deprecated script
+  prints a warning and still runs. See "Reproducing Published Benchmarks"
+  in the benchmarking guide.
+
+### Removed
+
+- **`--snapshot`.** A command line that still carries it is refused. It
+  was read only at a primary's startup, while the shadow exchange kept
+  writing to `--snapshot-path` (or `<journal>.snapshot`), so that file is
+  the freshest snapshot. With `--snapshot-path` set, drop `--snapshot`.
+  With `--snapshot X` alone, move the current `<journal>.snapshot` to the
+  location you want and set `--snapshot-path` to it; to restore a backup,
+  copy it to the snapshot path *(sequencer)*.
+
+### Fixed
+
+- **A node whose state exceeds 256 MiB can take snapshots.** That was the
+  sequencer's limit, and an exchange of about 100,000 accounts (around
+  480 MB of state) failed every save, logged an error each interval, and
+  recovered by replaying its whole journal. The limit is now 1 TiB. A load
+  still reads the snapshot into memory whole *(sequencer)*.
 
 ## [0.19.0] - 2026-10-10
 

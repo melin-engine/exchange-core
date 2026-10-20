@@ -1681,8 +1681,7 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13cf05dcb3ee4a770240e7f7637d09f21b3b9628d5030f88ed33ee92ef0e3f9b"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "base64",
  "libc",
@@ -1692,8 +1691,7 @@ dependencies = [
 [[package]]
 name = "melin-client"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7898c74f98dc28bebfe9466ce831ee38536718af63b204bd1e8837f7381cc325"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1703,8 +1701,7 @@ dependencies = [
 [[package]]
 name = "melin-dpdk"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c0a72d17433552b048ceeb36fa7d1f47b35df6b95231bd1bb89873e5c198ffe"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "bindgen",
  "cc",
@@ -1939,8 +1936,7 @@ version = "0.19.0"
 [[package]]
 name = "melin-journal"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ac1c8874e0d979132e7784d14027fba8ceea6769e9a18ce2271c02189f4d87"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1957,14 +1953,12 @@ dependencies = [
 [[package]]
 name = "melin-pipeline"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33b17239ce2968445aafdcf076509018181768991424f3cb7f687a0e6b90e122"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 
 [[package]]
 name = "melin-raft"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91029cd3e6cc0dc9c42ee509f9985032763e995af285f4694adc856a815bcf82"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "crc32c",
  "ed25519-dalek",
@@ -1981,8 +1975,7 @@ dependencies = [
 [[package]]
 name = "melin-server-runtime"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "945a8f87b4c352ef0d74606c00f1747143974e8a8fa5fbfdcdf73e972911ab86"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "base64",
  "blake3",
@@ -2008,8 +2001,7 @@ dependencies = [
 [[package]]
 name = "melin-transport-core"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a8115b7c81d883c8440af2aac125bb099fcf9f22da738eccf2477eccf9622bc"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 dependencies = [
  "crc32c",
  "hdrhistogram",
@@ -2025,8 +2017,7 @@ dependencies = [
 [[package]]
 name = "melin-wire-protocol"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3befca245e3954d1aac833a8a17aab9151096f7dd78085eb019eb4d08e85755d"
+source = "git+https://github.com/melin-engine/melin.git?branch=main#eb818f480efedfd7693c75eda75144922323f1ec"
 
 [[package]]
 name = "memchr"
