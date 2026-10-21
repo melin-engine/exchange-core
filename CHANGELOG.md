@@ -18,6 +18,12 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+This release adopts sequencer 0.22.0, which only makes runtime internals
+private; the [0.22.0 section of its
+changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0220---2026-10-21)
+has the detail. Nothing changes on the wire, on disk or in a node's
+configuration.
+
 ## [0.21.0] - 2026-10-21
 
 This release adopts sequencer 0.21.0; the
