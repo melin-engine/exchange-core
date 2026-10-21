@@ -644,8 +644,11 @@ impl Session {
                 // A query, safe to resend: nothing else is in flight
                 // before the Logon is acknowledged.
                 TurnedAway::Busy => self.queue_request_seq_sync(config),
+                // Every role may send the query, so a refusal is the node
+                // failing to decode it or denying a role it should not:
+                // its reason is the most the FIX client can be told.
                 TurnedAway::Refused { .. } => {
-                    self.queue_fix_logout(config, "not permitted");
+                    self.queue_fix_logout(config, text);
                     SessionAction::Close
                 }
             },
@@ -2578,6 +2581,39 @@ lot_size_inverse = 1
         );
         assert!(matches!(s.state, SessionState::SyncingRequestSeq));
         assert!(s.fix_send_buf.is_empty());
+    }
+
+    /// A refused sync query logs the FIX client out with the node's
+    /// reason: the session cannot open without the sync.
+    #[test]
+    fn a_refused_sync_query_logs_out_with_the_reason() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = new_session(Instant::now());
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.queue_request_seq_sync(&config);
+        let [(id, _)] = take_melin_requests(&mut s)[..] else {
+            panic!("one request");
+        };
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::Refused {
+                id,
+                kind: RefusalKind::Malformed,
+                reason: "invalid field",
+            }),
+        );
+        let sym = symbol_map(&config);
+        let action = s
+            .try_process_melin_frame(&config, &sym, Instant::now())
+            .expect("a whole frame");
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(s.melin_send_buf.is_empty(), "nothing resent");
+        let logout = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(logout.msg_type(), tags::MSG_LOGOUT);
+        assert_eq!(logout.get_str(tags::TEXT), Some("invalid field"));
+        assert_eq!(s.metrics.exchange_refused_total.load(Ordering::Relaxed), 1);
     }
 
     #[test]
