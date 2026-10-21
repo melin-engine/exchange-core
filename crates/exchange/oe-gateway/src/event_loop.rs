@@ -1453,8 +1453,8 @@ lot_size_inverse = 1
         client.write_all(&nos).unwrap();
 
         // The stub should receive the translated SubmitOrder.
-        let (_seq, req) = stub.next_request(Duration::from_secs(3));
-        let order_id = match req {
+        let sent = stub.next_request(Duration::from_secs(3));
+        let order_id = match sent.request {
             Request::SubmitOrder { symbol, order } => {
                 assert_eq!(symbol.0, 1);
                 assert_eq!(order.side, Side::Buy);
@@ -1465,14 +1465,17 @@ lot_size_inverse = 1
 
         // Push a Placed execution report back. The gateway should
         // translate it into a FIX ExecutionReport and forward it.
-        stub.send_response(ResponseKind::Report(ExecutionReport::Placed {
-            order_id,
-            symbol: Symbol(1),
-            account: AccountId(7),
-            side: Side::Buy,
-            price: Price(NonZeroU64::new(5_000_000).unwrap()),
-            quantity: Quantity(NonZeroU64::new(10).unwrap()),
-        }));
+        stub.send_reply(
+            sent.id,
+            ResponseKind::Report(ExecutionReport::Placed {
+                order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
+                side: Side::Buy,
+                price: Price(NonZeroU64::new(5_000_000).unwrap()),
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            }),
+        );
 
         let raw = read_fix_message(&mut client);
         let er = FixMessage::parse(&raw).unwrap();
@@ -1521,19 +1524,22 @@ lot_size_inverse = 1
             .str_tag(tags::TIME_IN_FORCE, "1")
             .build("FIRM_A", "MELIN", 2);
         client.write_all(&nos).unwrap();
-        let (_seq, req) = stub.next_request(Duration::from_secs(3));
-        let Request::SubmitOrder { order, .. } = req else {
-            panic!("expected SubmitOrder, got {req:?}");
+        let sent = stub.next_request(Duration::from_secs(3));
+        let Request::SubmitOrder { order, .. } = sent.request else {
+            panic!("expected SubmitOrder, got {:?}", sent.request);
         };
 
-        stub.send_response_behind_heartbeat(ResponseKind::Report(ExecutionReport::Placed {
-            order_id: order.id,
-            symbol: Symbol(1),
-            account: AccountId(7),
-            side: Side::Buy,
-            price: Price(NonZeroU64::new(5_000_000).unwrap()),
-            quantity: Quantity(NonZeroU64::new(10).unwrap()),
-        }));
+        stub.send_reply_behind_heartbeat(
+            sent.id,
+            ResponseKind::Report(ExecutionReport::Placed {
+                order_id: order.id,
+                symbol: Symbol(1),
+                account: AccountId(7),
+                side: Side::Buy,
+                price: Price(NonZeroU64::new(5_000_000).unwrap()),
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            }),
+        );
 
         let raw = read_fix_message(&mut client);
         let er = FixMessage::parse(&raw).unwrap();
@@ -1578,19 +1584,22 @@ lot_size_inverse = 1
             .str_tag(tags::TIME_IN_FORCE, "1")
             .build("FIRM_A", "MELIN", 2);
         client.write_all(&nos);
-        let (_, req) = stub.next_request(Duration::from_secs(3));
-        let order_id = match req {
+        let sent = stub.next_request(Duration::from_secs(3));
+        let order_id = match sent.request {
             Request::SubmitOrder { order, .. } => order.id,
             other => panic!("expected SubmitOrder, got {other:?}"),
         };
-        stub.send_response(ResponseKind::Report(ExecutionReport::Placed {
-            order_id,
-            symbol: Symbol(1),
-            account: AccountId(7),
-            side: Side::Buy,
-            price: Price(NonZeroU64::new(5_000_000).unwrap()),
-            quantity: Quantity(NonZeroU64::new(10).unwrap()),
-        }));
+        stub.send_reply(
+            sent.id,
+            ResponseKind::Report(ExecutionReport::Placed {
+                order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
+                side: Side::Buy,
+                price: Price(NonZeroU64::new(5_000_000).unwrap()),
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            }),
+        );
         let raw = client.read_message();
         assert_eq!(
             FixMessage::parse(&raw).unwrap().msg_type(),
@@ -1636,7 +1645,10 @@ lot_size_inverse = 1
     fn cancel_rejected_by_engine_yields_order_cancel_reject() {
         use crate::test_stub::MelinStub;
         use melin_ec_protocol::message::{Request, ResponseKind};
-        use melin_ec_types::types::{AccountId, ExecutionReport, RejectReason, Symbol};
+        use melin_ec_types::types::{
+            AccountId, ExecutionReport, Price, Quantity, RejectReason, Side, Symbol,
+        };
+        use std::num::NonZeroU64;
 
         let stub = MelinStub::start();
         let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
@@ -1665,11 +1677,27 @@ lot_size_inverse = 1
             .str_tag(tags::TIME_IN_FORCE, "1")
             .build("FIRM_A", "MELIN", 2);
         client.write_all(&nos).unwrap();
-        let (_, req) = stub.next_request(Duration::from_secs(3));
-        let order_id = match req {
+        let sent = stub.next_request(Duration::from_secs(3));
+        let order_id = match sent.request {
             Request::SubmitOrder { order, .. } => order.id,
             other => panic!("expected SubmitOrder, got {other:?}"),
         };
+        stub.send_reply(
+            sent.id,
+            ResponseKind::Report(ExecutionReport::Placed {
+                order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
+                side: Side::Buy,
+                price: Price(NonZeroU64::new(5_000_000).unwrap()),
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            }),
+        );
+        let raw = read_fix_message(&mut client);
+        assert_eq!(
+            FixMessage::parse(&raw).unwrap().msg_type(),
+            tags::MSG_EXECUTION_REPORT
+        );
 
         // Now send a cancel for it.
         let cxl = FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REQUEST)
@@ -1681,8 +1709,8 @@ lot_size_inverse = 1
             .build("FIRM_A", "MELIN", 3);
         client.write_all(&cxl).unwrap();
 
-        let (_, req) = stub.next_request(Duration::from_secs(3));
-        match req {
+        let sent = stub.next_request(Duration::from_secs(3));
+        match sent.request {
             Request::CancelOrder {
                 order_id: cancel_target,
                 ..
@@ -1691,12 +1719,15 @@ lot_size_inverse = 1
         }
 
         // Engine rejects the cancel (e.g. already filled).
-        stub.send_response(ResponseKind::Report(ExecutionReport::Rejected {
-            order_id,
-            symbol: Symbol(1),
-            account: AccountId(7),
-            reason: RejectReason::UnknownOrder,
-        }));
+        stub.send_reply(
+            sent.id,
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
+                reason: RejectReason::UnknownOrder,
+            }),
+        );
 
         // Gateway should emit an OrderCancelReject (35=9), not an ER.
         let raw = read_fix_message(&mut client);
@@ -1704,6 +1735,81 @@ lot_size_inverse = 1
         assert_eq!(reject.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
         assert_eq!(reject.get_str(tags::CL_ORD_ID), Some("CXL1"));
         assert_eq!(reject.get_str(tags::ORIG_CL_ORD_ID), Some("ORD1"));
+
+        drop(client);
+        gw.shutdown();
+        drop(stub);
+    }
+
+    /// An order the node sheds is rejected to the FIX client through the
+    /// real loop, and the session goes on: the resent order is placed.
+    #[test]
+    fn busy_order_is_rejected_and_its_resend_placed() {
+        use crate::test_stub::MelinStub;
+        use melin_ec_protocol::message::{Request, ResponseKind};
+        use melin_ec_types::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
+        use melin_wire_protocol::control::TransportResponse;
+        use std::num::NonZeroU64;
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let raw = read_fix_message(&mut client);
+        assert_eq!(FixMessage::parse(&raw).unwrap().msg_type(), tags::MSG_LOGON);
+
+        let nos = |seq, clord| {
+            FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+                .str_tag(tags::CL_ORD_ID, clord)
+                .str_tag(tags::SYMBOL, "BTC/USD")
+                .str_tag(tags::SIDE, "1")
+                .str_tag(tags::ORD_TYPE, "2")
+                .str_tag(tags::PRICE, "50000.00")
+                .str_tag(tags::ORDER_QTY, "10")
+                .str_tag(tags::TIME_IN_FORCE, "1")
+                .build("FIRM_A", "MELIN", seq)
+        };
+
+        client.write_all(&nos(2, "ORD1")).unwrap();
+        let shed = stub.next_request(Duration::from_secs(3));
+        assert!(matches!(shed.request, Request::SubmitOrder { .. }));
+        stub.send_transport(TransportResponse::ServerBusy { id: shed.id });
+
+        let raw = read_fix_message(&mut client);
+        let reject = FixMessage::parse(&raw).unwrap();
+        assert_eq!(reject.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(reject.get_str(tags::CL_ORD_ID), Some("ORD1"));
+        assert_eq!(reject.get_str(tags::EXEC_TYPE), Some("8"));
+
+        client.write_all(&nos(3, "ORD2")).unwrap();
+        let resent = stub.next_request(Duration::from_secs(3));
+        assert!(resent.id > shed.id, "a new ID");
+        let Request::SubmitOrder { order, .. } = resent.request else {
+            panic!("expected SubmitOrder, got {:?}", resent.request);
+        };
+        stub.send_reply(
+            resent.id,
+            ResponseKind::Report(ExecutionReport::Placed {
+                order_id: order.id,
+                symbol: Symbol(1),
+                account: AccountId(7),
+                side: Side::Buy,
+                price: Price(NonZeroU64::new(5_000_000).unwrap()),
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            }),
+        );
+        let raw = read_fix_message(&mut client);
+        let er = FixMessage::parse(&raw).unwrap();
+        assert_eq!(er.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(er.get_str(tags::CL_ORD_ID), Some("ORD2"));
+        assert_eq!(er.get_str(tags::EXEC_TYPE), Some("0"));
 
         drop(client);
         gw.shutdown();
