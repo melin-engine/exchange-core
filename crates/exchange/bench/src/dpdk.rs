@@ -823,10 +823,15 @@ pub fn run_dpdk_roundtrip(
                         // `warmup_end` too.
                         let received_tsc = crate::rdtscp();
                         diag_batch_ends += 1;
-                        if let Some(sent_tsc) = conn.in_flight.remove(id)
-                            && now >= deadlines.warmup_end
-                            && now < deadlines.measured_end
-                        {
+                        // Unlike a malformed frame, an answer naming no
+                        // request in flight means the pairing is broken,
+                        // and with it every latency measured: fail the
+                        // run, as the io_uring path does.
+                        let sent_tsc = conn
+                            .in_flight
+                            .remove(id)
+                            .expect("a BatchEnd for no request in flight");
+                        if now >= deadlines.warmup_end && now < deadlines.measured_end {
                             if measured_start.is_none() {
                                 measured_start = Some(now);
                             }
@@ -851,7 +856,9 @@ pub fn run_dpdk_roundtrip(
                     // A shed request leaves the window, unmeasured: it
                     // made no round trip through the engine.
                     Reply::ServerBusy { id } => {
-                        conn.in_flight.remove(id);
+                        conn.in_flight
+                            .remove(id)
+                            .expect("a busy answer for no request in flight");
                     }
                     // The bench's keys may send every request it
                     // generates: a refusal is a misconfigured run.

@@ -92,7 +92,8 @@ and logs the FIX client out with `exchange unavailable`.
 - **The bench pairs answers with requests by ID.** A shed request leaves
   the window unmeasured, counted under `server_busy` (printed as `shed
   (busy)`); a refused one fails the run, as the bench's keys may send every
-  request it makes.
+  request it makes, and so does an answer naming no request in flight, on
+  DPDK as on kernel TCP.
 
 - **The ack policy is journaled** *(sequencer)*. `ACK-POLICY` replies `OK`
   once the switch is journaled, which can be before it is in force; it
