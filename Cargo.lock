@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "astenn",
  "melin-ec-trading",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-admin"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "base64",
  "crossterm",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-bench"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "base64",
  "blake3",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-client"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "ed25519-dalek",
  "melin-client",
@@ -1797,14 +1797,14 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-gateway-core"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "melin-ec-market-data"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "astenn",
  "melin-client",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-md-gateway"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-oe-gateway"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "ed25519-dalek",
  "io-uring",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-protocol"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "bolero",
  "melin-app",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-server"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "base64",
  "blake3",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-trading"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "melin-app",
  "melin-ec-types",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-tui"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-tui-fix-client"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "crossterm",
  "melin-ec-gateway-core",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "melin-ec-types"
-version = "0.19.0"
+version = "0.21.0"
 
 [[package]]
 name = "melin-journal"

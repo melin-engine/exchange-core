@@ -18,6 +18,8 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-21
+
 This release adopts sequencer 0.21.0; the
 [0.20.0](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0200---2026-10-19)
 and [0.21.0](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0210---2026-10-21)
@@ -578,7 +580,8 @@ has no journal from sequence 1, is re-bootstrapped from a node that has.
 - An unpinned server thread runs on the process's own CPU set *(sequencer)*
   instead of inheriting an isolated core from the thread that started it.
 
-[Unreleased]: https://github.com/melin-engine/exchange-core/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/melin-engine/exchange-core/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.21.0
 [0.19.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.19.0
 [0.18.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.18.0
 [0.17.0]: https://github.com/melin-engine/exchange-core/releases/tag/v0.17.0
