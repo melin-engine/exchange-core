@@ -79,6 +79,10 @@ and logs the FIX client out with `exchange unavailable`.
   the same connection. A late answer to a request whose call timed out is
   discarded by the next call, which returns its own answer, where it used
   to be taken for that call's. Source-breaking for an exhaustive `match`.
+- **`melin_ec_market_data::cold_start::SnapshotError`** gains
+  `RequestAnswer`, for a `ServerBusy` or `Refused` frame on the event feed,
+  which only ever answers a client's own request. Source-breaking for an
+  exhaustive `match`.
 - **The event feed's batch ends name request 0**, whichever client's
   request they close: a request's ID belongs to its connection. Each grows
   by the eight bytes of the ID.

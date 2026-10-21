@@ -163,9 +163,7 @@ pub(crate) fn read_response(
             Reply::Response(body) => return Ok((seq, codec::decode_response_body(body)?)),
             Reply::Heartbeat | Reply::BatchEnd { .. } => {}
             Reply::ServerBusy { .. } | Reply::Refused { .. } => {
-                return Err(SnapshotError::Transport(melin_client::Error::Protocol(
-                    "a busy or a refusal on the event feed".to_owned(),
-                )));
+                return Err(SnapshotError::RequestAnswer);
             }
         }
     }
@@ -200,6 +198,9 @@ pub enum SnapshotError {
     /// The sequencer's client refused a frame: an empty one, or a tag
     /// no reply carries.
     Transport(melin_client::Error),
+    /// A `ServerBusy` or `Refused`: an answer to a client's request,
+    /// which the publisher should never have put on the feed.
+    RequestAnswer,
     FrameTooLarge(usize),
     DuplicateSymbol(Symbol),
 }
@@ -228,6 +229,7 @@ impl std::fmt::Display for SnapshotError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Transport(e) => write!(f, "malformed frame from the publisher: {e}"),
+            Self::RequestAnswer => write!(f, "a busy or a refusal on the event feed"),
             Self::FrameTooLarge(n) => write!(f, "frame too large: {n} bytes"),
             Self::DuplicateSymbol(s) => write!(f, "duplicate symbol in snapshot: {:?}", s),
         }
@@ -443,7 +445,7 @@ mod tests {
             assert!(
                 matches!(
                     parse_snapshot(&mut cursor),
-                    Err(SnapshotError::Transport(melin_client::Error::Protocol(_)))
+                    Err(SnapshotError::RequestAnswer)
                 ),
                 "{frame:?} must not be skipped"
             );
