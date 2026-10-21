@@ -2,6 +2,7 @@
 //! TCP socket; connect performs the four-message Ed25519 challenge-
 //! response handshake and returns a ready-to-use Client.
 
+use std::cmp::Ordering;
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
@@ -150,6 +151,12 @@ impl Client {
     /// Intended for tests and tools that need to fail fast when a
     /// server stalls; production clients usually want the default
     /// behaviour (no timeout — a healthy connection is just idle).
+    ///
+    /// A request whose call timed out may still have been applied, and
+    /// its answer may arrive later: the next call discards it and reads
+    /// on to its own. A timeout that strikes in the middle of a frame
+    /// leaves the connection unframed, and later calls fail; reconnect
+    /// after an error that is not one of the node's answers.
     pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
         self.reader.get_ref().set_read_timeout(dur)
     }
@@ -217,14 +224,22 @@ impl Client {
                         }),
                     ),
                 };
-            // One request is in flight: an answer naming another is the
-            // node's mistake, and nothing after it can be trusted.
-            if answered != sent {
-                return Err(ClientError::Protocol(ProtocolError::InvalidField(
-                    "an answer naming another request",
-                )));
+            match answered.cmp(&sent) {
+                Ordering::Equal => return outcome.map(|ack| (responses, ack)),
+                // A late answer to an earlier request, whose call gave up
+                // waiting (a read timeout): its responses came just before
+                // it, and are not this request's. Each call waits for its
+                // own answer, so an earlier request still unanswered is one
+                // whose call failed.
+                Ordering::Less => responses.clear(),
+                // IDs only grow: an answer to a request not yet sent is the
+                // node's mistake, and nothing after it can be trusted.
+                Ordering::Greater => {
+                    return Err(ClientError::Protocol(ProtocolError::InvalidField(
+                        "an answer naming a request not sent",
+                    )));
+                }
             }
-            return outcome.map(|ack| (responses, ack));
         }
     }
 
@@ -727,10 +742,10 @@ mod tests {
         assert!(client.send_request(&cancel_order()).unwrap().is_empty());
     }
 
-    /// Every answer names its request: one naming another is a protocol
-    /// violation, never taken for this request's.
+    /// Every answer names its request: one naming a request not yet sent
+    /// is a protocol violation, never taken for this request's.
     #[test]
-    fn an_answer_naming_another_request_is_a_protocol_error() {
+    fn an_answer_naming_a_request_not_sent_is_a_protocol_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -756,6 +771,49 @@ mod tests {
         assert!(
             matches!(result, Err(ClientError::Protocol(_))),
             "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// A request whose call timed out is answered late, ahead of the
+    /// next request's answer: the next call discards the late answer,
+    /// its responses included, and returns its own.
+    #[test]
+    fn a_late_answer_to_a_timed_out_request_is_discarded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+
+            // The first request goes unanswered until the second arrives,
+            // which the client sends once the first has timed out.
+            let (late, _request) = read_request(&mut reader);
+            let (next, _request) = read_request(&mut reader);
+            write_response(&mut writer, &ResponseKind::RequestSeqHwm { hwm: 1 });
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id: late });
+            write_response(&mut writer, &ResponseKind::RequestSeqHwm { hwm: 2 });
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id: next });
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        assert!(matches!(
+            client.send_request(&cancel_order()),
+            Err(ClientError::Io(_))
+        ));
+
+        client.set_read_timeout(None).unwrap();
+        let responses = client.send_request(&cancel_order()).unwrap();
+        assert!(
+            matches!(responses[..], [ResponseKind::RequestSeqHwm { hwm: 2 }]),
+            "expected the second request's own response, got {responses:?}"
         );
     }
 

@@ -75,7 +75,9 @@ signs anything.
   a request the node refused, and `ProtocolVersion { node, client }`, for a
   node of another client protocol; `RefusalKind` is re-exported.
   `ServerBusy` now means the request was not applied and may be resent on
-  the same connection. Source-breaking for an exhaustive `match`.
+  the same connection. A late answer to a request whose call timed out is
+  discarded by the next call, which returns its own answer, where it used
+  to be taken for that call's. Source-breaking for an exhaustive `match`.
 - **The event feed's batch ends name request 0**, whichever client's
   request they close: a request's ID belongs to its connection. Each grows
   by the eight bytes of the ID.
