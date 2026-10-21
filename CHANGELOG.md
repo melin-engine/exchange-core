@@ -26,7 +26,8 @@ restart on the existing journals and snapshots. An older release refuses a
 journal or snapshot written by this one rather than misread it. Upgrade
 clients and gateways with the nodes: the client wire protocol changes, and
 a client refuses a node of another protocol at the handshake, before it
-signs anything.
+signs anything. The FIX gateway then logs a warning naming both versions
+and logs the FIX client out with `exchange unavailable`.
 
 ### Added
 

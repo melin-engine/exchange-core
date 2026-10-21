@@ -798,6 +798,18 @@ impl Session {
                 self.queue_fix_logout(config, "authentication failed");
                 SessionAction::Close
             }
+            // A deployment with the gateway and the nodes on different
+            // releases: no bug here, but no session can open until the
+            // operator upgrades one side.
+            Err(melin_client::Error::ProtocolVersion { node, client }) => {
+                warn!(
+                    sender = %self.sender_comp_id,
+                    node, client,
+                    "Melin node speaks another client protocol version: upgrade the gateway with the nodes"
+                );
+                self.queue_fix_logout(config, "exchange unavailable");
+                SessionAction::Close
+            }
             Err(e) => {
                 error!(error = %e, "Melin handshake failed");
                 self.queue_fix_logout(config, "internal error");
@@ -2390,6 +2402,28 @@ lot_size_inverse = 1
             [(RequestId(1), Request::QueryRequestSeq)]
         ));
         assert!(s.in_flight.contains(RequestId(1)));
+    }
+
+    /// A node on another client protocol version logs the FIX client out
+    /// before anything is signed.
+    #[test]
+    fn a_challenge_of_another_protocol_version_logs_out() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = new_session(Instant::now());
+        s.state = SessionState::AwaitingChallenge;
+        s.sender_comp_id = "FIRM_A".to_owned();
+        s.handshake = Some(Handshake::new(&SigningKey::from_bytes(&[0u8; 32])));
+        let mut challenge = transport_payload(&TransportResponse::Challenge { nonce: [0u8; 32] });
+        // The version follows the tag.
+        challenge[1..3].copy_from_slice(&2u16.to_le_bytes());
+
+        let action = s.handle_handshake_frame(&challenge, &config);
+
+        assert_eq!(action, SessionAction::Close);
+        assert!(s.melin_send_buf.is_empty(), "nothing signed or sent");
+        let logout = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(logout.msg_type(), tags::MSG_LOGOUT);
+        assert_eq!(logout.get_str(tags::TEXT), Some("exchange unavailable"));
     }
 
     #[test]
