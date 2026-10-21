@@ -577,9 +577,20 @@ impl Session {
                 self.queue_position_report(&pos_req_id, &held, config);
                 SessionAction::SendFix
             }
+            // A node bug, but the FIX client is still owed an answer.
             (Some(InFlightRequest::Position { pos_req_id }), None) => {
                 warn!(sender = %self.sender_comp_id, pos_req_id, "position query answered without a position");
-                SessionAction::None
+                let msg = translate::position_reject_to_fix(
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                    &pos_req_id,
+                    &self.account_id.0.to_string(),
+                    "99",
+                    "no position in the exchange's answer",
+                );
+                self.queue_fix_raw(&msg);
+                SessionAction::SendFix
             }
             (Some(_), Some(_)) => {
                 warn!(sender = %self.sender_comp_id, id = id.0, "position in the reply to another request");
@@ -2815,6 +2826,168 @@ lot_size_inverse = 1
             ]
         );
         assert!(s.in_flight.is_empty());
+    }
+
+    /// Send RequestForPositions `pos_req_id` and return the ID it went
+    /// out under.
+    fn send_positions_request(
+        s: &mut Session,
+        config: &GatewayConfig,
+        seq: u64,
+        pos_req_id: &str,
+    ) -> RequestId {
+        let raw = positions_msg("FIRM_A", "MELIN", seq, pos_req_id);
+        assert_eq!(
+            s.handle_fix_message(&raw, config, &session_map(config), &symbol_map(config)),
+            SessionAction::SendMelin
+        );
+        let [(id, Request::QueryPosition { .. })] = take_melin_requests(s)[..] else {
+            panic!("one position query");
+        };
+        id
+    }
+
+    /// The node's position answer: an empty snapshot, then the end of
+    /// the reply to `id`.
+    fn push_position_reply(s: &mut Session, id: RequestId) {
+        push_melin_frame(
+            s,
+            &encode_response_payload(&ResponseKind::PositionSnapshot {
+                account: AccountId(7),
+                balances: [AccountBalance::ZERO; 16],
+                count: 0,
+            }),
+        );
+        push_melin_frame(s, &transport_payload(&TransportResponse::BatchEnd { id }));
+    }
+
+    /// The single FIX message the session queued, taken off its send
+    /// buffer.
+    fn take_one_fix(s: &mut Session) -> Vec<u8> {
+        let sent = take_fix(s);
+        let [msg] = &sent[..] else {
+            panic!("one FIX message, got {}", sent.len());
+        };
+        msg.clone()
+    }
+
+    /// A position query shed under load is a PositionReport with no
+    /// positions, `PosReqResult=99`, asking for a resend.
+    #[test]
+    fn a_busy_position_query_is_answered_with_result_99() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = active_session(&config, Instant::now());
+        let id = send_positions_request(&mut s, &config, 2, "POS1");
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::ServerBusy { id }),
+        );
+        drain_melin(&mut s, &config);
+
+        let raw = take_one_fix(&mut s);
+        let report = FixMessage::parse(&raw).unwrap();
+        assert_eq!(report.msg_type(), tags::MSG_POSITION_REPORT);
+        assert_eq!(report.get_str(tags::POS_REQ_ID), Some("POS1"));
+        assert_eq!(report.get_str(tags::POS_REQ_RESULT), Some("99"));
+        assert!(report.get_str(tags::TEXT).unwrap().contains("resend"));
+        assert!(s.in_flight.is_empty());
+    }
+
+    /// A position query whose reply ends without a position is still
+    /// answered, so the FIX client does not wait for a report.
+    #[test]
+    fn a_position_query_answered_without_a_position_is_still_answered() {
+        let config = make_config("FIRM_A", "MELIN");
+        let mut s = active_session(&config, Instant::now());
+        let id = send_positions_request(&mut s, &config, 2, "POS1");
+
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::BatchEnd { id }),
+        );
+        drain_melin(&mut s, &config);
+
+        let raw = take_one_fix(&mut s);
+        let report = FixMessage::parse(&raw).unwrap();
+        assert_eq!(report.msg_type(), tags::MSG_POSITION_REPORT);
+        assert_eq!(report.get_str(tags::POS_REQ_ID), Some("POS1"));
+        assert_eq!(report.get_str(tags::POS_REQ_RESULT), Some("99"));
+        assert!(s.in_flight.is_empty());
+    }
+
+    /// A position in the reply to some other request is dropped with
+    /// that reply, not held over for the next position query's.
+    #[test]
+    fn a_position_in_the_reply_to_another_request_is_dropped() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let raw = new_order_msg("FIRM_A", "MELIN", 2, "ORD1");
+        s.handle_fix_message(&raw, &config, &smap, &sym);
+        let [(order, _)] = take_melin_requests(&mut s)[..] else {
+            panic!("one order");
+        };
+        push_position_reply(&mut s, order);
+        drain_melin(&mut s, &config);
+        assert!(s.fix_send_buf.is_empty());
+        assert!(s.held_position.is_none());
+
+        // The next position query's reply ends without a position: had
+        // the stray one been held over, it would have answered it.
+        let id = send_positions_request(&mut s, &config, 3, "POS1");
+        push_melin_frame(
+            &mut s,
+            &transport_payload(&TransportResponse::BatchEnd { id }),
+        );
+        drain_melin(&mut s, &config);
+        let raw = take_one_fix(&mut s);
+        let report = FixMessage::parse(&raw).unwrap();
+        assert_eq!(report.get_str(tags::POS_REQ_RESULT), Some("99"));
+        assert!(s.in_flight.is_empty());
+    }
+
+    /// A turned-away request with no FIX message of its own to answer
+    /// with — a cancel whose ClOrdID was not kept, or any other request —
+    /// gets a session-level Reject carrying the reason.
+    #[test]
+    fn a_turned_away_request_without_its_own_answer_is_a_session_reject() {
+        let config = make_config("FIRM_A", "MELIN");
+        for (request, why) in [
+            (
+                InFlightRequest::Cancel {
+                    order_id: OrderId(9),
+                },
+                TransportResponse::ServerBusy { id: RequestId(1) },
+            ),
+            (
+                InFlightRequest::Other,
+                TransportResponse::Refused {
+                    id: RequestId(1),
+                    kind: RefusalKind::PermissionDenied,
+                    reason: "not for this role",
+                },
+            ),
+        ] {
+            let mut s = active_session(&config, Instant::now());
+            s.in_flight.insert(RequestId(1), request);
+            s.melin_last_id = 1;
+            let text = match &why {
+                TransportResponse::Refused { reason, .. } => *reason,
+                _ => "exchange busy, not applied: resend",
+            };
+
+            push_melin_frame(&mut s, &transport_payload(&why));
+            drain_melin(&mut s, &config);
+
+            let raw = take_one_fix(&mut s);
+            let reject = FixMessage::parse(&raw).unwrap();
+            assert_eq!(reject.msg_type(), tags::MSG_REJECT, "{why:?}");
+            assert_eq!(reject.get_str(tags::TEXT), Some(text));
+            assert!(s.in_flight.is_empty());
+        }
     }
 
     #[test]
