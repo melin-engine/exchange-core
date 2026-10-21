@@ -41,10 +41,11 @@ const _: () =
 // added so the response stage's durability gate can compare against
 // replica metrics in wire-seq space rather than the unsound local-vs-wire
 // mix that previously let the gate open on un-replicated events on a
-// recovered primary. Correctness > footprint here.
+// recovered primary. Correctness > footprint here. Then 424 → 432 for
+// the client's request ID, which every answer names.
 #[cfg(not(feature = "latency-trace"))]
 const _: () = assert!(
-    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 424
+    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 432
 );
 // The request sequence rides inside the event since the sequencer stopped
 // carrying it in the slot: eight bytes moved, none added.

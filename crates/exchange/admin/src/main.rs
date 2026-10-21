@@ -1416,11 +1416,12 @@ fn client_thread(
         let (responses, degraded) = match client.send_request(&request) {
             Ok(responses) => (responses, false),
             Err(ClientError::Degraded(responses)) => (responses, true),
-            // The engine's verdict on one request, not a connection
-            // failure: the next command goes through as usual.
-            Err(ClientError::EngineError) => {
+            // The node's word on one request, which it did not apply,
+            // not a connection failure: the next command goes through
+            // as usual.
+            Err(e @ (ClientError::ServerBusy | ClientError::Refused { .. })) => {
                 let latency = start.elapsed();
-                let _ = response_tx.send(format!("ENGINE ERROR  [{latency:.3?}]"));
+                let _ = response_tx.send(format!("NOT APPLIED: {e}  [{latency:.3?}]"));
                 continue;
             }
             Err(e) => {

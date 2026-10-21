@@ -17,8 +17,9 @@
 //!     |                      |<-- ChallengeResp ---|
 //!     |                      |--- ServerReady ---->|
 //!     |<-- next_request -----|                     |
-//!     |---- send_response ->-|                     |
+//!     |---- send_reply ---->-|                     |
 //!     |                      |--- Response ------->|
+//!     |                      |--- BatchEnd{id} --->|
 //!     |    ...               |                     |
 //!     |---- drop() ----------|                     |
 //!     |    (joins thread)                          |
@@ -34,18 +35,26 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use melin_client::RequestId;
 use melin_client::framing::FrameDecoder;
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
 
+/// A request the gateway sent the stub.
+pub struct StubRequest {
+    /// The ID its answer must name.
+    pub id: RequestId,
+    pub request: Request,
+}
+
 /// Control handle owned by the test. Starts a stub listener, connects
 /// to the first gateway connection, and exposes channels for driving
 /// the request/response flow.
 pub struct MelinStub {
     port: u16,
-    requests: Receiver<(u64, Request)>,
+    requests: Receiver<StubRequest>,
     /// Encoded frames for the stub to write, each `Vec` in one write so
     /// a test controls which frames share a TCP segment.
     responses: Sender<Vec<u8>>,
@@ -67,7 +76,7 @@ impl MelinStub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
 
-        let (req_tx, req_rx) = channel::<(u64, Request)>();
+        let (req_tx, req_rx) = channel::<StubRequest>();
         let (resp_tx, resp_rx) = channel::<Vec<u8>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -119,23 +128,33 @@ impl MelinStub {
     /// Wait up to `timeout` for the next request from the gateway.
     /// Panics if the timeout expires — tests should set this generously
     /// enough to absorb scheduling jitter but short enough to fail fast.
-    pub fn next_request(&self, timeout: Duration) -> (u64, Request) {
+    pub fn next_request(&self, timeout: Duration) -> StubRequest {
         self.requests
             .recv_timeout(timeout)
             .expect("stub did not receive a request in time")
     }
 
-    /// Queue a response for the stub to send on the wire. Non-blocking.
-    pub fn send_response(&self, resp: ResponseKind) {
-        self.send_bytes(encode_response(&resp));
+    /// Queue the reply to request `id`, as a node sends it: `resp`, then
+    /// the batch end naming the request. Non-blocking.
+    pub fn send_reply(&self, id: RequestId, resp: ResponseKind) {
+        let mut bytes = encode_response(&resp);
+        bytes.extend_from_slice(&encode_transport(&TransportResponse::BatchEnd { id }));
+        self.send_bytes(bytes);
     }
 
-    /// Queue a heartbeat and then a response, written together, so they
-    /// reach the gateway in the same receive.
-    pub fn send_response_behind_heartbeat(&self, resp: ResponseKind) {
+    /// Queue a heartbeat and then the reply to request `id`, written
+    /// together, so they reach the gateway in the same receive.
+    pub fn send_reply_behind_heartbeat(&self, id: RequestId, resp: ResponseKind) {
         let mut bytes = encode_transport(&TransportResponse::Heartbeat);
         bytes.extend_from_slice(&encode_response(&resp));
+        bytes.extend_from_slice(&encode_transport(&TransportResponse::BatchEnd { id }));
         self.send_bytes(bytes);
+    }
+
+    /// Queue one of the transport's frames, such as a `ServerBusy`
+    /// turning a request away.
+    pub fn send_transport(&self, resp: TransportResponse) {
+        self.send_bytes(encode_transport(&resp));
     }
 
     fn send_bytes(&self, bytes: Vec<u8>) {
@@ -165,7 +184,7 @@ impl Drop for MelinStub {
 /// unexpected happens — the test Drop surface will then fail.
 fn run_stub(
     listener: TcpListener,
-    requests: Sender<(u64, Request)>,
+    requests: Sender<StubRequest>,
     responses: Receiver<Vec<u8>>,
     shutdown: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
@@ -215,15 +234,18 @@ fn run_stub(
     // shape, then enter the regular request loop. Tests don't see this
     // exchange — it stays inside the stub.
     let payload = read_frame_blocking(&mut stream, &mut decoder, &shutdown)?;
-    match codec::decode_request(&payload).map_err(|e| format!("decode_request: {e:?}"))? {
-        (_, Request::QueryRequestSeq) => {}
-        (_, other) => return Err(format!("expected QueryRequestSeq, got {other:?}")),
-    }
+    let id = match codec::decode_request(&payload).map_err(|e| format!("decode_request: {e:?}"))? {
+        (id, _, Request::QueryRequestSeq) => id,
+        (_, _, other) => return Err(format!("expected QueryRequestSeq, got {other:?}")),
+    };
     write_bytes(
         &mut stream,
         &encode_response(&ResponseKind::RequestSeqHwm { hwm: 0 }),
     )?;
-    write_bytes(&mut stream, &encode_transport(&TransportResponse::BatchEnd))?;
+    write_bytes(
+        &mut stream,
+        &encode_transport(&TransportResponse::BatchEnd { id }),
+    )?;
 
     // --- Request/response loop ---
     let mut tmp = [0u8; 256];
@@ -263,12 +285,13 @@ fn run_stub(
             Err(e) => return Err(format!("read: {e}")),
         }
 
-        // Decode as many complete requests as have arrived.
+        // Decode as many complete requests as have arrived, each with the
+        // ID the test's answer names.
         while let Some(payload) = decoder.next().map_err(|e| e.to_string())? {
-            let request =
+            let (id, _seq, request) =
                 codec::decode_request(payload).map_err(|e| format!("decode_request: {e:?}"))?;
             requests
-                .send(request)
+                .send(StubRequest { id, request })
                 .map_err(|_| "request channel closed".to_string())?;
         }
     }

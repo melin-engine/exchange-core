@@ -6,23 +6,40 @@ All multi-byte integers are **little-endian**. No CRC on the wire -- TCP handles
 
 ## Frame Format
 
-Every frame, in either direction, is a length prefix, a one-byte frame tag, and a body:
+Every frame, in either direction, is a length prefix, a one-byte frame tag, and what the tag calls for. A request carries an ID the client chooses, and an exchange response carries a body:
 
 ```
+Request (client to server):
++----------------+----------+-----------+-----------+
+| length (4B LE) | 0x0B     | id (8B)   | body      |
++----------------+----------+-----------+-----------+
+
+Exchange response (server to client):
 +----------------+----------+-----------+
-| length (4B LE) | tag (1B) | body      |
+| length (4B LE) | 0x09     | body      |
 +----------------+----------+-----------+
 ```
 
 | Field   | Type | Size    | Description                                         |
 |---------|------|---------|-----------------------------------------------------|
-| length  | u32  | 4 bytes | Byte count of tag + body (excludes itself)          |
-| tag     | u8   | 1 byte  | Frame tag: `0x09` for an exchange message, otherwise one of the node frames below |
-| body    | ...  | 0..N    | For an exchange message, the request or response body below |
+| length  | u32  | 4 bytes | Byte count of everything after it                   |
+| tag     | u8   | 1 byte  | Frame tag: `0x0B` for a request, `0x09` for an exchange response, otherwise one of the node frames below |
+| id      | u64  | 8 bytes | Requests only: the request's ID, which the frame that ends its answer names (see "Request IDs") |
+| body    | ...  | 0..N    | The request or response body below                  |
 
-The frame tag belongs to the node. Tag `0x09` marks an exchange message: every request and every exchange response travels under it, and its body is laid out as described below. Every other tag is a node frame with a fixed meaning (see "Node Frames"). The node drops a client frame under any tag but `0x09` once the handshake is over, so a request framed any other way never reaches the exchange.
+The frame tag belongs to the node. Tag `0x0B` marks a request, and tag `0x09` an exchange response; their bodies are laid out as described below. Every other tag is a node frame with a fixed meaning (see "Node Frames"). Once the handshake is over, the node closes a connection that sends anything but a request: an empty frame, another tag, or a request too short for its ID.
 
-**Maximum frame size**: 1024 bytes (1 KiB) for the tag and body together, not counting the length prefix. A frame exceeding this limit is rejected and the connection is closed.
+**Maximum frame size**: 1024 bytes (1 KiB) after the length prefix: the tag, the ID and the body together. A frame exceeding this limit is rejected and the connection is closed.
+
+### Request IDs
+
+Every request carries an ID, and the node answers each request exactly once, with a final frame that names it: `BatchEnd` or `BatchEndDegraded` closing its reply, `ServerBusy`, or `Refused`. The ID is the client's choice and the node only echoes it; a client that keeps several requests in flight gives each one a different ID, and finds the request each answer is for by the ID the answer names. The exchange's client numbers each connection's requests from 1. The ID is not the request sequence below: that one is per key and makes retries safe, while the ID only pairs answers with requests on one connection.
+
+Exchange responses carry no ID: they belong to the final frame that follows them, and nothing but heartbeats falls between a reply's responses and its end.
+
+**Ordering.** Replies to the requests the node accepts arrive in the order the requests were sent. A request the node answers without applying it (shed with `ServerBusy`, refused with `Refused`, filtered, or refused while trading is halted) may be answered ahead of requests sent before it, but never inside another request's reply. A client that pipelines therefore pairs answers by ID, never by position.
+
+A `ServerBusy` request was not applied, but requests sent after it may have been. A client whose requests depend on each other's order stops on a busy, waits for the answers it is owed, and resends from the busy request on.
 
 ### Request Body
 
@@ -64,21 +81,24 @@ These frames carry no exchange body. The node sends and reads them itself; a cli
 | Tag  | Name              | Direction        | Body                               |
 |------|-------------------|------------------|------------------------------------|
 | 0x01 | Heartbeat         | Server to client | none                               |
-| 0x02 | BatchEnd          | Server to client | none                               |
-| 0x03 | EngineError       | Server to client | none                               |
-| 0x04 | ServerBusy        | Server to client | none                               |
-| 0x05 | Challenge         | Server to client | nonce (32 bytes)                   |
+| 0x02 | BatchEnd          | Server to client | request ID (8)                     |
+| 0x04 | ServerBusy        | Server to client | request ID (8)                     |
+| 0x05 | Challenge         | Server to client | protocol version (2) + nonce (32)  |
 | 0x06 | ChallengeResponse | Client to server | signature (64) + public key (32)   |
 | 0x07 | AuthFailed        | Server to client | none                               |
 | 0x08 | ServerReady       | Server to client | none                               |
-| 0x09 | *(exchange message)* | Both          | a request or response body         |
-| 0x0A | BatchEndDegraded  | Server to client | none                               |
+| 0x09 | *(exchange response)* | Server to client | a response body                |
+| 0x0A | BatchEndDegraded  | Server to client | request ID (8)                     |
+| 0x0B | *(request)*       | Client to server | request ID (8) + a request body    |
+| 0x0C | Refused           | Server to client | request ID (8) + kind (1) + reason length (1) + reason |
+
+Tag `0x03` is retired and never reused.
 
 - **Heartbeat**: server-initiated keepalive sent to idle connections (see "Heartbeat and Keepalive").
-- **BatchEnd**: the last frame of the reply to one request (see "BatchEnd Semantics").
+- **BatchEnd**: the last frame of the reply to the request it names (see "BatchEnd Semantics").
 - **BatchEndDegraded**: the last frame of a reply backed by the primary's own disk alone, weaker than the ack policy, which a primary that lost its last replica sends once its grace period has passed (see "BatchEnd Semantics").
-- **EngineError**: the matching engine hit an internal error on the request. The batch still ends with a `BatchEnd`.
-- **ServerBusy**: the server's input pipeline is full and the request was not accepted. Retry after a brief backoff. The reader answers this directly, without entering the pipeline, so the server can always respond even when saturated.
+- **ServerBusy**: the node's input pipeline was full, so it shed the request it names, which was not applied: resend it after a brief backoff. Every whole request the node had already received behind it is shed too, each with its own `ServerBusy`, so nothing pipelined behind a shed request in the same burst is applied ahead of its resend. The connection stays open.
+- **Refused**: the node refused the request it names, which was not applied. The kind says why: `1` (PermissionDenied), the key's role may not send it (see "Roles"); `2` (Malformed), the body is not a request the exchange can decode (see "Error Handling"). The reason is UTF-8 text for people, up to 255 bytes; it may change with any release, so do not parse it. The connection stays open.
 - **Challenge**, **ChallengeResponse**, **AuthFailed**, **ServerReady**: the authentication handshake (see "Authentication Handshake").
 
 ---
@@ -157,7 +177,7 @@ Total order size: 24 bytes (Market, no expiry) to 48 bytes (StopLimit + GTD expi
 | 0x21 | QueryPosition     | `trader`       | 4                    |
 | 0x22 | QueryRequestSeq   | `trader`       | 0                    |
 
-Payload sizes above exclude the 1-byte kind and 8-byte seq. The frame length = 1 (frame tag) + 1 (kind) + 8 (seq) + payload size.
+Payload sizes above exclude the 1-byte kind and 8-byte seq. The frame length = 1 (frame tag) + 8 (request ID) + 1 (kind) + 8 (seq) + payload size.
 
 ### 0x10: SubmitOrder
 
@@ -178,7 +198,7 @@ The order is encoded inline per the Order Encoding section above.
 
 ### 0x12: Heartbeat
 
-No payload. Resets the server's idle timeout for this connection and is otherwise dropped on arrival: it never reaches the matching engine and gets no reply.
+No payload. Resets the server's idle timeout for this connection. It never reaches the matching engine, and is answered with an empty batch: a `BatchEnd` naming it.
 
 ### 0x13: CancelAll
 
@@ -299,7 +319,7 @@ Permanently removes a disabled instrument. Only succeeds if the instrument is di
 
 ### 0x1F: Subscribe
 
-Sent to the event publisher's port after authentication, by the market-data gateway or any other subscriber. Requests book snapshots and a live event firehose for the listed symbols. On the trading port it is dropped on arrival.
+Sent to the event publisher's port after authentication, by the market-data gateway or any other subscriber. Requests book snapshots and a live event firehose for the listed symbols; the publisher answers with those, never a final frame naming the request. On the trading port it is answered with an empty batch and has no effect.
 
 | Offset | Field   | Size          |
 |--------|---------|---------------|
@@ -345,7 +365,7 @@ No payload. Asks for the high-water mark the engine keeps for this connection's 
 | 0x3C | PositionSnapshot         | 5 + count×20 |
 | 0x3D | RequestSeqHwm            | 8            |
 
-Payload sizes above exclude the 1-byte kind. `BatchEnd`, `EngineError`, `ServerBusy` and the server's heartbeat are node frames (see "Node Frames").
+Payload sizes above exclude the 1-byte kind. `BatchEnd`, `BatchEndDegraded`, `ServerBusy`, `Refused` and the server's heartbeat are node frames (see "Node Frames").
 
 ### 0x30: Placed
 
@@ -553,7 +573,8 @@ Client                              Server
   |                                    |
   |  <--- TCP/UDS connect --->         |
   |                                    |
-  |  Challenge (tag=0x05, 32B nonce)   |
+  |  Challenge (tag=0x05, version,     |
+  |  32B nonce)                        |
   |  <---------------------------------|  Server generates 32 random bytes
   |                                    |
   |  ChallengeResponse (tag=0x06)      |
@@ -573,6 +594,10 @@ Client                              Server
   |  <---------------------------------|  Auth failed, connection dropped
 ```
 
+### Protocol version
+
+The challenge carries the client protocol the node speaks, a u16 LE ahead of the nonce: `1` in this release, the first with request IDs. A client checks it before it signs anything and refuses a node of another protocol; the exchange's client reports it as `ClientError::ProtocolVersion`. A client of an earlier release reads the new challenge as malformed. Upgrade clients, the FIX gateway and the market-data gateway with the nodes.
+
 ### Timeout
 
 The server sets a **5-second read timeout** on the socket during the auth handshake. If the client does not send a `ChallengeResponse` within 5 seconds, the connection is closed. The timeout is cleared after successful authentication.
@@ -583,7 +608,7 @@ The maximum accepted auth frame size is 256 bytes. The expected `ChallengeRespon
 
 ### Post-auth behavior
 
-After authentication, a `ChallengeResponse`, like any frame under a tag other than `0x09`, is dropped without a reply.
+After authentication, a `ChallengeResponse`, like any frame other than a request, closes the connection.
 
 ---
 
@@ -620,7 +645,7 @@ A key is not tied to accounts: a `trader` key may trade, cancel and query positi
 **Universal operations** (any role but `replication`):
 - Heartbeat, and Subscribe on the event publisher's port
 
-Requests that fail the role check are dropped on the reader thread and never reach the matching engine.
+A request that fails the role check is refused on the reader thread with a `Refused` frame of kind PermissionDenied, and never reaches the matching engine. The connection stays open.
 
 ### Authorized keys file format
 
@@ -653,7 +678,7 @@ The `seq` is journaled with the request, so the check reaches the same verdict e
 
 ### Client-to-server heartbeat (kind 0x12)
 
-A request with no payload. Any data the server receives, heartbeats included, resets the connection's idle timer. Heartbeat requests do **not** enter the pipeline -- they are dropped on the reader thread.
+A request with no payload. Any data the server receives, heartbeats included, resets the connection's idle timer. Heartbeat requests do **not** enter the pipeline -- the reader thread answers them with an empty batch.
 
 ### Server-to-client heartbeat (tag 0x01)
 
@@ -676,11 +701,11 @@ A single request can produce multiple response messages. For example, a `SubmitO
 3. Possibly a **Rejected** report (if the order is rejected)
 4. A **BatchEnd** to signal completion
 
-The **BatchEnd** node frame (tag `0x02`) tells the client that all reports for the preceding request have been sent. This allows pipelined clients to correlate responses with requests: after sending N requests, the client reads responses until it receives N BatchEnd markers.
+The **BatchEnd** node frame (tag `0x02`) names the request whose reports it closes: every response before it, back to the previous final frame, is that request's. A pipelined client looks the request up by that ID rather than counting BatchEnds, since a request the node does not apply can be answered out of turn (see "Request IDs").
 
-For requests that produce a single response (e.g., `CancelOrder` produces one `Cancelled` or `Rejected`), BatchEnd still follows to maintain the uniform protocol.
+For requests that produce a single response (e.g., `CancelOrder` produces one `Cancelled` or `Rejected`), BatchEnd still follows to maintain the uniform protocol. A request that produces none (a heartbeat, say) is answered with a BatchEnd alone.
 
-A reply can instead end with **BatchEndDegraded** (tag `0x0A`). It closes the request's batch exactly as a BatchEnd does, and also says that the reports before it are held only on the primary's disk, not as the ack policy requires: the request was applied and survives a primary restart, but a failover to a node that never received it would lose it. A client that needs the policy's guarantee treats such a reply as unconfirmed and reconciles once the cluster is whole again; one that accepts a single disk copy treats it as done. A primary sends it only after it has had no replica connected for its degraded-ack grace period (see the operations guide), never under the `disk` policy, and never when started with `--no-degraded-acks`. A write the halted node refuses (`ReplicaDisconnected`) is never applied, and its reply always ends in a plain BatchEnd.
+A reply can instead end with **BatchEndDegraded** (tag `0x0A`). It closes the request's batch exactly as a BatchEnd does, and also says that the reports before it are held only on the primary's disk, not as the ack policy requires: the request was applied and survives a primary restart, but a failover to a node that never received it would lose it. A client that needs the policy's guarantee treats such a reply as unconfirmed and reconciles once the cluster is whole again; one that accepts a single disk copy treats it as done. A primary sends it only after it has had no replica connected for its degraded-ack grace period (see the operations guide), never under the `disk` policy, and never when started with `--no-degraded-acks`. A write the halted node refuses (`ReplicaDisconnected`) is never applied, and its reply always ends in a plain BatchEnd. That reply does not wait for the replies to requests sent before it, a write the ack policy is holding included.
 
 ---
 
@@ -688,12 +713,14 @@ A reply can instead end with **BatchEndDegraded** (tag `0x0A`). It closes the re
 
 ### Example 1: Heartbeat Request
 
-The simplest possible request -- kind and seq, no payload. Seq is 0 (heartbeats are exempt from dedup).
+The simplest possible request -- its ID, then kind and seq, no payload. Seq is 0 (heartbeats are exempt from dedup). Request ID 1.
 
 ```
-Frame (14 bytes total):
-  [0A 00 00 00]   length = 10 (LE u32: 1 tag + 1 kind + 8 seq)
-  [09]            tag = 0x09 (exchange message)
+Frame (22 bytes total):
+  [12 00 00 00]   length = 18 (LE u32: 1 tag + 8 id + 1 kind + 8 seq)
+  [0B]            tag = 0x0B (request)
+  [01 00 00 00    id = 1 (LE u64)
+   00 00 00 00]
   [12]            kind = 0x12 (Heartbeat)
   [00 00 00 00    seq = 0 (LE u64)
    00 00 00 00]
@@ -701,12 +728,14 @@ Frame (14 bytes total):
 
 ### Example 2: CancelOrder Request
 
-Cancel order ID 42 on symbol 1, account 5, request seq 7.
+Cancel order ID 42 on symbol 1, account 5, request seq 7, request ID 2.
 
 ```
-Frame (30 bytes total):
-  [1A 00 00 00]   length = 26 (LE u32: 1 tag + 1 kind + 8 seq + 16 payload)
-  [09]            tag = 0x09 (exchange message)
+Frame (38 bytes total):
+  [22 00 00 00]   length = 34 (LE u32: 1 tag + 8 id + 1 kind + 8 seq + 16 payload)
+  [0B]            tag = 0x0B (request)
+  [02 00 00 00    id = 2 (LE u64)
+   00 00 00 00]
   [11]            kind = 0x11 (CancelOrder)
   [07 00 00 00    seq = 7 (LE u64)
    00 00 00 00]
@@ -718,18 +747,38 @@ Frame (30 bytes total):
 
 ### Example 3: BatchEnd (node frame)
 
+The end of request 2's reply.
+
 ```
-Frame (5 bytes total):
-  [01 00 00 00]   length = 1 (LE u32)
+Frame (13 bytes total):
+  [09 00 00 00]   length = 9 (LE u32: 1 tag + 8 id)
   [02]            tag = 0x02 (BatchEnd)
+  [02 00 00 00    id = 2 (LE u64)
+   00 00 00 00]
 ```
 
-### Example 4: Challenge (node frame, server to client)
+### Example 4: Refused (node frame)
+
+Request 2, refused because its key's role may not trade.
 
 ```
-Frame (37 bytes total):
-  [21 00 00 00]   length = 33 (LE u32: 1 tag + 32 nonce)
+Frame (42 bytes total):
+  [26 00 00 00]   length = 38 (LE u32: 1 tag + 8 id + 1 kind + 1 length + 27 reason)
+  [0C]            tag = 0x0C (Refused)
+  [02 00 00 00    id = 2 (LE u64)
+   00 00 00 00]
+  [01]            kind = 1 (PermissionDenied)
+  [1B]            reason length = 27
+  [6F 6E ... 65]  reason = "only a trader key may trade" (UTF-8)
+```
+
+### Example 5: Challenge (node frame, server to client)
+
+```
+Frame (39 bytes total):
+  [23 00 00 00]   length = 35 (LE u32: 1 tag + 2 version + 32 nonce)
   [05]            tag = 0x05 (Challenge)
+  [01 00]         client protocol version = 1 (LE u16)
   [xx xx ... xx]  nonce (32 random bytes)
 ```
 
@@ -740,7 +789,8 @@ Frame (37 bytes total):
 - **Truncated bodies**: A body shorter than its kind requires is malformed.
 - **Unknown kinds**: A body whose first byte is not a known kind is malformed.
 - **Invalid fields**: Zero values in NonZeroU64 fields (prices, quantities) and out-of-range enum values are malformed.
-- **Malformed requests** are dropped on the reader thread without a reply; the server logs them at debug level and keeps the connection open.
+- **Malformed requests** are refused on the reader thread with a `Refused` frame of kind Malformed, whose reason names the fault; the server logs them at debug level and keeps the connection open.
+- **Frames that are not requests**: after the handshake, an empty frame, a frame under any tag but `0x0B`, or a request too short for its ID closes the connection.
 - **Oversized frames**: Frames with length > 1024 bytes are rejected at the framing layer and the connection is closed.
 
 ---

@@ -18,6 +18,7 @@ melin-ec-gateway-core = { workspace = true }
 melin-ec-protocol = { workspace = true }
 melin-ec = { workspace = true }
 melin-ec-types = { workspace = true }
+melin-wire-protocol = { workspace = true }
 ed25519-dalek = { workspace = true }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
@@ -27,5 +28,4 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-melin-wire-protocol = { workspace = true }
 proptest = "1"

@@ -43,7 +43,7 @@ use melin_server_runtime::client_auth::verify_client;
 use melin_transport_core::pipeline::{
     OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
 };
-use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control::{RequestId, TransportResponse};
 use melin_wire_protocol::control_codec;
 
 // Trading-bound shorthand for the wire-format types this publisher
@@ -88,11 +88,17 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
     }
 }
 
+/// The `BatchEnd` that closes each request's events on the feed. It
+/// names no request: the feed carries every client's events, and a
+/// request's ID is its own connection's business, meaningless to anyone
+/// else. `RequestId(0)` is the ID the node gives its own events.
+const FEED_BATCH_END: TransportResponse = TransportResponse::BatchEnd { id: RequestId(0) };
+
 /// One wire frame an output slot expands to. The exchange's own
-/// responses go through its codec; the frames the transport owns —
-/// `EngineError`, `BatchEnd` — through the sequencer's, as the node's
-/// response thread does, so a subscriber reads the publisher's stream
-/// with the same client it reads a node with.
+/// responses go through its codec; the transport's `BatchEnd` through
+/// the sequencer's, as the node's response thread does, so a subscriber
+/// reads the publisher's stream with the same client it reads a node
+/// with.
 // `ResponseKind` is wide (its position snapshot), the transport
 // variant a few bytes: two of these live on the stack per slot and are
 // encoded at once, so boxing the wide side would add an allocation on
@@ -147,7 +153,6 @@ fn payload_to_frame(payload: OutputPayload) -> Option<Frame> {
         }
         OutputPayload::Report(report) => Frame::Response(ResponseKind::Report(report)),
         OutputPayload::BatchEnd | OutputPayload::AckPolicyChange(_) => return None,
-        OutputPayload::EngineError => Frame::Transport(TransportResponse::EngineError),
     })
 }
 
@@ -156,7 +161,7 @@ fn payload_to_frame(payload: OutputPayload) -> Option<Frame> {
 /// `is_last_in_request` is set. Returns the populated count
 /// (`0..=2`); the array is filled from index 0.
 fn slot_to_frames(slot: &OutputSlot) -> ([Frame; 2], usize) {
-    let mut frames = [Frame::Transport(TransportResponse::BatchEnd); 2];
+    let mut frames = [Frame::Transport(FEED_BATCH_END); 2];
     // A journaled ack-policy change is the response gate's slot, not a
     // reply: it is flagged last-in-request only to close the gate's own
     // batch, so it expands to nothing, not even a `BatchEnd`.
@@ -169,7 +174,7 @@ fn slot_to_frames(slot: &OutputSlot) -> ([Frame; 2], usize) {
         len += 1;
     }
     if slot.is_last_in_request {
-        frames[len] = Frame::Transport(TransportResponse::BatchEnd);
+        frames[len] = Frame::Transport(FEED_BATCH_END);
         len += 1;
     }
     (frames, len)
@@ -403,7 +408,9 @@ fn try_read_subscribe(
     let mut frame_buf = [0u8; 256];
     io::Read::read_exact(&mut &*stream, &mut frame_buf[..frame_len])?;
 
-    let (_seq, request) = codec::decode_request(&frame_buf[..frame_len])?;
+    // The subscription is answered with the snapshot and the feed, never
+    // a reply naming the request: its ID goes no further.
+    let (_id, _seq, request) = codec::decode_request(&frame_buf[..frame_len])?;
     match request {
         Request::Subscribe { symbols, count } => {
             let n = count as usize;
@@ -672,13 +679,6 @@ mod tests {
         // wire BatchEnd is emitted via `is_last_in_request`.
         assert!(payload_to_frame(OutputPayload::BatchEnd).is_none());
 
-        // An engine error is the transport's frame, as on a node.
-        let r = payload_to_frame(OutputPayload::EngineError);
-        assert!(matches!(
-            r,
-            Some(Frame::Transport(TransportResponse::EngineError))
-        ));
-
         let r = payload_to_frame(OutputPayload::QueryResponse(QueryResponse::Stats {
             active_connections: 5,
             events_processed: 1000,
@@ -691,27 +691,37 @@ mod tests {
     }
 
     #[test]
-    fn a_last_slot_ends_its_batch_on_the_wire() {
+    fn a_last_slot_ends_its_batch_on_the_wire_naming_no_request() {
         // The batch end the runtime sends after the last slot of a
         // request is the sequencer's frame, so a subscriber's client
-        // classifies it as one.
+        // classifies it as one. It names no request: the ID is the
+        // sending client's, not the feed's.
         let slot = OutputSlot {
-            payload: OutputPayload::EngineError,
+            payload: OutputPayload::Report(ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                symbol: Symbol(1),
+                account: AccountId(1),
+                remaining_quantity: Quantity(std::num::NonZeroU64::new(10).unwrap()),
+            }),
             is_last_in_request: true,
+            request_id: RequestId(5),
             ..OutputSlot::default()
         };
         let (frames, len) = slot_to_frames(&slot);
         assert_eq!(len, 2);
         let mut buf = [0u8; MAX_FRAME_BUF];
         let n = frames[0].encode(&mut buf).unwrap();
-        assert_eq!(
+        assert!(matches!(
             melin_client::classify(&buf[4..n]).unwrap(),
-            melin_client::Reply::EngineError
-        );
+            melin_client::Reply::Response(_)
+        ));
         let n = frames[1].encode(&mut buf).unwrap();
         assert_eq!(
             melin_client::classify(&buf[4..n]).unwrap(),
-            melin_client::Reply::BatchEnd(melin_client::Ack::Policy)
+            melin_client::Reply::BatchEnd {
+                id: RequestId(0),
+                ack: melin_client::Ack::Policy
+            }
         );
     }
 
@@ -788,11 +798,8 @@ mod tests {
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         let ring_seq: u64 = 7;
         frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
-        let response_len = control_codec::encode_transport_response(
-            &TransportResponse::BatchEnd,
-            &mut frame_buf[8..],
-        )
-        .unwrap();
+        let response_len =
+            control_codec::encode_transport_response(&FEED_BATCH_END, &mut frame_buf[8..]).unwrap();
         let total_len = 8 + response_len;
         let frame = &frame_buf[..total_len];
 
@@ -837,11 +844,9 @@ mod tests {
             // Wire BatchEnd frame directly — synthetic test payload.
             let mut frame_buf = [0u8; MAX_FRAME_BUF];
             frame_buf[..8].copy_from_slice(&seq.to_le_bytes());
-            let response_len = control_codec::encode_transport_response(
-                &TransportResponse::BatchEnd,
-                &mut frame_buf[8..],
-            )
-            .unwrap();
+            let response_len =
+                control_codec::encode_transport_response(&FEED_BATCH_END, &mut frame_buf[8..])
+                    .unwrap();
             sub.stream
                 .write_all(&frame_buf[..8 + response_len])
                 .unwrap();
@@ -852,7 +857,8 @@ mod tests {
             .unwrap();
         let mut buf = [0u8; 2048];
         let mut total_read = 0;
-        while total_read < 10 * 13 {
+        // Each frame: the sequence, the length, the tag and the ID.
+        while total_read < 10 * (8 + 4 + 1 + 8) {
             match io::Read::read(&mut client, &mut buf[total_read..]) {
                 Ok(n) if n > 0 => total_read += n,
                 _ => break,
@@ -907,11 +913,8 @@ mod tests {
         // small dummy payload to push to subscribers.
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         frame_buf[..8].copy_from_slice(&0u64.to_le_bytes());
-        let response_len = control_codec::encode_transport_response(
-            &TransportResponse::BatchEnd,
-            &mut frame_buf[8..],
-        )
-        .unwrap();
+        let response_len =
+            control_codec::encode_transport_response(&FEED_BATCH_END, &mut frame_buf[8..]).unwrap();
         let frame = &frame_buf[..8 + response_len];
 
         for _ in 0..10 {

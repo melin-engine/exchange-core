@@ -2,10 +2,11 @@
 //! TCP socket; connect performs the four-message Ed25519 challenge-
 //! response handshake and returns a ready-to-use Client.
 
+use std::cmp::Ordering;
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
-use melin_client::{Ack, Reply};
+use melin_client::{Ack, Reply, RequestId};
 
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
@@ -32,6 +33,11 @@ pub struct Client {
     /// its per-key high-water mark. Starts at 0 and increments before
     /// each send.
     next_seq: u64,
+    /// The ID of the last request sent, which the final frame of its
+    /// answer names. Numbered from 1 on each connection, apart from
+    /// `next_seq`, which a resync moves: one request is in flight at a
+    /// time, so the ID only has to tell this answer from a stray one.
+    last_id: RequestId,
 }
 
 impl Client {
@@ -119,6 +125,7 @@ impl Client {
             writer,
             encode_buf: [0u8; 128],
             next_seq: 0,
+            last_id: RequestId(0),
         };
 
         // Step 5: Adopt the engine's per-key request_seq HWM so the next
@@ -144,6 +151,12 @@ impl Client {
     /// Intended for tests and tools that need to fail fast when a
     /// server stalls; production clients usually want the default
     /// behaviour (no timeout — a healthy connection is just idle).
+    ///
+    /// A request whose call timed out may still have been applied, and
+    /// its answer may arrive later: the next call discards it and reads
+    /// on to its own. A timeout that strikes in the middle of a frame
+    /// leaves the connection unframed, and later calls fail; reconnect
+    /// after an error that is not one of the node's answers.
     pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
         self.reader.get_ref().set_read_timeout(dur)
     }
@@ -154,7 +167,10 @@ impl Client {
     /// itself) of a reply backed as the node's ack policy requires. A
     /// reply only the primary's disk backs is [`ClientError::Degraded`],
     /// which carries the responses, so a weaker reply is never taken for
-    /// a full one unawares.
+    /// a full one unawares. A request the node did not apply is
+    /// [`ClientError::ServerBusy`] (shed under load: resend it) or
+    /// [`ClientError::Refused`]; the connection stays usable after any
+    /// of these.
     pub fn send_request(&mut self, request: &Request) -> Result<Vec<ResponseKind>, ClientError> {
         match self.request_batch(request)? {
             (responses, Ack::Policy) => Ok(responses),
@@ -173,37 +189,58 @@ impl Client {
         // The engine refuses a request whose sequence does not beat the
         // mark it keeps for this key.
         self.next_seq += 1;
-        let written = codec::encode_request(request, self.next_seq, &mut self.encode_buf)?;
+        let sent = RequestId(self.last_id.0 + 1);
+        let written = codec::encode_request(request, sent, self.next_seq, &mut self.encode_buf)?;
         // write_frame expects payload without length prefix; encode_request
-        // writes [length(4) | tag | body], so skip the prefix.
+        // writes [length(4) | tag | id | body], so skip the prefix.
         self.writer.write_frame(&self.encode_buf[4..written])?;
         self.writer.flush()?;
+        self.last_id = sent;
 
-        // Collect responses until BatchEnd. The sequencer's client tells
-        // the node's frames apart; only application responses reach the
-        // exchange codec. Heartbeats received during idle periods are
-        // silently consumed (not part of a request batch). An engine
-        // error is the node's word on this one request, and its batch
-        // still ends normally: read on to the `BatchEnd` so the
-        // connection's framing stays intact, then report the error.
+        // Collect responses until the frame that ends the answer, which
+        // names the request. The sequencer's client tells the node's
+        // frames apart; only application responses reach the exchange
+        // codec. Heartbeats received during idle periods are silently
+        // consumed (not part of a request batch). A busy or a refusal
+        // ends the answer too, and leaves the connection good.
         let mut responses = Vec::new();
-        let mut engine_error = false;
-        let ack = loop {
+        loop {
             let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
-            match melin_client::classify(frame).map_err(transport_error)? {
-                Reply::Response(body) => responses.push(codec::decode_response_body(body)?),
-                Reply::Heartbeat => continue,
-                Reply::BatchEnd(ack) => break ack,
-                Reply::ServerBusy => return Err(ClientError::ServerBusy),
-                Reply::EngineError => engine_error = true,
+            let (answered, outcome) =
+                match melin_client::classify(frame).map_err(transport_error)? {
+                    Reply::Response(body) => {
+                        responses.push(codec::decode_response_body(body)?);
+                        continue;
+                    }
+                    Reply::Heartbeat => continue,
+                    Reply::BatchEnd { id, ack } => (id, Ok(ack)),
+                    Reply::ServerBusy { id } => (id, Err(ClientError::ServerBusy)),
+                    Reply::Refused { id, kind, reason } => (
+                        id,
+                        Err(ClientError::Refused {
+                            kind,
+                            reason: reason.to_owned(),
+                        }),
+                    ),
+                };
+            match answered.cmp(&sent) {
+                Ordering::Equal => return outcome.map(|ack| (responses, ack)),
+                // A late answer to an earlier request, whose call gave up
+                // waiting (a read timeout): its responses came just before
+                // it, and are not this request's. Each call waits for its
+                // own answer, so an earlier request still unanswered is one
+                // whose call failed.
+                Ordering::Less => responses.clear(),
+                // IDs only grow: an answer to a request not yet sent is the
+                // node's mistake, and nothing after it can be trusted.
+                Ordering::Greater => {
+                    return Err(ClientError::Protocol(ProtocolError::InvalidField(
+                        "an answer naming a request not sent",
+                    )));
+                }
             }
-        };
-
-        if engine_error {
-            return Err(ClientError::EngineError);
         }
-        Ok((responses, ack))
     }
 
     /// Query and adopt the engine's current request_seq HWM for this
@@ -279,6 +316,7 @@ fn transport_error(e: melin_client::Error) -> ClientError {
         Error::Protocol(_) | Error::FrameTooLarge { .. } => {
             ClientError::Protocol(ProtocolError::InvalidField("frame from the node"))
         }
+        Error::ProtocolVersion { node, client } => ClientError::ProtocolVersion { node, client },
         other @ (Error::Connect { .. }
         | Error::Nic(_)
         | Error::Degraded { .. }
@@ -288,13 +326,14 @@ fn transport_error(e: melin_client::Error) -> ClientError {
         | Error::RequestTooLarge { .. }
         | Error::BufferTooSmall { .. }
         | Error::ServerBusy
-        | Error::EngineError) => ClientError::Io(std::io::Error::other(other.to_string())),
+        | Error::Refused { .. }) => ClientError::Io(std::io::Error::other(other.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RefusalKind;
     use melin_ec_protocol::types::{OrderId, Symbol};
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec;
@@ -313,6 +352,23 @@ mod tests {
         let written = control_codec::encode_transport_response(response, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
+    }
+
+    /// Read one request frame, as a node does: its ID and the request.
+    fn read_request(reader: &mut BlockingFrameReader<std::net::TcpStream>) -> (RequestId, Request) {
+        let frame = reader.read_frame().unwrap().unwrap();
+        let (id, _seq, request) = codec::decode_request(frame).unwrap();
+        (id, request)
+    }
+
+    /// Send one application response the way a node does.
+    fn write_response(
+        writer: &mut BlockingFrameWriter<std::net::TcpStream>,
+        response: &ResponseKind,
+    ) {
+        let mut buf = [0u8; 128];
+        let written = codec::encode_response(response, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
     }
 
     /// Run the server side of the challenge-response handshake, accepting
@@ -343,18 +399,13 @@ mod tests {
 
         // Service the auto-sync QueryRequestSeq: read the query, reply
         // with RequestSeqHwm + BatchEnd.
-        let frame = reader.read_frame().unwrap().unwrap();
-        let (_seq, req) = codec::decode_request(frame).unwrap();
+        let (id, req) = read_request(reader);
         assert!(
             matches!(req, Request::QueryRequestSeq),
             "expected auto-sync QueryRequestSeq, got {req:?}"
         );
-        let mut buf = [0u8; 128];
-        let written =
-            codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: sync_hwm }, &mut buf)
-                .unwrap();
-        writer.write_frame(&buf[4..written]).unwrap();
-        write_transport(writer, &TransportResponse::BatchEnd);
+        write_response(writer, &ResponseKind::RequestSeqHwm { hwm: sync_hwm });
+        write_transport(writer, &TransportResponse::BatchEnd { id });
     }
 
     /// Mock server that authenticates, reads one request, responds with BatchEnd.
@@ -365,11 +416,8 @@ mod tests {
 
         mock_auth_handshake(&mut reader, &mut writer, 0);
 
-        // Read one request frame (discard it).
-        let _frame = reader.read_frame().unwrap().unwrap();
-
-        // Respond with BatchEnd.
-        write_transport(&mut writer, &TransportResponse::BatchEnd);
+        let (id, _request) = read_request(&mut reader);
+        write_transport(&mut writer, &TransportResponse::BatchEnd { id });
     }
 
     #[test]
@@ -381,13 +429,7 @@ mod tests {
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
-        let responses = client
-            .send_request(&Request::CancelOrder {
-                symbol: Symbol(1),
-                account: melin_ec_protocol::types::AccountId(1),
-                order_id: OrderId(42),
-            })
-            .unwrap();
+        let responses = client.send_request(&cancel_order()).unwrap();
 
         // No reports before BatchEnd — just an empty batch.
         assert!(responses.is_empty());
@@ -449,16 +491,10 @@ mod tests {
             // below reports a higher HWM the test should adopt.
             mock_auth_handshake(&mut reader, &mut writer, 0);
 
-            let frame = reader.read_frame().unwrap().unwrap();
-            let (_seq, req) = codec::decode_request(frame).unwrap();
+            let (id, req) = read_request(&mut reader);
             assert!(matches!(req, Request::QueryRequestSeq));
-
-            let mut buf = [0u8; 64];
-            let written =
-                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: later_hwm }, &mut buf)
-                    .unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            write_transport(&mut writer, &TransportResponse::BatchEnd);
+            write_response(&mut writer, &ResponseKind::RequestSeqHwm { hwm: later_hwm });
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id });
         });
 
         let key = test_key();
@@ -625,10 +661,19 @@ mod tests {
         assert!(matches!(result, Err(ClientError::Protocol(_))));
     }
 
-    /// When the server pipeline is full, it sends ServerBusy.
-    /// The client should surface this as `ClientError::ServerBusy`.
+    fn cancel_order() -> Request {
+        Request::CancelOrder {
+            symbol: Symbol(1),
+            account: melin_ec_protocol::types::AccountId(1),
+            order_id: OrderId(42),
+        }
+    }
+
+    /// A request shed under load is answered `ServerBusy`, naming it.
+    /// The client surfaces it as `ClientError::ServerBusy`, and the
+    /// connection is good for the resend.
     #[test]
-    fn server_busy_returns_backpressure_error() {
+    fn server_busy_returns_backpressure_error_and_keeps_the_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -639,31 +684,28 @@ mod tests {
 
             mock_auth_handshake(&mut reader, &mut writer, 0);
 
-            // Read the request.
-            let _frame = reader.read_frame().unwrap().unwrap();
+            let (id, _request) = read_request(&mut reader);
+            write_transport(&mut writer, &TransportResponse::ServerBusy { id });
 
-            // Respond with ServerBusy instead of a normal response batch.
-            write_transport(&mut writer, &TransportResponse::ServerBusy);
+            // The resend is applied.
+            let (id, _request) = read_request(&mut reader);
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id });
         });
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
-        let result = client.send_request(&Request::CancelOrder {
-            symbol: Symbol(1),
-            account: melin_ec_protocol::types::AccountId(1),
-            order_id: OrderId(42),
-        });
-
+        let result = client.send_request(&cancel_order());
         assert!(
             matches!(result, Err(ClientError::ServerBusy)),
             "expected ServerBusy error, got {result:?}"
         );
+        assert!(client.send_request(&cancel_order()).unwrap().is_empty());
     }
 
-    /// An engine error is the node's word on one request: its batch
-    /// still ends, and the connection is good for the next request.
+    /// A request the node refuses is `ClientError::Refused`, with the
+    /// node's kind and reason, and the connection is good for the next.
     #[test]
-    fn engine_error_is_reported_once_its_batch_has_ended() {
+    fn refusal_is_reported_with_its_reason_and_keeps_the_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -674,32 +716,136 @@ mod tests {
 
             mock_auth_handshake(&mut reader, &mut writer, 0);
 
-            // The first request fails in the engine; the batch ends.
-            let _frame = reader.read_frame().unwrap().unwrap();
-            write_transport(&mut writer, &TransportResponse::EngineError);
-            write_transport(&mut writer, &TransportResponse::BatchEnd);
+            let (id, _request) = read_request(&mut reader);
+            write_transport(
+                &mut writer,
+                &TransportResponse::Refused {
+                    id,
+                    kind: RefusalKind::PermissionDenied,
+                    reason: "not for this role",
+                },
+            );
 
-            // The second, on the same connection, gets an empty batch.
-            let _frame = reader.read_frame().unwrap().unwrap();
-            write_transport(&mut writer, &TransportResponse::BatchEnd);
+            let (id, _request) = read_request(&mut reader);
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id });
         });
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
-        let request = Request::CancelOrder {
-            symbol: Symbol(1),
-            account: melin_ec_protocol::types::AccountId(1),
-            order_id: OrderId(42),
-        };
+        match client.send_request(&cancel_order()) {
+            Err(ClientError::Refused { kind, reason }) => {
+                assert_eq!(kind, RefusalKind::PermissionDenied);
+                assert_eq!(reason, "not for this role");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(client.send_request(&cancel_order()).unwrap().is_empty());
+    }
 
-        let result = client.send_request(&request);
+    /// Every answer names its request: one naming a request not yet sent
+    /// is a protocol violation, never taken for this request's.
+    #[test]
+    fn an_answer_naming_a_request_not_sent_is_a_protocol_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+
+            let (id, _request) = read_request(&mut reader);
+            write_transport(
+                &mut writer,
+                &TransportResponse::BatchEnd {
+                    id: RequestId(id.0 + 1),
+                },
+            );
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        let result = client.send_request(&cancel_order());
         assert!(
-            matches!(result, Err(ClientError::EngineError)),
-            "expected EngineError, got {result:?}"
+            matches!(result, Err(ClientError::Protocol(_))),
+            "expected a protocol error, got {result:?}"
         );
-        // The BatchEnd was consumed with the error: the next request
-        // reads its own batch, not a stale terminator.
-        assert!(client.send_request(&request).unwrap().is_empty());
+    }
+
+    /// A request whose call timed out is answered late, ahead of the
+    /// next request's answer: the next call discards the late answer,
+    /// its responses included, and returns its own.
+    #[test]
+    fn a_late_answer_to_a_timed_out_request_is_discarded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            mock_auth_handshake(&mut reader, &mut writer, 0);
+
+            // The first request goes unanswered until the second arrives,
+            // which the client sends once the first has timed out.
+            let (late, _request) = read_request(&mut reader);
+            let (next, _request) = read_request(&mut reader);
+            write_response(&mut writer, &ResponseKind::RequestSeqHwm { hwm: 1 });
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id: late });
+            write_response(&mut writer, &ResponseKind::RequestSeqHwm { hwm: 2 });
+            write_transport(&mut writer, &TransportResponse::BatchEnd { id: next });
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        assert!(matches!(
+            client.send_request(&cancel_order()),
+            Err(ClientError::Io(_))
+        ));
+
+        client.set_read_timeout(None).unwrap();
+        let responses = client.send_request(&cancel_order()).unwrap();
+        assert!(
+            matches!(responses[..], [ResponseKind::RequestSeqHwm { hwm: 2 }]),
+            "expected the second request's own response, got {responses:?}"
+        );
+    }
+
+    /// Each request on a connection carries an ID of its own, numbered
+    /// from 1, whatever the request sequence the resync adopts.
+    #[test]
+    fn requests_are_numbered_from_one_on_each_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            // The auto-sync is request 1, at a high request sequence.
+            mock_auth_handshake(&mut reader, &mut writer, 500);
+
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let (id, _request) = read_request(&mut reader);
+                ids.push(id);
+                write_transport(&mut writer, &TransportResponse::BatchEnd { id });
+            }
+            ids
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        client.send_request(&cancel_order()).unwrap();
+        client.send_request(&cancel_order()).unwrap();
+        assert_eq!(server.join().unwrap(), [RequestId(2), RequestId(3)]);
     }
 
     /// A reply backed by the primary's disk alone is never taken for a
@@ -719,35 +865,26 @@ mod tests {
             mock_auth_handshake(&mut reader, &mut writer, 0);
 
             // A write, answered with one response and a degraded end.
-            let _frame = reader.read_frame().unwrap().unwrap();
-            let mut buf = [0u8; 64];
-            let written =
-                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: 7 }, &mut buf).unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            write_transport(&mut writer, &TransportResponse::BatchEndDegraded);
+            let (id, _request) = read_request(&mut reader);
+            write_response(&mut writer, &ResponseKind::RequestSeqHwm { hwm: 7 });
+            write_transport(&mut writer, &TransportResponse::BatchEndDegraded { id });
 
             // A stats query, answered the same way.
-            let _frame = reader.read_frame().unwrap().unwrap();
-            let written = codec::encode_response(
+            let (id, _request) = read_request(&mut reader);
+            write_response(
+                &mut writer,
                 &ResponseKind::StatsHeader {
                     active_connections: 1,
                     events_processed: 2,
                     journal_sequence: 3,
                 },
-                &mut buf,
-            )
-            .unwrap();
-            writer.write_frame(&buf[4..written]).unwrap();
-            write_transport(&mut writer, &TransportResponse::BatchEndDegraded);
+            );
+            write_transport(&mut writer, &TransportResponse::BatchEndDegraded { id });
         });
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
-        let result = client.send_request(&Request::CancelOrder {
-            symbol: Symbol(1),
-            account: melin_ec_protocol::types::AccountId(1),
-            order_id: OrderId(42),
-        });
+        let result = client.send_request(&cancel_order());
         match result {
             Err(ClientError::Degraded(responses)) => assert!(
                 matches!(responses[..], [ResponseKind::RequestSeqHwm { hwm: 7 }]),
@@ -777,11 +914,7 @@ mod tests {
 
         let key = test_key();
         let mut client = Client::connect(addr, &key).unwrap();
-        let result = client.send_request(&Request::CancelOrder {
-            symbol: Symbol(1),
-            account: melin_ec_protocol::types::AccountId(1),
-            order_id: OrderId(42),
-        });
+        let result = client.send_request(&cancel_order());
 
         assert!(result.is_err());
     }

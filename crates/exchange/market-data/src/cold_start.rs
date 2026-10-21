@@ -150,9 +150,10 @@ fn seed_level(
 /// Read the next application response off the publisher's stream, with
 /// the ring sequence it was published at. The transport's frames in
 /// between — a heartbeat on a quiet feed, the `BatchEnd` closing each
-/// request's batch, a busy or failing engine's word on a request that
-/// is not ours — are told apart by the sequencer's client and skipped:
-/// the mirrors are built from execution reports alone.
+/// request's batch — are told apart by the sequencer's client and
+/// skipped: the mirrors are built from execution reports alone. A busy
+/// or a refusal answers the client that sent the request and never
+/// reaches the feed, so one here is the publisher's mistake.
 pub(crate) fn read_response(
     reader: &mut dyn io::Read,
 ) -> Result<(u64, ResponseKind), SnapshotError> {
@@ -160,7 +161,10 @@ pub(crate) fn read_response(
         let (seq, frame) = read_frame(reader)?;
         match melin_client::classify(&frame)? {
             Reply::Response(body) => return Ok((seq, codec::decode_response_body(body)?)),
-            Reply::Heartbeat | Reply::BatchEnd(_) | Reply::ServerBusy | Reply::EngineError => {}
+            Reply::Heartbeat | Reply::BatchEnd { .. } => {}
+            Reply::ServerBusy { .. } | Reply::Refused { .. } => {
+                return Err(SnapshotError::RequestAnswer);
+            }
         }
     }
 }
@@ -194,6 +198,9 @@ pub enum SnapshotError {
     /// The sequencer's client refused a frame: an empty one, or a tag
     /// no reply carries.
     Transport(melin_client::Error),
+    /// A `ServerBusy` or `Refused`: an answer to a client's request,
+    /// which the publisher should never have put on the feed.
+    RequestAnswer,
     FrameTooLarge(usize),
     DuplicateSymbol(Symbol),
 }
@@ -222,6 +229,7 @@ impl std::fmt::Display for SnapshotError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Transport(e) => write!(f, "malformed frame from the publisher: {e}"),
+            Self::RequestAnswer => write!(f, "a busy or a refusal on the event feed"),
             Self::FrameTooLarge(n) => write!(f, "frame too large: {n} bytes"),
             Self::DuplicateSymbol(s) => write!(f, "duplicate symbol in snapshot: {:?}", s),
         }
@@ -233,6 +241,7 @@ impl std::error::Error for SnapshotError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use melin_client::RequestId;
     use melin_ec_protocol::codec::encode_response;
     use melin_wire_protocol::control::TransportResponse;
     use melin_wire_protocol::control_codec;
@@ -392,7 +401,10 @@ mod tests {
             },
         ));
         data.extend(transport_frame(0, &TransportResponse::Heartbeat));
-        data.extend(transport_frame(0, &TransportResponse::BatchEnd));
+        data.extend(transport_frame(
+            0,
+            &TransportResponse::BatchEnd { id: RequestId(0) },
+        ));
         data.extend(encode_frame(
             0,
             &ResponseKind::BookSnapshotEnd {
@@ -415,6 +427,29 @@ mod tests {
         assert!(result.mirrors[0].1.bids().is_empty());
         assert!(result.mirrors[0].1.asks().is_empty());
         assert_eq!(result.last_applied_seq, 42);
+    }
+
+    /// A busy or a refusal answers the client whose request it was, never
+    /// the feed: one there is refused rather than skipped.
+    #[test]
+    fn a_busy_or_a_refusal_on_the_feed_is_an_error() {
+        for frame in [
+            TransportResponse::ServerBusy { id: RequestId(1) },
+            TransportResponse::Refused {
+                id: RequestId(1),
+                kind: melin_client::RefusalKind::Malformed,
+                reason: "bad",
+            },
+        ] {
+            let mut cursor = io::Cursor::new(transport_frame(0, &frame));
+            assert!(
+                matches!(
+                    parse_snapshot(&mut cursor),
+                    Err(SnapshotError::RequestAnswer)
+                ),
+                "{frame:?} must not be skipped"
+            );
+        }
     }
 
     #[test]

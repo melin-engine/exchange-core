@@ -50,11 +50,12 @@ use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::message::{Request, ResponseKind};
+use melin_wire_protocol::control::RequestId;
 use melin_wire_protocol::control_codec::{TAG_APP, TAG_LEN};
 use melin_wire_protocol::error::ProtocolError;
 #[cfg(doc)]
 use melin_wire_protocol::framing::REQUEST_HEADER_LEN;
-use melin_wire_protocol::framing::{self, PREFIX_LEN};
+use melin_wire_protocol::framing::{self, NotARequest, PREFIX_LEN};
 
 // --- Wire header structs ---
 //
@@ -174,7 +175,7 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 // built against an older release would misread the new reason.
 
 /// Encode a request into `buf` as a complete wire frame. Returns total
-/// bytes written (length prefix + tag + body).
+/// bytes written (length prefix + tag + ID + body).
 ///
 /// The body is encoded in place and the sequencer frames it, so the
 /// header is written exactly as the node reads it. The caller must
@@ -182,11 +183,18 @@ const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 /// largest is [`REQUEST_HEADER_LEN`] + [`MAX_REQUEST_BODY`]); a buffer
 /// shorter than the header is `Truncated`. The `ChallengeResponse` of the
 /// handshake is the sequencer's frame, built by its client, and never
-/// passes here. `seq` is the per-key monotonic request sequence the
-/// engine's idempotency check reads. A heartbeat uses `seq = 0`: the node
-/// runtime answers it, and it never reaches the engine.
-pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    framing::frame_request(buf, |body| encode_request_body(request, seq, body))
+/// passes here. `id` is the request's ID on its connection, which every
+/// answer to it names: a client that pipelines gives each request in
+/// flight a different one. `seq` is the per-key monotonic request sequence
+/// the engine's idempotency check reads. A heartbeat uses `seq = 0`: the
+/// node runtime answers it, and it never reaches the engine.
+pub fn encode_request(
+    request: &Request,
+    id: RequestId,
+    seq: u64,
+    buf: &mut [u8],
+) -> Result<usize, ProtocolError> {
+    framing::frame_request(buf, id, |body| encode_request_body(request, seq, body))
 }
 
 /// Encode a request's body — kind, sequence, payload — at the start of
@@ -384,10 +392,16 @@ pub fn app_frame_body(frame: &[u8]) -> Result<&[u8], ProtocolError> {
 }
 
 /// Decode a request frame from `buf`, after its length prefix: the
-/// protocol's tag, then the body. For a body the node runtime has
-/// already unframed, see [`decode_request_body`].
-pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
-    decode_request_body(app_frame_body(buf)?)
+/// protocol's tag and the request's ID, then the body. Returns
+/// `(id, seq, Request)`. For a body the node runtime has already
+/// unframed, see [`decode_request_body`].
+pub fn decode_request(buf: &[u8]) -> Result<(RequestId, u64, Request), ProtocolError> {
+    let (id, body) = framing::split_request(buf).map_err(|e| match e {
+        NotARequest::Tag(tag) => ProtocolError::UnknownTag(tag),
+        NotARequest::Empty | NotARequest::TooShort { .. } => ProtocolError::Truncated,
+    })?;
+    let (seq, request) = decode_request_body(body)?;
+    Ok((id, seq, request))
 }
 
 /// Decode a request body — kind, sequence, payload — as the node runtime
@@ -1462,6 +1476,12 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
 pub(crate) mod tests {
     use super::*;
     use melin_ec_types::types::{SelfTradeProtection, Side, TimeInForce};
+    use melin_wire_protocol::control_codec::TAG_REQUEST;
+    use melin_wire_protocol::framing::REQUEST_HEADER_LEN;
+
+    /// Where a request frame's body starts: past the length prefix, the
+    /// tag and the ID.
+    const BODY_AT: usize = REQUEST_HEADER_LEN;
 
     fn nz(v: u64) -> NonZeroU64 {
         NonZeroU64::new(v).unwrap()
@@ -1882,9 +1902,11 @@ pub(crate) mod tests {
 
         for (i, request) in requests.iter().enumerate() {
             let seq = (i as u64) + 1;
-            let written = encode_request(request, seq, &mut buf).unwrap();
+            let id = RequestId(1000 + seq);
+            let written = encode_request(request, id, seq, &mut buf).unwrap();
             // Skip the 4-byte length prefix for decode.
-            let (decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+            let (decoded_id, decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+            assert_eq!(decoded_id, id, "id mismatch for variant {i}");
             assert_eq!(decoded_seq, seq, "seq mismatch for variant {i}");
             assert_eq!(&decoded, request, "request variant {i}");
         }
@@ -1932,11 +1954,11 @@ pub(crate) mod tests {
 
         for (i, request) in make_requests().iter().enumerate() {
             let seq = i as u64;
-            let written = encode_request(request, seq, &mut frame).unwrap();
+            let written = encode_request(request, RequestId(seq), seq, &mut frame).unwrap();
             let len = encode_request_body(request, seq, &mut body).unwrap();
-            assert_eq!(frame[4], TAG_APP, "tag of variant {i}");
-            assert_eq!(TAG_LEN + len, written - 4, "length of variant {i}");
-            assert_eq!(body[..len], frame[5..written], "body of variant {i}");
+            assert_eq!(frame[4], TAG_REQUEST, "tag of variant {i}");
+            assert_eq!(BODY_AT + len, written, "length of variant {i}");
+            assert_eq!(body[..len], frame[BODY_AT..written], "body of variant {i}");
             assert_eq!(
                 decode_request_body(&body[..len]).unwrap(),
                 (seq, *request),
@@ -1966,9 +1988,16 @@ pub(crate) mod tests {
             decode_request_body(&[]),
             Err(ProtocolError::Truncated)
         ));
-        // A frame that is its tag alone has an empty body.
+        // A request tag with no room for its ID.
         assert!(matches!(
-            decode_request(&[TAG_APP]),
+            decode_request(&[TAG_REQUEST, 1, 2, 3]),
+            Err(ProtocolError::Truncated)
+        ));
+        // A tag and an ID alone have an empty body.
+        let mut bare = [0u8; 9];
+        bare[0] = TAG_REQUEST;
+        assert!(matches!(
+            decode_request(&bare),
             Err(ProtocolError::Truncated)
         ));
 
@@ -2006,26 +2035,41 @@ pub(crate) mod tests {
     }
 
     /// The layout the node runtime relies on: its tag is the first byte
-    /// after the length prefix, and the body it hands the decoder opens
-    /// with the kind, then the sequence.
+    /// after the length prefix, the request's ID follows it, and the body
+    /// it hands the decoder opens with the kind, then the sequence.
     #[test]
-    fn the_app_tag_leads_and_the_body_opens_with_kind_then_seq() {
+    fn the_request_tag_and_id_lead_and_the_body_opens_with_kind_then_seq() {
         let request = Request::CancelAll {
             account: AccountId(9),
         };
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 0x0102_0304_0506_0708, &mut buf).unwrap();
+        let written = encode_request(
+            &request,
+            RequestId(0x1112_1314_1516_1718),
+            0x0102_0304_0506_0708,
+            &mut buf,
+        )
+        .unwrap();
 
-        assert_eq!(buf[4], TAG_APP, "the protocol's tag follows the length");
-        assert_eq!(buf[5], KIND_CANCEL_ALL, "the kind opens the body");
+        assert_eq!(buf[4], TAG_REQUEST, "the protocol's tag follows the length");
         assert_eq!(
-            buf[6..14],
+            buf[5..BODY_AT],
+            0x1112_1314_1516_1718u64.to_le_bytes(),
+            "the request's ID follows the tag"
+        );
+        assert_eq!(buf[BODY_AT], KIND_CANCEL_ALL, "the kind opens the body");
+        assert_eq!(
+            buf[BODY_AT + 1..BODY_AT + 9],
             0x0102_0304_0506_0708u64.to_le_bytes(),
             "the seq follows the kind"
         );
-        assert_eq!(le::get_u32(&buf[14..]), 9, "the payload follows the seq");
+        assert_eq!(
+            le::get_u32(&buf[BODY_AT + 9..]),
+            9,
+            "the payload follows the seq"
+        );
 
-        let body = &buf[5..written];
+        let body = &buf[BODY_AT..written];
         assert_eq!(
             decode_request_body(body).unwrap(),
             (0x0102_0304_0506_0708, request)
@@ -2043,10 +2087,10 @@ pub(crate) mod tests {
     #[test]
     fn frames_and_bodies_do_not_mix() {
         let mut buf = [0u8; 136];
-        let written = encode_request(&Request::QueryStats, 1, &mut buf).unwrap();
+        let written = encode_request(&Request::QueryStats, RequestId(1), 1, &mut buf).unwrap();
         assert!(matches!(
             decode_request_body(&buf[4..written]),
-            Err(ProtocolError::UnknownTag(TAG_APP))
+            Err(ProtocolError::UnknownTag(TAG_REQUEST))
         ));
         let written = encode_response(&ResponseKind::RequestSeqHwm { hwm: 1 }, &mut buf).unwrap();
         assert!(matches!(
@@ -2054,13 +2098,13 @@ pub(crate) mod tests {
             Err(ProtocolError::UnknownTag(TAG_APP))
         ));
 
-        // A frame as the protocol framed application messages before
-        // `TAG_APP`, the kind in the tag's place: after its length prefix,
-        // that is today's body.
-        let written = encode_request(&Request::QueryStats, 1, &mut buf).unwrap();
+        // A request as clients framed it before request IDs, under the
+        // application's tag: not a request.
+        let len = encode_request_body(&Request::QueryStats, 1, &mut buf[1..]).unwrap();
+        buf[0] = TAG_APP;
         assert!(matches!(
-            decode_request(&buf[5..written]),
-            Err(ProtocolError::UnknownTag(KIND_QUERY_STATS))
+            decode_request(&buf[..1 + len]),
+            Err(ProtocolError::UnknownTag(TAG_APP))
         ));
     }
 
@@ -2084,8 +2128,8 @@ pub(crate) mod tests {
             },
         };
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 1, &mut buf).unwrap();
-        assert_eq!(written, 4 + 1 + MAX_REQUEST_BODY);
+        let written = encode_request(&request, RequestId(1), 1, &mut buf).unwrap();
+        assert_eq!(written, REQUEST_HEADER_LEN + MAX_REQUEST_BODY);
     }
 
     #[test]
@@ -2139,7 +2183,7 @@ pub(crate) mod tests {
             order_id: OrderId(42),
         };
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 42, &mut buf).unwrap();
+        let written = encode_request(&request, RequestId(7), 42, &mut buf).unwrap();
 
         let length = le::get_u32(&buf[0..]) as usize;
         assert_eq!(length, written - 4, "length prefix should be total - 4");
@@ -2150,8 +2194,8 @@ pub(crate) mod tests {
         // A heartbeat uses seq=0; the frame still carries it.
         let request = Request::Heartbeat;
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 0, &mut buf).unwrap();
-        let (decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        let written = encode_request(&request, RequestId(1), 0, &mut buf).unwrap();
+        let (_id, decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
         assert_eq!(decoded_seq, 0);
         assert_eq!(decoded, request);
     }
@@ -2164,22 +2208,24 @@ pub(crate) mod tests {
             amount: 100,
         };
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, u64::MAX, &mut buf).unwrap();
-        let (decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        let written = encode_request(&request, RequestId(u64::MAX), u64::MAX, &mut buf).unwrap();
+        let (decoded_id, decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        assert_eq!(decoded_id, RequestId(u64::MAX));
         assert_eq!(decoded_seq, u64::MAX);
         assert_eq!(decoded, request);
     }
 
     #[test]
-    fn length_prefix_includes_seq_bytes() {
-        // The length field must include tag(1) + kind(1) + seq(8) + payload.
+    fn length_prefix_includes_id_and_seq_bytes() {
+        // The length field must include tag(1) + id(8) + kind(1) + seq(8)
+        // + payload.
         let request = Request::Heartbeat;
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 0, &mut buf).unwrap();
+        let written = encode_request(&request, RequestId(1), 0, &mut buf).unwrap();
         let length = le::get_u32(&buf[0..]) as usize;
-        // Heartbeat has no payload, so length = tag(1) + kind(1) + seq(8) = 10.
-        assert_eq!(length, 10);
-        assert_eq!(written, 4 + 10); // 4-byte prefix + 10 behind it
+        // Heartbeat has no payload, so length = 1 + 8 + 1 + 8 = 18.
+        assert_eq!(length, 18);
+        assert_eq!(written, 4 + 18); // 4-byte prefix + 18 behind it
     }
 
     #[test]
@@ -2190,8 +2236,8 @@ pub(crate) mod tests {
             count: 0,
         };
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 1, &mut buf).unwrap();
-        let (seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        let written = encode_request(&request, RequestId(1), 1, &mut buf).unwrap();
+        let (_id, seq, decoded) = decode_request(&buf[4..written]).unwrap();
         assert_eq!(seq, 1);
         if let Request::Subscribe { count, .. } = decoded {
             assert_eq!(count, 0);
@@ -2215,8 +2261,8 @@ pub(crate) mod tests {
         ];
         let request = Request::Subscribe { symbols, count: 8 };
         let mut buf = [0u8; 136];
-        let written = encode_request(&request, 1, &mut buf).unwrap();
-        let (_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        let written = encode_request(&request, RequestId(1), 1, &mut buf).unwrap();
+        let (_id, _seq, decoded) = decode_request(&buf[4..written]).unwrap();
         if let Request::Subscribe {
             symbols: decoded_syms,
             count,

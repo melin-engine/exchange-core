@@ -61,9 +61,10 @@ impl RequestDecoderTrait for RequestDecoder {
 }
 
 /// Collapse a typed `ProtocolError` into the static reason carried by
-/// `Decoded::DecodeError`. The reader's debug log surfaces this
-/// reason; a misbehaving client gets diagnosed without exposing the
-/// full error chain.
+/// `Decoded::DecodeError`. The node refuses the request as malformed
+/// with this reason, which the client sees, and logs it at debug: a
+/// misbehaving client gets diagnosed without exposing the full error
+/// chain.
 #[inline]
 fn protocol_error_reason(e: &ProtocolError) -> &'static str {
     match e {
@@ -76,16 +77,17 @@ fn protocol_error_reason(e: &ProtocolError) -> &'static str {
 }
 
 /// The reason carried by `Decoded::PermissionDenied` for a request of
-/// `category` that its connection's role may not send. The reader's debug
-/// log surfaces it.
+/// `category` that its connection's role may not send. The node refuses
+/// the request with it, so the client whose request it was reads it, and
+/// logs it at debug.
 #[inline]
 fn denial_reason(category: RequestCategory) -> &'static str {
     match category {
-        RequestCategory::Trading => "non-trader attempted trading",
-        RequestCategory::FundManagement => "non-custodian attempted fund management",
-        RequestCategory::Administration => "non-operator attempted operator command",
+        RequestCategory::Trading => "only a trader key may trade",
+        RequestCategory::FundManagement => "only a custodian key may move funds",
+        RequestCategory::Administration => "only an operator key may send operator commands",
         // Every client role may send these today; named for completeness.
-        RequestCategory::Connection => "role may not send connection messages",
+        RequestCategory::Connection => "this key's role may not send connection messages",
     }
 }
 

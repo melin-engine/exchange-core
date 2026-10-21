@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use melin_client::Connection;
+use melin_client::{Connection, RequestId};
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::{Request, ResponseKind};
 use melin_ec_types::types::{ExecutionReport, Symbol};
@@ -120,7 +120,9 @@ fn run_session(
         symbols: symbols_arr,
         count,
     };
-    send_request(&mut stream, &subscribe, 1)?;
+    // The connection's one request: the publisher answers it with the
+    // snapshot and the firehose, not a reply naming it.
+    send_request(&mut stream, &subscribe, RequestId(1), 1)?;
 
     // Step 3: Parse snapshot.
     let snapshot = crate::cold_start::parse_snapshot(&mut stream)?;
@@ -178,9 +180,14 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
 }
 
 /// Send a length-prefixed request.
-fn send_request(stream: &mut TcpStream, request: &Request, seq: u64) -> io::Result<()> {
+fn send_request(
+    stream: &mut TcpStream,
+    request: &Request,
+    id: RequestId,
+    seq: u64,
+) -> io::Result<()> {
     let mut buf = [0u8; 256];
-    let written = codec::encode_request(request, seq, &mut buf)
+    let written = codec::encode_request(request, id, seq, &mut buf)
         .map_err(|e| io::Error::other(format!("encode: {e}")))?;
     stream.write_all(&buf[..written])?;
     stream.flush()

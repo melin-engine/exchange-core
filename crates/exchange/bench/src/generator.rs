@@ -45,13 +45,15 @@ fn fast_powf(base: f64, exp: f64) -> f64 {
     }
 }
 
+use melin_client::RequestId;
 use melin_ec_protocol::codec;
 use melin_ec_protocol::message::Request;
 
 /// Upper bound on the size (in bytes) of any single length-prefixed request
 /// frame this generator can produce. Matches the largest fixed encoding the
 /// codec emits for the request variants used by the bench (`SubmitOrder`,
-/// `CancelOrder`, `CancelReplace`) including the 4-byte LE length prefix.
+/// `CancelOrder`, `CancelReplace`) including the 4-byte LE length prefix,
+/// the tag and the request's ID, with room to spare.
 /// Callers should size scratch buffers to this so the encoder never reallocates.
 pub const MAX_REQUEST_FRAME_BYTES: usize = 136;
 use melin_ec_types::types::{
@@ -335,7 +337,11 @@ impl OrderFlowGenerator {
     /// Generate the next event and append its length-prefixed wire frame
     /// (`[u32 LE length][payload]`) to `out`. Used by transport benchmarks
     /// that generate orders on-the-fly to keep bench memory bounded.
-    pub fn next_wire_frame(&mut self, out: &mut Vec<u8>) {
+    ///
+    /// Returns the request's ID, which the node's answer names. It is the
+    /// request's sequence: a generator drives one connection, so its
+    /// sequence never repeats there.
+    pub fn next_wire_frame(&mut self, out: &mut Vec<u8>) -> RequestId {
         let event = self.next_event();
         let request = match event {
             GeneratedEvent::Submit { symbol, order } => Request::SubmitOrder { symbol, order },
@@ -364,11 +370,14 @@ impl OrderFlowGenerator {
         };
 
         self.seq += 1;
+        let id = RequestId(self.seq);
         // Stack scratch sized to the largest encoded request — codec writes
         // [u32 LE length][payload] starting at offset 0.
         let mut encode_buf = [0u8; MAX_REQUEST_FRAME_BYTES];
-        let written = codec::encode_request(&request, self.seq, &mut encode_buf).expect("encode");
+        let written =
+            codec::encode_request(&request, id, self.seq, &mut encode_buf).expect("encode");
         out.extend_from_slice(&encode_buf[..written]);
+        id
     }
 
     fn generate_submit(&mut self) -> GeneratedEvent {
@@ -815,11 +824,12 @@ mod tests {
         // length-prefixed frame to `buf`; we walk the cursor forward.
         let mut cursor = 0usize;
         for _ in 0..100 {
-            ofg.next_wire_frame(&mut buf);
+            let id = ofg.next_wire_frame(&mut buf);
             assert!(buf.len() >= cursor + 4, "frame must include length prefix");
             let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
             let payload = &buf[cursor + 4..cursor + 4 + len];
-            let (seq, _request) = codec::decode_request(payload).expect("decode");
+            let (framed_id, seq, _request) = codec::decode_request(payload).expect("decode");
+            assert_eq!(framed_id, id, "the frame carries the ID returned");
             assert!(seq > 0, "frame seq should be > 0");
             cursor += 4 + len;
         }

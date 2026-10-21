@@ -113,6 +113,22 @@ Execution reports from Melin are translated back into
 `ExecutionReport (35=8)` or `OrderCancelReject (35=9)` as appropriate
 and queued for the FIX client.
 
+A request the exchange turns away without applying it is answered the
+same way, so no FIX message goes unanswered. When the exchange is too
+busy to take a request, a new order is rejected with an
+`ExecutionReport (35=8)` (`ExecType=8`, `OrdRejReason=99`) whose `Text`
+asks the client to resend it, and a cancel or cancel-replace with an
+`OrderCancelReject (35=9)` (`CxlRejReason=99`). Under load the exchange
+sheds a burst at a time, so several messages in a row may be rejected
+this way; a client whose orders depend on each other's order waits for
+the answers it is owed before it resends. A request the exchange refuses
+(the session's key may not send it) is rejected the same way, with the
+exchange's reason as the `Text`. A `RequestForPositions (35=AN)` turned
+away is answered with a `PositionReport (35=AP)` carrying no positions
+and `PosReqResult=3` (not authorized) or `99` (other). Each session's
+key must be listed under the `trader` role in the exchange's
+`authorized_keys`.
+
 ## Metrics
 
 When `metrics_addr` is set in the config, the gateway exposes a
@@ -133,6 +149,12 @@ Exposed series:
 | `fix_gateway_resend_requests_received_total` | counter | ResendRequests received from peers |
 | `fix_gateway_store_evictions_total` | counter | Outbound store entries evicted at the per-session cap |
 | `fix_gateway_rate_limit_hits_total` | counter | Inbound messages dropped by per-session rate limit |
+| `fix_gateway_exchange_busy_total` | counter | Requests the exchange shed under load, each rejected to the FIX client |
+| `fix_gateway_exchange_refused_total` | counter | Requests the exchange refused, each rejected to the FIX client |
+
+The gateway also logs a warning when the exchange sheds or refuses a
+session's requests, at most once a second per session, with the count
+since the last warning.
 
 If `metrics_addr` is omitted the counters are still maintained but
 no scrape endpoint is exposed.

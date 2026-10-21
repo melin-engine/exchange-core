@@ -60,9 +60,6 @@ mod dpdk;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(not(feature = "dpdk"))]
-use std::collections::VecDeque;
-
-#[cfg(not(feature = "dpdk"))]
 use std::io::Write;
 use std::num::NonZeroU64;
 #[cfg(not(feature = "dpdk"))]
@@ -74,6 +71,8 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
+#[cfg(not(feature = "dpdk"))]
+use melin_client::InFlight;
 #[cfg(not(feature = "dpdk"))]
 use melin_client::framing::FrameDecoder;
 use melin_client::{Ack, Reply};
@@ -1406,7 +1405,6 @@ fn run_pipeline_inner(
     use melin_journal::JournalEvent;
     use melin_transport_core::pipeline::OutputPayload;
     use melin_transport_core::pipeline::{InputSlot, build_pipeline_with_replication};
-    use melin_transport_core::trace::mono_trace_ns;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -1604,14 +1602,11 @@ fn run_pipeline_inner(
                 } else {
                     rdtscp()
                 };
-                producer.publish(InputSlot {
-                    connection_id: 0,
-                    key_hash: 0,
-                    sequence: 0,
-                    timestamp_ns: tsc_clock.unix_ns(ts),
-                    // Key 0 is exempt from the engine's idempotency check,
-                    // so the sequence can stay at zero.
-                    event: JournalEvent::App(TradingRequest::internal(TradingEvent::SubmitOrder {
+                // A node event's slot: connection, key and sequence 0.
+                // Key 0 is exempt from the engine's idempotency check, so
+                // the sequence can stay at zero.
+                producer.publish(InputSlot::node_event(
+                    JournalEvent::App(TradingRequest::internal(TradingEvent::SubmitOrder {
                         symbol: Symbol(1),
                         order: Order {
                             id: order_id,
@@ -1627,9 +1622,8 @@ fn run_pipeline_inner(
                             expiry_ns: 0,
                         },
                     })),
-                    publish_ts: mono_trace_ns(),
-                    recv_ts: mono_trace_ns(),
-                });
+                    tsc_clock.unix_ns(ts),
+                ));
                 inflight_pub.fetch_add(1, Ordering::Release);
                 ts_tx.publish(ts);
             }
@@ -1703,12 +1697,11 @@ fn run_pipeline_inner(
             outcomes.batch_ends += 1;
         }
         // Tally the payload variant *after* the latency capture above.
-        // Report payloads count as their inner execution-report variant;
-        // EngineError payloads are tracked separately. BatchEnd /
-        // QueryResponse payloads carry no order-acceptance signal.
+        // Report payloads count as their inner execution-report variant.
+        // BatchEnd / QueryResponse payloads carry no order-acceptance
+        // signal.
         match slot.payload {
             OutputPayload::Report(report) => outcomes.record_execution_report(&report),
-            OutputPayload::EngineError => outcomes.engine_errors += 1,
             OutputPayload::BatchEnd
             | OutputPayload::QueryResponse(_)
             | OutputPayload::AckPolicyChange(_) => {}
@@ -2344,7 +2337,7 @@ fn run_uring_roundtrip<R, W, F>(
             send_buf: Vec::with_capacity(4096),
             send_pending: false,
             flow,
-            inflight_ts: VecDeque::with_capacity(window),
+            in_flight: InFlight::with_capacity(window),
             pacer: None,
             outcomes: OutcomeReport::default(),
         });
@@ -2565,12 +2558,14 @@ struct UringBenchConn {
     // pre-allocated cap: the loop runs until the wall-clock cooldown
     // deadline expires.
     flow: generator::OrderFlowGenerator,
-    /// TSC tick at send time. `u64` instead of `Instant` to avoid
+    /// TSC tick at send time, by request ID: an answer names its
+    /// request, and one the node sheds may arrive ahead of answers to
+    /// requests sent before it. `u64` instead of `Instant` to avoid
     /// ~15-25ns vDSO overhead per timestamp on the hot path. With
     /// open-loop pacing enabled this stores the *scheduled* TSC instead
     /// of the actual submission TSC — the standard coordinated-omission
     /// fix.
-    inflight_ts: VecDeque<u64>,
+    in_flight: InFlight<u64>,
     /// Open-loop scheduler (when `--target-rate > 0`). Materialised
     /// inside the per-thread bench loop where TSC calibration runs;
     /// constructed `None` initially.
@@ -2754,34 +2749,51 @@ fn run_uring_loop(
                 while let Some(reply) =
                     melin_client::next_reply(&mut conn.decoder).expect("classify reply")
                 {
-                    if matches!(reply, Reply::BatchEnd(_)) {
-                        // `rdtscp()` is captured FIRST — before any
-                        // per-frame bookkeeping (the outcome tally) — so
-                        // the histogram reflects only the wire roundtrip,
-                        // not the bench's own post-processing cost.
-                        let sent_tsc = conn.inflight_ts.pop_front().expect(
-                            "inflight timestamp desync: got BatchEnd without matching send",
-                        );
-                        let latency_ns = tsc_to_ns(rdtscp() - sent_tsc, ticks_per_ns);
-                        // Phase classification by *receive* time, using
-                        // the outer-iter `now`. Once `measured_end`
-                        // passes the histogram is sealed; any further
-                        // completions fall through silently.
-                        if now >= deadlines.warmup_end && now < deadlines.measured_end {
-                            if measured_start.is_none() {
-                                measured_start = Some(now);
+                    match reply {
+                        Reply::BatchEnd { id, .. } => {
+                            // `rdtscp()` is captured FIRST — before any
+                            // per-frame bookkeeping (the outcome tally) — so
+                            // the histogram reflects only the wire roundtrip,
+                            // not the bench's own post-processing cost.
+                            let received_tsc = rdtscp();
+                            let sent_tsc = conn
+                                .in_flight
+                                .remove(id)
+                                .expect("a BatchEnd for no request in flight");
+                            let latency_ns = tsc_to_ns(received_tsc - sent_tsc, ticks_per_ns);
+                            // Phase classification by *receive* time, using
+                            // the outer-iter `now`. Once `measured_end`
+                            // passes the histogram is sealed; any further
+                            // completions fall through silently.
+                            if now >= deadlines.warmup_end && now < deadlines.measured_end {
+                                if measured_start.is_none() {
+                                    measured_start = Some(now);
+                                }
+                                histogram.record(latency_ns).expect("record");
+                                interval_hist.record(latency_ns).expect("record interval");
+                                interval_count += 1;
+                                maybe_sample(
+                                    &mut interval_hist,
+                                    &mut interval_count,
+                                    &mut series,
+                                    bench_start,
+                                );
+                                progress.fetch_add(1, Ordering::Relaxed);
                             }
-                            histogram.record(latency_ns).expect("record");
-                            interval_hist.record(latency_ns).expect("record interval");
-                            interval_count += 1;
-                            maybe_sample(
-                                &mut interval_hist,
-                                &mut interval_count,
-                                &mut series,
-                                bench_start,
-                            );
-                            progress.fetch_add(1, Ordering::Relaxed);
                         }
+                        // A shed request leaves the window, unmeasured:
+                        // it made no round trip through the engine.
+                        Reply::ServerBusy { id } => {
+                            conn.in_flight
+                                .remove(id)
+                                .expect("a busy answer for no request in flight");
+                        }
+                        // The bench's keys may send every request it
+                        // generates: a refusal is a misconfigured run.
+                        Reply::Refused { kind, reason, .. } => {
+                            panic!("the node refused a bench request ({kind:?}): {reason}")
+                        }
+                        Reply::Response(_) | Reply::Heartbeat => {}
                     }
 
                     // Tally outcomes across every phase (warmup,
@@ -2864,7 +2876,7 @@ fn uring_fill_windows(
         // When pacing is active, `pop_due` gates each push by the
         // schedule; the recorded timestamp is the *scheduled* TSC, which
         // is what closes the coordinated-omission loophole.
-        while conn.inflight_ts.len() < window {
+        while conn.in_flight.len() < window {
             let send_tsc = if let Some(pacer) = conn.pacer.as_mut() {
                 let now_tsc = rdtscp();
                 match pacer.pop_due(now_tsc) {
@@ -2882,8 +2894,8 @@ fn uring_fill_windows(
             } else {
                 rdtscp()
             };
-            conn.flow.next_wire_frame(&mut conn.send_buf);
-            conn.inflight_ts.push_back(send_tsc);
+            let id = conn.flow.next_wire_frame(&mut conn.send_buf);
+            conn.in_flight.insert(id, send_tsc);
         }
 
         if !conn.send_buf.is_empty() {
@@ -3024,7 +3036,8 @@ pub(crate) struct OutcomeReport {
     pub replaced: u64,
     pub instrument_status: u64,
     pub rejected: u64,
-    pub engine_errors: u64,
+    /// Requests the node shed at ingress (`ServerBusy`): not applied,
+    /// not resent, and not in the latency histogram.
     pub server_busy: u64,
     /// The `BatchEnd`s above that only the primary's disk backed: a
     /// primary that lost its last replica acks degraded once its grace
@@ -3049,14 +3062,20 @@ impl OutcomeReport {
         reply: &Reply<'_>,
     ) -> Result<(), melin_wire_protocol::error::ProtocolError> {
         match *reply {
-            Reply::BatchEnd(Ack::Policy) => self.batch_ends += 1,
-            Reply::BatchEnd(Ack::PrimaryOnly) => {
+            Reply::BatchEnd {
+                ack: Ack::Policy, ..
+            } => self.batch_ends += 1,
+            Reply::BatchEnd {
+                ack: Ack::PrimaryOnly,
+                ..
+            } => {
                 self.batch_ends += 1;
                 self.degraded_acks += 1;
             }
-            Reply::EngineError => self.engine_errors += 1,
-            Reply::ServerBusy => self.server_busy += 1,
-            Reply::Heartbeat => {}
+            Reply::ServerBusy { .. } => self.server_busy += 1,
+            // The bench loops fail the run on a refusal before it gets
+            // here: the bench's keys may send every request it makes.
+            Reply::Refused { .. } | Reply::Heartbeat => {}
             Reply::Response(body) => {
                 if let ResponseKind::Report(report) = codec::decode_response_body(body)? {
                     self.record_execution_report(&report);
@@ -3095,7 +3114,6 @@ impl OutcomeReport {
         self.replaced += other.replaced;
         self.instrument_status += other.instrument_status;
         self.rejected += other.rejected;
-        self.engine_errors += other.engine_errors;
         self.server_busy += other.server_busy;
         self.degraded_acks += other.degraded_acks;
         for (a, b) in self
@@ -3177,16 +3195,9 @@ pub(crate) fn print_outcome_summary(outcomes: &OutcomeReport) {
     if outcomes.replaced > 0 {
         println!("    replaced:  {:>10}", outcomes.replaced);
     }
-    if outcomes.engine_errors > 0 {
-        println!(
-            "    engine errors: {} ({:.2}%)",
-            outcomes.engine_errors,
-            pct(outcomes.engine_errors)
-        );
-    }
     if outcomes.server_busy > 0 {
         println!(
-            "    server-busy:   {} ({:.2}%)",
+            "    shed (busy):   {} ({:.2}%)",
             outcomes.server_busy,
             pct(outcomes.server_busy)
         );
@@ -3433,7 +3444,7 @@ pub(crate) fn print_results(
                 }
                 reasons.push('}');
                 format!(
-                    ",\"outcomes\":{{\"batch_ends\":{},\"placed\":{},\"fills\":{},\"cancelled\":{},\"triggered\":{},\"replaced\":{},\"rejected\":{},\"engine_errors\":{},\"server_busy\":{},\"degraded_acks\":{},\"reject_reasons\":{reasons}}}",
+                    ",\"outcomes\":{{\"batch_ends\":{},\"placed\":{},\"fills\":{},\"cancelled\":{},\"triggered\":{},\"replaced\":{},\"rejected\":{},\"server_busy\":{},\"degraded_acks\":{},\"reject_reasons\":{reasons}}}",
                     o.batch_ends,
                     o.placed,
                     o.fills,
@@ -3441,7 +3452,6 @@ pub(crate) fn print_results(
                     o.triggered,
                     o.replaced,
                     o.rejected,
-                    o.engine_errors,
                     o.server_busy,
                     o.degraded_acks,
                 )
@@ -3550,6 +3560,7 @@ mod pipeline_core_tests {
 #[cfg(test)]
 mod outcome_report_tests {
     use super::*;
+    use melin_client::RequestId;
 
     fn dummy_order() -> (OrderId, Symbol, AccountId) {
         (OrderId(1), Symbol(0), AccountId(7))
@@ -3575,14 +3586,22 @@ mod outcome_report_tests {
         body.to_vec()
     }
 
+    /// The end of some request's reply, backed as `ack` says.
+    fn batch_end(ack: Ack) -> Reply<'static> {
+        Reply::BatchEnd {
+            id: RequestId(1),
+            ack,
+        }
+    }
+
     #[test]
     fn records_each_variant_into_the_right_bucket() {
         let (oid, sym, acc) = dummy_order();
         let mut r = OutcomeReport::default();
-        r.record(&Reply::BatchEnd(Ack::Policy)).unwrap();
+        r.record(&batch_end(Ack::Policy)).unwrap();
         // A degraded batch end still ends its request, and is counted
         // apart as well.
-        r.record(&Reply::BatchEnd(Ack::PrimaryOnly)).unwrap();
+        r.record(&batch_end(Ack::PrimaryOnly)).unwrap();
         let placed = wire(&ResponseKind::Report(ExecutionReport::Placed {
             order_id: oid,
             symbol: sym,
@@ -3599,8 +3618,7 @@ mod outcome_report_tests {
             reason: RejectReason::InsufficientBalance,
         }));
         r.record(&Reply::Response(&rejected)).unwrap();
-        r.record(&Reply::EngineError).unwrap();
-        r.record(&Reply::ServerBusy).unwrap();
+        r.record(&Reply::ServerBusy { id: RequestId(1) }).unwrap();
         // Heartbeat is intentionally untracked, and so is a response
         // that is not an execution report.
         r.record(&Reply::Heartbeat).unwrap();
@@ -3613,7 +3631,6 @@ mod outcome_report_tests {
         assert_eq!(r.degraded_acks, 1);
         assert_eq!(r.placed, 1);
         assert_eq!(r.rejected, 1);
-        assert_eq!(r.engine_errors, 1);
         assert_eq!(r.server_busy, 1);
         assert_eq!(
             r.reject_reasons[reject_reason_index(RejectReason::InsufficientBalance)],
@@ -3632,12 +3649,12 @@ mod outcome_report_tests {
         }));
         let mut a = OutcomeReport::default();
         a.record(&Reply::Response(&rejected)).unwrap();
-        a.record(&Reply::BatchEnd(Ack::Policy)).unwrap();
+        a.record(&batch_end(Ack::Policy)).unwrap();
 
         let mut b = OutcomeReport::default();
         b.record(&Reply::Response(&rejected)).unwrap();
-        b.record(&Reply::BatchEnd(Ack::Policy)).unwrap();
-        b.record(&Reply::BatchEnd(Ack::PrimaryOnly)).unwrap();
+        b.record(&batch_end(Ack::Policy)).unwrap();
+        b.record(&batch_end(Ack::PrimaryOnly)).unwrap();
 
         a.merge(&b);
         assert_eq!(a.batch_ends, 3);

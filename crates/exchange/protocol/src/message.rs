@@ -162,7 +162,7 @@ impl Request {
 /// Server → client application response payload.
 ///
 /// The transport's own frames — heartbeats, `BatchEnd`, `ServerBusy`,
-/// `EngineError`, and the auth handshake — are not here: the sequencer
+/// `Refused`, and the auth handshake — are not here: the sequencer
 /// encodes them and its client tells them apart (`melin_client::classify`)
 /// before a frame reaches this codec.
 ///
