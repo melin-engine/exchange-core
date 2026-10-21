@@ -158,7 +158,10 @@ signs anything.
   order or cancel the exchange shed under load was logged and dropped,
   leaving the FIX client waiting for an answer that never came; it is now
   rejected as the engine's rejections are, with a `Text` asking for a
-  resend. See "Translation to Melin" in the FIX gateway guide.
+  resend. `fix_gateway_exchange_busy_total` and
+  `fix_gateway_exchange_refused_total` count them, and the gateway warns
+  at most once a second per session. See "Translation to Melin" in the FIX
+  gateway guide.
 - **FIX position reports answer the request they belong to.** The gateway
   paired them with RequestForPositions messages in arrival order, so a
   position query the node dropped gave every later report the previous

@@ -43,6 +43,11 @@ pub struct GatewayMetrics {
     /// Inbound messages dropped because the per-session rate limit
     /// was exceeded in the current window.
     pub rate_limit_hits_total: AtomicU64,
+    /// Requests the exchange shed under load (`ServerBusy`), each
+    /// rejected to the FIX client.
+    pub exchange_busy_total: AtomicU64,
+    /// Requests the exchange refused, each rejected to the FIX client.
+    pub exchange_refused_total: AtomicU64,
 }
 
 impl GatewayMetrics {
@@ -94,7 +99,13 @@ impl GatewayMetrics {
              fix_gateway_store_evictions_total {}\n\
              # HELP fix_gateway_rate_limit_hits_total Inbound messages dropped due to per-session rate limit.\n\
              # TYPE fix_gateway_rate_limit_hits_total counter\n\
-             fix_gateway_rate_limit_hits_total {}\n",
+             fix_gateway_rate_limit_hits_total {}\n\
+             # HELP fix_gateway_exchange_busy_total Requests the exchange shed under load, rejected to the FIX client.\n\
+             # TYPE fix_gateway_exchange_busy_total counter\n\
+             fix_gateway_exchange_busy_total {}\n\
+             # HELP fix_gateway_exchange_refused_total Requests the exchange refused, rejected to the FIX client.\n\
+             # TYPE fix_gateway_exchange_refused_total counter\n\
+             fix_gateway_exchange_refused_total {}\n",
             self.sessions_accepted_total.load(Ordering::Relaxed),
             self.sessions_active.load(Ordering::Relaxed),
             self.messages_received_total.load(Ordering::Relaxed),
@@ -104,6 +115,8 @@ impl GatewayMetrics {
             self.resend_requests_received_total.load(Ordering::Relaxed),
             self.store_evictions_total.load(Ordering::Relaxed),
             self.rate_limit_hits_total.load(Ordering::Relaxed),
+            self.exchange_busy_total.load(Ordering::Relaxed),
+            self.exchange_refused_total.load(Ordering::Relaxed),
         );
         c.position() as usize
     }
@@ -243,6 +256,8 @@ mod tests {
             "fix_gateway_resend_requests_received_total",
             "fix_gateway_store_evictions_total",
             "fix_gateway_rate_limit_hits_total",
+            "fix_gateway_exchange_busy_total",
+            "fix_gateway_exchange_refused_total",
         ] {
             assert!(s.contains(name), "{name} missing from output");
         }

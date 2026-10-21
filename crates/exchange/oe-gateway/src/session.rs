@@ -94,6 +94,35 @@ impl TurnedAway<'_> {
     }
 }
 
+/// A warning given at most once a second, for an event that can come in
+/// bursts: it says how many occurred since the last one it gave.
+#[derive(Default)]
+struct WarnLimiter {
+    /// When the last warning went out; `None` before the first.
+    last: Option<Instant>,
+    /// Events since the last warning, this one included once it is due.
+    /// `u64`: a count that cannot wrap in any session's lifetime.
+    count: u64,
+}
+
+impl WarnLimiter {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Note one event at `now`. Returns how many occurred since the last
+    /// warning, this one included, if a warning is due now.
+    fn due(&mut self, now: Instant) -> Option<u64> {
+        self.count += 1;
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < Self::INTERVAL)
+        {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.count))
+    }
+}
+
 /// A position the node answered with, held until the end of its reply
 /// names the request it answers.
 struct HeldPosition {
@@ -184,6 +213,10 @@ pub struct Session {
     in_flight: InFlight<InFlightRequest>,
     /// A position answered in a reply whose end has not arrived yet.
     held_position: Option<HeldPosition>,
+    /// Paces the warning for requests the node shed.
+    busy_warning: WarnLimiter,
+    /// Paces the warning for requests the node refused.
+    refused_warning: WarnLimiter,
     /// Reusable encode buffer for Melin requests. 128 bytes is the
     /// upper bound (set by ChallengeResponse: 4 prefix + 8 seq + 1
     /// tag + 64 sig + 32 pubkey + slack).
@@ -279,6 +312,8 @@ impl Session {
             melin_last_id: 0,
             in_flight: InFlight::new(),
             held_position: None,
+            busy_warning: WarnLimiter::default(),
+            refused_warning: WarnLimiter::default(),
             melin_encode_buf: [0u8; 128],
             melin_multishot_active: false,
 
@@ -573,13 +608,33 @@ impl Session {
             warn!(sender = %self.sender_comp_id, id = id.0, "Melin answer for no request in flight");
             return SessionAction::None;
         };
+        // Each is counted and logged at debug; the warning, for the
+        // operator, comes at most once a second per session. A busy
+        // node sheds a session's whole pipelined burst at once, and a
+        // misconfigured key has every request refused, so a warning per
+        // request would flood the log.
+        let now = Instant::now();
         match &why {
-            TurnedAway::Busy => warn!(sender = %self.sender_comp_id, "Melin server busy"),
+            TurnedAway::Busy => {
+                self.metrics
+                    .exchange_busy_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!(sender = %self.sender_comp_id, id = id.0, "Melin server busy");
+                if let Some(shed) = self.busy_warning.due(now) {
+                    warn!(sender = %self.sender_comp_id, shed, "Melin server busy: requests shed and rejected");
+                }
+            }
             // The node refuses what the gateway's key may not send, or
             // what it cannot decode: a misconfigured key, or a gateway
             // bug, either way the operator's to see.
             TurnedAway::Refused { kind, reason } => {
-                warn!(sender = %self.sender_comp_id, ?kind, reason, "Melin refused a request")
+                self.metrics
+                    .exchange_refused_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!(sender = %self.sender_comp_id, id = id.0, ?kind, reason, "Melin refused a request");
+                if let Some(refused) = self.refused_warning.due(now) {
+                    warn!(sender = %self.sender_comp_id, refused, ?kind, reason, "Melin refused requests");
+                }
             }
         }
         let text = why.text();
@@ -2565,6 +2620,22 @@ lot_size_inverse = 1
         assert_eq!(reject.get_str(tags::ORD_STATUS), Some("8"));
         assert!(reject.get_str(tags::TEXT).unwrap().contains("resend"));
         assert!(s.in_flight.is_empty());
+        assert_eq!(s.metrics.exchange_busy_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// The first event warns at once; the rest within the second are
+    /// counted into the next warning rather than each warning.
+    #[test]
+    fn a_warning_comes_at_most_once_a_second_with_the_count_since() {
+        let start = Instant::now();
+        let mut limiter = WarnLimiter::default();
+        assert_eq!(limiter.due(start), Some(1));
+        for ms in [1, 10, 999] {
+            assert_eq!(limiter.due(start + Duration::from_millis(ms)), None);
+        }
+        assert_eq!(limiter.due(start + Duration::from_millis(1000)), Some(4));
+        assert_eq!(limiter.due(start + Duration::from_millis(1001)), None);
+        assert_eq!(limiter.due(start + Duration::from_secs(5)), Some(2));
     }
 
     /// A cancel the node refuses is an OrderCancelReject carrying the

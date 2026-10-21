@@ -149,6 +149,12 @@ Exposed series:
 | `fix_gateway_resend_requests_received_total` | counter | ResendRequests received from peers |
 | `fix_gateway_store_evictions_total` | counter | Outbound store entries evicted at the per-session cap |
 | `fix_gateway_rate_limit_hits_total` | counter | Inbound messages dropped by per-session rate limit |
+| `fix_gateway_exchange_busy_total` | counter | Requests the exchange shed under load, each rejected to the FIX client |
+| `fix_gateway_exchange_refused_total` | counter | Requests the exchange refused, each rejected to the FIX client |
+
+The gateway also logs a warning when the exchange sheds or refuses a
+session's requests, at most once a second per session, with the count
+since the last warning.
 
 If `metrics_addr` is omitted the counters are still maintained but
 no scrape endpoint is exposed.
