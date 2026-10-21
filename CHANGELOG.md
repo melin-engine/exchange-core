@@ -18,9 +18,10 @@ full detail behind entries marked *(sequencer)*.
 
 ## [Unreleased]
 
-This release adopts sequencer 0.20.0; the [0.20.0 section of its
-changelog](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0200---2026-10-19)
-has the detail. Upgrading is a cluster-wide stop: the replication protocol
+This release adopts sequencer 0.21.0; the
+[0.20.0](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0200---2026-10-19)
+and [0.21.0](https://github.com/melin-engine/melin/blob/main/CHANGELOG.md#0210---2026-10-21)
+sections of its changelog have the detail. Upgrading is a cluster-wide stop: the replication protocol
 and the snapshot format change, so stop the cluster, upgrade every node, and
 restart on the existing journals and snapshots. An older release refuses a
 journal or snapshot written by this one rather than misread it. Upgrade
