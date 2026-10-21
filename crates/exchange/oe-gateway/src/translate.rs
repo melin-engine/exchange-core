@@ -713,8 +713,6 @@ pub struct CancelReject<'a> {
 
 impl CancelReject<'_> {
     /// The OrderCancelReject, with CxlRejReason `cxl_reason` and `text`.
-    /// For a request the node turned away before the engine saw it (shed
-    /// under load, or refused), the reason is 99 (Other).
     pub fn to_fix(
         &self,
         cxl_reason: &str,

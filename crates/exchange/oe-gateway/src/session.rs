@@ -125,8 +125,12 @@ impl WarnLimiter {
 
 /// A position the node answered with, held until the end of its reply
 /// names the request it answers.
+///
+/// The snapshot's own fixed array, copied as it is: one position is held
+/// at a time, and a `Vec` would allocate for each query.
 struct HeldPosition {
     balances: [AccountBalance; 16],
+    /// How many of `balances` are filled; `u8`, as the snapshot carries it.
     count: u8,
 }
 
@@ -205,7 +209,7 @@ pub struct Session {
     /// The ID of the last request sent to the node, numbered from 1 on
     /// each connection. Apart from `melin_seq`, which the Logon sync
     /// moves: an ID must not repeat while its request is in flight.
-    melin_last_id: u64,
+    melin_last_id: RequestId,
     /// The requests sent to the node and not yet answered, by ID: an
     /// answer names its request, and one the node turned away may arrive
     /// ahead of answers to requests sent before it. The sequencer's
@@ -309,7 +313,7 @@ impl Session {
             melin_send_buf: Vec::with_capacity(256),
             melin_inflight: Vec::with_capacity(256),
             melin_seq: 0,
-            melin_last_id: 0,
+            melin_last_id: RequestId(0),
             in_flight: InFlight::new(),
             held_position: None,
             busy_warning: WarnLimiter::default(),
@@ -701,6 +705,8 @@ impl Session {
                     orig_clord_id: self.id_map.get_clord_id(order_id).unwrap_or("UNKNOWN"),
                     is_replace: pending.is_replace,
                 };
+                // CxlRejReason 99 (Other): the engine never saw the
+                // request, so none of its reasons applies.
                 let msg = reject.to_fix(
                     "99",
                     text,
@@ -747,11 +753,11 @@ impl Session {
         seq: u64,
         in_flight: InFlightRequest,
     ) -> Result<(), ProtocolError> {
-        let id = RequestId(self.melin_last_id + 1);
+        let id = RequestId(self.melin_last_id.0 + 1);
         let written = codec::encode_request(request, id, seq, &mut self.melin_encode_buf)?;
         self.melin_send_buf
             .extend_from_slice(&self.melin_encode_buf[..written]);
-        self.melin_last_id = id.0;
+        self.melin_last_id = id;
         self.in_flight.insert(id, in_flight);
         Ok(())
     }
@@ -2973,7 +2979,7 @@ lot_size_inverse = 1
         ] {
             let mut s = active_session(&config, Instant::now());
             s.in_flight.insert(RequestId(1), request);
-            s.melin_last_id = 1;
+            s.melin_last_id = RequestId(1);
             let text = match &why {
                 TransportResponse::Refused { reason, .. } => *reason,
                 _ => "exchange busy, not applied: resend",
